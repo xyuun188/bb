@@ -398,11 +398,31 @@ class EntryOpportunityScoringPolicy:
         selected_paper_horizon = None
         if execution_scope == "paper":
             normal_paper_trade = safe_dict(raw.get("normal_paper_trade"))
+            direction_competition = safe_dict(raw.get("direction_competition"))
+            ml_signal = safe_dict(raw.get("local_ml_signal") or raw.get("ml_signal"))
+            local_ai_tools = safe_dict(raw.get("local_ai_tools"))
+            shared_horizon = safe_dict(
+                local_ai_tools.get("shared_prediction_horizon")
+            )
+            preferred_horizon = next(
+                (
+                    horizon
+                    for value in (
+                        normal_paper_trade.get("prediction_horizon_minutes"),
+                        direction_competition.get(
+                            "authorized_prediction_horizon_minutes"
+                        ),
+                        direction_competition.get("selected_horizon_minutes"),
+                        ml_signal.get("primary_horizon_minutes"),
+                        shared_horizon.get("horizon_minutes"),
+                    )
+                    if (horizon := _finite(value)) is not None and horizon > 0.0
+                ),
+                None,
+            )
             horizon_selection = select_paper_horizon_cohort(
                 selected_components,
-                preferred_horizon_minutes=normal_paper_trade.get(
-                    "prediction_horizon_minutes"
-                ),
+                preferred_horizon_minutes=preferred_horizon,
                 source_weights=quant_multipliers,
             )
             selected_paper_horizon = _finite(

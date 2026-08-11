@@ -90,10 +90,34 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
-                    }
+                    },
+                    {
+                        "source": "server_profit",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": 0.6,
+                        "objective_expected_return_pct": 0.4,
+                        "horizon_minutes": 30,
+                    },
                 ]
             },
-            "short": {"evidence": []},
+            "short": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": -0.2,
+                        "objective_expected_return_pct": -0.3,
+                        "horizon_minutes": 30,
+                    },
+                    {
+                        "source": "server_profit",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": -0.2,
+                        "objective_expected_return_pct": -0.3,
+                        "horizon_minutes": 30,
+                    },
+                ]
+            },
         },
         "entry_candidate_evidence": {
             "preferred_side_by_evidence": "long",
@@ -433,10 +457,33 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "return_distribution_contract": {
                             "tail_loss_probability": 0.3
                         },
-                    }
+                    },
+                    {
+                        "source": "server_profit",
+                        "side": "long",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": 0.5,
+                        "objective_expected_return_pct": 0.25,
+                        "horizon_minutes": 30,
+                        "return_distribution_contract": {
+                            "tail_loss_probability": 0.3
+                        },
+                    },
                 ]
             },
-            "short": {"evidence": []},
+            "short": {
+                "evidence": [
+                    {
+                        "source": source,
+                        "side": "short",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": -0.2,
+                        "objective_expected_return_pct": -0.3,
+                        "horizon_minutes": 30,
+                    }
+                    for source in ("local_ml", "server_profit")
+                ]
+            },
         },
     )
     evidence = context["entry_candidate_evidence"]

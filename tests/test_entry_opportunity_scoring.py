@@ -563,6 +563,42 @@ def test_paper_scoring_horizon_selection_uses_continuous_model_weights() -> None
     ]
 
 
+def test_paper_scoring_keeps_direction_competition_authorized_horizon() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    profit = _paper_payload(side="short", long_return=-0.2, short_return=1.2)
+    timeseries = _paper_payload(side="long", long_return=0.5, short_return=-0.2)
+    for side in ("long", "short"):
+        profit["return_distribution_contract"][side]["horizon_minutes"] = 240
+        timeseries["return_distribution_contract"][side]["horizon_minutes"] = 5
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": profit,
+        "time_series_prediction": timeseries,
+    }
+    decision.raw_response["direction_competition"] = {
+        "authorized_prediction_horizon_minutes": 5,
+        "selected_horizon_minutes": 5,
+    }
+    strategy = {
+        "execution_mode": "paper",
+        "continuous_model_weights": {
+            "applied": True,
+            "quant_source_weights": {
+                "server_profit": {"effective_multiplier": 1.4},
+                "timeseries": {"effective_multiplier": 0.1},
+            },
+        },
+    }
+
+    _scorer().score_candidate(decision, strategy)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["selected_horizon_minutes"] == 5
+    assert opportunity["horizon_cohort_selection"]["selected_sources"] == [
+        "timeseries"
+    ]
+
+
 def test_shadow_server_models_remain_blocked_in_live_scoring() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from threading import get_ident
 from time import monotonic, sleep
@@ -394,6 +395,54 @@ def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> 
     assert snapshot["volume_sequence"] == [float(index * 10) for index in range(40, 120)]
     assert snapshot["sequence_timeframe"] == "1m"
     assert snapshot["sequence_length"] == 80
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_requests_share_local_ml_primary_horizon(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del request_timeout
+        requests.append((path, deepcopy(payload)))
+        return {"available": True, "path": path, "best_side": "hold"}
+
+    monkeypatch.setattr(client, "_post", capture)
+    result = await client.enrich_with_context(
+        {"symbol": "BTC/USDT", "horizon_minutes": 15},
+        ml_signal={"primary_horizon_minutes": 5, "predictions": []},
+    )
+
+    assert len(requests) == 3
+    assert all(payload["features"]["horizon_minutes"] == 5.0 for _, payload in requests)
+    assert all(
+        payload["shared_prediction_horizon"]
+        == {
+            "horizon_minutes": 5.0,
+            "source": "local_ml_primary_horizon",
+            "exact_match_required": True,
+            "cross_horizon_return_competition_allowed": False,
+        }
+        for _, payload in requests
+    )
+    assert result["shared_prediction_horizon"]["horizon_minutes"] == 5.0
+
+
+def test_local_ai_tools_shared_horizon_uses_explicit_feature_fallback() -> None:
+    client = LocalAIToolsClient()
+    payload = client._feature_payload({"symbol": "BTC/USDT", "horizon_minutes": 15})
+
+    horizon = client._shared_prediction_horizon(payload, {"predictions": []})
+
+    assert horizon["horizon_minutes"] == 15.0
+    assert horizon["source"] == "explicit_feature_horizon"
 
 
 def _healthy_paper_observation() -> dict[str, object]:

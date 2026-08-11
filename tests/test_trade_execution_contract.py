@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from models.decision import _compact_decision_learning_snapshot
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import (
@@ -22,6 +24,9 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["paper_entry_requires_positive_return_lcb"] is True
     assert policy["paper_entry_requires_profit_factor"] is False
     assert policy["paper_entry_requires_positive_expected_net_return"] is True
+    assert policy["paper_entry_requires_independent_quant_family_count"] == 2
+    assert policy["paper_direction_concentration_alert_threshold"] == 0.80
+    assert policy["paper_direction_concentration_is_execution_quota"] is False
     assert policy["live_entry_requires_production_trade_gate"] is True
     assert policy["live_entry_requires_positive_return_lcb"] is True
     assert "paper_exploration_live_permission" not in policy
@@ -89,6 +94,30 @@ def _decision(decision_id: int, action: str, raw: dict[str, object]) -> SimpleNa
         was_executed=False,
         raw_llm_response=raw,
     )
+
+
+def test_direction_concentration_audit_warns_without_forcing_opposite_entries() -> None:
+    decisions = [
+        _decision(index, "short", {})
+        for index in range(1, 6)
+    ] + [_decision(6, "long", {})]
+
+    report = summarize_trade_execution_contract(
+        decisions,
+        positions=[
+            SimpleNamespace(side="long", realized_pnl=2.5, closed_at="closed"),
+            SimpleNamespace(side="short", realized_pnl=-3.0, closed_at="closed"),
+        ],
+    )
+    summary = report["summary"]
+
+    assert summary["entry_direction_counts"] == {"short": 5, "long": 1}
+    assert summary["dominant_entry_direction"] == "short"
+    assert summary["dominant_entry_direction_share"] == pytest.approx(5 / 6)
+    assert summary["direction_concentration_alert"] is True
+    assert summary["realized_net_pnl_by_side_usdt"] == {"long": 2.5, "short": -3.0}
+    assert summary["closed_position_count_by_side"] == {"long": 1, "short": 1}
+    assert report["policy"]["paper_direction_concentration_is_execution_quota"] is False
 
 
 def _filled_order(

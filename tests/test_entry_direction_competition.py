@@ -87,6 +87,7 @@ def _paper_payload(long_return: float, short_return: float) -> dict:
 def _governed_ml(long_return: float, short_return: float) -> dict:
     return {
         **_governed_payload(long_return, short_return),
+        "primary_horizon_minutes": 30,
         "live_ml_ready": True,
         "influence_policy": {
             "long": {"enabled": True},
@@ -295,7 +296,7 @@ def test_paper_continuous_weights_can_change_direction_without_affecting_live() 
     assert live == equal
 
 
-def test_paper_mixed_horizons_select_shorter_equal_weight_cohort() -> None:
+def test_paper_mixed_horizons_keep_local_ml_authorized_horizon() -> None:
     server = _paper_payload(0.1, 0.7)
     for side in ("long", "short"):
         server["return_distribution_contract"][side]["horizon_minutes"] = 10
@@ -307,25 +308,25 @@ def test_paper_mixed_horizons_select_shorter_equal_weight_cohort() -> None:
     )
 
     assert context["enabled"] is True
-    assert context["preferred_side"] == "short"
-    assert context["selected_horizon_minutes"] == 10
+    assert context["preferred_side"] == "long"
+    assert context["selected_horizon_minutes"] == 30
     assert context["decision_source_count"] == 2
     assert context["aggregate_blockers"] == []
-    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
-    local_rows = [
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["local_ml"]
+    server_rows = [
         item
         for side in ("long", "short")
         for item in context[side]["evidence"]
-        if item["source"] == "local_ml"
+        if item["source"] == "server_profit"
     ]
-    assert all(item["decision_eligible"] is False for item in local_rows)
+    assert all(item["decision_eligible"] is False for item in server_rows)
     assert all(
         item["eligibility_reason"] == "paper_prediction_horizon_not_selected"
-        for item in local_rows
+        for item in server_rows
     )
 
 
-def test_paper_mixed_horizons_select_highest_weight_cohort() -> None:
+def test_high_weight_long_horizon_cannot_displace_authorized_horizon() -> None:
     server = _paper_payload(0.0, 0.7)
     for side in ("long", "short"):
         server["return_distribution_contract"][side]["horizon_minutes"] = 60
@@ -346,11 +347,32 @@ def test_paper_mixed_horizons_select_highest_weight_cohort() -> None:
     )
 
     assert context["enabled"] is True
-    assert context["preferred_side"] == "short"
-    assert context["selected_horizon_minutes"] == 60
-    assert context["training_long"]["horizon_minutes"] == 60
-    assert context["training_short"]["horizon_minutes"] == 60
-    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
+    assert context["preferred_side"] == "long"
+    assert context["selected_horizon_minutes"] == 30
+    assert context["training_long"]["horizon_minutes"] == 30
+    assert context["training_short"]["horizon_minutes"] == 30
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["local_ml"]
+    assert context["authorized_prediction_horizon_minutes"] == 30
+    assert context["authorized_prediction_horizon_source"] == "local_ml_primary_horizon"
+
+
+def test_unavailable_authorized_horizon_fails_closed() -> None:
+    ml = _governed_ml(0.8, -0.2)
+    ml["primary_horizon_minutes"] = 5
+    server = _paper_payload(0.0, 0.7)
+    for side in ("long", "short"):
+        server["return_distribution_contract"][side]["horizon_minutes"] = 240
+
+    context = _context(
+        ml=ml,
+        tools={"profit_prediction": server},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "neutral"
+    assert context["decision_source_count"] == 0
+    assert context["selected_horizon_minutes"] is None
+    assert "paper_prediction_horizon_unavailable" in context["aggregate_blockers"]
 
 
 def test_mismatched_horizons_cannot_enter_direction_aggregation() -> None:

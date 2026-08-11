@@ -46,6 +46,7 @@ _MAX_CIRCUIT_BREAKER_FAILURES = 20
 _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
 _STATUS_CACHE_TTL_SECONDS = 8.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
+_DEFAULT_SHARED_PREDICTION_HORIZON_MINUTES = 10.0
 _HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
 _HTTP_MAX_CONNECTIONS = 8
 _HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
@@ -147,6 +148,9 @@ class LocalAIToolsClient:
             return circuit_open
 
         payload = self._feature_payload(features)
+        shared_horizon = self._shared_prediction_horizon(payload, ml_signal)
+        payload["features"]["horizon_minutes"] = shared_horizon["horizon_minutes"]
+        payload["shared_prediction_horizon"] = shared_horizon
         if isinstance(ml_signal, dict):
             payload["local_ml_signal"] = ml_signal
         if include_exit_advice and open_positions:
@@ -303,6 +307,7 @@ class LocalAIToolsClient:
             "batch_budget_policy": "remaining_budget_fair_share_with_carry_forward",
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),
+            "shared_prediction_horizon": shared_horizon,
         }
         errors: dict[str, str] = {}
         for (name, _path), item in zip(tool_specs, results, strict=False):
@@ -1109,6 +1114,48 @@ class LocalAIToolsClient:
             "timestamp": datetime.now(UTC).isoformat(),
             "features": snapshot,
         }
+
+    def _shared_prediction_horizon(
+        self,
+        payload: dict[str, Any],
+        ml_signal: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        signal = ml_signal if isinstance(ml_signal, dict) else {}
+        candidates: list[tuple[str, Any]] = [
+            ("local_ml_primary_horizon", signal.get("primary_horizon_minutes")),
+        ]
+        predictions = signal.get("predictions")
+        if isinstance(predictions, list) and predictions:
+            primary = predictions[0] if isinstance(predictions[0], dict) else {}
+            contract = primary.get("return_distribution_contract")
+            contract = contract if isinstance(contract, dict) else {}
+            long_contract = contract.get("long")
+            long_contract = long_contract if isinstance(long_contract, dict) else {}
+            candidates.extend(
+                [
+                    ("local_ml_primary_prediction", primary.get("horizon_minutes")),
+                    (
+                        "local_ml_primary_return_contract",
+                        long_contract.get("horizon_minutes"),
+                    ),
+                ]
+            )
+        features = payload.get("features")
+        feature_snapshot = features if isinstance(features, dict) else {}
+        candidates.append(("explicit_feature_horizon", feature_snapshot.get("horizon_minutes")))
+        candidates.append(
+            ("default_prediction_horizon", _DEFAULT_SHARED_PREDICTION_HORIZON_MINUTES)
+        )
+        for source, raw_horizon in candidates:
+            horizon = self._to_float(raw_horizon, default=float("nan"))
+            if horizon == horizon and abs(horizon) != float("inf") and horizon > 0.0:
+                return {
+                    "horizon_minutes": float(horizon),
+                    "source": source,
+                    "exact_match_required": True,
+                    "cross_horizon_return_competition_allowed": False,
+                }
+        raise RuntimeError("shared prediction horizon could not be resolved")
 
     def _compact_numeric_sequence(self, value: Any, *, limit: int) -> list[float]:
         if not isinstance(value, (list, tuple)):

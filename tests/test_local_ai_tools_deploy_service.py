@@ -171,6 +171,14 @@ def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None
     assert "Bearer {LOCAL_AI_TOOLS_API_KEY}" in SERVICE_CODE
 
 
+def test_quant_service_smoke_uses_supported_exact_horizon() -> None:
+    command = deploy._remote_smoke_command()
+
+    assert "'horizon_minutes': 5" in command
+    assert "timeseries.get('requested_horizon_minutes') == 5" in command
+    assert "exact_requested_horizon_only" in command
+
+
 def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() -> None:
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in SERVICE_CODE
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in SERVICE_CODE
@@ -629,6 +637,106 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
         and item["blockers"] == []
         and "artifact_activation_not_production_authorized" in item["production_blockers"]
         for item in payload["return_distribution_inputs"].values()
+    )
+
+
+def test_timeseries_uses_exact_requested_horizon_instead_of_larger_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_exact_timeseries_horizon_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.FeatureRequest.model_rebuild()
+    bundle = {
+        "metadata": {},
+        "profiles": {},
+        "long_cost_model": "long-cost",
+        "short_cost_model": "short-cost",
+        "long_loss_model": "long-loss",
+        "short_loss_model": "short-loss",
+        "horizon_models": {
+            5: {"long_model": "long-5", "short_model": "short-5", "samples": 20},
+            240: {
+                "long_model": "long-240",
+                "short_model": "short-240",
+                "samples": 20,
+            },
+        },
+    }
+    expected = {
+        "long-5": 0.4,
+        "short-5": -0.2,
+        "long-240": -4.0,
+        "short-240": 5.0,
+        "long-cost": 0.1,
+        "short-cost": 0.1,
+    }
+
+    monkeypatch.setattr(module, "load_bundle", lambda: bundle)
+    monkeypatch.setattr(
+        module,
+        "regression_prediction_distribution",
+        lambda model, _x: {
+            "expected": expected[model],
+            "median": expected[model],
+            "lower_bound": expected[model] - 0.1,
+            "upper_bound": expected[model] + 0.1,
+            "std": 0.1,
+            "sample_count": 20,
+            "distribution_ready": True,
+        },
+    )
+    monkeypatch.setattr(module, "predict_proba_positive", lambda _model, _x: 0.2)
+    monkeypatch.setattr(
+        module,
+        "model_return_distribution_input",
+        lambda distribution, *, side, horizon_minutes, **_kwargs: {
+            "side": side,
+            "horizon_minutes": horizon_minutes,
+            "raw_expected_return_pct": distribution["expected"],
+            "median_return_pct": distribution["median"],
+            "lower_quantile_return_pct": distribution["lower_bound"],
+            "upper_quantile_return_pct": distribution["upper_bound"],
+            "production_eligible": True,
+            "blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "execution_cost_distribution_contract",
+        lambda _distribution: {"distribution_ready": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "with_model_metadata",
+        lambda _name, payload, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        module,
+        "_attach_timeseries_specialist_shadow",
+        lambda payload, **_kwargs: payload,
+    )
+
+    result = module.timeseries_predict(
+        module.FeatureRequest(symbol="BTC/USDT", features={"horizon_minutes": 5})
+    )
+
+    assert result["available"] is True
+    assert result["best_side"] == "long"
+    assert result["horizon_minutes"] == 5
+    assert result["requested_horizon_minutes"] == 5
+    assert result["horizon_selection_policy"] == "exact_requested_horizon_only"
+    assert result["available_horizon_minutes"] == [5, 240]
+
+    unavailable = module.timeseries_predict(
+        module.FeatureRequest(symbol="BTC/USDT", features={"horizon_minutes": 15})
+    )
+
+    assert unavailable["available"] is False
+    assert unavailable["trained"] is True
+    assert unavailable["horizon_minutes"] == 15
+    assert unavailable["prediction_quality"]["reason"] == (
+        "requested_timeseries_horizon_unavailable"
     )
 
 

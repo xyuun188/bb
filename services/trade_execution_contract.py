@@ -244,11 +244,37 @@ def summarize_trade_execution_contract(
                 violations.extend(_violation(decision, reason, row) for reason in reasons)
 
     reason_counts = Counter(str(row["reason"]) for row in violations)
+    entry_direction_counts = Counter(str(row.get("action") or "") for row in entry_rows)
+    executed_entry_direction_counts = Counter(
+        str(row.get("action") or "") for row in entry_rows if row.get("executed") is True
+    )
+    dominant_side = "neutral"
+    dominant_share = 0.0
+    if entry_rows:
+        dominant_side, dominant_count = max(
+            entry_direction_counts.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        dominant_share = dominant_count / len(entry_rows)
+    single_family_authorized_entry_count = sum(
+        1
+        for row in entry_rows
+        if row.get("executed") is True
+        and row.get("contract_lifecycle") == "normal_paper_trade"
+        and len(row.get("quant_evidence_families") or []) < 2
+    )
     realized_values = [
         _safe_float(_row_get(position, "realized_pnl"), 0.0)
         for position in positions or []
         if _row_get(position, "closed_at") is not None
     ]
+    realized_by_side: dict[str, list[float]] = {"long": [], "short": []}
+    for position in positions or []:
+        side = str(_row_get(position, "side") or "").lower()
+        if _row_get(position, "closed_at") is not None and side in realized_by_side:
+            realized_by_side[side].append(
+                _safe_float(_row_get(position, "realized_pnl"), 0.0)
+            )
     summary = {
         "decision_count": len(decisions),
         "executed_entry_count": executed_entry_count,
@@ -269,6 +295,19 @@ def summarize_trade_execution_contract(
         "closed_position_count": len(realized_values),
         "realized_net_pnl_usdt": round(sum(realized_values), 8),
         "negative_realized_position_count": sum(value < 0 for value in realized_values),
+        "realized_net_pnl_by_side_usdt": {
+            side: round(sum(values), 8) for side, values in realized_by_side.items()
+        },
+        "closed_position_count_by_side": {
+            side: len(values) for side, values in realized_by_side.items()
+        },
+        "entry_direction_counts": dict(entry_direction_counts),
+        "executed_entry_direction_counts": dict(executed_entry_direction_counts),
+        "dominant_entry_direction": dominant_side,
+        "dominant_entry_direction_share": round(dominant_share, 8),
+        "direction_concentration_alert": bool(entry_rows and dominant_share > 0.80),
+        "direction_concentration_alert_threshold": 0.80,
+        "single_family_authorized_entry_count": single_family_authorized_entry_count,
     }
     return {
         "audit_only": True,
@@ -287,6 +326,9 @@ def summarize_trade_execution_contract(
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
+            "paper_entry_requires_independent_quant_family_count": 2,
+            "paper_direction_concentration_alert_threshold": 0.80,
+            "paper_direction_concentration_is_execution_quota": False,
             "live_entry_requires_production_trade_gate": True,
             "live_entry_requires_positive_fee_after_return": True,
             "live_entry_requires_positive_return_lcb": True,
@@ -1150,6 +1192,9 @@ def validate_normal_paper_entry_contract(
             "entry_type": normal_trade.get("entry_type"),
             "selection_reason": normal_trade.get("selection_reason"),
             "decision_authority": normal_trade.get("decision_authority"),
+            "quant_evidence_families": list(
+                normal_trade.get("quant_evidence_families") or []
+            ),
             "expected_net_return_pct": _finite_value(
                 normal_trade.get("expected_net_return_pct")
             ),

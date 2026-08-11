@@ -787,6 +787,9 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     policy["paper_entry_requires_profit_factor"] = False
     policy["paper_entry_requires_positive_expected_net_return"] = True
     policy["paper_entry_requires_current_execution_cost"] = True
+    policy["paper_entry_requires_independent_quant_family_count"] = 2
+    policy["paper_direction_concentration_alert_threshold"] = 0.80
+    policy["paper_direction_concentration_is_execution_quota"] = False
     policy["live_entry_requires_production_trade_gate"] = True
     policy["live_entry_requires_positive_fee_after_return"] = True
     policy["live_entry_requires_positive_return_lcb"] = True
@@ -3304,13 +3307,18 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
     summary = _safe_dict(report.get("summary"))
     violation_count = int(summary.get("contract_violation_count") or 0)
     fill_sync_pending = int(summary.get("entry_authoritative_fill_sync_pending_count") or 0)
+    direction_alert = summary.get("direction_concentration_alert") is True
+    single_family_count = int(summary.get("single_family_authorized_entry_count") or 0)
+    warning = bool(fill_sync_pending or direction_alert or single_family_count)
     return _audit_card(
         "trade_execution_contract",
         "动态费后收益执行契约",
-        "critical" if violation_count else "warning" if fill_sync_pending else "ok",
+        "critical" if violation_count else "warning" if warning else "ok",
         (
             "已执行决策违反动态费后收益契约。"
             if violation_count
+            else "方向候选过度集中或存在单证据族历史授权，需继续观察。"
+            if direction_alert or single_family_count
             else "已执行开仓和平仓满足动态费后收益契约。"
         ),
         details=report,
@@ -3327,6 +3335,11 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
             },
             {"label": "违规项", "value": violation_count},
             {
+                "label": "候选方向集中度",
+                "value": float(summary.get("dominant_entry_direction_share") or 0.0),
+            },
+            {"label": "单证据族授权", "value": single_family_count},
+            {
                 "label": "已实现净盈亏",
                 "value": float(summary.get("realized_net_pnl_usdt") or 0.0),
             },
@@ -3334,7 +3347,7 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
         next_actions=(
             ["阻断任何缺少正向费后收益置信下界、实时成本、风险预算或来源证据的执行路径。"]
             if violation_count
-            else ["继续审计已实现费后收益和左尾结果。"]
+            else ["继续审计方向集中度、单证据族授权数和多空费后收益。"]
         ),
         owner_path="services/trade_execution_contract.py",
     )

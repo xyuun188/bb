@@ -5438,6 +5438,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
 @app.post("/timeseries/predict")
 def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
     features = req.features or {}
+    requested_horizon_minutes = int(feature_row(features)["horizon_minutes"])
+    available_horizon_minutes: list[int] = []
+    fallback_reason = "trained_timeseries_model_unavailable"
     bundle = load_bundle()
     if bundle:
         predictions = []
@@ -5551,22 +5554,18 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 for item in predictions
                 if item.get("prediction_distribution_ready") is True
             ]
-            if eligible_predictions:
-                primary = max(
-                    eligible_predictions,
-                    key=lambda r: max(
-                        float(
-                            r["return_distribution_inputs"]["long"][
-                                "lower_quantile_return_pct"
-                            ]
-                        ),
-                        float(
-                            r["return_distribution_inputs"]["short"][
-                                "lower_quantile_return_pct"
-                            ]
-                        ),
-                    ),
-                )
+            available_horizon_minutes = sorted(
+                int(item["horizon_minutes"]) for item in eligible_predictions
+            )
+            matching_predictions = [
+                item
+                for item in eligible_predictions
+                if int(item["horizon_minutes"]) == requested_horizon_minutes
+            ]
+            if eligible_predictions and not matching_predictions:
+                fallback_reason = "requested_timeseries_horizon_unavailable"
+            if matching_predictions:
+                primary = matching_predictions[0]
                 best_side = str(primary["best_side"])
                 edge = abs(
                     float(
@@ -5624,6 +5623,9 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "side": best_side,
                     "direction": primary["direction"],
                     "horizon_minutes": primary["horizon_minutes"],
+                    "requested_horizon_minutes": requested_horizon_minutes,
+                    "horizon_selection_policy": "exact_requested_horizon_only",
+                    "available_horizon_minutes": available_horizon_minutes,
                     "profit_edge_pct": round(edge, 4),
                     "return_semantics": "gross_market_opportunity_before_execution",
                     "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
@@ -5664,20 +5666,27 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     },
                 }, features=features)
                 return _attach_timeseries_specialist_shadow(payload, features=features)
-        except Exception:
-            pass
+        except Exception as exc:
+            fallback_reason = f"timeseries_prediction_failed:{type(exc).__name__}"
 
-    horizon_minutes = int(feature_row(features)["horizon_minutes"])
+    horizon_minutes = requested_horizon_minutes
     return with_model_metadata("time_series_prediction", {
         "available": False,
-        "trained": False,
-        "model": "local-timeseries-artifact-required-v3",
+        "trained": bool(bundle),
+        "model": (
+            "local-timeseries-trained-v2"
+            if bundle
+            else "local-timeseries-artifact-required-v3"
+        ),
         "architecture": "persisted_distribution_artifact_required",
         "symbol": req.symbol,
         "best_side": "hold",
         "side": "hold",
         "direction": "flat",
         "horizon_minutes": horizon_minutes,
+        "requested_horizon_minutes": requested_horizon_minutes,
+        "horizon_selection_policy": "exact_requested_horizon_only",
+        "available_horizon_minutes": available_horizon_minutes,
         "return_semantics": "gross_market_opportunity_before_execution",
         "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
         "return_distribution_inputs": unavailable_return_distribution_inputs(
@@ -5687,10 +5696,10 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
         "prediction_quality": {
             "production_eligible": False,
             "anomalous": True,
-            "reason": "trained_timeseries_model_unavailable",
-            "blockers": ["trained_timeseries_model_unavailable"],
+            "reason": fallback_reason,
+            "blockers": [fallback_reason],
         },
-    }, features=features, fallback_reason="trained_timeseries_model_unavailable")
+    }, features=features, fallback_reason=fallback_reason)
 
 
 @app.post("/timeseries/deep/predict")
@@ -6246,6 +6255,7 @@ def _remote_smoke_command() -> str:
         "    'returns_20': 0.03,\n"
         "    'rsi_14': 55.0,\n"
         "    'volume_ratio': 1.1,\n"
+        "    'horizon_minutes': 5,\n"
         "    'news_sentiment_avg': 0.0,\n"
         "    'social_sentiment_avg': 0.0,\n"
         "    'recent_headlines': ['Market liquidity remains stable.'],\n"
@@ -6288,6 +6298,9 @@ def _remote_smoke_command() -> str:
         "assert timeseries.get('trained') is has_artifact, timeseries\n"
         "assert timeseries.get('production_permission') is live, timeseries\n"
         "assert timeseries.get('live_ml_ready') is live, timeseries\n"
+        "assert timeseries.get('horizon_minutes') == 5, timeseries\n"
+        "assert timeseries.get('requested_horizon_minutes') == 5, timeseries\n"
+        "assert timeseries.get('horizon_selection_policy') == 'exact_requested_horizon_only', timeseries\n"
         "assert timeseries.get('prediction_quality', {}).get('production_eligible') is live, timeseries\n"
         "assert timeseries.get('prediction_quality', {}).get('paper_eligible') is has_artifact, timeseries\n"
         "assert timeseries.get('prediction_quality', {}).get('anomalous') is (not has_artifact), timeseries\n"

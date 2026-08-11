@@ -63,6 +63,35 @@ def _execution_scope(strategy_mode: dict[str, Any] | None) -> str:
     return "paper" if mode == "paper" else "live"
 
 
+def _authorized_prediction_horizon(
+    ml_signal_context: dict[str, Any] | None,
+    local_ai_tools_context: dict[str, Any] | None,
+) -> tuple[float | None, str]:
+    signal = _safe_dict(ml_signal_context)
+    primary_horizon = _safe_float(signal.get("primary_horizon_minutes"))
+    if primary_horizon is not None and primary_horizon > 0.0:
+        return primary_horizon, "local_ml_primary_horizon"
+
+    predictions = _safe_list(signal.get("predictions"))
+    primary = _safe_dict(predictions[0] if predictions else {})
+    prediction_horizon = _safe_float(primary.get("horizon_minutes"))
+    if prediction_horizon is None:
+        contract = _safe_dict(primary.get("return_distribution_contract"))
+        prediction_horizon = _safe_float(
+            _safe_dict(contract.get("long")).get("horizon_minutes")
+        )
+    if prediction_horizon is not None and prediction_horizon > 0.0:
+        return prediction_horizon, "local_ml_primary_prediction"
+
+    shared = _safe_dict(
+        _safe_dict(local_ai_tools_context).get("shared_prediction_horizon")
+    )
+    shared_horizon = _safe_float(shared.get("horizon_minutes"))
+    if shared_horizon is not None and shared_horizon > 0.0:
+        return shared_horizon, str(shared.get("source") or "local_ai_tools_shared_horizon")
+    return None, "unavailable"
+
+
 def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     eligible_objective = [
         (
@@ -170,6 +199,45 @@ def _enforce_aggregate_contract_consistency(
     return blockers
 
 
+def _annotate_source_direction_alignment(
+    evidence: dict[str, list[dict[str, Any]]],
+) -> None:
+    sources = {
+        str(item.get("source") or "")
+        for side in ("long", "short")
+        for item in evidence[side]
+        if item.get("decision_eligible") is True
+    }
+    for source in sources:
+        rows = {
+            side: next(
+                (
+                    item
+                    for item in evidence[side]
+                    if item.get("decision_eligible") is True
+                    and str(item.get("source") or "") == source
+                ),
+                None,
+            )
+            for side in ("long", "short")
+        }
+        scores = {
+            side: _safe_float(_safe_dict(row).get("objective_expected_return_pct"))
+            for side, row in rows.items()
+        }
+        preferred_side = "neutral"
+        if all(score is not None for score in scores.values()):
+            if scores["long"] > scores["short"]:
+                preferred_side = "long"
+            elif scores["short"] > scores["long"]:
+                preferred_side = "short"
+        for side, row in rows.items():
+            if row is None:
+                continue
+            row["source_preferred_side"] = preferred_side
+            row["direction_aligned"] = preferred_side == side
+
+
 @dataclass(frozen=True, slots=True)
 class EntryDirectionCompetitionPolicy:
     """Compare gross market-opportunity observations for the active scope.
@@ -218,6 +286,10 @@ class EntryDirectionCompetitionPolicy:
                     source = str(item.get("source") or "")
                     item["continuous_weight_multiplier"] = quant_weights.get(source, 1.0)
         all_rows = [item for side in ("long", "short") for item in evidence[side]]
+        authorized_horizon, authorized_horizon_source = _authorized_prediction_horizon(
+            ml_signal_context,
+            local_ai_tools_context,
+        )
         aggregate_blockers = _enforce_aggregate_contract_consistency(
             evidence,
             include_horizon=execution_scope == "live",
@@ -226,6 +298,7 @@ class EntryDirectionCompetitionPolicy:
         if execution_scope == "paper" and not aggregate_blockers:
             horizon_selection = select_paper_horizon_cohort(
                 (item for item in all_rows if item.get("decision_eligible") is True),
+                preferred_horizon_minutes=authorized_horizon,
                 source_weights=quant_weights,
             )
             aggregate_blockers.extend(horizon_selection.get("blockers") or [])
@@ -246,6 +319,9 @@ class EntryDirectionCompetitionPolicy:
         training_rows = [item for item in all_rows if item.get("paper_eligible") is True]
         training_horizon_selection = select_paper_horizon_cohort(
             training_rows,
+            preferred_horizon_minutes=(
+                authorized_horizon if execution_scope == "paper" else None
+            ),
             source_weights=quant_weights,
         )
         training_horizon = _safe_float(
@@ -256,6 +332,7 @@ class EntryDirectionCompetitionPolicy:
                 item.get("paper_eligible") is True
                 and _safe_float(item.get("horizon_minutes")) == training_horizon
             )
+        _annotate_source_direction_alignment(evidence)
         long_side = _side_summary(evidence["long"])
         short_side = _side_summary(evidence["short"])
         long_training = _training_side_summary(evidence["long"], training_horizon)
@@ -339,11 +416,13 @@ class EntryDirectionCompetitionPolicy:
             ),
             "horizon_cohort_selection": horizon_selection,
             "training_horizon_cohort_selection": training_horizon_selection,
+            "authorized_prediction_horizon_minutes": authorized_horizon,
+            "authorized_prediction_horizon_source": authorized_horizon_source,
             "policy_provenance": {
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-07-14.gross-market-direction-observation.v2",
+                "strategy_version": "2026-08-11.shared-horizon-direction-observation.v3",
                 "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }

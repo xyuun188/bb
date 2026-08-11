@@ -57,25 +57,43 @@ def test_correlated_local_ai_tools_outputs_count_as_one_family() -> None:
                     _row("timeseries"),
                     _row("sentiment"),
                 ]
-            }
+            },
+            "short": {
+                "evidence": [
+                    _row("server_profit", raw=-0.2, objective=-0.3),
+                    _row("timeseries", raw=-0.1, objective=-0.2),
+                    _row("sentiment", raw=-0.1, objective=-0.2),
+                ]
+            },
         },
         [],
         "long",
         execution_cost_pct=0.1,
     )
 
-    assert support["eligible"] is True
+    assert support["eligible"] is False
     assert support["quant_evidence_families"] == ["local_ai_tools"]
     assert support["quantitative_sources"] == [
         "sentiment",
         "server_profit",
         "timeseries",
     ]
+    assert "direction_support_independent_quant_families_insufficient" in support[
+        "blocking_reasons"
+    ]
 
 
 def test_all_hold_experts_do_not_block_auditable_paper_model_direction() -> None:
     support = assess_paper_model_trade_support(
-        {"long": {"evidence": [_row("local_ml")] }},
+        {
+            "long": {"evidence": [_row("local_ml"), _row("server_profit")]},
+            "short": {
+                "evidence": [
+                    _row("local_ml", raw=-0.2, objective=-0.3),
+                    _row("server_profit", raw=-0.1, objective=-0.2),
+                ]
+            },
+        },
         [
             _opinion("trend", "hold", source_group="llm:trend"),
             _opinion("momentum", "hold", source_group="llm:momentum"),
@@ -108,7 +126,15 @@ def test_negative_net_paper_direction_is_analysis_only() -> None:
 
 def test_two_independent_expert_groups_can_block_strong_opposition() -> None:
     support = assess_paper_model_trade_support(
-        {"long": {"evidence": [_row("local_ml")] }},
+        {
+            "long": {"evidence": [_row("local_ml"), _row("server_profit")]},
+            "short": {
+                "evidence": [
+                    _row("local_ml", raw=-0.2, objective=-0.3),
+                    _row("server_profit", raw=-0.1, objective=-0.2),
+                ]
+            },
+        },
         [
             _opinion("trend", "long", source_group="llm:trend"),
             _opinion("sentiment", "short", source_group="llm:sentiment"),
@@ -231,7 +257,10 @@ def test_paper_quantitative_summary_never_averages_different_horizons() -> None:
     )
     assert support["prediction_horizon_minutes"] == 60.0
     assert support["available_prediction_horizons"] == [10.0, 60.0]
-    assert directional_entry_support_reasons(support, "long") == []
+    assert support["eligible"] is False
+    assert "direction_support_independent_quant_families_insufficient" in (
+        directional_entry_support_reasons(support, "long")
+    )
 
 
 def test_paper_quantitative_summary_inherits_direction_cohort_selection() -> None:
@@ -265,3 +294,43 @@ def test_paper_quantitative_summary_inherits_direction_cohort_selection() -> Non
     assert summary["horizon_selection_policy"] == (
         "highest_continuous_weight_then_shortest_horizon"
     )
+
+
+def test_two_independent_quant_families_must_prefer_the_same_side() -> None:
+    competition = {
+        "selected_horizon_minutes": 30.0,
+        "horizon_cohort_selection": {"selected_horizon_minutes": 30.0},
+        "long": {"evidence": [_row("local_ml"), _row("timeseries")]},
+        "short": {
+            "evidence": [
+                _row("local_ml", raw=-0.2, objective=-0.3),
+                _row("timeseries", raw=-0.1, objective=-0.2),
+            ]
+        },
+    }
+
+    support = assess_paper_model_trade_support(
+        competition,
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["quant_evidence_families"] == ["local_ai_tools", "local_ml"]
+
+    competition["short"]["evidence"][1] = _row(
+        "timeseries", raw=0.8, objective=0.6
+    )
+    conflicted = assess_paper_model_trade_support(
+        competition,
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert conflicted["eligible"] is False
+    assert conflicted["quant_evidence_families"] == ["local_ml"]
+    assert "direction_support_independent_quant_families_insufficient" in conflicted[
+        "blocking_reasons"
+    ]
