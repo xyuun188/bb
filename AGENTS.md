@@ -5,9 +5,9 @@ This repository has a project-specific Hindsight memory bank:
 - Bank ID: `bb`
 - Project root: `E:\code\bb`
 - Scope: only memories about this project. Do not store this project's memories in `codex` or another project bank.
-- Hindsight API/MCP base: `http://45.207.197.48:18888`
-- Hindsight MCP endpoint: `http://45.207.197.48:18888/mcp/bb/`
-- Hindsight control panel: `http://45.207.197.48:19999/zh-CN`
+- Hindsight API/MCP base: `http://38.246.249.80:18888`
+- Hindsight MCP endpoint: `http://38.246.249.80:18888/mcp/bb/`
+- Hindsight control panel: `http://38.246.249.80:19999/zh-CN`
 
 Use the project-level MCP server `hindsight_bb` for this repository. The old `.codex-memory` scripts are not present in this checkout and must not be called.
 
@@ -37,7 +37,7 @@ rtk git commit -m "<concise change summary>"
 rtk git push origin main
 ```
 
-4. Update project memory for meaningful durable facts with the online `bb` Hindsight bank. Prefer `hindsight_bb` MCP when available; otherwise use the remote endpoint `http://45.207.197.48:18888/mcp/bb/` or the Hindsight API at `http://45.207.197.48:18888`. Never store secrets. Do not call `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync script is not part of this setup.
+4. Update project memory for meaningful durable facts with the online `bb` Hindsight bank. Prefer `hindsight_bb` MCP when available; otherwise use the remote endpoint `http://38.246.249.80:18888/mcp/bb/` or the Hindsight API at `http://38.246.249.80:18888`. Never store secrets. Do not call `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; that local sync script is not part of this setup.
 
 After completing work that creates durable knowledge, call `hindsight_bb.retain` once with a concise summary. Store architecture decisions, setup steps, important paths, service ports, verified fixes, and non-obvious debugging results. Do not retain secrets, temporary guesses, noisy logs, or casual conversation.
 
@@ -182,7 +182,7 @@ Overall average: **60-90% token reduction** on common development operations.
 ## Codex Automatic Hindsight Workflow
 
 For this repository, use the project-specific Hindsight MCP server `hindsight_bb` and bank `bb` automatically.
-Hindsight reads and writes must use `http://45.207.197.48:18888/mcp/bb/` by default.
+Hindsight reads and writes must use `http://38.246.249.80:18888/mcp/bb/` by default.
 
 Do not run old `D:\code\Hindsight\codex_memory_*.ps1` scripts or `C:\Users\Administrator\.codex\hindsight-memory\sync-project-memory.ps1`; those paths belong to earlier machines. Persist durable changes with `hindsight_bb.retain` through the project-level MCP server.
 
