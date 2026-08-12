@@ -3411,8 +3411,18 @@ function analysisMissingExpertReason(missing, record) {
     const rawReason = String(missing?.reason || '').trim();
     const lowerReason = rawReason.toLowerCase();
     const skipKind = missing?.skip_kind || record?.expert_call_status?.kind || '';
+    const ensembleTimedOut = missing?.status === 'ensemble_timeout'
+        || skipKind === 'ensemble_timeout'
+        || record?.expert_call_status?.timed_out === true;
 
-    if (missing?.status === 'pre_expert_skipped' || skipKind) {
+    if (ensembleTimedOut) {
+        const timeoutReason = rawReason
+            || record?.expert_call_status?.reason
+            || '专家协作已经发起，但超过单币种时间上限，结果未能完整返回并落库。';
+        return `${label} 已进入本轮专家协作，但整体任务超时，本条记录没有保存到完整专家结果。原因：${timeoutReason}`;
+    }
+
+    if (missing?.status === 'pre_expert_skipped' || record?.expert_call_status?.skipped === true) {
         const skipLabel = record?.expert_call_status?.label || '行情预检未进入专家';
         return `${label} 本轮没有发起调用，不是模型故障：${skipLabel}。原因：${rawReason || record?.expert_call_status?.reason || '预检阶段已确定暂不需要大模型专家。'}`;
     }
@@ -3423,14 +3433,19 @@ function analysisMissingExpertReason(missing, record) {
     if (cfg && cfg.enabled === false) {
         return `${label} 在系统设置中已关闭，所以本轮没有发起调用。`;
     }
-    if (cfg && !cfg.api_key) {
+    const keylessLoopback = cfg?.configured === true
+        && cfg?.configuration_type === 'keyless_loopback';
+    if (cfg && cfg.configured === false && !cfg.api_key) {
         return `${label} 未配置 API Key，所以本轮没有发起调用。`;
     }
-    if (cfg && !cfg.api_base) {
+    if (cfg && Object.hasOwn(cfg, 'api_base') && !cfg.api_base) {
         return `${label} 未配置 API URL，所以本轮没有发起调用。`;
     }
-    if (cfg && !cfg.model) {
+    if (cfg && Object.hasOwn(cfg, 'model') && !cfg.model) {
         return `${label} 未配置模型名称，所以本轮没有发起调用。`;
+    }
+    if (keylessLoopback && !attempted && !timing) {
+        return `${label} 已配置为本地免 Key 模型，但本轮没有留下调用结果；请结合专家协作状态判断是否整体超时。`;
     }
 
     if (attempted || timing) {
@@ -3752,8 +3767,12 @@ function renderAnalysisReasonModal(record) {
  
     const missingHtml = preExpertSkip.skipped ? '' : (record.missing_experts || []).map(e => {
         const reason = analysisMissingExpertReason(e, record);
-        const notCalled = !Array.isArray(record.attempted_experts)
-            || !record.attempted_experts.map(String).includes(String(e.expert_name || ''));
+        const ensembleTimedOut = e?.status === 'ensemble_timeout'
+            || record?.expert_call_status?.kind === 'ensemble_timeout';
+        const notCalled = !ensembleTimedOut && (
+            !Array.isArray(record.attempted_experts)
+            || !record.attempted_experts.map(String).includes(String(e.expert_name || ''))
+        );
         const pillText = notCalled ? '未调用' : '未返回';
         const pillTone = 'bad';
         return `  

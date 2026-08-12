@@ -670,7 +670,7 @@ def _analysis_decision_maker(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
-    """Return a normalized pre-expert skip state for analysis-flow rendering."""
+    """Return a normalized expert-call state for analysis-flow rendering."""
     fast_prefilter = _safe_dict(raw.get("fast_prefilter"))
     if fast_prefilter.get("skipped_llm"):
         return {
@@ -691,6 +691,23 @@ def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
             "reason": sanitize_text(
                 position_fast_scan.get("reason")
                 or "本轮是持仓快速扫描；只有出现强平仓、强加仓或高风险信号时才进入专家深度复盘。"
+            ),
+        }
+    market_timeout = _safe_dict(raw.get("market_model_timeout"))
+    if market_timeout:
+        timeout_seconds = _safe_float(market_timeout.get("timeout_seconds"), 0.0)
+        return {
+            "skipped": False,
+            "attempted": bool(market_timeout.get("expert_coordination_started", True)),
+            "timed_out": True,
+            "kind": "ensemble_timeout",
+            "label": "专家协作整体超时",
+            "reason": sanitize_text(
+                market_timeout.get("reason")
+                or (
+                    f"专家协作已经发起，但超过单币种 {timeout_seconds:.0f} 秒时间上限，"
+                    "结果未能完整返回并落库。"
+                )
             ),
         }
     return {"skipped": False, "kind": "", "label": "", "reason": ""}
@@ -7853,6 +7870,7 @@ async def get_analysis_records(
         attempted_names = {str(name) for name in attempted_experts}
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
         pre_expert_skip = _analysis_pre_expert_skip(raw)
+        ensemble_timed_out = pre_expert_skip.get("kind") == "ensemble_timeout"
         attempted_expert_count = (
             0 if pre_expert_skip.get("skipped") else (len(attempted_names) or len(expected_experts))
         )
@@ -7863,6 +7881,8 @@ async def get_analysis_records(
                 "reason": (
                     pre_expert_skip.get("reason")
                     if pre_expert_skip.get("skipped")
+                    else pre_expert_skip.get("reason")
+                    if ensemble_timed_out
                     else failures_by_name.get(e["expert_name"])
                     or (
                         "未发起调用，可能是该专家未启用或未配置 API Key。"
@@ -7870,7 +7890,13 @@ async def get_analysis_records(
                         else "本轮未返回结果，可能是模型调用失败、超时或返回格式不符合 JSON 要求。"
                     )
                 ),
-                "status": ("pre_expert_skipped" if pre_expert_skip.get("skipped") else "missing"),
+                "status": (
+                    "pre_expert_skipped"
+                    if pre_expert_skip.get("skipped")
+                    else "ensemble_timeout"
+                    if ensemble_timed_out
+                    else "missing"
+                ),
                 "skip_kind": pre_expert_skip.get("kind") or "",
             }
             for e in expected_experts

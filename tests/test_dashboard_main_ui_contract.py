@@ -1803,3 +1803,36 @@ def test_dashboard_api_normalizes_position_fast_scan_expert_status() -> None:
     assert status["kind"] == "position_fast_scan"
     assert status["label"] == "持仓快速扫描未进入专家"
     assert "强平仓" in status["reason"]
+
+
+def test_dashboard_api_normalizes_market_ensemble_timeout_as_attempted() -> None:
+    status = dashboard._analysis_pre_expert_skip(
+        {
+            "market_model_timeout": {
+                "expert_coordination_started": True,
+                "timeout_seconds": 58.0,
+                "reason": "专家协作整体超过时间上限。",
+            }
+        }
+    )
+
+    assert status == {
+        "skipped": False,
+        "attempted": True,
+        "timed_out": True,
+        "kind": "ensemble_timeout",
+        "label": "专家协作整体超时",
+        "reason": "专家协作整体超过时间上限。",
+    }
+
+
+def test_analysis_timeout_and_keyless_experts_are_not_reported_as_uncalled() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    start = script.index("function analysisMissingExpertReason")
+    end = script.index("function renderAnalysisPage", start)
+    block = script[start:end]
+
+    assert "ensembleTimedOut" in block
+    assert "已进入本轮专家协作" in block
+    assert "configuration_type === 'keyless_loopback'" in block
+    assert block.index("ensembleTimedOut") < block.index("未配置 API Key")

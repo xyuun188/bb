@@ -5211,10 +5211,32 @@ def test_market_symbol_context_and_model_budgets_are_independent(
     monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
     monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
+    monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
     assert service.market_symbol_context_timeout_seconds() == pytest.approx(16.25)
-    assert service.market_model_inference_timeout_seconds() == pytest.approx(48.0)
-    assert service.market_symbol_total_budget_seconds() == pytest.approx(64.25)
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(105.0)
+    assert service.market_symbol_total_budget_seconds() == pytest.approx(121.25)
+
+
+def test_market_model_budget_covers_live_batch_failure_and_independent_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
+    monkeypatch.setattr(trading_service.settings, "trading_mode", "live")
+
+    assert service._independent_expert_window_seconds() == pytest.approx(90.0)
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(140.0)
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
@@ -5227,12 +5249,16 @@ def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
         feature,
         timeout_seconds=9.5,
         market_context_timings=[{"stage": "ensemble_decision", "status": "timeout"}],
+        attempted_experts=["trend_expert", "risk_expert"],
     )
 
     assert decision.action == Action.HOLD
     assert decision.position_size_pct == 0.0
     assert decision.raw_response["market_model_timeout"]["isolated_to_symbol"] is True
     assert decision.raw_response["market_model_timeout"]["production_permission"] is False
+    assert decision.raw_response["market_model_timeout"]["expert_coordination_started"] is True
+    assert decision.raw_response["attempted_experts"] == ["trend_expert", "risk_expert"]
+    assert len(decision.raw_response["expert_failures"]) == 2
     assert TradingService._is_market_analysis_timeout_hold(decision) is True
     assert TradingService._is_market_analysis_timeout_hold(_decision(Action.HOLD)) is False
 
@@ -5602,12 +5628,15 @@ def test_position_round_watchdog_follows_position_review_cadence(
     monkeypatch.setattr(trading_service.settings, "position_analysis_watchdog_seconds", 180)
     monkeypatch.setattr(trading_service.settings, "market_analysis_watchdog_seconds", 180)
     monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
     monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
+    monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
+    monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
-    assert service.position_review_stage_timeout_seconds() == 63.0
+    assert service.position_review_stage_timeout_seconds() == 113.0
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
-    assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
+    assert service.position_round_watchdog_seconds() == pytest.approx(226.0)
 
 
 @pytest.mark.asyncio

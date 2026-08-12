@@ -27,7 +27,12 @@ from sqlalchemy import func, select
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
-from config.settings import ENSEMBLE_TRADER_NAME, settings
+from config.settings import (
+    DECISION_MAKER_NAME,
+    ENSEMBLE_TRADER_NAME,
+    FIXED_AI_MODEL_SLOTS,
+    settings,
+)
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
@@ -247,7 +252,7 @@ MARKET_LOCAL_ML_CONTEXT_ESTIMATE_SECONDS = 6.0
 MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
 MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
-MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 1.0
+MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
@@ -954,10 +959,30 @@ class TradingService:
 
         return max(
             10.0,
-            float(settings.ai_batch_expert_timeout_seconds or 0.0)
-            + float(settings.ai_decision_maker_timeout_seconds or 0.0)
+            self.market_model_inference_timeout_seconds()
             + float(settings.local_ai_tools_timeout_seconds or 0.0),
         )
+
+    @staticmethod
+    def _ensemble_expert_count() -> int:
+        configured = settings.get_fixed_ai_models(include_empty=True)
+        count = sum(
+            1
+            for item in configured
+            if item.get("name") != DECISION_MAKER_NAME and item.get("enabled", True)
+        )
+        return max(count, 1)
+
+    def _independent_expert_window_seconds(self) -> float:
+        """Cover every expert queue batch admitted by the global LLM semaphore."""
+
+        expert_count = self._ensemble_expert_count()
+        concurrency = max(int(settings.ai_llm_concurrency or expert_count), 1)
+        queue_batches = max(math.ceil(expert_count / concurrency), 1)
+        return max(
+            float(settings.ai_expert_timeout_seconds or 0.0),
+            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+        ) * queue_batches
 
     def market_round_time_budget_seconds(
         self,
@@ -1044,21 +1069,33 @@ class TradingService:
         )
 
     def market_model_inference_timeout_seconds(self) -> float:
-        """Return enough time for experts plus optional cross-validation."""
+        """Return enough time for the configured expert execution strategy.
+
+        Paper analysis calls experts independently. With five experts and the
+        default global concurrency of two, their tasks can occupy three queue
+        batches. Live batch analysis may first consume its batch timeout and
+        then retry independently, so its outer boundary must cover both phases.
+        """
 
         settings.refresh_runtime_env(force=True)
-        expert_timeout = max(
-            float(settings.ai_batch_expert_timeout_seconds or 0.0),
-            float(settings.ai_expert_timeout_seconds or 0.0),
-            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
-        )
+        independent_window = self._independent_expert_window_seconds()
+        execution_mode = str(settings.trading_mode or "").lower()
+        batch_window = 0.0
+        if execution_mode != "paper" and bool(settings.ai_batch_experts_enabled):
+            batch_window = max(
+                float(settings.ai_batch_expert_timeout_seconds or 0.0),
+                MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+            )
         decision_timeout = max(
             float(settings.ai_decision_maker_timeout_seconds or 0.0),
             0.0,
         )
         cross_validation_timeout = min(max(decision_timeout * 0.60, 6.0), 12.0)
         return round(
-            expert_timeout + cross_validation_timeout + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            batch_window
+            + independent_window
+            + cross_validation_timeout
+            + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
             3,
         )
 
@@ -6327,6 +6364,7 @@ class TradingService:
         *,
         timeout_seconds: float,
         market_context_timings: list[dict[str, Any]],
+        attempted_experts: list[str] | None = None,
     ) -> DecisionOutput:
         """Persist a neutral record when one candidate exhausts its own model slot."""
 
@@ -6347,8 +6385,17 @@ class TradingService:
             take_profit_pct=0.0,
             raw_response={
                 "analysis_type": "market",
+                "attempted_experts": list(attempted_experts or []),
+                "expert_failures": [
+                    {
+                        "expert_name": name,
+                        "reason": "专家协作整体超过单币种时间上限，结果未能完整落库。",
+                    }
+                    for name in (attempted_experts or [])
+                ],
                 "market_model_timeout": {
                     "isolated_to_symbol": True,
+                    "expert_coordination_started": True,
                     "timeout_seconds": round(max(float(timeout_seconds), 0.0), 3),
                     "retry_later": True,
                     "retry_after_seconds": MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS,
@@ -8232,6 +8279,12 @@ class TradingService:
                         fv,
                         timeout_seconds=symbol_timeout_seconds,
                         market_context_timings=market_context_timings,
+                        attempted_experts=[
+                            str(slot.get("name") or "")
+                            for slot in FIXED_AI_MODEL_SLOTS
+                            if slot.get("name") != DECISION_MAKER_NAME
+                            and str(slot.get("name") or "")
+                        ],
                     )
                     _opinions = {}
                 else:
