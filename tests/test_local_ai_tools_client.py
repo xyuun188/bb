@@ -116,7 +116,7 @@ async def test_local_ai_tools_circuit_breaker_recovers_after_cooldown(
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_routes(
+async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_routes(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,10 +140,10 @@ async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_rou
     assert len(timeouts) == 3
     assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
     assert len(set(timeouts)) == 1
-    assert 2.5 < timeouts[0] <= 2.7
-    assert result["execution_mode"] == "sequential_warm_cpu_routes"
+    assert 7.5 < timeouts[0] <= 8.0
+    assert result["execution_mode"] == "concurrent_routes_serial_batches"
     assert result["batch_budget_policy"] == (
-        "warm_route_budget_with_batch_deadline"
+        "shared_batch_deadline_concurrent_routes"
     )
     assert result["batch_budget_seconds"] == 8.0
     assert result["profit_prediction"]["duration_sec"] > 0
@@ -152,7 +152,7 @@ async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_rou
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_serializes_batches_and_cpu_bound_routes(
+async def test_local_ai_tools_serializes_batches_but_concurrently_runs_routes(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -183,7 +183,7 @@ async def test_local_ai_tools_serializes_batches_and_cpu_bound_routes(
 
     assert first["status"] == "completed"
     assert second["status"] == "analysis_budget_deferred"
-    assert max_active_calls == 1
+    assert max_active_calls == 3
     assert len(calls) == 3
     assert {symbol for symbol, _path in calls} == {"BTC/USDT"}
 

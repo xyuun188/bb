@@ -3157,6 +3157,8 @@ function analysisToolPlainStatus(payload) {
         trained_text_model: '已训练情绪模型',
         artifact_unavailable: '缺少模型产物',
         unavailable: '不可用',
+        timeout: '已调用未返回',
+        deferred: '本轮排队未执行',
         error: '错误',
         disabled: '已关闭',
         circuit_open: '熔断中',

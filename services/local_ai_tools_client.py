@@ -169,11 +169,12 @@ class LocalAIToolsClient:
             request_timeout - min(_BATCH_COMPLETION_RESERVE_MAX_SECONDS, max(request_timeout * 0.05, 0.01)),
             _MIN_INFERENCE_ATTEMPT_SECONDS,
         )
-        # The configured timeout is a batch budget, not a per-route allowance.
-        # Divide it across the routes so a slow first endpoint cannot consume
-        # the entire market-context deadline before later evidence is tried.
+        # The configured timeout is a batch budget. Since routes run together,
+        # each request may use the whole remaining batch window; a slow route
+        # can no longer consume a serial fair-share slice before healthy routes
+        # have a chance to return.
         route_timeout = max(
-            request_timeout / max(len(tool_specs), 1),
+            batch_deadline - monotonic(),
             _MIN_INFERENCE_ATTEMPT_SECONDS,
         )
 
@@ -244,10 +245,11 @@ class LocalAIToolsClient:
             )
             return item
 
-        # The model server is CPU-bound and has one effective inference worker.
-        # Keep routes serial within one batch, but give each route a warm-service
-        # budget larger than the old fair-share slice. Startup prewarming removes
-        # the cold-load spike that previously made the first route consume it.
+        # Keep complete batches mutually exclusive, but run the independent
+        # routes together inside the batch. The API exposes separate endpoints
+        # and the server's thread pool can overlap their I/O/model work; serial
+        # routes made a normal 12-second batch spend four seconds on each route
+        # and incorrectly turned healthy late responses into timeouts.
         results: list[dict[str, Any]] = []
         lock_acquired = False
         queue_started = monotonic()
@@ -263,10 +265,15 @@ class LocalAIToolsClient:
                 lock_acquired = True
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
             if lock_acquired:
-                for name, path in tool_specs:
-                    results.append(
-                        await call_tool(name, path, route_timeout=route_timeout)
+                results = list(
+                    await asyncio.gather(
+                        *(
+                            call_tool(name, path, route_timeout=route_timeout)
+                            for name, path in tool_specs
+                        ),
+                        return_exceptions=True,
                     )
+                )
             else:
                 results.extend(
                     {
@@ -288,8 +295,8 @@ class LocalAIToolsClient:
             "api_base": self._public_api_base(),
             "started_at": started.isoformat(),
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
-            "execution_mode": "sequential_warm_cpu_routes",
-            "batch_budget_policy": "warm_route_budget_with_batch_deadline",
+            "execution_mode": "concurrent_routes_serial_batches",
+            "batch_budget_policy": "shared_batch_deadline_concurrent_routes",
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
@@ -338,7 +345,11 @@ class LocalAIToolsClient:
             data["errors"] = errors
         if deferred_tools and not errors:
             data["status"] = "analysis_budget_deferred"
-        if errors and len(errors) == len(tool_specs) - len(deferred_names):
+        if deferred_tools and len(deferred_tools) == len(tool_specs):
+            # No remote request ran, so this round is neither a service success
+            # nor a service failure and must not alter the circuit breaker.
+            data.update(self._breaker_fields())
+        elif errors and len(errors) == len(tool_specs) - len(deferred_names):
             error_summary = "; ".join(errors.values())
             soft_timeout = all(
                 self._is_soft_timeout_failure(error) for error in errors.values()
