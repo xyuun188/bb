@@ -24,7 +24,7 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["paper_entry_requires_positive_return_lcb"] is True
     assert policy["paper_entry_requires_profit_factor"] is False
     assert policy["paper_entry_requires_positive_expected_net_return"] is True
-    assert policy["paper_entry_requires_independent_quant_family_count"] == 2
+    assert policy["paper_entry_requires_independent_quant_family_count"] == 1
     assert policy["paper_direction_concentration_alert_threshold"] == 0.80
     assert policy["paper_direction_concentration_is_execution_quota"] is False
     assert policy["live_entry_requires_production_trade_gate"] is True

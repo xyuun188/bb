@@ -8,11 +8,10 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-11.paper-model-direction.v6"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-13.paper-model-direction.v7"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
-MIN_PAPER_INDEPENDENT_QUANT_FAMILY_COUNT = 2
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -296,6 +295,9 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "horizon_selection_policy",
             "positive_quant_sources",
             "quant_evidence_families",
+            "quant_family_count",
+            "single_quant_family",
+            "conflicting_quant_families",
             "quant_family_summaries",
             "aligned_expert_count",
             "opposition_expert_count",
@@ -349,6 +351,7 @@ def assess_directional_entry_support(
             if _float(item.get("horizon_minutes")) == prediction_horizon_minutes
         }
         directional_families = []
+        conflicting_families = []
         for item in family_summaries:
             family = str(item.get("family") or "")
             opposite = opposite_by_family.get(family)
@@ -370,12 +373,14 @@ def assess_directional_entry_support(
             item["direction_aligned"] = aligned
             item["opposite_raw_expected_return_pct"] = opposite_raw
             item["opposite_objective_expected_return_pct"] = opposite_objective
-            if (
-                aligned
-                and (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
+            positive_net = bool(
+                (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
                 and (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
-            ):
+            )
+            if aligned and positive_net:
                 directional_families.append(item)
+            elif positive_net:
+                conflicting_families.append(item)
     else:
         directional_families = [
             item
@@ -383,6 +388,7 @@ def assess_directional_entry_support(
             if (_float(item.get("raw_expected_return_pct")) or 0.0) > 0.0
             and (_float(item.get("objective_expected_return_pct")) or 0.0) > 0.0
         ]
+        conflicting_families = []
     quantitative_sources = sorted(
         {
             source
@@ -436,10 +442,14 @@ def assess_directional_entry_support(
         expected_net_return_pct is None or expected_net_return_pct <= 0.0
     ):
         blockers.append("direction_support_expected_net_not_positive")
+    if paper_scope and (
+        objective_net_return_pct is None or objective_net_return_pct <= 0.0
+    ):
+        blockers.append("direction_support_objective_net_not_positive")
     if not quant_families:
         blockers.append("direction_support_quant_evidence_missing")
-    if paper_scope and len(quant_families) < MIN_PAPER_INDEPENDENT_QUANT_FAMILY_COUNT:
-        blockers.append("direction_support_independent_quant_families_insufficient")
+    if paper_scope and conflicting_families:
+        blockers.append("direction_support_quant_family_conflict")
     if prediction_horizon_minutes is None or prediction_horizon_minutes <= 0.0:
         blockers.append("direction_support_prediction_horizon_missing")
     if paper_scope:
@@ -482,6 +492,13 @@ def assess_directional_entry_support(
         "positive_quant_sources": quantitative_sources,
         "quantitative_sources": quantitative_sources,
         "quant_evidence_families": quant_families,
+        "quant_family_count": len(quant_families),
+        "single_quant_family": len(quant_families) == 1,
+        "conflicting_quant_families": sorted(
+            str(item.get("family") or "")
+            for item in conflicting_families
+            if str(item.get("family") or "")
+        ),
         "quant_family_summaries": family_summaries,
         "aligned_expert_count": len(aligned),
         "opposition_expert_count": len(opposition),
@@ -538,16 +555,17 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         expected_net = _float(support.get("expected_net_return_pct"))
         if expected_net is None or expected_net <= 0.0:
             reasons.append("direction_support_expected_net_not_positive")
+        objective_net = _float(support.get("objective_net_return_pct"))
+        if objective_net is None or objective_net <= 0.0:
+            reasons.append("direction_support_objective_net_not_positive")
     if not support.get("quant_evidence_families"):
         reasons.append("direction_support_quant_evidence_missing")
     horizon = _float(support.get("prediction_horizon_minutes"))
     if horizon is None or horizon <= 0.0:
         reasons.append("direction_support_prediction_horizon_missing")
     if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
-        if len(support.get("quant_evidence_families") or []) < (
-            MIN_PAPER_INDEPENDENT_QUANT_FAMILY_COUNT
-        ):
-            reasons.append("direction_support_independent_quant_families_insufficient")
+        if support.get("conflicting_quant_families"):
+            reasons.append("direction_support_quant_family_conflict")
         if support.get("strong_expert_opposition") is True:
             reasons.append("direction_support_strong_expert_opposition")
     else:

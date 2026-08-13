@@ -563,7 +563,7 @@ def test_paper_scoring_horizon_selection_uses_continuous_model_weights() -> None
     ]
 
 
-def test_paper_scoring_keeps_direction_competition_authorized_horizon() -> None:
+def test_paper_scoring_keeps_direction_competition_selected_native_horizon() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}
     profit = _paper_payload(side="short", long_return=-0.2, short_return=1.2)
@@ -577,7 +577,7 @@ def test_paper_scoring_keeps_direction_competition_authorized_horizon() -> None:
     }
     decision.raw_response["direction_competition"] = {
         "authorized_prediction_horizon_minutes": 5,
-        "selected_horizon_minutes": 5,
+        "selected_horizon_minutes": 240,
     }
     strategy = {
         "execution_mode": "paper",
@@ -593,9 +593,9 @@ def test_paper_scoring_keeps_direction_competition_authorized_horizon() -> None:
     _scorer().score_candidate(decision, strategy)
 
     opportunity = decision.raw_response["opportunity_score"]
-    assert opportunity["selected_horizon_minutes"] == 5
+    assert opportunity["selected_horizon_minutes"] == 240
     assert opportunity["horizon_cohort_selection"]["selected_sources"] == [
-        "timeseries"
+        "server_profit"
     ]
 
 

@@ -171,12 +171,12 @@ def test_local_ai_tools_generated_service_requires_api_key_or_loopback() -> None
     assert "Bearer {LOCAL_AI_TOOLS_API_KEY}" in SERVICE_CODE
 
 
-def test_quant_service_smoke_uses_supported_exact_horizon() -> None:
+def test_quant_service_smoke_accepts_governed_native_horizon() -> None:
     command = deploy._remote_smoke_command()
 
     assert "'horizon_minutes': 5" in command
-    assert "timeseries.get('requested_horizon_minutes') == 5" in command
-    assert "exact_requested_horizon_only" in command
+    assert "in timeseries.get('available_horizon_minutes', [])" in command
+    assert "best_governed_lower_quantile_native_horizon" in command
 
 
 def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() -> None:
@@ -640,7 +640,7 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
     )
 
 
-def test_timeseries_uses_exact_requested_horizon_instead_of_larger_return(
+def test_timeseries_selects_best_governed_native_horizon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = ModuleType("local_ai_tools_exact_timeseries_horizon_test")
@@ -722,22 +722,20 @@ def test_timeseries_uses_exact_requested_horizon_instead_of_larger_return(
     )
 
     assert result["available"] is True
-    assert result["best_side"] == "long"
-    assert result["horizon_minutes"] == 5
-    assert result["requested_horizon_minutes"] == 5
-    assert result["horizon_selection_policy"] == "exact_requested_horizon_only"
+    assert result["best_side"] == "short"
+    assert result["horizon_minutes"] == 240
+    assert result["horizon_selection_policy"] == (
+        "best_governed_lower_quantile_native_horizon"
+    )
     assert result["available_horizon_minutes"] == [5, 240]
 
-    unavailable = module.timeseries_predict(
+    different_request = module.timeseries_predict(
         module.FeatureRequest(symbol="BTC/USDT", features={"horizon_minutes": 15})
     )
 
-    assert unavailable["available"] is False
-    assert unavailable["trained"] is True
-    assert unavailable["horizon_minutes"] == 15
-    assert unavailable["prediction_quality"]["reason"] == (
-        "requested_timeseries_horizon_unavailable"
-    )
+    assert different_request["available"] is True
+    assert different_request["best_side"] == "short"
+    assert different_request["horizon_minutes"] == 240
 
 
 def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from threading import get_ident
 from time import monotonic, sleep
@@ -398,7 +397,7 @@ def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> 
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_requests_share_local_ml_primary_horizon(
+async def test_local_ai_tools_requests_keep_native_horizon_selection(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,7 +410,7 @@ async def test_local_ai_tools_requests_share_local_ml_primary_horizon(
         request_timeout: float | None = None,
     ) -> dict[str, Any]:
         del request_timeout
-        requests.append((path, deepcopy(payload)))
+        requests.append((path, dict(payload)))
         return {"available": True, "path": path, "best_side": "hold"}
 
     monkeypatch.setattr(client, "_post", capture)
@@ -421,28 +420,10 @@ async def test_local_ai_tools_requests_share_local_ml_primary_horizon(
     )
 
     assert len(requests) == 3
-    assert all(payload["features"]["horizon_minutes"] == 5.0 for _, payload in requests)
-    assert all(
-        payload["shared_prediction_horizon"]
-        == {
-            "horizon_minutes": 5.0,
-            "source": "local_ml_primary_horizon",
-            "exact_match_required": True,
-            "cross_horizon_return_competition_allowed": False,
-        }
-        for _, payload in requests
-    )
-    assert result["shared_prediction_horizon"]["horizon_minutes"] == 5.0
-
-
-def test_local_ai_tools_shared_horizon_uses_explicit_feature_fallback() -> None:
-    client = LocalAIToolsClient()
-    payload = client._feature_payload({"symbol": "BTC/USDT", "horizon_minutes": 15})
-
-    horizon = client._shared_prediction_horizon(payload, {"predictions": []})
-
-    assert horizon["horizon_minutes"] == 15.0
-    assert horizon["source"] == "explicit_feature_horizon"
+    assert len(requests) == 3
+    assert all(payload["features"]["horizon_minutes"] == 15 for _, payload in requests)
+    assert all("shared_prediction_horizon" not in payload for _, payload in requests)
+    assert "shared_prediction_horizon" not in result
 
 
 def _healthy_paper_observation() -> dict[str, object]:

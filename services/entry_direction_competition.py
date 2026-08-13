@@ -298,7 +298,6 @@ class EntryDirectionCompetitionPolicy:
         if execution_scope == "paper" and not aggregate_blockers:
             horizon_selection = select_paper_horizon_cohort(
                 (item for item in all_rows if item.get("decision_eligible") is True),
-                preferred_horizon_minutes=authorized_horizon,
                 source_weights=quant_weights,
             )
             aggregate_blockers.extend(horizon_selection.get("blockers") or [])
@@ -319,9 +318,6 @@ class EntryDirectionCompetitionPolicy:
         training_rows = [item for item in all_rows if item.get("paper_eligible") is True]
         training_horizon_selection = select_paper_horizon_cohort(
             training_rows,
-            preferred_horizon_minutes=(
-                authorized_horizon if execution_scope == "paper" else None
-            ),
             source_weights=quant_weights,
         )
         training_horizon = _safe_float(
@@ -422,7 +418,7 @@ class EntryDirectionCompetitionPolicy:
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-08-11.shared-horizon-direction-observation.v3",
+                "strategy_version": "2026-08-13.native-horizon-direction-observation.v4",
                 "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }

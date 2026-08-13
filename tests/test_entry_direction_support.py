@@ -48,7 +48,7 @@ def test_governed_candidate_still_requires_positive_objective_evidence() -> None
     assert directional_entry_support_reasons(support, "long") == []
 
 
-def test_correlated_local_ai_tools_outputs_count_as_one_family() -> None:
+def test_single_complete_quant_family_can_authorize_paper_direction() -> None:
     support = assess_paper_model_trade_support(
         {
             "long": {
@@ -71,16 +71,16 @@ def test_correlated_local_ai_tools_outputs_count_as_one_family() -> None:
         execution_cost_pct=0.1,
     )
 
-    assert support["eligible"] is False
+    assert support["eligible"] is True
     assert support["quant_evidence_families"] == ["local_ai_tools"]
+    assert support["quant_family_count"] == 1
+    assert support["single_quant_family"] is True
     assert support["quantitative_sources"] == [
         "sentiment",
         "server_profit",
         "timeseries",
     ]
-    assert "direction_support_independent_quant_families_insufficient" in support[
-        "blocking_reasons"
-    ]
+    assert support["blocking_reasons"] == []
 
 
 def test_all_hold_experts_do_not_block_auditable_paper_model_direction() -> None:
@@ -258,7 +258,7 @@ def test_paper_quantitative_summary_never_averages_different_horizons() -> None:
     assert support["prediction_horizon_minutes"] == 60.0
     assert support["available_prediction_horizons"] == [10.0, 60.0]
     assert support["eligible"] is False
-    assert "direction_support_independent_quant_families_insufficient" in (
+    assert "direction_support_quant_family_conflict" in (
         directional_entry_support_reasons(support, "long")
     )
 
@@ -331,6 +331,48 @@ def test_two_independent_quant_families_must_prefer_the_same_side() -> None:
 
     assert conflicted["eligible"] is False
     assert conflicted["quant_evidence_families"] == ["local_ml"]
-    assert "direction_support_independent_quant_families_insufficient" in conflicted[
+    assert conflicted["conflicting_quant_families"] == ["local_ai_tools"]
+    assert "direction_support_quant_family_conflict" in conflicted[
+        "blocking_reasons"
+    ]
+
+
+def test_v7_single_aligned_family_still_requires_positive_objective_net() -> None:
+    competition = {
+        "selected_horizon_minutes": 5.0,
+        "horizon_cohort_selection": {"selected_horizon_minutes": 5.0},
+        "short": {
+            "evidence": [
+                {
+                    **_row("local_ml", raw=0.37, objective=-0.61),
+                    "horizon_minutes": 5.0,
+                }
+            ]
+        },
+        "long": {
+            "evidence": [
+                {
+                    **_row("local_ml", raw=-0.37, objective=-2.25),
+                    "horizon_minutes": 5.0,
+                }
+            ]
+        },
+    }
+
+    support = assess_paper_model_trade_support(
+        competition,
+        [
+            _opinion("trend", "hold", source_group="llm:shared"),
+            _opinion("risk", "hold", source_group="llm:shared"),
+        ],
+        "short",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is False
+    assert support["expected_net_return_pct"] == pytest.approx(0.27)
+    assert support["objective_net_return_pct"] == pytest.approx(-0.71)
+    assert support["quant_evidence_families"] == []
+    assert "direction_support_objective_net_not_positive" in support[
         "blocking_reasons"
     ]

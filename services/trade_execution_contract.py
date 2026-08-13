@@ -326,7 +326,7 @@ def summarize_trade_execution_contract(
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
-            "paper_entry_requires_independent_quant_family_count": 2,
+            "paper_entry_requires_independent_quant_family_count": 1,
             "paper_direction_concentration_alert_threshold": 0.80,
             "paper_direction_concentration_is_execution_quota": False,
             "live_entry_requires_production_trade_gate": True,

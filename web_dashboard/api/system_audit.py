@@ -787,7 +787,7 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     policy["paper_entry_requires_profit_factor"] = False
     policy["paper_entry_requires_positive_expected_net_return"] = True
     policy["paper_entry_requires_current_execution_cost"] = True
-    policy["paper_entry_requires_independent_quant_family_count"] = 2
+    policy["paper_entry_requires_independent_quant_family_count"] = 1
     policy["paper_direction_concentration_alert_threshold"] = 0.80
     policy["paper_direction_concentration_is_execution_quota"] = False
     policy["live_entry_requires_production_trade_gate"] = True
