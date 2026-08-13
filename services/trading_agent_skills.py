@@ -311,6 +311,11 @@ class TradingAgentSkillBook:
             )
         side = payload_side(profit)
         available = signal_paper_eligibility(profit, side).get("eligible") is True
+        returned = (
+            profit.get("available", True) is not False
+            and not profit.get("error")
+            and bool(profit.get("prediction_quality") or profit.get("return_distribution_contract"))
+        )
         distribution = signal_return_distribution(profit, side)
         expected = self._first_number(
             distribution,
@@ -319,13 +324,15 @@ class TradingAgentSkillBook:
         status = (
             "supported"
             if available and expected is not None and expected > 0
-            else ("warning" if available else "unavailable")
+            else ("warning" if available else "returned_but_governance_blocked" if returned else "unavailable")
         )
         reason = (
             f"服务器盈利模型给出 {side or '中性'}，预期收益 {expected:.4f}%."
             if expected is not None
             else "服务器盈利模型已返回，但没有明确预期收益。"
         )
+        if status == "returned_but_governance_blocked":
+            reason = "链路已返回结果，但当前模型治理条件不允许其影响交易；这不是接口不可用。"
         return SkillResult(
             name="server_profit_model",
             label="服务器盈利预测",
@@ -377,6 +384,11 @@ class TradingAgentSkillBook:
             )
         side = payload_side(series)
         available = signal_paper_eligibility(series, side).get("eligible") is True
+        returned = (
+            series.get("available", True) is not False
+            and not series.get("error")
+            and bool(series.get("prediction_quality") or series.get("return_distribution_contract"))
+        )
         distribution = signal_return_distribution(series, side)
         expected = self._first_number(
             distribution,
@@ -388,7 +400,7 @@ class TradingAgentSkillBook:
             status=(
                 "supported"
                 if available and expected is not None and expected > 0
-                else ("warning" if available else "unavailable")
+                else ("warning" if available else "returned_but_governance_blocked" if returned else "unavailable")
             ),
             decision=side if available and side in {"long", "short"} else "neutral",
             confidence=self._first_number(series, "confidence", "score"),
@@ -437,13 +449,18 @@ class TradingAgentSkillBook:
                 reason="本轮没有拿到情绪模型预测。",
             )
         available = signal_analysis_eligibility(sentiment).get("eligible") is True
+        returned = (
+            sentiment.get("available", True) is not False
+            and not sentiment.get("error")
+            and bool(sentiment.get("model") or sentiment.get("primary_model"))
+        )
         side = payload_side(sentiment)
         score = self._first_number(sentiment, "score", "sentiment_score")
         return SkillResult(
             name="sentiment_model",
             label="情绪预测",
             status=(
-                "supported" if available else "unavailable"
+                "supported" if available else "returned_but_governance_blocked" if returned else "unavailable"
             ),
             decision="neutral",
             confidence=self._first_number(sentiment, "confidence"),

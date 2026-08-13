@@ -20,6 +20,8 @@ from core.url_safety import normalize_http_base_url
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     payload_side,
+    signal_analysis_eligibility,
+    signal_paper_eligibility,
     unwrap_tool_payload,
 )
 from services.model_promotion_policy import (
@@ -70,6 +72,7 @@ class LocalAIToolsClient:
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_base: str = ""
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._inference_active = False
 
     def _request_timeout(self) -> float:
         return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
@@ -153,15 +156,6 @@ class LocalAIToolsClient:
             payload["open_positions"] = self._position_payload(features, open_positions)
         payload = self._json_safe(payload)
         request_timeout = self._request_timeout()
-        completion_reserve = min(
-            _BATCH_COMPLETION_RESERVE_MAX_SECONDS,
-            max(request_timeout * 0.05, 0.01),
-        )
-        batch_deadline = monotonic() + max(
-            request_timeout - completion_reserve,
-            _MIN_INFERENCE_ATTEMPT_SECONDS,
-        )
-
         started = datetime.now(UTC)
         tool_specs = [
             ("profit_prediction", "/profit/predict"),
@@ -171,56 +165,55 @@ class LocalAIToolsClient:
         if include_exit_advice and open_positions:
             tool_specs.append(("exit_advice", "/exit/advise"))
 
+        batch_deadline = monotonic() + max(
+            request_timeout - min(_BATCH_COMPLETION_RESERVE_MAX_SECONDS, max(request_timeout * 0.05, 0.01)),
+            _MIN_INFERENCE_ATTEMPT_SECONDS,
+        )
+        # The configured timeout is a batch budget, not a per-route allowance.
+        # Divide it across the routes so a slow first endpoint cannot consume
+        # the entire market-context deadline before later evidence is tried.
+        route_timeout = max(
+            request_timeout / max(len(tool_specs), 1),
+            _MIN_INFERENCE_ATTEMPT_SECONDS,
+        )
+
         async def call_tool(
             name: str,
             path: str,
             *,
-            remaining_tool_count: int,
+            route_timeout: float,
         ) -> dict[str, Any]:
             tool_started = datetime.now(UTC)
-            remaining_seconds = max(batch_deadline - monotonic(), 0.0)
-            if remaining_seconds < _MIN_INFERENCE_ATTEMPT_SECONDS:
-                return {
-                    "available": False,
-                    "status": "timeout",
-                    "error": "local AI tools batch budget exhausted before request",
-                    "path": path,
-                    "duration_sec": round(
-                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
-                        4,
-                    ),
-                }
-            tool_timeout = min(
-                request_timeout,
-                remaining_seconds / max(int(remaining_tool_count or 0), 1),
-            )
-            if tool_timeout < _MIN_INFERENCE_ATTEMPT_SECONDS:
-                return {
-                    "available": False,
-                    "status": "timeout",
-                    "error": "local AI tools fair-share budget exhausted before request",
-                    "path": path,
-                    "allocated_timeout_sec": round(tool_timeout, 4),
-                    "duration_sec": round(
-                        max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
-                        4,
-                    ),
-                }
             request_task = asyncio.create_task(
-                self._post(path, payload, request_timeout=tool_timeout)
+                self._post(path, payload, request_timeout=route_timeout)
             )
-            done, _pending = await asyncio.wait({request_task}, timeout=tool_timeout)
+            effective_timeout = min(
+                route_timeout,
+                max(batch_deadline - monotonic(), 0.0),
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {request_task}, timeout=effective_timeout
+                )
+            except asyncio.CancelledError:
+                # The outer market deadline can cancel this coroutine while the
+                # HTTP task is still waiting. Always retain a callback that
+                # consumes the eventual exception, otherwise asyncio emits
+                # ``Task exception was never retrieved`` in production logs.
+                if not request_task.done():
+                    request_task.cancel()
+                self._track_background_task(request_task)
+                raise
             if not done:
                 request_task.cancel()
                 self._track_background_task(request_task)
-                connection_reset = await self._reset_http_client()
                 return {
                     "available": False,
                     "status": "timeout",
-                    "error": "server quant tool exceeded the remaining batch budget",
+                    "error": "server quant tool route timeout",
                     "path": path,
-                    "allocated_timeout_sec": round(tool_timeout, 4),
-                    "http_connection_reset": connection_reset,
+                    "allocated_timeout_sec": round(effective_timeout, 4),
+                    "http_connection_reset": False,
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
@@ -234,7 +227,7 @@ class LocalAIToolsClient:
                     "status": "error",
                     "error": safe_error_text(exc, limit=180),
                     "path": path,
-                    "allocated_timeout_sec": round(tool_timeout, 4),
+                    "allocated_timeout_sec": round(effective_timeout, 4),
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
@@ -244,47 +237,42 @@ class LocalAIToolsClient:
             item.setdefault("available", True)
             item.setdefault("status", "returned")
             item.setdefault("path", path)
-            item["allocated_timeout_sec"] = round(tool_timeout, 4)
+            item["allocated_timeout_sec"] = round(effective_timeout, 4)
             item["duration_sec"] = round(
                 max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                 4,
             )
             return item
 
-        # The model server runs these CPU-heavy routes in one process. Running
-        # them concurrently increases total latency enough to exhaust the market
-        # analysis deadline. Serialize both batches and routes, and let every
-        # later route use only the remaining batch budget so completed evidence
-        # survives a slow child model.
+        # The model server is CPU-bound and has one effective inference worker.
+        # Keep routes serial within one batch, but give each route a warm-service
+        # budget larger than the old fair-share slice. Startup prewarming removes
+        # the cold-load spike that previously made the first route consume it.
         results: list[dict[str, Any]] = []
         lock_acquired = False
         queue_started = monotonic()
         queue_wait_seconds = 0.0
         try:
-            lock_timeout = max(batch_deadline - monotonic(), 0.0)
-            if lock_timeout >= _MIN_INFERENCE_ATTEMPT_SECONDS:
-                try:
-                    await asyncio.wait_for(self._inference_lock.acquire(), timeout=lock_timeout)
-                    lock_acquired = True
-                except TimeoutError:
-                    pass
+            # Never queue a whole market round behind another batch. A queued
+            # asyncio.Lock can outlive the caller's deadline when the event loop
+            # is busy, which used to produce 50-60 second "unavailable" records.
+            # The next scheduled round will retry the deferred batch.
+            if not self._inference_active and not self._inference_lock.locked():
+                self._inference_active = True
+                await self._inference_lock.acquire()
+                lock_acquired = True
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
             if lock_acquired:
-                tool_count = len(tool_specs)
-                for index, (name, path) in enumerate(tool_specs):
+                for name, path in tool_specs:
                     results.append(
-                        await call_tool(
-                            name,
-                            path,
-                            remaining_tool_count=tool_count - index,
-                        )
+                        await call_tool(name, path, route_timeout=route_timeout)
                     )
             else:
                 results.extend(
                     {
                         "available": False,
-                        "status": "timeout",
-                        "error": "local AI tools inference queue exhausted the batch budget",
+                        "status": "deferred",
+                        "error": "local AI tools inference already in progress",
                         "path": path,
                         "duration_sec": 0.0001,
                     }
@@ -293,25 +281,29 @@ class LocalAIToolsClient:
         finally:
             if lock_acquired:
                 self._inference_lock.release()
+                self._inference_active = False
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
             "api_base": self._public_api_base(),
             "started_at": started.isoformat(),
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
-            "execution_mode": "sequential_cpu_bound",
-            "batch_budget_policy": "remaining_budget_fair_share_with_carry_forward",
+            "execution_mode": "sequential_warm_cpu_routes",
+            "batch_budget_policy": "warm_route_budget_with_batch_deadline",
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
         errors: dict[str, str] = {}
+        deferred_names: set[str] = set()
         for (name, _path), item in zip(tool_specs, results, strict=False):
             if isinstance(item, Exception):
                 error = safe_error_text(item, limit=180)
                 errors[name] = error
                 data[name] = {"available": False, "status": "error", "error": error}
             else:
-                if item.get("status") == "error" or item.get("available") is False:
+                if item.get("status") == "deferred":
+                    deferred_names.add(name)
+                elif item.get("status") == "error" or item.get("available") is False:
                     errors[name] = safe_error_text(
                         item.get("error"),
                         limit=180,
@@ -323,6 +315,14 @@ class LocalAIToolsClient:
             for name, error in errors.items()
             if self._is_soft_timeout_failure(error)
         )
+        deferred_tools = sorted(
+            name
+            for (name, _path), item in zip(tool_specs, results, strict=False)
+            if isinstance(item, dict) and item.get("status") == "deferred"
+        )
+        if deferred_tools and not errors:
+            data["status"] = "analysis_budget_deferred"
+            data["deferred_tools"] = deferred_tools
         if soft_timeout_tools:
             data["soft_timeout"] = True
             data["soft_timeout_tools"] = soft_timeout_tools
@@ -336,7 +336,9 @@ class LocalAIToolsClient:
         if errors:
             data["status"] = "partial" if len(errors) < len(tool_specs) else "unavailable"
             data["errors"] = errors
-        if errors and len(errors) == len(tool_specs):
+        if deferred_tools and not errors:
+            data["status"] = "analysis_budget_deferred"
+        if errors and len(errors) == len(tool_specs) - len(deferred_names):
             error_summary = "; ".join(errors.values())
             soft_timeout = all(
                 self._is_soft_timeout_failure(error) for error in errors.values()
@@ -395,6 +397,21 @@ class LocalAIToolsClient:
             normalized["action_label"] = "继续观察"
             normalized["reason"] = "本地退出模型仅提供观察画像，生产平仓由动态退出契约独占。"
             normalized["production_permission"] = False
+        governance = (
+            signal_analysis_eligibility(normalized)
+            if name == "sentiment_analysis"
+            else signal_paper_eligibility(normalized, payload_side(normalized))
+            if name in {"profit_prediction", "time_series_prediction"}
+            else {"eligible": True}
+        )
+        if (
+            normalized.get("available", True) is not False
+            and governance.get("eligible") is not True
+        ):
+            normalized["governance_status"] = "returned_but_governance_blocked"
+            normalized["governance_reason"] = str(
+                governance.get("reason") or "model_governance_blocks_influence"
+            )
         return self._attach_model_metadata(name, normalized)
 
     def _attach_return_distribution_contract(
@@ -947,12 +964,30 @@ class LocalAIToolsClient:
         payload: dict[str, Any],
         request_timeout: float | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._post_sync,
-            path,
-            payload,
-            request_timeout,
-        )
+        # Inference requests must be cancellable. A synchronous httpx call in
+        # asyncio.to_thread keeps running after task.cancel(), piling up stale
+        # requests while the trading loop has already moved on. Training is a
+        # deliberately long-lived operation and retains the isolated sync path.
+        if path == "/train":
+            return await asyncio.to_thread(
+                self._post_sync,
+                path,
+                payload,
+                request_timeout,
+            )
+        base = self._api_base()
+        try:
+            client = await self._shared_http_client(base)
+            response = await client.post(
+                f"{base}{path}",
+                json=payload,
+                headers=self._auth_headers(),
+                timeout=request_timeout or self._timeout,
+            )
+        except httpx.RequestError as exc:
+            await self._reset_http_client()
+            raise RuntimeError(self._request_error_message(exc)) from exc
+        return self._parse_response(response, path)
 
     def _post_sync(
         self,

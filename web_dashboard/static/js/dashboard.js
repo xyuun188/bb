@@ -1421,6 +1421,9 @@ function riskAlertSeverity(event) {
 
 function riskAlertTypeLabel(type) {
     const labels = {
+        specialist_shadow_inference: '\u5df2\u8fd4\u56de\uff08\u89c2\u5bdf\u6001\uff09',
+        shadow_observation: '\u5df2\u8fd4\u56de\uff08\u89c2\u5bdf\u6001\uff09',
+        trained_calibrator: '\u5df2\u8fd4\u56de\uff08\u6821\u51c6\u6001\uff09',
         position_review_warning: '持仓复盘预警',
         risk_alert: '风险告警',
         circuit_breaker: '风险熔断',
@@ -2783,6 +2786,7 @@ function analysisTimingStatusLabel(status) {
         completed: '完成',
         skipped: '跳过',
         failed: '失败',
+        returned_but_governance_blocked: '已返回（治理不可交易）',
         invalid: '无效',
         batch_fallback: '批量回退',
         partial_batch_fallback: '批量缺失',
@@ -3139,6 +3143,9 @@ function analysisToolAvailable(payload) {
 
 function analysisToolPlainStatus(payload) {
     if (!payload || typeof payload !== 'object' || !Object.keys(payload).length) return '未返回';
+    if (String(payload.governance_status || '').toLowerCase() === 'returned_but_governance_blocked') {
+        return '已返回（治理不可交易）';
+    }
     const status = String(payload.status || '').toLowerCase();
     const labels = {
         returned: '已返回',
@@ -3155,6 +3162,9 @@ function analysisToolPlainStatus(payload) {
         circuit_open: '熔断中',
         failed: '失败',
     };
+    labels.specialist_shadow_inference = '\u5df2\u8fd4\u56de\uff08\u89c2\u5bdf\u6001\uff09';
+    labels.shadow_observation = '\u5df2\u8fd4\u56de\uff08\u89c2\u5bdf\u6001\uff09';
+    labels.trained_calibrator = '\u5df2\u8fd4\u56de\uff08\u6821\u51c6\u6001\uff09';
     if (status && labels[status]) return labels[status];
     if (payload.trained === false) return '学习中';
     if (payload.model || payload.backend || payload.available === true || payload.ok === true) return '已返回';
@@ -3175,10 +3185,19 @@ function analysisToolStatus(payload) {
     if (!payload || typeof payload !== 'object' || !Object.keys(payload).length) {
         return analysisPill('未返回', 'warn');
     }
+    if (String(payload.governance_status || '').toLowerCase() === 'returned_but_governance_blocked') {
+        return analysisPill('已返回（治理不可交易）', 'muted');
+    }
     if (!analysisToolAvailable(payload)) {
         return analysisPill(analysisToolPlainStatus(payload), 'warn');
     }
-    return analysisPill(analysisToolPlainStatus(payload), payload.trained === false ? 'warn' : 'good');
+    const observationOnly = payload.production_permission === false
+        || ['specialist_shadow_inference', 'shadow_observation', 'trained_calibrator']
+            .includes(String(payload.status || '').toLowerCase());
+    return analysisPill(
+        analysisToolPlainStatus(payload),
+        observationOnly ? 'muted' : payload.trained === false ? 'warn' : 'good',
+    );
 }
 
 function analysisLocalToolsRunStatus(status) {
@@ -3414,6 +3433,10 @@ function analysisMissingExpertReason(missing, record) {
     const ensembleTimedOut = missing?.status === 'ensemble_timeout'
         || skipKind === 'ensemble_timeout'
         || record?.expert_call_status?.timed_out === true;
+
+    if (missing?.status === 'called_timeout') {
+        return `${label} 已发起调用，但在本轮截止时间内未返回；这不是“未调用”，系统已保留本轮超时记录。`;
+    }
 
     if (ensembleTimedOut) {
         const timeoutReason = rawReason
@@ -3769,12 +3792,13 @@ function renderAnalysisReasonModal(record) {
         const reason = analysisMissingExpertReason(e, record);
         const ensembleTimedOut = e?.status === 'ensemble_timeout'
             || record?.expert_call_status?.kind === 'ensemble_timeout';
-        const notCalled = !ensembleTimedOut && (
+        const calledTimeout = e?.status === 'called_timeout';
+        const notCalled = !ensembleTimedOut && !calledTimeout && (
             !Array.isArray(record.attempted_experts)
             || !record.attempted_experts.map(String).includes(String(e.expert_name || ''))
         );
-        const pillText = notCalled ? '未调用' : '未返回';
-        const pillTone = 'bad';
+        const pillText = calledTimeout ? '已调用未返回' : notCalled ? '未调用' : '未返回';
+        const pillTone = calledTimeout ? 'warn' : 'bad';
         return `  
         <div class="analysis-card analysis-card-warning">  
             <div class="analysis-card-head">

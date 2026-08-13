@@ -7895,6 +7895,8 @@ async def get_analysis_records(
                     if pre_expert_skip.get("skipped")
                     else "ensemble_timeout"
                     if ensemble_timed_out
+                    else "called_timeout"
+                    if e["expert_name"] in attempted_names
                     else "missing"
                 ),
                 "skip_kind": pre_expert_skip.get("kind") or "",

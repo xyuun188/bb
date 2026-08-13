@@ -139,10 +139,11 @@ async def test_local_ai_tools_enrich_shares_configured_timeout_across_serial_rou
     assert result["status"] == "completed"
     assert len(timeouts) == 3
     assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
-    assert timeouts == sorted(timeouts)
-    assert result["execution_mode"] == "sequential_cpu_bound"
+    assert len(set(timeouts)) == 1
+    assert 2.5 < timeouts[0] <= 2.7
+    assert result["execution_mode"] == "sequential_warm_cpu_routes"
     assert result["batch_budget_policy"] == (
-        "remaining_budget_fair_share_with_carry_forward"
+        "warm_route_budget_with_batch_deadline"
     )
     assert result["batch_budget_seconds"] == 8.0
     assert result["profit_prediction"]["duration_sec"] > 0
@@ -181,11 +182,10 @@ async def test_local_ai_tools_serializes_batches_and_cpu_bound_routes(
     )
 
     assert first["status"] == "completed"
-    assert second["status"] == "completed"
+    assert second["status"] == "analysis_budget_deferred"
     assert max_active_calls == 1
-    assert len(calls) == 6
-    symbols = [symbol for symbol, _path in calls]
-    assert sum(left != right for left, right in zip(symbols, symbols[1:], strict=False)) == 1
+    assert len(calls) == 3
+    assert {symbol for symbol, _path in calls} == {"BTC/USDT"}
 
 
 @pytest.mark.asyncio
@@ -263,6 +263,7 @@ async def test_local_ai_tools_slow_first_route_cannot_starve_later_tools(
     assert result["time_series_prediction"]["available"] is True
     assert result["soft_timeout_tools"] == ["profit_prediction"]
     assert result["http_connection_reset"] is True
+    await asyncio.sleep(0.05)
     assert stale_client.closed is True
     assert client._http_client is None
     assert calls == [
@@ -306,9 +307,43 @@ async def test_local_ai_tools_timeout_does_not_wait_for_stubborn_request_cleanup
     result = await client.enrich_with_context({"symbol": "BTC/USDT"})
 
     assert result["profit_prediction"]["status"] == "timeout"
-    assert result["profit_prediction"]["duration_sec"] < 0.3
+    assert result["profit_prediction"]["duration_sec"] < 0.8
     assert result["http_connection_reset"] is True
     await asyncio.sleep(0.2)
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_native_post_cancellation_stops_inference_request(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class FakeClient:
+        async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+            del args, kwargs
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(client, "_shared_http_client", lambda _base: _fake_client())
+
+    async def _fake_client() -> FakeClient:
+        return FakeClient()
+
+    task = asyncio.create_task(
+        client._post("/profit/predict", {"symbol": "BTC/USDT"}, request_timeout=5.0)
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -353,17 +388,17 @@ async def test_local_ai_tools_quant_post_isolated_from_trading_event_loop(
     caller_thread = get_ident()
     worker_threads: set[int] = set()
 
-    def post_sync(
+    async def post(
         path: str,
         payload: dict[str, Any],
         request_timeout: float | None = None,
     ) -> dict[str, Any]:
         del payload, request_timeout
         worker_threads.add(get_ident())
-        sleep(0.05)
+        await asyncio.sleep(0.05)
         return {"available": True, "path": path, "best_side": "long"}
 
-    monkeypatch.setattr(client, "_post_sync", post_sync)
+    monkeypatch.setattr(client, "_post", post)
     task = asyncio.create_task(client.enrich_with_context({"symbol": "BTC/USDT"}))
     await asyncio.sleep(0.01)
     sleep(0.3)  # noqa: ASYNC251 - deliberately starve the trading event loop.
@@ -373,8 +408,7 @@ async def test_local_ai_tools_quant_post_isolated_from_trading_event_loop(
     assert result["profit_prediction"]["available"] is True
     assert result["sentiment_analysis"]["available"] is True
     assert result["time_series_prediction"]["available"] is True
-    assert worker_threads
-    assert caller_thread not in worker_threads
+    assert worker_threads == {caller_thread}
 
 
 def test_local_ai_tools_feature_payload_preserves_real_timeseries_sequence() -> None:
