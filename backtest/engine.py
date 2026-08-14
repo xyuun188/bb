@@ -6,13 +6,144 @@ Uses Backtrader for event-driven backtesting with historical data.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Mapping
+from datetime import UTC
 from typing import Any
 
 import backtrader as bt
 import pandas as pd
 import structlog
 
+from core.strategy_contracts import (
+    PositionSide,
+    StrategyAction,
+    StrategyContext,
+    StrategyContractError,
+    StrategyDecision,
+    assert_decision_matches_context,
+)
+from services.strategy_contract_adapter import context_from_historical_bar
+
 logger = structlog.get_logger(__name__)
+
+
+class StandardContractBacktestStrategy(bt.Strategy):
+    """Backtrader execution adapter for a pure ``StrategyDecision`` provider.
+
+    The provider is the only strategy logic. This class translates its decision
+    into simulated fills and never talks to an exchange or production state.
+    """
+
+    params = dict(
+        decision_provider=None,
+        feature_provider=None,
+        symbol="",
+        timeframe="1h",
+        strategy_identity={},
+        parameters={},
+        account_constraints={},
+        execution_assumptions={},
+    )
+
+    def __init__(self):
+        if not callable(self.p.decision_provider):
+            raise StrategyContractError("decision_provider must be callable")
+        self.order = None
+        self.decision_records: list[dict[str, Any]] = []
+
+    def next(self):
+        if self.order:
+            return
+        price = float(self.data.close[0])
+        if not math.isfinite(price) or price <= 0:
+            return
+        timestamp = bt.num2date(self.data.datetime[0])
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        bar = {
+            "open": float(self.data.open[0]),
+            "high": float(self.data.high[0]),
+            "low": float(self.data.low[0]),
+            "close": price,
+            "volume": float(self.data.volume[0]),
+        }
+        feature_provider = self.p.feature_provider
+        features = feature_provider(self, bar) if callable(feature_provider) else {}
+        context = context_from_historical_bar(
+            symbol=str(self.p.symbol or ""),
+            timestamp=timestamp,
+            timeframe=str(self.p.timeframe or "1h"),
+            bar=bar,
+            feature_snapshot=features if isinstance(features, Mapping) else {},
+            strategy=dict(self.p.strategy_identity or {}),
+            parameters=dict(self.p.parameters or {}),
+            position_snapshot=self._position_snapshot(price),
+            account_constraints=dict(self.p.account_constraints or {}),
+            execution_assumptions=dict(self.p.execution_assumptions or {}),
+        )
+        decision = self.p.decision_provider(context)
+        if not isinstance(decision, StrategyDecision):
+            raise StrategyContractError("decision_provider must return StrategyDecision")
+        assert_decision_matches_context(context, decision)
+        self.decision_records.append(
+            {
+                "context_sha256": context.context_sha256,
+                "strategy_input_sha256": context.strategy_input_sha256,
+                "decision_sha256": decision.decision_sha256,
+                "decision": decision.to_dict(),
+            }
+        )
+        self._execute_decision(decision, price)
+
+    def _position_snapshot(self, price: float) -> dict[str, Any]:
+        size = float(self.position.size)
+        side = "long" if size > 0 else "short" if size < 0 else "none"
+        account_value = float(self.broker.getvalue())
+        exposure = abs(size * price) / account_value if account_value > 0 else 0.0
+        return {
+            "side": side,
+            "size": size,
+            "average_price": float(self.position.price or 0.0),
+            "exposure": exposure,
+        }
+
+    def _execute_decision(self, decision: StrategyDecision, price: float) -> None:
+        if decision.action == StrategyAction.ENTER:
+            if self.position:
+                return
+            account_value = max(float(self.broker.getvalue()), 0.0)
+            size = account_value * decision.target_exposure / price
+            if size <= 0:
+                return
+            self.order = self.buy(size=size) if decision.side == PositionSide.LONG else self.sell(size=size)
+            return
+        if decision.action == StrategyAction.EXIT:
+            if not self.position or not self._side_matches(decision.side):
+                return
+            self.order = self.close()
+            return
+        if decision.action == StrategyAction.REDUCE:
+            if not self.position or not self._side_matches(decision.side):
+                return
+            account_value = max(float(self.broker.getvalue()), 0.0)
+            desired_size = account_value * decision.target_exposure / price
+            reduction = max(abs(float(self.position.size)) - desired_size, 0.0)
+            if reduction <= 0:
+                return
+            self.order = (
+                self.sell(size=reduction)
+                if self.position.size > 0
+                else self.buy(size=reduction)
+            )
+
+    def _side_matches(self, side: PositionSide) -> bool:
+        return (self.position.size > 0 and side == PositionSide.LONG) or (
+            self.position.size < 0 and side == PositionSide.SHORT
+        )
+
+    def notify_order(self, order):
+        if order.status in {order.Completed, order.Canceled, order.Margin, order.Rejected}:
+            self.order = None
 
 
 class AITradingStrategy(bt.Strategy):
@@ -144,6 +275,39 @@ class BacktestEngine:
     def add_strategy(self, strategy_class=AITradingStrategy, **params):
         self.cerebro.addstrategy(strategy_class, **params)
 
+    def add_contract_strategy(
+        self,
+        decision_provider: Callable[[StrategyContext], StrategyDecision],
+        *,
+        symbol: str,
+        timeframe: str = "1h",
+        strategy: Mapping[str, Any],
+        parameters: Mapping[str, Any],
+        account_constraints: Mapping[str, Any] | None = None,
+        execution_assumptions: Mapping[str, Any] | None = None,
+        feature_provider: Callable[[Any, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    ) -> None:
+        """Install the standard contract adapter without replacing the legacy strategy."""
+
+        assumptions = {
+            "commission_rate": self.commission_rate,
+            "slippage_rate": self.slippage_rate,
+            "fill_model": "backtrader_next_bar",
+            "random_seed": self.random_seed,
+            **dict(execution_assumptions or {}),
+        }
+        self.cerebro.addstrategy(
+            StandardContractBacktestStrategy,
+            decision_provider=decision_provider,
+            feature_provider=feature_provider,
+            symbol=symbol,
+            timeframe=timeframe,
+            strategy_identity=dict(strategy),
+            parameters=dict(parameters),
+            account_constraints=dict(account_constraints or {}),
+            execution_assumptions=assumptions,
+        )
+
     def add_analyzer(self):
         if self._analyzers_added:
             return
@@ -173,7 +337,7 @@ class BacktestEngine:
         gross_loss = abs(float(trades.get("lost", {}).get("pnl", {}).get("total", 0) or 0))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-        return {
+        result = {
             "runner_version": self.RUNNER_VERSION,
             "initial_cash": self.initial_cash,
             "final_value": round(final_value, 2),
@@ -191,3 +355,11 @@ class BacktestEngine:
             "slippage_rate": self.slippage_rate,
             "random_seed": self.random_seed,
         }
+        records = getattr(strategy, "decision_records", None)
+        if isinstance(records, list):
+            result["strategy_contract"] = {
+                "contract_version": "bb.strategy-decision.v1",
+                "decision_count": len(records),
+                "decision_sha256": [record["decision_sha256"] for record in records],
+            }
+        return result

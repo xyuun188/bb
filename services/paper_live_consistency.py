@@ -7,6 +7,8 @@ import json
 import math
 from typing import Any
 
+from core.strategy_contracts import StrategyContext, StrategyDecision
+
 PAPER_LIVE_PARITY_CONTRACT_VERSION = "2026-07-19.paper-live-decision-parity.v1"
 PARITY_FIELDS = (
     "model_name",
@@ -118,4 +120,79 @@ def assert_paper_live_decision_parity(
         if not report["strategy_fingerprint_match"]:
             reasons.append("strategy_fingerprint_mismatch_or_missing")
         raise ValueError("paper/live parity contract failed: " + ",".join(reasons))
+    return report
+
+
+def compare_strategy_context_decisions(
+    paper_context: StrategyContext,
+    paper_decision: StrategyDecision,
+    live_context: StrategyContext,
+    live_decision: StrategyDecision,
+) -> dict[str, Any]:
+    """Compare pure decisions while allowing mode-specific execution assumptions."""
+
+    for context in (paper_context, live_context):
+        if not isinstance(context, StrategyContext):
+            raise TypeError("strategy parity requires StrategyContext instances")
+    for decision in (paper_decision, live_decision):
+        if not isinstance(decision, StrategyDecision):
+            raise TypeError("strategy parity requires StrategyDecision instances")
+
+    paper_semantics = paper_decision.semantics()
+    live_semantics = live_decision.semantics()
+    decision_differences = {
+        field: {"paper": paper_semantics[field], "live": live_semantics[field]}
+        for field in paper_semantics
+        if paper_semantics[field] != live_semantics[field]
+    }
+    context_input_match = (
+        paper_context.strategy_input_sha256 == live_context.strategy_input_sha256
+    )
+    execution_differences = {
+        field: {
+            "paper": paper_context.to_dict(False)["execution_assumptions"].get(field),
+            "live": live_context.to_dict(False)["execution_assumptions"].get(field),
+        }
+        for field in set(paper_context.execution_assumptions)
+        | set(live_context.execution_assumptions)
+        if paper_context.to_dict(False)["execution_assumptions"].get(field)
+        != live_context.to_dict(False)["execution_assumptions"].get(field)
+    }
+    mode_difference = paper_context.execution_mode.value != live_context.execution_mode.value
+    return {
+        "contract_version": "bb.strategy-context-parity.v1",
+        "ok": context_input_match and not decision_differences,
+        "context_input_match": context_input_match,
+        "decision_fields_match": not decision_differences,
+        "execution_mode_difference_allowed": mode_difference,
+        "execution_assumption_differences": execution_differences,
+        "decision_differences": decision_differences,
+        "paper_strategy_input_sha256": paper_context.strategy_input_sha256,
+        "live_strategy_input_sha256": live_context.strategy_input_sha256,
+        "paper_decision": paper_semantics,
+        "live_decision": live_semantics,
+        "paper_decision_sha256": paper_decision.decision_sha256,
+        "live_decision_sha256": live_decision.decision_sha256,
+    }
+
+
+def assert_strategy_context_decision_parity(
+    paper_context: StrategyContext,
+    paper_decision: StrategyDecision,
+    live_context: StrategyContext,
+    live_decision: StrategyDecision,
+) -> dict[str, Any]:
+    report = compare_strategy_context_decisions(
+        paper_context,
+        paper_decision,
+        live_context,
+        live_decision,
+    )
+    if not report["ok"]:
+        reasons = []
+        if not report["context_input_match"]:
+            reasons.append("strategy_input_mismatch")
+        if not report["decision_fields_match"]:
+            reasons.append("strategy_decision_mismatch")
+        raise ValueError("strategy context parity contract failed: " + ",".join(reasons))
     return report
