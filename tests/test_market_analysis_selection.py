@@ -54,7 +54,7 @@ def test_fresh_candidates_keep_advantage_order() -> None:
     assert result.diagnostics["is_entry_gate"] is False
 
 
-def test_unchanged_recent_candidates_are_penalized_without_being_banned() -> None:
+def test_unchanged_recent_candidates_are_excluded_when_fresh_alternatives_exist() -> None:
     now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
     policy = _policy(unchanged_repeat_penalty_ratio=0.35)
     repeated = _feature("BTC/USDT", 20.0)
@@ -68,11 +68,14 @@ def test_unchanged_recent_candidates_are_penalized_without_being_banned() -> Non
 
     result = policy.select(candidates, 3, now=now)
 
-    assert list(result.selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    btc = next(row for row in result.diagnostics["selected"] if row["symbol"] == "BTC/USDT")
+    assert list(result.selected) == ["ETH/USDT", "SOL/USDT", "DOGE/USDT"]
+    btc = next(
+        row for row in result.diagnostics["candidate_sample"] if row["symbol"] == "BTC/USDT"
+    )
     assert btc["selection_status"] == "recent_unchanged_penalty"
     assert btc["repeat_penalty"] == 7.0
     assert btc["evaluation_score"] == 13.0
+    assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
 
 
 def test_coverage_capacity_replaces_lower_value_unchanged_repeat() -> None:
@@ -92,10 +95,10 @@ def test_coverage_capacity_replaces_lower_value_unchanged_repeat() -> None:
 
     result = policy.select(candidates, 3, now=now)
 
-    assert list(result.selected) == ["SOL/USDT", "DOGE/USDT", "BTC/USDT"]
+    assert list(result.selected) == ["SOL/USDT", "DOGE/USDT"]
     assert result.diagnostics["coverage_selected_symbols"] == ["DOGE/USDT"]
-    assert result.diagnostics["advantage_selected_symbols"] == ["SOL/USDT", "BTC/USDT"]
-    assert result.diagnostics["skipped_symbols"] == ["ETH/USDT"]
+    assert result.diagnostics["advantage_selected_symbols"] == ["SOL/USDT"]
+    assert result.diagnostics["skipped_symbols"] == ["BTC/USDT", "ETH/USDT"]
     assert result.diagnostics["recent_unchanged_candidate_count"] == 2
 
 
@@ -147,7 +150,7 @@ def test_overdue_coverage_displaces_a_recent_repeat_without_changing_entry_permi
         now=now,
     )
 
-    assert list(result.selected) == ["BTC/USDT", "SOL/USDT"]
+    assert list(result.selected) == ["SOL/USDT"]
     assert result.diagnostics["coverage_selected_symbols"] == ["SOL/USDT"]
     assert result.diagnostics["coverage_due_symbols"] == ["SOL/USDT"]
     assert result.diagnostics["coverage_due_unselected_count"] == 0
@@ -173,14 +176,14 @@ def test_single_slot_rounds_periodically_cover_overdue_candidate() -> None:
     second = policy.select(candidates, 1, now=now)
     third = policy.select(candidates, 1, now=now)
 
-    assert list(first.selected) == ["BTC/USDT"]
-    assert list(second.selected) == ["BTC/USDT"]
+    assert list(first.selected) == ["SOL/USDT"]
+    assert list(second.selected) == ["SOL/USDT"]
     assert list(third.selected) == ["SOL/USDT"]
-    assert first.diagnostics["coverage_due_unselected_symbols"] == ["SOL/USDT"]
+    assert first.diagnostics["coverage_due_unselected_symbols"] == []
     assert third.diagnostics["coverage_selected_symbols"] == ["SOL/USDT"]
 
 
-def test_all_recent_candidates_still_produce_a_shortlist() -> None:
+def test_all_recent_unchanged_candidates_are_held_out_during_cooldown() -> None:
     now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
     policy = _policy()
     candidates = {
@@ -192,9 +195,31 @@ def test_all_recent_candidates_still_produce_a_shortlist() -> None:
 
     result = policy.select(candidates, 2, now=now)
 
-    assert list(result.selected) == ["BTC/USDT", "ETH/USDT"]
-    assert result.diagnostics["selected_count"] == 2
-    assert result.diagnostics["skipped_count"] == 0
+    assert list(result.selected) == []
+    assert result.diagnostics["selected_count"] == 0
+    assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT", "ETH/USDT"]
+    assert result.diagnostics["cooldown_underfilled"] is True
+    assert result.diagnostics["skipped_count"] == 2
+
+
+def test_recent_unchanged_candidate_cannot_fill_budget_over_fresh_candidate() -> None:
+    now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
+    policy = _policy()
+    repeated = _feature("BTC/USDT", 100.0)
+    policy.remember("BTC/USDT", repeated, observed_at=now - timedelta(seconds=30))
+
+    result = policy.select(
+        {
+            "BTC/USDT": repeated,
+            "ETH/USDT": _feature("ETH/USDT", 1.0),
+        },
+        2,
+        now=now,
+    )
+
+    assert list(result.selected) == ["ETH/USDT"]
+    assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
+    assert result.diagnostics["cooldown_underfilled"] is True
 
 
 def test_candidate_pool_expands_before_final_expert_limit() -> None:

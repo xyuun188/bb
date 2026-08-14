@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-07-26.advantage-coverage-market-analysis.v3"
+    VERSION = "2026-08-14.advantage-coverage-market-analysis.v4"
 
     def __init__(
         self,
@@ -128,14 +128,23 @@ class MarketAnalysisSelectionPolicy:
             reverse=True,
         )
 
+        # A repeat penalty is useful for ranking, but it must not be undone by
+        # the old fallback fill when the candidate pool is smaller than the
+        # requested budget.  Keep unchanged recent symbols out of this round
+        # instead of reintroducing them through fallback fill.  Recent symbols
+        # with a material change remain eligible as an explicit emergency
+        # re-review path.
+        cooldown_excluded = [row for row in ranked if bool(row["recent_unchanged"])]
+        eligible_ranked = [row for row in ranked if not bool(row["recent_unchanged"])]
+
         self._selection_round += 1
-        coverage_candidates = [row for row in ranked if bool(row["coverage_due"])]
+        coverage_candidates = [row for row in eligible_ranked if bool(row["coverage_due"])]
         coverage_slots = self._coverage_slot_count(
             final_limit,
             has_coverage_candidates=bool(coverage_candidates),
         )
         advantage_slots = final_limit - coverage_slots
-        selected_rows = ranked[:advantage_slots]
+        selected_rows = eligible_ranked[:advantage_slots]
         for row in selected_rows:
             row["selection_role"] = "advantage"
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
@@ -168,7 +177,7 @@ class MarketAnalysisSelectionPolicy:
             advantage_assigned = sum(
                 row.get("selection_role") == "advantage" for row in selected_rows
             )
-            for row in ranked:
+            for row in eligible_ranked:
                 if str(row["symbol_key"]) in selected_keys:
                     continue
                 if advantage_assigned < advantage_slots:
@@ -182,7 +191,13 @@ class MarketAnalysisSelectionPolicy:
                     break
 
         selected = {str(row["symbol"]): row["feature"] for row in selected_rows}
-        diagnostics = self._diagnostics(rows, selected_rows, final_limit, selected_at)
+        diagnostics = self._diagnostics(
+            rows,
+            selected_rows,
+            final_limit,
+            selected_at,
+            cooldown_excluded=cooldown_excluded,
+        )
         return MarketAnalysisSelectionResult(selected=selected, diagnostics=diagnostics)
 
     def _coverage_slot_count(
@@ -330,7 +345,10 @@ class MarketAnalysisSelectionPolicy:
         selected_rows: list[dict[str, Any]],
         final_limit: int,
         selected_at: datetime,
+        *,
+        cooldown_excluded: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        cooldown_excluded = list(cooldown_excluded or [])
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
         coverage_due_rows = [row for row in rows if bool(row["coverage_due"])]
         coverage_due_unselected = [
@@ -356,6 +374,13 @@ class MarketAnalysisSelectionPolicy:
             "final_limit": int(final_limit),
             "selected_count": len(selected_rows),
             "selected_symbols": [str(row["symbol"]) for row in selected_rows],
+            "cooldown_excluded_count": len(cooldown_excluded),
+            "cooldown_excluded_symbols": [
+                str(row["symbol"]) for row in cooldown_excluded
+            ],
+            "cooldown_underfilled": bool(
+                cooldown_excluded and len(selected_rows) < final_limit
+            ),
             "selected": selected_details,
             "cooldown_seconds": int(self.params.cooldown_seconds),
             "unchanged_repeat_penalty_ratio": round(
@@ -404,9 +429,10 @@ class MarketAnalysisSelectionPolicy:
             "generated_at": selected_at.isoformat(),
             "reason": (
                 "Allocate expert analysis between current advantage and overdue coverage. "
-                "Recent repeats remain penalized even after material market changes, while "
-                "single-slot rounds periodically cover overdue candidates. This controls "
-                "expert-analysis allocation only."
+                "Unchanged recent symbols stay out during cooldown instead of filling the "
+                "shortlist fallback; material-change symbols remain eligible for emergency "
+                "re-review, and single-slot rounds periodically cover overdue candidates. "
+                "This controls expert-analysis allocation only."
             ),
             "diagnostic_boundary": (
                 "Analysis scheduling only; it cannot authorize entry, change rank eligibility, "

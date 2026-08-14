@@ -6050,7 +6050,15 @@ class TradingService:
             "is_entry_gate": False,
             "skipped_count": int(diagnostics.get("skipped_count") or 0),
             "skipped_symbols": list(diagnostics.get("skipped_symbols") or []),
-            "reason": ("unchanged recent symbols that lost the marginal analysis value selection"),
+            "cooldown_excluded_count": int(diagnostics.get("cooldown_excluded_count") or 0),
+            "cooldown_excluded_symbols": list(
+                diagnostics.get("cooldown_excluded_symbols") or []
+            ),
+            "cooldown_underfilled": bool(diagnostics.get("cooldown_underfilled")),
+            "reason": (
+                "unchanged recent symbols held out during cooldown; material-change symbols "
+                "remain eligible for emergency re-review"
+            ),
         }
         logger.info(
             "market analysis value shortlist",
@@ -6067,6 +6075,8 @@ class TradingService:
                 "oldest_completed_analysis_age_seconds"
             ),
             skipped_symbols=diagnostics.get("skipped_symbols"),
+            cooldown_excluded_symbols=diagnostics.get("cooldown_excluded_symbols"),
+            cooldown_underfilled=bool(diagnostics.get("cooldown_underfilled")),
             recent_material_change_count=diagnostics.get("recent_material_change_count"),
         )
         return result.selected
@@ -7752,18 +7762,37 @@ class TradingService:
                     market_symbol_budget,
                     analysis_budget_context=analysis_budget_context,
                 )
+                selection_diagnostics = self._safe_dict(
+                    analysis_budget_context.get("market_analysis_selection")
+                )
                 selected_market_keys = {
                     self._normalize_position_symbol(symbol)
                     for symbol in market_feature_vectors
+                    if self._normalize_position_symbol(symbol)
+                }
+                cooldown_excluded_keys = {
+                    self._normalize_position_symbol(symbol)
+                    for symbol in selection_diagnostics.get("cooldown_excluded_symbols") or []
                     if self._normalize_position_symbol(symbol)
                 }
                 self._market_defer_tracker().defer_many(
                     [
                         symbol
                         for symbol in selectable_market_symbols
-                        if self._normalize_position_symbol(symbol) not in selected_market_keys
+                        if (
+                            self._normalize_position_symbol(symbol) not in selected_market_keys
+                            and self._normalize_position_symbol(symbol) not in cooldown_excluded_keys
+                        )
                     ],
                     "shortlist_capacity",
+                )
+                self._market_defer_tracker().defer_many(
+                    [
+                        symbol
+                        for symbol in selectable_market_symbols
+                        if self._normalize_position_symbol(symbol) in cooldown_excluded_keys
+                    ],
+                    "analysis_cooldown",
                 )
                 self._market_defer_tracker().begin_many(market_feature_vectors)
                 market_feature_vectors = self._rotate_market_feature_vectors_for_deferred_coverage(
