@@ -5015,6 +5015,7 @@ def test_successful_market_analysis_resolves_due_candidate_before_coverage_snaps
     assert diagnostics["coverage_due_candidate_count"] == 1
     assert diagnostics["coverage_due_resolved_symbols"] == ["BTC-USDT-SWAP"]
     assert diagnostics["never_analyzed_candidate_count"] == 0
+    assert diagnostics["selected"][0]["recent"] is True
     assert diagnostics["selected"][0]["selection_status"] == "completed_this_round"
     assert snapshot["coverage_due_symbols"] == ["ETH/USDT"]
     assert snapshot["coverage_window_met"] is False

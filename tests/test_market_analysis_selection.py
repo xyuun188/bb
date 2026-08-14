@@ -72,7 +72,7 @@ def test_unchanged_recent_candidates_are_excluded_when_fresh_alternatives_exist(
     btc = next(
         row for row in result.diagnostics["candidate_sample"] if row["symbol"] == "BTC/USDT"
     )
-    assert btc["selection_status"] == "recent_unchanged_penalty"
+    assert btc["selection_status"] == "recent_unchanged_cooldown"
     assert btc["repeat_penalty"] == 7.0
     assert btc["evaluation_score"] == 13.0
     assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
@@ -102,7 +102,7 @@ def test_coverage_capacity_replaces_lower_value_unchanged_repeat() -> None:
     assert result.diagnostics["recent_unchanged_candidate_count"] == 2
 
 
-def test_material_market_change_reduces_but_does_not_bypass_recent_penalty() -> None:
+def test_material_market_change_does_not_bypass_strict_cooldown() -> None:
     now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
     policy = _policy(material_price_change_ratio=0.003)
     policy.remember(
@@ -118,13 +118,16 @@ def test_material_market_change_reduces_but_does_not_bypass_recent_penalty() -> 
         now=now,
     )
 
-    selected = result.diagnostics["selected"][0]
-    assert selected["symbol"] == "BTC/USDT"
-    assert selected["selection_status"] == "recent_material_change_penalty"
-    assert selected["repeat_penalty"] == 2.5
-    assert selected["repeat_penalty_ratio"] == 0.25
-    assert selected["evaluation_score"] == 7.5
-    assert selected["material_change_reasons"][0]["feature"] == "current_price"
+    assert result.selected == {}
+    candidate = result.diagnostics["candidate_sample"][0]
+    assert candidate["symbol"] == "BTC/USDT"
+    assert candidate["selection_status"] == "recent_material_change_cooldown"
+    assert candidate["repeat_penalty"] == 2.5
+    assert candidate["repeat_penalty_ratio"] == 0.25
+    assert candidate["evaluation_score"] == 7.5
+    assert candidate["material_change_reasons"][0]["feature"] == "current_price"
+    assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
+    assert result.diagnostics["recent_material_change_count"] == 1
 
 
 def test_overdue_coverage_displaces_a_recent_repeat_without_changing_entry_permission() -> None:

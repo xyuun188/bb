@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-08-14.advantage-coverage-market-analysis.v4"
+    VERSION = "2026-08-14.strict-cooldown-market-analysis.v5"
 
     def __init__(
         self,
@@ -130,12 +130,12 @@ class MarketAnalysisSelectionPolicy:
 
         # A repeat penalty is useful for ranking, but it must not be undone by
         # the old fallback fill when the candidate pool is smaller than the
-        # requested budget.  Keep unchanged recent symbols out of this round
-        # instead of reintroducing them through fallback fill.  Recent symbols
-        # with a material change remain eligible as an explicit emergency
-        # re-review path.
-        cooldown_excluded = [row for row in ranked if bool(row["recent_unchanged"])]
-        eligible_ranked = [row for row in ranked if not bool(row["recent_unchanged"])]
+        # requested budget.  A completed expert review owns the full cooldown
+        # window even when short-cycle indicators move materially; those
+        # changes remain diagnostic evidence but cannot trigger another costly
+        # expert call until cooldown expires.
+        cooldown_excluded = [row for row in ranked if bool(row["recent"])]
+        eligible_ranked = [row for row in ranked if not bool(row["recent"])]
 
         self._selection_round += 1
         coverage_candidates = [row for row in eligible_ranked if bool(row["coverage_due"])]
@@ -258,9 +258,9 @@ class MarketAnalysisSelectionPolicy:
         if observation is None:
             status = "not_recently_analyzed"
         elif recent and material_change:
-            status = "recent_material_change_penalty"
+            status = "recent_material_change_cooldown"
         elif recent_unchanged:
-            status = "recent_unchanged_penalty"
+            status = "recent_unchanged_cooldown"
         elif material_change:
             status = "material_change_after_cooldown"
         else:
@@ -275,6 +275,7 @@ class MarketAnalysisSelectionPolicy:
             "repeat_penalty_ratio": round(repeat_penalty_ratio, 6),
             "evaluation_score": round(evaluation_score, 6),
             "recent_age_seconds": None if age_seconds is None else round(age_seconds, 3),
+            "recent": recent,
             "recent_unchanged": recent_unchanged,
             "never_analyzed": observation is None,
             "coverage_due": coverage_due,
@@ -356,8 +357,8 @@ class MarketAnalysisSelectionPolicy:
         ]
         recent_excluded = [
             row
-            for row in rows
-            if row["recent_unchanged"] and row["symbol_key"] not in selected_keys
+            for row in cooldown_excluded
+            if row["symbol_key"] not in selected_keys
         ]
         selected_details = [self._public_row(row) for row in selected_rows]
         coverage_selected = [
@@ -419,9 +420,10 @@ class MarketAnalysisSelectionPolicy:
             "advantage_selected_symbols": advantage_selected,
             "recent_material_change_count": sum(
                 bool(row["material_change"])
-                and row.get("selection_status") == "recent_material_change_penalty"
+                and row.get("selection_status") == "recent_material_change_cooldown"
                 for row in rows
             ),
+            "recent_candidate_count": sum(bool(row["recent"]) for row in rows),
             "recent_unchanged_candidate_count": sum(bool(row["recent_unchanged"]) for row in rows),
             "skipped_count": len(recent_excluded),
             "skipped_symbols": [str(row["symbol"]) for row in recent_excluded],
@@ -429,9 +431,8 @@ class MarketAnalysisSelectionPolicy:
             "generated_at": selected_at.isoformat(),
             "reason": (
                 "Allocate expert analysis between current advantage and overdue coverage. "
-                "Unchanged recent symbols stay out during cooldown instead of filling the "
-                "shortlist fallback; material-change symbols remain eligible for emergency "
-                "re-review, and single-slot rounds periodically cover overdue candidates. "
+                "Every completed symbol stays out for the full cooldown, including material "
+                "short-cycle changes; single-slot rounds periodically cover overdue candidates. "
                 "This controls expert-analysis allocation only."
             ),
             "diagnostic_boundary": (
@@ -453,6 +454,7 @@ class MarketAnalysisSelectionPolicy:
                 "repeat_penalty_ratio",
                 "evaluation_score",
                 "recent_age_seconds",
+                "recent",
                 "recent_unchanged",
                 "never_analyzed",
                 "coverage_due",

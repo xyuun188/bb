@@ -6056,8 +6056,8 @@ class TradingService:
             ),
             "cooldown_underfilled": bool(diagnostics.get("cooldown_underfilled")),
             "reason": (
-                "unchanged recent symbols held out during cooldown; material-change symbols "
-                "remain eligible for emergency re-review"
+                "completed market symbols stay out for the full cooldown, including material "
+                "short-cycle feature changes"
             ),
         }
         logger.info(
@@ -6065,6 +6065,7 @@ class TradingService:
             candidate_count=diagnostics.get("candidate_count"),
             selected_count=diagnostics.get("selected_count"),
             selected_symbols=diagnostics.get("selected_symbols"),
+            recent_candidate_count=diagnostics.get("recent_candidate_count"),
             recent_unchanged_candidate_count=diagnostics.get("recent_unchanged_candidate_count"),
             coverage_due_candidate_count=diagnostics.get("coverage_due_candidate_count"),
             coverage_due_symbols=diagnostics.get("coverage_due_symbols"),
@@ -6120,6 +6121,7 @@ class TradingService:
                     continue
                 was_never_analyzed = was_never_analyzed or item.get("never_analyzed") is True
                 item["recent_age_seconds"] = 0.0
+                item["recent"] = True
                 item["recent_unchanged"] = False
                 item["never_analyzed"] = False
                 item["coverage_due"] = False
