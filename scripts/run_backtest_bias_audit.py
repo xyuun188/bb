@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,18 +14,21 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from backtest.bias_analysis import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backtest.bias_analysis import (  # noqa: E402
     run_lookahead_analysis,
     run_recursive_warmup_analysis,
     validate_feature_availability,
 )
-from backtest.data_replay import load_historical_from_db, load_historical_from_okx
-from backtest.reproducibility import normalize_ohlcv_dataframe
-from core.safe_output import safe_print
-from data_feed.technical_indicators import compute_all_indicators
-from services.strategy_contract_adapter import timeframe_duration
+from backtest.data_replay import load_historical_from_db, load_historical_from_okx  # noqa: E402
+from backtest.reproducibility import normalize_ohlcv_dataframe  # noqa: E402
+from core.safe_output import safe_print  # noqa: E402
+from data_feed.technical_indicators import compute_all_indicators  # noqa: E402
+from services.strategy_contract_adapter import timeframe_duration  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "data" / "quality" / "backtest_bias_audits"
 AUDIT_FEATURES = (
     "rsi_14",
