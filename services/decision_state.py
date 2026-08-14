@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from core.reason_codes import infer_reason_code, reason_evidence
+
 
 class DecisionStage:
     AI_ANALYSIS = "ai_analysis"
@@ -93,6 +95,13 @@ def append_decision_stage(
     *,
     at: datetime | None = None,
     duration_sec: float | None = None,
+    reason_code: str | None = None,
+    blocker: bool | None = None,
+    observed_value: Any = None,
+    threshold: Any = None,
+    release_at: datetime | str | None = None,
+    source_event: str | None = None,
+    evidence_summary: str = "",
 ) -> dict[str, Any]:
     """Append a state-machine event to a raw LLM response payload."""
 
@@ -114,6 +123,23 @@ def append_decision_stage(
     }
     if duration_sec is not None:
         event["duration_sec"] = round(max(float(duration_sec), 0.0), 3)
+    normalized_code = str(reason_code or infer_reason_code(stage, status, reason)).strip().upper()
+    event["reason_code"] = normalized_code
+    event["reason_evidence"] = reason_evidence(
+        normalized_code,
+        stage=stage,
+        blocker=(
+            status in {DecisionStageStatus.BLOCKED, DecisionStageStatus.FAILED}
+            if blocker is None
+            else bool(blocker)
+        ),
+        observed_value=observed_value,
+        threshold=threshold,
+        triggered_at=event["at"],
+        release_at=release_at,
+        source_event=source_event,
+        evidence_summary=evidence_summary or str(reason or ""),
+    )
     if data:
         event["data"] = data
     stages.append(event)
@@ -124,6 +150,8 @@ def append_decision_stage(
     machine["current_status"] = status
     machine["current_status_label"] = event["status_label"]
     machine["last_reason"] = event["reason"]
+    machine["last_reason_code"] = event.get("reason_code")
+    machine["last_reason_evidence"] = event.get("reason_evidence")
     machine["updated_at"] = event["at"]
     machine["summary"] = summarize_decision_stages(stages)
     raw["decision_state_machine"] = machine
@@ -140,6 +168,8 @@ def summarize_decision_stages(stages: list[dict[str, Any]] | None) -> dict[str, 
         "final_stage": None,
         "final_status": None,
         "final_reason": "",
+        "final_reason_code": None,
+        "final_reason_evidence": None,
         "by_stage": [],
     }
     if not stages:
@@ -161,13 +191,26 @@ def summarize_decision_stages(stages: list[dict[str, Any]] | None) -> dict[str, 
     for stage in ordered:
         event = latest_by_stage[stage]
         status = str(event.get("status") or "")
+        event_reason = event.get("reason") or ""
+        event_reason_code = event.get("reason_code") or infer_reason_code(stage, status, event_reason)
+        event_evidence = event.get("reason_evidence")
+        if not isinstance(event_evidence, dict):
+            event_evidence = reason_evidence(
+                event_reason_code,
+                stage=stage,
+                blocker=status in {DecisionStageStatus.BLOCKED, DecisionStageStatus.FAILED},
+                triggered_at=event.get("at"),
+                evidence_summary=event_reason,
+            )
         by_stage.append(
             {
                 "stage": stage,
                 "stage_label": event.get("stage_label") or STAGE_LABELS.get(stage, stage),
                 "status": status,
                 "status_label": event.get("status_label") or STATUS_LABELS.get(status, status),
-                "reason": event.get("reason") or "",
+                "reason": event_reason,
+                "reason_code": event_reason_code,
+                "reason_evidence": event_evidence,
                 "at": event.get("at"),
                 "duration_sec": event.get("duration_sec"),
             }
@@ -183,6 +226,8 @@ def summarize_decision_stages(stages: list[dict[str, Any]] | None) -> dict[str, 
     summary["final_stage"] = final.get("stage")
     summary["final_status"] = final.get("status")
     summary["final_reason"] = final.get("reason") or ""
+    summary["final_reason_code"] = final.get("reason_code")
+    summary["final_reason_evidence"] = final.get("reason_evidence")
     summary["by_stage"] = by_stage
     return summary
 

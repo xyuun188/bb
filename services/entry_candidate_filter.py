@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from core.reason_codes import reason_code_for_blocker, reason_evidence
 from services.entry_candidate_queue import EntryCandidate
 
 GateReason = Callable[[DecisionOutput], str | None]
@@ -23,6 +24,8 @@ class RejectedEntryCandidate:
     reason: str
     blocker: str
     annotate_raw_response: bool = False
+    reason_code: str = "SYSTEM_POLICY_BLOCKED"
+    reason_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +67,12 @@ class EntryCandidateFilterPolicy:
                         reason=reason,
                         blocker="entry_gate",
                         annotate_raw_response=True,
+                        reason_code=reason_code_for_blocker("entry_gate", reason),
+                        reason_evidence=reason_evidence(
+                            reason_code_for_blocker("entry_gate", reason),
+                            stage="strategy_arbitration",
+                            evidence_summary=reason,
+                        ),
                     )
                 )
                 continue
@@ -80,6 +89,12 @@ class EntryCandidateFilterPolicy:
                         candidate=candidate,
                         reason=reason,
                         blocker="market_regime",
+                        reason_code=reason_code_for_blocker("market_regime", reason),
+                        reason_evidence=reason_evidence(
+                            reason_code_for_blocker("market_regime", reason),
+                            stage="strategy_arbitration",
+                            evidence_summary=reason,
+                        ),
                     )
                 )
                 continue
@@ -96,6 +111,12 @@ class EntryCandidateFilterPolicy:
                         candidate=candidate,
                         reason=reason,
                         blocker="entry_capacity",
+                        reason_code=reason_code_for_blocker("entry_capacity", reason),
+                        reason_evidence=reason_evidence(
+                            reason_code_for_blocker("entry_capacity", reason),
+                            stage="risk_check",
+                            evidence_summary=reason,
+                        ),
                     )
                 )
                 continue

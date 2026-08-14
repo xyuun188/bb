@@ -121,7 +121,9 @@ async def init_db(*, migrate_schema: bool = True) -> None:
     import models.learning  # noqa: F401 - register learning tables in metadata
     import models.market_data  # noqa: F401 - register market tables in metadata
     import models.news  # noqa: F401 - register news/social tables in metadata
+    import models.promotion  # noqa: F401 - register promotion evidence tables
     import models.risk  # noqa: F401 - register risk tables in metadata
+    import models.runtime_config  # noqa: F401 - register runtime configuration snapshots
     import models.secure_config  # noqa: F401 - register encrypted config tables
     import models.trade  # noqa: F401 - register trade tables in metadata
 

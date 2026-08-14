@@ -40,6 +40,7 @@ from services.account_accounting_service import (
     tradeable_balance_from_snapshot,
 )
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
+from services.decision_state import decision_state_from_raw
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     first_tool_payload,
@@ -7209,6 +7210,8 @@ async def get_decisions(
         raw = d.raw_llm_response if isinstance(d.raw_llm_response, dict) else {}
         order = order_map.get(d.id)
         display_reason = _display_execution_reason(d, order)
+        decision_state = decision_state_from_raw(raw)
+        decision_summary = decision_state.get("summary") if isinstance(decision_state, dict) else {}
         order_quantity = _safe_float(getattr(order, "quantity", None), 0.0) if order else None
         order_price = _safe_float(getattr(order, "price", None), 0.0) if order else None
         order_notional = (
@@ -7236,6 +7239,9 @@ async def get_decisions(
                     "suggested_leverage": d.suggested_leverage,
                     "was_executed": d.was_executed,
                     "execution_reason": display_reason,
+                    "reason_code": decision_summary.get("final_reason_code"),
+                    "reason_evidence": decision_summary.get("final_reason_evidence"),
+                    "decision_state": decision_state,
                     "executed_at": d.executed_at.isoformat() if d.executed_at else None,
                     "execution_price": d.execution_price,
                     "order_quantity": order_quantity,
