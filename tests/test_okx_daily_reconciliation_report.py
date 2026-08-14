@@ -624,6 +624,127 @@ def test_okx_daily_reconciliation_trade_execution_contract_blocks_entry_not_trai
     }
 
 
+def test_unexecuted_direction_concentration_is_observed_without_blocking_entry() -> None:
+    trade_contract = _card("trade_execution_contract", "warning")
+    trade_contract["details"] = {
+        "audit_only": True,
+        "read_only": True,
+        "live_entry_mutation": False,
+        "live_exit_mutation": False,
+        "can_bypass_risk_controls": False,
+        "summary": {
+            "direction_concentration_alert": True,
+            "executed_entry_count": 0,
+            "executed_exit_count": 0,
+            "contract_violation_count": 0,
+            "entry_authoritative_fill_sync_pending_count": 0,
+            "single_family_authorized_entry_count": 0,
+        },
+        "policy": {
+            "paper_direction_concentration_is_execution_quota": False,
+        },
+    }
+
+    integrity = _card("okx_trade_fact_integrity", "ok")
+    integrity["details"] = {
+        "issue_count": 0,
+        "critical_count": 0,
+        "position_fact_link_repair": {"candidate_link_count": 0},
+        "okx_authoritative_sync": {
+            "okx_pull_available": True,
+            "issue_count": 0,
+            "manual_review_count": 0,
+            "repairable_count": 0,
+        },
+        "runtime_okx_entry_gate": {
+            "entry_blocked": False,
+            "status": "ok",
+            "sync_status": "ok",
+            "last_requires_attention_count": 0,
+        },
+    }
+
+    report = report_script.build_report(
+        [
+            _card("okx_reconciliation", "ok"),
+            integrity,
+            _card("position_price_integrity", "ok"),
+            trade_contract,
+        ],
+        generated_at=datetime(2026, 8, 14, 10, 30, tzinfo=UTC),
+    )
+
+    assert report["status"] == "warning"
+    assert report["issue_ledger"]["summary"] == {
+        "fixed": 3,
+        "unresolved": 0,
+        "observing": 1,
+        "total": 4,
+    }
+    assert report["can_open_new_entries"] is True
+    assert report["can_refresh_training"] is True
+    assert report["requires_attention"] is False
+    assert report["operational_gates"]["entry_blockers"] == []
+    assert report_script.exit_code_for_report(report) == 0
+
+
+def test_executed_direction_concentration_remains_an_entry_blocker() -> None:
+    trade_contract = _card("trade_execution_contract", "warning")
+    trade_contract["details"] = {
+        "audit_only": True,
+        "read_only": True,
+        "live_entry_mutation": False,
+        "live_exit_mutation": False,
+        "can_bypass_risk_controls": False,
+        "summary": {
+            "direction_concentration_alert": True,
+            "executed_entry_count": 1,
+            "executed_exit_count": 0,
+            "contract_violation_count": 0,
+            "entry_authoritative_fill_sync_pending_count": 0,
+            "single_family_authorized_entry_count": 0,
+        },
+        "policy": {
+            "paper_direction_concentration_is_execution_quota": False,
+        },
+    }
+
+    integrity = _card("okx_trade_fact_integrity", "ok")
+    integrity["details"] = {
+        "issue_count": 0,
+        "critical_count": 0,
+        "position_fact_link_repair": {"candidate_link_count": 0},
+        "okx_authoritative_sync": {
+            "okx_pull_available": True,
+            "issue_count": 0,
+            "manual_review_count": 0,
+            "repairable_count": 0,
+        },
+        "runtime_okx_entry_gate": {
+            "entry_blocked": False,
+            "status": "ok",
+            "sync_status": "ok",
+            "last_requires_attention_count": 0,
+        },
+    }
+
+    report = report_script.build_report(
+        [
+            _card("okx_reconciliation", "ok"),
+            integrity,
+            _card("position_price_integrity", "ok"),
+            trade_contract,
+        ],
+        generated_at=datetime(2026, 8, 14, 10, 31, tzinfo=UTC),
+    )
+
+    assert report["issue_ledger"]["summary"]["unresolved"] == 1
+    assert report["can_open_new_entries"] is False
+    assert report["operational_gates"]["entry_blockers"][0]["code"] == (
+        "unresolved_trade_execution_contract"
+    )
+
+
 def test_okx_daily_reconciliation_data_integrity_issue_blocks_entry_and_training() -> None:
     card = _card("okx_trade_fact_integrity", "warning")
     card["details"] = {

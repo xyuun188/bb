@@ -803,6 +803,41 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     return safe
 
 
+def _trade_execution_contract_observation_only(details: dict[str, Any]) -> bool:
+    """Identify a non-executed direction alert that must not halt entries.
+
+    Direction concentration is intentionally an audit signal, not an execution
+    quota.  It is safe to quarantine only when the report also proves that no
+    order, contract violation, fill-sync pending item, or single-family
+    authorization exists in the current window.
+    """
+
+    if not isinstance(details, dict):
+        return False
+    if not bool(details.get("audit_only")) or not bool(details.get("read_only")):
+        return False
+    if any(
+        bool(details.get(key))
+        for key in (
+            "live_entry_mutation",
+            "live_exit_mutation",
+            "can_bypass_risk_controls",
+        )
+    ):
+        return False
+    summary = _safe_dict(details.get("summary"))
+    policy = _safe_dict(details.get("policy"))
+    return bool(
+        summary.get("direction_concentration_alert") is True
+        and policy.get("paper_direction_concentration_is_execution_quota") is False
+        and _safe_int_value(summary.get("executed_entry_count")) == 0
+        and _safe_int_value(summary.get("executed_exit_count")) == 0
+        and _safe_int_value(summary.get("contract_violation_count")) == 0
+        and _safe_int_value(summary.get("entry_authoritative_fill_sync_pending_count")) == 0
+        and _safe_int_value(summary.get("single_family_authorized_entry_count")) == 0
+    )
+
+
 def _relative_gap(left: float, right: float) -> float:
     denominator = max(abs(left), abs(right), 1e-12)
     return abs(left - right) / denominator
@@ -4672,6 +4707,12 @@ def _issue_ledger_state(
         return "fixed", "已修复 / 当前验证通过"
     if observation_only:
         return "observing", "历史/样本观察 / 当前未复现硬错误"
+    if (
+        key == "trade_execution_contract"
+        and status == "warning"
+        and _trade_execution_contract_observation_only(details)
+    ):
+        return "observing", "direction concentration is limited to unexecuted candidates"
     if (
         key == "okx_reconciliation"
         and status == "warning"
