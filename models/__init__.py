@@ -2,6 +2,7 @@ from models.account import ExecutionEquitySnapshot, OkxAccountBill, VirtualAccou
 from models.base import Base, TimestampMixin
 from models.dashboard_auth import DashboardUser
 from models.decision import AIDecision
+from models.experiment import ExperimentRun
 from models.learning import (
     ExpertMemory,
     ShadowBacktest,
@@ -29,6 +30,7 @@ __all__ = [
     "OkxAccountBill",
     "DashboardUser",
     "AIDecision",
+    "ExperimentRun",
     "ExpertMemory",
     "ShadowBacktest",
     "SecureSetting",

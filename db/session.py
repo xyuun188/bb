@@ -117,6 +117,7 @@ async def init_db(*, migrate_schema: bool = True) -> None:
     import models.account  # noqa: F401 - register account tables in metadata
     import models.dashboard_auth  # noqa: F401 - register dashboard auth tables
     import models.decision  # noqa: F401 - register decision tables in metadata
+    import models.experiment  # noqa: F401 - register immutable experiment tables
     import models.learning  # noqa: F401 - register learning tables in metadata
     import models.market_data  # noqa: F401 - register market tables in metadata
     import models.news  # noqa: F401 - register news/social tables in metadata
