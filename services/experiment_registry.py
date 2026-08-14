@@ -137,6 +137,28 @@ class ExperimentRegistry:
         await self.session.flush()
         return row
 
+    async def invalidate(self, experiment_id: str, *, reason: str) -> ExperimentRun:
+        """Preserve completed evidence while excluding a provenance-defective run."""
+
+        row = await self._required(experiment_id)
+        safe_reason = str(reason or "").strip()
+        if not safe_reason:
+            raise ExperimentContractError("experiment invalidation requires a reason")
+        if row.status == "invalidated":
+            if row.failure_reason != safe_reason[:4000]:
+                raise ExperimentContractError(
+                    "invalidated experiment reason cannot be replaced"
+                )
+            return row
+        if row.status not in {"complete", "failed"}:
+            raise ExperimentContractError(
+                f"experiment cannot be invalidated from status {row.status!r}"
+            )
+        row.status = "invalidated"
+        row.failure_reason = safe_reason[:4000]
+        await self.session.flush()
+        return row
+
     async def _required(self, experiment_id: str) -> ExperimentRun:
         row = await self.get(str(experiment_id or ""))
         if row is None:

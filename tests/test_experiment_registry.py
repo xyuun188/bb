@@ -80,6 +80,13 @@ async def test_experiment_registry_persists_and_protects_immutable_spec(
             assert completed.status == "complete"
             assert completed.result_sha256 == result["result_sha256"]
 
+            invalidated = await registry.invalidate(
+                spec["experiment_id"],
+                reason="fixture provenance was intentionally invalidated",
+            )
+            assert invalidated.status == "invalidated"
+            assert invalidated.result_sha256 == result["result_sha256"]
+
         async with get_session_ctx() as session:
             registry = ExperimentRegistry(session)
             row = await registry.get(spec["experiment_id"])

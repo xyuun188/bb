@@ -63,3 +63,4 @@ def test_backtest_bundle_replays_identical_metrics(monkeypatch, tmp_path) -> Non
     assert loaded_spec["dataset"]["row_count"] == 240
     assert loaded_spec["execution_assumptions"]["commission_rate"] == 0.001
     assert loaded_spec["execution_assumptions"]["slippage_rate"] == 0.0002
+    assert loaded_spec["dataset"]["source"] == "fixture"

@@ -28,6 +28,7 @@ async def load_historical_from_okx(
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df = df.set_index("timestamp")
+        df.attrs["bb_data_source"] = "okx_rest_api"
         logger.info("historical data loaded", symbol=symbol, rows=len(df))
         return df
     finally:
@@ -38,6 +39,8 @@ async def load_historical_from_db(
     symbol: str = "BTC/USDT",
     timeframe: str = "1h",
     limit: int = 500,
+    *,
+    fallback_to_okx: bool = True,
 ) -> pd.DataFrame:
     """Load historical OHLCV data from database."""
     from db.repositories.market_repo import MarketRepository
@@ -48,8 +51,12 @@ async def load_historical_from_db(
         klines = await repo.get_klines(symbol, timeframe, limit)
 
     if not klines:
+        if not fallback_to_okx:
+            raise RuntimeError(f"no historical DB data for {symbol} {timeframe}")
         logger.warning("no historical data in DB, fetching from OKX")
-        return await load_historical_from_okx(symbol, timeframe, limit)
+        frame = await load_historical_from_okx(symbol, timeframe, limit)
+        frame.attrs["bb_data_source"] = "okx_rest_api_fallback_for_postgresql"
+        return frame
 
     df = pd.DataFrame(
         [
@@ -65,4 +72,5 @@ async def load_historical_from_db(
         ]
     )
     df = df.set_index("timestamp")
+    df.attrs["bb_data_source"] = "postgresql_klines"
     return df

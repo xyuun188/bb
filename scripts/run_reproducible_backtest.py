@@ -72,7 +72,12 @@ def _git_commit(explicit: str = "") -> str:
 
 def _source_sha256() -> str:
     digest = hashlib.sha256()
-    for relative in ("backtest/engine.py", "backtest/reproducibility.py"):
+    for relative in (
+        "backtest/data_replay.py",
+        "backtest/engine.py",
+        "backtest/reproducibility.py",
+        "scripts/run_reproducible_backtest.py",
+    ):
         digest.update(relative.encode("utf-8"))
         digest.update((ROOT / relative).read_bytes())
     return digest.hexdigest()
@@ -200,7 +205,9 @@ def _build_spec(
 
 async def _load_frame(args: argparse.Namespace) -> pd.DataFrame:
     if args.csv:
-        return pd.read_csv(args.csv, parse_dates=["timestamp"])
+        frame = pd.read_csv(args.csv, parse_dates=["timestamp"])
+        frame.attrs["bb_data_source"] = f"csv_snapshot:{Path(args.csv).name}"
+        return frame
     if args.source == "okx":
         return await load_historical_from_okx(args.symbol, args.timeframe, args.limit)
     return await load_historical_from_db(args.symbol, args.timeframe, args.limit)
@@ -238,9 +245,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     frame = await _load_frame(args)
+    actual_source = str(frame.attrs.get("bb_data_source") or "").strip()
+    if not actual_source:
+        raise SystemExit("historical data loader did not provide source provenance")
     spec, snapshot = _build_spec(
         frame,
-        source="csv" if args.csv else args.source,
+        source=actual_source,
         symbol=args.symbol,
         timeframe=args.timeframe,
         parameters=_parse_parameters(args.parameters_json),
