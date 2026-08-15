@@ -76,6 +76,53 @@ def test_parse_okx_position_snapshot_uses_explicit_public_contract_size() -> Non
     assert exchange_snapshot_unrealized(snapshot, "long") == pytest.approx(-0.82)
 
 
+def test_parse_okx_position_snapshot_preserves_exchange_identity_gap() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "STRK-USDT-SWAP",
+            "side": "short",
+            "contracts": 10.0,
+            "contractSize": 1.0,
+            "markPrice": 0.023,
+            "entryPrice": 0.024,
+            "info": {
+                "instId": "STRK-USDT-SWAP",
+                "uly": "TSLA-USDT",
+                "pos": "-10",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert "exchange_position_underlying_mismatch" in snapshot["identity_gaps"]
+
+
+def test_parse_okx_position_snapshot_blocks_notional_price_unit_mismatch() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "STRK-USDT-SWAP",
+            "side": "short",
+            "contracts": 3949.0,
+            "contractSize": 1.0,
+            "markPrice": 376.6,
+            "entryPrice": 375.95,
+            "notional": 14856.0,
+            "info": {
+                "instId": "STRK-USDT-SWAP",
+                "pos": "-3949",
+                "markPx": "376.6",
+                "avgPx": "375.95",
+                "notionalUsd": "14856",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert "exchange_position_notional_mismatch" in snapshot["identity_gaps"]
+
+
 def test_parse_okx_position_snapshot_prefers_inst_id_over_ccxt_alias_symbol() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

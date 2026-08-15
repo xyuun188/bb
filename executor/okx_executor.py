@@ -58,6 +58,7 @@ OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
+OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO = 100.0
 OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS = 7
 
 
@@ -1697,6 +1698,27 @@ class OKXExecutor(AbstractExecutor):
             status = self._order_status_from_ccxt(
                 order.get("status") or (order.get("info") or {}).get("state")
             )
+            if decision.is_entry and filled_contracts > 0:
+                integrity = self._entry_fill_integrity(
+                    order=order,
+                    okx_symbol=okx_symbol,
+                    reference_price=price,
+                    execution_price=execution_price,
+                )
+                if not integrity["ok"]:
+                    logger.error(
+                        "OKX entry fill quarantined after price or instrument identity anomaly",
+                        symbol=decision.symbol,
+                        okx_symbol=okx_symbol,
+                        order_id=order.get("id"),
+                        integrity=integrity,
+                    )
+                    order = {
+                        **order,
+                        "execution_integrity_blocked": True,
+                        "execution_integrity": integrity,
+                    }
+                    status = OrderStatus.PENDING
             if decision.is_entry and status == OrderStatus.FILLED and filled_contracts <= 0:
                 info = order.get("info") or {}
                 order_id = str(order.get("id") or info.get("ordId") or "").strip()
@@ -1745,7 +1767,7 @@ class OKXExecutor(AbstractExecutor):
                     },
                 )
             filled_base_quantity = filled_contracts * contract_size
-            if decision.is_entry and filled_contracts > 0:
+            if decision.is_entry and filled_contracts > 0 and not order.get("execution_integrity_blocked"):
                 reconcile_profit_risk_sizing(
                     decision,
                     final_notional_usdt=(
@@ -3880,6 +3902,54 @@ class OKXExecutor(AbstractExecutor):
             0.0,
         )
         return max(price, buy_limit)
+
+    def _entry_fill_integrity(
+        self,
+        *,
+        order: dict[str, Any],
+        okx_symbol: str,
+        reference_price: float,
+        execution_price: float,
+    ) -> dict[str, Any]:
+        """Reject a confirmed fill whose price or native instrument is impossible.
+
+        A market order can be acknowledged while the demo account returns a
+        stale or cross-instrument fill. Treating that response as a normal fill
+        poisons the risk contract and creates a false position valuation.
+        """
+
+        reasons: list[str] = []
+        reference = max(self._safe_float(reference_price), 0.0)
+        execution = max(self._safe_float(execution_price), 0.0)
+        if reference <= 0 or execution <= 0:
+            reasons.append("execution_price_integrity_inputs_missing")
+        elif max(execution / reference, reference / execution) > OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO:
+            reasons.append("execution_price_far_from_pre_submit_quote")
+
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        expected_inst_id = okx_inst_id_from_symbol(okx_symbol)
+        actual_inst_id = str(info.get("instId") or order.get("instId") or "").strip().upper()
+        if actual_inst_id and expected_inst_id and actual_inst_id != expected_inst_id:
+            reasons.append("execution_instrument_mismatch")
+        actual_uly = str(info.get("uly") or order.get("uly") or "").strip().upper()
+        expected_uly = expected_inst_id[: -len("-SWAP")] if expected_inst_id.endswith("-SWAP") else ""
+        if actual_uly and expected_uly and actual_uly != expected_uly:
+            reasons.append("execution_underlying_mismatch")
+
+        return {
+            "ok": not reasons,
+            "reasons": list(dict.fromkeys(reasons)),
+            "reference_price": round(reference, 12),
+            "execution_price": round(execution, 12),
+            "price_ratio": round(max(execution / reference, reference / execution), 8)
+            if reference > 0 and execution > 0
+            else 0.0,
+            "expected_inst_id": expected_inst_id,
+            "actual_inst_id": actual_inst_id,
+            "expected_uly": expected_uly,
+            "actual_uly": actual_uly,
+            "threshold_ratio": OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO,
+        }
 
     def _entry_order_rule_snapshot(
         self,

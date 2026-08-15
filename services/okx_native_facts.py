@@ -386,16 +386,16 @@ class OkxNativeFactsClient:
             for row in rows
             if str(row.get("instId") or "").strip()
         }
-        contract_sizes: dict[str, float] = {}
+        contract_specs: dict[str, dict[str, Any]] = {}
         if callable(getattr(ccxt, "publicGetPublicInstruments", None)):
-            contract_sizes = await self.fetch_contract_sizes(inst_ids=position_inst_ids)
+            contract_specs = await self.fetch_contract_specs(inst_ids=position_inst_ids)
         return [
             _native_position_to_ccxt_shape(
                 row,
                 symbol_normalizer=self.symbol_normalizer,
-                public_contract_size=contract_sizes.get(
+                public_contract_spec=contract_specs.get(
                     str(row.get("instId") or "").strip().upper(),
-                    0.0,
+                    {},
                 ),
             )
             for row in rows
@@ -688,6 +688,8 @@ class OkxNativeFactsClient:
                     "ctVal": str(row.get("ctVal") or ""),
                     "ctMult": str(row.get("ctMult") or "1"),
                     "ctValCcy": str(row.get("ctValCcy") or ""),
+                    "uly": str(row.get("uly") or ""),
+                    "instFamily": str(row.get("instFamily") or ""),
                     "lotSz": str(row.get("lotSz") or ""),
                     "minSz": str(row.get("minSz") or ""),
                     "settleCcy": str(row.get("settleCcy") or ""),
@@ -1453,6 +1455,7 @@ def _native_position_to_ccxt_shape(
     row: dict[str, Any],
     *,
     symbol_normalizer: Any,
+    public_contract_spec: dict[str, Any] | None = None,
     public_contract_size: float = 0.0,
 ) -> dict[str, Any]:
     inst_id = str(row.get("instId") or "").strip().upper()
@@ -1464,6 +1467,18 @@ def _native_position_to_ccxt_shape(
     if side not in {"long", "short", "net"}:
         side = "short" if pos < 0 else "long" if pos > 0 else ""
     contracts = abs(pos)
+    public_spec = public_contract_spec if isinstance(public_contract_spec, dict) else {}
+    public_contract_size = (
+        _safe_float(public_spec.get("ctVal"), 0.0)
+        * _safe_float(public_spec.get("ctMult"), 1.0)
+        if public_spec
+        else _safe_float(public_contract_size, 0.0)
+    )
+    private_underlying = str(row.get("uly") or "").strip().upper()
+    public_underlying = str(public_spec.get("uly") or "").strip().upper()
+    identity_gaps: list[str] = []
+    if public_spec and private_underlying and public_underlying != private_underlying:
+        identity_gaps.append("okx_private_position_underlying_differs_from_public_instrument")
     mark_price = _safe_float(row.get("markPx") or row.get("last"), 0.0)
     entry_price = _safe_float(row.get("avgPx"), 0.0)
     return {
@@ -1475,6 +1490,8 @@ def _native_position_to_ccxt_shape(
         "contractSizeSource": (
             "okx_public_instruments" if public_contract_size > 0 else "missing"
         ),
+        "exchangeIdentityVerified": bool(public_spec and not identity_gaps),
+        "exchangeIdentityGaps": identity_gaps,
         "markPrice": mark_price,
         "entryPrice": entry_price,
         "unrealizedPnl": _safe_float(row.get("upl"), 0.0),

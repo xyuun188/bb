@@ -122,7 +122,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260808-settlement-config-v1" in html
+    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -638,7 +638,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260808-settlement-config-v1" in html
+    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -778,7 +778,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260808-settlement-config-v1" in html
+    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -946,7 +946,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260808-settlement-config-v1" in html
+    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1156,6 +1156,10 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "const rawText = message || code" in reason_block
     assert "const [baseCode, ...detailParts] = code.split(':')" in reason_block
     assert "DASHBOARD_REASON_TEXT[code] || DASHBOARD_REASON_TEXT[baseCode]" in reason_block
+    assert "execution_position_exceeds_model_request: '成交后实际仓位超出模型请求上限" in reason_block
+    assert "execution_notional_exceeds_authoritative_target: '实际成交名义价值超过风险合同上限" in reason_block
+    assert "execution_stressed_loss_exceeds_risk_budget: '实际成交后的压力损失超过风险预算" in reason_block
+    assert "blockers.flatMap(item => String(item || '').split(','))" in script
     assert "no_model: '本地 ML 尚未注册当前模型 Artifact'" in reason_block
     assert (
         "artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载'"
@@ -1196,7 +1200,47 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260808-settlement-config-v1" in html
+    assert "/static/js/dashboard.js?v=20260815-strk-evidence-v2" in html
+
+
+def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:
+    decision = SimpleNamespace(
+        id=276418,
+        raw_llm_response={
+            "profit_risk_sizing": {
+                "contract_version": "test",
+                "production_eligible": False,
+                "reason": (
+                    "execution_notional_exceeds_authoritative_target,"
+                    "execution_position_exceeds_model_request,"
+                    "execution_stressed_loss_exceeds_risk_budget"
+                ),
+                "blockers": [
+                    "execution_notional_exceeds_authoritative_target,"
+                    "execution_position_exceeds_model_request,"
+                    "execution_stressed_loss_exceeds_risk_budget"
+                ],
+                "risk_budget_usdt": 1.0,
+                "planned_stressed_loss_usdt": 1.0,
+                "target_notional_usdt": 1.0,
+                "final_notional_usdt": 2.0,
+                "current_portfolio_stressed_loss_usdt": 0.0,
+                "portfolio_risk_snapshot": {
+                    "current_stressed_loss_usdt": 0.0,
+                    "gross_notional_usdt": 0.0,
+                },
+                "policy_provenance": {"contract_fingerprint": "fingerprint"},
+            }
+        },
+    )
+
+    contract = dashboard._dashboard_position_risk_contract(decision)
+
+    assert contract["blockers"] == [
+        "execution_notional_exceeds_authoritative_target",
+        "execution_position_exceeds_model_request",
+        "execution_stressed_loss_exceeds_risk_budget",
+    ]
 
 
 def test_ml_dashboard_separates_shadow_cost_and_actual_return_samples() -> None:

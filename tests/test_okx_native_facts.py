@@ -45,6 +45,15 @@ class _FakeCcxt:
                     "instType": "SWAP",
                     "instId": "BTC-USDT-SWAP",
                     "ctVal": "0.01",
+                    "uly": "BTC-USDT",
+                    "settleCcy": "USDT",
+                    "state": "live",
+                },
+                {
+                    "instType": "SWAP",
+                    "instId": "STRK-USDT-SWAP",
+                    "ctVal": "1",
+                    "uly": "STRK-USDT",
                     "settleCcy": "USDT",
                     "state": "live",
                 },
@@ -1288,6 +1297,52 @@ async def test_native_facts_client_fetch_positions_uses_signed_okx_net_position(
     assert positions[0]["info"]["tradeId"] == "spk-trade-1"
     assert positions[0]["info"]["fee"] == "-0.006"
     assert ccxt.position_params == [{"instType": "SWAP", "instId": "SPK-USDT-SWAP"}]
+
+
+@pytest.mark.asyncio
+async def test_native_facts_client_marks_private_public_underlying_mismatch() -> None:
+    ccxt = _NativeStateCcxt()
+
+    async def positions(_params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "data": [
+                {
+                    "instId": "STRK-USDT-SWAP",
+                    "posId": "strk-pos-1",
+                    "posSide": "short",
+                    "pos": "-10",
+                    "avgPx": "375.95",
+                    "markPx": "376.6",
+                    "uly": "TSLA-USDT",
+                }
+            ]
+        }
+
+    async def instruments(_params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "data": [
+                {
+                    "instType": "SWAP",
+                    "instId": "STRK-USDT-SWAP",
+                    "ctVal": "1",
+                    "ctMult": "1",
+                    "uly": "STRK-USDT",
+                    "settleCcy": "USDT",
+                }
+            ]
+        }
+
+    ccxt.privateGetAccountPositions = positions
+    ccxt.publicGetPublicInstruments = instruments
+
+    positions = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_positions(
+        symbols=["STRK/USDT"]
+    )
+
+    assert positions[0]["exchangeIdentityVerified"] is False
+    assert "okx_private_position_underlying_differs_from_public_instrument" in positions[0][
+        "exchangeIdentityGaps"
+    ]
 
 
 @pytest.mark.asyncio

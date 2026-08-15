@@ -229,6 +229,13 @@ def parse_exchange_position_snapshot(
             default=0.0,
         )
     )
+    identity_gaps = list(
+        dict.fromkeys(
+            str(value)
+            for value in position.get("exchangeIdentityGaps") or []
+            if str(value or "").strip()
+        )
+    )
     contract_size = explicit_contract_size
     quantity = (
         contracts * contract_size
@@ -237,6 +244,18 @@ def parse_exchange_position_snapshot(
         if contracts <= 0
         else 0.0
     )
+    calculated_notional = contracts * contract_size * mark_price if contracts > 0 and contract_size > 0 else 0.0
+    if notional > 0 and calculated_notional > 0:
+        notional_ratio = max(calculated_notional / notional, notional / calculated_notional)
+        if notional_ratio > 10.0:
+            identity_gaps.append("exchange_position_notional_mismatch")
+    raw_inst_id = str(info.get("instId") or position.get("symbol") or "").strip().upper()
+    raw_uly = str(info.get("uly") or "").strip().upper()
+    if raw_inst_id and raw_uly and raw_inst_id.endswith("-USDT-SWAP"):
+        expected_uly = raw_inst_id[: -len("-SWAP")]
+        if raw_uly != expected_uly:
+            identity_gaps.append("exchange_position_underlying_mismatch")
+    identity_gaps = list(dict.fromkeys(identity_gaps))
     margin_used = (
         _first_positive_float(position.get("initialMargin"), default=0.0)
         or _first_positive_float(position.get("margin"), default=0.0)
@@ -265,6 +284,8 @@ def parse_exchange_position_snapshot(
         "raw_pos": raw_pos_value,
         "signed_position_size": signed_position_size,
         "side_inference": side_inference,
+        "identity_gaps": identity_gaps,
+        "calculated_notional": calculated_notional,
     }
 
 

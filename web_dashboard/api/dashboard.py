@@ -2394,6 +2394,26 @@ def _trading_service_cached_okx_balance_snapshot(mode: str) -> dict[str, Any] | 
     return result
 
 
+def _dashboard_reason_codes(*values: Any) -> list[str]:
+    """Normalize legacy comma-delimited blocker strings into diagnostic codes."""
+
+    normalized: list[str] = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            for code in _dashboard_reason_codes(*value):
+                if code not in normalized:
+                    normalized.append(code)
+            continue
+        text = str(value or "").strip()
+        if not text:
+            continue
+        for item in text.split(","):
+            code = item.strip()
+            if code and code not in normalized:
+                normalized.append(code)
+    return normalized
+
+
 def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
     raw = _safe_dict(getattr(decision, "raw_llm_response", None))
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
@@ -2470,21 +2490,20 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
         )
         if value is None or value == ""
     ]
+    # Older execution contracts stored multiple machine-readable violations in
+    # one comma-delimited ``reason`` string. Keep that raw field for evidence,
+    # but expose each code separately so the API and UI can localize it.
     eligibility_blockers = (
-        [sizing.get("reason") or "profit_risk_sizing_not_production_eligible"]
+        _dashboard_reason_codes(
+            sizing.get("reason") or "profit_risk_sizing_not_production_eligible"
+        )
         if sizing.get("production_eligible") is not True
         else []
     )
-    blockers = list(
-        dict.fromkeys(
-            str(value)
-            for value in (
-                _safe_list(sizing.get("blockers"))
-                + eligibility_blockers
-                + evidence_gaps
-            )
-            if value
-        )
+    blockers = _dashboard_reason_codes(
+        _safe_list(sizing.get("blockers")),
+        eligibility_blockers,
+        evidence_gaps,
     )
     target_notional = _safe_float(sizing.get("target_notional_usdt"), None)
     final_notional = _safe_float(sizing.get("final_notional_usdt"), None)

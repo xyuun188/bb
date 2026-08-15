@@ -94,6 +94,7 @@ def build_current_position_management_contract(
     side = str(facts.get("side") or "").lower().strip()
     quantity = abs(_safe_float(facts.get("quantity")))
     contracts = abs(_safe_float(facts.get("contracts")))
+    contract_size = abs(_safe_float(facts.get("contract_size")))
     entry_price = max(_safe_float(facts.get("entry_price")), 0.0)
     current_price = max(_safe_float(facts.get("current_price")), 0.0)
     entry_fee = max(_safe_float(facts.get("entry_fee_usdt")), 0.0)
@@ -112,6 +113,20 @@ def build_current_position_management_contract(
     portfolio_gross_notional = max(
         _safe_float(facts.get("portfolio_gross_notional_usdt")),
         0.0,
+    )
+    raw_position_notional = _safe_float(facts.get("position_notional_usdt"))
+    authoritative_position_notional = (
+        raw_position_notional if raw_position_notional > 0 else quantity * current_price
+    )
+    position_notional_source = str(
+        facts.get("position_notional_source") or "quantity_times_current_price"
+    ).strip()
+    identity_gaps = list(
+        dict.fromkeys(
+            str(value)
+            for value in facts.get("exchange_identity_gaps") or []
+            if str(value or "").strip()
+        )
     )
     account_equity = max(_safe_float(facts.get("account_equity_usdt")), 0.0)
     open_position_count = max(_safe_int(facts.get("open_position_count")), 0)
@@ -155,6 +170,10 @@ def build_current_position_management_contract(
         blockers.append("current_position_identity_incomplete")
     if quantity <= 0 or contracts <= 0 or entry_price <= 0 or current_price <= 0:
         blockers.append("current_position_valuation_incomplete")
+    if authoritative_position_notional <= 0:
+        blockers.append("current_position_notional_missing")
+    if identity_gaps:
+        blockers.extend(identity_gaps)
     if facts.get("entry_fee_evidence_complete") is not True:
         blockers.append("authoritative_entry_fee_evidence_incomplete")
     if not entry_order_ids:
@@ -216,6 +235,7 @@ def build_current_position_management_contract(
         "side": side,
         "quantity": quantity,
         "contracts": contracts,
+        "contract_size": contract_size,
         "entry_price": entry_price,
         "current_price": current_price,
         "entry_fee_usdt": entry_fee,
@@ -234,6 +254,9 @@ def build_current_position_management_contract(
         "protection_orders": protection_orders,
         "position_fragment_ids": fragment_ids,
         "position_fragment_count": fragment_count,
+        "position_notional_usdt": authoritative_position_notional,
+        "position_notional_source": position_notional_source,
+        "exchange_identity_gaps": identity_gaps,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "paper_canary_lifecycle": paper_canary_lifecycle,
@@ -271,7 +294,15 @@ def build_current_position_management_contract(
         "take_profit_price": round(take_profit, 12),
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "protection_orders": protection_orders,
-        "position_notional_usdt": round(quantity * current_price, 12),
+        "contract_size": round(contract_size, 12),
+        "position_notional_usdt": round(
+            authoritative_position_notional
+            if authoritative_position_notional > 0
+            else quantity * current_price,
+            12,
+        ),
+        "position_notional_source": position_notional_source or "quantity_times_current_price",
+        "exchange_identity_gaps": identity_gaps,
         "position_stressed_loss_usdt": round(position_stressed_loss, 12),
         "portfolio_stressed_loss_usdt": round(portfolio_stressed_loss, 12),
         "portfolio_gross_notional_usdt": round(portfolio_gross_notional, 12),

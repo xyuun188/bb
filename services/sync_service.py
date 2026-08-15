@@ -2391,6 +2391,20 @@ class OkxSyncService:
                         float_parser(snapshot.get("last_price"), 0.0),
                         entry_price,
                     ),
+                    "position_notional_usdt": max(
+                        float_parser(snapshot.get("notional"), 0.0),
+                        0.0,
+                    ),
+                    "position_notional_source": (
+                        "okx_notional_usd"
+                        if float_parser(snapshot.get("notional"), 0.0) > 0
+                        else "contracts_times_contract_size_times_mark"
+                    ),
+                    "contract_size": max(
+                        float_parser(snapshot.get("contract_size"), 0.0),
+                        0.0,
+                    ),
+                    "exchange_identity_gaps": list(snapshot.get("identity_gaps") or []),
                     "protection": protection,
                     "protection_orders": protection_orders,
                     "stop_loss": stop_loss,
@@ -2403,7 +2417,9 @@ class OkxSyncService:
             if row["entry_price"] > 0 and row["stop_loss"] > 0 and row["quantity"] > 0
         )
         portfolio_gross_notional = sum(
-            row["current_price"] * row["quantity"]
+            row["position_notional_usdt"]
+            if row["position_notional_usdt"] > 0
+            else row["current_price"] * row["quantity"]
             for row in group_rows
             if row["current_price"] > 0 and row["quantity"] > 0
         )
@@ -2473,6 +2489,12 @@ class OkxSyncService:
                 "contracts": row["contracts"],
                 "entry_price": row["entry_price"],
                 "current_price": row["current_price"],
+                "contract_size": row["contract_size"],
+                "position_notional_usdt": row["position_notional_usdt"]
+                if row["position_notional_usdt"] > 0
+                else row["current_price"] * row["quantity"],
+                "position_notional_source": row["position_notional_source"],
+                "exchange_identity_gaps": row["exchange_identity_gaps"],
                 "entry_fee_usdt": current_entry_fee,
                 "full_entry_fee_usdt": full_entry_fee,
                 "full_entry_notional_usdt": full_entry_notional,

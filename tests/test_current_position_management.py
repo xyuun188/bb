@@ -153,6 +153,25 @@ def test_takeover_contract_fails_closed_without_current_oco_or_account_equity() 
     assert "current_account_equity_missing" in contract["blockers"]
 
 
+def test_takeover_contract_uses_authoritative_notional_and_blocks_identity_gap() -> None:
+    contract = build_current_position_management_contract(
+        _facts(
+            quantity=3949.0,
+            current_price=376.6,
+            contracts=3949.0,
+            contract_size=1.0,
+            position_notional_usdt=0.02309 * 3949.0,
+            position_notional_source="okx_notional_usd",
+            exchange_identity_gaps=["okx_private_position_underlying_differs_from_public_instrument"],
+        )
+    )
+
+    assert contract["position_notional_usdt"] == pytest.approx(0.02309 * 3949.0)
+    assert contract["position_notional_source"] == "okx_notional_usd"
+    assert contract["management_eligible"] is False
+    assert "okx_private_position_underlying_differs_from_public_instrument" in contract["blockers"]
+
+
 def test_split_oco_validates_by_exact_inventory_not_single_position_price() -> None:
     contract = build_current_position_management_contract(
         _facts(

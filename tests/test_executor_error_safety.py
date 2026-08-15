@@ -2177,6 +2177,27 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     assert rules["pre_submit_valid"] is True
 
 
+def test_okx_entry_fill_integrity_quarantines_cross_scale_price_and_underlying() -> None:
+    executor = OKXExecutor(mode="paper")
+
+    result = executor._entry_fill_integrity(
+        order={
+            "info": {
+                "instId": "STRK-USDT-SWAP",
+                "uly": "TSLA-USDT",
+            }
+        },
+        okx_symbol="STRK-USDT-SWAP",
+        reference_price=0.02309,
+        execution_price=375.952409,
+    )
+
+    assert result["ok"] is False
+    assert "execution_price_far_from_pre_submit_quote" in result["reasons"]
+    assert "execution_underlying_mismatch" in result["reasons"]
+    assert result["price_ratio"] > 100.0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("action", "error_code", "error_message"),

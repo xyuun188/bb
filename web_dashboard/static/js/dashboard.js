@@ -4541,6 +4541,14 @@ function mlFirstNumber(source, keys) {
 }
 
 const DASHBOARD_REASON_TEXT = Object.freeze({
+    execution_position_exceeds_model_request: '成交后实际仓位超出模型请求上限，已标记为风险合同违规，不能作为合格执行证据',
+    execution_price_far_from_pre_submit_quote: '成交价与提交前权威行情相差过大，成交已隔离，禁止作为正常执行证据',
+    execution_instrument_mismatch: '成交返回的 OKX 合约身份与请求合约不一致，成交已隔离',
+    execution_underlying_mismatch: '成交返回的标的身份与 OKX 合约不一致，成交已隔离',
+    exchange_position_underlying_mismatch: 'OKX 当前仓位的 instId 与 underlying 标的不一致，已阻断正常持仓接管',
+    okx_private_position_underlying_differs_from_public_instrument: 'OKX 私有仓位标的与公共合约规格不一致，已阻断正常持仓接管',
+    current_position_notional_missing: 'OKX 当前仓位缺少可验证的权威名义价值，已阻断正常持仓接管',
+    exchange_position_notional_mismatch: 'OKX 当前仓位名义价值与合约张数、合约面值和标记价不一致，已阻断正常持仓接管',
     no_model: '本地 ML 尚未注册当前模型 Artifact',
     artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载',
     artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测',
@@ -8713,7 +8721,9 @@ function positionEvidenceValue(value, suffix = '') {
 }
 
 function positionEvidenceBlockers(blockers) {
-    const values = Array.isArray(blockers) ? blockers.filter(Boolean) : [];
+    const values = Array.isArray(blockers)
+        ? blockers.flatMap(item => String(item || '').split(',')).map(item => item.trim()).filter(Boolean)
+        : [];
     return values.length
         ? `<div class="position-evidence-blockers">阻断：${values.map(item => escHtml(dashboardReasonText(item))).join(' / ')}</div>`
         : '';
