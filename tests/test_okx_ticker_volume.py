@@ -57,6 +57,53 @@ async def test_okx_ws_ticker_keeps_contracts_and_base_volume_separate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_okx_ws_ticker_processing_is_bounded_per_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXWebSocketClient()
+    monotonic_times = iter((100.0, 100.1, 100.6))
+    current_time = [100.6]
+
+    def fake_monotonic() -> float:
+        try:
+            current_time[0] = next(monotonic_times)
+        except StopIteration:
+            pass
+        return current_time[0]
+
+    monkeypatch.setattr(okx_ws_client.time, "monotonic", fake_monotonic)
+
+    def payload(last: str, timestamp: str) -> str:
+        return json.dumps(
+            {
+                "arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+                "data": [
+                    {
+                        "last": last,
+                        "open24h": "63000",
+                        "bidPx": last,
+                        "askPx": last,
+                        "high24h": "65000",
+                        "low24h": "62000",
+                        "vol24h": "100",
+                        "volCcy24h": "10",
+                        "ts": timestamp,
+                    }
+                ],
+            }
+        )
+
+    await client._handle_message(payload("64000", "1782432000000"))
+    await client._handle_message(payload("64001", "1782432000100"))
+    await client._handle_message(payload("64002", "1782432000600"))
+
+    assert client.latest_tickers["BTC/USDT"]["last_price"] == pytest.approx(64002.0)
+    stats = client.get_stats()
+    assert stats["throttled_ticker_updates"] == 1
+    assert stats["ticker_process_interval_seconds"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
 async def test_okx_ws_connect_uses_unified_sdk_stream(monkeypatch) -> None:
     instances: list[Any] = []
 

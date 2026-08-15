@@ -12,6 +12,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -35,6 +36,9 @@ OKX_CROSS_MARGIN_MODE = "cross"
 OKX_SERVER_TIME_PATH = "/api/v5/public/time"
 OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
 OKX_WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_WS_TICKER_EMIT_INTERVAL_SECONDS = 5.0
+OKX_WS_TICKER_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"tickers"')
+OKX_WS_TICKER_INST_ID_RE = re.compile(r'"instId"\s*:\s*"([^"]+)"')
 OKX_WS_BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
 OKX_WS_DEMO_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 
@@ -162,6 +166,14 @@ class OkxPublicWebSocketSdkStream:
         self._client: Any | None = None
         self._consume_task: asyncio.Task[Any] | None = None
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # Keep the newest ticker per instrument. An unbounded FIFO here can
+        # make the trading loop consume minutes-old prices during busy scans.
+        self._ticker_messages: dict[str, str] = {}
+        self._ticker_ready: asyncio.Queue[str] = asyncio.Queue()
+        self._ticker_queued: set[str] = set()
+        self._ticker_next_emit_at: dict[str, float] = {}
+        self._ticker_emit_handles: dict[str, asyncio.TimerHandle] = {}
+        self._coalesced_ticker_messages = 0
 
     async def connect(self) -> None:
         from okx.websocket.WsPublicAsync import WsPublicAsync
@@ -170,7 +182,40 @@ class OkxPublicWebSocketSdkStream:
         self._consume_task = await self._client.start()
 
     def _on_message(self, message: str) -> None:
-        self._queue.put_nowait(message)
+        text = message.decode() if isinstance(message, bytes) else str(message)
+        if OKX_WS_TICKER_CHANNEL_RE.search(text) and '"data"' in text:
+            inst_match = OKX_WS_TICKER_INST_ID_RE.search(text)
+            inst_id = inst_match.group(1) if inst_match is not None else ""
+        else:
+            inst_id = ""
+        if inst_id:
+            if inst_id in self._ticker_messages:
+                self._coalesced_ticker_messages += 1
+            self._ticker_messages[inst_id] = text
+            self._schedule_ticker(inst_id)
+            return
+        self._queue.put_nowait(text)
+
+    def _schedule_ticker(self, inst_id: str) -> None:
+        if inst_id in self._ticker_queued or inst_id in self._ticker_emit_handles:
+            return
+        now = asyncio.get_running_loop().time()
+        delay = max(self._ticker_next_emit_at.get(inst_id, 0.0) - now, 0.0)
+        if delay <= 0:
+            self._queue_ticker(inst_id)
+            return
+        self._ticker_emit_handles[inst_id] = asyncio.get_running_loop().call_later(
+            delay,
+            self._queue_ticker,
+            inst_id,
+        )
+
+    def _queue_ticker(self, inst_id: str) -> None:
+        self._ticker_emit_handles.pop(inst_id, None)
+        if inst_id in self._ticker_queued or inst_id not in self._ticker_messages:
+            return
+        self._ticker_queued.add(inst_id)
+        self._ticker_ready.put_nowait(inst_id)
 
     async def send(self, payload: str) -> None:
         if self._client is None:
@@ -204,25 +249,47 @@ class OkxPublicWebSocketSdkStream:
             raise ExchangeAPIError("OKX WebSocket SDK consumer stopped unexpectedly")
 
         queue_waiter = asyncio.create_task(self._queue.get())
+        ticker_waiter = asyncio.create_task(self._ticker_ready.get())
         try:
             done, _ = await asyncio.wait(
-                (queue_waiter, consume_task),
+                (queue_waiter, ticker_waiter, consume_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if consume_task in done:
                 consume_task.result()
                 raise ExchangeAPIError("OKX WebSocket SDK consumer stopped unexpectedly")
+            if ticker_waiter in done:
+                inst_id = ticker_waiter.result()
+                self._ticker_queued.discard(inst_id)
+                message = self._ticker_messages.pop(inst_id, None)
+                if message is not None:
+                    self._ticker_next_emit_at[inst_id] = (
+                        asyncio.get_running_loop().time()
+                        + OKX_WS_TICKER_EMIT_INTERVAL_SECONDS
+                    )
+                    return message
+                return await self.recv()
             return queue_waiter.result()
         finally:
             if not queue_waiter.done():
                 queue_waiter.cancel()
-                await asyncio.gather(queue_waiter, return_exceptions=True)
+            if not ticker_waiter.done():
+                ticker_waiter.cancel()
+            await asyncio.gather(queue_waiter, ticker_waiter, return_exceptions=True)
 
     async def close(self) -> None:
         client = self._client
         consume_task = self._consume_task
         self._client = None
         self._consume_task = None
+        self._ticker_messages.clear()
+        self._ticker_queued.clear()
+        self._ticker_next_emit_at.clear()
+        for handle in self._ticker_emit_handles.values():
+            handle.cancel()
+        self._ticker_emit_handles.clear()
+        while not self._ticker_ready.empty():
+            self._ticker_ready.get_nowait()
         try:
             if client is not None:
                 await client.stop()

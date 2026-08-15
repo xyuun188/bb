@@ -100,6 +100,115 @@ async def test_sequence_loader_transports_native_series_without_expanded_window_
 
 
 @pytest.mark.asyncio
+async def test_sequence_loader_bounds_each_native_series_before_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(train_script, "_SEQUENCE_ROWS_PER_SERIES_LIMIT", 32)
+    start = datetime(2026, 7, 14, tzinfo=UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                Kline(
+                    symbol="BTC/USDT",
+                    timeframe="1m",
+                    open_time=start + timedelta(minutes=index),
+                    open=100.0 + index,
+                    high=101.0 + index,
+                    low=99.0 + index,
+                    close=100.0 + index,
+                    volume=10.0 + index,
+                )
+                for index in range(40)
+            ]
+        )
+        await session.commit()
+
+    samples = await train_script._load_sequence_samples()
+
+    assert len(samples) == 1
+    assert samples[0]["close_sequence"] == [float(value) for value in range(108, 140)]
+    assert samples[0]["volume_sequence"] == [float(value) for value in range(18, 50)]
+    assert samples[0]["observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_loader_evenly_bounds_rows_at_database_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol=f"S{index}/USDT",
+                    analysis_type="market",
+                    decision_action="long",
+                    decision_confidence=0.7,
+                    feature_snapshot={"current_price": 100.0 + index},
+                    status="completed",
+                    due_at=created_at + timedelta(minutes=index + 10),
+                    horizon_minutes=10,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.2,
+                    best_action="long",
+                    created_at=created_at + timedelta(minutes=index),
+                )
+                for index in range(10)
+            ]
+        )
+        await session.commit()
+
+    try:
+        samples = await train_script._load_shadow_samples(sample_budget=4)
+    finally:
+        await close_db()
+
+    assert [sample["symbol"] for sample in samples] == [
+        "S0/USDT",
+        "S3/USDT",
+        "S6/USDT",
+        "S9/USDT",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trade_loader_requests_compact_authoritative_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def load_outcomes(**kwargs: object) -> list[dict[str, object]]:
+        captured.update(kwargs)
+        return [
+            {
+                "symbol": "BTC/USDT",
+                "features": {"current_price": 100.0},
+            }
+        ]
+
+    monkeypatch.setattr(
+        train_script,
+        "load_authoritative_trade_outcomes",
+        load_outcomes,
+    )
+
+    samples = await train_script._load_trade_samples(compact=True)
+
+    assert captured["compact"] is True
+    assert captured["include_training_features"] is True
+    assert samples[0]["features"] == {
+        "symbol": "BTC/USDT",
+        "current_price": 100.0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -198,6 +307,86 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
     )
     assert "unused_llm_context" not in samples[0]["features"]
     assert samples[1]["symbol"] == "ETH/USDT"
+
+
+def test_remote_training_transport_bounds_rows_and_drops_audit_payloads() -> None:
+    training_payload = {
+        "shadow_samples": [
+            {
+                "id": 1,
+                "symbol": "BTC/USDT",
+                "raw_llm_response": {"text": "x" * 200_000},
+                "training_sample_contract": {"evidence": "x" * 200_000},
+                "features": {
+                    "symbol": "BTC/USDT",
+                    "current_price": 100.0,
+                    "rsi_14": 52.0,
+                    "unused_context": "x" * 200_000,
+                },
+                "profit_supervision": {
+                    "version": "test-v1",
+                    "contract_fingerprint": "audit-only",
+                    "tasks": {
+                        "market_opportunity_distribution": {
+                            "eligible": True,
+                            "source_authority": "shadow_native_market_path",
+                            "long_gross_market_return_pct": 0.12,
+                            "short_gross_market_return_pct": -0.12,
+                            "unused_evidence": "x" * 100_000,
+                        }
+                    },
+                },
+                "side": "long",
+                "lifecycle_key": "decision-1",
+            }
+        ],
+        "trade_samples": [],
+        "sequence_samples": [
+            {
+                "symbol": "BTC/USDT",
+                "timeframe": "1m",
+                "sequence_format": train_script.COMPACT_SEQUENCE_SERIES_FORMAT,
+                "close_sequence": list(range(600)),
+                "volume_sequence": list(range(600)),
+                "observation_count": 569,
+                "label_name": "gross_market_move_pct",
+                "label_version": "test-v1",
+            }
+        ],
+        "text_sentiment_samples": [],
+    }
+
+    views, report = train_script._build_training_transport_views(training_payload)
+
+    shadow = views["shadow"][0]
+    assert "raw_llm_response" not in shadow
+    assert "training_sample_contract" not in shadow
+    assert "unused_context" not in shadow["features"]
+    assert shadow["features"] == {
+        "symbol": "BTC/USDT",
+        "current_price": 100.0,
+        "rsi_14": 52.0,
+    }
+    assert shadow["profit_supervision"] == {
+        "version": "test-v1",
+        "tasks": {
+            "market_opportunity_distribution": {
+                "eligible": True,
+                "source_authority": "shadow_native_market_path",
+                "long_gross_market_return_pct": 0.12,
+                "short_gross_market_return_pct": -0.12,
+            }
+        },
+    }
+    sequence = views["sequence"][0]
+    assert len(sequence["close_sequence"]) == train_script._REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
+    assert len(sequence["volume_sequence"]) == train_script._REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
+    assert report["source_sample_counts"] == {
+        "shadow": 1,
+        "trade": 0,
+        "sequence": 1,
+        "text_sentiment": 0,
+    }
 
 
 def test_local_ai_tools_training_headers_use_bearer_token() -> None:

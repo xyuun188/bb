@@ -53,6 +53,7 @@ _HTTP_MAX_CONNECTIONS = 8
 _HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
 _BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
 _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
+_MAX_CONCURRENT_INFERENCE_BATCHES = 2
 
 
 class LocalAIToolsClient:
@@ -68,11 +69,14 @@ class LocalAIToolsClient:
         self._last_failure: str = ""
         self._last_success_at: datetime | None = None
         self._status_cache: tuple[float, dict[str, Any]] | None = None
-        self._inference_lock = asyncio.Lock()
+        self._inference_slots: asyncio.Queue[int] = asyncio.Queue(
+            maxsize=_MAX_CONCURRENT_INFERENCE_BATCHES
+        )
+        for slot in range(_MAX_CONCURRENT_INFERENCE_BATCHES):
+            self._inference_slots.put_nowait(slot)
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_base: str = ""
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._inference_active = False
 
     def _request_timeout(self) -> float:
         return min(max(self._timeout, 0.5), _MAX_REQUEST_TIMEOUT_SECONDS)
@@ -245,26 +249,22 @@ class LocalAIToolsClient:
             )
             return item
 
-        # Keep complete batches mutually exclusive, but run the independent
-        # routes together inside the batch. The API exposes separate endpoints
-        # and the server's thread pool can overlap their I/O/model work; serial
-        # routes made a normal 12-second batch spend four seconds on each route
-        # and incorrectly turned healthy late responses into timeouts.
+        # Run a small bounded number of complete batches while keeping routes
+        # concurrent inside each batch. Market analysis and position review can
+        # overlap without letting a burst build an unbounded inference queue.
         results: list[dict[str, Any]] = []
-        lock_acquired = False
+        inference_slot: int | None = None
         queue_started = monotonic()
         queue_wait_seconds = 0.0
         try:
-            # Never queue a whole market round behind another batch. A queued
-            # asyncio.Lock can outlive the caller's deadline when the event loop
-            # is busy, which used to produce 50-60 second "unavailable" records.
-            # The next scheduled round will retry the deferred batch.
-            if not self._inference_active and not self._inference_lock.locked():
-                self._inference_active = True
-                await self._inference_lock.acquire()
-                lock_acquired = True
+            # Never queue a whole market round behind the active capacity. The
+            # next scheduled round will retry a deferred batch.
+            try:
+                inference_slot = self._inference_slots.get_nowait()
+            except asyncio.QueueEmpty:
+                inference_slot = None
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
-            if lock_acquired:
+            if inference_slot is not None:
                 results = list(
                     await asyncio.gather(
                         *(
@@ -279,23 +279,23 @@ class LocalAIToolsClient:
                     {
                         "available": False,
                         "status": "deferred",
-                        "error": "local AI tools inference already in progress",
+                        "error": "local AI tools inference capacity exhausted",
                         "path": path,
                         "duration_sec": 0.0001,
                     }
                     for _name, path in tool_specs
                 )
         finally:
-            if lock_acquired:
-                self._inference_lock.release()
-                self._inference_active = False
+            if inference_slot is not None:
+                self._inference_slots.put_nowait(inference_slot)
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
             "api_base": self._public_api_base(),
             "started_at": started.isoformat(),
             "duration_sec": round((datetime.now(UTC) - started).total_seconds(), 3),
-            "execution_mode": "concurrent_routes_serial_batches",
+            "execution_mode": "concurrent_routes_bounded_batches",
+            "max_concurrent_batches": _MAX_CONCURRENT_INFERENCE_BATCHES,
             "batch_budget_policy": "shared_batch_deadline_concurrent_routes",
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),

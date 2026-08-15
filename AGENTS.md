@@ -192,21 +192,21 @@ Keep all memories for this repository in `bb`; do not store this project's facts
 <!-- BEGIN CODEX SEMBLE RTK -->
 ## Project Tooling
 
-- Semble is available globally through the Codex MCP server. Use Semble first for semantic code discovery in this project.
-- Use mcp__semble.search with repo="E:\\code\\bb" for broad codebase questions.
-- If the current Codex session has not hot-loaded `mcp__semble`, use the local CLI fallback before broad `rg`/file reads:
+- Semble is registered in this project's `.codex/config.toml`. Use it first for semantic code discovery in this project.
+- Use `mcp__semble__search` with `repo="E:\\code\\bb"` for broad codebase questions.
+- If the current Codex session has not hot-loaded `mcp__semble`, use the persistent local CLI fallback before broad `rg`/file reads:
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
-$env:SEMBLE_CACHE_LOCATION='F:\SemblevsRTK\cache\semble'
-$env:SEMBLE_MODEL_NAME='F:\SemblevsRTK\models\potion-code-16M'
-& 'F:\SemblevsRTK\.venvs\semble\Scripts\semble.exe' search '<query>' 'F:\bb' --top-k 5
+$env:SEMBLE_CACHE_LOCATION='E:\environment\semble-cache'
+$env:HF_HOME='E:\environment\huggingface-cache'
+& 'E:\environment\bin\semble.exe' search '<query>' 'E:\code\bb' --top-k 5
 ```
 
 - For any request asking "where", "how", architecture flow, similar code, risk/strategy/service relationships, or unknown symbols, run Semble search first and use returned file locations to narrow follow-up reads.
 - Codebase Memory MCP is available globally as `codebase_memory`; use repo path `E:\code\bb` for indexing, architecture queries, call-path tracing, code snippets, graph searches, and change detection.
 - `Codex-CodebaseMemory-AutoIndex` refreshes this project's Codebase Memory graph every 30 minutes and at logon. Already-open Codex sessions cannot hot-load native MCP tools; use the fallback script `C:\Users\Administrator\.codex\codebase-memory\invoke-codebase-memory-tool.ps1` if needed.
 - Treat Codebase Memory as structural code intelligence. Keep durable project decisions and preferences in `hindsight_bb`, not in another project's memory bank.
-- RTK is available globally from F:\SemblevsRTK\bin\rtk.exe. Prefer RTK for supported shell commands that produce large output.
+- RTK is available from `E:\environment\bin\rtk.exe`. Prefer RTK for supported shell commands that produce large output.
 - Do not force RTK onto PowerShell-only commands such as Get-ChildItem, Get-Content, Select-String, or Test-Path.
 <!-- END CODEX SEMBLE RTK -->

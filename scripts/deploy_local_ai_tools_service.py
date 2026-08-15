@@ -36,12 +36,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import re
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -129,6 +131,22 @@ TIMESERIES_PRIMARY_REPO_ID = os.environ.get(
 TIMESERIES_LEGACY_TIMESFM_REPO_ID = "google/timesfm-2.5-200m-transformers"
 TIMESERIES_CHRONOS_REPO_ID = "amazon/chronos-2"
 TIMESERIES_FALLBACK_REPO_ID = "ibm-granite/granite-timeseries-ttm-r2"
+TORCH_PATCH_MAX_SAMPLES = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_TORCH_PATCH_MAX_SAMPLES", "8000")),
+    2048,
+)
+TORCH_PATCH_MAX_EPOCHS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_TORCH_PATCH_MAX_EPOCHS", "6")),
+    1,
+)
+SEQUENCE_MODEL_MAX_SAMPLES = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000")),
+    2048,
+)
+ISOLATE_TRAINING_PROCESS = os.environ.get(
+    "LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
 SECRET_TEXT_RE = re.compile(
@@ -157,6 +175,27 @@ _CURRENT_MODEL_PATH: Path | None = None
 _STATUS_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
 _MODEL_CACHE_LOCK = threading.RLock()
+_SHADOW_EXECUTOR: ThreadPoolExecutor | None = None
+_SHADOW_EXECUTOR_LOCK = threading.RLock()
+_SHADOW_INFLIGHT: dict[str, Future] = {}
+_SHADOW_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SHADOW_CACHE_TTL_SECONDS = max(
+    float(os.environ.get("LOCAL_AI_TOOLS_SHADOW_CACHE_TTL_SECONDS", "45")),
+    5.0,
+)
+_SHADOW_FAILURE_TTL_SECONDS = max(
+    float(os.environ.get("LOCAL_AI_TOOLS_SHADOW_FAILURE_TTL_SECONDS", "10")),
+    2.0,
+)
+_SHADOW_EXECUTOR_MAX_WORKERS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS", "2")),
+    1,
+)
+_SHADOW_MAX_INFLIGHT = _SHADOW_EXECUTOR_MAX_WORKERS * 2
+_SHADOW_MAX_CACHE_ENTRIES = 256
+_TRAIN_LOCK = threading.Lock()
+_TRAIN_EXECUTOR_LOCK = threading.Lock()
+_TRAIN_EXECUTOR: ProcessPoolExecutor | None = None
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
     "phase",
@@ -274,6 +313,108 @@ def _cache_get_or_load(key: str, loader):
         return _TRANSFORMER_MODEL_CACHE[key]
 
 
+def _shadow_executor() -> ThreadPoolExecutor:
+    global _SHADOW_EXECUTOR
+    with _SHADOW_EXECUTOR_LOCK:
+        if _SHADOW_EXECUTOR is None:
+            _SHADOW_EXECUTOR = ThreadPoolExecutor(max_workers=_SHADOW_EXECUTOR_MAX_WORKERS, thread_name_prefix="phase3-shadow")
+        return _SHADOW_EXECUTOR
+
+
+def _shadow_cache_key(kind: str, features: dict[str, Any]) -> str:
+    relevant = {
+        "kind": kind,
+        "symbol": features.get("symbol"),
+        "close_sequence": features.get("close_sequence") or features.get("recent_closes") or features.get("closes"),
+        "recent_headlines": features.get("recent_headlines") or features.get("headlines"),
+        "news_sentiment_avg": features.get("news_sentiment_avg"),
+        "social_sentiment_avg": features.get("social_sentiment_avg"),
+        "horizon_steps": features.get("horizon_steps") or features.get("forecast_horizon_steps") or features.get("horizon_minutes"),
+    }
+    return canonical_sha256(relevant)
+
+
+def _shadow_ready_or_submit(kind: str, features: dict[str, Any], worker) -> dict[str, Any]:
+    """Return cached shadow evidence or submit one bounded background job."""
+    if kind in {"timesfm", "chronos2"}:
+        try:
+            closes, reason, sequence_source = _timeseries_close_sequence(features)
+            if reason:
+                return {
+                    "available": False,
+                    "actual_inference": False,
+                    "status": "shadow_unavailable",
+                    "reason": reason,
+                    "sequence_length": len(closes),
+                    "sequence_source": sequence_source,
+                    "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+                }
+        except NameError:
+            pass
+    key = _shadow_cache_key(kind, features)
+    now = time.monotonic()
+    with _SHADOW_EXECUTOR_LOCK:
+        cached = _SHADOW_RESULT_CACHE.get(key)
+        cache_ttl = (
+            _SHADOW_CACHE_TTL_SECONDS
+            if cached and cached[1].get("available")
+            else _SHADOW_FAILURE_TTL_SECONDS
+        )
+        if cached and now - cached[0] < cache_ttl:
+            return {**cached[1], "shadow_cache_hit": True}
+        if key in _SHADOW_INFLIGHT:
+            return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_in_progress", "shadow_cache_key": key}
+        if len(_SHADOW_INFLIGHT) >= _SHADOW_MAX_INFLIGHT:
+            return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_capacity_exhausted"}
+        try:
+            future = _shadow_executor().submit(worker, dict(features))
+        except RuntimeError:
+            return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_executor_unavailable"}
+        _SHADOW_INFLIGHT[key] = future
+
+    def complete(done: Future, cache_key: str = key) -> None:
+        try:
+            value = done.result()
+            result = dict(value) if isinstance(value, dict) else {"available": False, "reason": "shadow_invalid_result"}
+        except Exception as exc:
+            result = {"available": False, "reason": safe_error(exc, 220)}
+        with _SHADOW_EXECUTOR_LOCK:
+            _SHADOW_INFLIGHT.pop(cache_key, None)
+            _SHADOW_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+            if len(_SHADOW_RESULT_CACHE) > _SHADOW_MAX_CACHE_ENTRIES:
+                oldest = min(_SHADOW_RESULT_CACHE, key=lambda item: _SHADOW_RESULT_CACHE[item][0])
+                _SHADOW_RESULT_CACHE.pop(oldest, None)
+
+    future.add_done_callback(complete)
+    # Keep tests and very small adapters responsive without waiting on real
+    # transformer inference. Production model calls normally exceed this grace
+    # window and return immediately with a pending shadow marker.
+    try:
+        immediate = future.result(timeout=0.05)
+    except TimeoutError:
+        immediate = None
+    except Exception:
+        immediate = None
+    if isinstance(immediate, dict):
+        return {**immediate, "shadow_completed_inline": True}
+    return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_queued", "shadow_cache_key": key}
+
+
+def _preserve_torch_default_device(loader):
+    """Prevent optional model loaders from leaking a process-wide meta device."""
+
+    try:
+        import torch
+
+        default_device = torch.get_default_device()
+    except Exception:
+        return loader()
+    try:
+        return loader()
+    finally:
+        torch.set_default_device(default_device)
+
+
 def _is_loopback_request(request: Request) -> bool:
     client_host = (request.client.host if request.client else "") or ""
     return client_host in {"127.0.0.1", "::1", "localhost"}
@@ -310,6 +451,29 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def startup_load_current_bundle() -> None:
+    """Load the verified bundle before accepting inference traffic."""
+
+    # The first request otherwise pays the full joblib/scikit-learn and optional
+    # specialist-model load cost and is mistaken for a route timeout by the
+    # platform. Warm every inference path before accepting traffic.
+    _post_training_inference_warmup()
+
+
+@app.on_event("shutdown")
+def shutdown_shadow_executor() -> None:
+    """Stop background specialist work so deploys do not leave threads behind."""
+    global _SHADOW_EXECUTOR
+    with _SHADOW_EXECUTOR_LOCK:
+        executor = _SHADOW_EXECUTOR
+        _SHADOW_EXECUTOR = None
+        _SHADOW_INFLIGHT.clear()
+        _SHADOW_RESULT_CACHE.clear()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 class FeatureRequest(BaseModel):
     symbol: str | None = None
     features: dict[str, Any] = {}
@@ -327,6 +491,7 @@ class TrainRequest(BaseModel):
     completed_trade_sample_count: int | None = None
     quality_report: dict[str, Any] = {}
     governance_report: dict[str, Any] = {}
+    training_transport_report: dict[str, Any] = {}
     return_objective_report: dict[str, Any] = {}
     profit_supervision_report: dict[str, Any] = {}
     training_mode: str = "shadow"
@@ -2739,6 +2904,44 @@ def _iter_sequence_training_windows(
             }
 
 
+def _sequence_training_window_count(samples: list[dict[str, Any]]) -> int:
+    """Count valid source windows without allocating each overlapping window."""
+
+    total = 0
+    for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        compact = _compact_sequence_series(sample)
+        if sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+            if compact is not None:
+                total += max(len(compact[0]) - 31, 0)
+        else:
+            total += 1
+    return total
+
+
+def _iter_bounded_sequence_training_windows(
+    samples: list[dict[str, Any]],
+    max_samples: int,
+):
+    """Yield an evenly spaced chronological subset of sequence windows."""
+
+    source_count = _sequence_training_window_count(samples)
+    target = min(max(int(max_samples), 1), source_count)
+    if target <= 0:
+        return
+    if source_count <= target:
+        yield from _iter_sequence_training_windows(samples)
+        return
+    selected_indices = {
+        round(index * (source_count - 1) / (target - 1))
+        for index in range(target)
+    }
+    for source_index, sample in enumerate(_iter_sequence_training_windows(samples)):
+        if source_index in selected_indices:
+            yield sample
+
+
 def sequence_features(close_sequence: Any, volume_sequence: Any | None = None) -> list[float]:
     closes = _safe_sequence(close_sequence)
     volumes = _safe_sequence(volume_sequence or [])
@@ -2800,7 +3003,11 @@ def sequence_deep_features(close_sequence: Any, volume_sequence: Any | None = No
 
 def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     rows = []
-    for sample in _iter_sequence_training_windows(samples):
+    source_sample_count = _sequence_training_window_count(samples)
+    for sample in _iter_bounded_sequence_training_windows(
+        samples,
+        SEQUENCE_MODEL_MAX_SAMPLES,
+    ):
         x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
         long_return = f(sample, "long_return_pct", future_move)
@@ -2821,6 +3028,8 @@ def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | Non
         "long_model": long_model,
         "short_model": short_model,
         "samples": len(rows),
+        "source_samples": source_sample_count,
+        "max_samples": SEQUENCE_MODEL_MAX_SAMPLES,
         "timeframes": timeframes,
     }
 
@@ -2832,8 +3041,14 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     except Exception as exc:
         return {"available": False, "reason": f"torch_unavailable: {safe_error(exc, 120)}"}
 
+    # Sequence windows overlap heavily. Count cheap windows first, then keep an
+    # evenly spaced chronological subset before constructing deep features.
+    source_sample_count = _sequence_training_window_count(samples)
     rows = []
-    for sample in _iter_sequence_training_windows(samples):
+    for sample in _iter_bounded_sequence_training_windows(
+        samples,
+        TORCH_PATCH_MAX_SAMPLES,
+    ):
         x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
         future_move = f(sample, "future_return_pct")
         long_return = f(sample, "long_return_pct", future_move)
@@ -2843,6 +3058,9 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     if len(rows) <= 1:
         return {"available": False, "reason": "sequence_distribution_unavailable", "samples": len(rows)}
 
+    if len(rows) > TORCH_PATCH_MAX_SAMPLES:
+        rows = rows[:TORCH_PATCH_MAX_SAMPLES]
+
     X = np.array([x for x, _, _ in rows], dtype=np.float32)
     y = np.array([[long_y, short_y] for _, long_y, short_y in rows], dtype=np.float32)
     mean = X.mean(axis=0, keepdims=True)
@@ -2850,20 +3068,24 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     X = (X - mean) / std
 
     torch.set_num_threads(_adaptive_training_worker_count())
-    xt = torch.tensor(X, dtype=torch.float32)
-    yt = torch.tensor(y, dtype=torch.float32)
-    model = nn.Sequential(
-        nn.Linear(X.shape[1], 96),
-        nn.GELU(),
-        nn.Dropout(0.05),
-        nn.Linear(96, 48),
-        nn.GELU(),
-        nn.Linear(48, 2),
-    )
+    # Optional TimesFM loading can leave torch's process-wide default device at
+    # ``meta``. This patch model is deliberately CPU-only, so pin both tensors
+    # and module construction to CPU instead of inheriting that global default.
+    xt = torch.tensor(X, dtype=torch.float32, device="cpu")
+    yt = torch.tensor(y, dtype=torch.float32, device="cpu")
+    with torch.device("cpu"):
+        model = nn.Sequential(
+            nn.Linear(X.shape[1], 96),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(96, 48),
+            nn.GELU(),
+            nn.Linear(48, 2),
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=0.01)
     loss_fn = nn.SmoothL1Loss()
     model.train()
-    epochs = 120 if len(rows) < 1000 else 80
+    epochs = min(120 if len(rows) < 1000 else 80, TORCH_PATCH_MAX_EPOCHS)
     for _ in range(epochs):
         optimizer.zero_grad(set_to_none=True)
         loss = loss_fn(model(xt), yt)
@@ -2876,6 +3098,9 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         "available": True,
         "backend": "torch_patch_mlp_cpu",
         "samples": len(rows),
+        "source_samples": source_sample_count,
+        "max_samples": TORCH_PATCH_MAX_SAMPLES,
+        "epochs": epochs,
         "input_dim": int(X.shape[1]),
         "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "mean": mean.astype(float).tolist()[0],
@@ -2900,18 +3125,19 @@ def _predict_torch_patch_model(
         if mean.shape != x.shape or std.shape != x.shape:
             return None
         x = (x - mean) / (std + 1e-6)
-        net = nn.Sequential(
-            nn.Linear(x.shape[1], 96),
-            nn.GELU(),
-            nn.Dropout(0.05),
-            nn.Linear(96, 48),
-            nn.GELU(),
-            nn.Linear(48, 2),
-        )
+        with torch.device("cpu"):
+            net = nn.Sequential(
+                nn.Linear(x.shape[1], 96),
+                nn.GELU(),
+                nn.Dropout(0.05),
+                nn.Linear(96, 48),
+                nn.GELU(),
+                nn.Linear(48, 2),
+            )
         net.load_state_dict(model_info["state_dict"])
         net.eval()
         with torch.no_grad():
-            prediction = net(torch.tensor(x, dtype=torch.float32))[0]
+            prediction = net(torch.tensor(x, dtype=torch.float32, device="cpu"))[0]
             return float(prediction[0].item()), float(prediction[1].item())
     except Exception:
         return None
@@ -3041,7 +3267,10 @@ def _load_timesfm_model(model_dir: str):
             "official_backend_error": official_error,
         }
 
-    return _cache_get_or_load(f"timesfm::{model_dir}", loader)
+    return _cache_get_or_load(
+        f"timesfm::{model_dir}",
+        lambda: _preserve_torch_default_device(loader),
+    )
 
 
 def _load_chronos2_pipeline(model_dir: str):
@@ -3050,7 +3279,10 @@ def _load_chronos2_pipeline(model_dir: str):
 
         return Chronos2Pipeline.from_pretrained(model_dir)
 
-    return _cache_get_or_load(f"chronos2::{model_dir}", loader)
+    return _cache_get_or_load(
+        f"chronos2::{model_dir}",
+        lambda: _preserve_torch_default_device(loader),
+    )
 
 
 def _prediction_values(value: Any) -> list[float]:
@@ -3497,8 +3729,16 @@ def _attach_timeseries_specialist_shadow(
     features: dict[str, Any],
 ) -> dict[str, Any]:
     chain = _specialist_model_chain("timeseries")
-    primary_shadow = _run_timesfm_shadow(features)
-    challenger_shadow = _run_chronos2_shadow(features)
+    primary_shadow = _shadow_ready_or_submit(
+        "timesfm",
+        features,
+        _run_timesfm_shadow,
+    )
+    challenger_shadow = _shadow_ready_or_submit(
+        "chronos2",
+        features,
+        _run_chronos2_shadow,
+    )
     active = bool(primary_shadow.get("available") or challenger_shadow.get("available"))
     specialist_shadow = primary_shadow if primary_shadow.get("available") else challenger_shadow
     payload["specialist_response_applied"] = False
@@ -4646,14 +4886,15 @@ def _post_training_inference_warmup() -> dict[str, Any]:
 
 
 def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, Any]:
+    if os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1":
+        return payload
     return {
         **payload,
         "post_training_inference_warmup": _post_training_inference_warmup(),
     }
 
 
-@app.post("/train")
-def train(req: TrainRequest) -> dict[str, Any]:
+def _train_impl(req: TrainRequest) -> dict[str, Any]:
     rows = _market_training_rows(req.shadow_samples or [])
     cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
     if len(rows) <= 1:
@@ -5030,6 +5271,10 @@ def train(req: TrainRequest) -> dict[str, Any]:
             req.completed_trade_sample_count or len(trainable_trade_samples)
         ),
         "sequence_sample_count": int((deep_sequence_model or {}).get("samples") or 0),
+        "sequence_source_sample_count": int(
+            (deep_sequence_model or {}).get("source_samples") or 0
+        ),
+        "sequence_model_max_samples": SEQUENCE_MODEL_MAX_SAMPLES,
         "text_sentiment_sample_count": int((text_sentiment_model or {}).get("samples") or 0),
         "torch_patch_available": bool((torch_patch_model or {}).get("available")),
         "torch_patch_status": _public_torch_patch_status(torch_patch_model),
@@ -5077,6 +5322,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "authoritative_trade_return_evidence": authoritative_trade_return_evidence,
         "quality_report": req.quality_report or {},
         "governance_report": req.governance_report or {},
+        "training_transport_report": req.training_transport_report or {},
         "return_objective_report": req.return_objective_report or {},
         "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
@@ -5156,17 +5402,17 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "profiles": profiles,
     }
     if not req.persist_artifact:
-        return _with_post_training_inference_warmup({
+        return {
             "trained": False,
             "reason": "phase3_preflight_no_artifact_write",
             **metadata,
-        })
+        }
     if not req.confirm_phase3_rebuild:
-        return _with_post_training_inference_warmup({
+        return {
             "trained": False,
             "reason": "phase3_rebuild_confirmation_required",
             **metadata,
-        })
+        }
     candidate = persist_candidate_bundle(bundle, metadata)
     activation_evidence = {
         field: metadata[field]
@@ -5240,6 +5486,79 @@ def train(req: TrainRequest) -> dict[str, Any]:
         "candidate_version": candidate["version"],
         "champion_comparison": champion_comparison,
     })
+
+
+def _configure_training_child() -> None:
+    os.environ["LOCAL_AI_TOOLS_TRAINING_CHILD"] = "1"
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+    try:
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) >= 4:
+            os.sched_setaffinity(0, set(available[: max(len(available) // 2, 1)]))
+    except (AttributeError, OSError):
+        pass
+
+
+def _isolated_training_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    _configure_training_child()
+    return _train_impl(TrainRequest(**payload))
+
+
+def _training_executor() -> ProcessPoolExecutor:
+    global _TRAIN_EXECUTOR
+
+    with _TRAIN_EXECUTOR_LOCK:
+        if _TRAIN_EXECUTOR is None:
+            _TRAIN_EXECUTOR = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        return _TRAIN_EXECUTOR
+
+
+def _invalidate_parent_bundle_cache() -> None:
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+
+    _BUNDLE_CACHE = None
+    _CURRENT_MODEL_PATH = None
+    _CURRENT_POINTER_MTIME_NS = None
+    _CURRENT_MODEL_MTIME_NS = None
+    _STATUS_ARTIFACT_CACHE.clear()
+
+
+def _run_training_request(req: TrainRequest) -> dict[str, Any]:
+    if (
+        not ISOLATE_TRAINING_PROCESS
+        or os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1"
+    ):
+        return _train_impl(req)
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    result = _training_executor().submit(_isolated_training_worker, payload).result()
+    if bool(req.persist_artifact) and bool(result.get("trained")):
+        _invalidate_parent_bundle_cache()
+        result = _with_post_training_inference_warmup(result)
+    return result
+
+
+@app.post("/train")
+def train(req: TrainRequest) -> dict[str, Any]:
+    # Training mutates candidate/challenger/current pointers and the shared
+    # model cache. Reject overlapping scheduler retries instead of allowing two
+    # requests to observe a half-transitioned artifact registry.
+    if not _TRAIN_LOCK.acquire(blocking=False):
+        return {
+            "trained": False,
+            "reason": "training_in_progress",
+            "message": "A local AI training request is already running.",
+    }
+    try:
+        return _run_training_request(req)
+    finally:
+        _TRAIN_LOCK.release()
 
 
 @app.post("/profit/predict")
@@ -5969,7 +6288,11 @@ def deep_sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
     """Independent text sentiment service slot for CryptoBERT/FinBERT style models."""
     features = req.features or {}
     base = sentiment_analyze(req)
-    specialist_shadow = _run_finbert_shadow(features)
+    specialist_shadow = _shadow_ready_or_submit(
+        "finbert",
+        features,
+        _run_finbert_shadow,
+    )
     base.update(
         {
             "endpoint": "sentiment_deep",
@@ -6101,6 +6424,7 @@ def render_phase3_quant_api_service() -> str:
             Environment=PHASE3_QUANT_API_PORT={PHASE3_API_PORT}
             Environment=LOCAL_AI_TOOLS_MODEL_DIR={PHASE3_MODEL_DIR}
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
+            Environment=LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS=true
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
@@ -6402,7 +6726,12 @@ def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> N
         safe_print(
             run_remote_text(
                 ssh,
-                f"systemctl is-active {sh(PHASE3_SERVICE_NAME)} && sleep 2 && "
+                f"systemctl is-active {sh(PHASE3_SERVICE_NAME)} && "
+                "for i in $(seq 1 30); do "
+                "  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8101/health/live || true); "
+                "  [ \"$code\" = \"200\" ] && break; sleep 2; "
+                "done; "
+                "[ \"${code:-000}\" = \"200\" ] && "
                 + _remote_smoke_command(),
                 timeout=180,
                 check=True,

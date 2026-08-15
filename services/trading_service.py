@@ -14,7 +14,7 @@ import os
 import shutil
 import sys
 from collections import Counter
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -153,7 +153,10 @@ from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
     ModelTrainingStateStore,
 )
-from services.okx_order_fact_sync import OkxOrderFactSyncService
+from services.okx_order_fact_sync import (
+    OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
+    OkxOrderFactSyncService,
+)
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
@@ -223,6 +226,7 @@ from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.text_sanitize import sanitize_text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OKX_ORDER_FACT_SYNC_PROCESS_GRACE_SECONDS = 20.0
 
 logger = structlog.get_logger(__name__)
 
@@ -264,6 +268,9 @@ MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
+TRAINING_PROCESS_MAX_WORKERS = 1
+AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS = 30 * 60
+AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS = 4 * 60 * 60
 
 
 def _low_priority_training_command(
@@ -279,6 +286,25 @@ def _low_priority_training_command(
     if selected_platform == "posix" and resolved_nice:
         return [resolved_nice, "-n", str(TRAINING_PROCESS_NICE_LEVEL), *command]
     return list(command)
+
+
+def _training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Bound BLAS/torch thread pools so training cannot starve live inference."""
+
+    env = dict(base_env or os.environ)
+    worker_count = str(TRAINING_PROCESS_MAX_WORKERS)
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "TORCH_NUM_THREADS",
+    ):
+        env[key] = worker_count
+    env["BB_TRAINING_MAX_WORKERS"] = worker_count
+    return env
 
 
 async def drain_cancelled_tasks(
@@ -642,6 +668,9 @@ class TradingService:
             order_fact_recovery_trigger=self.request_okx_order_fact_recovery,
         )
         self.okx_order_fact_sync_factory = OkxOrderFactSyncService
+        self._okx_order_fact_sync_isolated_runner = (
+            self._run_okx_order_fact_sync_subprocess
+        )
         self.okx_settlement_fact_sync_factory = OkxSettlementFactSyncService
         self.okx_position_settlement_sync_factory = OkxPositionSettlementSyncService
         self.exit_position_matcher = ExitPositionMatcher(self._normalize_position_symbol)
@@ -948,6 +977,44 @@ class TradingService:
             store = MODEL_TRAINING_STATE_STORE
             self.model_training_state_store = store
         return store
+
+    def _auto_train_failure_delay(self, results: list[dict[str, Any]]) -> float:
+        """Back off repeated failures while keeping normal checks on their cadence."""
+        failed = any(
+            str(result.get("reason") or "")
+            in {"error", "invalid_training_response", "load_samples_error", "timeout"}
+            for result in results
+            if isinstance(result, dict)
+        )
+        if not failed:
+            self._auto_train_failure_count = 0
+            return float(AUTO_TRAIN_CHECK_INTERVAL_SECONDS)
+        retry_count = int(getattr(self, "_auto_train_failure_count", 0) or 0)
+        try:
+            payload = self._model_training_state().read()
+            models = payload.get("models") if isinstance(payload, dict) else {}
+            persisted_retry = max(
+                [
+                    int(row.get("retry_count") or 0)
+                    for row in (models.values() if isinstance(models, dict) else [])
+                    if isinstance(row, dict)
+                ]
+                or [0]
+            )
+            retry_count = max(retry_count, persisted_retry)
+        except Exception as exc:
+            logger.debug(
+                "persistent auto-train retry count unavailable; using process-local count",
+                error=safe_error_text(exc, limit=120),
+            )
+        retry_count += 1
+        self._auto_train_failure_count = retry_count
+        return float(
+            min(
+                AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS * (2 ** max(retry_count - 1, 0)),
+                AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS,
+            )
+        )
 
     def set_loop_stage(self, stage: str) -> None:
         """Set loop stage through an explicit analysis-service boundary."""
@@ -1659,13 +1726,26 @@ class TradingService:
             if account_discovery
             else self.okx_order_fact_sync_timeout_seconds()
         )
-        report = await factory(
-            mode=mode,
-            lookback_hours=24,
-            limit=100,
-            priority_only=not account_discovery,
-            timeout_seconds=timeout_seconds,
-        ).sync()
+        isolated_runner = getattr(
+            self,
+            "_okx_order_fact_sync_isolated_runner",
+            None,
+        )
+        if account_discovery and isolated_runner is not None:
+            report = await isolated_runner(
+                mode=mode,
+                lookback_hours=24,
+                limit=100,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            report = await factory(
+                mode=mode,
+                lookback_hours=24,
+                limit=100,
+                priority_only=not account_discovery,
+                timeout_seconds=timeout_seconds,
+            ).sync()
         report = dict(report if isinstance(report, dict) else {})
         report["sync_scope"] = "account_discovery" if account_discovery else "priority"
         status = str(report.get("status") or "unknown").lower()
@@ -1721,6 +1801,120 @@ class TradingService:
             "sync_scope": report["sync_scope"],
             "order_fact_sync": report,
         }
+
+    async def _run_okx_order_fact_sync_subprocess(
+        self,
+        *,
+        mode: str,
+        lookback_hours: int,
+        limit: int,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "run_okx_order_fact_sync.py"),
+            "--mode",
+            str(mode),
+            "--lookback-hours",
+            str(int(lookback_hours)),
+            "--limit",
+            str(int(limit)),
+            "--timeout-seconds",
+            str(float(timeout_seconds)),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(PROJECT_ROOT),
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "status": "deferred",
+                "okx_pull_available": False,
+                "error": safe_error_text(exc, limit=180),
+                "deferred_stages": ["isolated_process"],
+                "process_isolated": True,
+            }
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=(
+                    float(timeout_seconds)
+                    + OKX_ORDER_FACT_SYNC_PROCESS_GRACE_SECONDS
+                ),
+            )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            return {
+                "status": "deferred",
+                "okx_pull_available": False,
+                "error": "isolated OKX order fact sync exceeded its process deadline",
+                "deferred_stages": ["isolated_process"],
+                "process_isolated": True,
+            }
+
+        try:
+            stdout_text = stdout.decode("utf-8")
+            result_frame = next(
+                (
+                    line.removeprefix(OKX_ORDER_FACT_SYNC_RESULT_PREFIX)
+                    for line in reversed(stdout_text.splitlines())
+                    if line.startswith(OKX_ORDER_FACT_SYNC_RESULT_PREFIX)
+                ),
+                None,
+            )
+            if result_frame is None:
+                raise ValueError("OKX order fact sync result frame missing")
+            payload = json.loads(result_frame)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            return {
+                "status": "deferred",
+                "okx_pull_available": False,
+                "error": (
+                    safe_error_text(stderr_text, limit=180, fallback="")
+                    or safe_error_text(exc, limit=180)
+                ),
+                "deferred_stages": ["isolated_process"],
+                "process_isolated": True,
+            }
+        report = (
+            dict(payload)
+            if isinstance(payload, dict)
+            else {
+                "status": "deferred",
+                "okx_pull_available": False,
+                "error": "isolated OKX order fact sync response was not an object",
+                "deferred_stages": ["isolated_process"],
+            }
+        )
+        if process.returncode != 0 and str(report.get("status") or "") != "deferred":
+            report.update(
+                {
+                    "status": "deferred",
+                    "okx_pull_available": False,
+                    "error": safe_error_text(
+                        stderr.decode("utf-8", errors="replace"),
+                        limit=180,
+                        fallback="isolated OKX order fact sync failed",
+                    ),
+                    "deferred_stages": ["isolated_process"],
+                }
+            )
+        report["process_isolated"] = True
+        return report
 
     def request_okx_order_fact_recovery(self, _execution_mode: str) -> None:
         """Force authoritative fill sync after any exchange-confirmed execution."""
@@ -4965,13 +5159,18 @@ class TradingService:
                 *bootstrap_major_symbols,
             ]
         )
+        # Deferred retries are important, but cannot consume the whole fetch
+        # budget. Reserve at least half of the market slots for a rotating slice
+        # of the broader OKX universe so repeated failures do not monopolize
+        # expert analysis.
+        priority_budget = (
+            market_budget
+            if market_budget < 8
+            else min(market_budget, max(int(configured_limit), market_budget // 2, 1))
+        )
         priority_limit = min(
-            market_budget,
-            max(
-                int(configured_limit),
-                len(deferred_market_symbols),
-                len(bootstrap_major_symbols),
-            ),
+            priority_budget,
+            len(priority_market_symbols),
         )
         selected_verified = priority_market_symbols[:priority_limit]
         self._last_auto_feature_fetch_budget_diagnostics = {
@@ -4991,6 +5190,8 @@ class TradingService:
             "deferred_candidate_symbol_count": len(deferred_market_symbols),
             "bootstrap_major_symbol_count": len(bootstrap_major_symbols),
             "selected_priority_symbol_count": len(selected_verified),
+            "priority_budget": int(priority_budget),
+            "rotating_symbol_reserve": max(market_budget - priority_limit, 0),
             "execution_mode": model_mode,
             "diagnostic_boundary": (
                 "Feature-fetch breadth only expands discovery before rank/evidence gates; "
@@ -6077,7 +6278,7 @@ class TradingService:
             ),
             skipped_symbols=diagnostics.get("skipped_symbols"),
             cooldown_excluded_symbols=diagnostics.get("cooldown_excluded_symbols"),
-            cooldown_underfilled=bool(diagnostics.get("cooldown_underfilled")),
+            cooldown_underfilled=diagnostics.get("cooldown_underfilled"),
             recent_material_change_count=diagnostics.get("recent_material_change_count"),
         )
         return result.selected
@@ -8889,7 +9090,29 @@ class TradingService:
     async def _ml_auto_train_loop(self) -> None:
         """Retrain local ML and server-side quant tools without blocking trading."""
         while self._running:
+            def training_deferred() -> bool:
+                runtime = getattr(self, "_analysis_runtime", {})
+                active_round = any(
+                    isinstance(runtime.get(scope), _AnalysisRuntimeState)
+                    and runtime[scope].active
+                    for scope in ("market", "position")
+                )
+                return bool(
+                    active_round
+                    or getattr(self, "_active_analysis_symbols", set())
+                    or (
+                        getattr(self, "_market_entry_pipeline_semaphore", None)
+                        and self._market_entry_pipeline_semaphore.locked()
+                    )
+                )
+
             async def run_ml_step() -> dict[str, Any]:
+                if training_deferred():
+                    return {
+                        "trained": False,
+                        "reason": "analysis_busy_deferred",
+                        "training_process_isolated": True,
+                    }
                 try:
                     result = await self._run_local_ml_training_subprocess()
                     if result.get("trained"):
@@ -8933,6 +9156,12 @@ class TradingService:
                     }
 
             async def run_local_tools_step() -> dict[str, Any]:
+                if training_deferred():
+                    return {
+                        "trained": False,
+                        "reason": "analysis_busy_deferred",
+                        "training_process_isolated": True,
+                    }
                 try:
                     return await self._maybe_train_local_ai_tools()
                 except asyncio.CancelledError:
@@ -8948,28 +9177,11 @@ class TradingService:
                         "error": safe_error_text(exc),
                     }
 
-            # The ML subprocess can legitimately run for tens of minutes. Keep
-            # the independent local-AI trainer on its own cadence instead of
-            # making it wait behind the ML process.
-            ml_result, local_tools_result = await asyncio.gather(
-                run_ml_step(),
-                run_local_tools_step(),
-            )
-            failed_reasons = {
-                "error",
-                "invalid_training_response",
-                "load_samples_error",
-                "timeout",
-            }
-            retry_due = any(
-                str(result.get("reason") or "") in failed_reasons
-                for result in (ml_result, local_tools_result)
-            )
-            await asyncio.sleep(
-                AUTO_TRAIN_RETRY_INTERVAL_SECONDS
-                if retry_due
-                else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
-            )
+            # Both trainers read the same large history and use the same model
+            # tunnel.  Serial execution prevents CPU, DB and 18001 contention.
+            ml_result = await run_ml_step()
+            local_tools_result = await run_local_tools_step()
+            await asyncio.sleep(self._auto_train_failure_delay([ml_result, local_tools_result]))
 
     async def _run_local_ml_training_subprocess(
         self,
@@ -8985,7 +9197,7 @@ class TradingService:
         process = await asyncio.create_subprocess_exec(
             *_low_priority_training_command(command),
             cwd=str(PROJECT_ROOT),
-            env=os.environ.copy(),
+            env=_training_process_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -9377,7 +9589,7 @@ class TradingService:
         process = await asyncio.create_subprocess_exec(
             *_low_priority_training_command(command),
             cwd=str(PROJECT_ROOT),
-            env=os.environ.copy(),
+            env=_training_process_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -9441,7 +9653,7 @@ class TradingService:
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(PROJECT_ROOT),
-            env=os.environ.copy(),
+            env=_training_process_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

@@ -111,6 +111,12 @@ CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
     float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) + 2.0,
     7.0,
 )
+INSTRUMENT_SPEC_TIMEOUT_SECONDS = max(
+    float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS),
+    2.0,
+)
+INSTRUMENT_SPEC_FAILURE_CACHE_SECONDS = 30.0
+DERIVATIVES_FAILURE_CACHE_SECONDS = 15.0
 
 
 class _PriorityBuildGate:
@@ -215,6 +221,7 @@ class DataService:
         self._kline_coverage_index = 0
         self._derivatives_cache: dict[str, dict[str, Any]] = {}
         self._derivatives_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._derivatives_failed_at: dict[str, datetime] = {}
         self._last_sentiment_update: datetime | None = None
         self._sentiment_update_interval = 300  # seconds
         self._derivatives_update_interval = 20  # seconds
@@ -229,6 +236,7 @@ class DataService:
         self._available_symbols_refresh_task: asyncio.Task | None = None
         self._instrument_spec_cache: dict[str, dict[str, Any]] = {}
         self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
+        self._instrument_spec_failed_at: dict[str, datetime] = {}
         self._stopping = False
 
         # Register ticker callback for real-time price updates
@@ -361,6 +369,20 @@ class DataService:
     async def stop(self) -> None:
         """Stop all data feed connections."""
         self._stopping = True
+        derivative_tasks = list(self._derivatives_refresh_task_map().values())
+        for task in derivative_tasks:
+            if not task.done():
+                task.cancel()
+        if derivative_tasks:
+            await asyncio.gather(*derivative_tasks, return_exceptions=True)
+        self._derivatives_refresh_task_map().clear()
+        instrument_tasks = list(getattr(self, "_instrument_spec_tasks", {}).values())
+        for task in instrument_tasks:
+            if not task.done():
+                task.cancel()
+        if instrument_tasks:
+            await asyncio.gather(*instrument_tasks, return_exceptions=True)
+        getattr(self, "_instrument_spec_tasks", {}).clear()
         await self._stop_kline_coverage_refresh()
         await self._stop_kline_persistence()
         await self._stop_indicator_cached_reads()
@@ -1182,17 +1204,40 @@ class DataService:
         if not isinstance(tasks, dict):
             tasks = {}
             self._instrument_spec_tasks = tasks
+        failed_cache = getattr(self, "_instrument_spec_failed_at", None)
+        if not isinstance(failed_cache, dict):
+            failed_cache = {}
+            self._instrument_spec_failed_at = failed_cache
         cached = cache.get(normalized)
         if isinstance(cached, dict) and cached:
             return dict(cached)
+        failed_at = failed_cache.get(normalized)
+        if (
+            not block_on_remote
+            or failed_at is not None
+            and (datetime.now(UTC) - failed_at).total_seconds()
+            < INSTRUMENT_SPEC_FAILURE_CACHE_SECONDS
+        ):
+            return {}
         task = tasks.get(normalized)
         if task and not task.done():
             if not block_on_remote:
                 return {}
-            result = await asyncio.shield(task)
-            return dict(result or {})
-        if not block_on_remote:
-            return {}
+            try:
+                result = await asyncio.wait_for(
+                    task,
+                    timeout=INSTRUMENT_SPEC_TIMEOUT_SECONDS,
+                )
+                return dict(result or {})
+            except TimeoutError:
+                # Cancel the shared request instead of shielding a task that can
+                # occupy every later derivatives refresh.
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                tasks.pop(normalized, None)
+                failed_cache[normalized] = datetime.now(UTC)
+                return {}
 
         async def fetch() -> dict[str, Any]:
             try:
@@ -1212,7 +1257,21 @@ class DataService:
         task = asyncio.create_task(fetch())
         tasks[normalized] = task
         try:
-            return dict(await asyncio.shield(task) or {})
+            result = await asyncio.wait_for(
+                task,
+                timeout=INSTRUMENT_SPEC_TIMEOUT_SECONDS,
+            )
+            if result:
+                failed_cache.pop(normalized, None)
+            else:
+                failed_cache[normalized] = datetime.now(UTC)
+            return dict(result or {})
+        except TimeoutError:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            failed_cache[normalized] = datetime.now(UTC)
+            return {}
         finally:
             if tasks.get(normalized) is task:
                 tasks.pop(normalized, None)
@@ -2306,6 +2365,21 @@ class DataService:
             cache = {}
             self._derivatives_cache = cache
         cached = cache.get(normalized)
+        failed_cache = getattr(self, "_derivatives_failed_at", None)
+        if not isinstance(failed_cache, dict):
+            failed_cache = {}
+            self._derivatives_failed_at = failed_cache
+        failed_at = failed_cache.get(normalized)
+        if (
+            block_on_remote
+            and failed_at is not None
+            and (now - failed_at).total_seconds() < DERIVATIVES_FAILURE_CACHE_SECONDS
+        ):
+            data = dict((cached or {}).get("data") or {})
+            if data:
+                data["derivatives_snapshot_stale"] = True
+                data["derivatives_refresh_suppressed"] = True
+            return data
         if cached:
             updated_at = cached.get("updated_at")
             if (
@@ -2338,8 +2412,18 @@ class DataService:
         existing_task = tasks.get(normalized)
         if existing_task and not existing_task.done():
             if block_on_remote:
-                result = await asyncio.shield(existing_task)
-                return dict(result or {})
+                try:
+                    result = await asyncio.wait_for(
+                        existing_task,
+                        timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+                    )
+                    return dict(result or {})
+                except TimeoutError:
+                    existing_task.cancel()
+                    await asyncio.gather(existing_task, return_exceptions=True)
+                    tasks.pop(normalized, None)
+                    failed_cache[normalized] = datetime.now(UTC)
+                    return {}
             return {"derivatives_refresh_in_background": True}
         if not block_on_remote:
             if allow_background_refresh:
@@ -2349,8 +2433,20 @@ class DataService:
         task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
         tasks[normalized] = task
         try:
-            result = await asyncio.shield(task)
-            return dict(result or {})
+            try:
+                result = await asyncio.wait_for(
+                    task,
+                    timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+                )
+                return dict(result or {})
+            except TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                failed_cache[normalized] = datetime.now(UTC)
+                return {}
+            except Exception:
+                failed_cache[normalized] = datetime.now(UTC)
+                return {}
         finally:
             if tasks.get(normalized) is task:
                 tasks.pop(normalized, None)
@@ -2395,6 +2491,7 @@ class DataService:
                 ),
                 timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
             )
+            failed_cache.pop(normalized, None)
         except Exception as e:
             logger.debug(
                 "failed to fetch derivatives snapshot",
@@ -2402,6 +2499,7 @@ class DataService:
                 error=safe_error_text(e),
             )
             data = {}
+            failed_cache[normalized] = datetime.now(UTC)
 
         self._derivatives_cache[normalized] = {
             "updated_at": now,

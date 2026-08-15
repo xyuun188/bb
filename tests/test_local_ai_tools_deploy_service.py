@@ -196,6 +196,12 @@ def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() 
         SERVICE_CODE
     )
     assert "if len(rows) < 80:" not in SERVICE_CODE
+    assert "TORCH_PATCH_MAX_SAMPLES" in SERVICE_CODE
+    assert "TORCH_PATCH_MAX_EPOCHS" in SERVICE_CODE
+    assert "Sequence windows overlap heavily" in SERVICE_CODE
+    assert 'LOCAL_AI_TOOLS_TORCH_PATCH_MAX_SAMPLES", "8000"' in SERVICE_CODE
+    assert 'LOCAL_AI_TOOLS_TORCH_PATCH_MAX_EPOCHS", "6"' in SERVICE_CODE
+    assert 'LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000"' in SERVICE_CODE
 
 
 def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
@@ -219,6 +225,50 @@ def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
     assert classifier.named_steps["model"].n_jobs == 2
 
 
+def test_local_ai_tools_training_rejects_overlapping_registry_mutations(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    assert module._TRAIN_LOCK.acquire(blocking=False) is True
+    try:
+        result = module.train(module.TrainRequest())
+    finally:
+        module._TRAIN_LOCK.release()
+
+    assert result == {
+        "trained": False,
+        "reason": "training_in_progress",
+        "message": "A local AI training request is already running.",
+    }
+
+
+def test_local_ai_tools_torch_patch_is_explicitly_cpu_bound() -> None:
+    assert 'torch.tensor(X, dtype=torch.float32, device="cpu")' in SERVICE_CODE
+    assert 'torch.tensor(y, dtype=torch.float32, device="cpu")' in SERVICE_CODE
+    assert 'with torch.device("cpu"):' in SERVICE_CODE
+    assert 'torch.tensor(x, dtype=torch.float32, device="cpu")' in SERVICE_CODE
+
+
+def test_optional_model_loaders_restore_torch_default_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_torch_device_guard_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    fake_torch = SimpleNamespace(current_device="cpu")
+    fake_torch.get_default_device = lambda: fake_torch.current_device
+    fake_torch.set_default_device = lambda value: setattr(
+        fake_torch, "current_device", value
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    def load_on_meta() -> str:
+        fake_torch.current_device = "meta"
+        return "loaded"
+
+    assert module._preserve_torch_default_device(load_on_meta) == "loaded"
+    assert fake_torch.current_device == "cpu"
+
+
 def test_post_training_warmup_primes_every_market_inference_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,7 +281,7 @@ def test_post_training_warmup_primes_every_market_inference_route(
     def completed(name: str):
         def predictor(request: object) -> dict[str, object]:
             called.append(name)
-            assert getattr(request, "symbol") == "BTC/USDT"
+            assert request.symbol == "BTC/USDT"
             return {"available": True}
 
         return predictor
@@ -317,6 +367,33 @@ def test_compact_native_sequence_transport_expands_all_windows_lazily() -> None:
     assert windows[0]["long_return_pct"] == pytest.approx((131.0 - 130.0) / 130.0 * 100.0)
     assert windows[0]["short_return_pct"] == pytest.approx(-windows[0]["long_return_pct"])
     assert list(module._iter_sequence_training_windows([{**sample, "observation_count": 1}])) == []
+
+
+def test_sequence_training_models_use_bounded_evenly_spaced_windows() -> None:
+    module = ModuleType("local_ai_tools_bounded_sequence_test")
+    sys.modules[module.__name__] = module
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    closes = [100.0 + index for index in range(80)]
+    sample = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1m",
+        "sequence_format": module.COMPACT_SEQUENCE_SERIES_FORMAT,
+        "close_sequence": closes,
+        "volume_sequence": [10.0 + index for index in range(80)],
+        "observation_count": 49,
+        "label_name": "gross_market_move_pct",
+        "label_version": "test-v1",
+    }
+
+    windows = list(module._iter_bounded_sequence_training_windows([sample], 7))
+
+    assert module._sequence_training_window_count([sample]) == 49
+    assert len(windows) == 7
+    assert windows[0]["close_sequence"] == closes[:31]
+    assert windows[-1]["close_sequence"] == closes[19:79]
+    assert "_iter_bounded_sequence_training_windows" in SERVICE_CODE
+    assert "SEQUENCE_MODEL_MAX_SAMPLES" in SERVICE_CODE
+    assert "TORCH_PATCH_MAX_SAMPLES" in SERVICE_CODE
 
 
 def test_training_upload_uses_scheduler_deadline_instead_of_http_write_timeout() -> None:

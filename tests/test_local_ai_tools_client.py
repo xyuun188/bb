@@ -141,7 +141,8 @@ async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_rou
     assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
     assert len(set(timeouts)) == 1
     assert 7.5 < timeouts[0] <= 8.0
-    assert result["execution_mode"] == "concurrent_routes_serial_batches"
+    assert result["execution_mode"] == "concurrent_routes_bounded_batches"
+    assert result["max_concurrent_batches"] == 2
     assert result["batch_budget_policy"] == (
         "shared_batch_deadline_concurrent_routes"
     )
@@ -152,7 +153,7 @@ async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_rou
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_serializes_batches_but_concurrently_runs_routes(
+async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -160,6 +161,9 @@ async def test_local_ai_tools_serializes_batches_but_concurrently_runs_routes(
     active_calls = 0
     max_active_calls = 0
     calls: list[tuple[str, str]] = []
+    started_symbols: set[str] = set()
+    two_batches_started = asyncio.Event()
+    release_calls = asyncio.Event()
 
     async def succeed(
         path: str,
@@ -169,23 +173,40 @@ async def test_local_ai_tools_serializes_batches_but_concurrently_runs_routes(
         nonlocal active_calls, max_active_calls
         active_calls += 1
         max_active_calls = max(max_active_calls, active_calls)
-        calls.append((str(payload.get("symbol") or ""), path))
-        await asyncio.sleep(0.01)
+        symbol = str(payload.get("symbol") or "")
+        calls.append((symbol, path))
+        started_symbols.add(symbol)
+        if len(started_symbols) == 2:
+            two_batches_started.set()
+        await release_calls.wait()
         active_calls -= 1
         return {"available": True, "path": path, "best_side": "long"}
 
     monkeypatch.setattr(client, "_post", succeed)
 
-    first, second = await asyncio.gather(
-        client.enrich_with_context({"symbol": "BTC/USDT"}),
-        client.enrich_with_context({"symbol": "ETH/USDT"}),
+    first_task = asyncio.create_task(
+        client.enrich_with_context({"symbol": "BTC/USDT"})
     )
+    second_task = asyncio.create_task(
+        client.enrich_with_context({"symbol": "ETH/USDT"})
+    )
+    await asyncio.wait_for(two_batches_started.wait(), timeout=0.5)
+
+    third = await client.enrich_with_context({"symbol": "SOL/USDT"})
+    release_calls.set()
+    first, second = await asyncio.gather(first_task, second_task)
 
     assert first["status"] == "completed"
-    assert second["status"] == "analysis_budget_deferred"
-    assert max_active_calls == 3
-    assert len(calls) == 3
-    assert {symbol for symbol, _path in calls} == {"BTC/USDT"}
+    assert second["status"] == "completed"
+    assert third["status"] == "analysis_budget_deferred"
+    assert third["deferred_tools"] == [
+        "profit_prediction",
+        "sentiment_analysis",
+        "time_series_prediction",
+    ]
+    assert max_active_calls == 6
+    assert len(calls) == 6
+    assert {symbol for symbol, _path in calls} == {"BTC/USDT", "ETH/USDT"}
 
 
 @pytest.mark.asyncio

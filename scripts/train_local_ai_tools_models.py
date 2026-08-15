@@ -7,8 +7,10 @@ import asyncio
 import importlib
 import inspect
 import json
+import math
 import os
 import sys
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +59,12 @@ from services.training_epoch import (
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
+_REMOTE_TRAINING_TRANSPORT_VERSION = "2026-08-14.bounded-training-transport.v1"
+_REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 5_000
+_REMOTE_TRAINING_MAX_TRADE_SAMPLES = 2_048
+_REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 256
+_REMOTE_TRAINING_MAX_TEXT_SAMPLES = 2_000
+_SEQUENCE_ROWS_PER_SERIES_LIMIT = _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "change_24h_pct",
@@ -295,6 +303,248 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
     return compact
 
 
+_TRAINING_SAMPLE_SCALAR_KEYS = (
+    "id",
+    "decision_id",
+    "position_id",
+    "symbol",
+    "analysis_type",
+    "decision_action",
+    "decision_confidence",
+    "horizon_minutes",
+    "label_version",
+    "label_timestamp",
+    "decision_timestamp",
+    "long_return_pct",
+    "short_return_pct",
+    "best_action",
+    "missed_opportunity",
+    "sample_weight",
+    "data_quality_status",
+    "data_quality_score",
+    "exclude_from_training",
+    "quality_reasons",
+    "correlation_weight",
+    "side",
+    "lifecycle_key",
+    "holding_minutes",
+    "opened_at",
+    "closed_at",
+    "updated_at",
+    "realized_pnl",
+)
+
+_TRAINING_PROFIT_TASK_FIELDS = {
+    "market_opportunity_distribution": (
+        "eligible",
+        "source_authority",
+        "long_gross_market_return_pct",
+        "short_gross_market_return_pct",
+    ),
+    "execution_cost_and_slippage_distribution": (
+        "eligible",
+        "source_authority",
+        "total_cost_pct",
+        "slippage_pct",
+    ),
+    "authoritative_realized_return_distribution": (
+        "eligible",
+        "source_authority",
+        "net_return_after_all_cost_pct",
+        "side",
+        "stop_loss_slippage_pct",
+    ),
+}
+
+
+def _training_transport_features(features: Any) -> dict[str, Any]:
+    """Keep only scalar features consumed by the remote model factory.
+
+    Raw model transcripts and evidence contracts remain in the platform audit
+    database and quality report. They are not inputs to the numerical models and
+    must not cross the model-server tunnel with every rebuild.
+    """
+
+    if not isinstance(features, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in _LOCAL_AI_TOOLS_FEATURE_KEYS:
+        if key not in features:
+            continue
+        value = features.get(key)
+        if key == "symbol":
+            text = str(value or "").strip()
+            if text:
+                compact[key] = text[:40]
+            continue
+        number = _compact_numeric(value)
+        if number is not None:
+            compact[key] = number
+    return compact
+
+
+def _training_transport_profit_supervision(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {"version": str(value.get("version") or "")[:120]}
+    tasks = value.get("tasks") or {}
+    compact_tasks: dict[str, dict[str, Any]] = {}
+    if isinstance(tasks, dict):
+        for task_name, fields in _TRAINING_PROFIT_TASK_FIELDS.items():
+            source = tasks.get(task_name)
+            if not isinstance(source, dict):
+                continue
+            task = {
+                field: source.get(field)
+                for field in fields
+                if field in source
+            }
+            if task:
+                compact_tasks[task_name] = task
+    compact["tasks"] = compact_tasks
+    return compact
+
+
+def _evenly_spaced_rows(
+    rows: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Bound a chronological view while retaining both ends of its history."""
+
+    if len(rows) <= max(int(limit), 1):
+        return list(rows)
+    target = max(int(limit), 1)
+    if target == 1:
+        return [rows[-1]]
+    last_index = len(rows) - 1
+    indices = [round(index * last_index / (target - 1)) for index in range(target)]
+    return [rows[index] for index in indices]
+
+
+def _transport_sample(sample: dict[str, Any], *, kind: str) -> dict[str, Any]:
+    """Project one annotated sample to the model factory's input contract."""
+
+    if kind == "sequence":
+        sequence = {
+            key: sample.get(key)
+            for key in (
+                "symbol",
+                "timeframe",
+                "sequence_format",
+                "first_open_time",
+                "last_open_time",
+                "label_name",
+                "label_version",
+                "close_sequence",
+                "volume_sequence",
+                "sample_weight",
+                "exclude_from_training",
+                "data_quality_status",
+                "quality_reasons",
+            )
+            if key in sample
+        }
+        closes = list(sequence.get("close_sequence") or [])
+        volumes = list(sequence.get("volume_sequence") or [])
+        length = min(
+            len(closes),
+            len(volumes),
+            _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH,
+        )
+        sequence["close_sequence"] = closes[-length:] if length else []
+        sequence["volume_sequence"] = volumes[-length:] if length else []
+        sequence["observation_count"] = max(length - 31, 0)
+        return sequence
+
+    projected = {
+        key: sample.get(key)
+        for key in _TRAINING_SAMPLE_SCALAR_KEYS
+        if key in sample
+    }
+    projected["features"] = _training_transport_features(sample.get("features"))
+    if "profit_supervision" in sample:
+        projected["profit_supervision"] = _training_transport_profit_supervision(
+            sample.get("profit_supervision")
+        )
+    correlation = sample.get("correlation_weight") or {}
+    if isinstance(correlation, dict):
+        correlation_group = str(correlation.get("correlation_group") or "").strip()
+        projected["correlation_weight"] = (
+            {"correlation_group": correlation_group[:200]}
+            if correlation_group
+            else {}
+        )
+    return projected
+
+
+def _build_training_transport_views(
+    training_payload: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Build bounded, audit-linked views for the remote training request."""
+
+    source_rows = {
+        "shadow": list(training_payload.get("shadow_samples") or []),
+        "trade": list(training_payload.get("trade_samples") or []),
+        "sequence": list(training_payload.get("sequence_samples") or []),
+        "text_sentiment": list(training_payload.get("text_sentiment_samples") or []),
+    }
+    selected = {
+        "shadow": [
+            _transport_sample(row, kind="shadow")
+            for row in _evenly_spaced_rows(
+                source_rows["shadow"], _REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+            )
+        ],
+        "trade": [
+            _transport_sample(row, kind="trade")
+            for row in _evenly_spaced_rows(
+                source_rows["trade"], _REMOTE_TRAINING_MAX_TRADE_SAMPLES
+            )
+        ],
+        "sequence": [
+            _transport_sample(row, kind="sequence")
+            for row in source_rows["sequence"]
+        ],
+        "text_sentiment": [
+            {
+                key: row.get(key)
+                for key in (
+                    "id",
+                    "source",
+                    "platform",
+                    "text",
+                    "sentiment_score",
+                    "engagement_count",
+                    "symbols",
+                    "created_at",
+                    "label_timestamp",
+                    "sample_weight",
+                    "exclude_from_training",
+                    "data_quality_status",
+                    "quality_reasons",
+                )
+                if key in row
+            }
+            for row in _evenly_spaced_rows(
+                source_rows["text_sentiment"], _REMOTE_TRAINING_MAX_TEXT_SAMPLES
+            )
+        ],
+    }
+    transport_report = {
+        "version": _REMOTE_TRAINING_TRANSPORT_VERSION,
+        "source_sample_counts": {key: len(value) for key, value in source_rows.items()},
+        "sent_sample_counts": {key: len(value) for key, value in selected.items()},
+        "limits": {
+            "shadow_samples": _REMOTE_TRAINING_MAX_SHADOW_SAMPLES,
+            "trade_samples": _REMOTE_TRAINING_MAX_TRADE_SAMPLES,
+            "sequence_length": _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH,
+            "text_sentiment_samples": _REMOTE_TRAINING_MAX_TEXT_SAMPLES,
+        },
+        "raw_evidence_policy": "retained_on_platform;excluded_from_remote_training_transport",
+    }
+    return selected, transport_report
+
+
 def _compact_shadow_scalar(value: Any) -> Any:
     if isinstance(value, bool) or value is None:
         return value
@@ -503,21 +753,106 @@ def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _load_shadow_samples() -> list[dict[str, Any]]:
+async def _load_shadow_samples(
+    *,
+    sample_budget: int | None = None,
+) -> list[dict[str, Any]]:
     before_id: int | None = None
     samples: list[dict[str, Any]] = []
     epoch_start = load_training_epoch_start()
+
+    def append_sample(row: Mapping[str, Any]) -> None:
+        features = _snapshot(row.get("features"))
+        if not features:
+            return
+        features.setdefault("symbol", row.get("symbol"))
+        features.setdefault(
+            "decision_confidence",
+            _as_float(row.get("decision_confidence")),
+        )
+        features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
+        fee_pct, _fee_source = round_trip_fee_pct(features)
+        if fee_pct > 0:
+            features["round_trip_fee_pct"] = fee_pct
+        compact_features = _compact_local_ai_tools_features(features)
+        if not compact_features:
+            return
+        samples.append(
+            {
+                "id": int(row.get("id") or 0),
+                "decision_id": int(row.get("decision_id") or 0) or None,
+                "label_version": str(row.get("label_version") or ""),
+                "symbol": row.get("symbol"),
+                "analysis_type": row.get("analysis_type"),
+                "decision_action": row.get("decision_action"),
+                "decision_confidence": _as_float(row.get("decision_confidence")),
+                "horizon_minutes": int(row.get("horizon_minutes") or 10),
+                "features": compact_features,
+                "model_shadow_action": str(
+                    features.get("model_shadow_action") or ""
+                ).lower(),
+                "long_return_pct": _as_float(row.get("long_return_pct")),
+                "short_return_pct": _as_float(row.get("short_return_pct")),
+                "label_timestamp": row.get("label_timestamp"),
+                "best_action": row.get("best_action"),
+                "missed_opportunity": bool(row.get("missed_opportunity")),
+            }
+        )
+
+    filters = (
+        ShadowBacktest.status == "completed",
+        ShadowBacktest.created_at >= epoch_start,
+        ShadowBacktest.long_return_pct.is_not(None),
+        ShadowBacktest.short_return_pct.is_not(None),
+    )
+    requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
+    if requested_limit:
+        async with get_read_session_ctx() as session:
+            total_result = await session.execute(
+                select(func.count(ShadowBacktest.id)).where(*filters)
+            )
+            total_count = int(total_result.scalar() or 0)
+            if total_count > requested_limit:
+                stride = max(
+                    math.ceil((total_count - 1) / (requested_limit - 1)),
+                    1,
+                )
+                selected_ranks = list(range(1, total_count + 1, stride))
+                if selected_ranks[-1] != total_count:
+                    selected_ranks.append(total_count)
+                ranked_ids = (
+                    select(
+                        ShadowBacktest.id.label("shadow_id"),
+                        func.row_number()
+                        .over(order_by=ShadowBacktest.id.asc())
+                        .label("sample_rank"),
+                    )
+                    .where(*filters)
+                    .subquery()
+                )
+                stmt = (
+                    select(*_shadow_sample_columns())
+                    .join(
+                        ranked_ids,
+                        ranked_ids.c.shadow_id == ShadowBacktest.id,
+                    )
+                    .where(
+                        ranked_ids.c.sample_rank.in_(selected_ranks)
+                    )
+                    .order_by(ShadowBacktest.id.desc())
+                )
+                result = await session.stream(stmt)
+                async for row in result.mappings():
+                    append_sample(_shadow_sample_from_mapping(row))
+                samples.reverse()
+                return samples
+
     while True:
         page_limit = _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE
         async with get_read_session_ctx() as session:
             stmt = (
                 select(*_shadow_sample_columns())
-                .where(
-                    ShadowBacktest.status == "completed",
-                    ShadowBacktest.created_at >= epoch_start,
-                    ShadowBacktest.long_return_pct.is_not(None),
-                    ShadowBacktest.short_return_pct.is_not(None),
-                )
+                .where(*filters)
                 .order_by(ShadowBacktest.id.desc())
                 .limit(page_limit)
             )
@@ -528,39 +863,7 @@ async def _load_shadow_samples() -> list[dict[str, Any]]:
             break
         before_id = int(rows[-1].get("id") or 0) or before_id
         for row in rows:
-            features = _snapshot(row.get("features"))
-            if not features:
-                continue
-            features.setdefault("symbol", row.get("symbol"))
-            features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
-            features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
-            fee_pct, _fee_source = round_trip_fee_pct(features)
-            if fee_pct > 0:
-                features["round_trip_fee_pct"] = fee_pct
-            compact_features = _compact_local_ai_tools_features(features)
-            if not compact_features:
-                continue
-            samples.append(
-                {
-                    "id": int(row.get("id") or 0),
-                    "decision_id": int(row.get("decision_id") or 0) or None,
-                    "label_version": str(row.get("label_version") or ""),
-                    "symbol": row.get("symbol"),
-                    "analysis_type": row.get("analysis_type"),
-                    "decision_action": row.get("decision_action"),
-                    "decision_confidence": _as_float(row.get("decision_confidence")),
-                    "horizon_minutes": int(row.get("horizon_minutes") or 10),
-                    "features": compact_features,
-                    "model_shadow_action": str(
-                        features.get("model_shadow_action") or ""
-                    ).lower(),
-                    "long_return_pct": _as_float(row.get("long_return_pct")),
-                    "short_return_pct": _as_float(row.get("short_return_pct")),
-                    "label_timestamp": row.get("label_timestamp"),
-                    "best_action": row.get("best_action"),
-                    "missed_opportunity": bool(row.get("missed_opportunity")),
-                }
-            )
+            append_sample(row)
         if len(rows) < page_limit:
             break
     samples.reverse()
@@ -573,6 +876,7 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
     samples = await load_authoritative_trade_outcomes(
         since=load_training_epoch_start(),
         compact=compact,
+        include_training_features=compact,
     )
     for sample in samples:
         features = _compact_local_ai_tools_features(_snapshot(sample.get("features")))
@@ -622,8 +926,8 @@ async def _completed_trade_sample_count() -> int:
 async def _load_sequence_samples() -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     current_key: tuple[str, str] | None = None
-    closes: list[float] = []
-    volumes: list[float] = []
+    closes: deque[float] = deque(maxlen=_SEQUENCE_ROWS_PER_SERIES_LIMIT)
+    volumes: deque[float] = deque(maxlen=_SEQUENCE_ROWS_PER_SERIES_LIMIT)
     first_open_time: datetime | None = None
     last_open_time: datetime | None = None
 
@@ -645,32 +949,53 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
                     "last_open_time": (
                         last_open_time.isoformat() if last_open_time else None
                     ),
-                    "close_sequence": closes,
-                    "volume_sequence": volumes,
+                    "close_sequence": list(closes),
+                    "volume_sequence": list(volumes),
                     "observation_count": observation_count,
                     "label_name": "gross_market_move_pct",
                     "label_version": "2026-07-12.observation-only.v1",
                     "production_eligible": False,
                 }
             )
-        closes = []
-        volumes = []
+        closes = deque(maxlen=_SEQUENCE_ROWS_PER_SERIES_LIMIT)
+        volumes = deque(maxlen=_SEQUENCE_ROWS_PER_SERIES_LIMIT)
         first_open_time = None
         last_open_time = None
 
     async with get_read_session_ctx() as session:
         epoch_start = load_training_epoch_start()
-        stmt = (
+        ranked = (
             select(
                 Kline.symbol,
                 Kline.timeframe,
                 Kline.open_time,
                 Kline.close,
                 Kline.volume,
+                func.row_number()
+                .over(
+                    partition_by=(Kline.symbol, Kline.timeframe),
+                    order_by=Kline.open_time.desc(),
+                )
+                .label("series_rank"),
             )
             .where(Kline.timeframe.in_(("1m", "5m", "15m", "1h")))
             .where(Kline.open_time >= epoch_start)
-            .order_by(Kline.symbol.asc(), Kline.timeframe.asc(), Kline.open_time.asc())
+            .subquery()
+        )
+        stmt = (
+            select(
+                ranked.c.symbol,
+                ranked.c.timeframe,
+                ranked.c.open_time,
+                ranked.c.close,
+                ranked.c.volume,
+            )
+            .where(ranked.c.series_rank <= _SEQUENCE_ROWS_PER_SERIES_LIMIT)
+            .order_by(
+                ranked.c.symbol.asc(),
+                ranked.c.timeframe.asc(),
+                ranked.c.open_time.asc(),
+            )
         )
         result = await session.stream(stmt)
         async for row in result.mappings():
@@ -820,8 +1145,18 @@ async def _main() -> None:
     elif not args.skip_quarantine:
         quarantine_result = await quarantine_dirty_shadow_samples()
 
-    shadow_samples = await _load_shadow_samples()
-    trade_samples = await _load_trade_samples()
+    shadow_loader = _load_shadow_samples
+    shadow_samples = (
+        await shadow_loader(sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES)
+        if "sample_budget" in inspect.signature(shadow_loader).parameters
+        else await shadow_loader()
+    )
+    trade_loader = _load_trade_samples
+    trade_samples = (
+        await trade_loader(compact=True)
+        if "compact" in inspect.signature(trade_loader).parameters
+        else await trade_loader()
+    )
     sequence_samples = await _load_sequence_samples()
     text_sentiment_samples = await _load_text_sentiment_samples()
     training_payload = annotate_training_payload(
@@ -830,10 +1165,15 @@ async def _main() -> None:
         sequence_samples=sequence_samples,
         text_sentiment_samples=text_sentiment_samples,
     )
+    transport_views, training_transport_report = _build_training_transport_views(
+        training_payload
+    )
+    quality_report = training_payload["quality_report"]
     training_payload["governance_report"] = artifact_bound_governance_report(
-        training_payload["quality_report"],
+        quality_report,
         persist_artifact=bool(args.persist_artifact),
     )
+    governance_report = training_payload["governance_report"]
     label_consistency = training_payload["quality_report"].get(
         "training_label_consistency", {}
     )
@@ -850,33 +1190,44 @@ async def _main() -> None:
         shadow_samples=training_payload["shadow_samples"],
     )
 
+    # The complete annotated rows stay on the platform for audit and quality
+    # reporting, but only the bounded projections cross the model-server tunnel.
+    # Drop local list references before serializing the request to avoid keeping
+    # the original multi-hundred-megabyte payload alive during the POST.
+    training_payload.clear()
+    shadow_samples.clear()
+    trade_samples.clear()
+    sequence_samples.clear()
+    text_sentiment_samples.clear()
+
     payload = {
         "source": "local_trading_system",
-        "shadow_samples": training_payload["shadow_samples"],
-        "trade_samples": training_payload["trade_samples"],
-        "sequence_samples": training_payload["sequence_samples"],
-        "text_sentiment_samples": training_payload["text_sentiment_samples"],
+        "shadow_samples": transport_views["shadow"],
+        "trade_samples": transport_views["trade"],
+        "sequence_samples": transport_views["sequence"],
+        "text_sentiment_samples": transport_views["text_sentiment"],
         "completed_shadow_sample_count": completed_shadow_count,
         "completed_trade_sample_count": completed_trade_count,
         "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_quarantine": quarantine_result,
-        "quality_report": training_payload["quality_report"],
-        "governance_report": training_payload["governance_report"],
+        "quality_report": quality_report,
+        "governance_report": governance_report,
+        "training_transport_report": training_transport_report,
         "training_mode": args.training_mode,
         "persist_artifact": bool(args.persist_artifact),
         "confirm_phase3_rebuild": bool(args.confirm_phase3_rebuild),
         "okx_daily_reconciliation_gate": okx_gate,
         "paper_observation_report": paper_observation_report,
         "return_objective_report": return_objective_report,
-        "profit_supervision_report": training_payload["quality_report"].get(
+        "profit_supervision_report": quality_report.get(
             "profit_supervision",
             {},
         ),
     }
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
-        quality_report=training_payload["quality_report"],
-        governance_report=training_payload["governance_report"],
+        quality_report=quality_report,
+        governance_report=governance_report,
         paper_observation_report=paper_observation_report,
         completed_shadow_sample_count=completed_shadow_count,
         completed_trade_sample_count=completed_trade_count,

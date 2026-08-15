@@ -451,6 +451,7 @@ async def load_authoritative_trade_outcomes(
     since: datetime | None = None,
     limit: int | None = None,
     compact: bool = False,
+    include_training_features: bool = False,
     session_factory: Callable[[], AbstractAsyncContextManager[Any]] = get_read_session_ctx,
     _force_compact_refresh: bool = False,
 ) -> list[dict[str, Any]]:
@@ -463,6 +464,7 @@ async def load_authoritative_trade_outcomes(
     global _compact_outcome_cache, _compact_outcome_refresh_task
     cache_enabled = bool(
         compact
+        and not include_training_features
         and session_factory is get_read_session_ctx
         and str(settings.database_url or "").startswith("postgresql")
     )
@@ -563,16 +565,21 @@ async def load_authoritative_trade_outcomes(
             int(order.decision_id or 0) for order in orders if int(order.decision_id or 0) > 0
         }
         if decision_ids and compact:
+            decision_columns = [
+                AIDecision.id,
+                AIDecision.model_name,
+                AIDecision.stop_loss_pct,
+                AIDecision.take_profit_pct,
+                AIDecision.decision_learning_snapshot,
+            ]
+            if include_training_features:
+                decision_columns.append(AIDecision.feature_snapshot)
             decision_rows = list(
                 (
                     await session.execute(
-                        select(
-                            AIDecision.id,
-                            AIDecision.model_name,
-                            AIDecision.stop_loss_pct,
-                            AIDecision.take_profit_pct,
-                            AIDecision.decision_learning_snapshot,
-                        ).where(AIDecision.id.in_(decision_ids))
+                        select(*decision_columns).where(
+                            AIDecision.id.in_(decision_ids)
+                        )
                     )
                 ).all()
             )
@@ -582,7 +589,9 @@ async def load_authoritative_trade_outcomes(
                     model_name=row.model_name,
                     stop_loss_pct=row.stop_loss_pct,
                     take_profit_pct=row.take_profit_pct,
-                    feature_snapshot={},
+                    feature_snapshot=dict(
+                        row._mapping.get("feature_snapshot") or {}
+                    ),
                     decision_learning_snapshot=row.decision_learning_snapshot,
                     raw_llm_response=dict(row.decision_learning_snapshot or {}),
                 )

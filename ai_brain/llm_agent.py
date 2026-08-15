@@ -59,7 +59,84 @@ if TYPE_CHECKING:
 # Global semaphore limits active LLM calls. A single local 32B model cannot
 # reliably answer five expert prompts at once, so the default is intentionally
 # lower than the number of experts.
-_LLM_SEMAPHORE = asyncio.Semaphore(max(int(settings.ai_llm_concurrency or 5), 1))
+_LLM_CONCURRENCY = max(int(settings.ai_llm_concurrency or 5), 1)
+
+
+class _ScopedLLMCapacity:
+    """Bound provider calls while reserving one slot for market discovery."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(int(limit), 1)
+        self._active = 0
+        self._market_waiters = 0
+        self._condition = asyncio.Condition()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _ensure_loop(self) -> None:
+        """Rebind idle capacity after a test loop or worker loop is replaced."""
+        loop = asyncio.get_running_loop()
+        if self._loop is loop:
+            return
+        if self._active or self._market_waiters:
+            raise RuntimeError("LLM capacity cannot be shared across active event loops")
+        self._condition = asyncio.Condition()
+        self._loop = loop
+
+    def _scope(self, context: dict[str, Any]) -> str:
+        raw = str(context.get("_analysis_budget_scope") or "")
+        return "market" if raw.startswith("market") else "position" if raw.startswith("position") else "shared"
+
+    async def acquire(self, context: dict[str, Any]) -> str:
+        scope = self._scope(context)
+        self._ensure_loop()
+        async with self._condition:
+            if scope == "market":
+                self._market_waiters += 1
+            try:
+                while True:
+                    market_reserved = scope == "position" and self._market_waiters > 0
+                    if self._active < self._limit and not market_reserved:
+                        self._active += 1
+                        return scope
+                    await self._condition.wait()
+            finally:
+                if scope == "market":
+                    self._market_waiters = max(self._market_waiters - 1, 0)
+
+    async def release(self) -> None:
+        self._ensure_loop()
+        async with self._condition:
+            self._active = max(self._active - 1, 0)
+            self._condition.notify_all()
+
+    async def __aenter__(self) -> "_ScopedLLMCapacity":
+        raise RuntimeError("use slot(context) instead")
+
+    async def __aexit__(self, *_args: Any) -> None:
+        await self.release()
+
+    def slot(self, context: dict[str, Any]) -> "_ScopedLLMSlot":
+        return _ScopedLLMSlot(self, context)
+
+
+class _ScopedLLMSlot:
+    def __init__(self, capacity: _ScopedLLMCapacity, context: dict[str, Any]) -> None:
+        self._capacity = capacity
+        self._context = context
+        self._acquired = False
+
+    async def __aenter__(self) -> "_ScopedLLMSlot":
+        await self._capacity.acquire(self._context)
+        self._acquired = True
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        if self._acquired:
+            self._acquired = False
+            await self._capacity.release()
+
+
+_LLM_CAPACITY = _ScopedLLMCapacity(_LLM_CONCURRENCY)
 _LLM_CALL_DELAY = max(float(settings.ai_llm_call_delay_seconds or 0.0), 0.0)
 
 ROLE_TO_CROSS_TARGET = {
@@ -302,6 +379,41 @@ def _parse_json_candidate(candidate: str) -> dict | None:
     return None
 
 
+def _first_balanced_json_object(text: str) -> dict | None:
+    """Extract the first complete object when a provider concatenates JSON."""
+
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    parsed = _parse_json_candidate(text[start : index + 1])
+                    if parsed is not None:
+                        return parsed
+                    break
+                if depth < 0:
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
 def _extract_json(text: str) -> dict:
     """Robust JSON extraction from LLM output that may contain markdown or extra text.
 
@@ -326,6 +438,12 @@ def _extract_json(text: str) -> dict:
         if parsed is not None:
             return parsed
 
+    # Some OpenAI-compatible proxies append a second diagnostic object or
+    # duplicate fields after a valid object. Prefer the first complete object.
+    parsed = _first_balanced_json_object(text)
+    if parsed is not None:
+        return parsed
+
     # Strategy 3: find outermost braces
     start = text.find("{")
     end = text.rfind("}")
@@ -339,6 +457,44 @@ def _extract_json(text: str) -> dict:
             return parsed
 
     raise LLMResponseParseError(f"Could not extract valid JSON from: {text[:300]}")
+
+
+def _extract_truncated_expert_diagnostic(text: str) -> dict[str, Any] | None:
+    """Recover only a completed minimal expert verdict from a truncated response."""
+
+    cleaned = _strip_qwen_thinking(text).strip()
+    action_match = re.search(
+        r'"action"\s*:\s*"(long|short|close_long|close_short|hold)"',
+        cleaned,
+        re.IGNORECASE,
+    )
+    confidence_match = re.search(
+        r'"confidence"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+))',
+        cleaned,
+    )
+    reasoning_match = re.search(r'"reasoning"\s*:\s*"((?:\\.|[^"\\])*)"', cleaned)
+    if action_match is None or confidence_match is None or reasoning_match is None:
+        return None
+    try:
+        reasoning = json.loads(f'"{reasoning_match.group(1)}"')
+    except json.JSONDecodeError:
+        return None
+    return {
+        "action": action_match.group(1).lower(),
+        "confidence": _bounded_number(confidence_match.group(1), maximum=1.0),
+        "reasoning": str(reasoning)[:150],
+        "position_size_pct": 0.0,
+        "suggested_leverage": 1.0,
+        "stop_loss_pct": 0.0,
+        "take_profit_pct": 0.0,
+        "suggested_holding_minutes": 0.0,
+        "maximum_holding_minutes": 0.0,
+        "suggested_close_fraction": 0.0,
+        "cross_check_for": None,
+        "truncated_diagnostic_recovery": True,
+        "production_eligible": False,
+        "production_permission": False,
+    }
 
 
 def _normalize_cross_check(value: Any, own_role: str) -> dict[str, str] | None:
@@ -707,7 +863,7 @@ def _build_fast_expert_user_prompt(
 
 
 BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested minified JSON object. No markdown, no prose, no <think>.
-Use 12-28 Chinese chars per reasoning. Set cross_check_for to null. Actions are role-scoped diagnostic labels, not execution permission. Use hold only under that role's explicit contract."""
+Use 8-20 Chinese chars per reasoning. Set cross_check_for to null. Actions are role-scoped diagnostic labels, not execution permission. Use hold only under that role's explicit contract. Never add keys, duplicate fields, or trailing commentary. Finish the complete JSON object before stopping."""
 
 
 class LLMAgent(AbstractAIModel):
@@ -732,6 +888,9 @@ class LLMAgent(AbstractAIModel):
         self._api_key = ""
         self._model_name = ""
         self._llm: ChatOpenAI | None = None
+        # Provider retries are disabled in ChatOpenAI below. Keep the agent's
+        # historical single bounded parse/transport retry so a malformed primary
+        # response can recover, while the analysis deadline caps total wall time.
         self._max_retries = 1
 
     async def initialize(self) -> None:
@@ -808,7 +967,7 @@ class LLMAgent(AbstractAIModel):
             "api_key": client_api_key,
             "model": model,
             "timeout": request_timeout,
-            "max_retries": 1,
+            "max_retries": 0,
         }
         if reasoning_model:
             kwargs["temperature"] = None
@@ -977,13 +1136,30 @@ class LLMAgent(AbstractAIModel):
             )
             if llm is None:
                 raise RuntimeError(f"LLM client for {model_name} is not initialized")
-            for attempt in range(self._max_retries + 1):
+            # Fast experts must be one provider request. Backup providers are
+            # still available, but parse/transport retries are not nested.
+            attempt_limit = 1 if fast_expert_mode else self._max_retries + 1
+            for attempt in range(attempt_limit):
+                content = ""
+                response_contract: dict[str, Any] = {}
                 try:
                     messages = _messages_for_model(system_prompt, user_prompt, model_name)
-                    async with _LLM_SEMAPHORE:
+                    async with _LLM_CAPACITY.slot(context):
                         if _LLM_CALL_DELAY:
                             await asyncio.sleep(_LLM_CALL_DELAY)
-                        response = await llm.ainvoke(messages)
+                        request = llm.ainvoke(messages)
+                        try:
+                            deadline = float(context.get("_analysis_deadline_monotonic"))
+                        except (TypeError, ValueError):
+                            deadline = 0.0
+                        if deadline > 0:
+                            remaining = max(
+                                deadline - asyncio.get_running_loop().time() - 0.1,
+                                0.05,
+                            )
+                            response = await asyncio.wait_for(request, timeout=remaining)
+                        else:
+                            response = await request
                     response_contract = _provider_response_contract(response)
                     content = _message_content_text(response)
                     if not content.strip():
@@ -1017,6 +1193,24 @@ class LLMAgent(AbstractAIModel):
 
                 except LLMResponseParseError as e:
                     last_error = safe_error_text(e)
+                    if expert_mode and not decision_maker_mode:
+                        recovered = _extract_truncated_expert_diagnostic(content)
+                        if recovered is not None:
+                            recovered["provider_model"] = model_name
+                            recovered["provider_response_contract"] = response_contract
+                            recovered["parse_error"] = last_error
+                            decision = self._decision_from_parsed(
+                                recovered,
+                                features,
+                                context,
+                            )
+                            logger.warning(
+                                "truncated expert diagnostic recovered",
+                                name=self.name,
+                                model=model_name,
+                                attempt=attempt,
+                            )
+                            return decision
                     logger.warning(
                         "llm parse error",
                         name=self.name,
@@ -1057,7 +1251,7 @@ class LLMAgent(AbstractAIModel):
                 prompt,
                 self._model_name,
             )
-            async with _LLM_SEMAPHORE:
+            async with _LLM_CAPACITY.slot(context):
                 if _LLM_CALL_DELAY:
                     await asyncio.sleep(_LLM_CALL_DELAY)
                 batch_llm = self._create_llm(
@@ -1074,7 +1268,19 @@ class LLMAgent(AbstractAIModel):
                         else "batch_expert"
                     ),
                 )
-                response = await batch_llm.ainvoke(messages)
+                request = batch_llm.ainvoke(messages)
+                try:
+                    deadline = float(context.get("_analysis_deadline_monotonic"))
+                except (TypeError, ValueError):
+                    deadline = 0.0
+                if deadline > 0:
+                    remaining = max(
+                        deadline - asyncio.get_running_loop().time() - 0.1,
+                        0.05,
+                    )
+                    response = await asyncio.wait_for(request, timeout=remaining)
+                else:
+                    response = await request
             parsed = _extract_json(_message_content_text(response))
             experts = parsed.get("experts") if isinstance(parsed, dict) else None
             if not isinstance(experts, dict):

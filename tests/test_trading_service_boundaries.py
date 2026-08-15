@@ -656,24 +656,25 @@ async def test_forced_order_fact_sync_queues_follow_up_while_task_is_running() -
 async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -> None:
     service = TradingService.__new__(TradingService)
     service.round_start_reconcile_timeout_seconds = lambda: 8.0  # type: ignore[method-assign]
-    factory_kwargs: dict[str, Any] = {}
+    runner_kwargs: dict[str, Any] = {}
 
-    class FakeOrderFactSyncService:
-        async def sync(self) -> dict[str, Any]:
-            return {
-                "status": "deferred",
-                "okx_pull_available": True,
-                "confirmed_count": 96,
-                "unverified_count": 0,
-                "backfilled_count": 0,
-                "deferred_stages": ["contract_sizes"],
-            }
+    async def isolated_runner(**kwargs: Any) -> dict[str, Any]:
+        runner_kwargs.update(kwargs)
+        return {
+            "status": "deferred",
+            "okx_pull_available": True,
+            "confirmed_count": 96,
+            "unverified_count": 0,
+            "backfilled_count": 0,
+            "deferred_stages": ["contract_sizes"],
+            "process_isolated": True,
+        }
 
-    def factory(**kwargs: Any) -> FakeOrderFactSyncService:
-        factory_kwargs.update(kwargs)
-        return FakeOrderFactSyncService()
+    def direct_factory(**_kwargs: Any) -> Any:
+        raise AssertionError("account discovery must not run in the trading process")
 
-    service.okx_order_fact_sync_factory = factory
+    service.okx_order_fact_sync_factory = direct_factory
+    service._okx_order_fact_sync_isolated_runner = isolated_runner
 
     row = await service._sync_okx_order_facts_for_loop()
 
@@ -681,9 +682,9 @@ async def test_okx_order_fact_sync_deferred_stages_do_not_block_runtime_gate() -
     assert row["requires_attention"] is False
     assert "deferred_stages=1" in row["note"]
     assert row["order_fact_sync"]["unverified_count"] == 0
-    assert factory_kwargs["limit"] == 100
-    assert factory_kwargs["priority_only"] is False
-    assert factory_kwargs["timeout_seconds"] == 120.0
+    assert runner_kwargs["limit"] == 100
+    assert runner_kwargs["timeout_seconds"] == 120.0
+    assert row["order_fact_sync"]["process_isolated"] is True
     assert row["sync_scope"] == "account_discovery"
     assert service._okx_order_fact_discovery_last_finished_at is not None
     service._okx_order_fact_sync_last_row = row
@@ -2351,6 +2352,89 @@ async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
 
 
 @pytest.mark.asyncio
+async def test_okx_order_fact_account_discovery_isolated_from_trading_database_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b'{"event":"account order facts synchronized"}\n'
+                b"BB_OKX_ORDER_FACT_SYNC_RESULT_JSON="
+                b'{"status":"ok","okx_pull_available":true,"confirmed_count":12}\n',
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_okx_order_fact_sync_subprocess(
+        mode="paper",
+        lookback_hours=24,
+        limit=100,
+        timeout_seconds=120.0,
+    )
+
+    assert result["status"] == "ok"
+    assert result["confirmed_count"] == 12
+    assert result["process_isolated"] is True
+    script_path = str(captured["args"][1]).replace("\\", "/")
+    assert script_path.endswith("scripts/run_okx_order_fact_sync.py")
+    assert captured["args"][2:] == (
+        "--mode",
+        "paper",
+        "--lookback-hours",
+        "24",
+        "--limit",
+        "100",
+        "--timeout-seconds",
+        "120.0",
+    )
+    assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+
+
+@pytest.mark.asyncio
+async def test_okx_order_fact_isolated_process_start_failure_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    async def fail_create_subprocess_exec(*_args: str, **_kwargs: Any) -> None:
+        raise OSError("process creation unavailable")
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fail_create_subprocess_exec,
+    )
+
+    result = await service._run_okx_order_fact_sync_subprocess(
+        mode="paper",
+        lookback_hours=24,
+        limit=100,
+        timeout_seconds=120.0,
+    )
+
+    assert result["status"] == "deferred"
+    assert result["okx_pull_available"] is False
+    assert result["deferred_stages"] == ["isolated_process"]
+    assert result["process_isolated"] is True
+    assert result["error"] == "process creation unavailable"
+
+
+@pytest.mark.asyncio
 async def test_local_ml_auto_train_requires_framed_machine_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2504,7 +2588,20 @@ async def test_local_ml_auto_train_failure_uses_retry_interval(
 
     await service._ml_auto_train_loop()
 
-    assert delays == [trading_service.AUTO_TRAIN_RETRY_INTERVAL_SECONDS]
+    assert delays == [trading_service.AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_auto_train_failure_backoff_grows_and_caps() -> None:
+    service = TradingService.__new__(TradingService)
+    failure = {"reason": "error"}
+
+    assert service._auto_train_failure_delay([failure]) == 30 * 60
+    assert service._auto_train_failure_delay([failure]) == 60 * 60
+    assert service._auto_train_failure_delay([failure]) == 2 * 60 * 60
+    for _ in range(8):
+        delay = service._auto_train_failure_delay([failure])
+    assert delay == 4 * 60 * 60
 
 
 @pytest.mark.asyncio
@@ -2576,29 +2673,24 @@ async def test_local_ai_training_failure_uses_retry_interval(
 
     await service._ml_auto_train_loop()
 
-    assert delays == [trading_service.AUTO_TRAIN_RETRY_INTERVAL_SECONDS]
+    assert delays == [trading_service.AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS]
 
 
 @pytest.mark.asyncio
-async def test_local_ai_training_is_not_blocked_by_long_ml_run(
+async def test_local_ai_training_runs_after_long_ml_run_to_avoid_resource_contention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
     service._running = True
-    ml_started = asyncio.Event()
-    ml_released = asyncio.Event()
-    ai_started_before_ml_release = False
+    order: list[str] = []
 
     async def slow_ml() -> dict[str, Any]:
-        ml_started.set()
-        await ml_released.wait()
+        order.append("ml_start")
+        order.append("ml_done")
         return {"trained": False, "reason": "not_due"}
 
     async def local_ai() -> dict[str, Any]:
-        nonlocal ai_started_before_ml_release
-        await ml_started.wait()
-        ai_started_before_ml_release = not ml_released.is_set()
-        ml_released.set()
+        order.append("local_ai")
         return {"trained": False, "reason": "not_due"}
 
     service._run_local_ml_training_subprocess = slow_ml  # type: ignore[method-assign]
@@ -2611,7 +2703,7 @@ async def test_local_ai_training_is_not_blocked_by_long_ml_run(
 
     await service._ml_auto_train_loop()
 
-    assert ai_started_before_ml_release is True
+    assert order == ["ml_start", "ml_done", "local_ai"]
 
 
 @pytest.mark.asyncio
@@ -5416,6 +5508,16 @@ def test_training_subprocess_uses_lower_cpu_priority_on_linux() -> None:
 
     assert lowered == ["/usr/bin/nice", "-n", "10", *command]
     assert unchanged == command
+
+
+def test_training_subprocess_environment_bounds_native_thread_pools() -> None:
+    env = trading_service._training_process_env({"PATH": "test"})
+
+    assert env["PATH"] == "test"
+    assert env["BB_TRAINING_MAX_WORKERS"] == "1"
+    assert env["OMP_NUM_THREADS"] == "1"
+    assert env["MKL_NUM_THREADS"] == "1"
+    assert env["TORCH_NUM_THREADS"] == "1"
 
 
 @pytest.mark.asyncio

@@ -424,6 +424,93 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _execution_display_key(order: Any) -> tuple[Any, ...]:
+    """Build a coarse key used only to compare possible reconciliation twins."""
+    filled_at = _as_utc_datetime(getattr(order, "filled_at", None))
+    created_at = _as_utc_datetime(getattr(order, "created_at", None))
+    timestamp = filled_at or created_at
+    # Reconciliation can be a few milliseconds apart from the local submit.
+    # Keep the bucket narrow enough to avoid merging separate partial fills.
+    bucket = int(timestamp.timestamp() // 2) if timestamp else None
+    return (
+        str(getattr(order, "execution_mode", "") or ""),
+        _normalize_display_symbol(getattr(order, "symbol", None)),
+        str(getattr(order, "side", "") or "").lower(),
+        round(_safe_float(getattr(order, "quantity", None), 0.0), 6),
+        round(_safe_float(getattr(order, "price", None), 0.0), 8),
+        bucket,
+    )
+
+
+def _is_okx_reconciliation_order(order: Any) -> bool:
+    """Return whether a row is an exchange-only reconciliation/backfill fact."""
+    model_name = str(getattr(order, "model_name", "") or "").strip().lower()
+    sync_status = str(getattr(order, "okx_sync_status", "") or "").strip().lower()
+    return model_name == "okx_authoritative_sync" or sync_status == OKX_SYNC_OKX_ONLY
+
+
+def _can_merge_execution_twin(left: Any, right: Any) -> bool:
+    """Only merge a local row with an explicitly exchange-only row.
+
+    Matching numeric fields alone is intentionally insufficient: two genuine
+    partial fills can share the same second, price, and quantity.
+    """
+    return _is_okx_reconciliation_order(left) != _is_okx_reconciliation_order(right)
+
+
+def _same_exchange_execution(left: Any, right: Any) -> bool:
+    """Return whether two rows are the same exchange execution fact."""
+    left_id = str(getattr(left, "exchange_order_id", "") or "").strip()
+    right_id = str(getattr(right, "exchange_order_id", "") or "").strip()
+    return bool(left_id and left_id == right_id)
+
+
+def _execution_preference(order: Any) -> tuple[bool, bool, bool]:
+    """Prefer a row with decision lineage over a reconciliation-only row."""
+    order_id = bool(str(getattr(order, "exchange_order_id", "") or "").strip())
+    source = str(getattr(order, "okx_sync_status", "") or "").lower()
+    return (
+        bool(getattr(order, "decision_id", None)),
+        order_id,
+        source not in {"okx_only", "okx_only_backfilled", "synced"},
+    )
+
+
+def _deduplicate_execution_orders(orders: list[Any]) -> list[Any]:
+    """Hide an OKX reconciliation twin when the local filled order is present.
+
+    The database keeps both immutable evidence rows. The dashboard should show
+    one execution event, preferring the locally submitted order because it carries
+    the decision lineage; OKX-only rows remain visible when no local twin exists.
+    """
+    selected: dict[tuple[Any, ...], Any] = {}
+    passthrough: list[Any] = []
+    for order in orders:
+        key = _execution_display_key(order)
+        current = selected.get(key)
+        if current is None:
+            selected[key] = order
+            continue
+        same_exchange = _same_exchange_execution(current, order)
+        if not same_exchange and not _can_merge_execution_twin(current, order):
+            # Keep distinct local fills and distinct exchange fills visible.
+            passthrough.append(order)
+            continue
+        # Prefer a row with decision lineage, then the row with an exchange id.
+        current_score = _execution_preference(current)
+        order_score = _execution_preference(order)
+        if order_score > current_score:
+            selected[key] = order
+        elif order_score == current_score and getattr(order, "id", 0) < getattr(current, "id", 0):
+            selected[key] = order
+    passthrough.extend(selected.values())
+    return sorted(
+        passthrough,
+        key=lambda row: _as_utc_datetime(getattr(row, "created_at", None)) or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+
+
 def _decision_raw_and_snapshot(
     meta: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -555,14 +642,45 @@ async def get_trades(
     offset = (max(int(page or 1), 1) - 1) * page_size
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
+        # De-duplication is a presentation concern, so SQL offset must not be
+        # applied before it. Load a bounded recent window, merge safe twins, and
+        # only then apply the requested page. This keeps page boundaries stable
+        # when an OKX backfill row sits beside its local execution row.
+        recent_window = min(max(5000, offset + page_size), 20000)
         orders = await repo.get_recent_orders(
             model_name=model_name,
             symbol=symbol,
             execution_mode=mode,
-            limit=page_size,
-            offset=offset,
+            limit=recent_window,
+            offset=0,
         )
-        total = await repo.count_orders(model_name=model_name, symbol=symbol, execution_mode=mode)
+        raw_order_count = len(orders)
+        raw_filled_count = sum(
+            1
+            for order in orders
+            if str(getattr(order, "status", "") or "").lower() == "filled"
+        )
+        orders = _deduplicate_execution_orders(orders)
+        hidden_duplicate_count = max(raw_order_count - len(orders), 0)
+        hidden_filled_count = max(
+            raw_filled_count
+            - sum(
+                1
+                for order in orders
+                if str(getattr(order, "status", "") or "").lower() == "filled"
+            ),
+            0,
+        )
+        raw_total = await repo.count_orders(
+            model_name=model_name,
+            symbol=symbol,
+            execution_mode=mode,
+        )
+        # Adjust the authoritative raw total only by duplicates observed in the
+        # loaded window. Older rows remain counted without forcing an expensive
+        # full-table de-duplication query on every dashboard refresh.
+        total = max(raw_total - hidden_duplicate_count, len(orders))
+        orders = orders[offset : offset + page_size]
         filled_total = await repo.count_orders(
             model_name=model_name,
             symbol=symbol,
@@ -570,6 +688,7 @@ async def get_trades(
             statuses=["filled"],
             require_exchange_order_id=True,
         )
+        filled_total = max(filled_total - hidden_filled_count, 0)
         decision_ids = [o.decision_id for o in orders if o.decision_id]
         decision_meta: dict[int, dict[str, Any]] = {}
         if decision_ids:

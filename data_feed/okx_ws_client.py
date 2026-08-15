@@ -40,6 +40,7 @@ WS_RECEIVE_TIMEOUT_SECONDS = 30.0
 WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS = 2
 WS_TICKER_STALE_RECONNECT_SECONDS = 90.0
 WS_RECONNECT_DELAY_SECONDS = 5.0
+WS_TICKER_MIN_PROCESS_INTERVAL_SECONDS = 0.5
 
 
 class OKXWebSocketClient:
@@ -62,6 +63,8 @@ class OKXWebSocketClient:
         self._last_ticker_time = 0.0
         self._connected_at = 0.0
         self._reconnect_count = 0
+        self._last_processed_ticker_time: dict[str, float] = {}
+        self._throttled_ticker_updates = 0
 
     @property
     def is_connected(self) -> bool:
@@ -142,6 +145,15 @@ class OKXWebSocketClient:
                 self._last_ticker_time = time.time()
             for ticker in data["data"]:
                 symbol = inst_id.replace("-SWAP", "").replace("-", "/")
+                now = time.monotonic()
+                last_processed = self._last_processed_ticker_time.get(symbol, 0.0)
+                if (
+                    now - last_processed
+                    < WS_TICKER_MIN_PROCESS_INTERVAL_SECONDS
+                ):
+                    self._throttled_ticker_updates += 1
+                    continue
+                self._last_processed_ticker_time[symbol] = now
                 last = safe_float(ticker.get("last"), 0.0)
                 open24h = safe_float(ticker.get("open24h"), 0.0)
                 change_pct = ((last - open24h) / open24h * 100) if open24h else 0
@@ -371,4 +383,6 @@ class OKXWebSocketClient:
             ),
             "ticker_stale_after_seconds": WS_TICKER_STALE_RECONNECT_SECONDS,
             "reconnect_count": self._reconnect_count,
+            "throttled_ticker_updates": self._throttled_ticker_updates,
+            "ticker_process_interval_seconds": WS_TICKER_MIN_PROCESS_INTERVAL_SECONDS,
         }

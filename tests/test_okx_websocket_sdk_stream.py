@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from core.exceptions import WebSocketConnectionError
 from data_feed import okx_ws_client
 from data_feed.okx_ws_client import OKXWebSocketClient
+from services import okx_perpetual_sdk
 from services.okx_perpetual_sdk import OkxPublicWebSocketSdkStream
 
 
@@ -42,6 +44,72 @@ async def test_sdk_stream_cancelled_recv_does_not_steal_next_message() -> None:
 
     stream._on_message("next-message")
     assert await asyncio.wait_for(stream.recv(), timeout=0.2) == "next-message"
+
+    await stream.close()
+    assert consume_task.done()
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_coalesces_ticker_backlog_to_latest_payload() -> None:
+    stream = OkxPublicWebSocketSdkStream()
+    consumer_released = asyncio.Event()
+    consume_task = asyncio.create_task(consumer_released.wait())
+    stream._consume_task = consume_task
+
+    def ticker(last: str, timestamp: str) -> str:
+        return json.dumps(
+            {
+                "arg": {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+                "data": [{"last": last, "ts": timestamp}],
+            }
+        )
+
+    stream._on_message(ticker("64000", "1000"))
+    stream._on_message(ticker("64001", "1100"))
+    stream._on_message(ticker("64002", "1200"))
+
+    received = json.loads(await asyncio.wait_for(stream.recv(), timeout=0.2))
+
+    assert received["data"][0]["last"] == "64002"
+    assert stream._ticker_ready.empty()
+    assert stream._ticker_messages == {}
+    assert stream._coalesced_ticker_messages == 2
+
+    await stream.close()
+    assert consume_task.done()
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_rate_limits_each_ticker_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = OkxPublicWebSocketSdkStream()
+    consumer_released = asyncio.Event()
+    consume_task = asyncio.create_task(consumer_released.wait())
+    stream._consume_task = consume_task
+
+    def ticker(last: str, timestamp: str) -> str:
+        return json.dumps(
+            {
+                "arg": {"channel": "tickers", "instId": "ETH-USDT-SWAP"},
+                "data": [{"last": last, "ts": timestamp}],
+            }
+        )
+
+    monkeypatch.setattr(okx_perpetual_sdk, "OKX_WS_TICKER_EMIT_INTERVAL_SECONDS", 0.1)
+    stream._on_message(ticker("1800", "1000"))
+    first = json.loads(await asyncio.wait_for(stream.recv(), timeout=0.2))
+    stream._on_message(ticker("1801", "1100"))
+    stream._on_message(ticker("1802", "1200"))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(stream.recv(), timeout=0.05)
+
+    await asyncio.sleep(0.1)
+    latest = json.loads(await asyncio.wait_for(stream.recv(), timeout=0.2))
+
+    assert first["data"][0]["last"] == "1800"
+    assert latest["data"][0]["last"] == "1802"
 
     await stream.close()
     assert consume_task.done()

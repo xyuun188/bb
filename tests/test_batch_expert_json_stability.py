@@ -8,7 +8,11 @@ import pytest
 
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
-from ai_brain.llm_agent import LLMAgent, _extract_json
+from ai_brain.llm_agent import (
+    LLMAgent,
+    _extract_json,
+    _extract_truncated_expert_diagnostic,
+)
 from ai_brain.model_registry import ModelRegistry
 from ai_brain.prompts import build_batch_experts_user_prompt
 from config.settings import settings
@@ -23,7 +27,7 @@ def test_batch_expert_prompt_uses_compact_json_contract() -> None:
         {"review_positions": True, "open_positions": [{"symbol": "BTC/USDT"}]},
     )
 
-    assert "BATCH_EXPERT_JSON_V12" in prompt
+    assert "BATCH_EXPERT_JSON_V13" in prompt
     assert (
         "Required experts: trend_expert, momentum_expert, sentiment_expert, position_expert, risk_expert"
         in prompt
@@ -168,6 +172,29 @@ def test_extract_json_repairs_missing_batch_tail() -> None:
 
     assert parsed["experts"]["trend_expert"]["action"] == "hold"
     assert parsed["experts"]["momentum_expert"]["confidence"] == 0.4
+
+
+def test_extract_truncated_expert_diagnostic_never_grants_execution() -> None:
+    parsed = _extract_truncated_expert_diagnostic(
+        '{"action":"short","confidence":0.71,"reasoning":"短线动量转弱",'
+        '"fee_after_cost_after_slippage_repeated_field":"unfinished'
+    )
+
+    assert parsed is not None
+    assert parsed["action"] == "short"
+    assert parsed["reasoning"] == "短线动量转弱"
+    assert parsed["position_size_pct"] == 0.0
+    assert parsed["production_permission"] is False
+    assert parsed["truncated_diagnostic_recovery"] is True
+
+
+def test_extract_truncated_expert_diagnostic_requires_complete_reasoning() -> None:
+    assert (
+        _extract_truncated_expert_diagnostic(
+            '{"action":"long","confidence":0.8,"reasoning":"unfinished'
+        )
+        is None
+    )
 
 
 def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
@@ -557,10 +584,7 @@ class _ProviderBatchExpert(AbstractAIModel):
         if not self.allow_individual:
             raise AssertionError("provider batch tests should not call individual decide")
         assert context.get("_force_independent_expert") is True
-        if str(context.get("execution_mode") or "").lower() == "paper":
-            assert context.get("_force_fast_independent_expert") is not True
-        else:
-            assert context.get("_force_fast_independent_expert") is True
+        assert context.get("_force_fast_independent_expert") is True
         assert context.get("_provider_independent_expert_mode")
         type(self).individual_calls.append((self._model_name, self.name))
         return DecisionOutput(
@@ -1060,7 +1084,7 @@ async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
     assert len(_ProviderBatchExpert.individual_calls) == 5
     assert all(row.get("batch_expert", False) is False for row in context["_model_timings"])
     assert context["_force_independent_expert"] is True
-    assert "_force_fast_independent_expert" not in context
+    assert context["_force_fast_independent_expert"] is True
     assert context["_provider_independent_expert_mode"] is True
 
 

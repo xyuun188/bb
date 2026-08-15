@@ -341,6 +341,22 @@ def test_start_online_model_tunnels_use_approved_internal_ports() -> None:
     assert "21840" not in source and "21841" not in source and "21842" not in source
 
 
+def test_start_online_model_tunnels_preserve_long_quant_training_requests() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    specs = {spec.name: spec for spec in tunnels.build_default_tunnels()}
+
+    assert (
+        specs["phase3-quant-api"].max_connection_seconds
+        == tunnels.FORWARD_QUANT_MAX_CONNECTION_SECONDS
+    )
+    assert specs["phase3-quant-api"].max_connection_seconds >= 1_800
+    assert specs["qwen3-14b-trade"].max_connection_seconds >= 600
+    assert "server.spec.max_connection_seconds" in (
+        ROOT / "scripts" / "start_online_model_tunnels.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_start_online_model_tunnels_swallow_short_client_disconnects() -> None:
     from scripts.start_online_model_tunnels import ForwardHandler
 
@@ -405,7 +421,7 @@ def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch
     assert transports[1] is not transports[3]
 
 
-def test_start_online_model_tunnels_restart_after_consecutive_quant_health_failures() -> None:
+def test_start_online_model_tunnels_report_backend_busy_after_consecutive_health_failures() -> None:
     from scripts import start_online_model_tunnels as tunnels
 
     specs = tunnels.build_default_tunnels()
@@ -446,6 +462,12 @@ def test_start_online_model_tunnels_restart_after_consecutive_quant_health_failu
         == []
     )
     assert failure_counts["phase3-quant-api"] == 0
+
+
+def test_start_online_model_tunnels_do_not_rebuild_on_http_busy_probe() -> None:
+    source = (ROOT / "scripts" / "start_online_model_tunnels.py").read_text(encoding="utf-8")
+    assert "model backend is busy; keeping active SSH tunnels" in source
+    assert "tunnel semantic health failed for:" not in source
 
 
 def test_start_online_model_tunnels_default_health_limit_tolerates_brief_busy_periods() -> None:

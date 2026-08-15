@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import select
+import socket
 import socketserver
 import sys
 import threading
@@ -42,6 +43,14 @@ SELECT_TIMEOUT_SECONDS = 1.0
 TRANSPORT_KEEPALIVE_SECONDS = 30
 TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS = 15.0
 TUNNEL_HEALTH_TIMEOUT_SECONDS = 5.0
+# A forwarded request must not leave a handler blocked forever when the
+# upstream client gives up or the remote service stops reading.  Without this
+# bound, repeated dashboard timeouts accumulate CLOSE-WAIT sockets and
+# eventually make the loopback listener look alive while it cannot accept
+# useful traffic.
+FORWARD_CHANNEL_IO_TIMEOUT_SECONDS = 10.0
+FORWARD_DEFAULT_MAX_CONNECTION_SECONDS = 600.0
+FORWARD_QUANT_MAX_CONNECTION_SECONDS = 1_800.0
 # Training can briefly saturate the quant API while the SSH transport remains healthy.
 # Require a sustained semantic outage before rebuilding all four isolated tunnels.
 TUNNEL_HEALTH_FAILURE_LIMIT = 6
@@ -57,6 +66,7 @@ class TunnelSpec:
     local_port: int
     remote_host: str
     remote_port: int
+    max_connection_seconds: float = FORWARD_DEFAULT_MAX_CONNECTION_SECONDS
 
 
 def probe_tunnel_http_health(spec: TunnelSpec, path: str) -> tuple[bool, str]:
@@ -116,6 +126,7 @@ class ForwardServer(socketserver.ThreadingTCPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
     def __init__(self, spec: TunnelSpec, ssh_transport: Any) -> None:
         self.spec = spec
@@ -143,6 +154,7 @@ class ForwardHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         server = self.server
+        self.request.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
         assert isinstance(server, ForwardServer)
         try:
             peer = self.request.getpeername()
@@ -157,9 +169,17 @@ class ForwardHandler(socketserver.BaseRequestHandler):
         if channel is None:
             safe_print(f"{server.spec.name} tunnel rejected by SSH server")
             return
+        deadline = time.monotonic() + max(
+            float(server.spec.max_connection_seconds),
+            FORWARD_CHANNEL_IO_TIMEOUT_SECONDS,
+        )
+        try:
+            channel.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
+        except (AttributeError, OSError):
+            pass
 
         try:
-            while True:
+            while time.monotonic() < deadline:
                 readable, _, _ = select.select(
                     [self.request, channel],
                     [],
@@ -179,7 +199,15 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                     if not self._sendall_or_closed(self.request, data):
                         break
         finally:
+            try:
+                channel.shutdown_write()
+            except (AttributeError, OSError):
+                pass
             channel.close()
+            try:
+                self.request.shutdown(socket.SHUT_RDWR)
+            except (OSError, AttributeError):
+                pass
             self.request.close()
 
 
@@ -200,6 +228,7 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
             local_port=18_001,
             remote_host="127.0.0.1",
             remote_port=8101,
+            max_connection_seconds=FORWARD_QUANT_MAX_CONNECTION_SECONDS,
         ),
         TunnelSpec(
             name="deepseek-r1-14b-risk",
@@ -295,8 +324,13 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
                     health_failure_counts,
                 )
                 if unhealthy_names:
-                    raise RuntimeError(
-                        "tunnel semantic health failed for: " + ", ".join(unhealthy_names)
+                    # A forwarded HTTP health request can legitimately time out while
+                    # the model is occupied with inference/training.  The SSH transport
+                    # above is the authoritative tunnel liveness signal; rebuilding all
+                    # four transports here creates a larger outage than the slow request.
+                    safe_print(
+                        "model backend is busy; keeping active SSH tunnels for: "
+                        + ", ".join(unhealthy_names)
                     )
                 next_health_check = now + TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS
             time.sleep(5)

@@ -715,8 +715,8 @@ def build_batch_experts_user_prompt(
         if paper_multidimensional
         else "Experts are diagnostic and cannot set size, leverage, stop loss, or take profit."
     )
-    return f"""BATCH_EXPERT_JSON_V12
-Return one minified JSON object only. No markdown, no prose, no <think>. Keep it short enough to finish in one response.
+    return f"""BATCH_EXPERT_JSON_V13
+Return one minified JSON object only. No markdown, no prose, no <think>. Keep every reasoning value to 8-20 Chinese chars so the complete object fits in one response.
 Schema: {{"experts":{{{requested_schema}}}}}
 Required experts: {requested_list}. {omitted_rule.rstrip()}
 Role contracts; do not copy or merge them:
@@ -724,6 +724,7 @@ Role contracts; do not copy or merge them:
 Each expert value must contain exactly:
 {expert_schema}
 Rules: {expert_rule} Follow only each role contract; no matching position means position_expert hold; do not copy one expert's opinion into all experts; do not invent data; cross_check_for must be null in batch mode.
+Output contract: exactly the requested expert keys and exactly the fields above. Never repeat a field, add an explanation, or stop before the final closing braces.
 Payload JSON (complete and valid):
 {text}
 JSON:"""

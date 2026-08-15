@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,7 @@ from web_dashboard.api.dashboard import (
     get_positions as get_dashboard_positions,
 )
 from web_dashboard.api.trades import (
+    _deduplicate_execution_orders,
     _execution_status_label,
     _readable_execution_reason,
     _repair_position_reason_hold_hours,
@@ -3577,3 +3579,55 @@ def test_trade_detail_numeric_only_reason_falls_back_to_readable_success() -> No
 
     assert "3670054929945042944" not in reason
     assert "订单已成交" in reason
+
+def _execution_row(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "id": 1,
+        "model_name": "ensemble_trader",
+        "execution_mode": "paper",
+        "symbol": "XPL/USDT",
+        "side": "sell",
+        "quantity": 420.0,
+        "price": 0.0755,
+        "filled_at": datetime(2026, 8, 14, 19, 32, tzinfo=UTC),
+        "created_at": datetime(2026, 8, 14, 19, 32, tzinfo=UTC),
+        "decision_id": 99,
+        "exchange_order_id": "local-1",
+        "okx_sync_status": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_execution_display_deduplicates_local_and_okx_backfill_twin() -> None:
+    local = _execution_row(id=1, decision_id=99, exchange_order_id="local-1")
+    okx = _execution_row(
+        id=2,
+        model_name="okx_authoritative_sync",
+        decision_id=None,
+        exchange_order_id="okx-1",
+        okx_sync_status="okx_only_backfilled",
+    )
+    result = _deduplicate_execution_orders([okx, local])
+    assert [row.id for row in result] == [1]
+
+
+def test_execution_display_keeps_distinct_local_fills() -> None:
+    first = _execution_row(id=1, exchange_order_id="local-1")
+    second = _execution_row(id=2, exchange_order_id="local-2", decision_id=100)
+    result = _deduplicate_execution_orders([first, second])
+    assert {row.id for row in result} == {1, 2}
+
+
+def test_execution_display_does_not_merge_different_price() -> None:
+    local = _execution_row(id=1)
+    okx = _execution_row(
+        id=2,
+        model_name="okx_authoritative_sync",
+        decision_id=None,
+        exchange_order_id="okx-2",
+        okx_sync_status="okx_only_backfilled",
+        price=0.0756,
+    )
+    result = _deduplicate_execution_orders([local, okx])
+    assert {row.id for row in result} == {1, 2}
