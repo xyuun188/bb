@@ -21,6 +21,8 @@ from config.settings import (
     DECISION_MAKER_NAME,
     ENSEMBLE_TRADER_NAME,
     FIXED_AI_MODEL_SLOTS,
+    MARKET_ANALYSIS_EXPERT_NAMES,
+    POSITION_ANALYSIS_EXPERT_NAMES,
 )
 from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_direction_support import (
@@ -101,7 +103,7 @@ class EnsembleCoordinator:
         opinions, expert_context, expert_timing, model_timings = await self._run_expert_pass(
             features,
             base_expert_context,
-            include_names=None,
+            include_names=self._initial_expert_names(context),
             stage="expert_initial",
             label="专家初诊",
         )
@@ -191,6 +193,12 @@ class EnsembleCoordinator:
         raw["analysis_type_label"] = "持仓分析" if analysis_type == "position" else "市场分析"
         final.raw_response = raw
         return final, opinions
+
+    @staticmethod
+    def _initial_expert_names(context: dict[str, Any]) -> tuple[str, ...]:
+        if context.get("review_positions"):
+            return POSITION_ANALYSIS_EXPERT_NAMES
+        return MARKET_ANALYSIS_EXPERT_NAMES
 
     def _base_expert_context(self, context: dict[str, Any]) -> dict[str, Any]:
         expert_context = dict(context)

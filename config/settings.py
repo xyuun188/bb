@@ -82,6 +82,17 @@ FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     },
 ]
 
+POSITION_ANALYSIS_EXPERT_NAMES: tuple[str, ...] = tuple(
+    str(slot["name"])
+    for slot in FIXED_AI_MODEL_SLOTS
+    if slot.get("name") != DECISION_MAKER_NAME
+)
+MARKET_ANALYSIS_EXPERT_NAMES: tuple[str, ...] = tuple(
+    str(slot["name"])
+    for slot in FIXED_AI_MODEL_SLOTS
+    if slot.get("name") != DECISION_MAKER_NAME and slot.get("role") != "position_exit"
+)
+
 
 class TradingMode(StrEnum):
     PAPER = "paper"

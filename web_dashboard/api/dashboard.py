@@ -18,9 +18,10 @@ import structlog
 from fastapi import APIRouter, Depends
 
 from config.settings import (
-    DECISION_MAKER_NAME,
     ENSEMBLE_TRADER_NAME,
     FIXED_AI_MODEL_SLOTS,
+    MARKET_ANALYSIS_EXPERT_NAMES,
+    POSITION_ANALYSIS_EXPERT_NAMES,
     settings,
 )
 from core.safe_output import safe_error_text
@@ -7803,12 +7804,31 @@ async def get_analysis_records(
         raw = _safe_dict(d.raw_llm_response)
         if not raw:
             continue
+        analysis_type, analysis_type_label = infer_analysis_type(d, raw)
+        expected_expert_names = (
+            POSITION_ANALYSIS_EXPERT_NAMES
+            if analysis_type == "position"
+            else MARKET_ANALYSIS_EXPERT_NAMES
+        )
+        expected_expert_name_set = set(expected_expert_names)
         opinions = raw.get("opinions") or []
         if not isinstance(opinions, list):
             continue
+        opinions = [
+            opinion
+            for opinion in opinions
+            if isinstance(opinion, dict)
+            and str(opinion.get("model_name") or "") in expected_expert_name_set
+        ]
         model_timings = raw.get("model_timings") or []
         if not isinstance(model_timings, list):
             model_timings = []
+        model_timings = [
+            item
+            for item in model_timings
+            if isinstance(item, dict)
+            and str(item.get("name") or "") in expected_expert_name_set
+        ]
         timings_by_name = {
             str(item.get("name")): item
             for item in model_timings
@@ -7839,14 +7859,35 @@ async def get_analysis_records(
             continue
 
         cross_validations = raw.get("cross_validations") or []
+        if isinstance(cross_validations, list):
+            cross_validations = [
+                item
+                for item in cross_validations
+                if isinstance(item, dict)
+                and all(
+                    str(name) in expected_expert_name_set
+                    for name in (item.get("expert_pair") or [])
+                )
+            ]
+        else:
+            cross_validations = []
         consultation = raw.get("consultation")
         conflict_resolution = raw.get("conflict_resolution") or {}
         attempted_experts = raw.get("attempted_experts") or []
         failure_rows = raw.get("expert_failures") or []
         if not isinstance(attempted_experts, list):
             attempted_experts = []
+        attempted_experts = [
+            str(name) for name in attempted_experts if str(name) in expected_expert_name_set
+        ]
         if not isinstance(failure_rows, list):
             failure_rows = []
+        failure_rows = [
+            item
+            for item in failure_rows
+            if isinstance(item, dict)
+            and str(item.get("expert_name") or "") in expected_expert_name_set
+        ]
         failures_by_name = {
             str(item.get("expert_name")): _humanize_expert_failure(item.get("reason"))
             for item in failure_rows
@@ -7870,7 +7911,7 @@ async def get_analysis_records(
                 "role": slot.get("role", ""),
             }
             for slot in FIXED_AI_MODEL_SLOTS
-            if slot.get("name") != DECISION_MAKER_NAME
+            if slot.get("name") in expected_expert_name_set
         ]
         returned_names = {e["expert_name"] for e in experts}
         attempted_names = {str(name) for name in attempted_experts}
@@ -7910,7 +7951,6 @@ async def get_analysis_records(
             for e in expected_experts
             if e["expert_name"] not in returned_names
         ]
-        analysis_type, analysis_type_label = infer_analysis_type(d, raw)
         trade_confidence = _clamp_confidence(_safe_float(d.confidence, 0.0))
         display_execution_reason = _display_execution_reason(d)
         display_action, observed_action, display_reasoning = _analysis_display_action(
