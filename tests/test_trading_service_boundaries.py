@@ -55,7 +55,12 @@ from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.sync_service import OPEN_ORDER_SNAPSHOT_UNKNOWN_KIND, OkxSyncService
 from services.trading_policies import EntryPolicy, ExitPolicy, PolicyGateResult
-from services.trading_service import TradingService, _AnalysisRuntimeState
+from services.trading_service import (
+    TradingService,
+    _AnalysisRuntimeState,
+    _feature_fetch_batch_timeout_seconds,
+    _feature_fetch_wave_count,
+)
 from services.training_data_quality import DATA_QUALITY_VERSION
 
 
@@ -67,6 +72,33 @@ def test_local_ai_tools_training_subprocess_requests_governed_walk_forward() -> 
     assert '"--training-mode"' in source
     assert '"walk_forward"' in source
     assert '"--model-stage"' not in source
+
+
+@pytest.mark.parametrize(
+    ("total_count", "concurrency", "expected"),
+    [
+        (11, 8, 2),
+        (48, 8, 6),
+        (8, 8, 1),
+        (0, 8, 1),
+        (11, 0, 11),
+        (11, -1, 11),
+    ],
+)
+def test_feature_fetch_wave_count_covers_every_concurrency_wave(
+    total_count: int,
+    concurrency: int,
+    expected: int,
+) -> None:
+    assert _feature_fetch_wave_count(total_count, concurrency) == expected
+
+
+def test_feature_fetch_batch_timeout_covers_partial_second_wave() -> None:
+    assert _feature_fetch_batch_timeout_seconds(
+        feature_timeout=8.0,
+        total_count=11,
+        concurrency=8,
+    ) == 18.0
 
 
 def _decision(action: Action) -> DecisionOutput:

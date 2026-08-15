@@ -359,6 +359,28 @@ def _consume_task_result(task: asyncio.Task) -> None:
         return
 
 
+def _feature_fetch_wave_count(total_count: int, concurrency: int) -> int:
+    """Return the number of sequential waves needed by bounded fetches."""
+
+    total = max(int(total_count or 0), 0)
+    slots = max(int(concurrency or 0), 1)
+    return max(1, math.ceil(total / slots))
+
+
+def _feature_fetch_batch_timeout_seconds(
+    *,
+    feature_timeout: float,
+    total_count: int,
+    concurrency: int,
+) -> float:
+    """Budget every bounded-concurrency fetch wave plus scheduling overhead."""
+
+    per_wave_timeout = max(float(feature_timeout or 0.0), 1.0)
+    return (
+        per_wave_timeout * _feature_fetch_wave_count(total_count, concurrency) + 2.0
+    )
+
+
 _analysis_scope_context: ContextVar[str | None] = ContextVar(
     "analysis_scope_context",
     default=None,
@@ -7815,11 +7837,10 @@ class TradingService:
                         return sym, None
 
             tasks = [asyncio.create_task(fetch_fv(s)) for s in fetch_symbols]
-            batch_timeout = max(
-                feature_timeout + 2.0,
-                feature_timeout
-                * (max(1, len(fetch_symbols)) / max(1, int(AUTO_SCAN_FEATURE_FETCH_CONCURRENCY)))
-                + 2.0,
+            batch_timeout = _feature_fetch_batch_timeout_seconds(
+                feature_timeout=feature_timeout,
+                total_count=len(fetch_symbols),
+                concurrency=AUTO_SCAN_FEATURE_FETCH_CONCURRENCY,
             )
             batch_timeout = min(
                 batch_timeout,
