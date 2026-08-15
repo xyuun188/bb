@@ -10,7 +10,7 @@ from typing import Any
 
 from core.symbols import normalize_trading_symbol
 
-CURRENT_POSITION_MANAGEMENT_VERSION = "2026-07-15.current-position-management.v1"
+CURRENT_POSITION_MANAGEMENT_VERSION = "2026-08-15.current-position-management.v2"
 CURRENT_POSITION_MANAGEMENT_KIND = "current_position_takeover"
 ALLOWED_MANAGEMENT_ACTIONS = (
     "hold",
@@ -98,6 +98,28 @@ def build_current_position_management_contract(
     entry_price = max(_safe_float(facts.get("entry_price")), 0.0)
     current_price = max(_safe_float(facts.get("current_price")), 0.0)
     entry_fee = max(_safe_float(facts.get("entry_fee_usdt")), 0.0)
+    funding_fee = _safe_float(facts.get("funding_fee_usdt"), 0.0)
+    funding_bill_count = max(_safe_int(facts.get("funding_bill_count")), 0)
+    funding_fee_source = str(
+        facts.get("funding_fee_source") or "none"
+    ).strip() or "none"
+    funding_evidence_gaps = list(
+        dict.fromkeys(
+            str(value)
+            for value in facts.get("funding_evidence_gaps") or []
+            if str(value or "").strip()
+        )
+    )
+    funding_window_opened_at = (
+        str(facts.get("funding_window_opened_at") or "").strip() or None
+    )
+    # A missing bill is a valid zero-cost observation. Bills are eligible only
+    # when the refresh explicitly proves their identity and time window.
+    funding_evidence_complete = bool(
+        facts.get("funding_evidence_complete") is True
+        or (funding_bill_count == 0 and not funding_evidence_gaps)
+    )
+    requested_funding_eligibility = facts.get("funding_evidence_eligible") is True
     full_entry_fee = max(_safe_float(facts.get("full_entry_fee_usdt")), 0.0)
     full_entry_notional = max(_safe_float(facts.get("full_entry_notional_usdt")), 0.0)
     stop_loss = max(_safe_float(facts.get("stop_loss_price")), 0.0)
@@ -127,6 +149,12 @@ def build_current_position_management_contract(
             for value in facts.get("exchange_identity_gaps") or []
             if str(value or "").strip()
         )
+    )
+    funding_evidence_eligible = bool(
+        not identity_gaps
+        and not funding_evidence_gaps
+        and funding_evidence_complete
+        and (requested_funding_eligibility or funding_bill_count == 0)
     )
     account_equity = max(_safe_float(facts.get("account_equity_usdt")), 0.0)
     open_position_count = max(_safe_int(facts.get("open_position_count")), 0)
@@ -257,6 +285,13 @@ def build_current_position_management_contract(
         "position_notional_usdt": authoritative_position_notional,
         "position_notional_source": position_notional_source,
         "exchange_identity_gaps": identity_gaps,
+        "funding_fee_usdt": funding_fee,
+        "funding_bill_count": funding_bill_count,
+        "funding_fee_source": funding_fee_source,
+        "funding_evidence_complete": funding_evidence_complete,
+        "funding_evidence_eligible": funding_evidence_eligible,
+        "funding_evidence_gaps": funding_evidence_gaps,
+        "funding_window_opened_at": funding_window_opened_at,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "paper_canary_lifecycle": paper_canary_lifecycle,
@@ -288,6 +323,13 @@ def build_current_position_management_contract(
         "full_entry_fee_usdt": round(full_entry_fee, 12),
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "entry_fee_source": facts.get("entry_fee_source"),
+        "funding_fee_usdt": round(funding_fee, 12),
+        "funding_bill_count": funding_bill_count,
+        "funding_fee_source": funding_fee_source,
+        "funding_evidence_complete": funding_evidence_complete,
+        "funding_evidence_eligible": funding_evidence_eligible,
+        "funding_evidence_gaps": funding_evidence_gaps,
+        "funding_window_opened_at": funding_window_opened_at,
         "exit_fee_rate_proxy": round(exit_fee_rate_proxy, 12),
         "exit_fee_rate_source": "authoritative_entry_fill_fee_rate_proxy",
         "stop_loss_price": round(stop_loss, 12),
@@ -351,11 +393,35 @@ def current_position_management_contract_complete(
         if contract is not None
         else getattr(position, "current_management_contract", None)
     )
+    funding_bill_count = _safe_int(value.get("funding_bill_count"), -1)
+    funding_source = str(value.get("funding_fee_source") or "").strip()
+    funding_gaps = [
+        str(item)
+        for item in value.get("funding_evidence_gaps") or []
+        if str(item or "").strip()
+    ]
+    funding_contract_valid = bool(
+        funding_bill_count >= 0
+        and isinstance(value.get("funding_evidence_complete"), bool)
+        and isinstance(value.get("funding_evidence_eligible"), bool)
+        and (
+            (funding_bill_count == 0 and funding_source == "none")
+            or (funding_bill_count > 0 and funding_source == "okx_account_bills")
+        )
+        and (
+            value.get("funding_evidence_eligible") is not True
+            or (
+                value.get("funding_evidence_complete") is True
+                and not funding_gaps
+            )
+        )
+    )
     if (
         value.get("contract_version") != CURRENT_POSITION_MANAGEMENT_VERSION
         or value.get("kind") != CURRENT_POSITION_MANAGEMENT_KIND
         or value.get("management_eligible") is not True
         or value.get("entry_fee_evidence_complete") is not True
+        or not funding_contract_valid
         or value.get("protection_evidence_complete") is not True
         or value.get("can_expand_position") is not False
         or value.get("can_increase_leverage") is not False

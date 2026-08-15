@@ -8749,6 +8749,21 @@ function openPositionEvidenceModal(positionIndex) {
 
     const managementActions = Array.isArray(management.allowed_actions)
         ? management.allowed_actions : [];
+    const fundingGaps = Array.isArray(management.funding_evidence_gaps)
+        ? management.funding_evidence_gaps : [];
+    const fundingBillCount = Number(management.funding_bill_count || 0);
+    const fundingInclusionLabel = fundingBillCount <= 0
+        ? '\u65e0\u8d26\u5355\uff0c\u6309 0 \u5904\u7406'
+        : management.funding_evidence_eligible === true
+            ? '\u5df2\u7eb3\u5165\u9000\u51fa\u5224\u65ad'
+            : '\u4ec5\u5c55\u793a\uff0c\u672a\u7eb3\u5165\u9000\u51fa\u5224\u65ad';
+    const fundingHtml = `
+        <div class="position-evidence-grid">
+            <div><span>\u7d2f\u8ba1\u8d44\u91d1\u8d39</span><strong>${positionEvidenceValue(management.funding_fee_usdt, ' U')}</strong></div>
+            <div><span>\u8d44\u91d1\u8d39\u8d26\u5355</span><strong>${fundingBillCount}</strong></div>
+            <div><span>\u8d44\u91d1\u8d39\u9000\u51fa\u53e3\u5f84</span><strong>${fundingInclusionLabel}</strong></div>
+            <div><span>\u8d44\u91d1\u8d39\u6765\u6e90</span><strong>${escHtml(management.funding_fee_source || 'none')}</strong></div>
+        </div>`;
     const managementHtml = management.contract_version
         ? `
             <article class="position-evidence-contract">
@@ -8771,7 +8786,8 @@ function openPositionEvidenceModal(positionIndex) {
                     <div><span>允许动作</span><strong>${managementActions.length ? managementActions.map(item => escHtml(({ hold: '保持', reduce: '减仓', close: '平仓', protection_repair: '修复保护单' })[item] || dashboardReasonText(item))).join(' / ') : '未授权任何动作'}</strong></div>
                 </div>
                 <div class="position-evidence-provenance"><span>版本 ${escHtml(management.contract_version || '缺失')}</span><span>接管时间 ${escHtml(management.takeover_at || '缺失')}</span><span>指纹 ${escHtml(management.policy_provenance?.contract_fingerprint || '缺失')}</span></div>
-                ${positionEvidenceBlockers(managementBlockers)}
+                ${fundingHtml}
+                ${positionEvidenceBlockers([...managementBlockers, ...fundingGaps])}
             </article>`
         : '<div class="position-evidence-empty">当前仓位尚未生成只减仓接管合同。</div>';
 

@@ -460,6 +460,131 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
 
 
 @pytest.mark.asyncio
+async def test_management_refresh_adds_only_matching_lifecycle_funding_bills() -> None:
+    opened_at = datetime(2026, 8, 15, 0, 0, tzinfo=UTC)
+    position = SimpleNamespace(
+        id=3,
+        is_open=True,
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        quantity=2.0,
+        entry_price=100.0,
+        entry_fee=0.2,
+        entry_exchange_order_id="entry-funding",
+        current_management_contract={},
+        created_at=opened_at,
+        updated_at=None,
+    )
+    order = SimpleNamespace(
+        exchange_order_id="entry-funding",
+        status="filled",
+        okx_raw_fills={
+            "fee_abs": 0.2,
+            "fills_history_confirmed": True,
+            "order_id": "entry-funding",
+        },
+        price=100.0,
+        quantity=2.0,
+        decision_id=13,
+    )
+    bills = [
+        SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            pos_side="long",
+            bill_ts=opened_at + timedelta(hours=8),
+            funding_fee=12.5,
+        ),
+        SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            pos_side="short",
+            bill_ts=opened_at + timedelta(hours=8),
+            funding_fee=999.0,
+        ),
+        SimpleNamespace(
+            inst_id="ETH-USDT-SWAP",
+            pos_side="long",
+            bill_ts=opened_at + timedelta(hours=8),
+            funding_fee=888.0,
+        ),
+        SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            pos_side="long",
+            bill_ts=opened_at - timedelta(hours=8),
+            funding_fee=777.0,
+        ),
+    ]
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class Session:
+        execute_count = 0
+
+        async def execute(self, _statement):
+            self.execute_count += 1
+            return Result([order] if self.execute_count == 1 else bills)
+
+    async def balance(_mode):
+        return {"equity": 1_000.0}
+
+    session = Session()
+    refreshed = await OkxSyncService(
+        account_equity_provider=balance
+    )._refresh_current_position_management_contracts(
+        session=session,
+        positions=[position],
+        exchange_positions=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "contracts": 2.0,
+                "contractSize": 1.0,
+                "entryPrice": 100.0,
+                "markPrice": 101.0,
+                "notional": 202.0,
+                "info": {"instId": "BTC-USDT-SWAP", "pos": "2", "posSide": "long"},
+            }
+        ],
+        protection_by_key={
+            ("BTC/USDT", "long"): {
+                "stop_loss_price": 95.0,
+                "take_profit_price": 110.0,
+                "protection_orders": [
+                    {
+                        "algo_id": "oco-funding",
+                        "state": "live",
+                        "contracts": 2.0,
+                        "reduce_only": True,
+                        "stop_loss_price": 95.0,
+                        "take_profit_price": 110.0,
+                    }
+                ],
+            }
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+    )
+
+    contract = position.current_management_contract
+    assert refreshed == 1
+    assert session.execute_count == 2
+    assert contract["funding_fee_usdt"] == pytest.approx(12.5)
+    assert contract["funding_bill_count"] == 1
+    assert contract["funding_fee_source"] == "okx_account_bills"
+    assert contract["funding_evidence_complete"] is True
+    assert contract["funding_evidence_eligible"] is True
+    assert contract["funding_window_opened_at"] == opened_at.isoformat()
+
+
+@pytest.mark.asyncio
 async def test_confirmed_local_close_order_is_reused_before_remote_fill_lookup() -> None:
     filled_at = datetime.now(UTC)
     order = SimpleNamespace(

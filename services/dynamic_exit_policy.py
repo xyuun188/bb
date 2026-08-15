@@ -86,11 +86,16 @@ class DynamicExitAssessment:
     hard_risk: bool
     gross_unrealized_pnl_usdt: float
     fee_after_unrealized_pnl_usdt: float
+    funding_fee_usdt: float
+    funding_fee_included: bool
+    funding_evidence_eligible: bool
+    lifecycle_net_pnl_usdt: float
     fee_buffer_usdt: float
     estimated_exit_cost_usdt: float
     execution_cost_complete: bool
     current_management_contract_complete: bool
     profit_retrace_ratio: float
+    profit_lock_pressure: float
     stop_risk_usage: float
     continuation_deterioration: float
     opposite_pressure: float
@@ -165,6 +170,12 @@ def assess_dynamic_exit(
     planned_stop_crossed = False
     management_contracts: list[dict[str, Any]] = []
     management_pressure_values: list[float] = []
+    funding_fee_observed = 0.0
+    funding_fee_eligible = 0.0
+    funding_bill_count = 0
+    funding_contract_count = 0
+    eligible_funding_contract_count = 0
+    seen_funding_contracts: set[str] = set()
     canary_horizon_assessments: list[dict[str, Any]] = []
     training_horizon_assessments: list[dict[str, Any]] = []
     position_ages_minutes: list[float] = []
@@ -259,6 +270,29 @@ def assess_dynamic_exit(
         )
         management = _safe_dict(position.get("current_management_contract"))
         management_contracts.append(management)
+        funding_identity = str(
+            _safe_dict(management.get("policy_provenance")).get("contract_fingerprint")
+            or ",".join(
+                str(value) for value in management.get("position_fragment_ids") or []
+            )
+            or id(management)
+        )
+        if funding_identity not in seen_funding_contracts:
+            seen_funding_contracts.add(funding_identity)
+            funding_contract_count += 1
+            contract_funding_fee = _safe_float(
+                management.get("funding_fee_usdt"),
+                0.0,
+            )
+            contract_bill_count = max(
+                int(_safe_float(management.get("funding_bill_count"), 0.0)),
+                0,
+            )
+            funding_fee_observed += contract_funding_fee
+            funding_bill_count += contract_bill_count
+            if management.get("funding_evidence_eligible") is True:
+                eligible_funding_contract_count += 1
+                funding_fee_eligible += contract_funding_fee
         canary_horizon_assessments.append(assess_paper_canary_position_horizon(position))
         training_horizon_assessments.append(assess_paper_training_position_horizon(position))
         opened_at = _parse_utc_datetime(
@@ -289,7 +323,16 @@ def assess_dynamic_exit(
         round_trip_cost_pct / 200.0 if execution_cost.get("production_eligible") is True else 0.0,
     )
     estimated_exit_cost = notional * estimated_exit_cost_rate
-    net_pnl = gross_pnl - fee_buffer
+    price_fee_after_pnl = gross_pnl - fee_buffer
+    funding_evidence_eligible = bool(
+        funding_contract_count > 0
+        and eligible_funding_contract_count == funding_contract_count
+    )
+    funding_fee_included = bool(
+        funding_bill_count > 0 and funding_evidence_eligible
+    )
+    included_funding_fee = funding_fee_eligible if funding_fee_included else 0.0
+    lifecycle_net_pnl = price_fee_after_pnl + included_funding_fee
     peak_profit = max(peak_profit, gross_pnl)
     retrace = _clamp((peak_profit - gross_pnl) / peak_profit) if peak_profit > 0 else 0.0
     hard_risk = planned_stop_crossed
@@ -370,7 +413,9 @@ def assess_dynamic_exit(
         != _normalized_symbol(decision.symbol)
         and str(replacement.get("side") or "").lower() in {"long", "short"}
     )
-    current_fee_after_return_pct = net_pnl / notional * 100.0 if notional > 0 else 0.0
+    current_fee_after_return_pct = (
+        lifecycle_net_pnl / notional * 100.0 if notional > 0 else 0.0
+    )
     replacement_advantage = (
         max(replacement_lcb - current_fee_after_return_pct, 0.0)
         if replacement_eligible
@@ -415,6 +460,11 @@ def assess_dynamic_exit(
         if current_management_contract_complete
         else 0.0
     )
+    profit_lock_pressure = (
+        _clamp(max(lifecycle_net_pnl, 0.0) / planned_risk)
+        if funding_fee_included and planned_risk > 0.0
+        else 0.0
+    )
     # The prediction horizon is a label deadline, not position-exit authority.
     # Keep its elapsed state in the assessment for audit and training only.
     close_fraction = (
@@ -427,6 +477,7 @@ def assess_dynamic_exit(
             opposite,
             portfolio_pressure,
             model_exit_pressure,
+            profit_lock_pressure,
         )
     )
     position_age_minutes = min(position_ages_minutes) if position_ages_minutes else None
@@ -448,6 +499,7 @@ def assess_dynamic_exit(
         or significant_model_exit_pressure
         or replacement_pressure > 0.0
         or portfolio_pressure > 0.0
+        or profit_lock_pressure > 0.0
     )
     reasons: list[str] = []
     if not matches:
@@ -465,7 +517,7 @@ def assess_dynamic_exit(
     if (
         not hard_risk
         and gross_pnl > 0
-        and net_pnl <= 0
+        and lifecycle_net_pnl <= 0
         and stop_usage <= 0
         and continuation <= 0
     ):
@@ -477,16 +529,17 @@ def assess_dynamic_exit(
     eligible = not reasons
     provenance = {
         "source": (
-            "current_position_takeover_fee_after_pnl_peak_planned_stop_market_portfolio_and_replacement_facts"
+            "current_position_takeover_lifecycle_pnl_funding_peak_planned_stop_market_portfolio_and_replacement_facts"
         ),
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-08-07.dynamic-exit-executable-economic-debounce.v11",
+        "strategy_version": "2026-08-15.dynamic-exit-lifecycle-funding.v12",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
+        "funding_fee_source": "current_position_management_contract",
     }
     return DynamicExitAssessment(
         eligible=eligible,
@@ -494,12 +547,17 @@ def assess_dynamic_exit(
         close_fraction=round(close_fraction if eligible else 0.0, 8),
         hard_risk=hard_risk,
         gross_unrealized_pnl_usdt=round(gross_pnl, 8),
-        fee_after_unrealized_pnl_usdt=round(net_pnl, 8),
+        fee_after_unrealized_pnl_usdt=round(price_fee_after_pnl, 8),
+        funding_fee_usdt=round(funding_fee_observed, 8),
+        funding_fee_included=funding_fee_included,
+        funding_evidence_eligible=funding_evidence_eligible,
+        lifecycle_net_pnl_usdt=round(lifecycle_net_pnl, 8),
         fee_buffer_usdt=round(fee_buffer, 8),
         estimated_exit_cost_usdt=round(estimated_exit_cost, 8),
         execution_cost_complete=execution_cost_complete,
         current_management_contract_complete=current_management_contract_complete,
         profit_retrace_ratio=round(retrace, 8),
+        profit_lock_pressure=round(profit_lock_pressure, 8),
         stop_risk_usage=round(stop_usage, 8),
         continuation_deterioration=round(continuation, 8),
         opposite_pressure=round(opposite, 8),

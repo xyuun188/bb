@@ -64,6 +64,10 @@ def test_takeover_contract_is_reduce_only_and_preserves_historical_gap() -> None
     )
     assert contract["original_entry_contract_gaps"] == ["decision_99:risk_contract_missing"]
     assert contract["entry_fee_usdt"] == pytest.approx(0.12)
+    assert contract["funding_fee_usdt"] == 0.0
+    assert contract["funding_bill_count"] == 0
+    assert contract["funding_evidence_complete"] is True
+    assert contract["funding_evidence_eligible"] is True
     assert contract["exit_fee_rate_proxy"] == pytest.approx(0.0006)
     assert contract["policy_provenance"]["contract_fingerprint"]
 
@@ -163,12 +167,19 @@ def test_takeover_contract_uses_authoritative_notional_and_blocks_identity_gap()
             position_notional_usdt=0.02309 * 3949.0,
             position_notional_source="okx_notional_usd",
             exchange_identity_gaps=["okx_private_position_underlying_differs_from_public_instrument"],
+            funding_fee_usdt=2030.93,
+            funding_bill_count=4,
+            funding_fee_source="okx_account_bills",
+            funding_evidence_complete=True,
+            funding_evidence_eligible=True,
         )
     )
 
     assert contract["position_notional_usdt"] == pytest.approx(0.02309 * 3949.0)
     assert contract["position_notional_source"] == "okx_notional_usd"
     assert contract["management_eligible"] is False
+    assert contract["funding_fee_usdt"] == pytest.approx(2030.93)
+    assert contract["funding_evidence_eligible"] is False
     assert "okx_private_position_underlying_differs_from_public_instrument" in contract["blockers"]
 
 

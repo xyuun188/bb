@@ -26,6 +26,7 @@ from core.trading_mode import mode_manager
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import TradeReflection
 from models.trade import Order, Position
@@ -38,7 +39,11 @@ from services.entry_fee_provider import entry_fee_from_orders
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
-from services.position_open_time import parse_position_time, serialize_position_time
+from services.position_open_time import (
+    parse_position_time,
+    position_open_time,
+    serialize_position_time,
+)
 from services.position_protection_rebalance import rebalance_current_position_protection
 from services.position_settlement import (
     SETTLEMENT_STATUS_SETTLING,
@@ -2361,6 +2366,59 @@ class OkxSyncService:
                 if str(order.exchange_order_id or "").strip()
             }
 
+        # Settlement sync owns the OKX private API. This refresh only reads its
+        # local bill mirror so it cannot add latency or private-endpoint load.
+        funding_bills_by_key: dict[tuple[str, str], list[OkxAccountBill]] = {}
+        funding_lookup_gaps: dict[tuple[str, str], list[str]] = {}
+        bill_windows: dict[tuple[str, str], tuple[datetime, datetime]] = {}
+        observed_at = datetime.now(UTC)
+        for key, fragments in local_by_key.items():
+            opened_values = [position_open_time(position) for position in fragments]
+            opened_at = min(
+                (value for value in opened_values if value is not None),
+                default=None,
+            )
+            if opened_at is None:
+                funding_lookup_gaps[key] = ["funding_window_opened_at_missing"]
+                continue
+            bill_windows[key] = (opened_at, observed_at)
+        if bill_windows:
+            try:
+                earliest_opened_at = min(window[0] for window in bill_windows.values())
+                bill_result = await session.execute(
+                    select(OkxAccountBill).where(
+                        OkxAccountBill.mode == "paper",
+                        OkxAccountBill.bill_ts >= earliest_opened_at,
+                        OkxAccountBill.bill_ts <= observed_at,
+                    )
+                )
+                for bill in bill_result.scalars().all():
+                    inst_id = str(bill.inst_id or "").strip().upper()
+                    side = str(bill.pos_side or "").strip().lower()
+                    bill_ts = parse_position_time(bill.bill_ts)
+                    if bill_ts is None:
+                        continue
+                    for key, window in bill_windows.items():
+                        expected_inst_id = (
+                            f"{key[0].replace('/', '-')}-SWAP".upper()
+                        )
+                        if inst_id != expected_inst_id or (
+                            side in {"long", "short"} and side != key[1]
+                        ):
+                            continue
+                        if (
+                            window[0] <= bill_ts <= window[1]
+                            and abs(float_parser(bill.funding_fee, 0.0)) > 1e-12
+                        ):
+                            funding_bills_by_key.setdefault(key, []).append(bill)
+            except Exception as exc:
+                logger.warning(
+                    "optional funding bill cache lookup failed",
+                    error=safe_error_text(exc),
+                )
+                for key in bill_windows:
+                    funding_lookup_gaps[key] = ["funding_bill_cache_lookup_failed"]
+
         group_rows: list[dict[str, Any]] = []
         for key, snapshot in exchange_by_key.items():
             protection = _dict_value(protection_by_key.get(key))
@@ -2521,6 +2579,48 @@ class OkxSyncService:
                 "position_fragment_ids": [position.id for position in fragments if position.id],
                 "position_fragment_count": len(fragments),
             }
+            funding_bills = funding_bills_by_key.get(key, [])
+            funding_total = sum(
+                float_parser(bill.funding_fee, 0.0) for bill in funding_bills
+            )
+            lookup_gaps = list(funding_lookup_gaps.get(key, []))
+            funding_gaps = [
+                *lookup_gaps,
+                *(
+                    f"funding_identity:{gap}"
+                    for gap in row["exchange_identity_gaps"]
+                ),
+            ]
+            opened_at = min(
+                (
+                    value
+                    for value in (
+                        position_open_time(position) for position in fragments
+                    )
+                    if value is not None
+                ),
+                default=None,
+            )
+            identity_complete = not row["exchange_identity_gaps"] and bool(
+                row["position_notional_usdt"] > 0
+            )
+            facts.update(
+                {
+                    "funding_fee_usdt": funding_total,
+                    "funding_bill_count": len(funding_bills),
+                    "funding_fee_source": (
+                        "okx_account_bills" if funding_bills else "none"
+                    ),
+                    "funding_evidence_complete": not lookup_gaps,
+                    "funding_evidence_eligible": bool(
+                        identity_complete and not funding_gaps
+                    ),
+                    "funding_evidence_gaps": funding_gaps,
+                    "funding_window_opened_at": (
+                        opened_at.isoformat() if opened_at else None
+                    ),
+                }
+            )
             previous = _dict_value(fragments[0].current_management_contract)
             contract = build_current_position_management_contract(
                 facts,

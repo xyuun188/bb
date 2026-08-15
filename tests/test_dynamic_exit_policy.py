@@ -99,7 +99,7 @@ def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size(
     assert decision.position_size_pct == pytest.approx(0.5)
     assert decision.raw_response["close_fraction"] == pytest.approx(0.5)
     assert result.policy_provenance["source"] == (
-        "current_position_takeover_fee_after_pnl_peak_planned_stop_market_portfolio_and_replacement_facts"
+        "current_position_takeover_lifecycle_pnl_funding_peak_planned_stop_market_portfolio_and_replacement_facts"
     )
     assert result.policy_provenance["fallback_reason"] == ""
     assert result.execution_cost_complete is True
@@ -252,6 +252,63 @@ def test_fee_only_loss_does_not_consume_planned_stop_budget() -> None:
     assert "dynamic_exit_pressure_zero" in result.reason
 
 
+def test_trusted_funding_profit_adds_lifecycle_profit_lock_pressure() -> None:
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+    position["current_management_contract"] = {
+        **position["current_management_contract"],
+        "funding_fee_usdt": 10.0,
+        "funding_bill_count": 2,
+        "funding_fee_source": "okx_account_bills",
+        "funding_evidence_complete": True,
+        "funding_evidence_eligible": True,
+        "funding_evidence_gaps": [],
+    }
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.funding_fee_usdt == pytest.approx(10.0)
+    assert result.funding_fee_included is True
+    assert result.funding_evidence_eligible is True
+    assert result.lifecycle_net_pnl_usdt == pytest.approx(9.0)
+    assert result.profit_lock_pressure == pytest.approx(0.45)
+    assert result.eligible is True
+    assert result.close_fraction == pytest.approx(0.45)
+
+
+def test_untrusted_funding_is_audited_but_cannot_drive_exit() -> None:
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+    position["current_management_contract"] = {
+        **position["current_management_contract"],
+        "funding_fee_usdt": 2030.93,
+        "funding_bill_count": 4,
+        "funding_fee_source": "okx_account_bills",
+        "funding_evidence_complete": True,
+        "funding_evidence_eligible": False,
+        "funding_evidence_gaps": ["exchange_position_notional_mismatch"],
+    }
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.funding_fee_usdt == pytest.approx(2030.93)
+    assert result.funding_fee_included is False
+    assert result.funding_evidence_eligible is False
+    assert result.lifecycle_net_pnl_usdt == pytest.approx(-1.0)
+    assert result.profit_lock_pressure == 0.0
+    assert result.close_fraction == 0.0
+    assert result.eligible is False
+    assert "dynamic_exit_pressure_zero" in result.reason
+
+
 def test_early_non_hard_partial_exit_requires_price_move_to_cover_exit_cost() -> None:
     position = _position(
         created_at=datetime.now(UTC) - timedelta(minutes=2),
@@ -399,7 +456,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-07.dynamic-exit-executable-economic-debounce.v11"
+        "2026-08-15.dynamic-exit-lifecycle-funding.v12"
     )
 
 
