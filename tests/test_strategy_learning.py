@@ -7,11 +7,17 @@ from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
+import pytest
+
+import services.strategy_learning as strategy_learning_module
 from services.strategy_learning import (
     StrategyCandidateGenerator,
     StrategyFeedback,
     StrategyLearningEngine,
+    StrategyLearningService,
+    _build_historical_replay_observations,
     _json_safe,
     _regime_label,
     _runtime_prior_usage,
@@ -45,6 +51,125 @@ def test_strategy_learning_json_payload_replaces_nested_non_finite_values() -> N
         "generated_at": "2026-07-15T00:00:00+00:00",
     }
     json.dumps(payload, allow_nan=False)
+
+
+def test_historical_replay_observations_build_in_background_helper() -> None:
+    epoch_start = datetime(2026, 7, 1, tzinfo=UTC)
+    row = SimpleNamespace(
+        id=1,
+        decision_id=2,
+        symbol="BTC/USDT",
+        training_feature_snapshot={
+            "adx_14": 25.0,
+            "funding_data_available": True,
+            "funding_rate": 0.0001,
+            "funding_interval_minutes": 480,
+            "taker_fee_rate": 0.0005,
+            "spread_pct": 0.01,
+            "market_fact_quality_status": "verified",
+        },
+        feature_snapshot={},
+        horizon_minutes=10,
+        long_return_pct=1.0,
+        short_return_pct=-1.0,
+        created_at=datetime(2026, 7, 2, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 2, 0, 10, tzinfo=UTC),
+        due_at=datetime(2026, 7, 2, 0, 10, tzinfo=UTC),
+        decision_action="long",
+        best_action="long",
+        missed_opportunity=False,
+    )
+
+    observations, excluded = _build_historical_replay_observations(
+        [row],
+        epoch_start=epoch_start,
+    )
+
+    assert len(observations) == 1
+    assert observations[0]["symbol"] == "BTC/USDT"
+    assert excluded == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def __init__(self, rows: list[Any]) -> None:
+            self.rows = rows
+
+        def scalars(self) -> FakeResult:
+            return self
+
+        def all(self) -> list[Any]:
+            return list(self.rows)
+
+    class FakeReadSession:
+        def __init__(self) -> None:
+            self.statements: list[Any] = []
+
+        async def execute(self, statement: Any) -> FakeResult:
+            self.statements.append(statement)
+            if len(self.statements) == 3:
+                return FakeResult([SimpleNamespace(id=2), SimpleNamespace(id=1)])
+            return FakeResult([])
+
+    class FakeReadContext:
+        def __init__(self, session: FakeReadSession) -> None:
+            self.session = session
+
+        async def __aenter__(self) -> FakeReadSession:
+            return self.session
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    async def empty_outcomes(**_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    replay_row_ids: list[int] = []
+
+    def capture_replay_rows(
+        rows: list[Any],
+        *,
+        epoch_start: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        del epoch_start
+        replay_row_ids.extend(int(row.id) for row in rows)
+        return [], {}
+
+    session = FakeReadSession()
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_authoritative_trade_outcomes",
+        empty_outcomes,
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "get_read_session_ctx",
+        lambda: FakeReadContext(session),
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "_build_historical_replay_observations",
+        capture_replay_rows,
+    )
+
+    await StrategyLearningService()._feedback(
+        mode="paper",
+        hours=24,
+        limit=7,
+        include_historical_replay=True,
+    )
+
+    replay_statement = session.statements[2]
+    assert replay_statement._limit_clause.value == 7
+    assert replay_row_ids == [1, 2]
 
 
 def _sample(

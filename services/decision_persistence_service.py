@@ -133,11 +133,9 @@ class DecisionPersistenceService:
         if isinstance(value, datetime):
             return value.isoformat()
         if isinstance(value, dict):
-            payload = {str(key): self.json_safe_payload(item) for key, item in value.items()}
-            return sanitize_runtime_text(payload)
+            return {str(key): self.json_safe_payload(item) for key, item in value.items()}
         if isinstance(value, (list, tuple, set)):
-            payload = [self.json_safe_payload(item) for item in value]
-            return sanitize_runtime_text(payload)
+            return [self.json_safe_payload(item) for item in value]
         item = getattr(value, "item", None)
         if callable(item):
             try:

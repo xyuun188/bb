@@ -490,6 +490,11 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
             "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
         ),
         (
+            "idx_ai_decisions_market_selection",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_market_selection "
+            "ON ai_decisions (model_name, analysis_type, symbol, created_at DESC, id DESC)",
+        ),
+        (
             "idx_orders_okx_inst_id",
             "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
         ),

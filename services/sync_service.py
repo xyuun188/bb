@@ -66,6 +66,7 @@ ORPHAN_QUARANTINE_REFLECTION_SOURCE = "okx_orphan_position_quarantine"
 ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
 POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS = 0.1
+POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS = 4.0
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS = 10 * 60.0
 CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO = 0.005
@@ -1738,11 +1739,27 @@ class OkxSyncService:
                 source_mode: str,
                 executor: Any,
             ) -> tuple[str, list[dict[str, Any]]]:
+                task = asyncio.create_task(executor.get_positions_strict())
                 try:
-                    exchange_positions = await asyncio.wait_for(
-                        executor.get_positions_strict(),
-                        timeout=4.0,
+                    done, pending = await asyncio.wait(
+                        {task},
+                        timeout=POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS,
                     )
+                    if pending:
+                        task.cancel()
+                        task.add_done_callback(_consume_background_task_result)
+                        logger.debug(
+                            "OKX position snapshot source timed out during price refresh",
+                            source_mode=source_mode,
+                            timeout_seconds=POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS,
+                        )
+                        return source_mode, []
+                    exchange_positions = next(iter(done)).result()
+                except asyncio.CancelledError:
+                    if not task.done():
+                        task.cancel()
+                        task.add_done_callback(_consume_background_task_result)
+                    raise
                 except Exception as exc:
                     logger.debug(
                         "OKX position snapshot source unavailable during price refresh",

@@ -116,8 +116,6 @@ async def test_decision_persistence_uses_unified_runtime_text_boundary(
         calls.append(value)
         if isinstance(value, str):
             return f"unified:{value}"
-        if isinstance(value, dict):
-            return {"unified": value}
         return value
 
     monkeypatch.setattr(
@@ -146,13 +144,47 @@ async def test_decision_persistence_uses_unified_runtime_text_boundary(
     await service.fill_missing_reasons([9], "raw missing reason")
 
     assert repo.logged[0]["reasoning"] == "unified:raw decision reason"
-    assert repo.logged[0]["feature_snapshot"]["unified"]["note"] == "unified:raw feature"
-    assert repo.logged[0]["raw_llm_response"]["unified"]["note"] == "unified:raw llm"
-    assert "decision_state_machine" in repo.logged[0]["raw_llm_response"]["unified"]
-    assert repo.raw_updates[-1][1]["unified"]["note"] == "unified:raw llm"
+    assert repo.logged[0]["feature_snapshot"]["note"] == "unified:raw feature"
+    assert repo.logged[0]["raw_llm_response"]["note"] == "unified:raw llm"
+    assert "decision_state_machine" in repo.logged[0]["raw_llm_response"]
+    assert repo.raw_updates[-1][1]["note"] == "unified:raw llm"
     assert repo.reasons == [(9, "unified:raw final reason")]
     assert repo.fill_missing == [([9], "unified:raw missing reason")]
     assert "raw decision reason" in calls
+
+
+def test_json_safe_payload_sanitizes_each_text_leaf_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_sanitize(value: Any) -> Any:
+        assert isinstance(value, str)
+        calls.append(value)
+        return f"clean:{value}"
+
+    monkeypatch.setattr(
+        decision_persistence_module,
+        "sanitize_runtime_text",
+        fake_sanitize,
+        raising=False,
+    )
+    service = _service(FakeSession(), FakeDecisionRepo())
+
+    payload = service.json_safe_payload(
+        {
+            "first": "one",
+            "nested": [{"second": "two"}, ["three"]],
+            "number": 4,
+        }
+    )
+
+    assert payload == {
+        "first": "clean:one",
+        "nested": [{"second": "clean:two"}, ["clean:three"]],
+        "number": 4,
+    }
+    assert calls == ["one", "two", "three"]
 
 
 @pytest.mark.asyncio

@@ -74,13 +74,21 @@ INDICATOR_CACHED_READ_CONCURRENCY = max(
     1,
     min(4, int(settings.database_pool_size or 1)),
 )
-INDICATOR_CACHED_READ_TASK_LIMIT = 64
+INDICATOR_CACHED_READ_TASK_LIMIT = 8
+INDICATOR_COMPUTE_CONCURRENCY = 1
 KLINE_PERSIST_CONCURRENCY = 2
 TICKER_PERSIST_CONCURRENCY = max(
     1,
     min(4, max(int(settings.database_pool_size or 1) // 8, 1)),
 )
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        return
 NATIVE_MARKET_REMOTE_CONCURRENCY = max(
     1,
     int(_MARKET_DATA_PARAMS.native_market_remote_concurrency),
@@ -201,6 +209,8 @@ class DataService:
         self._indicator_cached_read_semaphore = asyncio.Semaphore(
             INDICATOR_CACHED_READ_CONCURRENCY
         )
+        self._indicator_compute_semaphore = asyncio.Semaphore(INDICATOR_COMPUTE_CONCURRENCY)
+        self._indicator_compute_tasks: set[asyncio.Task] = set()
         self._indicator_snapshot_priority_gate = _PriorityBuildGate(
             INDICATOR_SNAPSHOT_BUILD_CONCURRENCY
         )
@@ -386,6 +396,7 @@ class DataService:
         await self._stop_kline_coverage_refresh()
         await self._stop_kline_persistence()
         await self._stop_indicator_cached_reads()
+        await self._stop_indicator_computations()
         await self.ws_client.close()
         await self.rest_client.close()
         await self.news_fetcher.close()
@@ -775,26 +786,36 @@ class DataService:
                 finally:
                     gate.release()
 
+            total_timeout = (
+                timeout * 2.0
+                if uses_native_remote and prioritize_native_market_data
+                else timeout
+            )
+            task = asyncio.create_task(read())
             try:
-                total_timeout = (
-                    timeout * 2.0
-                    if uses_native_remote and prioritize_native_market_data
-                    else timeout
-                )
-                result = await asyncio.wait_for(read(), timeout=total_timeout)
+                done, pending = await asyncio.wait({task}, timeout=total_timeout)
+                if pending:
+                    task.cancel()
+                    task.add_done_callback(_consume_task_result)
+                    await asyncio.sleep(0)
+                    logger.warning(
+                        "feature snapshot source timed out",
+                        symbol=symbol,
+                        source=name,
+                        timeout_seconds=total_timeout,
+                        provider_timeout_seconds=timeout,
+                        priority_queue=bool(
+                            uses_native_remote and prioritize_native_market_data
+                        ),
+                    )
+                    return {}
+                result = next(iter(done)).result()
                 return result if isinstance(result, dict) else {}
-            except TimeoutError:
-                logger.warning(
-                    "feature snapshot source timed out",
-                    symbol=symbol,
-                    source=name,
-                    timeout_seconds=total_timeout,
-                    provider_timeout_seconds=timeout,
-                    priority_queue=bool(
-                        uses_native_remote and prioritize_native_market_data
-                    ),
-                )
-                return {}
+            except asyncio.CancelledError:
+                if not task.done():
+                    task.cancel()
+                    task.add_done_callback(_consume_task_result)
+                raise
             except Exception as exc:
                 logger.debug(
                     "feature snapshot source failed",
@@ -1659,6 +1680,43 @@ class DataService:
             self._indicator_cached_read_semaphore = gate
         return gate
 
+    def _indicator_compute_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_indicator_compute_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(INDICATOR_COMPUTE_CONCURRENCY)
+            self._indicator_compute_semaphore = gate
+        return gate
+
+    def _indicator_compute_task_set(self) -> set[asyncio.Task]:
+        tasks = getattr(self, "_indicator_compute_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._indicator_compute_tasks = tasks
+        return tasks
+
+    async def _compute_indicator_features_off_loop(
+        self,
+        klines_by_timeframe: dict[str, list],
+    ) -> dict[str, Any]:
+        gate = self._indicator_compute_gate()
+        await gate.acquire()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._indicator_features_from_timeframes,
+                klines_by_timeframe,
+            )
+        )
+        tasks = self._indicator_compute_task_set()
+        tasks.add(task)
+
+        def release_when_finished(finished: asyncio.Task) -> None:
+            tasks.discard(finished)
+            gate.release()
+            _consume_task_result(finished)
+
+        task.add_done_callback(release_when_finished)
+        return await asyncio.shield(task)
+
     async def _stop_indicator_cached_reads(self) -> None:
         tasks = list(self._indicator_cached_read_task_map().values())
         if tasks:
@@ -1667,6 +1725,15 @@ class DataService:
                 return_exceptions=True,
             )
         self._indicator_cached_read_task_map().clear()
+
+    async def _stop_indicator_computations(self) -> None:
+        tasks = list(self._indicator_compute_task_set())
+        if tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+        self._indicator_compute_task_set().clear()
 
     def _indicator_remote_refresh_gate(self) -> asyncio.Semaphore:
         gate = getattr(self, "_indicator_remote_refresh_semaphore", None)
@@ -1909,7 +1976,9 @@ class DataService:
                 for timeframe, rows in (item,)
                 if rows
             }
-            features = self._indicator_features_from_timeframes(klines_by_timeframe)
+            features = await self._compute_indicator_features_off_loop(
+                klines_by_timeframe
+            )
             if features:
                 self._store_indicator_snapshot_cache(symbol, features)
             return features
@@ -1979,7 +2048,9 @@ class DataService:
                     KLINE_PERSIST_TIMEFRAME_LIMITS,
                 )
             )
-        features = self._indicator_features_from_timeframes(cached_klines_by_timeframe)
+        features = await self._compute_indicator_features_off_loop(
+            cached_klines_by_timeframe
+        )
         if features:
             self._store_indicator_snapshot_cache(symbol, features)
         return features

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import Float, cast, func, or_, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
@@ -257,6 +257,15 @@ MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
 MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
+MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 6.0
+MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS = 5.0
+MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS = (
+    "current_price",
+    "entry_activity_volume_ratio",
+    "adx_14",
+    "returns_5",
+    "volatility_20",
+)
 VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
@@ -269,6 +278,7 @@ MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
+TRAINING_STARTUP_GRACE_SECONDS = 180.0
 AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS = 30 * 60
 AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS = 4 * 60 * 60
 
@@ -960,6 +970,7 @@ class TradingService:
         self._okx_authoritative_sync_failure_count = 0
         self._ml_auto_train_task: asyncio.Task | None = None
         self._model_training_heartbeat_task: asyncio.Task | None = None
+        self._active_training_processes: set[asyncio.subprocess.Process] = set()
         self._local_tools_active_training_run_id: str | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
@@ -1058,7 +1069,7 @@ class TradingService:
     ) -> float:
         """Return the soft per-round scan budget used inside market analysis."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         base_budget = max(8.0, interval * 0.90)
         del strategy_context
@@ -1083,7 +1094,7 @@ class TradingService:
     ) -> float:
         """Return remaining time needed before starting another market AI symbol."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         model_reserve = max(
             MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
@@ -1104,19 +1115,30 @@ class TradingService:
         remaining_round_seconds: float,
         remaining_symbol_count: int,
     ) -> float:
-        """Return a full model-stage window once a candidate has started.
+        """Return a model window that cannot overrun the market round budget.
 
-        Candidate count controls whether another symbol may start; it must not
-        shrink a started provider call below its normal response time.
+        A started symbol still gets the normal provider window when the round
+        has enough time. Near the round boundary it must inherit the remaining
+        budget instead; otherwise one slow provider can run past the scheduler
+        budget and delay every deferred symbol in the next round.
         """
 
-        del remaining_round_seconds, remaining_symbol_count
-        return self.market_model_inference_timeout_seconds()
+        del remaining_symbol_count
+        normal_timeout = self.market_model_inference_timeout_seconds()
+        try:
+            remaining = max(float(remaining_round_seconds or 0.0), 0.0)
+        except (TypeError, ValueError):
+            remaining = 0.0
+        budget_limited_timeout = max(
+            remaining - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            0.0,
+        )
+        return round(min(normal_timeout, budget_limited_timeout), 3)
 
     def market_symbol_context_timeout_seconds(self) -> float:
         """Return the independent deadline for memory and local context work."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         local_tools_timeout = max(
             float(settings.local_ai_tools_timeout_seconds or 0.0),
             0.0,
@@ -1144,7 +1166,7 @@ class TradingService:
         then retry independently, so its outer boundary must cover both phases.
         """
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         independent_window = self._independent_expert_window_seconds()
         execution_mode = str(settings.trading_mode or "").lower()
         batch_window = 0.0
@@ -1178,21 +1200,21 @@ class TradingService:
     def position_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent position-review rounds."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(5.0, interval * 0.65)
 
     def market_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent market-scan rounds."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(8.0, min(14.0, interval * 0.35))
 
     def market_round_watchdog_seconds(self) -> float:
         """Return the hard watchdog for a genuinely stuck market-analysis round."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         expert_budget = (
             float(settings.ai_batch_expert_timeout_seconds or 0.0)
@@ -1211,7 +1233,7 @@ class TradingService:
         real diagnostic.
         """
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         stage_budget = self.position_review_stage_timeout_seconds()
         configured_watchdog = float(
@@ -1224,21 +1246,21 @@ class TradingService:
     def round_start_reconcile_timeout_seconds(self) -> float:
         """Return the short OKX sync boundary used at analysis round start."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(14.0, min(20.0, interval * 0.5))
 
     def okx_authoritative_sync_interval_seconds(self) -> float:
         """Return the background cadence for current OKX position sync."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(20.0, min(60.0, interval * 0.5))
 
     def okx_authoritative_sync_timeout_seconds(self) -> float:
         """Allow the independent OKX sync loop to finish its full account pass."""
 
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
         return max(30.0, min(45.0, interval * 1.5))
 
@@ -2394,6 +2416,7 @@ class TradingService:
         status = "ok"
         gate = self._strategy_context_io_gate()
         acquired = False
+        task: asyncio.Task[Any] | None = None
         try:
             self._safe_set_strategy_context_stage(f"strategy_context:{label}")
             budget_seconds = max(float(timeout_seconds), 0.0)
@@ -2426,7 +2449,12 @@ class TradingService:
                 timeout=remaining_seconds,
             )
             if pending:
-                await drain_cancelled_tasks(pending, timeout_seconds=0.05)
+                # Strategy context is optional and must not wait for a slow
+                # HTTP/model cancellation path before the next round proceeds.
+                for pending_task in pending:
+                    pending_task.cancel()
+                    pending_task.add_done_callback(_consume_task_result)
+                await asyncio.sleep(0)
                 status = "timeout"
                 logger.warning(
                     "strategy context stage timed out; using baseline value",
@@ -2435,6 +2463,11 @@ class TradingService:
                 )
                 return fallback
             return next(iter(done)).result()
+        except asyncio.CancelledError:
+            if task is not None and not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+            raise
         except Exception as exc:
             status = "error"
             logger.warning(
@@ -2477,6 +2510,7 @@ class TradingService:
             max(remaining_seconds - MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS, 0.0),
         )
         status = "ok"
+        task: asyncio.Task[Any] | None = None
         try:
             if allowed_timeout <= 0.0:
                 if inspect.iscoroutine(awaitable):
@@ -2486,7 +2520,17 @@ class TradingService:
             task = asyncio.ensure_future(awaitable)
             done, pending = await asyncio.wait({task}, timeout=allowed_timeout)
             if pending:
-                await drain_cancelled_tasks(pending, timeout_seconds=0.05)
+                # Optional context must never hold the market round open while
+                # an HTTP client or model server finishes cancellation.  Send
+                # cancellation and detach immediately; the task callback
+                # consumes any late result/exception without blocking the
+                # latency-sensitive analysis path.
+                for pending_task in pending:
+                    pending_task.cancel()
+                    pending_task.add_done_callback(_consume_task_result)
+                # Give cooperative coroutines one scheduling turn to observe
+                # cancellation, while never waiting for user cleanup.
+                await asyncio.sleep(0)
                 status = "timeout"
                 logger.warning(
                     "market context stage timed out; using observation fallback",
@@ -2496,6 +2540,14 @@ class TradingService:
                 )
                 return timeout_fallback if timeout_fallback is not None else fallback
             return next(iter(done)).result()
+        except asyncio.CancelledError:
+            # A watchdog may cancel the whole market round while this optional
+            # context is in flight. Detach the child task before propagating
+            # cancellation so the next round cannot inherit an orphaned task.
+            if task is not None and not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+            raise
         except Exception as exc:
             status = "error"
             logger.warning(
@@ -3027,18 +3079,36 @@ class TradingService:
         strategy_context: dict[str, Any] | None = None,
         market_symbol_count: int | None = None,
     ) -> bool:
+        return (
+            self._market_ai_budget_defer_reason(
+                market_ai_started_at,
+                strategy_context=strategy_context,
+                market_symbol_count=market_symbol_count,
+            )
+            is not None
+        )
+
+    def _market_ai_budget_defer_reason(
+        self,
+        market_ai_started_at: datetime,
+        *,
+        strategy_context: dict[str, Any] | None = None,
+        market_symbol_count: int | None = None,
+    ) -> str | None:
         elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
         budget_seconds = self.market_round_time_budget_seconds(
             strategy_context=strategy_context,
             market_symbol_count=market_symbol_count,
         )
         if elapsed_seconds >= budget_seconds:
-            return True
+            return "time_budget_exhausted"
         reserve_seconds = self.market_symbol_start_reserve_seconds(
             strategy_context=strategy_context,
             market_symbol_count=market_symbol_count,
         )
-        return (budget_seconds - elapsed_seconds) < reserve_seconds
+        if (budget_seconds - elapsed_seconds) < reserve_seconds:
+            return "next_symbol_start_reserve"
+        return None
 
     async def _runtime_heartbeat_loop(self) -> None:
         """Keep split-process dashboard heartbeat fresh while a round is busy."""
@@ -4458,6 +4528,10 @@ class TradingService:
         return self._recent_stage_durations(state)
 
     def _start_runtime_round(self, scope: str, started_at: datetime) -> None:
+        # Training is useful only while the trading loops are idle.  Preempt a
+        # process that raced with round scheduling before it can consume the
+        # CPU budget needed by live inference.
+        self._request_training_preemption()
         state = self._runtime_state(scope)
         state.current_stage = "starting"
         state.current_stage_started_at = started_at
@@ -4474,6 +4548,30 @@ class TradingService:
         elif scope == "position":
             self._last_position_round_started_at = started_at
             self._last_position_round_finished_at = None
+
+    def _training_process_set(self) -> set[asyncio.subprocess.Process]:
+        processes = getattr(self, "_active_training_processes", None)
+        if not isinstance(processes, set):
+            processes = set()
+            self._active_training_processes = processes
+        return processes
+
+    def _request_training_preemption(self) -> None:
+        processes = [
+            process
+            for process in self._training_process_set()
+            if process.returncode is None
+        ]
+        for process in processes:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                continue
+        if processes:
+            logger.info(
+                "preempted background training for live analysis round",
+                process_count=len(processes),
+            )
 
     def _finish_runtime_round(self, scope: str, finished_at: datetime, *, ok: bool) -> None:
         state = self._runtime_state(scope)
@@ -4550,7 +4648,7 @@ class TradingService:
     def _write_runtime_heartbeat(self) -> None:
         """Persist a lightweight status heartbeat for split dashboard deployments."""
         try:
-            settings.refresh_runtime_env(force=True)
+            settings.refresh_runtime_env()
             now = datetime.now(UTC)
             uptime = (
                 int((now - self._start_time).total_seconds()) if self._start_time is not None else 0
@@ -6196,41 +6294,78 @@ class TradingService:
                 1,
             )
         )
-        try:
+        timeout_path = AIDecision.raw_llm_response["market_model_timeout"][
+            "isolated_to_symbol"
+        ].as_boolean()
+        feature_columns = [
+            cast(AIDecision.feature_snapshot[key].as_float(), Float).label(key)
+            for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
+        ]
+
+        async def load_rows() -> list[Any]:
             async with get_read_session_ctx() as session:
-                rows = (
+                return (
                     await session.execute(
                         select(
                             AIDecision.symbol,
                             AIDecision.created_at,
-                            AIDecision.feature_snapshot,
-                            AIDecision.reasoning,
-                            AIDecision.raw_llm_response,
+                            *feature_columns,
                         )
                         .where(
                             AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                             AIDecision.analysis_type == "market",
                             AIDecision.created_at >= cutoff,
+                            or_(timeout_path.is_(False), timeout_path.is_(None)),
+                            or_(
+                                AIDecision.reasoning.is_(None),
+                                ~AIDecision.reasoning.contains("模型分析超过独立时间上限"),
+                            ),
                         )
-                        .order_by(AIDecision.created_at.desc())
+                        .distinct(AIDecision.symbol)
+                        .order_by(AIDecision.symbol, AIDecision.created_at.desc())
                         .limit(max(int(MARKET_ANALYSIS_SELECTION_PARAMS.history_limit), 1))
                     )
                 ).all()
+
+        task = asyncio.create_task(load_rows())
+        try:
+            done, pending = await asyncio.wait(
+                {task},
+                timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+            )
+            if pending:
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+                await asyncio.sleep(0)
+                policy.history_loaded = True
+                logger.warning(
+                    "market analysis selection history load timed out; starting empty",
+                    timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+                )
+                return
+            rows = next(iter(done)).result()
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+            raise
         except Exception as exc:
+            policy.history_loaded = True
             logger.warning(
                 "recent market analysis selection history load failed",
                 error=safe_error_text(exc),
             )
             return
-        for row in reversed(rows):
-            if not self._persisted_market_analysis_completed(
-                row.reasoning,
-                row.raw_llm_response,
-            ):
-                continue
+        for row in rows:
+            row_values = row._mapping if hasattr(row, "_mapping") else vars(row)
+            feature_snapshot = {
+                key: row_values.get(key)
+                for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
+                if row_values.get(key) is not None
+            }
             policy.remember(
                 str(row.symbol or ""),
-                row.feature_snapshot if isinstance(row.feature_snapshot, dict) else {},
+                feature_snapshot,
                 observed_at=row.created_at,
             )
         policy.history_loaded = True
@@ -6368,11 +6503,62 @@ class TradingService:
             return {}
         selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
         executor = await self._get_okx_executor_for_mode(selected_mode)
-        shortlist = await executor.entry_instrument_availability_shortlist(
-            list(feature_vectors),
-            target_count=target,
-            concurrency=4,
+        verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
+        verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
+        shortlist_task = asyncio.create_task(
+            executor.entry_instrument_availability_shortlist(
+                list(feature_vectors),
+                target_count=target,
+                concurrency=4,
+            )
         )
+        try:
+            done, pending = await asyncio.wait(
+                {shortlist_task},
+                timeout=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            shortlist_task.cancel()
+            shortlist_task.add_done_callback(_consume_task_result)
+            raise
+        if pending:
+            shortlist_task.cancel()
+            shortlist_task.add_done_callback(_consume_task_result)
+            await asyncio.sleep(0)
+            cached_selected = [
+                symbol for symbol in feature_vectors if symbol in verified_symbols
+            ][:target]
+            shortlist = {
+                "selected_symbols": cached_selected,
+                "availability": {
+                    symbol: {
+                        "available": True if symbol in verified_symbols else None,
+                        "reason": (
+                            "cached_okx_private_account_instrument_verified"
+                            if symbol in verified_symbols
+                            else "okx_private_entry_instrument_probe_deferred"
+                        ),
+                        "cache_hit": symbol in verified_symbols,
+                    }
+                    for symbol in feature_vectors
+                },
+                "evaluated_count": len(cached_selected),
+                "probed_count": 0,
+                "cache_hit_count": len(cached_selected),
+                "skipped_after_target_count": max(
+                    len(feature_vectors) - len(cached_selected),
+                    0,
+                ),
+                "timeout": True,
+            }
+            logger.warning(
+                "market instrument shortlist timed out; using verified cache",
+                timeout_seconds=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
+                cached_selected_count=len(cached_selected),
+            )
+        else:
+            shortlist = next(iter(done)).result()
         availability = self._safe_dict(shortlist.get("availability"))
         selected_order = [
             str(symbol)
@@ -6381,9 +6567,6 @@ class TradingService:
         ]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
-        verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
-        verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
-        verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
         for symbol, facts in availability.items():
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:
@@ -6411,6 +6594,7 @@ class TradingService:
             "probed_count": int(shortlist.get("probed_count") or 0),
             "cache_hit_count": int(shortlist.get("cache_hit_count") or 0),
             "skipped_after_target_count": int(shortlist.get("skipped_after_target_count") or 0),
+            "timeout": bool(shortlist.get("timeout")),
             "available_count": sum(
                 self._safe_dict(facts).get("available") is True for facts in availability.values()
             ),
@@ -7334,7 +7518,7 @@ class TradingService:
 
         Returns a summary dict for runtime observers.
         """
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         if not self._running:
             return {"status": "stopped"}
         analysis_scope = (
@@ -7840,6 +8024,7 @@ class TradingService:
                 else:
                     model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
                     rank_limit = len(market_feature_vectors)
+                    self._set_loop_stage("market_ranking")
                     market_feature_vectors = self._rank_auto_feature_vectors(
                         market_feature_vectors, rank_limit
                     )
@@ -7849,6 +8034,7 @@ class TradingService:
                             len(market_feature_vectors),
                         )
                     )
+                    self._set_loop_stage("instrument_shortlist")
                     market_feature_vectors = await self._filter_entry_instrument_shortlist(
                         market_feature_vectors,
                         availability_target,
@@ -7859,6 +8045,7 @@ class TradingService:
                     )
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
+                self._set_loop_stage("indicator_prewarm_queue")
                 prewarm_symbols = self._market_indicator_prewarm_symbols(market_feature_vectors)
                 market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
                     prewarm_symbols
@@ -7877,6 +8064,7 @@ class TradingService:
                 }
             results["market_indicator_prewarm"] = market_indicator_prewarm
             if run_market_analysis and market_feature_vectors:
+                self._set_loop_stage("indicator_hydration")
                 (
                     hydrated_market_feature_vectors,
                     hydration_diagnostics,
@@ -7897,6 +8085,7 @@ class TradingService:
                     )
                 if market_feature_vectors:
                     market_regime_context = self._market_regime_context(market_feature_vectors)
+                    self._set_loop_stage("build_strategy_context_after_hydration")
                     strategy_mode_context = await self._strategy_mode_context(
                         self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
                         market_regime_context,
@@ -7959,6 +8148,7 @@ class TradingService:
                 }
             if run_market_analysis and market_feature_vectors:
                 selectable_market_symbols = list(market_feature_vectors)
+                self._set_loop_stage("candidate_selection")
                 await self._ensure_market_analysis_selection_history()
                 market_feature_vectors = self._select_market_analysis_candidates(
                     market_feature_vectors,
@@ -8103,6 +8293,7 @@ class TradingService:
             all_candidates: list[tuple[str, str, DecisionOutput, Any, int | None]] = []
             staged_entry_counts = self.entry_capacity.empty_staged_counts()
             market_round_skipped_by_budget: list[str] = []
+            market_round_defer_reason: str | None = None
             market_timeout_retry_symbols: list[str] = []
 
             if new_pair_market_pause_applied:
@@ -8128,15 +8319,17 @@ class TradingService:
                 asyncio.get_running_loop().time() + market_ai_budget_seconds
             )
             for market_index, (symbol, fv) in enumerate(market_feature_items):
-                if market_index > 0 and self._market_ai_budget_exhausted(
+                budget_defer_reason = self._market_ai_budget_defer_reason(
                     market_ai_started_at,
                     strategy_context=strategy_mode_context,
                     market_symbol_count=len(market_feature_items),
-                ):
+                )
+                if market_index > 0 and budget_defer_reason is not None:
                     remaining = [
                         item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
                     ]
                     market_round_skipped_by_budget = remaining
+                    market_round_defer_reason = budget_defer_reason
                     budget_seconds = self.market_round_time_budget_seconds(
                         strategy_context=strategy_mode_context,
                         market_symbol_count=len(market_feature_items),
@@ -8155,37 +8348,76 @@ class TradingService:
                         "本轮市场 AI 分析已达到调度时间预算，剩余候选顺延到后续轮次；"
                         "这不是开仓门槛，只用于防止单轮分析拖住系统心跳。"
                     )
-                    logger.warning(
-                        "market analysis round reached time budget",
-                        elapsed_seconds=round(market_ai_elapsed_seconds, 3),
-                        market_ai_elapsed_seconds=round(market_ai_elapsed_seconds, 3),
-                        full_round_elapsed_seconds=round(full_round_elapsed_seconds, 3),
-                        budget_seconds=round(budget_seconds, 3),
-                        remaining_budget_seconds=round(remaining_budget_seconds, 3),
-                        start_reserve_seconds=round(start_reserve_seconds, 3),
-                        skipped_count=len(remaining),
-                        skipped_symbols=remaining[:10],
-                    )
-                    results.setdefault("warnings", []).append(
-                        {
-                            "model": ENSEMBLE_TRADER_NAME,
-                            "symbol": "ALL",
-                            "warning": warning,
-                            "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
-                            "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
-                            "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
-                            "budget_seconds": round(budget_seconds, 3),
-                            "remaining_budget_seconds": round(remaining_budget_seconds, 3),
-                            "market_symbol_start_reserve_seconds": round(
-                                start_reserve_seconds,
-                                3,
-                            ),
-                            "skipped_symbols": remaining[:20],
-                        }
-                    )
+                    budget_diagnostic = {
+                        "defer_reason": budget_defer_reason,
+                        "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                        "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                        "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
+                        "budget_seconds": round(budget_seconds, 3),
+                        "remaining_budget_seconds": round(remaining_budget_seconds, 3),
+                        "start_reserve_seconds": round(start_reserve_seconds, 3),
+                        "skipped_count": len(remaining),
+                        "skipped_symbols": remaining[:10],
+                    }
+                    if budget_defer_reason == "time_budget_exhausted":
+                        logger.warning(
+                            "market analysis round reached time budget",
+                            **budget_diagnostic,
+                        )
+                        results.setdefault("warnings", []).append(
+                            {
+                                "model": ENSEMBLE_TRADER_NAME,
+                                "symbol": "ALL",
+                                "warning": warning,
+                                "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
+                                "market_ai_elapsed_seconds": round(
+                                    market_ai_elapsed_seconds,
+                                    3,
+                                ),
+                                "full_round_elapsed_seconds": round(
+                                    full_round_elapsed_seconds,
+                                    3,
+                                ),
+                                "budget_seconds": round(budget_seconds, 3),
+                                "remaining_budget_seconds": round(
+                                    remaining_budget_seconds,
+                                    3,
+                                ),
+                                "market_symbol_start_reserve_seconds": round(
+                                    start_reserve_seconds,
+                                    3,
+                                ),
+                                "skipped_symbols": remaining[:20],
+                            }
+                        )
+                    else:
+                        logger.info(
+                            "market analysis deferred by next-symbol start reserve",
+                            **budget_diagnostic,
+                        )
+                        results.setdefault("market_analysis_scheduler_deferrals", []).append(
+                            {
+                                "read_only": True,
+                                "is_entry_gate": False,
+                                "reason": budget_defer_reason,
+                                "remaining_budget_seconds": round(
+                                    remaining_budget_seconds,
+                                    3,
+                                ),
+                                "required_start_reserve_seconds": round(
+                                    start_reserve_seconds,
+                                    3,
+                                ),
+                                "deferred_symbols": remaining[:20],
+                            }
+                        )
                     self._market_defer_tracker().defer_many(
                         remaining,
-                        "round_budget",
+                        (
+                            "round_time_budget"
+                            if budget_defer_reason == "time_budget_exhausted"
+                            else "next_symbol_start_reserve"
+                        ),
                     )
                     break
                 if not await self._try_claim_analysis_symbol(symbol, "market"):
@@ -8223,8 +8455,12 @@ class TradingService:
                 feature_vectors[symbol] = fv
                 symbol_started_monotonic = asyncio.get_running_loop().time()
                 context_timeout_seconds = self.market_symbol_context_timeout_seconds()
-                context_deadline_monotonic = symbol_started_monotonic + max(
-                    context_timeout_seconds, 0.05
+                context_deadline_monotonic = min(
+                    symbol_started_monotonic + max(context_timeout_seconds, 0.05),
+                    max(
+                        market_ai_deadline_monotonic - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+                        symbol_started_monotonic,
+                    ),
                 )
                 market_analysis_progress = self._market_analysis_progress_snapshot(
                     symbol=symbol,
@@ -8273,16 +8509,28 @@ class TradingService:
                         timings=market_context_timings,
                     ),
                 )
-                local_tools_timeout_seconds = max(
-                    float(settings.local_ai_tools_timeout_seconds or 0.0),
+                remaining_round_context_seconds = max(
+                    market_ai_deadline_monotonic
+                    - asyncio.get_running_loop().time()
+                    - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
                     0.0,
+                )
+                local_tools_timeout_seconds = min(
+                    max(
+                        float(settings.local_ai_tools_timeout_seconds or 0.0),
+                        0.0,
+                    ),
+                    remaining_round_context_seconds,
                 )
                 local_tools_stage_timeout_seconds = (
                     local_tools_timeout_seconds + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
                 )
-                local_tools_deadline_monotonic = asyncio.get_running_loop().time() + max(
-                    local_tools_stage_timeout_seconds + MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS,
-                    0.05,
+                local_tools_deadline_monotonic = min(
+                    context_deadline_monotonic,
+                    max(
+                        market_ai_deadline_monotonic - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+                        asyncio.get_running_loop().time(),
+                    ),
                 )
                 local_ai_tools_context = await self._bounded_market_context_value(
                     "local_ai_tools_context",
@@ -8435,6 +8683,23 @@ class TradingService:
                     ),
                     remaining_symbol_count=len(market_feature_items) - market_index,
                 )
+                if symbol_timeout_seconds <= 0.0:
+                    remaining = [
+                        item_symbol
+                        for item_symbol, _item_fv in market_feature_items[market_index:]
+                    ]
+                    market_round_skipped_by_budget = remaining
+                    market_round_defer_reason = "time_budget_exhausted"
+                    self._market_defer_tracker().defer_many(
+                        remaining,
+                        "round_time_budget",
+                    )
+                    logger.info(
+                        "market model stage deferred because round budget is exhausted",
+                        symbol=symbol,
+                        skipped_count=len(remaining),
+                    )
+                    break
                 symbol_deadline_monotonic = model_started_monotonic + max(
                     symbol_timeout_seconds, 0.05
                 )
@@ -8657,18 +8922,18 @@ class TradingService:
             if market_round_skipped_by_budget:
                 market_ai_elapsed_seconds = self._round_elapsed_seconds(market_ai_started_at)
                 full_round_elapsed_seconds = self._round_elapsed_seconds(round_start)
+                applied_market_budget_seconds = self.market_round_time_budget_seconds(
+                    strategy_context=strategy_mode_context,
+                    market_symbol_count=len(market_feature_items),
+                )
                 results["market_analysis_budget"] = {
-                    "budget_seconds": round(self.market_round_time_budget_seconds(), 3),
+                    "budget_seconds": round(applied_market_budget_seconds, 3),
                     "elapsed_seconds": round(market_ai_elapsed_seconds, 3),
                     "market_ai_elapsed_seconds": round(market_ai_elapsed_seconds, 3),
                     "full_round_elapsed_seconds": round(full_round_elapsed_seconds, 3),
                     "remaining_budget_seconds": round(
                         max(
-                            self.market_round_time_budget_seconds(
-                                strategy_context=strategy_mode_context,
-                                market_symbol_count=len(market_feature_items),
-                            )
-                            - market_ai_elapsed_seconds,
+                            applied_market_budget_seconds - market_ai_elapsed_seconds,
                             0.0,
                         ),
                         3,
@@ -8684,10 +8949,15 @@ class TradingService:
                     "processed_symbols": int(results.get("symbols_processed") or 0),
                     "deferred_symbols": market_round_skipped_by_budget[:50],
                     "deferred_count": len(market_round_skipped_by_budget),
+                    "defer_reason": market_round_defer_reason,
+                    "time_budget_exhausted": (
+                        market_round_defer_reason == "time_budget_exhausted"
+                    ),
                     "is_entry_gate": False,
                     "reason": (
-                        "市场分析轮次达到调度预算，剩余币种通过滚动扫描顺延；"
-                        "该预算不参与开仓风控评分。"
+                        "市场分析轮次已达到调度时间预算，剩余币种通过滚动扫描顺延；"
+                        if market_round_defer_reason == "time_budget_exhausted"
+                        else "剩余时间不足以完整启动下一个币种分析，系统主动顺延候选；"
                     ),
                 }
 
@@ -9089,6 +9359,18 @@ class TradingService:
 
     async def _ml_auto_train_loop(self) -> None:
         """Retrain local ML and server-side quant tools without blocking trading."""
+        # A service restart commonly follows deployment or host maintenance.
+        # Let market data and the first analysis rounds establish a stable CPU
+        # baseline before launching a full historical training subprocess.
+        started_at = getattr(self, "_start_time", None)
+        if isinstance(started_at, datetime):
+            startup_delay = max(
+                TRAINING_STARTUP_GRACE_SECONDS
+                - (datetime.now(UTC) - started_at).total_seconds(),
+                0.0,
+            )
+            if startup_delay > 0.0:
+                await asyncio.sleep(startup_delay)
         while self._running:
             def training_deferred() -> bool:
                 runtime = getattr(self, "_analysis_runtime", {})
@@ -9201,6 +9483,8 @@ class TradingService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        active_processes = self._training_process_set()
+        active_processes.add(process)
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
@@ -9220,6 +9504,8 @@ class TradingService:
                 "error": "isolated local ML training exceeded its scheduler lease",
                 "training_process_isolated": True,
             }
+        finally:
+            active_processes.discard(process)
 
         try:
             stdout_text = stdout.decode("utf-8")
@@ -9593,6 +9879,8 @@ class TradingService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        active_processes = self._training_process_set()
+        active_processes.add(process)
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
@@ -9611,6 +9899,8 @@ class TradingService:
                 "reason": "timeout",
                 "error": "isolated local AI tools training exceeded its scheduler lease",
             }
+        finally:
+            active_processes.discard(process)
         if process.returncode != 0:
             return {
                 "trained": False,
@@ -9657,6 +9947,8 @@ class TradingService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        active_processes = self._training_process_set()
+        active_processes.add(process)
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
@@ -9676,6 +9968,8 @@ class TradingService:
                 "error": "isolated Local AI cursor probe exceeded its scheduler lease",
                 "training_process_isolated": True,
             }
+        finally:
+            active_processes.discard(process)
         if process.returncode != 0:
             return {
                 "trained": False,
@@ -12654,7 +12948,7 @@ class TradingService:
         }
 
     def get_stats(self, mode_filter: str | None = None) -> dict[str, Any]:
-        settings.refresh_runtime_env(force=True)
+        settings.refresh_runtime_env()
         uptime = (datetime.now(UTC) - self._start_time).total_seconds() if self._start_time else 0
         now = datetime.now(UTC)
         market_state = self._runtime_state("market")

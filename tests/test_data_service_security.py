@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -24,6 +25,10 @@ def _service() -> DataService:
     service._indicator_cached_read_semaphore = asyncio.Semaphore(
         data_service_module.INDICATOR_CACHED_READ_CONCURRENCY
     )
+    service._indicator_compute_semaphore = asyncio.Semaphore(
+        data_service_module.INDICATOR_COMPUTE_CONCURRENCY
+    )
+    service._indicator_compute_tasks = set()
     service._indicator_remote_refresh_semaphore = asyncio.Semaphore(
         max(1, int(data_service_module.INDICATOR_REMOTE_REFRESH_CONCURRENCY))
     )
@@ -149,6 +154,131 @@ async def test_priority_queue_wait_does_not_consume_native_provider_budget(
     )
 
     assert vector.current_price == 100.0
+
+
+@pytest.mark.asyncio
+async def test_indicator_computation_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    computation_started = threading.Event()
+
+    async def cached_klines(
+        _symbol: str,
+        _timeframe_limits: dict[str, int],
+    ) -> dict[str, list[list[float]]]:
+        return {"1m": []}
+
+    def slow_compute(_grouped: dict[str, list[list[float]]]) -> dict[str, Any]:
+        computation_started.set()
+        time.sleep(0.25)
+        return {"indicator_snapshot_available": True}
+
+    service._load_recent_cached_klines_for_timeframes = cached_klines  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_indicator_features_from_timeframes", slow_compute)
+
+    compute_task = asyncio.create_task(
+        service._indicator_features_from_cached_klines("BTC/USDT")
+    )
+    await asyncio.wait_for(
+        asyncio.to_thread(computation_started.wait, 0.2),
+        timeout=0.3,
+    )
+
+    heartbeat_started = time.perf_counter()
+    await asyncio.sleep(0.01)
+    heartbeat_elapsed = time.perf_counter() - heartbeat_started
+
+    assert heartbeat_elapsed < 0.1
+    assert await compute_task == {"indicator_snapshot_available": True}
+
+
+@pytest.mark.asyncio
+async def test_indicator_cpu_concurrency_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._indicator_compute_semaphore = asyncio.Semaphore(2)
+    compute_lock = threading.Lock()
+    two_computations_started = threading.Event()
+    release_computations = threading.Event()
+    active_computations = 0
+    peak_computations = 0
+
+    def bounded_compute(_grouped: dict[str, list[list[float]]]) -> dict[str, Any]:
+        nonlocal active_computations, peak_computations
+        with compute_lock:
+            active_computations += 1
+            peak_computations = max(peak_computations, active_computations)
+            if active_computations == 2:
+                two_computations_started.set()
+        release_computations.wait(timeout=1.0)
+        with compute_lock:
+            active_computations -= 1
+        return {"indicator_snapshot_available": True}
+
+    monkeypatch.setattr(service, "_indicator_features_from_timeframes", bounded_compute)
+    tasks = [
+        asyncio.create_task(service._compute_indicator_features_off_loop({"1m": []}))
+        for _index in range(4)
+    ]
+    await asyncio.wait_for(
+        asyncio.to_thread(two_computations_started.wait, 0.5),
+        timeout=0.7,
+    )
+
+    assert peak_computations == 2
+    release_computations.set()
+    await asyncio.gather(*tasks)
+    assert peak_computations == 2
+    assert service._indicator_compute_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_indicator_awaiter_holds_cpu_permit_until_thread_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._indicator_compute_semaphore = asyncio.Semaphore(1)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def slow_compute(grouped: dict[str, list[list[float]]]) -> dict[str, Any]:
+        if "first" in grouped:
+            first_started.set()
+            release_first.wait(timeout=1.0)
+        else:
+            second_started.set()
+        return {"indicator_snapshot_available": True}
+
+    monkeypatch.setattr(service, "_indicator_features_from_timeframes", slow_compute)
+    first_request = asyncio.create_task(
+        service._compute_indicator_features_off_loop({"first": []})
+    )
+    await asyncio.wait_for(
+        asyncio.to_thread(first_started.wait, 0.5),
+        timeout=0.7,
+    )
+    first_request.cancel()
+    await asyncio.gather(first_request, return_exceptions=True)
+
+    second_request = asyncio.create_task(
+        service._compute_indicator_features_off_loop({"second": []})
+    )
+    await asyncio.sleep(0.05)
+
+    assert service._indicator_compute_semaphore.locked() is True
+    assert second_started.is_set() is False
+    assert len(service._indicator_compute_tasks) == 1
+
+    release_first.set()
+    await asyncio.wait_for(
+        asyncio.to_thread(second_started.wait, 0.5),
+        timeout=0.7,
+    )
+    assert await second_request == {"indicator_snapshot_available": True}
+    assert service._indicator_compute_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -318,6 +448,61 @@ async def test_feature_vector_source_timeouts_do_not_block_analysis(
 
     assert fv.symbol == "BTC/USDT"
     assert fv.current_price == 101.0
+
+
+@pytest.mark.asyncio
+async def test_feature_vector_timeout_does_not_wait_for_stubborn_source_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    cancellation_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    monkeypatch.setattr(data_service_module, "FEATURE_SNAPSHOT_TIMEOUT_SECONDS", 0.5)
+
+    async def noop_sentiment(_symbol: str, *, wait_for_initial: bool) -> None:
+        return None
+
+    async def ticker(_symbol: str, *, block_on_remote: bool) -> dict[str, Any]:
+        return {"last_price": 101.0, "bid": 100.0, "ask": 102.0}
+
+    async def indicators(
+        _symbol: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        return {"close": 101.0}
+
+    async def stubborn_derivatives(
+        _symbol: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancellation_started.set()
+            await release_cleanup.wait()
+        finally:
+            cleanup_finished.set()
+        return {}
+
+    service._ensure_sentiment_for_analysis = noop_sentiment  # type: ignore[method-assign]
+    service._get_feature_ticker_snapshot = ticker  # type: ignore[method-assign]
+    service._get_feature_indicator_snapshot = indicators  # type: ignore[method-assign]
+    service._get_feature_derivatives_snapshot = stubborn_derivatives  # type: ignore[method-assign]
+    service._attach_market_source_consistency = (  # type: ignore[method-assign]
+        lambda _symbol, ticker_snapshot, _derivatives: ticker_snapshot
+    )
+
+    started = asyncio.get_running_loop().time()
+    vector = await service.get_feature_vector("BTC/USDT", wait_for_sentiment=False)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert vector.current_price == pytest.approx(101.0)
+    assert cancellation_started.is_set()
+    assert elapsed < 0.8
+
+    release_cleanup.set()
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
 
 
 @pytest.mark.asyncio

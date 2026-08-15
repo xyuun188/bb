@@ -218,6 +218,29 @@ def _historical_replay_observation(
     }, []
 
 
+def _build_historical_replay_observations(
+    rows: list[Any],
+    *,
+    epoch_start: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build replay evidence off the event loop's latency-sensitive thread."""
+
+    observations: list[dict[str, Any]] = []
+    excluded: dict[str, int] = {}
+    for row in rows:
+        observation, reasons = _historical_replay_observation(
+            row,
+            epoch_start=epoch_start,
+        )
+        if observation is not None:
+            observations.append(observation)
+            continue
+        for reason in reasons or ["historical_replay_observation_incomplete"]:
+            reason_text = str(reason)
+            excluded[reason_text] = excluded.get(reason_text, 0) + 1
+    return observations, excluded
+
+
 def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
     """Summarize which governed historical priors recent decisions actually matched."""
 
@@ -1491,9 +1514,10 @@ class StrategyLearningService:
                                 )
                             )
                             .order_by(
-                                ShadowBacktest.created_at.asc(),
-                                ShadowBacktest.id.asc(),
+                                ShadowBacktest.created_at.desc(),
+                                ShadowBacktest.id.desc(),
                             )
+                            .limit(effective_limit)
                         )
                     )
                     .scalars()
@@ -1502,6 +1526,7 @@ class StrategyLearningService:
                 if selected_mode == "paper" and include_historical_replay
                 else []
             )
+            replay_shadows.reverse()
             decisions = list(
                 (
                     await session.execute(
@@ -1627,18 +1652,11 @@ class StrategyLearningService:
                     }
                 )
 
-        replay_excluded: dict[str, int] = {}
-        for row in replay_shadows:
-            replay_observation, reasons = _historical_replay_observation(
-                row,
-                epoch_start=epoch_start,
-            )
-            if replay_observation is not None:
-                shadow_replay_observations.append(replay_observation)
-                continue
-            for reason in reasons or ["historical_replay_observation_incomplete"]:
-                reason_text = str(reason)
-                replay_excluded[reason_text] = replay_excluded.get(reason_text, 0) + 1
+        shadow_replay_observations, replay_excluded = await asyncio.to_thread(
+            _build_historical_replay_observations,
+            replay_shadows,
+            epoch_start=epoch_start,
+        )
 
         side_performance = {
             side: _legacy_observation_summary(

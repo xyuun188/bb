@@ -466,6 +466,7 @@ async def test_postgres_trade_fact_indexes_skip_existing_indexes(
             "idx_ai_decisions_pending_entry_recent",
             "idx_ai_decisions_recent_scan",
             "idx_ai_decisions_strategy_learning_recent",
+            "idx_ai_decisions_market_selection",
             "idx_shadow_backtests_training_completed",
         }
     )

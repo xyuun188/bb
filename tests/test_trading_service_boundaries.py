@@ -2682,6 +2682,7 @@ async def test_local_ai_training_runs_after_long_ml_run_to_avoid_resource_conten
 ) -> None:
     service = TradingService.__new__(TradingService)
     service._running = True
+    service._start_time = datetime.now(UTC) - timedelta(minutes=5)
     order: list[str] = []
 
     async def slow_ml() -> dict[str, Any]:
@@ -3182,6 +3183,59 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
     assert not hasattr(TradingService, "_is_pending_execution_reason")
     assert not hasattr(TradingService, "_pending_execution_failed_reason")
     assert not hasattr(TradingService, "_action_label")
+
+
+@pytest.mark.asyncio
+async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 2,
+        "ranked_symbol_sample": [
+            {"symbol": "BTC/USDT", "selected": True},
+            {"symbol": "ETH/USDT", "selected": True},
+        ],
+    }
+    service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT"}}
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    class SlowExecutor:
+        async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await release_cleanup.wait()
+            return {}
+
+    async def executor_provider(_mode: str) -> SlowExecutor:
+        return SlowExecutor()
+
+    service._get_okx_executor_for_mode = executor_provider
+    monkeypatch.setattr(
+        trading_service,
+        "MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    started = asyncio.get_running_loop().time()
+    selected = await service._filter_entry_instrument_shortlist(
+        {"BTC/USDT": object(), "ETH/USDT": object()},
+        2,
+        "paper",
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert list(selected) == ["BTC/USDT"]
+    assert cleanup_started.is_set()
+    assert elapsed < 0.2
+    assert service._last_auto_feature_rank_diagnostics["execution_availability"][
+        "timeout"
+    ] is True
+    release_cleanup.set()
+    await asyncio.sleep(0)
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():
@@ -5246,6 +5300,90 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
     assert service.market_round_watchdog_seconds() >= 180.0
 
 
+def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    reserve_defer_started_at = datetime.now(UTC) - timedelta(seconds=60)
+    exhausted_started_at = datetime.now(UTC) - timedelta(seconds=91)
+
+    assert (
+        service._market_ai_budget_defer_reason(
+            reserve_defer_started_at,
+            market_symbol_count=3,
+        )
+        == "next_symbol_start_reserve"
+    )
+    assert (
+        service._market_ai_budget_defer_reason(
+            exhausted_started_at,
+            market_symbol_count=3,
+        )
+        == "time_budget_exhausted"
+    )
+
+
+def test_starting_analysis_round_preempts_background_training_processes() -> None:
+    service = TradingService.__new__(TradingService)
+    service._active_training_processes = set()
+    terminated: list[bool] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def terminate(self) -> None:
+            terminated.append(True)
+
+    process = FakeProcess()
+    service._active_training_processes.add(process)
+    service._analysis_runtime = {
+        "market": trading_service._AnalysisRuntimeState(),
+        "position": trading_service._AnalysisRuntimeState(),
+        "full": trading_service._AnalysisRuntimeState(),
+    }
+    service._start_runtime_round("market", datetime.now(UTC))
+
+    assert terminated == [True]
+
+
+@pytest.mark.asyncio
+async def test_auto_training_waits_for_startup_grace_before_first_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._start_time = datetime.now(UTC)
+    service._analysis_runtime = {}
+    service._active_analysis_symbols = set()
+    service._market_entry_pipeline_semaphore = None
+    service._active_training_processes = set()
+    started = asyncio.Event()
+
+    async def fake_ml_step() -> dict[str, Any]:
+        started.set()
+        return {"trained": False, "reason": "not_due"}
+
+    service._run_local_ml_training_subprocess = fake_ml_step  # type: ignore[method-assign]
+    service._maybe_train_local_ai_tools = fake_ml_step  # type: ignore[method-assign]
+    monkeypatch.setattr(trading_service, "TRAINING_STARTUP_GRACE_SECONDS", 0.02)
+
+    task = asyncio.create_task(service._ml_auto_train_loop())
+    await asyncio.sleep(0)
+    assert started.is_set() is False
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert started.is_set()
+
+
 def test_market_round_budget_reserves_full_analysis_time_per_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5261,7 +5399,7 @@ def test_market_round_budget_reserves_full_analysis_time_per_candidate(
     assert service.market_round_time_budget_seconds(market_symbol_count=3) == 90.0
 
 
-def test_market_symbol_analysis_timeout_preserves_full_started_model_window(
+def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
@@ -5273,7 +5411,7 @@ def test_market_symbol_analysis_timeout_preserves_full_started_model_window(
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
     shared = service.market_symbol_analysis_timeout_seconds(
-        remaining_round_seconds=52.5,
+        remaining_round_seconds=152.5,
         remaining_symbol_count=5,
     )
     last = service.market_symbol_analysis_timeout_seconds(
@@ -5286,8 +5424,8 @@ def test_market_symbol_analysis_timeout_preserves_full_started_model_window(
     )
 
     assert shared == service.market_model_inference_timeout_seconds()
-    assert last == service.market_model_inference_timeout_seconds()
-    assert after_soft_deadline == service.market_model_inference_timeout_seconds()
+    assert last == pytest.approx(27.0)
+    assert after_soft_deadline == 0.0
     assert shared >= 40.0
 
 
@@ -5373,6 +5511,136 @@ def test_market_selection_history_excludes_persisted_timeout_holds() -> None:
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_market_selection_history_projects_only_small_selection_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    remembered: list[tuple[str, dict[str, Any], datetime]] = []
+    selected_column_keys: list[str] = []
+
+    class Policy:
+        history_loaded = False
+
+        def remember(
+            self,
+            symbol: str,
+            feature: dict[str, Any],
+            *,
+            observed_at: datetime,
+        ) -> None:
+            remembered.append((symbol, feature, observed_at))
+
+    policy = Policy()
+    service._market_analysis_selector_policy = lambda: policy  # type: ignore[method-assign]
+    observed_at = datetime.now(UTC) - timedelta(minutes=3)
+
+    class Result:
+        def all(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    symbol="BTC/USDT",
+                    created_at=observed_at,
+                    current_price=100.5,
+                    entry_activity_volume_ratio=1.2,
+                    adx_14=25.0,
+                    returns_5=0.01,
+                    volatility_20=0.02,
+                )
+            ]
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            selected_column_keys.extend(
+                str(column.key) for column in statement.selected_columns
+            )
+            return Result()
+
+    class SessionContext:
+        async def __aenter__(self) -> Session:
+            return Session()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(trading_service, "get_read_session_ctx", SessionContext)
+
+    await service._ensure_market_analysis_selection_history()
+
+    assert "raw_llm_response" not in selected_column_keys
+    assert "feature_snapshot" not in selected_column_keys
+    assert set(trading_service.MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS).issubset(
+        selected_column_keys
+    )
+    assert remembered == [
+        (
+            "BTC/USDT",
+            {
+                "current_price": 100.5,
+                "entry_activity_volume_ratio": 1.2,
+                "adx_14": 25.0,
+                "returns_5": 0.01,
+                "volatility_20": 0.02,
+            },
+            observed_at,
+        )
+    ]
+    assert policy.history_loaded is True
+
+
+@pytest.mark.asyncio
+async def test_market_selection_history_timeout_detaches_slow_database_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    cancellation_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    class Policy:
+        history_loaded = False
+
+    policy = Policy()
+    service._market_analysis_selector_policy = lambda: policy  # type: ignore[method-assign]
+
+    class Session:
+        async def execute(self, _statement: Any) -> Any:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancellation_started.set()
+                await release_cleanup.wait()
+            finally:
+                cleanup_finished.set()
+            return SimpleNamespace(all=lambda: [])
+
+    class SessionContext:
+        async def __aenter__(self) -> Session:
+            return Session()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(trading_service, "get_read_session_ctx", SessionContext)
+    monkeypatch.setattr(
+        trading_service,
+        "MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    started = asyncio.get_running_loop().time()
+    await service._ensure_market_analysis_selection_history()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.2
+    assert cancellation_started.is_set()
+    assert cleanup_finished.is_set() is False
+    assert policy.history_loaded is True
+
+    release_cleanup.set()
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
 
 
 def test_market_symbol_timeout_cooldown_yields_to_other_candidates() -> None:
@@ -5920,6 +6188,96 @@ async def test_market_context_stage_distinguishes_timeout_from_budget_defer() ->
 
     assert result == timed_out
     assert timings[0]["status"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_market_context_timeout_returns_before_stubborn_cleanup_finishes() -> None:
+    service = TradingService.__new__(TradingService)
+    cleanup_started = asyncio.Event()
+
+    async def stubborn_context() -> dict[str, Any]:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await asyncio.sleep(60)
+            return {"status": "late"}
+        return {"status": "late"}
+
+    started = asyncio.get_running_loop().time()
+    result = await service._bounded_market_context_value(
+        "local_ai_tools_context",
+        stubborn_context(),
+        {"status": "fallback"},
+        deadline_monotonic=asyncio.get_running_loop().time() + 0.5,
+        timeout_seconds=0.01,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result == {"status": "fallback"}
+    assert cleanup_started.is_set()
+    assert elapsed < 0.5
+
+
+@pytest.mark.asyncio
+async def test_market_context_outer_cancellation_detaches_child_task() -> None:
+    service = TradingService.__new__(TradingService)
+    child_cancelled = asyncio.Event()
+
+    async def child_context() -> dict[str, Any]:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            raise
+        return {"status": "late"}
+
+    task = asyncio.create_task(
+        service._bounded_market_context_value(
+            "memory_vector_context",
+            child_context(),
+            {"status": "fallback"},
+            deadline_monotonic=asyncio.get_running_loop().time() + 5.0,
+            timeout_seconds=5.0,
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert child_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_strategy_context_timeout_returns_before_stubborn_cleanup_finishes() -> None:
+    service = TradingService.__new__(TradingService)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def stubborn_context() -> dict[str, Any]:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+        return {"status": "late"}
+
+    started = asyncio.get_running_loop().time()
+    result = await service._bounded_strategy_context_value(
+        "account_equity",
+        stubborn_context(),
+        {"status": "fallback"},
+        0.01,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result == {"status": "fallback"}
+    assert cleanup_started.is_set()
+    assert elapsed < 0.2
+    release_cleanup.set()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -9073,6 +9431,62 @@ async def test_refresh_position_prices_fetches_active_and_paper_snapshots_concur
     await service.refresh_position_prices({})
 
     assert active_saw_paper is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_prices_does_not_wait_for_slow_cancellation_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cancellation_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return []
+
+    class StubbornOkx:
+        async def get_positions_strict(self):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancellation_started.set()
+                await release_cleanup.wait()
+            finally:
+                cleanup_finished.set()
+            return []
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(
+        sync_module,
+        "POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    service = OkxSyncService(
+        active_okx_provider=StubbornOkx,
+        position_profit_peak_recorder=lambda **_kwargs: None,
+        position_age_minutes_provider=lambda _created_at: 12.5,
+        position_profit_peak_pruner=lambda _open_context: None,
+    )
+
+    started = asyncio.get_running_loop().time()
+    result = await service.refresh_position_prices({})
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result["exchange_snapshot_count"] == 0
+    assert cancellation_started.is_set()
+    assert elapsed < 0.2
+
+    release_cleanup.set()
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
 
 
 @pytest.mark.asyncio
