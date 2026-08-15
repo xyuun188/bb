@@ -2474,6 +2474,10 @@ class DataService:
         normalized = self._normalize_symbols([symbol])[0]
         now = datetime.now(UTC)
         tasks = self._derivatives_refresh_task_map()
+        failed_cache = getattr(self, "_derivatives_failed_at", None)
+        if not isinstance(failed_cache, dict):
+            failed_cache = {}
+            self._derivatives_failed_at = failed_cache
         current_task = asyncio.current_task()
         existing_task = tasks.get(normalized)
         if existing_task and existing_task is not current_task and not existing_task.done():

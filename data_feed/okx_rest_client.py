@@ -41,22 +41,34 @@ class OKXRestClient:
 
     def __init__(self) -> None:
         self._exchange: OkxPerpetualSdkExchange | None = None
+        # Concurrent candidate fetches can all arrive before the first market
+        # bootstrap completes. Serialize that one-time bootstrap so the shared
+        # SDK session is not initialized and used concurrently.
+        self._exchange_init_lock = asyncio.Lock()
+        self._instrument_spec_lock = asyncio.Lock()
+        self._exchange_ready = False
 
     async def _get_exchange(self) -> OkxPerpetualSdkExchange:
-        if self._exchange is None:
-            mode = mode_manager.mode.value
-            is_demo = settings.is_okx_demo(mode)
+        if self._exchange is not None and self._exchange_ready:
+            return self._exchange
+        async with self._exchange_init_lock:
+            if self._exchange is None:
+                mode = mode_manager.mode.value
+                self._exchange = OkxPerpetualSdkExchange(mode)
+                self._ensure_rest_url()
+            else:
+                mode = str(getattr(self._exchange, "mode", "") or mode_manager.mode.value)
 
-            self._exchange = OkxPerpetualSdkExchange(mode)
-            self._ensure_rest_url()
-
-            await self._load_usdt_swap_markets()
-            logger.info(
-                "OKX REST markets loaded",
-                mode=mode,
-                demo=is_demo,
-                symbols_count=len(self._exchange.markets),
-            )
+            if not self._exchange_ready:
+                is_demo = settings.is_okx_demo(mode)
+                await self._load_usdt_swap_markets()
+                self._exchange_ready = True
+                logger.info(
+                    "OKX REST markets loaded",
+                    mode=mode,
+                    demo=is_demo,
+                    symbols_count=len(self._exchange.markets),
+                )
 
         return self._exchange
 
@@ -126,11 +138,36 @@ class OKXRestClient:
         return self._native_ticker_to_ccxt_shape(rows[0])
 
     async def fetch_instrument_spec(self, symbol: str) -> dict[str, Any]:
+        # Coalesce the rare fallback instrument request. The first caller may
+        # bootstrap the SDK; later callers can then reuse the full native
+        # instrument cache instead of issuing one request per symbol.
+        async with self._instrument_spec_lock:
+            return await self._fetch_instrument_spec_locked(symbol)
+
+    async def _fetch_instrument_spec_locked(self, symbol: str) -> dict[str, Any]:
         """Return the exact OKX-native contract identity for one swap symbol."""
 
         inst_id = okx_inst_id_from_symbol(symbol)
         if not inst_id:
             return {}
+        # The initial SWAP instruments bootstrap already contains the exact
+        # native contract row. Reuse it instead of issuing one public request
+        # per candidate, which otherwise creates a burst of instrument calls
+        # and starves derivatives requests behind the same SDK session.
+        exchange = self._exchange
+        markets = getattr(exchange, "markets", {}) or {}
+        market = markets.get(inst_id)
+        if isinstance(market, dict):
+            info = market.get("info")
+            if isinstance(info, dict) and str(info.get("instId") or "").strip().upper() == inst_id:
+                return {
+                    key: info.get(key)
+                    for key in (
+                        "instId", "instType", "uly", "instFamily", "ctType",
+                        "ctVal", "ctMult", "ctValCcy", "settleCcy", "lotSz",
+                        "minSz", "tickSz", "state",
+                    )
+                } | {"source": "okx_public_instruments_cache"}
         response = await self._ccxt_call(
             "publicGetPublicInstruments",
             {"instType": "SWAP", "instId": inst_id},
@@ -899,8 +936,10 @@ class OKXRestClient:
         """Close and recreate the exchange with current settings."""
         await self.close()
         self._exchange = None
+        self._exchange_ready = False
 
     async def close(self) -> None:
         if self._exchange:
             await self._exchange.close()
             self._exchange = None
+        self._exchange_ready = False

@@ -1567,6 +1567,29 @@ async def test_blocking_derivatives_read_refreshes_stale_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derivatives_refresh_records_success_without_missing_cache_state() -> None:
+    service = _service()
+    service._derivatives_failed_at = {}
+    service._derivatives_refresh_tasks = {}
+    service._get_instrument_spec = (  # type: ignore[method-assign]
+        lambda _symbol, **_kwargs: asyncio.sleep(0, result={"instId": "PROS-USDT-SWAP"})
+    )
+
+    class FakeRestClient:
+        async def fetch_derivatives_snapshot(self, _symbol: str, *, contract_spec: dict) -> dict[str, Any]:
+            assert contract_spec["instId"] == "PROS-USDT-SWAP"
+            return {"funding_rate": 0.001, "orderbook_bid_depth": 10.0}
+
+    service.rest_client = FakeRestClient()
+
+    result = await service._refresh_derivatives_snapshot("PROS/USDT")
+
+    assert result["funding_rate"] == pytest.approx(0.001)
+    assert "PROS/USDT" not in service._derivatives_failed_at
+    assert service._derivatives_cache["PROS/USDT"]["data"] == result
+
+
+@pytest.mark.asyncio
 async def test_feature_market_fact_proves_rest_ws_book_reference_and_native_path() -> None:
     service = _service()
     timestamp = int(time.time() * 1000)

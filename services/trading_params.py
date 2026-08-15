@@ -27,7 +27,10 @@ class EntryMarketDataQualityParams:
     kline_coverage_refresh_symbol_cap: int = 80
     kline_coverage_initial_delay_seconds: float = 5.0
     indicator_remote_refresh_concurrency: int = 3
-    native_market_remote_concurrency: int = 4
+    # OKX public and market SDK calls are serialized per API session. Four
+    # outer slots made an 11-symbol review queue exceed the 5-second source
+    # budget even though each individual exchange request was healthy.
+    native_market_remote_concurrency: int = 8
     derivatives_stale_max_age_seconds: float = 180.0
     short_return_feature_timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1h")
     trend_feature_timeframes: tuple[str, ...] = ("1h", "15m", "5m", "1m")

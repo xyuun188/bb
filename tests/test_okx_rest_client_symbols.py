@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from data_feed.feature_vector import build_feature_vector
@@ -40,6 +42,25 @@ class _PepeMarketExchange:
                 "info": {"instId": "PEPE-USDT-SWAP", "ctValCcy": "PEPE"},
             }
         }
+
+
+@pytest.mark.asyncio
+async def test_exchange_bootstrap_is_shared_by_concurrent_callers(monkeypatch) -> None:
+    client = OKXRestClient()
+    load_calls = 0
+
+    async def slow_load() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(client, "_load_usdt_swap_markets", slow_load)
+
+    first, second = await asyncio.gather(client._get_exchange(), client._get_exchange())
+
+    assert first is second
+    assert client._exchange_ready is True
+    assert load_calls == 1
 
 
 @pytest.mark.asyncio
@@ -173,6 +194,49 @@ async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch)
     assert spec["uly"] == "ROBO-USDT"
     assert spec["ctVal"] == "1"
     assert spec["source"] == "okx_public_instruments"
+
+
+@pytest.mark.asyncio
+async def test_fetch_instrument_spec_reuses_loaded_native_market_without_remote_call(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    client._exchange = type(
+        "LoadedExchange",
+        (),
+        {
+            "markets": {
+                "ROBO-USDT-SWAP": {
+                    "info": {
+                        "instId": "ROBO-USDT-SWAP",
+                        "instType": "SWAP",
+                        "uly": "ROBO-USDT",
+                        "instFamily": "ROBO-USDT",
+                        "ctType": "linear",
+                        "ctVal": "1",
+                        "ctMult": "1",
+                        "ctValCcy": "ROBO",
+                        "settleCcy": "USDT",
+                        "lotSz": "1",
+                        "minSz": "1",
+                        "tickSz": "0.00001",
+                        "state": "live",
+                    }
+                }
+            }
+        },
+    )()
+
+    async def unexpected_remote_call(*_args, **_kwargs):
+        raise AssertionError("loaded native instrument must not be fetched again")
+
+    monkeypatch.setattr(client, "_ccxt_call", unexpected_remote_call)
+
+    spec = await client.fetch_instrument_spec("ROBO/USDT")
+
+    assert spec["instId"] == "ROBO-USDT-SWAP"
+    assert spec["ctVal"] == "1"
+    assert spec["source"] == "okx_public_instruments_cache"
 
 
 @pytest.mark.asyncio
