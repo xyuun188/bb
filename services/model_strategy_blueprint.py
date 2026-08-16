@@ -204,6 +204,12 @@ def model_strategy_side_authorization(
     }
     if not blueprint:
         return result
+    if blueprint.get("authority_available") is False:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "model_strategy_blueprint_authority_unavailable",
+        }
     if normalized_side not in {"long", "short"}:
         return {**result, "eligible": False, "reason": "invalid_entry_direction"}
 

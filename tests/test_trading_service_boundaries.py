@@ -134,6 +134,16 @@ async def test_local_ml_signal_context_offloads_and_serializes_predictions() -> 
             active_predictions -= 1
             return features
 
+        @staticmethod
+        def strategy_blueprint() -> dict[str, object]:
+            return {
+                "version": "blueprint-v1",
+                "model_version": "champion-v1",
+                "paper_execution_eligible": True,
+                "live_execution_permission": False,
+                "eligible_sides": ["long"],
+            }
+
     service.ml_signal_service = Predictor()
 
     first, second = await asyncio.gather(
@@ -141,8 +151,10 @@ async def test_local_ml_signal_context_offloads_and_serializes_predictions() -> 
         service._local_ml_signal_context({"symbol": "ETH/USDT"}),
     )
 
-    assert first == {"symbol": "BTC/USDT"}
-    assert second == {"symbol": "ETH/USDT"}
+    assert first["symbol"] == "BTC/USDT"
+    assert second["symbol"] == "ETH/USDT"
+    assert first["strategy_blueprint"]["model_version"] == "champion-v1"
+    assert second["strategy_blueprint"]["model_version"] == "champion-v1"
     assert max_active_predictions == 1
     assert worker_thread_ids
     assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
@@ -157,6 +169,16 @@ async def test_local_ml_signal_failure_is_isolated_from_other_analysis_sources()
         def predict(self, _features: dict[str, str]) -> dict[str, str]:
             raise ValueError("artifact feature contract mismatch")
 
+        @staticmethod
+        def strategy_blueprint() -> dict[str, object]:
+            return {
+                "version": "blueprint-v1",
+                "model_version": "champion-v1",
+                "paper_execution_eligible": True,
+                "live_execution_permission": False,
+                "eligible_sides": ["long"],
+            }
+
     service.ml_signal_service = Predictor()
 
     result = await service._local_ml_signal_context({"symbol": "BTC/USDT"})
@@ -166,7 +188,27 @@ async def test_local_ml_signal_failure_is_isolated_from_other_analysis_sources()
     assert result["reason"] == "local_ml_inference_failed"
     assert result["production_permission"] is False
     assert "artifact feature contract mismatch" in result["error"]
+    assert result["strategy_blueprint"]["model_version"] == "champion-v1"
+    assert result["strategy_blueprint_binding"]["authority_available"] is True
     assert service._local_ml_inference_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_local_ml_signal_missing_blueprint_provider_fails_closed() -> None:
+    service = TradingService.__new__(TradingService)
+    service._local_ml_inference_lock = asyncio.Lock()
+    service.ml_signal_service = SimpleNamespace(
+        predict=lambda _features: {"available": True, "status": "ready"}
+    )
+
+    result = await service._local_ml_signal_context({"symbol": "BTC/USDT"})
+
+    assert result["strategy_blueprint"]["authority_available"] is False
+    assert result["strategy_blueprint"]["eligible_sides"] == []
+    assert result["strategy_blueprint_binding"]["authority_available"] is False
+    assert result["strategy_blueprint_binding"]["resolution_error"] == (
+        "strategy_blueprint_provider_unavailable"
+    )
 
 
 @pytest.mark.asyncio
@@ -6625,7 +6667,14 @@ async def test_market_local_ml_context_does_not_queue_behind_position_inference(
     await lock.acquire()
     service._local_ml_inference_lock = lock
     service.ml_signal_service = SimpleNamespace(
-        predict=lambda _features: pytest.fail("queued market inference must not run")
+        predict=lambda _features: pytest.fail("queued market inference must not run"),
+        strategy_blueprint=lambda: {
+            "version": "blueprint-v1",
+            "model_version": "champion-v1",
+            "paper_execution_eligible": True,
+            "live_execution_permission": False,
+            "eligible_sides": ["long"],
+        },
     )
 
     result = await service._local_ml_signal_context(
@@ -6635,6 +6684,7 @@ async def test_market_local_ml_context_does_not_queue_behind_position_inference(
 
     assert result["status"] == "analysis_budget_deferred"
     assert result["reason"] == "local_ml_inference_queue_busy"
+    assert result["strategy_blueprint"]["eligible_sides"] == ["long"]
     assert lock.locked() is True
     lock.release()
 

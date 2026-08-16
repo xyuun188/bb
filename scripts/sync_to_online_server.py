@@ -701,6 +701,42 @@ def _okx_network_probe_command() -> str:
     )
 
 
+def _split_services_restart_command(
+    *,
+    trading_service: str,
+    dashboard_service: str,
+    model_tunnel_restart: str,
+    model_tunnel_active_check: str,
+    model_readiness_refresh: str,
+) -> str:
+    quoted_trading = _remote_quote(trading_service)
+    quoted_dashboard = _remote_quote(dashboard_service)
+    maintenance_window = (
+        "set -e; "
+        "resume_platform_services() { "
+        f"systemctl start {quoted_trading} {quoted_dashboard} >/dev/null 2>&1 || true; "
+        "}; "
+        "trap resume_platform_services EXIT; "
+        f"systemctl stop {quoted_trading} {quoted_dashboard}; "
+    )
+    service_start = (
+        f"systemctl start {quoted_trading} {quoted_dashboard} && "
+    )
+    return maintenance_window + model_tunnel_restart + (
+        f"{model_readiness_refresh}"
+        f"{model_tunnel_active_check}"
+        f"{_okx_network_probe_command()}"
+        f"{service_start}"
+        f"systemctl is-active {quoted_trading} && "
+        f"systemctl is-active {quoted_dashboard} && "
+        "for i in $(seq 1 30); do "
+        "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
+        'case "$code" in 200|302|401) trap - EXIT; echo dashboard-ok:$code; exit 0;; esac; '
+        "sleep 2; "
+        "done; echo dashboard-timeout; exit 7"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-app-dir", default=REMOTE_APP_DIR)
@@ -880,19 +916,12 @@ def main() -> None:
                 f"systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}; "
                 "fi; "
             )
-            command = model_tunnel_restart + (
-                f"systemctl restart {_remote_quote(args.service)} && "
-                f"systemctl restart {_remote_quote(args.dashboard_service)} && "
-                f"{model_readiness_refresh}"
-                f"{model_tunnel_active_check}"
-                f"systemctl is-active {_remote_quote(args.service)} && "
-                f"systemctl is-active {_remote_quote(args.dashboard_service)} && "
-                f"{_okx_network_probe_command()}"
-                "for i in $(seq 1 30); do "
-                "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
-                'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
-                "sleep 2; "
-                "done; echo dashboard-timeout; exit 7"
+            command = _split_services_restart_command(
+                trading_service=args.service,
+                dashboard_service=args.dashboard_service,
+                model_tunnel_restart=model_tunnel_restart,
+                model_tunnel_active_check=model_tunnel_active_check,
+                model_readiness_refresh=model_readiness_refresh,
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return

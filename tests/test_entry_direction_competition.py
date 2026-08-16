@@ -415,6 +415,65 @@ def test_model_blueprint_authority_blocks_unauthorized_short_observation() -> No
     assert all(item["observation_only"] is True for item in short_evidence)
 
 
+def test_model_blueprint_still_blocks_short_when_current_local_ml_signal_is_unavailable() -> None:
+    signal = {
+        "available": False,
+        "status": "analysis_budget_deferred",
+        "strategy_blueprint": {
+            "version": "blueprint-v1",
+            "model_version": "champion-v1",
+            "paper_execution_eligible": True,
+            "live_execution_permission": False,
+            "eligible_sides": ["long"],
+        },
+    }
+    tools = {"time_series_prediction": _paper_payload(0.5, 1.5)}
+
+    context = _context(
+        ml=signal,
+        tools=tools,
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "long"
+    assert context["model_strategy_direction_authorization"]["short"][
+        "reason"
+    ] == "direction_not_authorized_by_model_blueprint"
+    short_evidence = context["short"]["evidence"]
+    assert short_evidence
+    assert all(item["decision_eligible"] is False for item in short_evidence)
+    assert all(item["paper_eligible"] is False for item in short_evidence)
+
+
+def test_unavailable_blueprint_authority_fails_closed_for_every_side() -> None:
+    signal = {
+        "available": False,
+        "strategy_blueprint": {
+            "version": "runtime-authority-fail-closed-v1",
+            "authority_available": False,
+            "paper_execution_eligible": False,
+            "live_execution_permission": False,
+            "eligible_sides": [],
+        },
+    }
+
+    context = _context(
+        ml=signal,
+        tools={"time_series_prediction": _paper_payload(0.5, 1.5)},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "neutral"
+    for side in ("long", "short"):
+        assert context["model_strategy_direction_authorization"][side][
+            "reason"
+        ] == "model_strategy_blueprint_authority_unavailable"
+        assert all(
+            item["decision_eligible"] is False
+            for item in context[side]["evidence"]
+        )
+
+
 def test_authorized_long_can_compare_against_unauthorized_short_observation() -> None:
     signal = _paper_payload(1.2, 0.3)
     signal["strategy_blueprint"] = {

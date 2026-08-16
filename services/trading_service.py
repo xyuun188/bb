@@ -4293,19 +4293,22 @@ class TradingService:
                     raise TimeoutError
                 await asyncio.wait_for(lock.acquire(), timeout=wait_seconds)
             acquired = True
-            return await asyncio.to_thread(self.ml_signal_service.predict, features)
+            prediction = await asyncio.to_thread(self.ml_signal_service.predict, features)
+            return self._bind_current_model_strategy_blueprint(prediction)
         except TimeoutError:
             logger.warning(
                 "local ML inference queue exceeded market context budget",
                 symbol=getattr(features, "symbol", None),
                 lock_wait_seconds=round(max(float(lock_wait_seconds or 0.0), 0.0), 3),
             )
-            return {
-                "available": False,
-                "status": "analysis_budget_deferred",
-                "reason": "local_ml_inference_queue_busy",
-                "production_permission": False,
-            }
+            return self._bind_current_model_strategy_blueprint(
+                {
+                    "available": False,
+                    "status": "analysis_budget_deferred",
+                    "reason": "local_ml_inference_queue_busy",
+                    "production_permission": False,
+                }
+            )
         except Exception as exc:
             error_text = safe_error_text(exc, limit=180)
             logger.warning(
@@ -4313,16 +4316,66 @@ class TradingService:
                 symbol=getattr(features, "symbol", None),
                 error=error_text,
             )
-            return {
-                "available": False,
-                "status": "inference_unavailable",
-                "reason": "local_ml_inference_failed",
-                "error": error_text,
-                "production_permission": False,
-            }
+            return self._bind_current_model_strategy_blueprint(
+                {
+                    "available": False,
+                    "status": "inference_unavailable",
+                    "reason": "local_ml_inference_failed",
+                    "error": error_text,
+                    "production_permission": False,
+                }
+            )
         finally:
             if acquired:
                 lock.release()
+
+    def _bind_current_model_strategy_blueprint(
+        self,
+        signal: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Keep artifact direction authority when one symbol inference is unavailable."""
+
+        payload = dict(signal) if isinstance(signal, dict) else {}
+        model_service = getattr(self, "ml_signal_service", None)
+        blueprint_provider = getattr(model_service, "strategy_blueprint", None)
+        embedded = self._safe_dict(payload.get("strategy_blueprint"))
+        error_text = ""
+        if not callable(blueprint_provider):
+            error_text = "strategy_blueprint_provider_unavailable"
+            blueprint = {}
+        else:
+            try:
+                resolved = blueprint_provider()
+                blueprint = dict(resolved) if isinstance(resolved, dict) else {}
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=180)
+                logger.warning(
+                    "current model strategy blueprint resolution failed",
+                    error=error_text,
+                )
+                blueprint = {}
+
+        if not blueprint:
+            blueprint = {
+                "version": "runtime-authority-fail-closed-v1",
+                "source": "ml_signal_service_current_artifact",
+                "authority_available": False,
+                "paper_execution_eligible": False,
+                "live_execution_permission": False,
+                "eligible_sides": [],
+                "blocking_reasons": ["model_strategy_blueprint_authority_unavailable"],
+            }
+
+        payload["strategy_blueprint"] = blueprint
+        payload["strategy_blueprint_binding"] = {
+            "source": "ml_signal_service.strategy_blueprint",
+            "authority_available": blueprint.get("authority_available") is not False,
+            "embedded_model_version": embedded.get("model_version"),
+            "bound_model_version": blueprint.get("model_version"),
+            "embedded_blueprint_replaced": bool(embedded and embedded != blueprint),
+            "resolution_error": error_text,
+        }
+        return payload
 
     def _entry_direction_competition_policy(self) -> EntryDirectionCompetitionPolicy:
         policy = getattr(self, "entry_direction_competition", None)

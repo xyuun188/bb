@@ -73,6 +73,31 @@ def test_dashboard_stays_running_while_model_tunnels_recover() -> None:
     assert "Requires=bb-model-tunnels.service" not in unit
 
 
+def test_split_service_deploy_stops_model_consumers_before_tunnel_restart() -> None:
+    from scripts.sync_to_online_server import _split_services_restart_command
+
+    command = _split_services_restart_command(
+        trading_service="bb-paper-trading.service",
+        dashboard_service="bb-dashboard.service",
+        model_tunnel_restart="restart-model-tunnels; ",
+        model_tunnel_active_check="check-model-tunnels; ",
+        model_readiness_refresh="refresh-model-readiness; ",
+    )
+
+    stop_index = command.index(
+        "systemctl stop 'bb-paper-trading.service' 'bb-dashboard.service'"
+    )
+    restart_index = command.index("restart-model-tunnels")
+    readiness_index = command.index("refresh-model-readiness")
+    network_index = command.index("okx_code=$(curl")
+    start_index = command.index(
+        "systemctl start 'bb-paper-trading.service' 'bb-dashboard.service' &&"
+    )
+    assert stop_index < restart_index < readiness_index < network_index < start_index
+    assert command.index("trap resume_platform_services EXIT") < stop_index
+    assert command.index("trap - EXIT") > start_index
+
+
 def test_sync_to_online_server_requires_okx_network_route() -> None:
     from scripts.sync_to_online_server import _okx_network_probe_command
 
