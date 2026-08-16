@@ -49,6 +49,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_MONITOR_CACHE_TTL_SECONDS = 10.0
 SERVER_MONITOR_STALE_CACHE_TTL_SECONDS = 60.0
 PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS = 3.5
+# Runtime model metadata is large and changes only when a model/service state
+# changes. Keep the expensive probe single-flight and reuse it across the
+# dashboard's polling requests instead of filling the quant SSH tunnel every
+# few seconds.
+PLATFORM_RUNTIME_CACHE_TTL_SECONDS = 30.0
+PLATFORM_RUNTIME_ERROR_CACHE_TTL_SECONDS = 15.0
+_platform_runtime_cache: tuple[float, int, dict[str, Any]] | None = None
+_platform_runtime_cache_lock: asyncio.Lock | None = None
 PLATFORM_SERVICE_NAMES = (
     "bb-dashboard.service",
     "bb-paper-trading.service",
@@ -537,7 +545,10 @@ def collect_server_monitor_sync(root_dir: Path = PROJECT_ROOT) -> dict[str, Any]
 
 def clear_server_monitor_cache() -> None:
     """Clear the default server monitor cache."""
+
+    global _platform_runtime_cache
     _default_service.clear_cache()
+    _platform_runtime_cache = None
 
 
 def get_server_monitor_status_sync() -> dict[str, Any]:
@@ -1190,7 +1201,13 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
     """Probe the endpoints the platform actually calls, without returning secrets."""
     ai_rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    async with httpx.AsyncClient(timeout=PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(
+        timeout=PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        limits=httpx.Limits(
+            max_keepalive_connections=0,
+            max_connections=4,
+        ),
+    ) as client:
         fixed_model_rows = [
             cfg for cfg in settings.get_fixed_ai_models(include_empty=False) if isinstance(cfg, dict)
         ]
@@ -1256,23 +1273,39 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
             )
             api_key = _local_ai_tools_api_key_for_platform_probe()
-            health = await _probe_platform_json(
-                client,
-                f"{local_base}/health",
-                api_key=api_key,
-            )
             status_probe = await _probe_platform_json(
                 client,
                 f"{local_base}/models/status",
                 api_key=api_key,
             )
+            if status_probe.get("ok"):
+                health = {
+                    "ok": True,
+                    "status_code": status_probe.get("status_code"),
+                    "latency_ms": status_probe.get("latency_ms"),
+                    "status_category": status_probe.get("status_category"),
+                    "error": "",
+                    "data": {"service": "phase3_quant_api"},
+                    "probe_mode": "models_status_reachability",
+                }
+            else:
+                health = await _probe_platform_json(
+                    client,
+                    f"{local_base}/health/live",
+                    api_key=api_key,
+                )
+                health["probe_mode"] = "liveness_fallback"
             metadata = health.get("data") if isinstance(health.get("data"), dict) else {}
             status_metadata = (
                 status_probe.get("data") if isinstance(status_probe.get("data"), dict) else {}
             )
             is_phase3_quant_api = metadata.get("service") == "phase3_quant_api"
             service_available = bool(
-                tunnel_contract.get("ok") and health.get("ok") and is_phase3_quant_api
+                tunnel_contract.get("ok")
+                and (
+                    status_probe.get("ok")
+                    or (health.get("ok") and is_phase3_quant_api)
+                )
             )
             model_bundle_available = bool(
                 status_metadata.get("available") or metadata.get("trained_models_available")
@@ -1309,6 +1342,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         "latency_ms": health.get("latency_ms"),
                         "status_category": health.get("status_category"),
                         "error": health.get("error", ""),
+                        "probe_mode": health.get("probe_mode"),
                         "service": metadata.get("service"),
                         "root": metadata.get("root"),
                         "validation_all_ok": metadata.get("validation_all_ok"),
@@ -1416,11 +1450,101 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
     }
 
 
+def _platform_runtime_cache_ttl(payload: dict[str, Any]) -> float:
+    local_tools = payload.get("local_ai_tools")
+    local_tools = local_tools if isinstance(local_tools, dict) else {}
+    if local_tools.get("available") is True:
+        return PLATFORM_RUNTIME_CACHE_TTL_SECONDS
+    return PLATFORM_RUNTIME_ERROR_CACHE_TTL_SECONDS
+
+
+def _platform_runtime_cache_result(
+    payload: dict[str, Any],
+    *,
+    status: str,
+    age_seconds: float,
+    ttl_seconds: float,
+    refresh_error: BaseException | None = None,
+) -> dict[str, Any]:
+    result = copy.deepcopy(payload)
+    result["cache"] = {
+        "status": status,
+        "age_seconds": round(max(age_seconds, 0.0), 3),
+        "ttl_seconds": ttl_seconds,
+    }
+    if refresh_error is not None:
+        result["cache"]["refresh_error"] = safe_error_text(refresh_error, limit=180)
+    return result
+
+
+async def _cached_platform_runtime_status() -> dict[str, Any]:
+    """Single-flight the platform model probes and retain truthful stale evidence."""
+
+    global _platform_runtime_cache, _platform_runtime_cache_lock
+    source_id = id(collect_platform_runtime_status)
+    now = monotonic()
+    cached = _platform_runtime_cache
+    if cached is not None and cached[1] == source_id:
+        cached_at, _source_id, payload = cached
+        age = max(now - cached_at, 0.0)
+        ttl = _platform_runtime_cache_ttl(payload)
+        if age <= ttl:
+            return _platform_runtime_cache_result(
+                payload,
+                status="fresh",
+                age_seconds=age,
+                ttl_seconds=ttl,
+            )
+
+    if _platform_runtime_cache_lock is None:
+        _platform_runtime_cache_lock = asyncio.Lock()
+    async with _platform_runtime_cache_lock:
+        now = monotonic()
+        cached = _platform_runtime_cache
+        if cached is not None and cached[1] == source_id:
+            cached_at, _source_id, payload = cached
+            age = max(now - cached_at, 0.0)
+            ttl = _platform_runtime_cache_ttl(payload)
+            if age <= ttl:
+                return _platform_runtime_cache_result(
+                    payload,
+                    status="fresh_after_wait",
+                    age_seconds=age,
+                    ttl_seconds=ttl,
+                )
+        try:
+            payload = await collect_platform_runtime_status()
+        except Exception as exc:
+            if cached is not None and cached[1] == source_id:
+                cached_at, _source_id, stale_payload = cached
+                return _platform_runtime_cache_result(
+                    stale_payload,
+                    status="stale_refresh_failed",
+                    age_seconds=max(now - cached_at, 0.0),
+                    ttl_seconds=_platform_runtime_cache_ttl(stale_payload),
+                    refresh_error=exc,
+                )
+            raise
+        _platform_runtime_cache = (monotonic(), source_id, copy.deepcopy(payload))
+        return _platform_runtime_cache_result(
+            payload,
+            status="refreshed",
+            age_seconds=0.0,
+            ttl_seconds=_platform_runtime_cache_ttl(payload),
+        )
+
+
+async def get_cached_platform_runtime_status() -> dict[str, Any]:
+    """Return the shared single-flight platform runtime probe result."""
+
+    return await _cached_platform_runtime_status()
+
+
 async def get_server_monitor_status_async() -> dict[str, Any]:
     """Return cached server monitor status using async DB loading on the main loop."""
     checked_at = datetime.now(UTC).isoformat()
     platform_server = await asyncio.to_thread(collect_platform_server_status)
-    platform_runtime = await collect_platform_runtime_status()
+    platform_runtime = await _cached_platform_runtime_status()
     try:
         info = await load_model_server_info_from_secure_settings()
     except ModelServerConfigNotConfigured as exc:

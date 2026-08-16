@@ -409,6 +409,43 @@ async def test_local_ai_tools_native_post_cancellation_stops_inference_request(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_get_uses_disposable_no_keepalive_client(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    created: list[Any] = []
+
+    class FakeStatusClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.closed = False
+            created.append(self)
+
+        async def __aenter__(self) -> FakeStatusClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            self.closed = True
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            request = httpx.Request("GET", url, headers=kwargs.get("headers"))
+            return httpx.Response(200, json={"available": True}, request=request)
+
+    monkeypatch.setattr(local_ai_tools_client_module.httpx, "AsyncClient", FakeStatusClient)
+
+    result = await client._get("/models/status", request_timeout=1.0)
+
+    assert result["available"] is True
+    assert len(created) == 1
+    assert created[0].closed is True
+    limits = created[0].kwargs["limits"]
+    assert limits.max_keepalive_connections == 0
+    assert limits.max_connections == 1
+    assert client._http_client is None
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_client_reset_does_not_wait_for_stubborn_close_cleanup(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -1133,7 +1170,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         get_calls.append(path)
         assert request_timeout == 0.5
-        if path == "/health":
+        if path == "/health/live":
             return {"ok": True, "service": "phase3_quant_api", "trained_models_available": False}
         return {
             "available": False,
@@ -1161,7 +1198,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
 
     result = await client.status()
 
-    assert get_calls == ["/models/status", "/health"]
+    assert get_calls == ["/models/status", "/health/live"]
     assert post_calls == []
     assert result["available"] is True
     assert result["model_bundle_available"] is False
@@ -1188,13 +1225,13 @@ async def test_local_ai_tools_status_uses_override_timeout_for_parallel_health_r
         if len(calls) == 2:
             both_started.set()
         await asyncio.wait_for(both_started.wait(), timeout=0.2)
-        return {"available": path == "/models/status", "ok": path == "/health"}
+        return {"available": path == "/models/status", "ok": path == "/health/live"}
 
     monkeypatch.setattr(client, "_get", get_status)
 
     result = await client.status(request_timeout=1.25)
 
-    assert calls == [("/models/status", 1.25), ("/health", 1.25)]
+    assert calls == [("/models/status", 1.25), ("/health/live", 1.25)]
     assert result["service_available"] is True
 
 
@@ -1207,7 +1244,7 @@ async def test_local_ai_tools_status_probes_service_when_trading_influence_disab
     client = LocalAIToolsClient()
 
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
-        if path == "/health":
+        if path == "/health/live":
             return {"ok": True, "service": "phase3_quant_api"}
         return {"available": False, "message": "No trained local quant bundle found"}
 
@@ -1238,7 +1275,7 @@ async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
     client = LocalAIToolsClient()
 
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
-        if path == "/health":
+        if path == "/health/live":
             return {"ok": True, "service": "phase3_quant_api"}
         assert path == "/models/status"
         return {
@@ -1326,7 +1363,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
 
     async def fail_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         assert request_timeout == 0.5
-        if path == "/health":
+        if path == "/health/live":
             return {
                 "ok": True,
                 "service": "phase3_quant_api",
@@ -1397,7 +1434,7 @@ async def test_local_ai_tools_status_uses_health_when_status_and_bundle_missing(
 
     result = await client.status()
 
-    assert get_calls == ["/models/status", "/health"]
+    assert get_calls == ["/models/status", "/health/live"]
     assert result["available"] is True
     assert result["service_available"] is True
     assert result["model_bundle_available"] is False
@@ -1418,7 +1455,7 @@ async def test_local_ai_tools_status_uses_short_cache(
     async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
         get_calls.append(path)
         assert request_timeout == 0.5
-        if path == "/health":
+        if path == "/health/live":
             return {"ok": True, "service": "phase3_quant_api"}
         return {
             "available": False,
@@ -1448,7 +1485,7 @@ async def test_local_ai_tools_status_uses_short_cache(
     first["child_endpoints"]["profit_prediction"]["available"] = False
     second = await client.status()
 
-    assert get_calls == ["/models/status", "/health"]
+    assert get_calls == ["/models/status", "/health/live"]
     assert post_calls == []
     assert second["status_cache"]["hit"] is True
     assert second["child_endpoints"]["profit_prediction"]["available"] is True

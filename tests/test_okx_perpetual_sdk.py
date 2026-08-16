@@ -245,6 +245,38 @@ async def test_sdk_adapter_serializes_calls_on_same_sync_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sdk_adapter_disposable_http_clients_close_and_recreate_after_each_call() -> None:
+    exchange = OkxPerpetualSdkExchange("paper", close_http_after_call=True)
+    instances: list[Any] = []
+
+    class DisposableApi:
+        def __init__(self) -> None:
+            self.close_count = 0
+            instances.append(self)
+
+        def probe(self, value: str) -> dict[str, Any]:
+            return {"code": "0", "data": [{"value": value}]}
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    def api_getter() -> DisposableApi:
+        if exchange._account_api is None:
+            exchange._account_api = DisposableApi()
+        return exchange._account_api
+
+    first = await exchange._call_sdk(api_getter, "probe", value="first")
+    second = await exchange._call_sdk(api_getter, "probe", value="second")
+
+    assert first["data"][0]["value"] == "first"
+    assert second["data"][0]["value"] == "second"
+    assert len(instances) == 2
+    assert all(api.close_count == 1 for api in instances)
+    assert exchange._account_api is None
+    assert exchange._sdk_call_locks == {}
+
+
+@pytest.mark.asyncio
 async def test_sdk_adapter_forces_public_tickers_to_swap() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     market_api = _MarketApi()

@@ -2441,6 +2441,7 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
     monkeypatch,
 ) -> None:
     requests: list[tuple[str, str, str]] = []
+    client_options: dict[str, Any] = {}
 
     fake_settings = SimpleNamespace(
         get_fixed_ai_models=lambda include_empty=False: [
@@ -2460,7 +2461,8 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
 
     class FakeAsyncClient:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
+            del args
+            client_options.update(kwargs)
 
         async def __aenter__(self) -> FakeAsyncClient:
             return self
@@ -2483,7 +2485,7 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
                     json={"data": [{"id": "qwen3-14b-trade"}]},
                     request=request,
                 )
-            if url == "http://local-ai.test/health":
+            if url == "http://local-ai.test/health/live":
                 return httpx.Response(
                     200,
                     json={
@@ -2507,7 +2509,21 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
             if url == "http://local-ai.test/models/status":
                 return httpx.Response(
                     200,
-                    json={"available": True},
+                    json={
+                        "available": True,
+                        "child_endpoints": {
+                            "profit_prediction": {
+                                "available": True,
+                                "path": "/profit/predict",
+                                "probe_mode": "metadata_contract",
+                            },
+                            "exit_advice": {
+                                "available": False,
+                                "path": "/exit/advise",
+                                "probe_mode": "metadata_contract",
+                            },
+                        },
+                    },
                     request=request,
                 )
             raise AssertionError(f"unexpected heavy inference probe: {method} {url}")
@@ -2525,9 +2541,69 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
     assert tools["child_endpoints"]["profit_prediction"]["available"] is True
     assert tools["child_endpoints"]["exit_advice"]["available"] is False
     assert tools["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
+    assert tools["health"]["probe_mode"] == "models_status_reachability"
     assert tools["expected_platform_api_base"] == "http://127.0.0.1:18001"
     assert tools["tunnel_contract"]["status"] == "external_or_dev_endpoint"
+    assert all(not url.endswith("/health/live") for _method, url, _auth in requests)
     assert all(method == "GET" for method, _url, _auth in requests)
+    limits = client_options["limits"]
+    assert limits.max_keepalive_connections == 0
+    assert limits.max_connections == 4
+
+
+async def test_collect_platform_runtime_status_falls_back_to_liveness_when_status_fails(
+    monkeypatch,
+) -> None:
+    requests: list[str] = []
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [],
+        local_ai_tools_api_base="http://local-ai.test",
+        local_ai_tools_api_key="hidden-tools-key",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            requests.append(url)
+            request = httpx.Request(method, url)
+            if url.endswith("/models/status"):
+                return httpx.Response(503, json={"detail": "busy"}, request=request)
+            if url.endswith("/health/live"):
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "service": "phase3_quant_api"},
+                    request=request,
+                )
+            raise AssertionError(f"unexpected request: {url}")
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+
+    tools = result["local_ai_tools"]
+    assert requests[-2:] == [
+        "http://local-ai.test/models/status",
+        "http://local-ai.test/health/live",
+    ]
+    assert tools["available"] is True
+    assert tools["service_available"] is True
+    assert tools["model_bundle_available"] is False
+    assert tools["health"]["probe_mode"] == "liveness_fallback"
 
 
 async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(
@@ -2562,7 +2638,7 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
         ) -> httpx.Response:
             requests.append((method, url, str((headers or {}).get("Authorization") or "")))
             payload = {"available": True}
-            if url.endswith("/health"):
+            if url.endswith("/health/live"):
                 payload = {
                     "available": True,
                     "service": "phase3_quant_api",
@@ -2580,8 +2656,8 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
     result = await server_monitor_status.collect_platform_runtime_status()
 
     assert result["local_ai_tools"]["available"] is True
-    assert ("GET", "http://local-ai.test/health", "Bearer env-tools-key") in requests
     assert ("GET", "http://local-ai.test/models/status", "Bearer env-tools-key") in requests
+    assert ("GET", "http://local-ai.test/health/live", "Bearer env-tools-key") not in requests
     assert all(method == "GET" for method, _url, _auth in requests)
 
 
@@ -2634,7 +2710,7 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
                     json={"data": [{"id": "BB-FinQuant-Expert-14B"}]},
                     request=request,
                 )
-            if url == "http://127.0.0.1:18001/health":
+            if url == "http://127.0.0.1:18001/health/live":
                 return httpx.Response(
                     200,
                     json={"ok": True, "service": "phase3_quant_api", "root": "/data/BB"},
@@ -2654,7 +2730,8 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
     assert tools["using_default_phase3_tunnel"] is True
     assert tools["api_base"] == "http://127.0.0.1:18001"
     assert tools["configured_api_base"] == ""
-    assert ("GET", "http://127.0.0.1:18001/health") in requests
+    assert ("GET", "http://127.0.0.1:18001/health/live") not in requests
+    assert ("GET", "http://127.0.0.1:18001/models/status") in requests
     tunnels = result["model_tunnels"]
     assert tunnels["ready"] is True
     assert tunnels["can_call_expert"] is True
@@ -2777,7 +2854,7 @@ async def test_collect_platform_runtime_status_uses_external_decision_route(
                     json={"data": [{"id": "deepseek-r1-14b-risk"}]},
                     request=request,
                 )
-            if url == "http://127.0.0.1:18001/health":
+            if url == "http://127.0.0.1:18001/health/live":
                 return httpx.Response(
                     200,
                     json={"ok": True, "service": "phase3_quant_api", "root": "/data/BB"},

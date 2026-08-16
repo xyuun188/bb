@@ -49,12 +49,26 @@ TUNNEL_HEALTH_TIMEOUT_SECONDS = 5.0
 # eventually make the loopback listener look alive while it cannot accept
 # useful traffic.
 FORWARD_CHANNEL_IO_TIMEOUT_SECONDS = 10.0
+FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS = 15.0
+# Spread busy endpoints across more than one SSH session and keep each session
+# below the model server's sshd MaxSessions limit.
+FORWARD_CHANNELS_PER_TRANSPORT = 5
+FORWARD_TRANSPORT_POOL_SIZES = {
+    "phase3-quant-api": 2,
+    "BB-FinQuant-Expert-14B": 2,
+}
 FORWARD_DEFAULT_MAX_CONNECTION_SECONDS = 600.0
 FORWARD_QUANT_MAX_CONNECTION_SECONDS = 1_800.0
 # Training can briefly saturate the quant API while the SSH transport remains healthy.
 # Require a sustained semantic outage before rebuilding all four isolated tunnels.
 TUNNEL_HEALTH_FAILURE_LIMIT = 6
 REQUIRED_HTTP_HEALTH_PATHS = {"phase3-quant-api": "/health/live"}
+
+
+def _log(message: str) -> None:
+    """Write tunnel events immediately so journal timestamps reflect the real failure time."""
+
+    safe_print(message, flush=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +81,98 @@ class TunnelSpec:
     remote_host: str
     remote_port: int
     max_connection_seconds: float = FORWARD_DEFAULT_MAX_CONNECTION_SECONDS
+
+
+def _transport_is_active(transport: Any) -> bool:
+    """Read Paramiko transport liveness without allowing a stale object to break the loop."""
+
+    try:
+        return bool(transport is not None and transport.is_active())
+    except Exception:
+        return False
+
+
+def _should_retire_transport(exc: BaseException) -> bool:
+    """Retire a transport only when the channel-open failure makes it unsafe to reuse."""
+
+    if isinstance(exc, (EOFError, TimeoutError, socket.timeout, ConnectionError, OSError)):
+        return True
+    message = safe_error_text(exc, limit=240).lower()
+    return any(
+        marker in message for marker in ("timeout opening channel", "ssh session not active", "eof")
+    )
+
+
+class TransportPool:
+    """Bounded, replaceable SSH transport pool for one forwarded endpoint."""
+
+    def __init__(self, transports: list[Any], *, slots_per_transport: int) -> None:
+        if not transports:
+            raise ValueError("a transport pool requires at least one transport")
+        self._condition = threading.Condition()
+        self._transports = list(transports)
+        self._in_use = {id(transport): 0 for transport in transports}
+        self._slots_per_transport = max(int(slots_per_transport), 1)
+        self._next_index = 0
+
+    @property
+    def transports(self) -> tuple[Any, ...]:
+        with self._condition:
+            return tuple(self._transports)
+
+    def acquire(self, timeout: float) -> Any | None:
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        with self._condition:
+            while True:
+                count = len(self._transports)
+                for offset in range(count):
+                    index = (self._next_index + offset) % count
+                    transport = self._transports[index]
+                    if (
+                        _transport_is_active(transport)
+                        and self._in_use.get(id(transport), 0) < self._slots_per_transport
+                    ):
+                        self._next_index = (index + 1) % count
+                        self._in_use[id(transport)] = self._in_use.get(id(transport), 0) + 1
+                        return transport
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+
+    def release(self, transport: Any) -> None:
+        with self._condition:
+            transport_id = id(transport)
+            if transport_id in self._in_use:
+                self._in_use[transport_id] = max(self._in_use[transport_id] - 1, 0)
+            self._condition.notify_all()
+
+    def replace(self, old_transport: Any, new_transport: Any) -> bool:
+        """Replace one failed transport while keeping all listeners and other channels alive."""
+
+        with self._condition:
+            index = next(
+                (
+                    current_index
+                    for current_index, transport in enumerate(self._transports)
+                    if transport is old_transport
+                ),
+                -1,
+            )
+            if index < 0:
+                return False
+            self._transports[index] = new_transport
+            self._in_use.pop(id(old_transport), None)
+            self._in_use[id(new_transport)] = 0
+            self._next_index = index % len(self._transports)
+            self._condition.notify_all()
+            return True
+
+    def inactive_transports(self) -> list[Any]:
+        with self._condition:
+            return [
+                transport for transport in self._transports if not _transport_is_active(transport)
+            ]
 
 
 def probe_tunnel_http_health(spec: TunnelSpec, path: str) -> tuple[bool, str]:
@@ -107,12 +213,12 @@ def check_required_tunnel_health(
         healthy, error = probe(spec, path)
         if healthy:
             if failure_counts.get(spec.name, 0):
-                safe_print(f"{spec.name} tunnel health recovered")
+                _log(f"{spec.name} tunnel health recovered")
             failure_counts[spec.name] = 0
             continue
         count = failure_counts.get(spec.name, 0) + 1
         failure_counts[spec.name] = count
-        safe_print(
+        _log(
             f"{spec.name} tunnel health failed ({count}/{failure_limit}): "
             f"{safe_error_text(error, limit=120)}"
         )
@@ -128,10 +234,24 @@ class ForwardServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, spec: TunnelSpec, ssh_transport: Any) -> None:
+    def __init__(self, spec: TunnelSpec, ssh_transports: list[Any]) -> None:
+        if not ssh_transports:
+            raise ValueError(f"{spec.name} requires at least one SSH transport")
         self.spec = spec
-        self.ssh_transport = ssh_transport
+        self.transport_pool = TransportPool(
+            ssh_transports,
+            slots_per_transport=FORWARD_CHANNELS_PER_TRANSPORT,
+        )
+        self.ssh_transports = self.transport_pool.transports
+        self.ssh_transport = self.ssh_transports[0]
         super().__init__((spec.local_host, spec.local_port), ForwardHandler)
+
+    def replace_transport(self, old_transport: Any, new_transport: Any) -> bool:
+        replaced = self.transport_pool.replace(old_transport, new_transport)
+        if replaced:
+            self.ssh_transports = self.transport_pool.transports
+            self.ssh_transport = self.ssh_transports[0]
+        return replaced
 
 
 class ForwardHandler(socketserver.BaseRequestHandler):
@@ -141,7 +261,7 @@ class ForwardHandler(socketserver.BaseRequestHandler):
     def _recv_or_empty(sock: Any) -> bytes:
         try:
             return sock.recv(BUFFER_SIZE)
-        except (ConnectionResetError, BrokenPipeError, OSError):
+        except Exception:
             return b""
 
     @staticmethod
@@ -149,66 +269,99 @@ class ForwardHandler(socketserver.BaseRequestHandler):
         try:
             sock.sendall(data)
             return True
-        except (ConnectionResetError, BrokenPipeError, OSError):
+        except Exception:
             return False
 
     def handle(self) -> None:
         server = self.server
         self.request.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
         assert isinstance(server, ForwardServer)
-        try:
-            peer = self.request.getpeername()
-            channel = server.ssh_transport.open_channel(
-                "direct-tcpip",
-                (server.spec.remote_host, server.spec.remote_port),
-                peer,
-            )
-        except Exception as exc:  # pragma: no cover - live SSH transport only.
-            safe_print(f"{server.spec.name} tunnel open failed: {safe_error_text(exc)}")
-            return
-        if channel is None:
-            safe_print(f"{server.spec.name} tunnel rejected by SSH server")
-            return
-        deadline = time.monotonic() + max(
-            float(server.spec.max_connection_seconds),
-            FORWARD_CHANNEL_IO_TIMEOUT_SECONDS,
+        transport_pool = getattr(server, "transport_pool", None)
+        ssh_transport = (
+            transport_pool.acquire(FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS)
+            if transport_pool is not None
+            else getattr(server, "ssh_transport", None)
         )
+        if ssh_transport is None:
+            _log(f"{server.spec.name} tunnel channel capacity exhausted or unavailable")
+            return
         try:
-            channel.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
-        except (AttributeError, OSError):
-            pass
-
-        try:
-            while time.monotonic() < deadline:
-                readable, _, _ = select.select(
-                    [self.request, channel],
-                    [],
-                    [],
-                    SELECT_TIMEOUT_SECONDS,
-                )
-                if self.request in readable:
-                    data = self._recv_or_empty(self.request)
-                    if not data:
-                        break
-                    if not self._sendall_or_closed(channel, data):
-                        break
-                if channel in readable:
-                    data = self._recv_or_empty(channel)
-                    if not data:
-                        break
-                    if not self._sendall_or_closed(self.request, data):
-                        break
-        finally:
             try:
-                channel.shutdown_write()
+                peer = self.request.getpeername()
+                channel = ssh_transport.open_channel(
+                    "direct-tcpip",
+                    (server.spec.remote_host, server.spec.remote_port),
+                    peer,
+                    timeout=FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:  # pragma: no cover - live SSH transport only.
+                _log(f"{server.spec.name} tunnel open failed: {safe_error_text(exc)}")
+                if _should_retire_transport(exc):
+                    # Paramiko can receive a late channel-open success after its timeout.
+                    # Closing this endpoint's dedicated transport prevents that response
+                    # from leaving an orphaned TCP connection on the model server.
+                    try:
+                        ssh_transport.close()
+                    except (AttributeError, OSError):
+                        pass
+                return
+            if channel is None:
+                _log(f"{server.spec.name} tunnel rejected by SSH server")
+                return
+            deadline = time.monotonic() + max(
+                float(server.spec.max_connection_seconds),
+                FORWARD_CHANNEL_IO_TIMEOUT_SECONDS,
+            )
+            try:
+                channel.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
             except (AttributeError, OSError):
                 pass
-            channel.close()
+
+            try:
+                while time.monotonic() < deadline:
+                    readable, _, _ = select.select(
+                        [self.request, channel],
+                        [],
+                        [],
+                        SELECT_TIMEOUT_SECONDS,
+                    )
+                    if self.request in readable:
+                        data = self._recv_or_empty(self.request)
+                        if not data:
+                            break
+                        if not self._sendall_or_closed(channel, data):
+                            break
+                    if channel in readable:
+                        data = self._recv_or_empty(channel)
+                        if not data:
+                            break
+                        if not self._sendall_or_closed(self.request, data):
+                            break
+            except Exception as exc:  # pragma: no cover - live channel races only.
+                _log(
+                    f"{server.spec.name} tunnel stream closed: "
+                    f"{safe_error_text(exc, limit=120)}"
+                )
+            finally:
+                try:
+                    channel.shutdown_write()
+                except (AttributeError, OSError):
+                    pass
+                try:
+                    channel.close()
+                except (AttributeError, OSError):
+                    pass
+        finally:
+            if transport_pool is not None:
+                transport_pool.release(ssh_transport)
             try:
                 self.request.shutdown(socket.SHUT_RDWR)
             except (OSError, AttributeError):
                 pass
-            self.request.close()
+            try:
+                self.request.close()
+            except (OSError, AttributeError):
+                pass
 
 
 def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
@@ -250,48 +403,104 @@ def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
 def open_dedicated_transports(
     specs: list[TunnelSpec],
     server_info: Any,
-) -> tuple[list[Any], list[Any]]:
-    """Open one SSH transport per endpoint to prevent cross-model blocking."""
+) -> tuple[list[Any], list[list[Any]]]:
+    """Open isolated SSH transport pools so busy endpoints cannot head-of-line block."""
 
     ssh_clients: list[Any] = []
-    transports: list[Any] = []
+    transport_pools: list[list[Any]] = []
     try:
         for spec in specs:
-            ssh = connect_remote_ssh(ROOT, timeout=20, info=server_info)
-            ssh_clients.append(ssh)
-            transport = ssh.get_transport()
-            if transport is None or not transport.is_active():
-                raise RuntimeError(f"{spec.name} SSH transport is not active")
-            transport.set_keepalive(TRANSPORT_KEEPALIVE_SECONDS)
-            transports.append(transport)
+            pool: list[Any] = []
+            pool_size = max(int(FORWARD_TRANSPORT_POOL_SIZES.get(spec.name, 1)), 1)
+            for _index in range(pool_size):
+                ssh = connect_remote_ssh(ROOT, timeout=20, info=server_info)
+                ssh_clients.append(ssh)
+                transport = ssh.get_transport()
+                if transport is None or not transport.is_active():
+                    raise RuntimeError(f"{spec.name} SSH transport is not active")
+                transport.set_keepalive(TRANSPORT_KEEPALIVE_SECONDS)
+                pool.append(transport)
+            transport_pools.append(pool)
     except Exception:
         for ssh in reversed(ssh_clients):
             ssh.close()
         raise
-    return ssh_clients, transports
+    return ssh_clients, transport_pools
 
 
 def start_servers(
     specs: list[TunnelSpec],
-    ssh_transports: list[Any],
+    ssh_transport_pools: list[list[Any]],
 ) -> list[ForwardServer]:
-    """Start local forwarders with a dedicated transport for every endpoint."""
+    """Start local forwarders with an isolated transport pool per endpoint."""
 
-    if len(specs) != len(ssh_transports):
-        raise ValueError("each tunnel endpoint requires one dedicated SSH transport")
+    if len(specs) != len(ssh_transport_pools):
+        raise ValueError("each tunnel endpoint requires one SSH transport pool")
 
     servers: list[ForwardServer] = []
-    for spec, ssh_transport in zip(specs, ssh_transports, strict=True):
-        server = ForwardServer(spec, ssh_transport)
+    for spec, ssh_transports in zip(specs, ssh_transport_pools, strict=True):
+        server = ForwardServer(spec, ssh_transports)
         thread = threading.Thread(target=server.serve_forever, name=f"tunnel-{spec.name}")
         thread.daemon = True
         thread.start()
         servers.append(server)
-        safe_print(
+        _log(
             f"{spec.name}: http://{spec.local_host}:{spec.local_port} "
             f"-> {spec.remote_host}:{spec.remote_port}"
         )
     return servers
+
+
+def recover_inactive_transports(
+    specs: list[TunnelSpec],
+    servers: list[ForwardServer],
+    ssh_clients: list[Any],
+    client_by_transport: dict[int, Any],
+    server_info: Any,
+) -> list[str]:
+    """Replace failed endpoint transports in place and keep listeners serving."""
+
+    failed_names: list[str] = []
+    for spec, server in zip(specs, servers, strict=True):
+        inactive = server.transport_pool.inactive_transports()
+        for old_transport in inactive:
+            new_client: Any | None = None
+            replacement_installed = False
+            try:
+                new_client = connect_remote_ssh(ROOT, timeout=20, info=server_info)
+                new_transport = new_client.get_transport()
+                if new_transport is None or not _transport_is_active(new_transport):
+                    raise RuntimeError(f"{spec.name} replacement SSH transport is not active")
+                new_transport.set_keepalive(TRANSPORT_KEEPALIVE_SECONDS)
+                if not server.replace_transport(old_transport, new_transport):
+                    new_client.close()
+                    continue
+                replacement_installed = True
+                old_client = client_by_transport.pop(id(old_transport), None)
+                if old_client is not None:
+                    try:
+                        ssh_clients.remove(old_client)
+                    except ValueError:
+                        pass
+                    try:
+                        old_client.close()
+                    except Exception as close_exc:
+                        _log(
+                            f"{spec.name} old SSH client close deferred: "
+                            f"{safe_error_text(close_exc, limit=120)}"
+                        )
+                ssh_clients.append(new_client)
+                client_by_transport[id(new_transport)] = new_client
+                _log(f"{spec.name} tunnel transport recovered in place")
+            except Exception as exc:  # pragma: no cover - live SSH recovery only.
+                if new_client is not None and not replacement_installed:
+                    new_client.close()
+                failed_names.append(spec.name)
+                _log(
+                    f"{spec.name} tunnel transport recovery deferred: "
+                    f"{safe_error_text(exc, limit=180)}"
+                )
+    return sorted(set(failed_names))
 
 
 def run_tunnels(specs: list[TunnelSpec]) -> None:
@@ -299,24 +508,36 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
 
     info = load_model_server_info_from_secure_settings_sync()
     ssh_clients: list[Any] = []
-    transports: list[Any] = []
+    transport_pools: list[list[Any]] = []
     servers: list[ForwardServer] = []
+    client_by_transport: dict[int, Any] = {}
     try:
-        ssh_clients, transports = open_dedicated_transports(specs, info)
-        servers = start_servers(specs, transports)
-        safe_print("online model tunnels ready with isolated transports")
+        ssh_clients, transport_pools = open_dedicated_transports(specs, info)
+        servers = start_servers(specs, transport_pools)
+        client_index = 0
+        for pool in transport_pools:
+            for transport in pool:
+                client_by_transport[id(transport)] = ssh_clients[client_index]
+                client_index += 1
+        _log("online model tunnels ready with isolated transport pools")
         health_failure_counts: dict[str, int] = {}
         next_health_check = time.monotonic() + TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS
         while True:
             inactive_names = [
-                spec.name
-                for spec, transport in zip(specs, transports, strict=True)
-                if not transport.is_active()
+                server.spec.name
+                for server in servers
+                if server.transport_pool.inactive_transports()
             ]
             if inactive_names:
-                raise RuntimeError(
-                    "SSH transport closed for: " + ", ".join(inactive_names)
+                unrecovered_names = recover_inactive_transports(
+                    specs,
+                    servers,
+                    ssh_clients,
+                    client_by_transport,
+                    info,
                 )
+                if unrecovered_names:
+                    _log("SSH transport recovery pending for: " + ", ".join(unrecovered_names))
             now = time.monotonic()
             if now >= next_health_check:
                 unhealthy_names = check_required_tunnel_health(
@@ -328,12 +549,12 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
                     # the model is occupied with inference/training.  The SSH transport
                     # above is the authoritative tunnel liveness signal; rebuilding all
                     # four transports here creates a larger outage than the slow request.
-                    safe_print(
+                    _log(
                         "model backend is busy; keeping active SSH tunnels for: "
                         + ", ".join(unhealthy_names)
                     )
                 next_health_check = now + TUNNEL_HEALTH_CHECK_INTERVAL_SECONDS
-            time.sleep(5)
+            time.sleep(1)
     finally:
         for server in servers:
             server.shutdown()

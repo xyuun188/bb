@@ -472,5 +472,19 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 - 最新线上 challenger `20260816T131531951968Z-86e19f51` 完成约 42 分钟训练后被正确拒绝，继续保留 champion `20260813T145130254885Z-10c06715`。拒绝原因为 `candidate_primary_fee_after_metrics_not_improved`、`candidate_cvar_materially_worsened` 和 `candidate_max_drawdown_materially_worsened`，不是训练超时或状态机失败。
 - 最新 v2 样本外结果仍不满足收益门禁：long 平均费后收益 `-0.2191%`、LCB `-0.3233%`、PF `0.4362`、CVaR `-2.0644%`、最大回撤 `46.44%`；short 平均费后收益 `-0.1894%`、LCB `-0.3627%`、PF `0.6544`、CVaR `-2.7256%`、最大回撤 `60.40%`。因此没有晋升，也没有解除保护。
 - 标签方向复核未发现 short 正负号错误：long/short 毛收益严格互为相反数。真实限制来自非平稳性和周期混合：`horizon_minutes` 特征重要性约 24.7%，5/15 分钟样本更多进入高分组，240 分钟样本更多进入低分组；short 在 trending 阶段平均收益约 `0.3602%`、PF `1.845`，在 ranging 阶段平均收益约 `-0.2963%`、PF `0.467`。后续应在新增干净样本上改进周期与市场阶段建模，不能强制晋升当前 challenger。
-- 部署后在线运行时验证：16 核服务器的训练 worker 计算结果为 2；当前加载的 12 个分类/回归估计器推理均为 `n_jobs=1`；candidate 文件不存在、训练 lease 为空、没有训练进程。7 个模型状态全部为 `succeeded`、`active_run_id=null`、`last_error=null`、`retry_count=0`，本次部署没有重复启动训练。
+- 部署后在线运行时验证：16 核服务器的训练 worker 计算结果为 2，当前加载的 12 个分类/回归估计器推理均为 `n_jobs=1`。无副作用线上探针同时确认 `trained=true` 的结构化结果可通过、`trained=false` 必然失败，拟合 estimator 从 `n_jobs=2` 切到单条推理后为 `n_jobs=1`。
+- 首轮稳定性观察在上一 challenger 结束约 47 分钟后捕获到一次真实的自动重复训练：固定 50 个新决策组阈值相对于约 42 分钟训练耗时过低，调度器由 `mature_decision_group_batch` 再次进入 `running`。该唯一进程已终止，终止前 candidate 不存在；不能把 `checking` 或进程存活误报成正常。
+- 重复训练根因已按数据规模治理：普通批次阈值改为“至少 50 且至少为上次已评估决策组数的 5%”，批次和漂移触发增加 6 小时最短重训间隔，24 小时最小增量兜底仍保留；强制训练、首次产物和训练合同升级不受该冷却限制。合同新旧判断改用最新已评估 challenger，而不是只看仍在服役的旧 champion，避免 challenger 被拒后反复重建同一合同。
+- 隔离训练子进程缺失结果帧、非零退出或超时后，父调度器现在会明确关闭 active run 并回收已死亡子进程拥有的 lease；不再等待两小时 stale lease 才恢复。对应节流、拒绝后游标、非零退出、缺失结果和超时回收均已有回归测试。
 - 同次线上复核中交易、Dashboard、模型隧道均为 `active/running` 且 `NRestarts=0`；OKX 日对账 `can_open_new_entries=true`、`can_refresh_training=true`、关键问题 0、人工复核 0。10 个开放仓位对应 12 个保护单，缺失、孤儿、数量覆盖不一致、无效单和 repair blocker 均为 0。
+
+### 15.6 2026-08-16 最终连接治理与连续稳定性验收
+
+- 模型隧道已改为双 transport 池并限制并发；异常 transport、连接超时和日志输出均有原位恢复与回收路径。Dashboard 冷启动先返回完整 `warming` 快照，正式状态由后台单飞构建，避免多个请求同时压向量化隧道和 OKX。
+- Local AI 状态 GET 与模型运行态探针改用显式禁用 keep-alive 的临时 HTTP 客户端；推理 POST 继续使用受限共享连接池。Dashboard 的稀疏 OKX 只读调用也改为每次调用后关闭会话，并使用独立串行锁保护 disposable 客户端；交易服务高频 OKX 客户端仍保持连接复用。
+- Dashboard lifespan 现在统一关闭 Dashboard 持有的 Local AI 状态客户端。部署前旧 Dashboard 进程长期保留的 4 个 `CLOSE-WAIT` 已随进程替换消失；新进程在最终 27 个分钟样本中 Dashboard 与模型隧道的 `CLOSE-WAIT` 始终为 0。交易进程仅出现 0 至 3 个短暂 `CLOSE-WAIT`，后续样本均自行回落，最终为 0，没有持续累积。
+- 最终连续观察覆盖 `2026-08-16T19:44:01Z` 至 `2026-08-16T20:10:57Z`，且三项服务实际自 `19:38:43Z/19:38:49Z` 起持续运行。交易、Dashboard、模型隧道全程均为 `active/running`、`NRestarts=0`，最终 PID 分别为 `617688/617691/617629`；最终 FD 数分别为 `53/15/26`，累计 critical 日志数均为 0。Dashboard、量化健康检查和认证状态 API 每个样本均返回预期的 `302/200/200`。
+- 部署后正式 30 分钟覆盖窗口为 `2026-08-16T19:43:46Z` 至 `2026-08-16T20:13:46Z`，审计结果 `assessment.ready=true`：市场分析 17 条、10 个币种，最大活动间隔 `229.275` 秒，最高单币占比 `17.6471%`；`overdue_count=0`、`coverage_due_count=0`、`coverage_window_met=true`。10 个开放仓位产生 681 条持仓复核记录。
+- 最终只读 OKX 日对账为 `status=ok`、`can_open_new_entries=true`、`can_refresh_training=true`、未解决项 0、人工复核 0；10 个仓位对应 12 个保护单，缺失、孤儿、覆盖数量不一致、无效单和 repair blocker 均为 0。另有 1 条无法修复的历史平仓候选保留原始记录并隔离出训练集，不属于当前训练周期阻塞项，也未被伪造为已补齐事实。
+- 最终训练唯一性检查只观察到一把 `local_ai_tools_auto_train` 租约和一个训练子进程，没有重复训练。该轮先完成游标检查，再由同一 run 启动真实训练；6 个 Local AI 模型于 `2026-08-16T20:05:21Z` 全部自然结束为 `succeeded`，`active_run_id=null`、`last_error=null`、`retry_count=0`，训练进程和租约随后消失。Local ML 本轮因未到重训条件落为 `skipped`，不是失败。
+- 本节只证明运行、连接、覆盖、对账、保护单和训练状态机通过线上验收。收益质量结论没有改变：现有 challenger 仍未通过费后收益、LCB、CVaR、最大回撤和 walk-forward 门禁，`live_ml_ready=false`、`live_routing_enabled=false` 继续保持，未执行强制晋升或放宽安全门禁。

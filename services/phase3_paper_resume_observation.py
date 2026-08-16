@@ -15,8 +15,8 @@ from core.safe_output import safe_error_text
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.okx_integrity_gate import partition_okx_integrity_issues
 from services.server_monitor_status import (
-    collect_platform_runtime_status,
     collect_platform_server_status,
+    get_cached_platform_runtime_status,
 )
 
 DEFAULT_OBSERVATION_HOURS = 2
@@ -528,7 +528,7 @@ class Phase3PaperResumeObservationService:
             self._collect(
                 "platform_runtime",
                 self.platform_runtime_provider,
-                collect_platform_runtime_status,
+                get_cached_platform_runtime_status,
             ),
             self._collect(
                 "trading_runtime_status",

@@ -26,6 +26,12 @@ def _report(now: datetime) -> dict:
                 "restart_count": 0,
                 "active_enter_at": (window_started_at - timedelta(minutes=1)).isoformat(),
             },
+            "model_tunnels": {
+                "active_state": "active",
+                "sub_state": "running",
+                "restart_count": 0,
+                "active_enter_at": (window_started_at - timedelta(minutes=1)).isoformat(),
+            },
         },
         "coverage": {
             "monitoring_active": True,
@@ -105,6 +111,23 @@ def test_assessment_requires_full_window_of_service_continuity() -> None:
     assert assessment["blockers"] == ["trading_service_continuity_unproven"]
 
 
+def test_assessment_rejects_model_tunnel_restart_in_window() -> None:
+    now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    report = _report(now)
+    report["services"]["model_tunnels"]["restart_count"] = 1
+    report["services"]["model_tunnels"]["active_enter_at"] = (
+        now - timedelta(minutes=5)
+    ).isoformat()
+
+    assessment = audit.assess_coverage_report(report, now=now)
+
+    assert assessment["ready"] is False
+    assert assessment["blockers"] == [
+        "model_tunnels_service_restarted",
+        "model_tunnels_service_continuity_unproven",
+    ]
+
+
 def test_assessment_rejects_unresolved_due_market_candidates() -> None:
     now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
     report = _report(now)
@@ -153,6 +176,7 @@ def test_remote_script_compiles_and_reads_only_runtime_evidence() -> None:
     assert "AIDecision.analysis_type" in script
     assert "Position.is_open.is_(True)" in script
     assert "bb-paper-trading.service" in script
+    assert "bb-model-tunnels.service" in script
     assert "ActiveEnterTimestamp" in script
     assert "strict=True" not in script
 

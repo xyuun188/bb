@@ -120,6 +120,27 @@ def test_local_ml_training_uses_bounded_parallelism(
     assert regressor.named_steps["model"].n_jobs == 1
 
 
+def test_local_ml_training_cadence_scales_and_enforces_cooldown() -> None:
+    recent = ml_signal_module._local_ml_training_cadence(
+        previous_decision_group_count=18_175,
+        new_decision_group_count=50,
+        seconds_since_training=47 * 60,
+        distribution_drift_detected=True,
+    )
+    mature = ml_signal_module._local_ml_training_cadence(
+        previous_decision_group_count=18_175,
+        new_decision_group_count=909,
+        seconds_since_training=6 * 60 * 60,
+        distribution_drift_detected=False,
+    )
+
+    assert recent["effective_batch_decision_group_threshold"] == 909
+    assert recent["minimum_retraining_interval_elapsed"] is False
+    assert recent["batch_due"] is False
+    assert recent["drift_due"] is False
+    assert mature["batch_due"] is True
+
+
 def _with_return_objective(metadata: dict) -> dict:
     metadata = dict(metadata)
     metadata.setdefault("objective_name", RETURN_OBJECTIVE_NAME)
@@ -1951,6 +1972,82 @@ async def test_ml_signal_auto_train_does_not_retrain_for_one_new_decision_group(
     assert result["reason"] == "not_due"
     assert result["new_decision_group_count"] == 1
     assert result["training_policy"]["trigger"] == "not_due"
+
+
+@pytest.mark.asyncio
+async def test_rejected_challenger_contract_and_cursor_prevent_rapid_retraining(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+        completed_sample_count=1_000,
+    )
+    current_metadata["quality_report"] = {
+        **current_metadata["quality_report"],
+        "data_quality_version": "old-contract",
+    }
+    current_metadata["last_trained_completed_shadow_decision_group_count"] = 1_000
+    challenger_metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+        completed_sample_count=2_000,
+    )
+    challenger_metadata["last_trained_completed_shadow_decision_group_count"] = 2_000
+    challenger_metadata["trained_at"] = (datetime.now(UTC) - timedelta(minutes=47)).isoformat()
+    challenger = ResolvedModelArtifact(
+        model_id=LOCAL_ML_MODEL_IDS[0],
+        version="challenger-v1",
+        model_path=tmp_path / "model.joblib",
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="a" * 64,
+        manifest=challenger_metadata,
+        pointer_role="challenger",
+        pointer_path=tmp_path / "challenger.json",
+    )
+    service = MLSignalService(
+        artifact_registry=SimpleNamespace(
+            model_root=tmp_path / "model_artifacts",
+            resolve_challenger=lambda: challenger,
+        ),
+        training_state_store=ModelTrainingStateStore(tmp_path / "training_state.json"),
+    )
+
+    async def completed_shadow_sample_count() -> int:
+        return 2_050
+
+    async def load_rows() -> list[object]:
+        return [object()]
+
+    async def load_trade_samples() -> list[dict[str, object]]:
+        return []
+
+    async def forbidden_quarantine(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("recent rejected challenger must suppress rapid retraining")
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: current_metadata  # type: ignore[method-assign]
+    service._quarantine_dirty_training_samples = forbidden_quarantine  # type: ignore[method-assign]
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(
+        "services.ml_signal_service.build_training_frame",
+        lambda _rows: _training_frame(2_050),
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        load_trade_samples,
+    )
+
+    result = await service.maybe_auto_train()
+
+    assert result["trained"] is False
+    assert result["reason"] == "not_due"
+    assert result["new_decision_group_count"] == 50
+    assert result["training_policy"]["training_data_contract_stale"] is False
+    assert result["training_policy"]["effective_batch_decision_group_threshold"] == 100
+    assert result["training_policy"]["minimum_retraining_interval_elapsed"] is False
 
 
 def test_authoritative_trade_return_evidence_prefers_profit_training_target() -> None:

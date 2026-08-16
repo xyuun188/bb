@@ -80,6 +80,15 @@ async def lifespan(app: FastAPI):
                 await audit_task
             except asyncio.CancelledError:
                 pass
+        from web_dashboard.api.dashboard import shutdown_dashboard_read_clients
+
+        try:
+            await shutdown_dashboard_read_clients()
+        except Exception as exc:
+            logger.warning(
+                "dashboard read client shutdown failed",
+                error=safe_error_text(exc, limit=240),
+            )
         await ws_manager.close_all()
 
 

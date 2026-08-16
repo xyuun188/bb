@@ -46,7 +46,11 @@ _MIN_REQUEST_TIMEOUT_SECONDS = 0.2
 _MAX_REQUEST_TIMEOUT_SECONDS = 15.0
 _MAX_CIRCUIT_BREAKER_FAILURES = 20
 _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
-_STATUS_CACHE_TTL_SECONDS = 8.0
+# The verified artifact/status contract can be over 100 KB. It is diagnostic
+# metadata rather than an inference heartbeat, so successful reads are reused
+# long enough to avoid saturating the dedicated SSH tunnel during UI polling.
+_STATUS_CACHE_TTL_SECONDS = 60.0
+_STATUS_ERROR_CACHE_TTL_SECONDS = 2.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
 _HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
 _HTTP_MAX_CONNECTIONS = 8
@@ -688,7 +692,7 @@ class LocalAIToolsClient:
         )
         status_result, health_result = await asyncio.gather(
             self._get("/models/status", request_timeout=timeout),
-            self._get("/health", request_timeout=timeout),
+            self._get("/health/live", request_timeout=timeout),
             return_exceptions=True,
         )
         try:
@@ -952,23 +956,36 @@ class LocalAIToolsClient:
             return None
         cached_at, payload = self._status_cache
         age = monotonic() - cached_at
-        if age > _STATUS_CACHE_TTL_SECONDS:
+        cache_ttl = self._status_cache_ttl(payload)
+        if age > cache_ttl:
             self._status_cache = None
             return None
         data = copy.deepcopy(payload)
         data["status_cache"] = {
             "hit": True,
             "age_seconds": round(max(age, 0.0), 2),
-            "ttl_seconds": _STATUS_CACHE_TTL_SECONDS,
+            "ttl_seconds": cache_ttl,
         }
         return data
+
+    @staticmethod
+    def _status_cache_ttl(payload: Mapping[str, Any]) -> float:
+        """Keep degraded probes short-lived without re-polling healthy metadata."""
+
+        if (
+            payload.get("service_available") is True
+            and not payload.get("status_error")
+            and not payload.get("health_error")
+        ):
+            return _STATUS_CACHE_TTL_SECONDS
+        return _STATUS_ERROR_CACHE_TTL_SECONDS
 
     def _write_status_cache(self, payload: dict[str, Any]) -> dict[str, Any]:
         data = copy.deepcopy(payload)
         data["status_cache"] = {
             "hit": False,
             "age_seconds": 0.0,
-            "ttl_seconds": _STATUS_CACHE_TTL_SECONDS,
+            "ttl_seconds": self._status_cache_ttl(data),
         }
         self._status_cache = (monotonic(), copy.deepcopy(data))
         return data
@@ -1000,14 +1017,21 @@ class LocalAIToolsClient:
     async def _get(self, path: str, request_timeout: float | None = None) -> dict[str, Any]:
         base = self._api_base()
         try:
-            client = await self._shared_http_client(base)
-            response = await client.get(
-                f"{base}{path}",
-                headers=self._auth_headers(),
-                timeout=request_timeout or self._timeout,
-            )
+            # Status probes are sparse and the upstream server expires idle
+            # keep-alive sockets. Keep them out of the inference connection
+            # pool so an idle Dashboard cannot retain peer-closed sockets.
+            async with httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=0,
+                    max_connections=1,
+                )
+            ) as client:
+                response = await client.get(
+                    f"{base}{path}",
+                    headers=self._auth_headers(),
+                    timeout=request_timeout or self._timeout,
+                )
         except httpx.RequestError as exc:
-            await self._reset_http_client()
             raise RuntimeError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
 

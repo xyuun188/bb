@@ -149,6 +149,7 @@ async def run():
         "services": {{
             "trading": service_status("bb-paper-trading.service"),
             "dashboard": service_status("bb-dashboard.service"),
+            "model_tunnels": service_status("bb-model-tunnels.service"),
         }},
         "coverage": runtime.get("market_analysis_deferred") or {{}},
         "market": {{
@@ -206,7 +207,7 @@ def assess_coverage_report(
     if window_started_at is None:
         blockers.append("observation_window_start_missing")
     services = report.get("services") if isinstance(report.get("services"), dict) else {}
-    for name in ("trading", "dashboard"):
+    for name in ("trading", "dashboard", "model_tunnels"):
         status = services.get(name) if isinstance(services.get(name), dict) else {}
         if status.get("active_state") != "active" or status.get("sub_state") != "running":
             blockers.append(f"{name}_service_not_running")

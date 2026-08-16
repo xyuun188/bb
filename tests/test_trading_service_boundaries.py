@@ -2471,6 +2471,10 @@ async def test_local_ml_auto_train_requires_framed_machine_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
+    failures: list[dict[str, Any]] = []
+    service._record_training_subprocess_failure = (  # type: ignore[method-assign]
+        lambda **payload: failures.append(payload)
+    )
 
     class FakeProcess:
         returncode = 0
@@ -2492,6 +2496,102 @@ async def test_local_ml_auto_train_requires_framed_machine_result(
     assert result["trained"] is False
     assert result["reason"] == "error"
     assert result["error"] == "local ML auto-train result frame missing"
+    assert failures == [
+        {
+            "scheduler_id": "local_ml_auto_train",
+            "model_ids": ("local_ml_profit_quality",),
+            "error": "local ML auto-train result frame missing",
+        }
+    ]
+
+
+def test_dead_training_subprocess_closes_state_and_reclaims_lease() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    released: list[bool] = []
+
+    class FakeLease:
+        def release(self) -> None:
+            released.append(True)
+
+    class FakeStore:
+        def read(self) -> dict[str, Any]:
+            return {
+                "models": {
+                    "local_ml_profit_quality": {
+                        "state": "running",
+                        "active_run_id": "run-1",
+                    }
+                }
+            }
+
+        def record_exception(self, **kwargs: Any) -> None:
+            calls.append(("record_exception", kwargs))
+
+        def try_acquire_lease(self, **kwargs: Any) -> SimpleNamespace:
+            calls.append(("try_acquire_lease", kwargs))
+            return SimpleNamespace(acquired=True, lease=FakeLease())
+
+    service.model_training_state_store = FakeStore()
+
+    service._record_training_subprocess_failure(
+        scheduler_id="local_ml_auto_train",
+        model_ids=("local_ml_profit_quality",),
+        error="worker exited without result",
+    )
+
+    assert calls[0][0] == "record_exception"
+    assert calls[0][1]["run_id"] == "run-1"
+    assert calls[0][1]["error"] == "worker exited without result"
+    assert calls[1] == (
+        "try_acquire_lease",
+        {
+            "scheduler_id": "local_ml_auto_train",
+            "stale_after_seconds": trading_service.AUTO_TRAIN_LEASE_STALE_SECONDS,
+        },
+    )
+    assert released == [True]
+
+
+def test_timed_out_training_subprocess_reclaims_lease() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    released: list[bool] = []
+
+    class FakeLease:
+        def release(self) -> None:
+            released.append(True)
+
+    class FakeStore:
+        def read(self) -> dict[str, Any]:
+            return {
+                "models": {
+                    "local_ml_profit_quality": {
+                        "state": "running",
+                        "active_run_id": "run-timeout",
+                    }
+                }
+            }
+
+        def record_timeout(self, **kwargs: Any) -> None:
+            calls.append(("record_timeout", kwargs))
+
+        def try_acquire_lease(self, **kwargs: Any) -> SimpleNamespace:
+            calls.append(("try_acquire_lease", kwargs))
+            return SimpleNamespace(acquired=True, lease=FakeLease())
+
+    service.model_training_state_store = FakeStore()
+
+    service._record_training_subprocess_timeout(
+        scheduler_id="local_ml_auto_train",
+        model_ids=("local_ml_profit_quality",),
+        error="worker timed out",
+    )
+
+    assert calls[0][0] == "record_timeout"
+    assert calls[0][1]["run_id"] == "run-timeout"
+    assert calls[1][0] == "try_acquire_lease"
+    assert released == [True]
 
 
 @pytest.mark.asyncio
@@ -2642,6 +2742,11 @@ async def test_isolated_subprocess_empty_stderr_reports_exit_code(
     expected_error: str,
 ) -> None:
     service = TradingService.__new__(TradingService)
+    failures: list[dict[str, Any]] = []
+    if method_name == "_run_local_ml_training_subprocess":
+        service._record_training_subprocess_failure = (  # type: ignore[method-assign]
+            lambda **payload: failures.append(payload)
+        )
 
     class FakeProcess:
         returncode = 17
@@ -2662,6 +2767,8 @@ async def test_isolated_subprocess_empty_stderr_reports_exit_code(
 
     assert result["error"] == expected_error
     assert result["error"] != "str"
+    if method_name == "_run_local_ml_training_subprocess":
+        assert failures and failures[0]["error"] == expected_error
 
 
 @pytest.mark.asyncio
@@ -6416,7 +6523,7 @@ async def test_strategy_context_timeout_returns_before_stubborn_cleanup_finishes
     elapsed = asyncio.get_running_loop().time() - started
 
     assert result == {"status": "fallback"}
-    assert cleanup_started.is_set()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
     assert elapsed < 0.2
     release_cleanup.set()
     await asyncio.sleep(0)

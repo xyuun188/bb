@@ -1269,9 +1269,14 @@ async def test_okx_initialize_enables_and_loads_time_difference(
 ) -> None:
     created: dict[str, Any] = {}
 
-    def fake_exchange(mode: str) -> _InitTimeSyncCcxt:
+    def fake_exchange(
+        mode: str,
+        *,
+        close_http_after_call: bool = False,
+    ) -> _InitTimeSyncCcxt:
         exchange = _InitTimeSyncCcxt({"options": {"defaultType": "swap"}})
         exchange.mode = mode
+        exchange.close_http_after_call = close_http_after_call
         created["exchange"] = exchange
         return exchange
 
@@ -1286,6 +1291,7 @@ async def test_okx_initialize_enables_and_loads_time_difference(
 
     exchange = created["exchange"]
     assert exchange.mode == "paper"
+    assert exchange.close_http_after_call is False
     assert exchange.load_time_difference_calls == 1
 
 

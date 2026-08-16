@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from web_dashboard import app as dashboard_app
 from web_dashboard.api import dashboard
 
 FAKE_BEARER_ERROR = "Authorization: Bearer " + "dashboard-balance-secret failed"
@@ -661,11 +662,20 @@ async def test_dashboard_standalone_okx_executor_is_reused_until_shutdown(
         async def shutdown(self) -> None:
             self.shutdown_count += 1
 
+    class LocalAIToolsStatusClient:
+        close_count = 0
+
+        async def close(self) -> None:
+            self.close_count += 1
+
+    local_ai_tools = LocalAIToolsStatusClient()
+
     monkeypatch.setattr(dashboard, "_trading_service", None)
     monkeypatch.setattr(dashboard, "OKXExecutor", PersistentExecutor)
     monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executors", {})
     monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executor_factories", {})
     monkeypatch.setattr(dashboard, "_dashboard_read_only_okx_executor_locks", {})
+    monkeypatch.setattr(dashboard, "_local_ai_tools_status_client", local_ai_tools)
 
     first = await dashboard._fetch_dashboard_okx_balance_uncached("paper")
     second = await dashboard._fetch_dashboard_okx_balance_uncached("paper")
@@ -678,6 +688,46 @@ async def test_dashboard_standalone_okx_executor_is_reused_until_shutdown(
     await dashboard.shutdown_dashboard_read_clients()
 
     assert instances[0].shutdown_count == 1
+    assert local_ai_tools.close_count == 1
+    assert dashboard._local_ai_tools_status_client is None
+
+
+def test_dashboard_lightweight_okx_executor_disables_idle_http_sessions() -> None:
+    captured: dict[str, Any] = {}
+
+    class CapturingExecutor:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    executor = dashboard._make_lightweight_okx_executor(CapturingExecutor, "paper")
+
+    assert isinstance(executor, CapturingExecutor)
+    assert captured == {
+        "mode": "paper",
+        "load_markets_on_initialize": False,
+        "close_http_after_call": True,
+    }
+
+
+async def test_dashboard_lifespan_closes_read_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def close_read_clients() -> None:
+        calls.append("read_clients")
+
+    async def close_websockets() -> None:
+        calls.append("websockets")
+
+    monkeypatch.setattr(dashboard_app.settings, "system_audit_history_enabled", False)
+    monkeypatch.setattr(dashboard, "shutdown_dashboard_read_clients", close_read_clients)
+    monkeypatch.setattr(dashboard_app.ws_manager, "close_all", close_websockets)
+
+    async with dashboard_app.lifespan(dashboard_app.app):
+        pass
+
+    assert calls == ["read_clients", "websockets"]
 
 
 async def test_dashboard_okx_position_cache_is_bound_to_executor(

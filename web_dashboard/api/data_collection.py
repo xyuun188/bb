@@ -56,7 +56,9 @@ logger = structlog.get_logger(__name__)
 
 TRAINING_SAMPLE_LIMIT = 240
 GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT = 500
-STATUS_SECTION_TIMEOUT_SECONDS = 6.0
+# Production status reads are cached. The first cold build runs in the background,
+# so it can tolerate brief database pool warm-up without delaying the Dashboard.
+STATUS_SECTION_TIMEOUT_SECONDS = 12.0
 STATUS_REMOTE_MODEL_TIMEOUT_SECONDS = 2.0
 STATUS_CACHE_TTL_SECONDS = 60.0
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
@@ -1291,6 +1293,50 @@ def _start_data_collection_status_refresh(include_feature_coverage: bool) -> Non
     task.add_done_callback(_consume_status_refresh_task(include_feature_coverage))
 
 
+def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str, Any]:
+    """Return a complete non-error shape while the first production snapshot warms."""
+
+    settings_payload = _data_collection_settings_payload()
+    payload = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "status": "warming",
+        "config": settings_payload["config"],
+        "sources": _collection_sources_summary(),
+        "stats": {"news": {}, "social": {}, "market": {}},
+        "feature_coverage": {
+            "status": "warming" if include_feature_coverage else "skipped",
+            "features": [],
+            "audit_only": True,
+        },
+        "training": {
+            "text_sentiment_quality_sample": {
+                "status": "warming",
+                "sampled": 0,
+                "included": 0,
+                "top_sources": [],
+                "top_reasons": [],
+            },
+            "local_ai_tools": {
+                "available": False,
+                "status": "warming",
+                "service_available": None,
+                "models": {},
+            },
+            "governance": {
+                "status": "warming",
+                "cleanup_effective": None,
+            },
+        },
+        "cache": {
+            "age_seconds": 0.0,
+            "ttl_seconds": STATUS_CACHE_TTL_SECONDS,
+            "refresh_in_progress": True,
+            "cold_start": True,
+        },
+    }
+    return sanitize_payload(payload)
+
+
 @router.get("/data-collection/status")
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
@@ -1311,7 +1357,8 @@ async def get_data_collection_status(
             "refresh_in_progress": age_seconds > STATUS_CACHE_TTL_SECONDS,
         }
         return result
-    return await _refresh_data_collection_status(include_feature_coverage)
+    _start_data_collection_status_refresh(include_feature_coverage)
+    return _warming_data_collection_status(include_feature_coverage)
 
 
 @router.post("/data-collection/training-governance/refresh")

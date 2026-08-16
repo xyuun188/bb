@@ -376,7 +376,7 @@ def _instrument_to_market(instrument: Mapping[str, Any]) -> dict[str, Any]:
 class OkxPerpetualSdkExchange:
     """Async SDK-backed OKX exchange adapter for USDT perpetual swaps."""
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, *, close_http_after_call: bool = False) -> None:
         self.mode = mode
         self.markets: dict[str, dict[str, Any]] = {}
         self.markets_by_id: dict[str, list[dict[str, Any]]] = {}
@@ -387,6 +387,8 @@ class OkxPerpetualSdkExchange:
         self._market_api: Any | None = None
         self._public_api: Any | None = None
         self._sdk_call_locks: dict[int, asyncio.Lock] = {}
+        self._close_http_after_call = bool(close_http_after_call)
+        self._disposable_http_call_lock = asyncio.Lock()
         self._server_time_lock = threading.Lock()
         self._server_time_offset_ms: int | None = None
         self._server_time_synced_at: float = 0.0
@@ -509,10 +511,7 @@ class OkxPerpetualSdkExchange:
         check_data_code: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        api = api_getter()
-        call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
-
-        def _sync() -> dict[str, Any]:
+        def _sync(api: Any) -> dict[str, Any]:
             method = getattr(api, method_name)
             result = method(**kwargs)
             raise_if_okx_error(
@@ -524,20 +523,56 @@ class OkxPerpetualSdkExchange:
 
         # python-okx reuses a requests Session inside each API object. Concurrent
         # to_thread calls can corrupt that session's mutable cookie state.
+        if self._close_http_after_call:
+            # Dashboard probes are sparse. Serializing those low-volume reads
+            # lets each call own and close its SDK HTTP client without racing a
+            # second call that already captured the same client instance.
+            async with self._disposable_http_call_lock:
+                api = api_getter()
+                try:
+                    return await asyncio.to_thread(_sync, api)
+                finally:
+                    await self._close_sdk_api(api)
+
+        api = api_getter()
+        call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
         async with call_lock:
-            return await asyncio.to_thread(_sync)
+            return await asyncio.to_thread(_sync, api)
 
     async def load_time_difference(self) -> int:
         return 0
 
-    async def close(self) -> None:
-        for api in (self._account_api, self._trade_api, self._market_api, self._public_api):
+    async def _close_sdk_api(self, api: Any) -> None:
+        if api is None:
+            return
+        try:
             closer = getattr(api, "close", None)
             if callable(closer):
-                try:
-                    await asyncio.to_thread(closer)
-                except Exception as exc:
-                    logger.debug("OKX SDK client close failed", error=safe_error_text(exc))
+                await asyncio.to_thread(closer)
+        except Exception as exc:
+            logger.debug("OKX SDK client close failed", error=safe_error_text(exc))
+        finally:
+            for attribute in ("_account_api", "_trade_api", "_market_api", "_public_api"):
+                if getattr(self, attribute) is api:
+                    setattr(self, attribute, None)
+            self._sdk_call_locks.pop(id(api), None)
+
+    async def close(self) -> None:
+        clients = tuple(
+            dict.fromkeys(
+                api
+                for api in (
+                    self._account_api,
+                    self._trade_api,
+                    self._market_api,
+                    self._public_api,
+                )
+                if api is not None
+            )
+        )
+        for api in clients:
+            await self._close_sdk_api(api)
+        self._sdk_call_locks.clear()
 
     def set_sandbox_mode(self, _enabled: bool) -> None:
         return None

@@ -196,10 +196,10 @@ async def _runtime_probe_report(*, include_runtime_probe: bool) -> dict[str, Any
             "status": "skipped",
             "reason": "include_runtime_probe_not_requested",
         }
-    from services.server_monitor_status import collect_platform_runtime_status
+    from services.server_monitor_status import get_cached_platform_runtime_status
 
     try:
-        runtime = await collect_platform_runtime_status()
+        runtime = await get_cached_platform_runtime_status()
     except Exception as exc:
         return {
             "status": "warning",

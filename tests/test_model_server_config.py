@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -160,6 +161,44 @@ async def test_server_monitor_keeps_platform_runtime_when_remote_config_fails(
     assert result["platform_runtime"]["ai_models"][0]["model"] == "qwen3-14b-trade"
     assert result["model_runtime"]["vllm_endpoints"][0]["provider_model"] == "qwen3-14b-trade"
     assert result["model_runtime"]["local_ai_tools"]["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_platform_runtime_status_probe_is_singleflight_and_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def platform_runtime():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {
+            "ai_models": [],
+            "local_ai_tools": {"available": True},
+            "model_tunnels": {"ready": True},
+        }
+
+    monkeypatch.setattr(
+        server_monitor_status,
+        "collect_platform_runtime_status",
+        platform_runtime,
+    )
+    server_monitor_status.clear_server_monitor_cache()
+
+    first, second, third = await asyncio.gather(
+        server_monitor_status._cached_platform_runtime_status(),
+        server_monitor_status._cached_platform_runtime_status(),
+        server_monitor_status._cached_platform_runtime_status(),
+    )
+
+    assert calls == 1
+    assert first["cache"]["status"] == "refreshed"
+    assert second["cache"]["status"] == "fresh_after_wait"
+    assert third["cache"]["status"] == "fresh_after_wait"
+    cached = await server_monitor_status._cached_platform_runtime_status()
+    assert calls == 1
+    assert cached["cache"]["status"] == "fresh"
 
 
 @pytest.mark.asyncio

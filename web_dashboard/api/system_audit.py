@@ -66,7 +66,10 @@ from services.phase3_stage_handoff import Phase3StageHandoffService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.production_source_health import ProductionSourceHealthService
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
-from services.server_monitor_status import collect_platform_runtime_status
+from services.server_monitor_status import (
+    collect_platform_runtime_status,
+    get_cached_platform_runtime_status,
+)
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
 )
@@ -83,6 +86,7 @@ from web_dashboard.api.text_sanitize import sanitize_payload
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+_DEFAULT_PLATFORM_RUNTIME_PROVIDER = collect_platform_runtime_status
 _skip_okx_daily_reconciliation_latest: ContextVar[bool] = ContextVar(
     "skip_okx_daily_reconciliation_latest",
     default=False,
@@ -3597,10 +3601,18 @@ def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
         return
 
 
+async def _audit_platform_runtime_status() -> dict[str, Any]:
+    """Use the shared probe cache while preserving test/provider overrides."""
+
+    if collect_platform_runtime_status is not _DEFAULT_PLATFORM_RUNTIME_PROVIDER:
+        return await collect_platform_runtime_status()
+    return await get_cached_platform_runtime_status()
+
+
 async def _model_training_audit() -> dict[str, Any]:
     runtime_task = asyncio.create_task(
         asyncio.wait_for(
-            collect_platform_runtime_status(),
+            _audit_platform_runtime_status(),
             timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS,
         )
     )

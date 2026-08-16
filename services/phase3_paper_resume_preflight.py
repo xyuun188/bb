@@ -16,7 +16,7 @@ from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.okx_integrity_gate import partition_okx_integrity_issues
 from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
 from services.phase3_model_server_readiness import Phase3ModelServerReadinessAuditService
-from services.server_monitor_status import collect_platform_runtime_status
+from services.server_monitor_status import get_cached_platform_runtime_status
 
 DEFAULT_OKX_LOOKBACK_HOURS = 24
 DEFAULT_OKX_LIMIT = 120
@@ -559,7 +559,7 @@ class Phase3PaperResumePreflightService:
             self._collect(
                 "platform_runtime",
                 self.platform_runtime_provider,
-                collect_platform_runtime_status,
+                get_cached_platform_runtime_status,
             ),
             self._collect(
                 "platform_server",

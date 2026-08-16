@@ -501,6 +501,60 @@ def _adaptive_training_worker_count() -> int:
     return max(min(int(math.sqrt(_available_cpu_count())), 2), 1)
 
 
+def _local_ml_training_cadence(
+    *,
+    previous_decision_group_count: int,
+    new_decision_group_count: int,
+    seconds_since_training: float | None,
+    distribution_drift_detected: bool,
+) -> dict[str, Any]:
+    effective_batch_threshold = max(
+        _LOCAL_ML_PARAMS.batch_decision_group_threshold,
+        int(
+            math.ceil(
+                max(previous_decision_group_count, 0)
+                * _LOCAL_ML_PARAMS.batch_decision_group_growth_fraction
+            )
+        ),
+    )
+    cooldown_elapsed = bool(
+        seconds_since_training is None
+        or seconds_since_training
+        >= _LOCAL_ML_PARAMS.minimum_retraining_interval_seconds
+    )
+    batch_due = bool(
+        cooldown_elapsed and new_decision_group_count >= effective_batch_threshold
+    )
+    interval_due = bool(
+        new_decision_group_count >= _LOCAL_ML_PARAMS.minimum_decision_group_increment
+        and seconds_since_training is not None
+        and seconds_since_training
+        >= _LOCAL_ML_PARAMS.maximum_training_interval_seconds
+    )
+    drift_due = bool(
+        cooldown_elapsed
+        and distribution_drift_detected
+        and new_decision_group_count
+        >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
+    )
+    return {
+        "configured_batch_decision_group_threshold": (
+            _LOCAL_ML_PARAMS.batch_decision_group_threshold
+        ),
+        "batch_decision_group_growth_fraction": (
+            _LOCAL_ML_PARAMS.batch_decision_group_growth_fraction
+        ),
+        "effective_batch_decision_group_threshold": effective_batch_threshold,
+        "minimum_retraining_interval_seconds": (
+            _LOCAL_ML_PARAMS.minimum_retraining_interval_seconds
+        ),
+        "minimum_retraining_interval_elapsed": cooldown_elapsed,
+        "batch_due": batch_due,
+        "interval_due": interval_due,
+        "drift_due": drift_due,
+    }
+
+
 def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float | None:
     if not len(scores):
         return None
@@ -3126,7 +3180,20 @@ class MLSignalService:
                         "ML model metadata is not available.",
                     )
                 )
-                readiness_metrics = _safe_dict(readiness.get("metrics"))
+                cursor_influence = (
+                    _influence_policy(cursor_metadata)
+                    if cursor_metadata
+                    else {"enabled": False}
+                )
+                cursor_readiness = (
+                    build_ml_readiness_report(cursor_metadata, cursor_influence)
+                    if cursor_metadata
+                    else disabled_ml_readiness(
+                        "no_cursor_metadata",
+                        "ML training cursor metadata is not available.",
+                    )
+                )
+                readiness_metrics = _safe_dict(cursor_readiness.get("metrics"))
                 training_data_version = str(
                     readiness_metrics.get("training_data_version") or ""
                 ).strip()
@@ -3140,13 +3207,13 @@ class MLSignalService:
                 training_data_contract_stale = bool(
                     training_data_contract_stale
                     or (
-                        metadata
-                        and metadata.get("feature_contract_version")
+                        cursor_metadata
+                        and cursor_metadata.get("feature_contract_version")
                         != FEATURE_CONTRACT_VERSION
                     )
                     or (
-                        metadata
-                        and metadata.get("multitask_prediction_contract_version")
+                        cursor_metadata
+                        and cursor_metadata.get("multitask_prediction_contract_version")
                         != MULTITASK_PREDICTION_CONTRACT_VERSION
                     )
                 )
@@ -3189,22 +3256,17 @@ class MLSignalService:
                     if last_trained_at is not None
                     else None
                 )
-                batch_due = bool(
-                    new_decision_group_count
-                    >= _LOCAL_ML_PARAMS.batch_decision_group_threshold
+                cadence = _local_ml_training_cadence(
+                    previous_decision_group_count=previous_group_count,
+                    new_decision_group_count=new_decision_group_count,
+                    seconds_since_training=seconds_since_training,
+                    distribution_drift_detected=(
+                        distribution_drift.get("detected") is True
+                    ),
                 )
-                interval_due = bool(
-                    new_decision_group_count
-                    >= _LOCAL_ML_PARAMS.minimum_decision_group_increment
-                    and seconds_since_training is not None
-                    and seconds_since_training
-                    >= _LOCAL_ML_PARAMS.maximum_training_interval_seconds
-                )
-                drift_due = bool(
-                    distribution_drift.get("detected") is True
-                    and new_decision_group_count
-                    >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
-                )
+                batch_due = bool(cadence["batch_due"])
+                interval_due = bool(cadence["interval_due"])
+                drift_due = bool(cadence["drift_due"])
                 trigger_reason = (
                     "forced"
                     if force
@@ -3236,9 +3298,7 @@ class MLSignalService:
                     "completed_mature_decision_group_count": completed_decision_group_count,
                     "last_trained_mature_decision_group_count": previous_group_count,
                     "new_mature_decision_group_count": new_decision_group_count,
-                    "batch_decision_group_threshold": (
-                        _LOCAL_ML_PARAMS.batch_decision_group_threshold
-                    ),
+                    **cadence,
                     "minimum_decision_group_increment": (
                         _LOCAL_ML_PARAMS.minimum_decision_group_increment
                     ),
@@ -4498,7 +4558,8 @@ class MLSignalService:
             "auto_train_enabled": True,
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
             "auto_train_trigger": (
-                "50_new_mature_decision_groups_or_10_after_24h_or_drift_with_10"
+                "5pct_new_mature_decision_groups_min_50_after_6h_or_10_after_24h_"
+                "or_drift_with_10_after_6h"
             ),
             "auto_train_distribution_requirement": (
                 "chronological_purged_holdout_with_minimum_fit_distribution"

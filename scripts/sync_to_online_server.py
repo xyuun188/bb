@@ -93,9 +93,7 @@ SKIP_SUFFIXES = {
     ".7z",
     ".rar",
 }
-SKIP_PATH_PREFIXES = (
-    "docs/superpowers/plans/",
-)
+SKIP_PATH_PREFIXES = ("docs/superpowers/plans/",)
 SKIP_NAME_PARTS = (
     "\u670d\u52a1\u5668\u4fe1\u606f",  # server info
     "\u670d\u52a1\u5668\u8d44\u6599",  # server data
@@ -117,7 +115,6 @@ def _render_dashboard_service(remote_app_dir: str, owner: str) -> str:
 Description=BB Dashboard
 After=network-online.target postgresql.service redis-server.service redis.service bb-model-tunnels.service
 Wants=network-online.target bb-model-tunnels.service
-Requires=bb-model-tunnels.service
 
 [Service]
 Type=simple
@@ -648,10 +645,7 @@ def prune_remote_stale_sources(
 
     expected = {remote_path_for(path, remote_app_dir) for path in files}
     stale: list[str] = []
-    stack = [
-        str(PurePosixPath(remote_app_dir) / root)
-        for root in REMOTE_MANAGED_SOURCE_ROOTS
-    ]
+    stack = [str(PurePosixPath(remote_app_dir) / root) for root in REMOTE_MANAGED_SOURCE_ROOTS]
     while stack:
         remote_dir = stack.pop()
         try:
@@ -791,9 +785,7 @@ def main() -> None:
         try:
             uploaded = upload_files(sftp, files, args.remote_app_dir, dry_run=False)
             removed = (
-                []
-                if args.only
-                else prune_remote_stale_sources(sftp, files, args.remote_app_dir)
+                [] if args.only else prune_remote_stale_sources(sftp, files, args.remote_app_dir)
             )
             if remote_secret_path:
                 upload_runtime_secret(
@@ -888,9 +880,7 @@ def main() -> None:
                 f"systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}; "
                 "fi; "
             )
-            command = (
-                model_tunnel_restart
-                + (
+            command = model_tunnel_restart + (
                 f"systemctl restart {_remote_quote(args.service)} && "
                 f"systemctl restart {_remote_quote(args.dashboard_service)} && "
                 f"{model_readiness_refresh}"
@@ -903,7 +893,6 @@ def main() -> None:
                 'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
                 "sleep 2; "
                 "done; echo dashboard-timeout; exit 7"
-                )
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return

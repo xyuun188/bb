@@ -94,12 +94,19 @@ class OKXExecutor(AbstractExecutor):
     In production mode, real orders are placed.
     """
 
-    def __init__(self, mode: str | None = None, *, load_markets_on_initialize: bool = True) -> None:
+    def __init__(
+        self,
+        mode: str | None = None,
+        *,
+        load_markets_on_initialize: bool = True,
+        close_http_after_call: bool = False,
+    ) -> None:
         self._mode_override = mode  # "paper" or "live", overrides global mode
         self._exchange: Any = None
         self._rate_limiter = TokenBucket(RATE_LIMIT_TOKENS, RATE_LIMIT_TOKENS * 2)
         self._connected = False
         self._load_markets_on_initialize = load_markets_on_initialize
+        self._close_http_after_call = bool(close_http_after_call)
         self._markets_loaded = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
         self._contract_delivery_locks: dict[str, tuple[float, str]] = {}
@@ -115,7 +122,10 @@ class OKXExecutor(AbstractExecutor):
         mode = self.executor_mode
         is_demo = settings.is_okx_demo(mode)
 
-        self._exchange = OkxPerpetualSdkExchange(mode)
+        self._exchange = OkxPerpetualSdkExchange(
+            mode,
+            close_http_after_call=self._close_http_after_call,
+        )
         self._ensure_rest_url()
 
         try:

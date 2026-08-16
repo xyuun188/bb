@@ -1333,9 +1333,13 @@ async def test_data_collection_status_reuses_runtime_snapshot_cache(
     monkeypatch.setattr(data_collection_module, "_status_refresh_locks", {})
 
     first = await data_collection_module.get_data_collection_status(True)
+    task = data_collection_module._status_refresh_tasks[True]
+    await task
     second = await data_collection_module.get_data_collection_status(True)
 
-    assert first["feature"] is True
+    assert first["status"] == "warming"
+    assert first["cache"]["cold_start"] is True
+    assert first["cache"]["refresh_in_progress"] is True
     assert second["feature"] is True
     assert second["cache"]["refresh_in_progress"] is False
     assert calls == 1

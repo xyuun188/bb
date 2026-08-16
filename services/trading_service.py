@@ -143,6 +143,7 @@ from services.ml_signal_service import (
     AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
     AUTO_TRAIN_LEASE_STALE_SECONDS,
     AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
+    LOCAL_ML_TRAINING_SCHEDULER_ID,
     MODEL_TRAINING_STATE_STORE,
     MLSignalService,
 )
@@ -151,6 +152,7 @@ from services.model_contribution_performance import ModelContributionPerformance
 from services.model_training_state import (
     ALL_TRAINABLE_MODEL_IDS,
     LOCAL_AI_TOOL_MODEL_IDS,
+    LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
 )
 from services.okx_order_fact_sync import (
@@ -1063,6 +1065,63 @@ class TradingService:
         except Exception as exc:
             logger.warning(
                 "failed to persist training subprocess timeout state",
+                scheduler_id=scheduler_id,
+                error=safe_error_text(exc, limit=180),
+            )
+        self._reclaim_training_subprocess_lease(
+            store=store,
+            scheduler_id=scheduler_id,
+        )
+
+    @staticmethod
+    def _reclaim_training_subprocess_lease(
+        *,
+        store: ModelTrainingStateStore,
+        scheduler_id: str,
+    ) -> None:
+        cleanup = store.try_acquire_lease(
+            scheduler_id=scheduler_id,
+            stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+        if cleanup.acquired and cleanup.lease is not None:
+            cleanup.lease.release()
+
+    def _record_training_subprocess_failure(
+        self,
+        *,
+        scheduler_id: str,
+        model_ids: tuple[str, ...],
+        error: str,
+    ) -> None:
+        """Close a dead isolated worker's run and reclaim its process-owned lease."""
+
+        store = self._model_training_state()
+        run_id: str | None = None
+        try:
+            payload = store.read()
+            rows = payload.get("models") if isinstance(payload, dict) else {}
+            for model_id in model_ids:
+                row = rows.get(model_id) if isinstance(rows, dict) else None
+                if isinstance(row, dict) and row.get("state") in {"checking", "running"}:
+                    run_id = str(row.get("active_run_id") or "") or None
+                    if run_id:
+                        break
+            if run_id:
+                store.record_exception(
+                    scheduler_id=scheduler_id,
+                    model_ids=model_ids,
+                    run_id=run_id,
+                    error=error,
+                    next_check_at=datetime.now(UTC)
+                    + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+                )
+            self._reclaim_training_subprocess_lease(
+                store=store,
+                scheduler_id=scheduler_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to close dead training subprocess state",
                 scheduler_id=scheduler_id,
                 error=safe_error_text(exc, limit=180),
             )
@@ -9698,7 +9757,7 @@ class TradingService:
             payload = json.loads(result_frame)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            return {
+            result = {
                 "trained": False,
                 "reason": "error",
                 "error": (
@@ -9707,6 +9766,12 @@ class TradingService:
                 ),
                 "training_process_isolated": True,
             }
+            self._record_training_subprocess_failure(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                error=str(result["error"]),
+            )
+            return result
         result = (
             dict(payload)
             if isinstance(payload, dict)
@@ -9730,6 +9795,12 @@ class TradingService:
                         ),
                     ),
                 }
+            )
+        if process.returncode != 0:
+            self._record_training_subprocess_failure(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                error=str(result.get("error") or "isolated local ML training failed"),
             )
         result["training_process_isolated"] = True
         return result

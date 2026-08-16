@@ -63,6 +63,16 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}" in source
 
 
+def test_dashboard_stays_running_while_model_tunnels_recover() -> None:
+    from scripts.sync_to_online_server import _render_dashboard_service
+
+    unit = _render_dashboard_service("/data/bb/app", "bb:bb")
+
+    assert "After=" in unit and "bb-model-tunnels.service" in unit
+    assert "Wants=network-online.target bb-model-tunnels.service" in unit
+    assert "Requires=bb-model-tunnels.service" not in unit
+
+
 def test_sync_to_online_server_requires_okx_network_route() -> None:
     from scripts.sync_to_online_server import _okx_network_probe_command
 
@@ -102,16 +112,15 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     app_dir.mkdir()
     monkeypatch.setattr(sync, "REMOTE_RUNTIME_ENV_PATH", str(runtime_env))
     runtime_env.write_text(
-        "DATABASE_URL=postgresql+asyncpg://runtime\n"
-        "BB_SECURE_SETTINGS_KEY=runtime-key\n",
+        "DATABASE_URL=postgresql+asyncpg://runtime\n" "BB_SECURE_SETTINGS_KEY=runtime-key\n",
         encoding="utf-8",
     )
     app_env = app_dir / ".env"
     app_env.write_text(
         "AI_API_BASE=http://stale-decision-route.example.invalid:31840/v1\n"
         "AI_MODEL=qwen3-32b-trade\n"
-        "AI_MODELS=[{\"model\":\"qwen3-14b-trade\",\"api_base\":"
-        "\"http://stale-model-route.example.invalid:21840/v1\"}]\n"
+        'AI_MODELS=[{"model":"qwen3-14b-trade","api_base":'
+        '"http://stale-model-route.example.invalid:21840/v1"}]\n'
         "LOCAL_AI_TOOLS_API_BASE=http://old-local-ai.example\n"
         "HIGH_RISK_REVIEW_MODEL=old-risk-model\n"
         "DATABASE_URL=postgresql+asyncpg://app\n"
@@ -176,7 +185,7 @@ def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(
     runtime_text = runtime_env.read_text(encoding="utf-8")
     assert "https://online-llm.example/v1" in runtime_text
     assert "deepseek-reasoner" in runtime_text
-    assert "route_mode\":\"online_slow_brain" in runtime_text
+    assert 'route_mode":"online_slow_brain' in runtime_text
     assert "http://127.0.0.1:18003/v1" in runtime_text
     assert "BB-FinQuant-Expert-14B" in runtime_text
 
@@ -372,6 +381,83 @@ def test_start_online_model_tunnels_swallow_short_client_disconnects() -> None:
     assert ForwardHandler._recv_or_empty(socket_obj) == b""
     assert ForwardHandler._sendall_or_closed(socket_obj, b"hello") is False
 
+    class ClosedSSHChannel:
+        def sendall(self, _data: bytes) -> None:
+            raise EOFError
+
+    assert ForwardHandler._sendall_or_closed(ClosedSSHChannel(), b"hello") is False
+
+
+def test_start_online_model_tunnels_bound_ssh_channel_open_time() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeRequest:
+        def settimeout(self, _seconds: float) -> None:
+            return None
+
+        def getpeername(self) -> tuple[str, int]:
+            return ("127.0.0.1", 12345)
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.timeout: float | None = None
+
+        def open_channel(self, *_args, timeout: float | None = None, **_kwargs):
+            self.timeout = timeout
+            return None
+
+    server = object.__new__(tunnels.ForwardServer)
+    server.spec = tunnels.build_default_tunnels()[1]
+    server.ssh_transport = FakeTransport()
+    handler = object.__new__(tunnels.ForwardHandler)
+    handler.server = server
+    handler.request = FakeRequest()
+
+    handler.handle()
+
+    assert server.ssh_transport.timeout == tunnels.FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS
+    assert server.ssh_transport.timeout > tunnels.TUNNEL_HEALTH_TIMEOUT_SECONDS
+    assert server.ssh_transport.timeout <= 30.0
+    assert tunnels.FORWARD_CHANNELS_PER_TRANSPORT <= 10
+
+
+def test_start_online_model_tunnels_close_transport_after_open_timeout() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeRequest:
+        def settimeout(self, _seconds: float) -> None:
+            return None
+
+        def getpeername(self) -> tuple[str, int]:
+            return ("127.0.0.1", 12345)
+
+        def shutdown(self, *_args) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def open_channel(self, *_args, **_kwargs):
+            raise TimeoutError("open timed out")
+
+        def close(self) -> None:
+            self.closed = True
+
+    server = object.__new__(tunnels.ForwardServer)
+    server.spec = tunnels.build_default_tunnels()[1]
+    server.ssh_transport = FakeTransport()
+    handler = object.__new__(tunnels.ForwardHandler)
+    handler.server = server
+    handler.request = FakeRequest()
+
+    handler.handle()
+
+    assert server.ssh_transport.closed is True
+
 
 def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch) -> None:
     from scripts import start_online_model_tunnels as tunnels
@@ -407,18 +493,99 @@ def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch
     monkeypatch.setattr(tunnels, "connect_remote_ssh", connect)
     specs = tunnels.build_default_tunnels()
 
-    opened_clients, transports = tunnels.open_dedicated_transports(specs, object())
+    opened_clients, transport_pools = tunnels.open_dedicated_transports(specs, object())
 
     assert opened_clients == clients
-    assert len(clients) == len(specs) == 4
-    assert len({id(transport) for transport in transports}) == len(specs)
+    assert len(transport_pools) == len(specs) == 4
+    assert len(clients) == 6
+    transports = [transport for pool in transport_pools for transport in pool]
+    assert len({id(transport) for transport in transports}) == len(transports)
     assert all(
-        transport.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS
-        for transport in transports
+        transport.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS for transport in transports
     )
-    assert transports[1] is not transports[0]
-    assert transports[1] is not transports[2]
-    assert transports[1] is not transports[3]
+    assert len(transport_pools[0]) == 1
+    assert len(transport_pools[1]) == 2
+    assert len(transport_pools[2]) == 1
+    assert len(transport_pools[3]) == 2
+
+
+def test_start_online_model_tunnel_pool_replaces_only_failed_transport() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeTransport:
+        def __init__(self, active: bool) -> None:
+            self.active = active
+
+        def is_active(self) -> bool:
+            return self.active
+
+    failed = FakeTransport(active=False)
+    healthy = FakeTransport(active=True)
+    replacement = FakeTransport(active=True)
+    pool = tunnels.TransportPool([failed, healthy], slots_per_transport=1)
+
+    assert pool.inactive_transports() == [failed]
+    assert pool.replace(failed, replacement) is True
+    first = pool.acquire(0)
+    second = pool.acquire(0)
+
+    assert {first, second} == {healthy, replacement}
+    assert pool.acquire(0) is None
+    pool.release(first)
+    assert pool.acquire(0) is first
+
+
+def test_start_online_model_tunnels_recover_failed_transport_in_place(monkeypatch) -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeTransport:
+        def __init__(self, active: bool) -> None:
+            self.active = active
+            self.keepalive: int | None = None
+
+        def is_active(self) -> bool:
+            return self.active
+
+        def set_keepalive(self, seconds: int) -> None:
+            self.keepalive = seconds
+
+    class FakeClient:
+        def __init__(self, transport: FakeTransport) -> None:
+            self.transport = transport
+            self.closed = False
+
+        def get_transport(self) -> FakeTransport:
+            return self.transport
+
+        def close(self) -> None:
+            self.closed = True
+
+    failed = FakeTransport(active=False)
+    healthy = FakeTransport(active=True)
+    old_client = FakeClient(failed)
+    new_client = FakeClient(healthy)
+    server = object.__new__(tunnels.ForwardServer)
+    server.spec = tunnels.build_default_tunnels()[1]
+    server.transport_pool = tunnels.TransportPool([failed], slots_per_transport=1)
+    server.ssh_transports = (failed,)
+    server.ssh_transport = failed
+    clients = [old_client]
+    client_by_transport = {id(failed): old_client}
+    monkeypatch.setattr(tunnels, "connect_remote_ssh", lambda *_args, **_kwargs: new_client)
+
+    failures = tunnels.recover_inactive_transports(
+        [server.spec],
+        [server],
+        clients,
+        client_by_transport,
+        object(),
+    )
+
+    assert failures == []
+    assert old_client.closed is True
+    assert clients == [new_client]
+    assert server.transport_pool.transports == (healthy,)
+    assert healthy.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS
 
 
 def test_start_online_model_tunnels_report_backend_busy_after_consecutive_health_failures() -> None:
@@ -523,7 +690,10 @@ def test_model_server_status_scripts_use_dual_14b_contract() -> None:
 
     for source in (check_source, inspect_source):
         assert "bb-phase3-llm-decision.service" in source or "qwen3-14b-trade.service" in source
-        assert "bb-phase3-llm-risk-review.service" in source or "deepseek-r1-14b-risk.service" in source
+        assert (
+            "bb-phase3-llm-risk-review.service" in source
+            or "deepseek-r1-14b-risk.service" in source
+        )
         assert "qwen3-32b-main.service" in source
         assert "deprecated service" in source.lower()
 

@@ -3025,9 +3025,16 @@ def _trading_service_is_running() -> bool:
 def _make_lightweight_okx_executor(cls: Any, mode: str):
     """Create an OKX executor for balance-only reads without loading market rules."""
     try:
-        return cls(mode=mode, load_markets_on_initialize=False)
+        return cls(
+            mode=mode,
+            load_markets_on_initialize=False,
+            close_http_after_call=True,
+        )
     except TypeError:
-        return cls(mode=mode)
+        try:
+            return cls(mode=mode, load_markets_on_initialize=False)
+        except TypeError:
+            return cls(mode=mode)
 
 
 async def _dashboard_read_only_okx_executor(
@@ -3175,6 +3182,7 @@ async def _warm_dashboard_data_collection_cache() -> None:
 async def shutdown_dashboard_read_clients() -> None:
     global _dashboard_public_rest_client, _dashboard_public_rest_client_factory
     global _dashboard_public_rest_client_lock
+    global _local_ai_tools_status_client
 
     tasks = [
         task
@@ -3210,6 +3218,13 @@ async def shutdown_dashboard_read_clients() -> None:
             await rest_client.close()
         except Exception as exc:
             _log_dashboard_fallback("dashboard public ticker client close failed", exc)
+    local_ai_tools = _local_ai_tools_status_client
+    _local_ai_tools_status_client = None
+    if local_ai_tools is not None:
+        try:
+            await local_ai_tools.close()
+        except Exception as exc:
+            _log_dashboard_fallback("dashboard local AI tools client close failed", exc)
 
 
 def _dashboard_ml_signal_service() -> Any | None:
