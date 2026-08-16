@@ -1,4 +1,4 @@
-"""Train the local ML fee-after-return model from all clean shadow backtests."""
+"""Build a local ML candidate from all clean shadow backtests."""
 
 from __future__ import annotations
 
@@ -6,11 +6,16 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.ml_signal_service import (
+    AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+    AUTO_TRAIN_LEASE_STALE_SECONDS,
+    LOCAL_ML_TRAINING_SCHEDULER_ID,
+    MODEL_TRAINING_STATE_STORE,
     build_training_frame,
     count_shadow_training_rows,
     load_authoritative_trade_training_samples,
@@ -18,6 +23,7 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
+from services.model_training_state import LOCAL_ML_MODEL_IDS
 from services.okx_training_gate import okx_training_refresh_gate
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 
@@ -77,7 +83,7 @@ async def run_training(
     }
 
 
-async def _main() -> None:
+async def _main() -> dict[str, object]:
     parser = argparse.ArgumentParser(description="Train local ML signal model")
     parser.add_argument("--skip-quarantine", action="store_true")
     parser.add_argument(
@@ -91,12 +97,12 @@ async def _main() -> None:
     parser.add_argument(
         "--persist-artifact",
         action="store_true",
-        help="Write the model artifact after an explicit Phase 3 rebuild confirmation.",
+        help="Write a candidate artifact after an explicit Phase 3 rebuild confirmation.",
     )
     parser.add_argument(
         "--confirm-phase3-rebuild",
         action="store_true",
-        help="Required together with --persist-artifact to replace the local ML artifact.",
+        help="Required together with --persist-artifact to build a governed candidate.",
     )
     args = parser.parse_args()
 
@@ -122,7 +128,95 @@ async def _main() -> None:
             indent=2,
         )
     )
+    return result
+
+
+def main() -> int:
+    lease_attempt = MODEL_TRAINING_STATE_STORE.try_acquire_lease(
+        scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+        stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+    )
+    if not lease_attempt.acquired or lease_attempt.lease is None:
+        print(
+            json.dumps(
+                {
+                    "trained": False,
+                    "reason": "local_ml_training_already_running",
+                    "lease_reason": lease_attempt.reason,
+                    "recovered_stale_lease": lease_attempt.recovered_stale_lease,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 3
+
+    lease = lease_attempt.lease
+    run_id = lease.run_id
+    next_check_at = datetime.now(UTC) + timedelta(
+        seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS
+    )
+    try:
+        MODEL_TRAINING_STATE_STORE.heartbeat(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+        )
+        MODEL_TRAINING_STATE_STORE.record_check(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            run_id=run_id,
+            force=True,
+        )
+        MODEL_TRAINING_STATE_STORE.start_run(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            run_id=run_id,
+            trigger_reason="manual_cli",
+            timeout_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+        result = asyncio.run(_main())
+        metadata = result.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        MODEL_TRAINING_STATE_STORE.finish_check(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            run_id=run_id,
+            result={
+                "trained": bool(metadata.get("artifact_persisted")),
+                "reason": (
+                    "manual_training_completed"
+                    if metadata.get("artifact_persisted")
+                    else "manual_preflight_completed"
+                ),
+                "artifact_persisted": bool(metadata.get("artifact_persisted")),
+                "completed_shadow_sample_count": result.get(
+                    "completed_shadow_sample_count"
+                ),
+                "completed_trade_sample_count": result.get(
+                    "authoritative_trade_sample_count"
+                ),
+                "last_trained_completed_shadow_sample_count": metadata.get(
+                    "last_trained_completed_shadow_sample_count"
+                ),
+                "last_trained_completed_trade_sample_count": metadata.get(
+                    "last_trained_completed_trade_sample_count"
+                ),
+            },
+            next_check_at=next_check_at,
+        )
+        return 0
+    except BaseException as exc:
+        MODEL_TRAINING_STATE_STORE.record_exception(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            run_id=run_id,
+            error=f"{type(exc).__name__}: {str(exc)[:900]}",
+            next_check_at=next_check_at,
+        )
+        raise
+    finally:
+        lease.release()
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    raise SystemExit(main())

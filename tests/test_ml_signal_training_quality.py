@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,9 @@ from services.profit_supervision import (
 )
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_objective import (
+    HOLDOUT_REALIZED_RETURN_BASIS,
+    HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+    HOLDOUT_SCORE_BASIS,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
@@ -89,6 +93,33 @@ def test_loaded_local_ml_estimators_disable_parallel_single_row_inference() -> N
     assert estimator.n_jobs == 1
 
 
+def test_local_ml_training_uses_bounded_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ml_signal_module.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(16)),
+        raising=False,
+    )
+    classifier = ml_signal_module._make_classifier(
+        pd.Series(([0, 1] * 150), dtype=int)
+    )
+    regressor = ml_signal_module._make_regressor(
+        pd.Series(np.linspace(-1.0, 1.0, 300))
+    )
+
+    assert ml_signal_module._adaptive_training_worker_count() == 2
+    assert classifier.named_steps["model"].n_jobs == 2
+    assert regressor.named_steps["model"].n_jobs == 2
+
+    ml_signal_module._configure_single_row_inference(
+        {"classifier": classifier, "regressor": regressor}
+    )
+    assert classifier.named_steps["model"].n_jobs == 1
+    assert regressor.named_steps["model"].n_jobs == 1
+
+
 def _with_return_objective(metadata: dict) -> dict:
     metadata = dict(metadata)
     metadata.setdefault("objective_name", RETURN_OBJECTIVE_NAME)
@@ -98,6 +129,19 @@ def _with_return_objective(metadata: dict) -> dict:
     metadata.setdefault(
         "training_cost_policy",
         "separated_market_opportunity_and_execution_cost_tasks",
+    )
+    metadata.setdefault(
+        "holdout_return_metric_contract",
+        {
+            "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+            "realized_return_basis": HOLDOUT_REALIZED_RETURN_BASIS,
+            "score_basis": HOLDOUT_SCORE_BASIS,
+            "tail_loss_basis": "net_after_counterfactual_execution_cost",
+            "source": "test_artifact_holdout",
+            "observation_window": "test_holdout_window",
+            "sample_count": int(metadata.get("test_count") or 1),
+            "generated_at": "2026-08-16T00:00:00+00:00",
+        },
     )
     metadata.setdefault("profit_supervision_version", PROFIT_SUPERVISION_VERSION)
     metadata.setdefault("feature_contract_version", FEATURE_CONTRACT_VERSION)
@@ -227,6 +271,7 @@ def _with_return_objective(metadata: dict) -> dict:
     metadata.setdefault(
         "walk_forward_report",
         {
+            "version": ml_signal_module.WALK_FORWARD_REPORT_VERSION,
             "status": "complete",
             "decision_group_disjoint": True,
             "chronological_label_disjoint": True,
@@ -878,6 +923,47 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
             assert isinstance(summary["top_quality_reasons"], list)
 
 
+def test_train_from_frame_holdout_quality_metrics_use_fee_after_returns() -> None:
+    frame = _training_frame(120)
+    for side in ("long", "short"):
+        frame[f"{side}_return_pct"] = 0.20
+        frame[f"{side}_execution_cost_pct"] = 0.30
+
+    metadata = train_from_frame(
+        frame,
+        completed_sample_count=120,
+        persist_artifact=False,
+    )
+
+    contract = metadata["holdout_return_metric_contract"]
+    assert contract["version"] == HOLDOUT_RETURN_METRIC_CONTRACT_VERSION
+    assert contract["realized_return_basis"] == HOLDOUT_REALIZED_RETURN_BASIS
+    assert contract["score_basis"] == HOLDOUT_SCORE_BASIS
+    for side in ("long", "short"):
+        metrics = metadata["metrics"]
+        assert metrics[f"top_{side}_avg_return_pct"] == pytest.approx(-0.10)
+        assert metrics[f"bottom_{side}_avg_return_pct"] == pytest.approx(-0.10)
+        assert metrics[f"top_{side}_median_return_pct"] == pytest.approx(-0.10)
+        assert metrics[f"top_{side}_return_lcb_pct"] == pytest.approx(-0.10)
+        assert metrics[f"top_{side}_profit_factor"] == pytest.approx(0.0)
+        assert metrics[f"top_{side}_cvar_10_pct"] == pytest.approx(-0.10)
+        for bucket in ("top", "bottom"):
+            diagnostic = metadata["score_bucket_diagnostics"][side][bucket]
+            assert diagnostic["avg_return_pct"] == pytest.approx(-0.10)
+            assert diagnostic["return_basis"] == HOLDOUT_REALIZED_RETURN_BASIS
+
+
+def test_ml_readiness_rejects_unversioned_holdout_return_metrics() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    metadata.pop("holdout_return_metric_contract")
+
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+
+    codes = {item["code"] for item in readiness["blocking_reasons"]}
+    assert "artifact_holdout_return_metric_contract_incompatible" in codes
+    assert readiness["live_ml_ready"] is False
+
+
 def test_training_data_fingerprint_is_order_independent_and_content_bound() -> None:
     frame = _training_frame(12)
     shuffled = frame.sample(frac=1.0, random_state=7).reset_index(drop=True)
@@ -946,7 +1032,14 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
     report = ml_signal_module._walk_forward_return_report(pd.DataFrame(rows))
 
     assert report["status"] == "complete"
+    assert report["version"] == "2026-08-16.expanding-decision-group-walk-forward.v2"
     assert report["chronological_label_disjoint"] is True
+    assert report["initial_training_fraction"] == pytest.approx(0.20)
+    assert all(
+        fold["training_decision_group_count"]
+        >= report["minimum_initial_training_decision_group_count"]
+        for fold in report["folds"]
+    )
     assert any(fold["purged_training_decision_group_count"] > 0 for fold in report["folds"])
     assert all(
         fold["training_label_end"] < fold["validation_decision_start"]
@@ -1462,6 +1555,88 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
     assert result["metadata"] == {"artifact_persisted": True}
 
 
+def test_train_ml_signal_cli_uses_auto_training_singleflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class Lease:
+        run_id = "manual-run"
+
+        def release(self) -> None:
+            calls.append(("release", {}))
+
+    class Store:
+        def try_acquire_lease(self, **kwargs: object) -> SimpleNamespace:
+            calls.append(("acquire", kwargs))
+            return SimpleNamespace(
+                acquired=True,
+                lease=Lease(),
+                reason="acquired",
+                recovered_stale_lease=False,
+            )
+
+        def heartbeat(self, **kwargs: object) -> None:
+            calls.append(("heartbeat", kwargs))
+
+        def record_check(self, **kwargs: object) -> None:
+            calls.append(("check", kwargs))
+
+        def start_run(self, **kwargs: object) -> None:
+            calls.append(("start", kwargs))
+
+        def finish_check(self, **kwargs: object) -> None:
+            calls.append(("finish", kwargs))
+
+        def record_exception(self, **kwargs: object) -> None:
+            calls.append(("error", kwargs))
+
+    async def completed_main() -> dict[str, object]:
+        return {
+            "metadata": {
+                "artifact_persisted": True,
+                "last_trained_completed_shadow_sample_count": 120,
+            },
+            "completed_shadow_sample_count": 120,
+            "authoritative_trade_sample_count": 8,
+        }
+
+    monkeypatch.setattr(train_ml_signal_script, "MODEL_TRAINING_STATE_STORE", Store())
+    monkeypatch.setattr(train_ml_signal_script, "_main", completed_main)
+
+    assert train_ml_signal_script.main() == 0
+    assert [name for name, _payload in calls] == [
+        "acquire",
+        "heartbeat",
+        "check",
+        "start",
+        "finish",
+        "release",
+    ]
+    assert calls[0][1]["scheduler_id"] == "local_ml_auto_train"
+    assert calls[-2][1]["result"]["trained"] is True
+
+
+def test_train_ml_signal_cli_refuses_overlapping_training(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = SimpleNamespace(
+        try_acquire_lease=lambda **_kwargs: SimpleNamespace(
+            acquired=False,
+            lease=None,
+            reason="lease_held",
+            recovered_stale_lease=False,
+        )
+    )
+    monkeypatch.setattr(train_ml_signal_script, "MODEL_TRAINING_STATE_STORE", store)
+
+    assert train_ml_signal_script.main() == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "local_ml_training_already_running"
+    assert payload["lease_reason"] == "lease_held"
+
+
 @pytest.mark.asyncio
 async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
     monkeypatch: pytest.MonkeyPatch,
@@ -1595,6 +1770,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["live_ml_ready"] is False
+    assert result["candidate_readiness"] == result["readiness"]
+    assert result["preflight_candidate_readiness"]["live_ml_ready"] is False
     assert result["live_ml_ready"] is False
     assert result["artifact_activation_stage"] == "canary"
     assert result["paper_canary_authorized"] is True
@@ -1867,6 +2044,8 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
     assert result["artifact_persisted"] is True
     assert result["candidate"]["artifact_persisted"] is False
     assert result["candidate_readiness"]["live_ml_ready"] is True
+    assert result["candidate_readiness"] == result["readiness"]
+    assert "preflight_candidate_readiness" in result
     assert result["live_ml_ready"] is True
     assert result["artifact_activation_stage"] == "active"
     assert result["live_enabled_sides"] == ["long", "short"]
@@ -2357,6 +2536,44 @@ def test_ml_signal_predict_uses_direct_regressor_not_win_probability_calibration
     assert primary["best_side"] == "short"
     assert distributions["long"]["raw_expected_return_pct"] == pytest.approx(-9.0)
     assert distributions["short"]["raw_expected_return_pct"] == pytest.approx(9.0)
+
+
+def test_ml_signal_predict_selects_side_by_fee_after_return() -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    service = MLSignalService()
+    service._bundle = {
+        "metadata": metadata,
+        "long_classifier": _Classifier(0.7),
+        "short_classifier": _Classifier(0.7),
+        "long_tail_classifier": _Classifier(0.0),
+        "short_tail_classifier": _Classifier(0.0),
+        "long_regressor": _Regressor(0.50),
+        "short_regressor": _Regressor(0.30),
+        "long_cost_regressor": _Regressor(0.60),
+        "short_cost_regressor": _Regressor(0.05),
+        "feature_keys": FEATURE_KEYS,
+    }
+    service._ensure_loaded = lambda: None  # type: ignore[method-assign]
+
+    prediction = service.predict(
+        {"current_price": 100.0, "spread_pct": 0.01},
+        horizons=(30,),
+    )
+    primary = prediction["predictions"][0]
+
+    assert primary["return_distribution_contract"]["long"][
+        "raw_expected_return_pct"
+    ] == pytest.approx(0.50)
+    assert primary["best_side"] == "short"
+    assert primary["multitask_prediction"]["long"][
+        "expected_net_return_pct"
+    ] == pytest.approx(-0.10)
+    assert primary["multitask_prediction"]["short"][
+        "expected_net_return_pct"
+    ] == pytest.approx(0.25)
+    assert primary["fee_after_side_selection"]["return_semantics"] == (
+        "risk_adjusted_net_after_counterfactual_execution_cost"
+    )
 
 
 def test_ml_signal_predict_penalizes_excess_tail_loss_probability() -> None:

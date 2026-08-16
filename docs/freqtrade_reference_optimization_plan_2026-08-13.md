@@ -422,7 +422,7 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 ### 15.1 已实施并通过线上验证
 
 - 专家输出不再使用固定 320 tokens；按任务类型设置输出预算，并保留超时、解析失败和降级的显式证据。输出预算的调整没有放宽专家总超时，分析时效仍由独立专家窗口、轮次预算和 watchdog 控制。
-- 市场分析、持仓复核和自动训练已拆分调度；训练进程使用独立子进程、单 worker、低优先级和最长租约，不再占用交易数据库连接池。
+- 市场分析、持仓复核和自动训练已拆分调度；训练进程使用独立子进程、低优先级和最长租约，不再占用交易数据库连接池。树模型拟合按 CPU affinity 使用最多 2 个 worker，在线单条推理仍强制 `n_jobs=1`，在缩短重训时间的同时为交易服务保留容量。
 - funding、open interest 等慢衍生品请求已增加单飞、短缓存和失败退避；超时任务不会立即被重复拉起，partial 数据继续明确标记为不完整。
 - 候选池已增加轮换、覆盖欠账和队尾重排；同一币种可以因新行情重新入选，但不会因失败或冷却长期挤占全部分析名额。
 - OKX 成交、订单、仓位结算、手续费、资金费和权威训练结果已统一接入事实闭环；不完整生命周期不会伪装成完整训练样本。
@@ -461,3 +461,16 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 - YB 历史仓位已按 OKX 权威仓位历史的 `realizedPnl/pnlRatio/leverage` 复原历史合约名义价值：约 `819.432 USDT`，不再使用错误的 `81.9432 USDT`；费后收益约为 `-29.92197%`，名义价值错配 0 条、权威来源冲突 0 条。资金费仍计入训练和持仓退出风险预算，未将资金费收益当作入场 alpha。
 - 使用修复后数据生成的当前质量报告中，short 高分组费后平均收益约 `0.0374%`、收益 LCB `-0.0061%`、Profit Factor `1.4953`，而低分组约 `0.8418%`；因此 short 继续被 `short_top_return_not_above_bottom`、`short_top_return_lcb_not_positive` 和 walk-forward 稳定性门禁阻止，不能以“增加开仓”为目的放宽门禁。`live_ml_ready=false` 与 `live_routing_enabled=false` 保持不变。
 - 线上仍可能看到 OKX 行情 partial、保护单拉取超时或缓存余额等 warning；复核显示这些请求均有明确降级/缓存路径，覆盖、专家、保护单和交易合同仍通过。未配置实盘凭据时访问 live 余额会返回“凭据未配置”，这是 live 模式权限状态，不影响当前 paper 模式，也不能被当作 paper 交易服务故障。
+
+### 15.5 2026-08-16 费后训练合同与 walk-forward v2 复核
+
+- Local ML 的留出集排序、top/bottom 收益、Profit Factor、LCB、CVaR、最大回撤以及运行时 long/short 方向竞争已统一为 `gross_market_return - counterfactual_execution_cost`。合同版本为 `2026-08-16.fee-after-holdout-metrics.v1`；缺少该合同的旧产物不得通过生产 readiness，不能再用毛收益指标冒充费后证据。
+- walk-forward 已升级为 `2026-08-16.expanding-decision-group-walk-forward.v2`。v1 首折曾仅用 1 个决策组训练、用 3625 组验证，不能代表可用的时间序列泛化；v2 预留至少 20% 初始训练决策组，并使用按标签可用时间排序的查询。线上最新 5 折训练组数为 `3635/6560/9463/12312/15148`，各折继续保持决策组和标签时间隔离。
+- 手工 Local ML 训练与自动训练现共用 `local_ml_auto_train` 跨进程租约；持久化在线训练统一经过 fit、candidate、champion compare、reject/promote 全生命周期。已清理一次迁移后手工训练与自动训练重叠，保留先启动进程并终止后启动进程；后续线上训练只有一个进程和一个租约。
+- 在线训练 SSH 默认上限已提高到 7200 秒，远端 `timeout` 会先于 SSH 客户端终止；在线入口同时解析带协议前缀的 JSON 业务结果。退出码为 0 但 `trained=false`、缺失结果帧或 JSON 损坏都会判为失败，不再把业务失败记成成功。
+- 自动训练结果现明确区分 `preflight_candidate_readiness` 与持久化后的 `candidate_readiness`。最终候选状态不再显示 dry-run 产物缺少持久化指纹所造成的 `artifact_quality_fingerprint_mismatch` 误导告警。
+- 最新线上 challenger `20260816T131531951968Z-86e19f51` 完成约 42 分钟训练后被正确拒绝，继续保留 champion `20260813T145130254885Z-10c06715`。拒绝原因为 `candidate_primary_fee_after_metrics_not_improved`、`candidate_cvar_materially_worsened` 和 `candidate_max_drawdown_materially_worsened`，不是训练超时或状态机失败。
+- 最新 v2 样本外结果仍不满足收益门禁：long 平均费后收益 `-0.2191%`、LCB `-0.3233%`、PF `0.4362`、CVaR `-2.0644%`、最大回撤 `46.44%`；short 平均费后收益 `-0.1894%`、LCB `-0.3627%`、PF `0.6544`、CVaR `-2.7256%`、最大回撤 `60.40%`。因此没有晋升，也没有解除保护。
+- 标签方向复核未发现 short 正负号错误：long/short 毛收益严格互为相反数。真实限制来自非平稳性和周期混合：`horizon_minutes` 特征重要性约 24.7%，5/15 分钟样本更多进入高分组，240 分钟样本更多进入低分组；short 在 trending 阶段平均收益约 `0.3602%`、PF `1.845`，在 ranging 阶段平均收益约 `-0.2963%`、PF `0.467`。后续应在新增干净样本上改进周期与市场阶段建模，不能强制晋升当前 challenger。
+- 部署后在线运行时验证：16 核服务器的训练 worker 计算结果为 2；当前加载的 12 个分类/回归估计器推理均为 `n_jobs=1`；candidate 文件不存在、训练 lease 为空、没有训练进程。7 个模型状态全部为 `succeeded`、`active_run_id=null`、`last_error=null`、`retry_count=0`，本次部署没有重复启动训练。
+- 同次线上复核中交易、Dashboard、模型隧道均为 `active/running` 且 `NRestarts=0`；OKX 日对账 `can_open_new_entries=true`、`can_refresh_training=true`、关键问题 0、人工复核 0。10 个开放仓位对应 12 个保护单，缺失、孤儿、数量覆盖不一致、无效单和 repair blocker 均为 0。

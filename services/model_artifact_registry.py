@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
-from services.ml_training_contract import decision_group_partition_errors
+from services.ml_training_contract import (
+    WALK_FORWARD_REPORT_VERSION,
+    decision_group_partition_errors,
+)
+from services.return_objective import holdout_return_metric_contract_errors
 
 ARTIFACT_REGISTRY_VERSION = "2026-07-24.v3"
 ARTIFACT_ACTIVATION_MANIFEST_VERSION = "2026-07-24.v2"
@@ -461,6 +465,14 @@ class ModelArtifactRegistry:
             or replay_manifest.get("validation_and_test_resampling") is not False
         ):
             raise ValueError("replay_weight_manifest is incomplete")
+        holdout_metric_errors = holdout_return_metric_contract_errors(
+            metadata.get("holdout_return_metric_contract")
+        )
+        if holdout_metric_errors:
+            raise ValueError(
+                "holdout_return_metric_contract is incomplete: "
+                + ", ".join(holdout_metric_errors)
+            )
         sample_sources = metadata.get("training_sample_sources")
         if not isinstance(sample_sources, dict) or any(
             int(sample_sources.get(source) or 0) < 0
@@ -493,7 +505,8 @@ class ModelArtifactRegistry:
             )
         walk_forward = metadata.get("walk_forward_report")
         if not isinstance(walk_forward, dict) or (
-            walk_forward.get("status") != "complete"
+            walk_forward.get("version") != WALK_FORWARD_REPORT_VERSION
+            or walk_forward.get("status") != "complete"
             or walk_forward.get("decision_group_disjoint") is not True
             or walk_forward.get("chronological_label_disjoint") is not True
             or walk_forward.get("model_refit_per_fold") is not True

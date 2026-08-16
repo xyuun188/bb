@@ -3,12 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from services.ml_training_contract import decision_group_partition_errors
+from services.ml_training_contract import (
+    WALK_FORWARD_REPORT_VERSION,
+    decision_group_partition_errors,
+)
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
+    HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
+    holdout_return_metric_contract_errors,
 )
 from services.training_data_quality import (
     DATA_QUALITY_VERSION,
@@ -315,7 +320,8 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
         )
     walk_forward = _safe_dict(metadata.get("walk_forward_report"))
     if (
-        walk_forward.get("status") != "complete"
+        walk_forward.get("version") != WALK_FORWARD_REPORT_VERSION
+        or walk_forward.get("status") != "complete"
         or walk_forward.get("decision_group_disjoint") is not True
         or walk_forward.get("chronological_label_disjoint") is not True
         or walk_forward.get("model_refit_per_fold") is not True
@@ -561,6 +567,9 @@ def build_ml_readiness_report(
     actual_trade_profiles = _safe_dict(actual_trade_calibration.get("profiles"))
     tail_loss_policy = _safe_dict(metadata.get("tail_loss_policy"))
     tail_loss_scales = _safe_dict(metadata.get("tail_loss_scale_pct"))
+    holdout_return_metric_contract = _safe_dict(
+        metadata.get("holdout_return_metric_contract")
+    )
 
     global_blockers: list[dict[str, Any]] = [
         *_market_fact_contract_blockers(metadata),
@@ -591,6 +600,18 @@ def build_ml_readiness_report(
                 "模型产物没有把市场机会与执行成本分开建模。",
                 actual=training_cost_policy or "missing",
                 required="separated_market_opportunity_and_execution_cost_tasks",
+            )
+        )
+    holdout_metric_errors = holdout_return_metric_contract_errors(
+        holdout_return_metric_contract
+    )
+    if holdout_metric_errors:
+        global_blockers.append(
+            _reason(
+                "artifact_holdout_return_metric_contract_incompatible",
+                "模型产物的留出集收益指标不是经过合同验证的费后净收益口径。",
+                actual=holdout_metric_errors,
+                required=HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
             )
         )
     if (
@@ -823,6 +844,12 @@ def build_ml_readiness_report(
             "required_label_version": RETURN_LABEL_VERSION,
             "profit_supervision_version": profit_supervision_version,
             "required_profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+            "holdout_return_metric_contract_version": (
+                holdout_return_metric_contract.get("version")
+            ),
+            "required_holdout_return_metric_contract_version": (
+                HOLDOUT_RETURN_METRIC_CONTRACT_VERSION
+            ),
         },
     }
 

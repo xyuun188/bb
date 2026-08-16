@@ -17,10 +17,8 @@ if str(ROOT) not in sys.path:
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db  # noqa: E402
-from services.ml_signal_service import (  # noqa: E402
-    LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
-    MLSignalService,
-)
+from services.ml_signal_service import MLSignalService  # noqa: E402
+from services.ml_training_contract import LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX  # noqa: E402
 
 
 async def run_once(

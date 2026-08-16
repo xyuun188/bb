@@ -11,6 +11,8 @@ import asyncio
 import hashlib
 import json
 import math
+import os
+from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,6 +46,7 @@ from services.ml_training_contract import (
     MIN_TRAINING_DECISION_GROUP_COUNT,
     MIN_TRAINING_SAMPLE_COUNT,
     RANDOM_FOREST_MIN_SAMPLES_LEAF,
+    WALK_FORWARD_REPORT_VERSION,
     decision_group_partition_errors,
 )
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
@@ -65,11 +68,15 @@ from services.profit_supervision import (
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.return_objective import (
     COST_MODEL_VERSION,
+    HOLDOUT_REALIZED_RETURN_BASIS,
+    HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+    HOLDOUT_SCORE_BASIS,
     RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
     RETURN_OBJECTIVE_VERSION,
+    holdout_return_metric_contract_errors,
     return_distribution_summary,
     risk_adjusted_expected_return,
     standardized_return_distribution,
@@ -101,7 +108,6 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     Path(settings.data_dir) / "model_training_scheduler_state.json"
 )
 LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
-LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX = "BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
@@ -361,7 +367,7 @@ def _make_classifier(y: pd.Series) -> Pipeline:
             min_samples_leaf=RANDOM_FOREST_MIN_SAMPLES_LEAF,
             class_weight="balanced_subsample",
             random_state=42,
-            n_jobs=1,
+            n_jobs=_adaptive_training_worker_count(),
         )
     return Pipeline(
         [
@@ -382,7 +388,7 @@ def _make_regressor(y: pd.Series) -> Pipeline:
             max_depth=8,
             min_samples_leaf=RANDOM_FOREST_MIN_SAMPLES_LEAF,
             random_state=42,
-            n_jobs=1,
+            n_jobs=_adaptive_training_worker_count(),
         )
     return Pipeline(
         [
@@ -462,7 +468,7 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 
 
 def _bucket_return_summary(
-    y_return: pd.Series,
+    net_returns: pd.Series,
     scores: np.ndarray,
     *,
     top: bool,
@@ -477,9 +483,22 @@ def _bucket_return_summary(
     order = np.argsort(scores)
     idx = order[-count:] if top else order[:count]
     return return_distribution_summary(
-        pd.Series(y_return).iloc[idx].astype(float).tolist(),
+        pd.Series(net_returns).iloc[idx].astype(float).tolist(),
         tail_loss_threshold_pct=tail_loss_threshold_pct,
     )
+
+
+def _available_cpu_count() -> int:
+    try:
+        return max(len(os.sched_getaffinity(0)), 1)
+    except (AttributeError, OSError):
+        return max(int(os.cpu_count() or 1), 1)
+
+
+def _adaptive_training_worker_count() -> int:
+    """Use bounded tree parallelism while reserving capacity for live services."""
+
+    return max(min(int(math.sqrt(_available_cpu_count())), 2), 1)
 
 
 def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float | None:
@@ -628,6 +647,30 @@ def _multitask_side_prediction(
     }
 
 
+def _fee_after_prediction_objective(
+    prediction: dict[str, Any],
+    *,
+    tail_loss_scale_pct: float,
+) -> dict[str, float]:
+    expected = _safe_float(prediction.get("expected_net_return_pct"), float("nan"))
+    lower = _safe_float(prediction.get("return_q10"), float("nan"))
+    tail_probability = _safe_float(prediction.get("tail_loss_probability"), 0.0)
+    if not all(math.isfinite(value) for value in (expected, lower, tail_probability)):
+        return {
+            "expected_net_return_pct": float("nan"),
+            "lower_quantile_net_return_pct": float("nan"),
+            "uncertainty_penalty_pct": float("nan"),
+            "tail_loss_penalty_pct": float("nan"),
+            "objective_net_return_pct": float("nan"),
+        }
+    return risk_adjusted_expected_return(
+        expected_return_pct=expected,
+        lower_quantile_return_pct=min(lower, expected),
+        tail_loss_probability=tail_probability,
+        tail_loss_scale_pct=tail_loss_scale_pct,
+    )
+
+
 def _actual_calibration_ready(profile: dict[str, Any]) -> bool:
     realized = _safe_dict(profile.get(PROFIT_TRAINING_TARGET))
     slippage = _safe_dict(profile.get("slippage_pct"))
@@ -665,20 +708,33 @@ def _distribution_ready_at(
 
 
 def _risk_adjusted_expected_scores(
-    distribution: dict[str, np.ndarray],
+    market_distribution: dict[str, np.ndarray],
+    cost_distribution: dict[str, np.ndarray],
     tail_loss_scores: np.ndarray,
     *,
     tail_loss_scale_pct: float,
 ) -> np.ndarray:
+    gross_expected = np.asarray(market_distribution["expected"], dtype=float)
+    gross_lower = np.asarray(market_distribution["lower_quantile"], dtype=float)
+    cost_expected = np.maximum(
+        np.asarray(cost_distribution["expected"], dtype=float),
+        0.0,
+    )
+    cost_upper = np.maximum(
+        np.asarray(cost_distribution["upper_quantile"], dtype=float),
+        cost_expected,
+    )
+    expected_net = gross_expected - cost_expected
+    lower_net = np.minimum(gross_lower - cost_upper, expected_net)
     return np.asarray(
         [
             risk_adjusted_expected_return(
-                expected_return_pct=float(distribution["expected"][index]),
-                lower_quantile_return_pct=float(distribution["lower_quantile"][index]),
+                expected_return_pct=float(expected_net[index]),
+                lower_quantile_return_pct=float(lower_net[index]),
                 tail_loss_probability=float(tail_loss_scores[index]),
                 tail_loss_scale_pct=tail_loss_scale_pct,
             )["objective_net_return_pct"]
-            for index in range(len(distribution["expected"]))
+            for index in range(len(expected_net))
         ],
         dtype=float,
     )
@@ -718,6 +774,14 @@ def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any
         hard_reasons.append("artifact objective/label version is not fee-after-return v1")
     if metadata.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
         hard_reasons.append("artifact separated profit supervision contract is missing")
+    metric_contract_errors = holdout_return_metric_contract_errors(
+        metadata.get("holdout_return_metric_contract")
+    )
+    if metric_contract_errors:
+        hard_reasons.append(
+            "artifact holdout return metrics are not verified fee-after metrics: "
+            + ",".join(metric_contract_errors)
+        )
     calibration = _safe_dict(metadata.get("actual_trade_calibration"))
     profiles = _safe_dict(calibration.get("profiles"))
     global_profile = _safe_dict(profiles.get(f"*|{side}"))
@@ -1656,7 +1720,7 @@ def _walk_forward_return_report(
 ) -> dict[str, Any]:
     ordered = _chronological_frame(frame)
     groups, group_bounds = _decision_group_availability(ordered)
-    version = "2026-07-15.expanding-decision-group-walk-forward.v1"
+    version = WALK_FORWARD_REPORT_VERSION
     if len(groups) <= 1:
         return {
             "version": version,
@@ -1666,21 +1730,34 @@ def _walk_forward_return_report(
             "chronological_label_disjoint": False,
             "model_refit_per_fold": True,
         }
-    validation_candidates = [
-        group
-        for group in groups
-        if any(
-            group_bounds[prior]["end"] < group_bounds[group]["decision_start"]
-            for prior in groups
-            if group_bounds[prior]["decision_start"] < group_bounds[group]["decision_start"]
-        )
-    ]
+    minimum_initial_training_group_count = max(
+        MIN_TRAINING_DECISION_GROUP_COUNT,
+        int(math.ceil(len(groups) * 0.20)),
+    )
+    ordered_group_end_times = sorted(group_bounds[group]["end"] for group in groups)
+    first_validation_index = next(
+        (
+            index
+            for index, group in enumerate(groups)
+            if bisect_left(
+                ordered_group_end_times,
+                group_bounds[group]["decision_start"],
+            )
+            >= minimum_initial_training_group_count
+        ),
+        len(groups),
+    )
+    validation_candidates = groups[first_validation_index:]
     if not validation_candidates:
         return {
             "version": version,
             "status": "insufficient_purged_chronological_decision_groups",
             "folds": [],
             "decision_group_count": len(groups),
+            "minimum_initial_training_decision_group_count": (
+                minimum_initial_training_group_count
+            ),
+            "initial_training_fraction": 0.20,
             "decision_group_disjoint": False,
             "chronological_label_disjoint": False,
             "model_refit_per_fold": True,
@@ -1765,6 +1842,10 @@ def _walk_forward_return_report(
         "folds": folds,
         "fold_count": len(folds),
         "decision_group_count": len(groups),
+        "minimum_initial_training_decision_group_count": (
+            minimum_initial_training_group_count
+        ),
+        "initial_training_fraction": 0.20,
         "decision_group_disjoint": all(row["decision_group_overlap_count"] == 0 for row in folds),
         "chronological_label_disjoint": all(
             row["label_timestamp_overlap_count"] == 0
@@ -2347,24 +2428,31 @@ def train_from_frame(
     )
     long_expected_scores = _risk_adjusted_expected_scores(
         long_distribution,
+        long_cost_distribution,
         long_tail_scores,
         tail_loss_scale_pct=tail_scales["long"],
     )
     short_expected_scores = _risk_adjusted_expected_scores(
         short_distribution,
+        short_cost_distribution,
         short_tail_scores,
         tail_loss_scale_pct=tail_scales["short"],
     )
+    holdout_net_returns = {
+        side: test[f"{side}_return_pct"].astype(float)
+        - test[f"{side}_execution_cost_pct"].astype(float)
+        for side in ("long", "short")
+    }
     return_buckets = {
         "long": {
             "top": _bucket_return_summary(
-                test["long_return_pct"],
+                holdout_net_returns["long"],
                 long_expected_scores,
                 top=True,
                 tail_loss_threshold_pct=tail_scales["long"],
             ),
             "bottom": _bucket_return_summary(
-                test["long_return_pct"],
+                holdout_net_returns["long"],
                 long_expected_scores,
                 top=False,
                 tail_loss_threshold_pct=tail_scales["long"],
@@ -2372,13 +2460,13 @@ def train_from_frame(
         },
         "short": {
             "top": _bucket_return_summary(
-                test["short_return_pct"],
+                holdout_net_returns["short"],
                 short_expected_scores,
                 top=True,
                 tail_loss_threshold_pct=tail_scales["short"],
             ),
             "bottom": _bucket_return_summary(
-                test["short_return_pct"],
+                holdout_net_returns["short"],
                 short_expected_scores,
                 top=False,
                 tail_loss_threshold_pct=tail_scales["short"],
@@ -2520,6 +2608,16 @@ def train_from_frame(
         "tail_loss_policy": tail_policy,
         "tail_loss_scale_pct": tail_scales,
         "training_cost_policy": "separated_market_opportunity_and_execution_cost_tasks",
+        "holdout_return_metric_contract": {
+            "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+            "realized_return_basis": HOLDOUT_REALIZED_RETURN_BASIS,
+            "score_basis": HOLDOUT_SCORE_BASIS,
+            "tail_loss_basis": "net_after_counterfactual_execution_cost",
+            "source": "artifact_chronological_holdout",
+            "observation_window": "artifact_disjoint_holdout_partition",
+            "sample_count": int(len(test)),
+            "generated_at": now,
+        },
         "evaluation_group_policy": "chronological_disjoint_decision_groups",
         "decision_group_partition": partition.report,
         "strategy_replay_holdout": strategy_replay_holdout,
@@ -2577,8 +2675,12 @@ def train_from_frame(
             "top_long_return_lcb_pct": return_buckets["long"]["top"]["return_lcb_pct"],
             "top_long_profit_factor": return_buckets["long"]["top"]["profit_factor"],
             "top_long_cvar_10_pct": return_buckets["long"]["top"]["cvar_10_pct"],
-            "top_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=True),
-            "bottom_long_win_rate": _bucket_win_rate(test["long_win"], long_scores, top=False),
+            "top_long_win_rate": _bucket_win_rate(
+                test["long_win"], long_expected_scores, top=True
+            ),
+            "bottom_long_win_rate": _bucket_win_rate(
+                test["long_win"], long_expected_scores, top=False
+            ),
             "top_long_tail_loss_rate": return_buckets["long"]["top"]["tail_loss_rate"],
             "bottom_long_tail_loss_rate": return_buckets["long"]["bottom"]["tail_loss_rate"],
             "top_short_avg_return_pct": return_buckets["short"]["top"]["avg_return_pct"],
@@ -2587,8 +2689,12 @@ def train_from_frame(
             "top_short_return_lcb_pct": return_buckets["short"]["top"]["return_lcb_pct"],
             "top_short_profit_factor": return_buckets["short"]["top"]["profit_factor"],
             "top_short_cvar_10_pct": return_buckets["short"]["top"]["cvar_10_pct"],
-            "top_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=True),
-            "bottom_short_win_rate": _bucket_win_rate(test["short_win"], short_scores, top=False),
+            "top_short_win_rate": _bucket_win_rate(
+                test["short_win"], short_expected_scores, top=True
+            ),
+            "bottom_short_win_rate": _bucket_win_rate(
+                test["short_win"], short_expected_scores, top=False
+            ),
             "top_short_tail_loss_rate": return_buckets["short"]["top"]["tail_loss_rate"],
             "bottom_short_tail_loss_rate": return_buckets["short"]["bottom"]["tail_loss_rate"],
         },
@@ -3244,7 +3350,7 @@ class MLSignalService:
                     persist_artifact=False,
                 )
                 candidate_influence = _influence_policy(candidate_metadata)
-                candidate_readiness = build_ml_readiness_report(
+                preflight_candidate_readiness = build_ml_readiness_report(
                     candidate_metadata,
                     candidate_influence,
                 )
@@ -3280,6 +3386,12 @@ class MLSignalService:
                     trained_metadata,
                     trained_influence,
                 )
+                candidate_result_evidence = {
+                    "preflight_candidate_readiness": preflight_candidate_readiness,
+                    "candidate_readiness": trained_readiness,
+                    "preflight_candidate_influence_policy": candidate_influence,
+                    "candidate_influence_policy": trained_influence,
+                }
                 production_authorized = bool(
                     trained_readiness.get("live_ml_ready")
                     and trained_readiness.get("state") in {"ready", "partial_ready"}
@@ -3371,7 +3483,7 @@ class MLSignalService:
                         "training_quarantine": quarantine_result,
                         "training_policy": training_policy,
                         "candidate": candidate_summary,
-                        "candidate_readiness": candidate_readiness,
+                        **candidate_result_evidence,
                         "readiness": readiness,
                         "readiness_state": readiness.get("state"),
                         "live_ml_ready": bool(readiness.get("live_ml_ready")),
@@ -3517,8 +3629,7 @@ class MLSignalService:
                     "training_policy": training_policy,
                     "candidate": candidate_summary,
                     "champion_comparison": champion_comparison,
-                    "candidate_readiness": candidate_readiness,
-                    "candidate_influence_policy": candidate_influence,
+                    **candidate_result_evidence,
                     "readiness": trained_readiness,
                     "readiness_state": trained_readiness.get("state"),
                     "live_ml_ready": live_ml_ready,
@@ -3808,10 +3919,6 @@ class MLSignalService:
             long_mae = _optional_regression_value(self._bundle, "long_mae_regressor", x)
             short_mfe = _optional_regression_value(self._bundle, "short_mfe_regressor", x)
             short_mae = _optional_regression_value(self._bundle, "short_mae_regressor", x)
-            raw_long_expected = float(long_distribution["expected"][0])
-            raw_short_expected = float(short_distribution["expected"][0])
-            long_lower_quantile = float(long_distribution["lower_quantile"][0])
-            short_lower_quantile = float(short_distribution["lower_quantile"][0])
             long_cost_distribution_ready = _distribution_ready_at(
                 long_cost_distribution,
                 0,
@@ -3887,39 +3994,76 @@ class MLSignalService:
                     expected_mae_pct=short_mae,
                 ),
             }
+            fee_after_side_selection = {
+                "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+                "return_semantics": (
+                    "risk_adjusted_net_after_counterfactual_execution_cost"
+                ),
+                "long": _fee_after_prediction_objective(
+                    _safe_dict(multitask_prediction.get("long")),
+                    tail_loss_scale_pct=long_tail_scale,
+                ),
+                "short": _fee_after_prediction_objective(
+                    _safe_dict(multitask_prediction.get("short")),
+                    tail_loss_scale_pct=short_tail_scale,
+                ),
+            }
             long_market_distribution_ready = bool(long_return_contract.get("production_eligible"))
             short_market_distribution_ready = bool(short_return_contract.get("production_eligible"))
             long_objective_expected = _safe_float(
-                long_return_contract.get("objective_expected_return_pct"),
+                _safe_dict(fee_after_side_selection.get("long")).get(
+                    "objective_net_return_pct"
+                ),
                 float("nan"),
             )
             short_objective_expected = _safe_float(
-                short_return_contract.get("objective_expected_return_pct"),
+                _safe_dict(fee_after_side_selection.get("short")).get(
+                    "objective_net_return_pct"
+                ),
                 float("nan"),
             )
-            long_rank = long_objective_expected if long_market_distribution_ready else float("-inf")
+            long_rank = (
+                long_objective_expected
+                if long_market_distribution_ready and long_cost_distribution_ready
+                else float("-inf")
+            )
             short_rank = (
-                short_objective_expected if short_market_distribution_ready else float("-inf")
+                short_objective_expected
+                if short_market_distribution_ready and short_cost_distribution_ready
+                else float("-inf")
             )
             if not math.isfinite(long_rank) and not math.isfinite(short_rank):
-                long_rank = raw_long_expected
-                short_rank = raw_short_expected
+                long_rank = _safe_float(
+                    _safe_dict(multitask_prediction.get("long")).get(
+                        "expected_net_return_pct"
+                    ),
+                    float("-inf"),
+                )
+                short_rank = _safe_float(
+                    _safe_dict(multitask_prediction.get("short")).get(
+                        "expected_net_return_pct"
+                    ),
+                    float("-inf"),
+                )
             best_side = "long" if long_rank >= short_rank else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_objective_expected = (
                 long_objective_expected if best_side == "long" else short_objective_expected
             )
-            best_raw_expected = raw_long_expected if best_side == "long" else raw_short_expected
-            best_scoring_expected = (
-                best_objective_expected
-                if math.isfinite(best_objective_expected)
-                else best_raw_expected
+            selected_fee_after = _safe_dict(fee_after_side_selection.get(best_side))
+            best_net_expected = _safe_float(
+                selected_fee_after.get("expected_net_return_pct"),
+                float("nan"),
             )
+            best_scoring_expected = best_objective_expected
             best_tail_loss_probability = (
                 long_tail_loss_probability if best_side == "long" else short_tail_loss_probability
             )
             best_lower_quantile = (
-                long_lower_quantile if best_side == "long" else short_lower_quantile
+                _safe_float(
+                    selected_fee_after.get("lower_quantile_net_return_pct"),
+                    float("nan"),
+                )
             )
             selected_market_distribution_ready = (
                 long_market_distribution_ready
@@ -3953,12 +4097,22 @@ class MLSignalService:
                 (
                     long_objective_expected
                     if math.isfinite(long_objective_expected)
-                    else raw_long_expected
+                    else _safe_float(
+                        _safe_dict(multitask_prediction.get("long")).get(
+                            "expected_net_return_pct"
+                        ),
+                        0.0,
+                    )
                 )
                 - (
                     short_objective_expected
                     if math.isfinite(short_objective_expected)
-                    else raw_short_expected
+                    else _safe_float(
+                        _safe_dict(multitask_prediction.get("short")).get(
+                            "expected_net_return_pct"
+                        ),
+                        0.0,
+                    )
                 )
             )
             profit_quality = _profit_quality_score(
@@ -3979,7 +4133,7 @@ class MLSignalService:
             )
             paper_prediction_eligible = bool(
                 best_side in {"long", "short"}
-                and math.isfinite(best_raw_expected)
+                and math.isfinite(best_net_expected)
                 and math.isfinite(
                     _safe_float(
                         _safe_dict(multitask_prediction.get(best_side)).get(
@@ -4001,6 +4155,7 @@ class MLSignalService:
                         "short": short_return_contract,
                     },
                     "multitask_prediction": multitask_prediction,
+                    "fee_after_side_selection": fee_after_side_selection,
                     "counterfactual_execution_cost_distribution": {
                         "long": {
                             "expected_pct": round(float(long_cost_distribution["expected"][0]), 4),
@@ -4025,6 +4180,9 @@ class MLSignalService:
                     "actual_trade_calibration": actual_calibration,
                     "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
                     "return_semantics": "gross_market_opportunity_before_execution",
+                    "side_selection_return_semantics": (
+                        "risk_adjusted_net_after_counterfactual_execution_cost"
+                    ),
                     "best_side": best_side,
                     "best_win_rate": round(best_win, 4),
                     "profit_edge_pct": round(profit_edge, 4),
@@ -4128,6 +4286,9 @@ class MLSignalService:
             "label_name": metadata.get("label_name"),
             "label_version": metadata.get("label_version"),
             "training_cost_policy": metadata.get("training_cost_policy"),
+            "holdout_return_metric_contract": metadata.get(
+                "holdout_return_metric_contract"
+            ),
             "artifact_persisted": metadata.get("artifact_persisted") is True,
             "artifact_lifecycle": _safe_dict(
                 self._resolved_artifact.activation_manifest
@@ -4573,14 +4734,17 @@ def _bucket_segment_summary(
     bucket = test.iloc[idx].copy() if len(idx) else test.iloc[:0].copy()
     score_values = pd.Series(scores).iloc[idx] if len(idx) else pd.Series([], dtype=float)
     return_col = f"{side}_return_pct"
+    cost_col = f"{side}_execution_cost_pct"
     win_col = f"{side}_win"
     reasons = _flatten_quality_reasons(
         bucket.get("quality_reasons", pd.Series([], dtype=object)).tolist()
     )
+    net_returns = bucket[return_col].astype(float) - bucket[cost_col].astype(float)
     return {
         "count": int(len(bucket)),
         "avg_model_score": None if bucket.empty else float(score_values.mean()),
-        "avg_return_pct": None if bucket.empty else float(bucket[return_col].mean()),
+        "avg_return_pct": None if bucket.empty else float(net_returns.mean()),
+        "return_basis": HOLDOUT_REALIZED_RETURN_BASIS,
         "win_rate": None if bucket.empty else float(bucket[win_col].mean()),
         "tail_loss_rate": (
             None

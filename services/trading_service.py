@@ -143,10 +143,10 @@ from services.ml_signal_service import (
     AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
     AUTO_TRAIN_LEASE_STALE_SECONDS,
     AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
-    LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
     MODEL_TRAINING_STATE_STORE,
     MLSignalService,
 )
+from services.ml_training_contract import LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.model_training_state import (
     ALL_TRAINABLE_MODEL_IDS,

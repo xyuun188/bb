@@ -29,6 +29,13 @@ from services.local_ai_training_contract import (
 RETURN_DISTRIBUTION_CONTRACT_VERSION = "2026-07-15.standardized-return-distribution.v1"
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 PAPER_RETURN_COMBINATION_VERSION = "2026-07-27.paper-current-cost-return-combination.v1"
+HOLDOUT_RETURN_METRIC_CONTRACT_VERSION = "2026-08-16.fee-after-holdout-metrics.v1"
+HOLDOUT_REALIZED_RETURN_BASIS = (
+    "gross_market_return_pct_minus_counterfactual_execution_cost_pct"
+)
+HOLDOUT_SCORE_BASIS = (
+    "risk_adjusted_gross_market_return_minus_counterfactual_execution_cost"
+)
 
 
 def safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -39,6 +46,27 @@ def safe_float(value: Any, default: float | None = 0.0) -> float | None:
         return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
+
+
+def holdout_return_metric_contract_errors(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["holdout_return_metric_contract_missing"]
+    errors: list[str] = []
+    expected = {
+        "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+        "realized_return_basis": HOLDOUT_REALIZED_RETURN_BASIS,
+        "score_basis": HOLDOUT_SCORE_BASIS,
+        "tail_loss_basis": "net_after_counterfactual_execution_cost",
+    }
+    for field, required in expected.items():
+        if value.get(field) != required:
+            errors.append(f"holdout_return_metric_{field}_mismatch")
+    if int(safe_float(value.get("sample_count"), 0.0) or 0) <= 0:
+        errors.append("holdout_return_metric_sample_count_missing")
+    for field in ("source", "observation_window", "generated_at"):
+        if not str(value.get(field) or "").strip():
+            errors.append(f"holdout_return_metric_{field}_missing")
+    return errors
 
 
 def standardized_return_distribution(

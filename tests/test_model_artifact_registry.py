@@ -16,7 +16,10 @@ from services.ml_signal_service import (
     REPLAY_WEIGHT_POLICY_VERSION,
     MLSignalService,
 )
-from services.ml_training_contract import DECISION_GROUP_PARTITION_VERSION
+from services.ml_training_contract import (
+    DECISION_GROUP_PARTITION_VERSION,
+    WALK_FORWARD_REPORT_VERSION,
+)
 from services.model_artifact_registry import (
     ARTIFACT_REGISTRY_VERSION,
     ModelArtifactRegistry,
@@ -24,6 +27,9 @@ from services.model_artifact_registry import (
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     COST_MODEL_VERSION,
+    HOLDOUT_REALIZED_RETURN_BASIS,
+    HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+    HOLDOUT_SCORE_BASIS,
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_NAME,
@@ -54,6 +60,16 @@ def _metadata() -> dict:
         "label_version": RETURN_LABEL_VERSION,
         "cost_model_version": COST_MODEL_VERSION,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "holdout_return_metric_contract": {
+            "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+            "realized_return_basis": HOLDOUT_REALIZED_RETURN_BASIS,
+            "score_basis": HOLDOUT_SCORE_BASIS,
+            "tail_loss_basis": "net_after_counterfactual_execution_cost",
+            "source": "test_artifact_holdout",
+            "observation_window": "test_holdout_window",
+            "sample_count": 128,
+            "generated_at": "2026-08-16T00:00:00+00:00",
+        },
         "feature_contract_version": FEATURE_CONTRACT_VERSION,
         "label_contract_versions": ["2026-07-27.market-opportunity-multitask.v2"],
         "multitask_prediction_contract_version": MULTITASK_PREDICTION_CONTRACT_VERSION,
@@ -97,6 +113,7 @@ def _metadata() -> dict:
         "training_data_sha256": "a" * 64,
         "source_code_sha256": SOURCE_CODE_SHA256,
         "walk_forward_report": {
+            "version": WALK_FORWARD_REPORT_VERSION,
             "status": "complete",
             "decision_group_disjoint": True,
             "chronological_label_disjoint": True,
@@ -579,6 +596,23 @@ def test_candidate_rejects_old_partition_metadata_without_compatibility(tmp_path
     metadata.pop("decision_group_partition")
 
     with pytest.raises(ValueError, match="decision_group_partition is required"):
+        registry.persist_candidate_joblib(
+            {"weights": [1]},
+            metadata,
+            parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+            code_version=SOURCE_CODE_VERSION,
+        )
+
+
+def test_candidate_rejects_unversioned_holdout_return_metrics(tmp_path) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    metadata = _metadata()
+    metadata.pop("holdout_return_metric_contract")
+
+    with pytest.raises(ValueError, match="holdout_return_metric_contract is incomplete"):
         registry.persist_candidate_joblib(
             {"weights": [1]},
             metadata,
