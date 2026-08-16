@@ -309,6 +309,57 @@ def test_untrusted_funding_is_audited_but_cannot_drive_exit() -> None:
     assert "dynamic_exit_pressure_zero" in result.reason
 
 
+def test_trusted_adverse_funding_loss_consumes_planned_risk_and_forces_exit() -> None:
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+    position["current_management_contract"] = {
+        **position["current_management_contract"],
+        "funding_fee_usdt": -25.0,
+        "funding_bill_count": 1,
+        "funding_fee_source": "okx_account_bills",
+        "funding_evidence_complete": True,
+        "funding_evidence_eligible": True,
+        "funding_evidence_gaps": [],
+    }
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.funding_loss_budget_crossed is True
+    assert result.hard_risk is True
+    assert result.stop_risk_usage == 1.0
+    assert result.close_fraction == 1.0
+    assert result.eligible is True
+
+
+def test_next_adverse_funding_charge_cannot_exceed_remaining_risk_budget() -> None:
+    decision = _decision()
+    decision.feature_snapshot = {
+        "funding_rate": 0.15,
+        "funding_data_available": True,
+        "funding_interval_minutes": 60.0,
+        "funding_rate_observed_at": "2026-08-16T08:00:00+00:00",
+    }
+    position = _position(
+        current_price=100.0,
+        notional_usdt=1000.0,
+        unrealized_pnl=0.0,
+        peak_unrealized_pnl=0.0,
+    )
+
+    result = apply_dynamic_exit(decision, [position])
+
+    assert result.funding_cost_projection_eligible is True
+    assert result.projected_funding_cost_usdt == pytest.approx(150.0)
+    assert result.projected_funding_budget_crossed is True
+    assert result.hard_risk is True
+    assert result.close_fraction == 1.0
+    assert result.eligible is True
+
+
 def test_early_non_hard_partial_exit_requires_price_move_to_cover_exit_cost() -> None:
     position = _position(
         created_at=datetime.now(UTC) - timedelta(minutes=2),
@@ -456,7 +507,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-15.dynamic-exit-lifecycle-funding.v12"
+        "2026-08-16.dynamic-exit-funding-risk-budget.v13"
     )
 
 

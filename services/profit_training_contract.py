@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 
-PROFIT_TRAINING_CONTRACT_VERSION = "2026-08-16.profit-loop-training.v3"
+PROFIT_TRAINING_CONTRACT_VERSION = "2026-08-16.profit-loop-training.v4"
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 
 DecisionAuthority = Literal["rules", "model", "manual", "system"]
@@ -181,6 +181,7 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     if _text(sample.get("notional_source")) not in {
         "okx_entry_fill_base_quantity_and_average_price",
         "okx_fills_history_pnl_and_position_history_price_path",
+        "okx_position_history_realized_pnl_pnl_ratio_and_leverage",
     }:
         blockers.append("notional_source_not_authoritative")
     allowed_fee_sources = {

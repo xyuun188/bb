@@ -15,6 +15,7 @@ from services.current_position_management import (
     current_position_management_contract_complete,
 )
 from services.dynamic_policy_values import continuous_budget_fraction
+from services.execution_cost_model import funding_cost_estimate
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
 
@@ -89,6 +90,12 @@ class DynamicExitAssessment:
     funding_fee_usdt: float
     funding_fee_included: bool
     funding_evidence_eligible: bool
+    funding_loss_budget_crossed: bool
+    projected_funding_budget_crossed: bool
+    projected_funding_cost_usdt: float
+    projected_funding_risk_usage: float
+    funding_cost_projection_eligible: bool
+    funding_cost_projection_reason: str
     lifecycle_net_pnl_usdt: float
     fee_buffer_usdt: float
     estimated_exit_cost_usdt: float
@@ -335,7 +342,53 @@ def assess_dynamic_exit(
     lifecycle_net_pnl = price_fee_after_pnl + included_funding_fee
     peak_profit = max(peak_profit, gross_pnl)
     retrace = _clamp((peak_profit - gross_pnl) / peak_profit) if peak_profit > 0 else 0.0
-    hard_risk = planned_stop_crossed
+    target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
+    feature_snapshot = _safe_dict(decision.feature_snapshot)
+    funding_interval_minutes = _safe_float(
+        feature_snapshot.get("funding_interval_minutes"),
+        0.0,
+    )
+    if funding_interval_minutes <= 0.0:
+        funding_interval_hours = _safe_float(
+            feature_snapshot.get("funding_interval_hours"),
+            0.0,
+        )
+        funding_interval_minutes = funding_interval_hours * 60.0
+    funding_projection = funding_cost_estimate(
+        feature_snapshot,
+        side=target_side,
+        horizon_minutes=funding_interval_minutes,
+    )
+    projected_funding_cost = (
+        notional * float(funding_projection.adverse_cost_pct) / 100.0
+        if funding_projection.production_eligible
+        and funding_projection.adverse_cost_pct is not None
+        else 0.0
+    )
+    funding_adjusted_gross_pnl = gross_pnl + min(included_funding_fee, 0.0)
+    funding_adjusted_loss = max(-funding_adjusted_gross_pnl, 0.0)
+    remaining_planned_risk = max(planned_risk - funding_adjusted_loss, 0.0)
+    funding_loss_budget_crossed = bool(
+        funding_fee_included
+        and planned_risk > 0.0
+        and funding_adjusted_loss + 1e-9 >= planned_risk
+    )
+    projected_funding_budget_crossed = bool(
+        funding_projection.production_eligible
+        and planned_risk > 0.0
+        and projected_funding_cost > 0.0
+        and projected_funding_cost + 1e-9 >= remaining_planned_risk
+    )
+    projected_funding_risk_usage = (
+        _clamp(projected_funding_cost / planned_risk)
+        if planned_risk > 0.0
+        else 0.0
+    )
+    hard_risk = bool(
+        planned_stop_crossed
+        or funding_loss_budget_crossed
+        or projected_funding_budget_crossed
+    )
     elapsed_canary_horizons = [
         item
         for item in canary_horizon_assessments
@@ -351,14 +404,12 @@ def assess_dynamic_exit(
     # Entry and estimated exit fees are already/inevitably paid costs, not
     # evidence that market price has consumed the planned stop budget.
     stop_usage = (
-        _clamp(max(-gross_pnl, 0.0) / planned_risk)
+        _clamp(funding_adjusted_loss / planned_risk)
         if planned_risk > 0
-        else _clamp(max(-gross_pnl, 0.0) / notional)
+        else _clamp(funding_adjusted_loss / notional)
         if notional > 0
         else 0.0
     )
-    target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
-    feature_snapshot = _safe_dict(decision.feature_snapshot)
     market_returns = [
         _safe_float(feature_snapshot.get(name), 0.0)
         for name in ("returns_1", "returns_5", "returns_20")
@@ -534,12 +585,13 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-08-15.dynamic-exit-lifecycle-funding.v12",
+        "strategy_version": "2026-08-16.dynamic-exit-funding-risk-budget.v13",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
         "funding_fee_source": "current_position_management_contract",
+        "funding_cost_projection_source": "current_okx_funding_rate_next_interval",
     }
     return DynamicExitAssessment(
         eligible=eligible,
@@ -551,6 +603,12 @@ def assess_dynamic_exit(
         funding_fee_usdt=round(funding_fee_observed, 8),
         funding_fee_included=funding_fee_included,
         funding_evidence_eligible=funding_evidence_eligible,
+        funding_loss_budget_crossed=funding_loss_budget_crossed,
+        projected_funding_budget_crossed=projected_funding_budget_crossed,
+        projected_funding_cost_usdt=round(projected_funding_cost, 8),
+        projected_funding_risk_usage=round(projected_funding_risk_usage, 8),
+        funding_cost_projection_eligible=funding_projection.production_eligible,
+        funding_cost_projection_reason=funding_projection.reason,
         lifecycle_net_pnl_usdt=round(lifecycle_net_pnl, 8),
         fee_buffer_usdt=round(fee_buffer, 8),
         estimated_exit_cost_usdt=round(estimated_exit_cost, 8),

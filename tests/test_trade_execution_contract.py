@@ -68,6 +68,11 @@ def _entry_raw() -> dict[str, object]:
         "opportunity_score": {
             "production_eligible": True,
             "policy_provenance": provenance,
+            "funding_cost": {
+                "production_eligible": True,
+                "adverse_cost_pct": 0.0,
+                "reason": "current_direction_funding_cost_ready",
+            },
             "execution_cost": {
                 "production_eligible": True,
                 "total_pct": 0.08,
@@ -267,6 +272,20 @@ def test_complete_dynamic_return_entry_contract_is_clean() -> None:
     assert report["summary"]["executed_entry_count"] == 1
     assert report["summary"]["entry_contract_ready_count"] == 1
     assert report["summary"]["contract_violation_count"] == 0
+
+
+def test_projected_adverse_funding_cannot_exceed_planned_trade_loss() -> None:
+    raw = _entry_raw()
+    raw["opportunity_score"]["funding_cost"]["adverse_cost_pct"] = 7.5
+
+    report = summarize_trade_execution_contract(
+        [_decision(101, "long", raw)],
+        orders=[_filled_order(101)],
+    )
+
+    assert report["violation_reason_counts"][
+        "projected_adverse_funding_exceeds_planned_stressed_loss"
+    ] == 1
 
 
 def test_non_positive_fee_after_return_cannot_execute() -> None:

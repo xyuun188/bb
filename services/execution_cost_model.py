@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
 EXECUTION_COST_FACT_FIELDS = (
@@ -76,6 +77,90 @@ class ExecutionCostEstimate:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class FundingCostEstimate:
+    """Direction-aware adverse funding cost over one prediction horizon."""
+
+    side: str
+    funding_rate: float | None
+    funding_interval_minutes: float | None
+    horizon_minutes: float | None
+    adverse_cost_pct: float | None
+    signed_return_impact_pct: float | None
+    production_eligible: bool
+    reason: str
+    policy_provenance: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def funding_cost_estimate(
+    feature_snapshot: dict[str, Any] | None,
+    *,
+    side: str,
+    horizon_minutes: Any,
+) -> FundingCostEstimate:
+    """Project adverse funding as a cost; funding income never creates entry alpha."""
+
+    snapshot = feature_snapshot if isinstance(feature_snapshot, dict) else {}
+    normalized_side = str(side or "").strip().lower()
+    horizon = _optional_finite_float(horizon_minutes)
+    rate = _optional_finite_float(snapshot.get("funding_rate"))
+    interval = _optional_finite_float(snapshot.get("funding_interval_minutes"))
+    if interval is None:
+        interval_hours = _optional_finite_float(snapshot.get("funding_interval_hours"))
+        interval = interval_hours * 60.0 if interval_hours is not None else None
+
+    reason = ""
+    if normalized_side not in {"long", "short"}:
+        reason = "funding_side_invalid"
+    elif snapshot.get("funding_data_available") is not True:
+        reason = "funding_data_unavailable"
+    elif rate is None:
+        reason = "funding_rate_missing"
+    elif interval is None or interval <= 0.0:
+        reason = "funding_interval_missing"
+    elif horizon is None or horizon <= 0.0:
+        reason = "prediction_horizon_missing"
+
+    eligible = not reason
+    signed_impact = None
+    adverse_cost = None
+    if eligible and rate is not None and interval is not None and horizon is not None:
+        signed_impact = (
+            (-rate if normalized_side == "long" else rate)
+            * 100.0
+            * horizon
+            / interval
+        )
+        adverse_cost = max(-signed_impact, 0.0)
+
+    observed_at = str(snapshot.get("funding_rate_observed_at") or "").strip()
+    return FundingCostEstimate(
+        side=normalized_side,
+        funding_rate=rate,
+        funding_interval_minutes=interval,
+        horizon_minutes=horizon,
+        adverse_cost_pct=(round(adverse_cost, 10) if adverse_cost is not None else None),
+        signed_return_impact_pct=(
+            round(signed_impact, 10) if signed_impact is not None else None
+        ),
+        production_eligible=eligible,
+        reason="current_direction_funding_cost_ready" if eligible else reason,
+        policy_provenance={
+            "source": "okx_current_perpetual_funding_rate",
+            "observation_window": "current_prediction_horizon",
+            "sample_count": int(eligible),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "strategy_version": "2026-08-16.directional-funding-cost.v1",
+            "fallback_reason": "" if eligible else reason,
+            "funding_rate_observed_at": observed_at,
+            "income_credit_policy": "adverse_cost_only_no_funding_income_alpha",
+        },
+    )
 
 
 def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> ExecutionCostEstimate:
@@ -318,3 +403,11 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None

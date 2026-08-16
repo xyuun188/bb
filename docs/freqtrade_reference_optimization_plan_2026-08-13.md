@@ -451,3 +451,13 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 - `live_ml_ready=false`。本地 ML 仍为 `promotion_blocked`，Local AI Tools 仍为 canary；现有阻断包括 walk-forward、市场阶段、留一币种稳定性以及 short 方向费后质量不足。
 - FinQuant 和模型服务 ready 只代表运行时可用，不代表策略模型已经满足 live 晋升条件；`live_routing_enabled=false` 保持不变。
 - Freqtrade 方案中的完整实验注册表、全量参数搜索、配置审批/回滚演练等长期治理项尚未全部落地，不能将本节状态解释为原方案全部完成。
+
+### 15.4 2026-08-16 最终线上复核与 YB 数据结论
+
+- `2026-08-16T10:28:58Z` 至 `2026-08-16T10:58:58Z` 的线上覆盖审计为 `assessment.ready=true`：市场分析 23 条、11 个币种，最大活动间隔 215.659 秒，最高单币占比 13.0435%，`overdue_count=0`、`coverage_due_count=0`；10 个开放仓位对应 581 条持仓复核记录。
+- 同一窗口内抽查数据库中的 24 条市场分析记录，4 个专家阶段全部为 `completed`，专家完整率 100%；专家阶段耗时 P50 5.04 秒、P95 7.00 秒，没有缺失调用或不完整调用记录。
+- 交易服务、Dashboard、模型隧道均为 `active/running`，`NRestarts=0`；Dashboard 本机 HTTP 返回 302（登录跳转），响应约 1.6 ms。训练调度器 `status=ok`、有效心跳新鲜、`training_timeout_exceeded=false`，7 个模型状态均为 `succeeded`，失败/中断/超时模型数均为 0。
+- 当前保护单复核为 10 个持仓、12 个保护单，`missing_keys=[]`、`orphan_keys=[]`、`coverage_mismatches=[]`、无效单 0、`repair_blockers=[]`。OKX 权威对账仍为 `status=ok`，未解决项为 0，允许新开仓和刷新训练。
+- YB 历史仓位已按 OKX 权威仓位历史的 `realizedPnl/pnlRatio/leverage` 复原历史合约名义价值：约 `819.432 USDT`，不再使用错误的 `81.9432 USDT`；费后收益约为 `-29.92197%`，名义价值错配 0 条、权威来源冲突 0 条。资金费仍计入训练和持仓退出风险预算，未将资金费收益当作入场 alpha。
+- 使用修复后数据生成的当前质量报告中，short 高分组费后平均收益约 `0.0374%`、收益 LCB `-0.0061%`、Profit Factor `1.4953`，而低分组约 `0.8418%`；因此 short 继续被 `short_top_return_not_above_bottom`、`short_top_return_lcb_not_positive` 和 walk-forward 稳定性门禁阻止，不能以“增加开仓”为目的放宽门禁。`live_ml_ready=false` 与 `live_routing_enabled=false` 保持不变。
+- 线上仍可能看到 OKX 行情 partial、保护单拉取超时或缓存余额等 warning；复核显示这些请求均有明确降级/缓存路径，覆盖、专家、保护单和交易合同仍通过。未配置实盘凭据时访问 live 余额会返回“凭据未配置”，这是 live 模式权限状态，不影响当前 paper 模式，也不能被当作 paper 交易服务故障。

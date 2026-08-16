@@ -216,6 +216,10 @@ def _decision() -> DecisionOutput:
             "orderbook_bid_depth": 10_000.0,
             "orderbook_ask_depth": 9_000.0,
             "taker_fee_rate": 0.0004,
+            "funding_rate": 0.0,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+            "funding_rate_observed_at": "2026-08-16T08:00:00+00:00",
         },
         raw_response={
             "ml_signal": _live_ml(),
@@ -253,10 +257,55 @@ def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:
     assert opportunity["expected_net_return_pct"] == pytest.approx(
         opportunity["expected_gross_return_pct"]
         - breakdown["live_execution_cost_pct"]
+        - breakdown["current_adverse_funding_cost_pct"]
         - breakdown["authoritative_slippage_tail_excess_pct"]
     )
     assert opportunity["policy_provenance"]["valid_for_seconds"] > 0
     assert opportunity["policy_provenance"]["fallback_reason"] == ""
+
+
+def test_extreme_payer_funding_is_deducted_without_crediting_receiver_alpha() -> None:
+    payer = _decision()
+    payer.feature_snapshot.update(
+        {
+            "funding_rate": 0.15,
+            "funding_interval_minutes": 60.0,
+        }
+    )
+    receiver = _decision()
+    receiver.feature_snapshot.update(
+        {
+            "funding_rate": -0.15,
+            "funding_interval_minutes": 60.0,
+        }
+    )
+
+    payer_score = _scorer().score_candidate(payer)
+    receiver_score = _scorer().score_candidate(receiver)
+
+    payer_opportunity = payer.raw_response["opportunity_score"]
+    receiver_opportunity = receiver.raw_response["opportunity_score"]
+    assert payer_opportunity["funding_cost"]["adverse_cost_pct"] == pytest.approx(7.5)
+    assert payer_opportunity["expected_net_return_pct"] < 0.0
+    assert payer_score < 0.0
+    assert receiver_opportunity["funding_cost"]["adverse_cost_pct"] == 0.0
+    assert receiver_score == pytest.approx(receiver_opportunity["return_lcb_pct"])
+
+
+def test_missing_current_funding_evidence_blocks_entry_distribution() -> None:
+    decision = _decision()
+    decision.feature_snapshot["funding_data_available"] = False
+
+    score = _scorer().score_candidate(decision)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert score == float("-inf")
+    assert opportunity["decision_eligible"] is False
+    assert opportunity["funding_cost"]["reason"] == "funding_data_unavailable"
+    assert any(
+        blocker.startswith("current_funding_cost_incomplete:")
+        for blocker in opportunity["return_distribution_contract"]["blockers"]
+    )
 
 
 def test_legacy_paper_canary_cannot_override_current_opportunity_score() -> None:

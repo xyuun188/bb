@@ -614,6 +614,32 @@ def entry_opportunity_evidence_score(raw: dict[str, Any]) -> float | None:
     return _finite_value(_safe_dict(raw.get("opportunity_score")).get("score"))
 
 
+def _entry_funding_risk_reasons(raw: dict[str, Any]) -> list[str]:
+    """Reject new contracts whose projected funding loss exceeds planned risk."""
+
+    opportunity = _safe_dict(raw.get("opportunity_score"))
+    if "funding_cost" not in opportunity:
+        return []
+    funding = _safe_dict(opportunity.get("funding_cost"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    reasons: list[str] = []
+    if funding.get("production_eligible") is not True:
+        reasons.append("entry_funding_cost_incomplete")
+        return reasons
+    adverse_cost_pct = _finite_value(funding.get("adverse_cost_pct"))
+    if adverse_cost_pct is None or adverse_cost_pct < 0.0:
+        reasons.append("entry_funding_cost_invalid")
+        return reasons
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
+    if final_notional <= 0.0 or planned_loss <= 0.0:
+        return reasons
+    projected_funding_loss = final_notional * adverse_cost_pct / 100.0
+    if projected_funding_loss > planned_loss + 1e-8:
+        reasons.append("projected_adverse_funding_exceeds_planned_stressed_loss")
+    return reasons
+
+
 def validate_entry_execution_contract(
     raw: dict[str, Any],
     *,
@@ -839,6 +865,7 @@ def validate_paper_canary_entry_contract(
     if executed and filled_order_present is not True:
         reasons.append("executed_entry_without_filled_order")
 
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     contract = {
         "contract_lifecycle": "paper_bootstrap_canary",
@@ -1182,6 +1209,7 @@ def validate_normal_paper_entry_contract(
     if executed and filled_order_present is False:
         reasons.append("executed_entry_without_filled_order")
 
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     return (
         {
@@ -1328,6 +1356,7 @@ def validate_paper_training_entry_contract(
         reasons.append("paper_training_filled_notional_exceeds_target")
     if executed and filled_order_present is False:
         reasons.append("executed_entry_without_filled_order")
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     return (
         {
@@ -1446,6 +1475,7 @@ def validate_paper_exploration_entry_contract(
         reasons.append("paper_exploration_filled_notional_exceeds_risk_budget")
     if executed and filled_order_present is False:
         reasons.append("executed_entry_without_filled_order")
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     return (
         {
@@ -1680,6 +1710,7 @@ def build_live_rules_canary_entry_contract(
     if leverage_tier.get("production_eligible") is not True:
         reasons.append("rules_canary_leverage_tier_ineligible")
 
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     contract = {
         "contract_lifecycle": "live_rules_canary",
@@ -1760,6 +1791,7 @@ def validate_live_rules_canary_entry_contract(
     ):
         reasons.append("filled_order_notional_above_rules_canary_limit")
 
+    reasons.extend(_entry_funding_risk_reasons(raw))
     reasons = list(dict.fromkeys(reasons))
     contract["contract_complete"] = not reasons
     contract["filled_order_notional_usdt"] = filled_notional
@@ -1831,6 +1863,8 @@ def validate_production_entry_contract(
         reasons.append("filled_order_notional_differs_from_risk_contract")
     if executed and filled_order_present is not True:
         reasons.append("executed_entry_without_filled_order")
+    reasons.extend(_entry_funding_risk_reasons(raw))
+    reasons = list(dict.fromkeys(reasons))
     contract = {
         "contract_lifecycle": "live_ml",
         "contract_complete": not reasons,

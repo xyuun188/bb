@@ -518,6 +518,9 @@ def _historical_contract_notional_reconciliation(
     entry_price: float,
     close_price: float,
     gross_pnl: float,
+    realized_pnl: float,
+    pnl_ratio: float | None,
+    leverage: float,
     current_notional: float | None,
     contracts: float,
     contract_ct_mult: float | None,
@@ -536,30 +539,82 @@ def _historical_contract_notional_reconciliation(
         close_price=close_price,
     )
     close_fill_pnl = _safe_float(close_fill_group.get("fill_pnl"), None)
+    price_path_notional: float | None = None
     if (
-        price_return_pct is None
-        or abs(price_return_pct) <= 1e-12
-        or abs(gross_pnl) <= 1e-12
-        or gross_pnl * price_return_pct <= 0
-        or contracts <= 0
-        or close_fill_group.get("fill_pnl_complete") is not True
-        or close_fill_pnl is None
-        or not math.isclose(
+        price_return_pct is not None
+        and abs(price_return_pct) > 1e-12
+        and abs(gross_pnl) > 1e-12
+        and gross_pnl * price_return_pct > 0
+        and close_fill_group.get("fill_pnl_complete") is True
+        and close_fill_pnl is not None
+        and math.isclose(
             close_fill_pnl,
             gross_pnl,
             rel_tol=1e-6,
             abs_tol=max(1e-8, abs(gross_pnl) * 1e-8),
         )
     ):
-        return {"applied": False, "reason": "authoritative_price_pnl_derivation_unavailable"}
-    derived_notional = gross_pnl / (price_return_pct / 100.0)
-    if derived_notional <= 0 or not math.isfinite(derived_notional):
-        return {"applied": False, "reason": "derived_historical_notional_invalid"}
+        candidate = gross_pnl / (price_return_pct / 100.0)
+        if candidate > 0 and math.isfinite(candidate):
+            price_path_notional = candidate
+
+    margin_ratio_notional: float | None = None
+    if (
+        pnl_ratio is not None
+        and abs(pnl_ratio) > 1e-12
+        and abs(realized_pnl) > 1e-12
+        and realized_pnl * pnl_ratio > 0
+        and leverage > 0
+        and math.isfinite(leverage)
+    ):
+        candidate = realized_pnl / pnl_ratio * leverage
+        if candidate > 0 and math.isfinite(candidate):
+            margin_ratio_notional = candidate
+
+    if (
+        price_path_notional is not None
+        and margin_ratio_notional is not None
+        and not math.isclose(
+            price_path_notional,
+            margin_ratio_notional,
+            rel_tol=0.02,
+            abs_tol=max(1e-8, price_path_notional * 1e-6),
+        )
+    ):
+        return {
+            "applied": False,
+            "reason": "authoritative_historical_notional_sources_conflict",
+            "authority_conflict": True,
+            "price_path_notional": price_path_notional,
+            "margin_ratio_notional": margin_ratio_notional,
+            "position_history_pnl_ratio": pnl_ratio,
+            "position_history_leverage": leverage,
+        }
+
+    derived_notional = price_path_notional or margin_ratio_notional
+    if derived_notional is None:
+        return {
+            "applied": False,
+            "reason": "authoritative_historical_notional_derivation_unavailable",
+        }
+    source_authority = (
+        "okx_fills_history_pnl_and_position_history_price_path"
+        if price_path_notional is not None
+        else "okx_position_history_realized_pnl_pnl_ratio_and_leverage"
+    )
     if current_notional is None or current_notional <= 0:
         return {"applied": False, "reason": "current_fill_notional_unavailable"}
-    current_return = gross_pnl / current_notional * 100.0
-    if math.isclose(current_return, price_return_pct, rel_tol=0.01, abs_tol=0.05):
+    if math.isclose(
+        current_notional,
+        derived_notional,
+        rel_tol=0.01,
+        abs_tol=max(1e-8, derived_notional * 1e-6),
+    ):
         return {"applied": False, "reason": "current_contract_spec_already_consistent"}
+    if contracts <= 0:
+        return {"applied": False, "reason": "historical_contract_count_unavailable"}
+    if entry_price <= 0:
+        return {"applied": False, "reason": "historical_entry_price_unavailable"}
     ct_mult = contract_ct_mult if contract_ct_mult is not None and contract_ct_mult > 0 else 1.0
     effective_base_quantity = derived_notional / entry_price
     effective_ct_val = effective_base_quantity / contracts / ct_mult
@@ -568,7 +623,7 @@ def _historical_contract_notional_reconciliation(
     return {
         "applied": True,
         "reason": "current_public_contract_value_mismatches_authoritative_history",
-        "source_authority": "okx_fills_history_pnl_and_position_history_price_path",
+        "source_authority": source_authority,
         "current_notional": current_notional,
         "historical_notional": derived_notional,
         "notional_scale": derived_notional / current_notional,
@@ -577,6 +632,10 @@ def _historical_contract_notional_reconciliation(
         "close_fill_pnl": close_fill_pnl,
         "position_history_gross_pnl": gross_pnl,
         "gross_price_return_pct": price_return_pct,
+        "price_path_notional": price_path_notional,
+        "margin_ratio_notional": margin_ratio_notional,
+        "position_history_pnl_ratio": pnl_ratio,
+        "position_history_leverage": leverage,
     }
 
 
@@ -681,6 +740,9 @@ def build_okx_history_training_sample(
         entry_price=entry_price,
         close_price=close_price,
         gross_pnl=gross_pnl,
+        realized_pnl=realized_pnl,
+        pnl_ratio=_safe_float(_value(history, "pnl_ratio"), None),
+        leverage=_safe_float(_value(history, "leverage"), 1.0) or 1.0,
         current_notional=canonical_notional,
         contracts=contracts,
         contract_ct_mult=ct_mult,
@@ -708,6 +770,8 @@ def build_okx_history_training_sample(
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
     gaps: list[str] = []
+    if historical_contract_reconciliation.get("authority_conflict") is True:
+        gaps.append("historical_contract_notional_authorities_conflict")
     if not execution_mode:
         gaps.append("missing_or_invalid_execution_mode")
     if _text(_value(history, "sync_status")).lower() != "synced":
@@ -1090,7 +1154,7 @@ def build_okx_history_training_sample(
         "contract_lot_size": lot_size,
         "notional": canonical_notional,
         "notional_source": (
-            "okx_fills_history_pnl_and_position_history_price_path"
+            str(historical_contract_reconciliation.get("source_authority") or "")
             if historical_contract_reconciliation.get("applied") is True
             else "okx_entry_fill_base_quantity_and_average_price"
             if canonical_notional is not None and canonical_notional > 0
@@ -1108,6 +1172,7 @@ def build_okx_history_training_sample(
         "settlement_components_total": settlement_expected,
         "holding_minutes": holding_minutes,
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,
+        "position_history_pnl_ratio": _safe_float(_value(history, "pnl_ratio"), None),
         "planned_stop_loss_price": stop_loss_price,
         "planned_take_profit_price": take_profit_price,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,

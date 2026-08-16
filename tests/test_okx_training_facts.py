@@ -91,10 +91,11 @@ def _slippage_fact(
     mark_price: float,
     contracts: float = 2.0,
     contract_size: float = 0.01,
+    inst_id: str = "BTC-USDT-SWAP",
 ) -> dict:
     return build_okx_fill_mark_slippage(
         order_id=order_id,
-        inst_id="BTC-USDT-SWAP",
+        inst_id=inst_id,
         side=side,
         contracts=contracts,
         average_price=average_price,
@@ -102,7 +103,7 @@ def _slippage_fact(
         rows=[
             {
                 "ordId": order_id,
-                "instId": "BTC-USDT-SWAP",
+                "instId": inst_id,
                 "tradeId": trade_id,
                 "side": side,
                 "fillSz": str(contracts),
@@ -363,6 +364,7 @@ def test_historical_price_and_fill_pnl_recover_changed_contract_value() -> None:
         open_max_pos=100.0,
         realized_pnl=0.9,
         pnl=1.0,
+        pnl_ratio=0.018,
         fee=-0.1,
         funding_fee=0.0,
     )
@@ -445,6 +447,139 @@ def test_historical_price_and_fill_pnl_recover_changed_contract_value() -> None:
     assert sample["profit_training_contract"]["eligible"] is True
 
 
+def test_historical_margin_return_recovers_funding_only_changed_contract_value() -> None:
+    history = _history(
+        row_identity="paper|YB-USDT-SWAP|yb-pos|net|1785428549448",
+        inst_id="YB-USDT-SWAP",
+        symbol="YB/USDT",
+        pos_id="yb-pos",
+        side="short",
+        open_avg_px=0.0456,
+        close_avg_px=0.0456,
+        open_max_pos=1797.0,
+        leverage=7.0,
+        realized_pnl=-245.1902274,
+        pnl=0.0,
+        pnl_ratio=-2.094538157894737,
+        funding_fee=-244.616625,
+        fee=-0.5736024,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "instId": "YB-USDT-SWAP",
+        "posId": "yb-pos",
+        "posSide": "net",
+        "direction": "short",
+        "openAvgPx": "0.0456",
+        "closeAvgPx": "0.0456",
+        "openMaxPos": "1797",
+        "closeTotalPos": "1797",
+        "lever": "7",
+        "realizedPnl": "-245.1902274",
+        "pnl": "0",
+        "pnlRatio": "-2.094538157894737",
+        "fee": "-0.5736024",
+        "fundingFee": "-244.616625",
+        "_bb_contract_spec": {
+            "ctVal": "1",
+            "ctMult": "1",
+            "lotSz": "1",
+            "source": "okx_public_instruments",
+        },
+    }
+    lineage = _complete_lineage()
+    entry = lineage["orders_by_exchange_id"]["entry-1"]
+    entry.okx_inst_id = "YB-USDT-SWAP"
+    entry.side = "sell"
+    entry.quantity = 1797.0
+    entry.price = 0.0456
+    entry.fee = 0.2868
+    entry.okx_fill_contracts = 1797.0
+    entry.okx_raw_fills.update(
+        {
+            "inst_id": "YB-USDT-SWAP",
+            "contracts": 1797.0,
+            "base_quantity": 1797.0,
+            "avg_price": 0.0456,
+            "fee_abs": 0.2868,
+            "contract_size": 1.0,
+            "execution_slippage": _slippage_fact(
+                order_id="entry-1",
+                trade_id="trade-entry",
+                side="sell",
+                average_price=0.0456,
+                mark_price=0.04561,
+                contracts=1797.0,
+                contract_size=1.0,
+                inst_id="YB-USDT-SWAP",
+            ),
+        }
+    )
+    close = lineage["orders_by_exchange_id"]["close-1"]
+    close.okx_inst_id = "YB-USDT-SWAP"
+    close.side = "buy"
+    close.quantity = 1797.0
+    close.price = 0.0456
+    close.fee = 0.2868024
+    close.okx_fill_contracts = 1797.0
+    close.okx_fill_pnl = 0.0
+    close.okx_raw_fills.update(
+        {
+            "inst_id": "YB-USDT-SWAP",
+            "contracts": 1797.0,
+            "base_quantity": 1797.0,
+            "avg_price": 0.0456,
+            "fee_abs": 0.2868024,
+            "fill_pnl": 0.0,
+            "contract_size": 1.0,
+            "execution_slippage": _slippage_fact(
+                order_id="close-1",
+                trade_id="trade-close",
+                side="buy",
+                average_price=0.0456,
+                mark_price=0.04559,
+                contracts=1797.0,
+                contract_size=1.0,
+                inst_id="YB-USDT-SWAP",
+            ),
+        }
+    )
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["historical_contract_reconciliation"]["applied"] is True
+    assert sample["historical_contract_reconciliation"]["price_path_notional"] is None
+    assert sample["contract_ct_val"] == pytest.approx(10.0)
+    assert sample["notional"] == pytest.approx(819.432)
+    assert sample["notional_source"] == (
+        "okx_position_history_realized_pnl_pnl_ratio_and_leverage"
+    )
+    assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(-29.921973684210524)
+    assert sample["gross_return_price_consistent"] is True
+    assert sample["trade_fact_trusted"] is True, sample["training_evidence_gaps"]
+    assert sample["profit_training_contract"]["eligible"] is True
+
+
+def test_conflicting_price_and_margin_notional_authorities_are_quarantined() -> None:
+    history = _history(
+        realized_pnl=8.5,
+        pnl_ratio=0.017,
+    )
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["close-1"].okx_fill_pnl = 10.0
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    reconciliation = sample["historical_contract_reconciliation"]
+    assert reconciliation["applied"] is False, reconciliation
+    assert reconciliation["authority_conflict"] is True
+    assert reconciliation["reason"] == "authoritative_historical_notional_sources_conflict"
+    assert "historical_contract_notional_authorities_conflict" in sample[
+        "training_evidence_gaps"
+    ]
+    assert sample["trade_fact_trusted"] is False
+
+
 def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> None:
     history = _history(
         mode="live",
@@ -498,7 +633,7 @@ def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> Non
 
 
 def test_training_rejects_account_derived_contract_size_override() -> None:
-    history = _history(pnl=100.0, realized_pnl=98.5)
+    history = _history(pnl=100.0, realized_pnl=98.5, pnl_ratio=None)
     lineage = _complete_lineage()
     entry_order = lineage["orders_by_exchange_id"]["entry-1"]
     entry_order.quantity = 0.2
@@ -1128,13 +1263,13 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
         close_avg_px=97_000.0,
         realized_pnl=-8.5,
         pnl=-7.0,
-        pnl_ratio=-0.085,
+        pnl_ratio=-0.0085,
     )
     history.raw_row = {
         **history.raw_row,
         "realizedPnl": "-8.5",
         "pnl": "-7",
-        "pnlRatio": "-0.085",
+        "pnlRatio": "-0.0085",
     }
 
     sample = build_okx_history_training_sample(history, **lineage)

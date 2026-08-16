@@ -27,7 +27,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution,
     signal_return_distribution_eligibility,
 )
-from services.execution_cost_model import execution_cost_estimate
+from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
 from services.model_strategy_blueprint import (
     model_strategy_side_authorization,
     paper_strategy_authorization,
@@ -481,6 +481,28 @@ class EntryOpportunityScoringPolicy:
         )
         input_blockers = []
         input_blockers.extend(horizon_selection.get("blockers") or [])
+        funding_horizons = {
+            horizon
+            for contract in claimed_contracts
+            if (horizon := _finite(contract.get("horizon_minutes"))) is not None
+            and horizon > 0.0
+        }
+        funding_horizon = (
+            selected_paper_horizon
+            if selected_paper_horizon is not None
+            else next(iter(funding_horizons))
+            if len(funding_horizons) == 1
+            else None
+        )
+        funding_cost = funding_cost_estimate(
+            decision.feature_snapshot
+            if isinstance(decision.feature_snapshot, dict)
+            else {},
+            side=side,
+            horizon_minutes=funding_horizon,
+        )
+        if funding_cost.production_eligible is not True:
+            input_blockers.append(f"current_funding_cost_incomplete:{funding_cost.reason}")
         if len(claimed_contracts) != len(claimed_components):
             input_blockers.append("claimed_profit_target_distribution_missing")
         cost_distributions = _unique_distribution_rows(
@@ -642,10 +664,15 @@ class EntryOpportunityScoringPolicy:
                 ),
                 profit_supervision_version=PROFIT_SUPERVISION_VERSION,
                 source_authority=(
-                    "contract_complete_model_distributions_and_current_orderbook_cost"
+                    "contract_complete_models_current_orderbook_and_okx_funding"
                 ),
                 input_blockers=input_blockers,
                 model_weights=claimed_model_weights,
+                current_adverse_funding_cost_pct=(
+                    funding_cost.adverse_cost_pct
+                    if funding_cost.production_eligible
+                    else 0.0
+                ),
             )
             if execution_scope == "paper"
             else combine_production_return_distribution(
@@ -665,10 +692,15 @@ class EntryOpportunityScoringPolicy:
                 actual_trade_calibrations=valid_calibrations,
                 profit_supervision_version=PROFIT_SUPERVISION_VERSION,
                 source_authority=(
-                    "governed_model_contracts_live_orderbook_and_okx_position_history"
+                    "governed_models_live_orderbook_funding_and_okx_position_history"
                 ),
                 input_blockers=input_blockers,
                 model_weights=claimed_model_weights,
+                current_adverse_funding_cost_pct=(
+                    funding_cost.adverse_cost_pct
+                    if funding_cost.production_eligible
+                    else 0.0
+                ),
             )
         )
         combination_ready = combination.get("decision_eligible") is True
@@ -772,7 +804,7 @@ class EntryOpportunityScoringPolicy:
         )
         provenance = {
             "source": (
-                "contract_complete_models_and_current_orderbook_cost"
+                "contract_complete_models_current_orderbook_and_funding_cost"
                 if execution_scope == "paper" and combination_ready
                 else "governed_market_live_cost_and_okx_trade_calibration"
                 if combination_ready
@@ -833,6 +865,7 @@ class EntryOpportunityScoringPolicy:
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
             "return_combination_version": combination_version,
             "execution_cost": execution_cost.to_dict(),
+            "funding_cost": funding_cost.to_dict(),
             "selected_horizon_minutes": selected_paper_horizon,
             "horizon_cohort_selection": horizon_selection,
             "expected_net_breakdown": {
@@ -845,6 +878,9 @@ class EntryOpportunityScoringPolicy:
                 ),
                 "live_execution_cost_pct": transformations.get(
                     "live_execution_cost_pct"
+                ),
+                "current_adverse_funding_cost_pct": transformations.get(
+                    "current_adverse_funding_cost_pct"
                 ),
                 "historical_counterfactual_cost_expected_pct": (
                     round(historical_cost_expected, 8)

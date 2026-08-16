@@ -257,6 +257,7 @@ def _combine_execution_return_distribution(
     source_authority: str,
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
+    current_adverse_funding_cost_pct: Any = 0.0,
 ) -> dict[str, Any]:
     """Combine governed market distributions under an explicit execution scope."""
 
@@ -465,10 +466,13 @@ def _combine_execution_return_distribution(
 
     live_cost = safe_float(live_execution_cost_pct, None)
     live_slippage = safe_float(live_slippage_pct, None)
+    adverse_funding_cost = safe_float(current_adverse_funding_cost_pct, None)
     if live_cost is None or live_cost < 0:
         blockers.append("live_execution_cost_distribution_missing")
     if live_scope and (live_slippage is None or live_slippage < 0):
         blockers.append("live_execution_cost_distribution_missing")
+    if adverse_funding_cost is None or adverse_funding_cost < 0:
+        blockers.append("current_adverse_funding_cost_invalid")
     authoritative_slippage_upper = max(slippage_upper_values) if slippage_upper_values else None
     slippage_tail_excess = (
         authoritative_slippage_upper - live_slippage
@@ -481,13 +485,19 @@ def _combine_execution_return_distribution(
     ) if live_scope else 0.0
 
     net_expected = (
-        gross_expected - live_cost - slippage_tail_excess
-        if gross_expected is not None and live_cost is not None and slippage_tail_excess is not None
+        gross_expected - live_cost - adverse_funding_cost - slippage_tail_excess
+        if gross_expected is not None
+        and live_cost is not None
+        and adverse_funding_cost is not None
+        and slippage_tail_excess is not None
         else None
     )
     net_median = (
-        gross_median - live_cost - slippage_tail_excess
-        if gross_median is not None and live_cost is not None and slippage_tail_excess is not None
+        gross_median - live_cost - adverse_funding_cost - slippage_tail_excess
+        if gross_median is not None
+        and live_cost is not None
+        and adverse_funding_cost is not None
+        and slippage_tail_excess is not None
         else None
     )
     total_dispersion = (
@@ -509,11 +519,17 @@ def _combine_execution_return_distribution(
     )
     net_upper = (
         max(
-            float(weighted_mean(gross_upper_values)) - live_cost - slippage_tail_excess,
+            float(weighted_mean(gross_upper_values))
+            - live_cost
+            - adverse_funding_cost
+            - slippage_tail_excess,
             net_median if net_median is not None else float("-inf"),
             net_expected if net_expected is not None else float("-inf"),
         )
-        if gross_upper_values and live_cost is not None and slippage_tail_excess is not None
+        if gross_upper_values
+        and live_cost is not None
+        and adverse_funding_cost is not None
+        and slippage_tail_excess is not None
         else None
     )
     horizon = contracts[0].get("horizon_minutes") if contracts and len(signatures) == 1 else None
@@ -533,9 +549,9 @@ def _combine_execution_return_distribution(
         tail_loss_scale_pct=max(tail_scales) if tail_scales else None,
         distribution_member_count=member_count,
         return_semantics=(
-            "realized_net_return_after_live_cost_and_authoritative_slippage"
+            "realized_net_return_after_live_cost_funding_and_authoritative_slippage"
             if live_scope
-            else "paper_net_return_after_current_estimated_execution_cost"
+            else "paper_net_return_after_current_execution_and_funding_cost"
         ),
         source_authority=source_authority,
         profit_supervision_version=profit_supervision_version,
@@ -564,11 +580,12 @@ def _combine_execution_return_distribution(
     }
     contract["transformations"] = {
         "formula": (
-            "gross_market_expected-live_execution_cost-authoritative_slippage_tail_excess"
+            "gross_market_expected-live_execution_cost-current_adverse_funding_cost-authoritative_slippage_tail_excess"
             if live_scope
-            else "gross_market_expected-current_estimated_execution_cost"
+            else "gross_market_expected-current_execution_cost-current_adverse_funding_cost"
         ),
         "live_execution_cost_pct": live_cost,
+        "current_adverse_funding_cost_pct": adverse_funding_cost,
         "live_slippage_pct": live_slippage,
         "authoritative_slippage_expected_pct": (
             sum(slippage_expected_values) / len(slippage_expected_values)
@@ -585,7 +602,8 @@ def _combine_execution_return_distribution(
             max(actual_uncertainties) if actual_uncertainties else None
         ),
         "cost_deduction_count": (
-            1 if live_cost is not None and slippage_tail_excess is not None else 0
+            int(live_cost is not None and slippage_tail_excess is not None)
+            + int(adverse_funding_cost is not None and adverse_funding_cost > 0.0)
         ),
     }
     if requested_weights is not None:
@@ -618,6 +636,7 @@ def combine_production_return_distribution(
     source_authority: str,
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
+    current_adverse_funding_cost_pct: Any = 0.0,
 ) -> dict[str, Any]:
     """Build the fee-after live distribution with production evidence gates."""
 
@@ -633,6 +652,7 @@ def combine_production_return_distribution(
         source_authority=source_authority,
         input_blockers=input_blockers,
         model_weights=model_weights,
+        current_adverse_funding_cost_pct=current_adverse_funding_cost_pct,
     )
 
 
@@ -646,6 +666,7 @@ def combine_paper_return_distribution(
     source_authority: str,
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
+    current_adverse_funding_cost_pct: Any = 0.0,
 ) -> dict[str, Any]:
     """Build a paper decision distribution without live promotion evidence."""
 
@@ -661,6 +682,7 @@ def combine_paper_return_distribution(
         source_authority=source_authority,
         input_blockers=input_blockers,
         model_weights=model_weights,
+        current_adverse_funding_cost_pct=current_adverse_funding_cost_pct,
     )
 
 
