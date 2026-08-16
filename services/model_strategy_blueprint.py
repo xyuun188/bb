@@ -167,6 +167,80 @@ def build_model_strategy_blueprint(
     }
 
 
+def model_strategy_side_authorization(
+    signal: dict[str, Any] | None,
+    *,
+    execution_scope: str,
+    side: str,
+) -> dict[str, Any]:
+    """Resolve the trained model blueprint as the directional authority.
+
+    Legacy or server-only signals may not carry a blueprint. In that case this
+    policy is not enforced and the source's own governance remains authoritative.
+    Once a blueprint is present, however, every model source must respect its
+    execution scope and eligible sides.
+    """
+
+    model_signal = _safe_dict(signal)
+    blueprint = _safe_dict(model_signal.get("strategy_blueprint"))
+    normalized_scope = "paper" if str(execution_scope).lower() == "paper" else "live"
+    normalized_side = str(side or "").lower()
+    eligible_sides = sorted(
+        {
+            str(value).lower()
+            for value in _safe_list(blueprint.get("eligible_sides"))
+            if str(value).lower() in {"long", "short"}
+        }
+    )
+    result = {
+        "enforced": bool(blueprint),
+        "eligible": True,
+        "reason": "model_strategy_blueprint_unavailable",
+        "execution_scope": normalized_scope,
+        "side": normalized_side,
+        "eligible_sides": eligible_sides,
+        "blueprint_version": blueprint.get("version"),
+        "model_version": blueprint.get("model_version"),
+    }
+    if not blueprint:
+        return result
+    if normalized_side not in {"long", "short"}:
+        return {**result, "eligible": False, "reason": "invalid_entry_direction"}
+
+    signal_version = str(model_signal.get("model_version") or "")
+    blueprint_version = str(blueprint.get("model_version") or "")
+    if signal_version and blueprint_version and signal_version != blueprint_version:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "model_strategy_blueprint_version_mismatch",
+        }
+    if normalized_scope == "paper":
+        if blueprint.get("paper_execution_eligible") is not True:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "model_strategy_blueprint_paper_permission_missing",
+            }
+    elif blueprint.get("live_execution_permission") is not True:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "model_strategy_blueprint_live_permission_missing",
+        }
+    if normalized_side not in eligible_sides:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "direction_not_authorized_by_model_blueprint",
+        }
+    return {
+        **result,
+        "eligible": True,
+        "reason": "direction_authorized_by_model_blueprint",
+    }
+
+
 def paper_strategy_replay_available(blueprint: dict[str, Any] | None) -> bool:
     """Allow paper evaluation of a complete artifact without granting execution."""
 

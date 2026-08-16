@@ -89,21 +89,23 @@ def _slippage_fact(
     side: str,
     average_price: float,
     mark_price: float,
+    contracts: float = 2.0,
+    contract_size: float = 0.01,
 ) -> dict:
     return build_okx_fill_mark_slippage(
         order_id=order_id,
         inst_id="BTC-USDT-SWAP",
         side=side,
-        contracts=2.0,
+        contracts=contracts,
         average_price=average_price,
-        contract_size=0.01,
+        contract_size=contract_size,
         rows=[
             {
                 "ordId": order_id,
                 "instId": "BTC-USDT-SWAP",
                 "tradeId": trade_id,
                 "side": side,
-                "fillSz": "2",
+                "fillSz": str(contracts),
                 "fillPx": str(average_price),
                 "fillMarkPx": str(mark_price),
             }
@@ -275,6 +277,172 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert label["execution_mode"] == "paper"
     assert label["net_return_after_all_cost_pct"] == pytest.approx(8.5 / 2000.0 * 100.0)
     assert label["realized_net_pnl_usdt"] == 8.5
+
+
+def test_complete_lifecycle_aggregates_multiple_close_orders() -> None:
+    lineage = _complete_lineage()
+    first_close = lineage["orders_by_exchange_id"]["close-1"]
+    first_close.quantity = 0.01
+    first_close.fee = 0.3
+    first_close.okx_fill_contracts = 1.0
+    first_close.okx_trade_ids = "trade-close-1"
+    first_close.okx_raw_fills.update(
+        {
+            "trade_ids": ["trade-close-1"],
+            "contracts": 1.0,
+            "base_quantity": 0.01,
+            "fee_abs": 0.3,
+            "execution_slippage": _slippage_fact(
+                order_id="close-1",
+                trade_id="trade-close-1",
+                side="sell",
+                average_price=100_500.0,
+                mark_price=100_580.0,
+                contracts=1.0,
+            ),
+        }
+    )
+    lineage["orders_by_exchange_id"]["close-2"] = SimpleNamespace(
+        exchange_order_id="close-2",
+        okx_inst_id="BTC-USDT-SWAP",
+        side="sell",
+        quantity=0.01,
+        price=100_500.0,
+        fee=0.3,
+        okx_fill_contracts=1.0,
+        okx_fill_pnl=5.0,
+        okx_trade_ids="trade-close-2",
+        decision_id=93,
+        order_type="market",
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": "close-2",
+            "trade_ids": ["trade-close-2"],
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": 1.0,
+            "base_quantity": 0.01,
+            "avg_price": 100_500.0,
+            "fee_abs": 0.3,
+            "fill_pnl": 5.0,
+            "contract_size": 0.01,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "execution_slippage": _slippage_fact(
+                order_id="close-2",
+                trade_id="trade-close-2",
+                side="sell",
+                average_price=100_500.0,
+                mark_price=100_580.0,
+                contracts=1.0,
+            ),
+        },
+    )
+    history = _history(
+        close_order_ids=["close-1", "close-2"],
+        linked_order_ids=["entry-1", "close-1", "close-2"],
+    )
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["close_order_ids"] == ["close-1", "close-2"]
+    assert sample["close_order_id"] == "close-2"
+    assert sample["close_fee"] == pytest.approx(0.6)
+    assert sample["trade_fact_trusted"] is True
+    assert sample["profit_training_contract"]["eligible"] is True
+    outcome = _outcome(sample)
+    assert outcome["training_label_contract"]["close_order_ids"] == [
+        "close-1",
+        "close-2",
+    ]
+
+
+def test_historical_price_and_fill_pnl_recover_changed_contract_value() -> None:
+    history = _history(
+        open_avg_px=100.0,
+        close_avg_px=101.0,
+        open_max_pos=100.0,
+        realized_pnl=0.9,
+        pnl=1.0,
+        fee=-0.1,
+        funding_fee=0.0,
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "openAvgPx": "100",
+        "closeAvgPx": "101",
+        "realizedPnl": "0.9",
+        "pnl": "1",
+        "fee": "-0.1",
+        "fundingFee": "0",
+        "_bb_contract_spec": {
+            "ctVal": "1",
+            "ctMult": "1",
+            "lotSz": "1",
+            "source": "okx_public_instruments",
+        },
+    }
+    lineage = _complete_lineage()
+    entry = lineage["orders_by_exchange_id"]["entry-1"]
+    entry.quantity = 100.0
+    entry.price = 100.0
+    entry.fee = 0.04
+    entry.okx_fill_contracts = 100.0
+    entry.okx_raw_fills.update(
+        {
+            "contracts": 100.0,
+            "base_quantity": 100.0,
+            "avg_price": 100.0,
+            "fee_abs": 0.04,
+            "contract_size": 1.0,
+            "execution_slippage": _slippage_fact(
+                order_id="entry-1",
+                trade_id="trade-entry",
+                side="buy",
+                average_price=100.0,
+                mark_price=99.9,
+                contracts=100.0,
+                contract_size=1.0,
+            ),
+        }
+    )
+    close = lineage["orders_by_exchange_id"]["close-1"]
+    close.quantity = 100.0
+    close.price = 101.0
+    close.fee = 0.06
+    close.okx_fill_contracts = 100.0
+    close.okx_fill_pnl = 1.0
+    close.okx_raw_fills.update(
+        {
+            "contracts": 100.0,
+            "base_quantity": 100.0,
+            "avg_price": 101.0,
+            "fee_abs": 0.06,
+            "fill_pnl": 1.0,
+            "contract_size": 1.0,
+            "execution_slippage": _slippage_fact(
+                order_id="close-1",
+                trade_id="trade-close",
+                side="sell",
+                average_price=101.0,
+                mark_price=101.1,
+                contracts=100.0,
+                contract_size=1.0,
+            ),
+        }
+    )
+
+    sample = build_okx_history_training_sample(history, **lineage)
+
+    assert sample["historical_contract_reconciliation"]["applied"] is True
+    assert sample["contract_ct_val"] == pytest.approx(0.01)
+    assert sample["notional"] == pytest.approx(100.0)
+    assert sample["notional_source"] == (
+        "okx_fills_history_pnl_and_position_history_price_path"
+    )
+    assert sample["gross_return_price_consistent"] is True
+    assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(0.9)
+    assert sample["trade_fact_trusted"] is True
+    assert sample["profit_training_contract"]["eligible"] is True
 
 
 def test_rules_canary_loss_keeps_rule_authority_and_model_shadow_lesson() -> None:

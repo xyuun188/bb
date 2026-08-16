@@ -42,6 +42,27 @@ def safe_error_text(
     return text
 
 
+def safe_error_tail(
+    value: Any,
+    *,
+    limit: int = DEFAULT_ERROR_TEXT_LIMIT,
+    fallback: str | None = None,
+) -> str:
+    """Return a redacted error excerpt that preserves the final exception line."""
+
+    if fallback is None:
+        fallback = type(value).__name__ if value is not None else ""
+    text = redact_output(value).strip() or fallback
+    safe_limit = max(0, int(limit or 0))
+    if not safe_limit or len(text) <= safe_limit:
+        return text
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    tail = "\n".join(lines[-6:]) if lines else text[-safe_limit:]
+    if len(tail) > safe_limit:
+        tail = tail[-safe_limit:]
+    return f"...{tail}"
+
+
 def bounded_redacted_text(value: Any, *, limit: int) -> str:
     """Return redacted text capped to a deterministic character budget."""
     text = redact_output(value).strip()

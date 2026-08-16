@@ -253,9 +253,12 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     assert decision.action.value == "hold"
     assert captured_calls
     kwargs = captured_calls[-1]["kwargs"]
-    assert kwargs["timeout"] <= 12.0
-    assert kwargs["max_tokens"] <= 320
-    assert kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
+    assert kwargs["timeout"] <= 18.0
+    assert kwargs["max_tokens"] == 640
+    # Fast independent experts must use the raw completion path.  OpenAI's
+    # parse helper raises before exposing a length-limited completion, while
+    # LLMAgent's own extractor can retain diagnostics and deny execution.
+    assert "response_format" not in kwargs.get("model_kwargs", {})
     assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     system_prompt = str(captured_calls[-1]["messages"][0].content)
     assert "PAPER_FAST_EXPERT_JSON_V1" in system_prompt
@@ -324,6 +327,98 @@ def test_provider_response_contract_distinguishes_reasoning_only_from_final_json
     assert completed["reasoning_only"] is False
     assert completed["has_final_content"] is True
     assert completed["reasoning_tokens"] == 20
+
+
+@pytest.mark.asyncio
+async def test_length_limited_expert_recovers_complete_provider_completion_without_execution_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLengthError(Exception):
+        def __init__(self) -> None:
+            self.completion = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=(
+                                '{"action":"hold","confidence":0.62,'
+                                '"reasoning":"provider ended after complete JSON"}'
+                            )
+                        )
+                    )
+                ]
+            )
+
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, _messages: list[Any]) -> Any:
+            raise FakeLengthError()
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": "http://llm.test/v1",
+            "api_key": "test-key",
+            "model": "BB-FinQuant-Expert-14B",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    decision = await agent.decide(
+        FeatureVector(symbol="BTC/USDT", current_price=100.0),
+        {"expert_mode": True},
+    )
+
+    assert decision.raw_response["truncated_json_recovery"] is True
+    assert decision.raw_response["production_permission"] is False
+    assert decision.raw_response["provider_response_contract"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_length_limited_expert_with_incomplete_provider_completion_uses_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLengthError(Exception):
+        def __init__(self) -> None:
+            self.completion = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"action":"long","confidence":0.8'
+                        )
+                    )
+                ]
+            )
+
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, _messages: list[Any]) -> Any:
+            raise FakeLengthError()
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": "http://llm.test/v1",
+            "api_key": "test-key",
+            "model": "BB-FinQuant-Expert-14B",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    decision = await agent.decide(
+        FeatureVector(symbol="BTC/USDT", current_price=100.0),
+        {"expert_mode": True},
+    )
+
+    assert decision.raw_response["local_fallback"] is True
+    assert decision.raw_response["production_eligible"] is False
 
 
 def test_invalid_final_json_is_reported_as_a_parse_error() -> None:

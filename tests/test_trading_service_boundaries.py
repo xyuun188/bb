@@ -1008,15 +1008,15 @@ def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> Non
     }
 
 
-def test_non_market_discovery_feature_fetch_keeps_complete_source_policy() -> None:
+def test_position_discovery_refreshes_derivatives_without_blocking_round() -> None:
     options = TradingService._market_feature_fetch_options(
         run_market_analysis=False,
         run_position_analysis=True,
     )
 
     assert options["block_on_remote_ticker"] is False
-    assert options["block_on_remote_indicators"] is True
-    assert options["block_on_remote_derivatives"] is True
+    assert options["block_on_remote_indicators"] is False
+    assert options["block_on_remote_derivatives"] is False
     assert options["allow_cached_indicator_build"] is True
     assert options["allow_indicator_background_refresh"] is True
     assert options["allow_derivatives_background_refresh"] is True
@@ -2591,6 +2591,77 @@ async def test_local_ai_cursor_probe_isolated_from_trading_database_pool(
     script_path = str(captured["args"][1]).replace("\\", "/")
     assert script_path.endswith("scripts/run_local_ai_tools_training_cursors.py")
     assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "kwargs", "stdout", "expected_error"),
+    (
+        (
+            "_run_okx_order_fact_sync_subprocess",
+            {
+                "mode": "paper",
+                "lookback_hours": 24,
+                "limit": 100,
+                "timeout_seconds": 120.0,
+            },
+            (
+                b"BB_OKX_ORDER_FACT_SYNC_RESULT_JSON="
+                b'{"status":"ok","okx_pull_available":true}\n'
+            ),
+            "isolated OKX order fact sync exited with code 17 without stderr",
+        ),
+        (
+            "_run_local_ml_training_subprocess",
+            {},
+            (
+                b"BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="
+                b'{"trained":false,"reason":"not_due"}\n'
+            ),
+            "isolated local ML training exited with code 17 without stderr",
+        ),
+        (
+            "_run_local_ai_tools_training_subprocess",
+            {},
+            b"",
+            "isolated local AI tools training exited with code 17 without stderr",
+        ),
+        (
+            "_run_local_ai_tools_training_cursor_subprocess",
+            {},
+            b"",
+            "isolated Local AI cursor probe exited with code 17 without stderr",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_isolated_subprocess_empty_stderr_reports_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    kwargs: dict[str, Any],
+    stdout: bytes,
+    expected_error: str,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeProcess:
+        returncode = 17
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return stdout, b""
+
+    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await getattr(service, method_name)(**kwargs)
+
+    assert result["error"] == expected_error
+    assert result["error"] != "str"
 
 
 @pytest.mark.asyncio
@@ -5362,16 +5433,12 @@ def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
     )
 
 
-def test_starting_analysis_round_preempts_background_training_processes() -> None:
+def test_starting_analysis_round_does_not_preempt_isolated_training_processes() -> None:
     service = TradingService.__new__(TradingService)
     service._active_training_processes = set()
-    terminated: list[bool] = []
 
     class FakeProcess:
         returncode = None
-
-        def terminate(self) -> None:
-            terminated.append(True)
 
     process = FakeProcess()
     service._active_training_processes.add(process)
@@ -5382,7 +5449,7 @@ def test_starting_analysis_round_preempts_background_training_processes() -> Non
     }
     service._start_runtime_round("market", datetime.now(UTC))
 
-    assert terminated == [True]
+    assert process in service._active_training_processes
 
 
 @pytest.mark.asyncio
@@ -5414,6 +5481,59 @@ async def test_auto_training_waits_for_startup_grace_before_first_check(
     await asyncio.gather(task, return_exceptions=True)
 
     assert started.is_set()
+
+
+def test_auto_training_busy_deferral_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    started_at = datetime(2026, 8, 15, 1, 0, tzinfo=UTC)
+    service._analysis_runtime = {
+        "market": trading_service._AnalysisRuntimeState(last_started_at=started_at),
+    }
+    service._active_analysis_symbols = set()
+    service._market_entry_pipeline_semaphore = None
+
+    assert service._auto_training_should_defer(now=started_at) is True
+    assert (
+        service._auto_training_should_defer(
+            now=started_at
+            + timedelta(seconds=trading_service.TRAINING_MAX_BUSY_DEFERRAL_SECONDS - 1)
+        )
+        is True
+    )
+    assert (
+        service._auto_training_should_defer(
+            now=started_at
+            + timedelta(seconds=trading_service.TRAINING_MAX_BUSY_DEFERRAL_SECONDS)
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_training_busy_retry_does_not_sleep_full_training_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._start_time = None
+    service._analysis_runtime = {
+        "market": trading_service._AnalysisRuntimeState(last_started_at=datetime.now(UTC)),
+    }
+    service._active_analysis_symbols = set()
+    service._market_entry_pipeline_semaphore = None
+    delays: list[float] = []
+
+    async def stop_after_sleep(delay: float) -> None:
+        delays.append(delay)
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
+
+    await service._ml_auto_train_loop()
+
+    assert delays == [trading_service.TRAINING_BUSY_RETRY_SECONDS]
 
 
 def test_market_round_budget_reserves_full_analysis_time_per_candidate(
@@ -5623,12 +5743,12 @@ async def test_market_selection_history_projects_only_small_selection_fields(
 
 
 @pytest.mark.asyncio
-async def test_market_selection_history_timeout_detaches_slow_database_cleanup(
+async def test_market_selection_history_loads_in_background_without_blocking_round(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
-    cancellation_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
+    query_started = asyncio.Event()
+    release_query = asyncio.Event()
     cleanup_finished = asyncio.Event()
 
     class Policy:
@@ -5639,13 +5759,9 @@ async def test_market_selection_history_timeout_detaches_slow_database_cleanup(
 
     class Session:
         async def execute(self, _statement: Any) -> Any:
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                cancellation_started.set()
-                await release_cleanup.wait()
-            finally:
-                cleanup_finished.set()
+            query_started.set()
+            await release_query.wait()
+            cleanup_finished.set()
             return SimpleNamespace(all=lambda: [])
 
     class SessionContext:
@@ -5656,22 +5772,16 @@ async def test_market_selection_history_timeout_detaches_slow_database_cleanup(
             return None
 
     monkeypatch.setattr(trading_service, "get_read_session_ctx", SessionContext)
-    monkeypatch.setattr(
-        trading_service,
-        "MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS",
-        0.01,
-    )
-
     started = asyncio.get_running_loop().time()
     await service._ensure_market_analysis_selection_history()
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 0.2
-    assert cancellation_started.is_set()
+    assert query_started.is_set()
     assert cleanup_finished.is_set() is False
     assert policy.history_loaded is True
 
-    release_cleanup.set()
+    release_query.set()
     await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
 
 
@@ -6358,6 +6468,47 @@ async def test_vector_memory_runs_in_parallel_with_expert_memory(
     assert second["vector_memory_feedback"]["status"] == "ok"
     assert second["vector_memory_feedback"]["matched_count"] == 1
     assert second["vector_memory_feedback"]["hits"] == [{"id": 1}]
+
+
+@pytest.mark.asyncio
+async def test_expert_memory_context_refresh_does_not_block_market_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._expert_memory_context_cache = {}
+    service._expert_memory_context_tasks = {}
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    release = asyncio.Event()
+    calls = 0
+
+    class FakeExpertMemoryService:
+        async def context(self, _symbol: str) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {
+                "expert_memories": {"trend_expert": [{"id": 7}]},
+                "expert_memories_flat": [{"id": 7}],
+                "memory_feedback": {"status": "available"},
+            }
+
+    service.expert_memory_service = FakeExpertMemoryService()
+    monkeypatch.setattr(trading_service.settings, "vector_memory_enabled", False)
+
+    first = await service._memory_context_with_vector_feedback("BTC/USDT")
+
+    assert first["expert_memory_context_cache"]["status"] == "warming"
+    assert first["expert_memories"] == {}
+    assert len(service._expert_memory_context_tasks) == 1
+
+    release.set()
+    await asyncio.gather(*service._expert_memory_context_tasks.values())
+    second = await service._memory_context_with_vector_feedback("BTC/USDT")
+
+    assert calls == 1
+    assert second["expert_memory_context_cache"]["status"] == "hit"
+    assert second["expert_memories_flat"] == [{"id": 7}]
 
 
 @pytest.mark.asyncio

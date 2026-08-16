@@ -39,11 +39,17 @@ import math
 import multiprocessing
 import os
 import re
+import signal
 import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -87,6 +93,19 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
 CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
+TRAIN_REQUEST_TIMEOUT_SECONDS = min(
+    max(
+        float(
+            os.environ.get(
+                "LOCAL_AI_TOOLS_TRAINING_TIMEOUT_SECONDS",
+                "5400",
+            )
+        ),
+        60.0,
+    ),
+    7200.0,
+)
+TRAINING_RUNTIME_STATE_PATH = PHASE3_ROOT / "runtime" / "phase3_quant_api" / "training_process.json"
 LOCAL_REVIEW_DISABLED_DETAIL = (
     "Local AI tools do not provide high-risk trade review. "
     "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
@@ -455,6 +474,7 @@ app.add_middleware(
 def startup_load_current_bundle() -> None:
     """Load the verified bundle before accepting inference traffic."""
 
+    _cleanup_stale_training_workers()
     # The first request otherwise pays the full joblib/scikit-learn and optional
     # specialist-model load cost and is mistaken for a route timeout by the
     # platform. Warm every inference path before accepting traffic.
@@ -5494,6 +5514,143 @@ def _configure_training_child() -> None:
         os.nice(10)
     except (AttributeError, OSError):
         pass
+
+
+def _process_start_token(pid: int) -> str:
+    """Return a PID-reuse-safe identity token on Linux when available."""
+
+    if os.name == "nt":
+        return ""
+    try:
+        stat_text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+        _comm, remainder = stat_text.split(") ", 1)
+        fields = remainder.split()
+        # /proc/<pid>/stat field 22 is index 19 after the comm field.
+        return str(fields[19])
+    except (IndexError, OSError, ValueError):
+        return ""
+
+
+def _pid_matches_identity(pid: int, token: str | None) -> bool:
+    current = _process_start_token(pid)
+    return bool(current) and (not token or current == str(token))
+
+
+def _terminate_pid(pid: int, token: str | None = None) -> bool:
+    """Terminate one known training process without touching a reused PID."""
+
+    if int(pid or 0) <= 0 or int(pid) == os.getpid():
+        return False
+    if token and not _pid_matches_identity(int(pid), token):
+        return False
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _pid_matches_identity(int(pid), token):
+            return True
+        time.sleep(0.05)
+    try:
+        if _pid_matches_identity(int(pid), token):
+            os.kill(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    return True
+
+
+def _training_worker_processes(executor: ProcessPoolExecutor) -> list[Any]:
+    processes = getattr(executor, "_processes", {})
+    if not isinstance(processes, dict):
+        return []
+    return [process for process in processes.values() if getattr(process, "pid", None)]
+
+
+def _write_training_runtime_state(
+    *,
+    request_id: str,
+    started_at: str,
+    executor: ProcessPoolExecutor,
+    phase: str,
+) -> None:
+    TRAINING_RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    workers = _training_worker_processes(executor)
+    payload = {
+        "request_id": request_id,
+        "owner_pid": os.getpid(),
+        "started_at": started_at,
+        "phase": phase,
+        "timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+        "worker_pids": [int(process.pid) for process in workers],
+        "worker_identities": {
+            str(int(process.pid)): _process_start_token(int(process.pid))
+            for process in workers
+        },
+    }
+    temporary = TRAINING_RUNTIME_STATE_PATH.with_suffix(
+        f".{uuid.uuid4().hex}.tmp"
+    )
+    temporary.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    os.replace(temporary, TRAINING_RUNTIME_STATE_PATH)
+
+
+def _clear_training_runtime_state(request_id: str | None = None) -> None:
+    try:
+        payload = json.loads(TRAINING_RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    if request_id and str(payload.get("request_id") or "") != request_id:
+        return
+    try:
+        TRAINING_RUNTIME_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _terminate_training_executor(executor: ProcessPoolExecutor) -> None:
+    """Cancel queued work and terminate an in-flight worker before returning."""
+
+    workers = _training_worker_processes(executor)
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except (RuntimeError, TypeError):
+        executor.shutdown(wait=False)
+    for process in workers:
+        pid = int(getattr(process, "pid", 0) or 0)
+        token = _process_start_token(pid)
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=2.0)
+        except (AttributeError, OSError, ValueError):
+            _terminate_pid(pid, token)
+
+
+def _cleanup_stale_training_workers() -> None:
+    """Reap workers recorded by a previous API process before accepting traffic."""
+
+    try:
+        payload = json.loads(TRAINING_RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    owner_pid = int(payload.get("owner_pid") or 0)
+    if owner_pid == os.getpid():
+        return
+    identities = payload.get("worker_identities")
+    identities = identities if isinstance(identities, dict) else {}
+    for raw_pid in payload.get("worker_pids") or []:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        _terminate_pid(pid, identities.get(str(pid)))
+    _clear_training_runtime_state()
     try:
         available = sorted(os.sched_getaffinity(0))
         if len(available) >= 4:
@@ -5531,13 +5688,58 @@ def _invalidate_parent_bundle_cache() -> None:
 
 
 def _run_training_request(req: TrainRequest) -> dict[str, Any]:
+    global _TRAIN_EXECUTOR
+
     if (
         not ISOLATE_TRAINING_PROCESS
         or os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1"
     ):
         return _train_impl(req)
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-    result = _training_executor().submit(_isolated_training_worker, payload).result()
+    executor = _training_executor()
+    request_id = uuid.uuid4().hex
+    started_at = datetime.now(timezone.utc).isoformat()
+    future = executor.submit(_isolated_training_worker, payload)
+    _write_training_runtime_state(
+        request_id=request_id,
+        started_at=started_at,
+        executor=executor,
+        phase="running",
+    )
+    try:
+        result = future.result(timeout=TRAIN_REQUEST_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        return {
+            "trained": False,
+            "reason": "timeout",
+            "error": (
+                "isolated local AI training exceeded its bounded request deadline "
+                f"of {TRAIN_REQUEST_TIMEOUT_SECONDS:.0f} seconds"
+            ),
+            "training_process_isolated": True,
+            "training_request_id": request_id,
+            "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+            "training_worker_terminated": True,
+        }
+    except BaseException:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        raise
+    else:
+        _clear_training_runtime_state(request_id)
+        if not isinstance(result, dict):
+            result = {"trained": False, "reason": "invalid_training_response"}
+        result.setdefault("training_process_isolated", True)
+        result.setdefault("training_request_id", request_id)
+        result.setdefault("training_timeout_seconds", TRAIN_REQUEST_TIMEOUT_SECONDS)
     if bool(req.persist_artifact) and bool(result.get("trained")):
         _invalidate_parent_bundle_cache()
         result = _with_post_training_inference_warmup(result)
@@ -6493,6 +6695,22 @@ def _remote_preflight_command() -> str:
     )
 
 
+def _remote_training_runtime_compatibility_command() -> str:
+    """Verify the target Python can create the isolated training executor."""
+
+    return (
+        "set -euo pipefail; "
+        f"if grep -Fq max_tasks_per_child {sh(PHASE3_APP_DIR + '/local_ai_tools_api.py')}; then "
+        "echo phase3_training_unsupported_executor_argument >&2; exit 1; fi; "
+        f"{PHASE3_PYTHON_BIN} - <<'PY'\n"
+        "from concurrent.futures import ProcessPoolExecutor\n"
+        "executor = ProcessPoolExecutor(max_workers=1)\n"
+        "executor.shutdown(wait=False, cancel_futures=True)\n"
+        "print('phase3_training_executor_compatibility_ok')\n"
+        "PY"
+    )
+
+
 def _stop_legacy_8101_holder_command() -> str:
     """Stop the old ad-hoc 8101 inventory API before systemd owns the port."""
 
@@ -6691,6 +6909,12 @@ def deploy_phase3_quant_api(*, plan_only: bool = False, start: bool = True) -> N
     try:
         run_remote_text(ssh, _remote_preflight_command(), timeout=180, check=True)
         _upload_text(ssh, f"{PHASE3_APP_DIR}/local_ai_tools_api.py", SERVICE_CODE)
+        run_remote_text(
+            ssh,
+            _remote_training_runtime_compatibility_command(),
+            timeout=60,
+            check=True,
+        )
         staged_service_path = f"{PHASE3_SYSTEMD_DIR}/{PHASE3_SERVICE_NAME}"
         _upload_text(ssh, staged_service_path, render_phase3_quant_api_service())
         _upload_text(

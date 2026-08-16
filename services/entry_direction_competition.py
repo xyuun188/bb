@@ -13,6 +13,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution,
     signal_return_distribution_eligibility,
 )
+from services.model_strategy_blueprint import model_strategy_side_authorization
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 
 
@@ -279,6 +280,34 @@ class EntryDirectionCompetitionPolicy:
             ),
             execution_scope=execution_scope,
         )
+        direction_authorization = {
+            side: model_strategy_side_authorization(
+                ml_signal_context,
+                execution_scope=execution_scope,
+                side=side,
+            )
+            for side in ("long", "short")
+        }
+        for side in ("long", "short"):
+            authorization = direction_authorization[side]
+            if authorization.get("enforced") is not True:
+                continue
+            for item in evidence[side]:
+                item["model_strategy_side_authorization"] = authorization
+                if authorization.get("eligible") is True:
+                    continue
+                # Keep otherwise-valid evidence as a counterfactual baseline.
+                # It cannot authorize this side, but the selected side still
+                # needs a fair long-vs-short comparison.
+                item["direction_comparison_eligible"] = bool(
+                    item.get("decision_eligible") is True
+                )
+                item["decision_eligible"] = False
+                item["paper_eligible"] = False
+                item["production_eligible"] = False
+                item["aggregate_eligible"] = False
+                item["observation_only"] = True
+                item["eligibility_reason"] = authorization.get("reason")
         quant_weights = _paper_quant_weights(strategy_mode)
         if quant_weights:
             for side in ("long", "short"):
@@ -403,6 +432,7 @@ class EntryDirectionCompetitionPolicy:
             "paper_source_count": source_count if execution_scope == "paper" else 0,
             "production_source_count": production_source_count,
             "production_permission": False,
+            "model_strategy_direction_authorization": direction_authorization,
             "policy": "execution_scoped_gross_market_observation_only_no_fixed_gap",
             "aggregate_blockers": aggregate_blockers,
             "selected_horizon_minutes": (
@@ -418,7 +448,7 @@ class EntryDirectionCompetitionPolicy:
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-08-13.native-horizon-direction-observation.v4",
+                "strategy_version": "2026-08-13.native-horizon-direction-observation.v5",
                 "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Float, cast, func, or_, select
+from sqlalchemy import Float, cast, func, or_, select, update
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
@@ -97,16 +97,17 @@ class MemoryRepository(BaseRepository):
         }
 
     async def mark_memories_used(self, memory_ids: list[int]) -> None:
-        if not memory_ids:
+        ids = sorted({int(memory_id or 0) for memory_id in memory_ids if int(memory_id or 0) > 0})
+        if not ids:
             return
-        result = await self.session.execute(
-            select(ExpertMemory).where(ExpertMemory.id.in_(memory_ids))
+        await self.session.execute(
+            update(ExpertMemory)
+            .where(ExpertMemory.id.in_(ids))
+            .values(
+                hit_count=func.coalesce(ExpertMemory.hit_count, 0) + 1,
+                last_used_at=datetime.now(UTC),
+            )
         )
-        now = datetime.now(UTC)
-        for memory in result.scalars().all():
-            memory.hit_count = int(memory.hit_count or 0) + 1
-            memory.last_used_at = now
-        await self.session.flush()
 
     async def upsert_memory(self, data: dict[str, Any]) -> ExpertMemory:
         data = _normalize_memory_payload(dict(data or {}))

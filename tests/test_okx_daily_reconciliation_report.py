@@ -75,6 +75,21 @@ def test_online_report_parser_ignores_runtime_logs_before_json() -> None:
     assert report == {"status": "warning", "mutates_database": False}
 
 
+def test_online_report_parser_accepts_pretty_nested_json_after_runtime_logs() -> None:
+    expected = {
+        "status": "ok",
+        "issue_ledger": {"summary": {"unresolved": 0}},
+        "summary": {"critical": 0},
+    }
+
+    report = report_script._last_json_object(
+        "2026-08-15 [info] executor initialized\n"
+        + json.dumps(expected, indent=2)
+    )
+
+    assert report == expected
+
+
 @pytest.mark.asyncio
 async def test_daily_reconciliation_uses_unbounded_read_only_close_scan(
     monkeypatch: pytest.MonkeyPatch,

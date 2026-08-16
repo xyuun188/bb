@@ -288,6 +288,75 @@ async def test_reference_prices_keep_swap_and_index_native_identities(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    cancelled = asyncio.Event()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        if method_name == "publicGetPublicMarkPrice":
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        if method_name == "publicGetMarketIndexTickers":
+            return {"data": []}
+        assert method_name == "publicGetMarketTicker"
+        return {"data": [{"instId": "ROBO-USDT-SWAP", "last": "0.01291"}]}
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    prices = await client.fetch_reference_prices(
+        "ROBO/USDT",
+        contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
+    )
+
+    assert cancelled.is_set()
+    assert prices["mark_price"] == pytest.approx(0.01291)
+    assert prices["index_price"] == pytest.approx(0.01291)
+    assert prices["reference_prices_fallback"] == "ticker_last"
+
+
+@pytest.mark.asyncio
+async def test_reference_prices_are_single_flight_per_instrument(monkeypatch) -> None:
+    client = OKXRestClient()
+    release = asyncio.Event()
+    started = asyncio.Event()
+    calls = 0
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            started.set()
+        await release.wait()
+        if method_name == "publicGetPublicMarkPrice":
+            return {"data": [{"instId": "ROBO-USDT-SWAP", "markPx": "1.0"}]}
+        return {"data": [{"instId": "ROBO-USDT", "idxPx": "1.0"}]}
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    first = asyncio.create_task(
+        client.fetch_reference_prices(
+            "ROBO/USDT",
+            contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
+        )
+    )
+    second = asyncio.create_task(
+        client.fetch_reference_prices(
+            "ROBO/USDT",
+            contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert calls == 2
+    release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result["mark_price"] == pytest.approx(1.0)
+    assert second_result["index_price"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
 async def test_orderbook_depth_uses_native_contract_value(monkeypatch) -> None:
     client = OKXRestClient()
 
@@ -315,6 +384,41 @@ async def test_orderbook_depth_uses_native_contract_value(monkeypatch) -> None:
     assert metrics["orderbook_bid_depth"] == pytest.approx(2.0)
     assert metrics["orderbook_ask_depth"] == pytest.approx(3.003)
     assert metrics["orderbook_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+
+
+@pytest.mark.asyncio
+async def test_orderbook_timeout_returns_unavailable_then_reuses_completed_cache(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    release = asyncio.Event()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_order_book"
+        await release.wait()
+        return {
+            "timestamp": 1_783_990_800_000,
+            "bids": [[100.0, 2.0]],
+            "asks": [[100.1, 3.0]],
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    monkeypatch.setattr(
+        "data_feed.okx_rest_client.ORDERBOOK_ROUTE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    first = await client.fetch_order_book_metrics("BTC/USDT")
+    assert first["orderbook_data_available"] is False
+    assert first["orderbook_refresh_in_background"] is True
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    second = await client.fetch_order_book_metrics("BTC/USDT")
+
+    assert second["orderbook_data_available"] is True
+    assert second["orderbook_cached"] is True
 
 
 @pytest.mark.asyncio
@@ -346,6 +450,101 @@ async def test_funding_snapshot_derives_interval_from_okx_times(monkeypatch) -> 
     assert vector.funding_interval_minutes == pytest.approx(480.0)
     assert vector.funding_data_available is True
     assert vector.to_dict()["funding_rate_observed_at"] == "1783931769300"
+
+
+@pytest.mark.asyncio
+async def test_derivatives_snapshot_returns_completed_routes_before_deadline(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    cancelled = asyncio.Event()
+
+    async def funding(_symbol: str) -> dict:
+        return {"funding_rate": 0.0001}
+
+    async def open_interest(_symbol: str) -> dict:
+        return {"open_interest": 123.0}
+
+    async def orderbook(_symbol: str, *, contract_spec=None) -> dict:
+        return {"orderbook_bid_depth": 10.0, "orderbook_ask_depth": 11.0}
+
+    async def slow_reference(_symbol: str, *, contract_spec=None) -> dict:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"mark_price": 100.0}
+
+    monkeypatch.setattr(client, "fetch_funding_rate", funding)
+    monkeypatch.setattr(client, "fetch_open_interest", open_interest)
+    monkeypatch.setattr(client, "fetch_order_book_metrics", orderbook)
+    monkeypatch.setattr(client, "fetch_reference_prices", slow_reference)
+
+    result = await client.fetch_derivatives_snapshot(
+        "BTC/USDT",
+        timeout_seconds=0.01,
+    )
+
+    assert result["funding_rate"] == pytest.approx(0.0001)
+    assert result["open_interest"] == pytest.approx(123.0)
+    assert result["orderbook_bid_depth"] == pytest.approx(10.0)
+    assert result["derivatives_snapshot_partial"] is True
+    assert result["derivatives_route_status"] == {
+        "completed": ["funding", "open_interest", "orderbook"],
+        "failed": [],
+        "timed_out": ["reference_prices"],
+    }
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_derivatives_route_timeout_keeps_single_flight_and_populates_cache(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_open_interest(_symbol: str) -> dict:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"open_interest_contracts": 321.0}
+
+    monkeypatch.setattr(client, "fetch_open_interest", slow_open_interest)
+
+    first = asyncio.create_task(
+        client._cached_derivatives_route(
+            "open_interest",
+            "BTC/USDT",
+            lambda: client.fetch_open_interest("BTC/USDT"),
+            timeout_seconds=0.01,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    first_result = await first
+    assert first_result["open_interest_timeout"] is True
+    assert calls == 1
+
+    second = asyncio.create_task(
+        client._cached_derivatives_route(
+            "open_interest",
+            "BTC/USDT",
+            lambda: client.fetch_open_interest("BTC/USDT"),
+            timeout_seconds=0.01,
+        )
+    )
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    second_result = await second
+    assert second_result["open_interest_contracts"] == pytest.approx(321.0)
+    assert calls == 1
 
 
 @pytest.mark.asyncio

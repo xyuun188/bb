@@ -318,3 +318,33 @@ async def test_evidence_refresh_survives_cancelled_caller_and_populates_cache() 
 
     assert report["available"] is True
     assert calls == {"health": 1, "specialist": 1}
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_evidence_report_starts_refresh_without_waiting() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Health:
+        async def report(self, **_kwargs):
+            started.set()
+            await release.wait()
+            return {"components": {}}
+
+    class Specialist:
+        async def report(self, **_kwargs):
+            await release.wait()
+            return {"models": []}
+
+    service = ContinuousModelWeightEvidenceService(
+        health_service=Health(),
+        specialist_service=Specialist(),
+    )
+    report = await service.report("paper", wait_for_refresh=False)
+
+    assert report["available"] is False
+    assert report["refresh_in_flight"] is True
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    release.set()
+    assert service._refresh_task is not None
+    await asyncio.wait_for(asyncio.shield(service._refresh_task), timeout=0.2)

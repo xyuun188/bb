@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-13.paper-model-direction.v7"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-13.paper-model-direction.v8"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
@@ -76,12 +76,17 @@ def _weighted_mean(rows: list[dict[str, Any]], key: str) -> float | None:
 def _quant_family_summaries(
     evidence_rows: list[dict[str, Any]],
     execution_cost_pct: float,
+    *,
+    include_direction_comparison_observations: bool = False,
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, float], list[dict[str, Any]]] = {}
     for item in evidence_rows:
         if not isinstance(item, dict):
             continue
-        if item.get("decision_eligible") is not True:
+        if item.get("decision_eligible") is not True and not (
+            include_direction_comparison_observations
+            and item.get("direction_comparison_eligible") is True
+        ):
             continue
         family = _quant_family(str(item.get("source") or ""))
         if not family:
@@ -344,6 +349,7 @@ def assess_directional_entry_support(
         opposite_summaries = _quant_family_summaries(
             opposite_rows if isinstance(opposite_rows, list) else [],
             float(_float(quantitative.get("execution_cost_pct")) or 0.0),
+            include_direction_comparison_observations=True,
         )
         opposite_by_family = {
             str(item.get("family") or ""): item

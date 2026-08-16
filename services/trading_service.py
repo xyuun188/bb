@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from sqlalchemy import Float, cast, func, or_, select
+from sqlalchemy import Float, cast, func, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
@@ -33,7 +33,7 @@ from config.settings import (
     FIXED_AI_MODEL_SLOTS,
     settings,
 )
-from core.safe_output import safe_error_text
+from core.safe_output import safe_error_tail, safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
 from db.repositories.risk_repo import RiskRepository
@@ -258,7 +258,6 @@ MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 6.0
-MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS = 5.0
 MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS = (
     "current_price",
     "entry_activity_volume_ratio",
@@ -268,6 +267,9 @@ MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS = (
 )
 VECTOR_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 VECTOR_MEMORY_CONTEXT_CACHE_LIMIT = 128
+EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
+EXPERT_MEMORY_CONTEXT_CACHE_LIMIT = 128
+EXPERT_MEMORY_CONTEXT_REFRESH_CONCURRENCY = 2
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
@@ -279,6 +281,8 @@ MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
 TRAINING_STARTUP_GRACE_SECONDS = 180.0
+TRAINING_BUSY_RETRY_SECONDS = 30.0
+TRAINING_MAX_BUSY_DEFERRAL_SECONDS = 15 * 60.0
 AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS = 30 * 60
 AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS = 4 * 60 * 60
 
@@ -782,6 +786,11 @@ class TradingService:
         self._market_indicator_prewarm_last_diagnostics: dict[str, Any] = {}
         self._vector_memory_context_cache: dict[str, dict[str, Any]] = {}
         self._vector_memory_context_tasks: dict[str, asyncio.Task] = {}
+        self._expert_memory_context_cache: dict[str, dict[str, Any]] = {}
+        self._expert_memory_context_tasks: dict[str, asyncio.Task] = {}
+        self._expert_memory_context_refresh_semaphore = asyncio.Semaphore(
+            EXPERT_MEMORY_CONTEXT_REFRESH_CONCURRENCY
+        )
         self._market_timeout_retry_not_before: dict[str, datetime] = {}
         self.entry_opportunity_gate = EntryOpportunityGatePolicy(
             suspicious_symbol_policy=self.entry_suspicious_symbol,
@@ -996,6 +1005,7 @@ class TradingService:
         self._local_tools_active_training_run_id: str | None = None
         self._local_tools_last_train_started_at: datetime | None = None
         self._local_tools_last_completed_shadow_count: int = 0
+        self._auto_train_busy_since: datetime | None = None
         self._strategy_learning_context_cache: dict[str, Any] = {}
         self._strategy_learning_context_refresh_tasks: dict[str, asyncio.Task] = {}
 
@@ -1010,6 +1020,52 @@ class TradingService:
             store = MODEL_TRAINING_STATE_STORE
             self.model_training_state_store = store
         return store
+
+    def _record_training_subprocess_timeout(
+        self,
+        *,
+        scheduler_id: str,
+        model_ids: tuple[str, ...],
+        error: str,
+        run_id: str | None = None,
+    ) -> None:
+        """Close the persisted run when its isolated worker is killed by a lease timeout."""
+
+        store = self._model_training_state()
+        selected_run_id = run_id
+        if not selected_run_id:
+            try:
+                payload = store.read()
+                rows = payload.get("models") if isinstance(payload, dict) else {}
+                for model_id in model_ids:
+                    row = rows.get(model_id) if isinstance(rows, dict) else None
+                    if isinstance(row, dict) and row.get("state") == "running":
+                        selected_run_id = str(row.get("active_run_id") or "") or None
+                        if selected_run_id:
+                            break
+            except Exception as exc:
+                logger.warning(
+                    "failed to read training state before timeout closure",
+                    scheduler_id=scheduler_id,
+                    error=safe_error_text(exc, limit=180),
+                )
+        if not selected_run_id:
+            return
+        try:
+            store.record_timeout(
+                scheduler_id=scheduler_id,
+                model_ids=model_ids,
+                run_id=selected_run_id,
+                error=error,
+                next_check_at=datetime.now(UTC)
+                + timedelta(seconds=AUTO_TRAIN_RETRY_INTERVAL_SECONDS),
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to persist training subprocess timeout state",
+                scheduler_id=scheduler_id,
+                error=safe_error_text(exc, limit=180),
+            )
 
     def _auto_train_failure_delay(self, results: list[dict[str, Any]]) -> float:
         """Back off repeated failures while keeping normal checks on their cadence."""
@@ -1048,6 +1104,37 @@ class TradingService:
                 AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS,
             )
         )
+
+    def _auto_training_should_defer(self, *, now: datetime | None = None) -> bool:
+        runtime = getattr(self, "_analysis_runtime", {})
+        busy = any(
+            isinstance(runtime.get(scope), _AnalysisRuntimeState) and runtime[scope].active
+            for scope in ("market", "position")
+        ) or bool(
+            getattr(self, "_active_analysis_symbols", set())
+            or (
+                getattr(self, "_market_entry_pipeline_semaphore", None)
+                and self._market_entry_pipeline_semaphore.locked()
+            )
+        )
+        if not busy:
+            self._auto_train_busy_since = None
+            return False
+
+        checked_at = now or datetime.now(UTC)
+        busy_since = getattr(self, "_auto_train_busy_since", None)
+        if not isinstance(busy_since, datetime):
+            self._auto_train_busy_since = checked_at
+            return True
+        if (checked_at - busy_since).total_seconds() < TRAINING_MAX_BUSY_DEFERRAL_SECONDS:
+            return True
+
+        self._auto_train_busy_since = None
+        logger.warning(
+            "auto-training busy deferral limit reached; running isolated trainers",
+            deferred_seconds=round((checked_at - busy_since).total_seconds(), 3),
+        )
+        return False
 
     def set_loop_stage(self, stage: str) -> None:
         """Set loop stage through an explicit analysis-service boundary."""
@@ -1928,8 +2015,8 @@ class TradingService:
                 "status": "deferred",
                 "okx_pull_available": False,
                 "error": (
-                    safe_error_text(stderr_text, limit=180, fallback="")
-                    or safe_error_text(exc, limit=180)
+                    safe_error_tail(stderr_text, limit=500, fallback="")
+                    or safe_error_tail(exc, limit=500)
                 ),
                 "deferred_stages": ["isolated_process"],
                 "process_isolated": True,
@@ -1949,10 +2036,13 @@ class TradingService:
                 {
                     "status": "deferred",
                     "okx_pull_available": False,
-                    "error": safe_error_text(
+                    "error": safe_error_tail(
                         stderr.decode("utf-8", errors="replace"),
-                        limit=180,
-                        fallback="isolated OKX order fact sync failed",
+                        limit=500,
+                        fallback=(
+                            "isolated OKX order fact sync exited with code "
+                            f"{process.returncode} without stderr"
+                        ),
                     ),
                     "deferred_stages": ["isolated_process"],
                 }
@@ -4258,7 +4348,7 @@ class TradingService:
         vector_result: dict[str, Any] = {}
         if bool(settings.vector_memory_enabled):
             vector_result = self._cached_vector_memory_context(symbol, action)
-        context = await self.expert_memory_service.context(symbol)
+        context = self._cached_expert_memory_context(symbol)
         if not bool(settings.vector_memory_enabled):
             return context
         await asyncio.sleep(0)
@@ -4286,6 +4376,102 @@ class TradingService:
         context["memory_feedback"] = memory_feedback
         context["vector_memory_feedback"] = memory_feedback["vector_memory"]
         return context
+
+    def _empty_expert_memory_context(self, *, cache_status: str) -> dict[str, Any]:
+        policy = getattr(self.expert_memory_service, "memory_feedback_policy", None)
+        feedback = policy.build([]) if policy is not None else {}
+        return {
+            "expert_memories": {},
+            "expert_memories_flat": [],
+            "memory_feedback": feedback,
+            "expert_memory_context_cache": {
+                "status": cache_status,
+                "ttl_seconds": EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS,
+            },
+        }
+
+    def _cached_expert_memory_context(self, symbol: str) -> dict[str, Any]:
+        """Return cached prompt memories while refreshing them off the analysis path."""
+
+        normalized = self._normalize_position_symbol(symbol) or str(symbol or "")
+        now = datetime.now(UTC)
+        cache = getattr(self, "_expert_memory_context_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._expert_memory_context_cache = cache
+        cached = cache.get(normalized)
+        cached_payload: dict[str, Any] = {}
+        age_seconds = float("inf")
+        if isinstance(cached, dict):
+            cached_at = cached.get("cached_at")
+            age_seconds = (
+                max((now - cached_at).total_seconds(), 0.0)
+                if isinstance(cached_at, datetime)
+                else float("inf")
+            )
+            cached_payload = self._safe_dict(cached.get("payload"))
+            if age_seconds <= EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS:
+                return {
+                    **cached_payload,
+                    "expert_memory_context_cache": {
+                        "status": "hit",
+                        "age_seconds": round(age_seconds, 3),
+                        "ttl_seconds": EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS,
+                    },
+                }
+
+        tasks = getattr(self, "_expert_memory_context_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._expert_memory_context_tasks = tasks
+        task = tasks.get(normalized)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._refresh_expert_memory_context(normalized, symbol)
+            )
+            tasks[normalized] = task
+
+        if cached_payload:
+            return {
+                **cached_payload,
+                "expert_memory_context_cache": {
+                    "status": "stale_refreshing",
+                    "age_seconds": round(age_seconds, 3),
+                    "ttl_seconds": EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS,
+                },
+            }
+        return self._empty_expert_memory_context(cache_status="warming")
+
+    async def _refresh_expert_memory_context(self, key: str, symbol: str) -> None:
+        try:
+            semaphore = getattr(self, "_expert_memory_context_refresh_semaphore", None)
+            if not isinstance(semaphore, asyncio.Semaphore):
+                semaphore = asyncio.Semaphore(EXPERT_MEMORY_CONTEXT_REFRESH_CONCURRENCY)
+                self._expert_memory_context_refresh_semaphore = semaphore
+            async with semaphore:
+                payload = await self.expert_memory_service.context(symbol)
+            if not isinstance(payload, dict):
+                payload = self._empty_expert_memory_context(cache_status="invalid_result")
+            cache = getattr(self, "_expert_memory_context_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._expert_memory_context_cache = cache
+            cache[key] = {
+                "cached_at": datetime.now(UTC),
+                "payload": payload,
+            }
+            while len(cache) > EXPERT_MEMORY_CONTEXT_CACHE_LIMIT:
+                cache.pop(next(iter(cache)))
+        except Exception as exc:
+            logger.warning(
+                "expert memory context background refresh failed",
+                symbol=symbol,
+                error=safe_error_text(exc, limit=180),
+            )
+        finally:
+            tasks = getattr(self, "_expert_memory_context_tasks", None)
+            if isinstance(tasks, dict) and tasks.get(key) is asyncio.current_task():
+                tasks.pop(key, None)
 
     def _vector_memory_context_key(self, symbol: str, action: str) -> str:
         normalized_symbol = self._normalize_position_symbol(symbol) or str(symbol or "")
@@ -4499,11 +4685,14 @@ class TradingService:
         market_only = bool(run_market_analysis and not run_position_analysis)
         return {
             # Position review consumes the fresh websocket cache and the
-            # authoritative position snapshot. Final entry analysis still owns
-            # the blocking REST fallback when cached market facts are invalid.
+            # authoritative position snapshot. Derivatives are refreshed in a
+            # bounded background queue so a portfolio-wide review cannot turn
+            # serialized OKX public routes into one timeout per position. Final
+            # entry analysis still owns the blocking REST fallback when cached
+            # market facts are invalid.
             "block_on_remote_ticker": False,
-            "block_on_remote_indicators": not market_only,
-            "block_on_remote_derivatives": not market_only,
+            "block_on_remote_indicators": False,
+            "block_on_remote_derivatives": False,
             # Cached K-lines and background refreshes are local/read-only. They
             # keep the ranker from seeing an empty candidate pool while the
             # final AI/entry gates still require complete current evidence.
@@ -4550,10 +4739,10 @@ class TradingService:
         return self._recent_stage_durations(state)
 
     def _start_runtime_round(self, scope: str, started_at: datetime) -> None:
-        # Training is useful only while the trading loops are idle.  Preempt a
-        # process that raced with round scheduling before it can consume the
-        # CPU budget needed by live inference.
-        self._request_training_preemption()
+        # Isolated training is already restricted to one low-priority worker.
+        # Let it cross analysis rounds so a normal market tick cannot starve
+        # training. Service shutdown still cancels the scheduler task, whose
+        # subprocess boundary performs kill/wait cleanup.
         state = self._runtime_state(scope)
         state.current_stage = "starting"
         state.current_stage_started_at = started_at
@@ -4577,23 +4766,6 @@ class TradingService:
             processes = set()
             self._active_training_processes = processes
         return processes
-
-    def _request_training_preemption(self) -> None:
-        processes = [
-            process
-            for process in self._training_process_set()
-            if process.returncode is None
-        ]
-        for process in processes:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                continue
-        if processes:
-            logger.info(
-                "preempted background training for live analysis round",
-                process_count=len(processes),
-            )
 
     def _finish_runtime_round(self, scope: str, finished_at: datetime, *, ok: bool) -> None:
         state = self._runtime_state(scope)
@@ -6149,7 +6321,10 @@ class TradingService:
         if service is None:
             service = ContinuousModelWeightEvidenceService()
             self.continuous_model_weight_evidence_service = service
-        return await service.report(mode)
+        # Evidence queries are optional paper context. Start/continue the
+        # single-flight refresh without making the analysis round wait on DB
+        # aggregation; later rounds consume the populated cache.
+        return await service.report(mode, wait_for_refresh=False)
 
     def _continuous_model_weight_report(
         self,
@@ -6304,10 +6479,13 @@ class TradingService:
         return "模型分析超过独立时间上限" not in str(reasoning or "")
 
     async def _ensure_market_analysis_selection_history(self) -> None:
-        """Hydrate the short cooldown window once after each service start."""
+        """Start one non-blocking hydration of the analysis cooldown history."""
 
         policy = self._market_analysis_selector_policy()
         if policy.history_loaded:
+            return
+        existing = getattr(self, "_market_analysis_selection_history_task", None)
+        if isinstance(existing, asyncio.Task) and not existing.done():
             return
         cutoff = datetime.now(UTC) - timedelta(
             seconds=max(
@@ -6318,7 +6496,7 @@ class TradingService:
         )
         timeout_path = AIDecision.raw_llm_response["market_model_timeout"][
             "isolated_to_symbol"
-        ].as_boolean()
+        ].as_boolean().label("isolated_timeout")
         feature_columns = [
             cast(AIDecision.feature_snapshot[key].as_float(), Float).label(key)
             for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
@@ -6331,66 +6509,58 @@ class TradingService:
                         select(
                             AIDecision.symbol,
                             AIDecision.created_at,
+                            timeout_path,
                             *feature_columns,
                         )
                         .where(
                             AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                             AIDecision.analysis_type == "market",
                             AIDecision.created_at >= cutoff,
-                            or_(timeout_path.is_(False), timeout_path.is_(None)),
-                            or_(
-                                AIDecision.reasoning.is_(None),
-                                ~AIDecision.reasoning.contains("模型分析超过独立时间上限"),
-                            ),
                         )
-                        .distinct(AIDecision.symbol)
-                        .order_by(AIDecision.symbol, AIDecision.created_at.desc())
+                        .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
                         .limit(max(int(MARKET_ANALYSIS_SELECTION_PARAMS.history_limit), 1))
                     )
                 ).all()
 
-        task = asyncio.create_task(load_rows())
-        try:
-            done, pending = await asyncio.wait(
-                {task},
-                timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
-            )
-            if pending:
-                task.cancel()
-                task.add_done_callback(_consume_task_result)
-                await asyncio.sleep(0)
-                policy.history_loaded = True
+        async def hydrate() -> None:
+            try:
+                rows = await load_rows()
+                remembered_symbols: set[str] = set()
+                for row in rows:
+                    row_values = row._mapping if hasattr(row, "_mapping") else vars(row)
+                    if row_values.get("isolated_timeout") is True:
+                        continue
+                    symbol = str(row.symbol or "")
+                    symbol_key = self._normalize_position_symbol(symbol)
+                    if not symbol_key or symbol_key in remembered_symbols:
+                        continue
+                    remembered_symbols.add(symbol_key)
+                    feature_snapshot = {
+                        key: row_values.get(key)
+                        for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
+                        if row_values.get(key) is not None
+                    }
+                    policy.remember(
+                        symbol,
+                        feature_snapshot,
+                        observed_at=row.created_at,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 logger.warning(
-                    "market analysis selection history load timed out; starting empty",
-                    timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+                    "recent market analysis selection history load failed",
+                    error=safe_error_text(exc),
                 )
-                return
-            rows = next(iter(done)).result()
-        except asyncio.CancelledError:
-            if not task.done():
-                task.cancel()
-                task.add_done_callback(_consume_task_result)
-            raise
-        except Exception as exc:
-            policy.history_loaded = True
-            logger.warning(
-                "recent market analysis selection history load failed",
-                error=safe_error_text(exc),
-            )
-            return
-        for row in rows:
-            row_values = row._mapping if hasattr(row, "_mapping") else vars(row)
-            feature_snapshot = {
-                key: row_values.get(key)
-                for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
-                if row_values.get(key) is not None
-            }
-            policy.remember(
-                str(row.symbol or ""),
-                feature_snapshot,
-                observed_at=row.created_at,
-            )
+            finally:
+                if getattr(self, "_market_analysis_selection_history_task", None) is asyncio.current_task():
+                    self._market_analysis_selection_history_task = None
+
         policy.history_loaded = True
+        task = asyncio.create_task(hydrate())
+        self._market_analysis_selection_history_task = task
+        task.add_done_callback(_consume_task_result)
+        await asyncio.sleep(0)
 
     def _select_market_analysis_candidates(
         self,
@@ -9309,11 +9479,16 @@ class TradingService:
             (getattr(self, "_vector_memory_context_tasks", {}) or {}).values()
         )
         self._vector_memory_context_tasks = {}
-        for task in vector_memory_tasks:
+        expert_memory_tasks = list(
+            (getattr(self, "_expert_memory_context_tasks", {}) or {}).values()
+        )
+        self._expert_memory_context_tasks = {}
+        memory_context_tasks = [*vector_memory_tasks, *expert_memory_tasks]
+        for task in memory_context_tasks:
             if task and not task.done():
                 task.cancel()
-        if vector_memory_tasks:
-            await asyncio.gather(*vector_memory_tasks, return_exceptions=True)
+        if memory_context_tasks:
+            await asyncio.gather(*memory_context_tasks, return_exceptions=True)
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self._okx_paper, self._okx_live):
@@ -9393,29 +9568,7 @@ class TradingService:
             if startup_delay > 0.0:
                 await asyncio.sleep(startup_delay)
         while self._running:
-            def training_deferred() -> bool:
-                runtime = getattr(self, "_analysis_runtime", {})
-                active_round = any(
-                    isinstance(runtime.get(scope), _AnalysisRuntimeState)
-                    and runtime[scope].active
-                    for scope in ("market", "position")
-                )
-                return bool(
-                    active_round
-                    or getattr(self, "_active_analysis_symbols", set())
-                    or (
-                        getattr(self, "_market_entry_pipeline_semaphore", None)
-                        and self._market_entry_pipeline_semaphore.locked()
-                    )
-                )
-
             async def run_ml_step() -> dict[str, Any]:
-                if training_deferred():
-                    return {
-                        "trained": False,
-                        "reason": "analysis_busy_deferred",
-                        "training_process_isolated": True,
-                    }
                 try:
                     result = await self._run_local_ml_training_subprocess()
                     if result.get("trained"):
@@ -9459,12 +9612,6 @@ class TradingService:
                     }
 
             async def run_local_tools_step() -> dict[str, Any]:
-                if training_deferred():
-                    return {
-                        "trained": False,
-                        "reason": "analysis_busy_deferred",
-                        "training_process_isolated": True,
-                    }
                 try:
                     return await self._maybe_train_local_ai_tools()
                 except asyncio.CancelledError:
@@ -9482,6 +9629,9 @@ class TradingService:
 
             # Both trainers read the same large history and use the same model
             # tunnel.  Serial execution prevents CPU, DB and 18001 contention.
+            if self._auto_training_should_defer():
+                await asyncio.sleep(TRAINING_BUSY_RETRY_SECONDS)
+                continue
             ml_result = await run_ml_step()
             local_tools_result = await run_local_tools_step()
             await asyncio.sleep(self._auto_train_failure_delay([ml_result, local_tools_result]))
@@ -9519,6 +9669,11 @@ class TradingService:
         except TimeoutError:
             process.kill()
             await process.wait()
+            self._record_training_subprocess_timeout(
+                scheduler_id="local_ml_auto_train",
+                model_ids=("local_ml_profit_quality",),
+                error="isolated local ML training exceeded its scheduler lease",
+            )
             return {
                 "trained": False,
                 "reason": "timeout",
@@ -9547,8 +9702,8 @@ class TradingService:
                 "trained": False,
                 "reason": "error",
                 "error": (
-                    safe_error_text(stderr_text, limit=180, fallback="")
-                    or safe_error_text(exc, limit=180)
+                    safe_error_tail(stderr_text, limit=500, fallback="")
+                    or safe_error_tail(exc, limit=500)
                 ),
                 "training_process_isolated": True,
             }
@@ -9566,9 +9721,13 @@ class TradingService:
                 {
                     "trained": False,
                     "reason": "error",
-                    "error": safe_error_text(
+                    "error": safe_error_tail(
                         stderr.decode("utf-8", errors="replace"),
-                        limit=180,
+                        limit=500,
+                        fallback=(
+                            "isolated local ML training exited with code "
+                            f"{process.returncode} without stderr"
+                        ),
                     ),
                 }
             )
@@ -9915,6 +10074,12 @@ class TradingService:
         except TimeoutError:
             process.kill()
             await process.wait()
+            self._record_training_subprocess_timeout(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                error="isolated local AI tools training exceeded its scheduler lease",
+                run_id=getattr(self, "_local_tools_active_training_run_id", None),
+            )
             return {
                 "trained": False,
                 "reason": "timeout",
@@ -9926,7 +10091,14 @@ class TradingService:
             return {
                 "trained": False,
                 "reason": "error",
-                "error": safe_error_text(stderr.decode("utf-8", errors="replace"), limit=180),
+                "error": safe_error_tail(
+                    stderr.decode("utf-8", errors="replace"),
+                    limit=500,
+                    fallback=(
+                        "isolated local AI tools training exited with code "
+                        f"{process.returncode} without stderr"
+                    ),
+                ),
             }
         try:
             stdout_text = stdout.decode("utf-8")
@@ -9995,9 +10167,13 @@ class TradingService:
             return {
                 "trained": False,
                 "reason": "error",
-                "error": safe_error_text(
+                "error": safe_error_tail(
                     stderr.decode("utf-8", errors="replace"),
-                    limit=180,
+                    limit=500,
+                    fallback=(
+                        "isolated Local AI cursor probe exited with code "
+                        f"{process.returncode} without stderr"
+                    ),
                 ),
                 "training_process_isolated": True,
             }

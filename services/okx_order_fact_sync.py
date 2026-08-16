@@ -75,6 +75,7 @@ ORDER_FACT_SYNC_DB_LOCK_TIMEOUT_MILLISECONDS = 1500
 ORDER_FACT_SYNC_DB_STATEMENT_TIMEOUT_MILLISECONDS = 10000
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
+PROTECTION_ALGO_HISTORY_TIMEOUT_SECONDS = 3.0
 ACCOUNT_HISTORY_MAX_PAGES = 5
 ACCOUNT_HISTORY_OVERLAP_HOURS = 6
 OKX_RECENT_FILL_RETENTION_HOURS = 72
@@ -803,7 +804,7 @@ class OkxOrderFactSyncService:
                     max_pages=2,
                     strict=True,
                 ),
-                cap_seconds=1.5,
+                cap_seconds=PROTECTION_ALGO_HISTORY_TIMEOUT_SECONDS,
             )
             protection_algo_rows = list(protection_algo_rows or [])
             if not protection_complete:

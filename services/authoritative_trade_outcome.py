@@ -171,6 +171,8 @@ def _profit_label_contract(
         "decision_id": int(sample.get("decision_id") or 0),
         "entry_order_id": sample.get("entry_order_id"),
         "close_order_id": sample.get("close_order_id"),
+        "entry_order_ids": list(sample.get("entry_order_ids") or []),
+        "close_order_ids": list(sample.get("close_order_ids") or []),
         "label_timestamp": sample.get("label_timestamp"),
         PROFIT_TRAINING_TARGET: net_return,
         "realized_net_pnl_usdt": realized_pnl,

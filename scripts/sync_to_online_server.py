@@ -115,8 +115,9 @@ def _render_dashboard_service(remote_app_dir: str, owner: str) -> str:
     group = group or user
     return f"""[Unit]
 Description=BB Dashboard
-After=network-online.target postgresql.service redis-server.service redis.service
-Wants=network-online.target
+After=network-online.target postgresql.service redis-server.service redis.service bb-model-tunnels.service
+Wants=network-online.target bb-model-tunnels.service
+Requires=bb-model-tunnels.service
 
 [Service]
 Type=simple
@@ -478,6 +479,7 @@ def _install_split_service_command(
     trading_dropin = f"""[Service]
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+ExecStartPre=/bin/bash -lc 'for spec in 18000:/v1/models 18001:/health/live 18002:/v1/models 18003:/v1/models; do port=${{spec%%:*}}; path=${{spec#*:}}; for i in $(seq 1 60); do curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 && break; sleep 1; done; curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 || exit 1; done'
 StandardOutput=journal
 StandardError=journal
 """

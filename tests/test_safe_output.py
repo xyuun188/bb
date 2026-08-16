@@ -7,6 +7,7 @@ import httpx
 from core.safe_output import (
     format_command_failure,
     redact_output,
+    safe_error_tail,
     safe_error_text,
     safe_print,
     safe_response_error_text,
@@ -80,6 +81,25 @@ def test_safe_error_text_redacts_truncates_and_uses_fallback() -> None:
     assert len(message) == 43
     assert message.endswith("...")
     assert safe_error_text("", fallback="fallback-error") == "fallback-error"
+
+
+def test_safe_error_tail_preserves_root_exception_and_redacts_secrets() -> None:
+    token = "abcdefghi" + "jklmnopqrst" + "uvwxyz123456"
+    traceback = "\n".join(
+        [
+            "Traceback (most recent call last):",
+            *(f'  File "training.py", line {index}, in worker' for index in range(20)),
+            f"httpx.ReadError: connection reset Authorization: Bearer {token}",
+        ]
+    )
+
+    message = safe_error_tail(traceback, limit=180)
+
+    assert message.startswith("...")
+    assert "httpx.ReadError: connection reset" in message
+    assert "abcdefghijklmnopqrstuvwxyz" not in message
+    assert "Authorization: ***" in message
+    assert len(message) <= 183
 
 
 def test_safe_response_error_text_handles_json_response_body() -> None:

@@ -53,7 +53,7 @@ def test_profit_training_contract_accepts_ensemble_authority() -> None:
     assert contract.model_shadow_alignment == "avoided_losing_side"
 
 
-def test_profit_training_contract_rejects_legacy_lifecycle_aliases() -> None:
+def test_profit_training_contract_accepts_order_id_collections_but_rejects_legacy_metrics() -> None:
     contract = validate_profit_training_sample(
         {
             "symbol": "ETH/USDT",
@@ -74,8 +74,8 @@ def test_profit_training_contract_rejects_legacy_lifecycle_aliases() -> None:
 
     assert contract.eligible is False
     assert contract.outcome == "invalid"
-    assert "entry_order_id_missing" in contract.blockers
-    assert "close_order_id_missing" in contract.blockers
+    assert "entry_order_ids_missing" not in contract.blockers
+    assert "close_order_ids_missing" not in contract.blockers
     assert "close_price_missing_or_invalid" in contract.blockers
     assert "notional_missing_or_invalid" in contract.blockers
     assert "entry_fee_missing_or_invalid" in contract.blockers
@@ -100,8 +100,20 @@ def test_profit_training_contract_rejects_missing_close_order() -> None:
     )
 
     assert contract.eligible is False
-    assert contract.reason == "close_order_id_missing"
-    assert "close_order_id_missing" in contract.blockers
+    assert contract.reason == "close_order_ids_missing"
+    assert "close_order_ids_missing" in contract.blockers
+
+
+def test_profit_training_contract_accepts_multiple_close_orders() -> None:
+    sample = _closed_trade_sample(
+        close_order_id="",
+        close_order_ids=["close-1", "close-2"],
+    )
+
+    contract = validate_profit_training_sample(sample)
+
+    assert contract.eligible is True
+    assert contract.outcome == "loss"
 
 
 def test_profit_training_contract_rejects_execution_result_fee_source() -> None:

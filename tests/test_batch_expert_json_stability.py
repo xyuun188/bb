@@ -317,12 +317,10 @@ async def test_batch_expert_missing_provider_group_is_repaired(
 
     assert set(decisions) == {"sentiment_expert", "position_expert", "risk_expert"}
     assert len(calls) == 2
-    json_kwargs = [kwargs for kwargs in captured_kwargs if kwargs.get("model_kwargs")]
-    assert len(json_kwargs) == 2
-    assert all(
-        kwargs["model_kwargs"]["response_format"] == {"type": "json_object"}
-        for kwargs in json_kwargs
-    )
+    # Batch experts also use the raw completion path.  The provider may return
+    # a length-limited completion and OpenAI's parse helper would raise before
+    # LLMAgent can classify that output safely.
+    assert all("response_format" not in kwargs.get("model_kwargs", {}) for kwargs in captured_kwargs)
     assert all(
         kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
         for kwargs in captured_kwargs
@@ -331,7 +329,8 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     assert not decisions["risk_expert"].raw_response.get("batch_expert_fallback")
     assert decisions["risk_expert"].position_size_pct == 0.0
     assert decisions["risk_expert"].suggested_leverage == 1.0
-    assert all(kwargs["max_tokens"] == 560 for kwargs in json_kwargs)
+    batch_kwargs = [kwargs for kwargs in captured_kwargs if kwargs.get("max_tokens") == 560]
+    assert len(batch_kwargs) == 2
 
 
 @pytest.mark.asyncio

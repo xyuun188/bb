@@ -109,6 +109,41 @@ async def test_prioritized_feature_vector_wraps_native_sources_in_priority_gate(
 
 
 @pytest.mark.asyncio
+async def test_derivatives_background_refresh_concurrency_is_bounded() -> None:
+    service = _service()
+    service._derivatives_background_refresh_semaphore = asyncio.Semaphore(2)
+    active = 0
+    peak = 0
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def refresh(symbol: str) -> dict[str, Any]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if active == 2:
+            two_started.set()
+        try:
+            await release.wait()
+            return {"symbol": symbol}
+        finally:
+            active -= 1
+
+    service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
+    for symbol in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+        service._schedule_derivatives_background_refresh(symbol)
+
+    await asyncio.wait_for(two_started.wait(), timeout=0.2)
+    assert peak == 2
+    assert active == 2
+
+    tasks = list(service._derivatives_refresh_tasks.values())
+    release.set()
+    await asyncio.gather(*tasks)
+    assert peak == 2
+
+
+@pytest.mark.asyncio
 async def test_priority_queue_wait_does_not_consume_native_provider_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1259,6 +1294,39 @@ async def test_indicator_snapshot_nonblocking_does_not_wait_for_remote_without_c
     await asyncio.wait_for(remote_started.wait(), timeout=0.2)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_indicator_cached_build_outlives_its_source_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    release_read = asyncio.Event()
+    monkeypatch.setattr(data_service_module, "FEATURE_SNAPSHOT_TIMEOUT_SECONDS", 0.1)
+
+    async def slow_cached_features(_symbol: str) -> dict[str, Any]:
+        await release_read.wait()
+        return {"close": 100.5, "indicator_snapshot_available": True}
+
+    service._indicator_features_from_cached_klines = slow_cached_features  # type: ignore[method-assign]
+
+    started = asyncio.get_running_loop().time()
+    result = await service._get_indicator_snapshot(
+        "BTC/USDT",
+        block_on_remote=False,
+        allow_cached_build=True,
+        allow_background_refresh=False,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.5
+    assert result["indicator_snapshot_available"] is False
+    assert result["indicator_snapshot_reason"] == "indicator_cached_build_in_progress"
+    assert result["indicator_snapshot_refresh_in_background"] is True
+
+    release_read.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

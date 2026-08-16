@@ -1076,6 +1076,38 @@ async def test_recovery_order_continues_through_protection_history(
 
 
 @pytest.mark.asyncio
+async def test_protection_history_can_complete_after_legacy_stage_budget(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "protection-history-stage-budget.db")
+
+    async def fetch_protection_history_after_legacy_budget(
+        _client: Any,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        await asyncio.sleep(1.6)
+        return []
+
+    monkeypatch.setattr(
+        order_fact_sync_module.OkxNativeFactsClient,
+        "fetch_protection_algo_history_rows",
+        fetch_protection_history_after_legacy_budget,
+    )
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=6.0,
+            executor_factory=_executor_factory(_FakeCcxt()),
+        ).sync()
+
+        assert "protection_algo_history" in report["completed_stages"]
+        assert "protection_algo_history" not in report["deferred_stages"]
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_stored_fact_fallback_recovers_confirmed_protection_position(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -243,6 +243,74 @@ async def test_position_settlement_retires_final_duplicate_lifecycle_with_clock_
 
 
 @pytest.mark.asyncio
+async def test_position_settlement_prefers_complete_close_order_projection(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-complete-projection.db")
+    now = datetime.now(UTC)
+    try:
+        canonical_id = await _seed_closed_position(now)
+        duplicate_id = await _seed_closed_position(now + timedelta(seconds=3))
+        async with get_session_ctx() as session:
+            canonical = await session.get(Position, canonical_id)
+            duplicate = await session.get(Position, duplicate_id)
+            assert canonical is not None
+            assert duplicate is not None
+            canonical.close_exchange_order_id = "close-1,close-2,close-3"
+            duplicate.close_exchange_order_id = "close-1"
+            await session.flush()
+
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(
+            now + timedelta(minutes=1)
+        )
+
+        assert [candidate.position_id for candidate in candidates] == [canonical_id]
+        async with get_session_ctx() as session:
+            canonical = await session.get(Position, canonical_id)
+            duplicate = await session.get(Position, duplicate_id)
+        assert canonical is not None
+        assert duplicate is not None
+        assert canonical.settlement_status == "settling"
+        assert duplicate.settlement_status == SUPERSEDED_POSITION_STATUS
+        assert duplicate.settlement_raw["canonical_position_id"] == canonical_id
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_settlement_does_not_merge_different_quantity_lifecycles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-distinct-quantity.db")
+    now = datetime.now(UTC)
+    try:
+        first_id = await _seed_closed_position(now)
+        second_id = await _seed_closed_position(now + timedelta(seconds=3))
+        async with get_session_ctx() as session:
+            second = await session.get(Position, second_id)
+            assert second is not None
+            second.quantity = 50.0
+            await session.flush()
+
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(
+            now + timedelta(minutes=1)
+        )
+
+        assert {candidate.position_id for candidate in candidates} == {first_id, second_id}
+        async with get_session_ctx() as session:
+            first = await session.get(Position, first_id)
+            second = await session.get(Position, second_id)
+        assert first is not None
+        assert second is not None
+        assert first.settlement_status == "settling"
+        assert second.settlement_status == "settling"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_position_settlement_rejects_reused_pos_id_from_older_lifecycle(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

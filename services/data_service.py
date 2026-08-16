@@ -125,6 +125,11 @@ INSTRUMENT_SPEC_TIMEOUT_SECONDS = max(
 )
 INSTRUMENT_SPEC_FAILURE_CACHE_SECONDS = 30.0
 DERIVATIVES_FAILURE_CACHE_SECONDS = 15.0
+DERIVATIVES_REFRESH_TIMEOUT_SECONDS = max(
+    float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) * 2.0,
+    5.0,
+)
+DERIVATIVES_BACKGROUND_REFRESH_CONCURRENCY = 2
 
 
 class _PriorityBuildGate:
@@ -775,6 +780,11 @@ class DataService:
             uses_native_remote: bool = False,
         ) -> dict[str, Any]:
             timeout = max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5)
+            source_timeout = (
+                timeout * 2.0
+                if uses_native_remote and prioritize_native_market_data
+                else timeout
+            )
 
             async def read() -> Any:
                 if not uses_native_remote:
@@ -782,15 +792,11 @@ class DataService:
                 gate = self._native_market_snapshot_gate()
                 await gate.acquire(priority=prioritize_native_market_data)
                 try:
-                    return await asyncio.wait_for(provider(), timeout=timeout)
+                    return await asyncio.wait_for(provider(), timeout=source_timeout)
                 finally:
                     gate.release()
 
-            total_timeout = (
-                timeout * 2.0
-                if uses_native_remote and prioritize_native_market_data
-                else timeout
-            )
+            total_timeout = source_timeout
             task = asyncio.create_task(read())
             try:
                 done, pending = await asyncio.wait({task}, timeout=total_timeout)
@@ -803,7 +809,7 @@ class DataService:
                         symbol=symbol,
                         source=name,
                         timeout_seconds=total_timeout,
-                        provider_timeout_seconds=timeout,
+                        provider_timeout_seconds=source_timeout,
                         priority_queue=bool(
                             uses_native_remote and prioritize_native_market_data
                         ),
@@ -1618,7 +1624,31 @@ class DataService:
 
         if not block_on_remote:
             if allow_cached_build:
-                cached_features = await self._indicator_features_from_cached_klines(normalized)
+                async def build_cached_features() -> dict[str, Any]:
+                    result = await self._indicator_features_from_cached_klines(normalized)
+                    if not result and allow_background_refresh:
+                        self._schedule_indicator_snapshot_refresh(normalized)
+                    return result
+
+                cached_build_task = asyncio.create_task(build_cached_features())
+                local_build_timeout = max(
+                    min(
+                        float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) * 0.8,
+                        float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) - 0.1,
+                    ),
+                    0.1,
+                )
+                done, pending = await asyncio.wait(
+                    {cached_build_task},
+                    timeout=local_build_timeout,
+                )
+                if pending:
+                    cached_build_task.add_done_callback(_consume_task_result)
+                    return self._unavailable_indicator_snapshot(
+                        "indicator_cached_build_in_progress",
+                        refresh_in_background=True,
+                    )
+                cached_features = next(iter(done)).result()
                 if cached_features:
                     self._store_indicator_snapshot_cache(normalized, cached_features)
                     if allow_background_refresh:
@@ -2486,7 +2516,7 @@ class DataService:
                 try:
                     result = await asyncio.wait_for(
                         existing_task,
-                        timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+                        timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
                     )
                     return dict(result or {})
                 except TimeoutError:
@@ -2507,7 +2537,7 @@ class DataService:
             try:
                 result = await asyncio.wait_for(
                     task,
-                    timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+                    timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
                 )
                 return dict(result or {})
             except TimeoutError:
@@ -2532,7 +2562,9 @@ class DataService:
         existing_task = tasks.get(normalized)
         if existing_task and not existing_task.done():
             return
-        task = loop.create_task(self._refresh_derivatives_snapshot(normalized))
+        task = loop.create_task(
+            self._refresh_derivatives_snapshot_in_background(normalized)
+        )
         tasks[normalized] = task
 
         def cleanup(_task: asyncio.Task) -> None:
@@ -2540,6 +2572,20 @@ class DataService:
                 tasks.pop(normalized, None)
 
         task.add_done_callback(cleanup)
+
+    def _derivatives_background_refresh_gate(self) -> asyncio.Semaphore:
+        gate = getattr(self, "_derivatives_background_refresh_semaphore", None)
+        if not isinstance(gate, asyncio.Semaphore):
+            gate = asyncio.Semaphore(DERIVATIVES_BACKGROUND_REFRESH_CONCURRENCY)
+            self._derivatives_background_refresh_semaphore = gate
+        return gate
+
+    async def _refresh_derivatives_snapshot_in_background(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+        async with self._derivatives_background_refresh_gate():
+            return await self._refresh_derivatives_snapshot(symbol)
 
     async def _refresh_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]

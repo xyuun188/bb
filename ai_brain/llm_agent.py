@@ -109,13 +109,13 @@ class _ScopedLLMCapacity:
             self._active = max(self._active - 1, 0)
             self._condition.notify_all()
 
-    async def __aenter__(self) -> "_ScopedLLMCapacity":
+    async def __aenter__(self) -> _ScopedLLMCapacity:
         raise RuntimeError("use slot(context) instead")
 
     async def __aexit__(self, *_args: Any) -> None:
         await self.release()
 
-    def slot(self, context: dict[str, Any]) -> "_ScopedLLMSlot":
+    def slot(self, context: dict[str, Any]) -> _ScopedLLMSlot:
         return _ScopedLLMSlot(self, context)
 
 
@@ -125,7 +125,7 @@ class _ScopedLLMSlot:
         self._context = context
         self._acquired = False
 
-    async def __aenter__(self) -> "_ScopedLLMSlot":
+    async def __aenter__(self) -> _ScopedLLMSlot:
         await self._capacity.acquire(self._context)
         self._acquired = True
         return self
@@ -622,6 +622,21 @@ def _provider_response_contract(response: Any) -> dict[str, Any]:
     }
 
 
+def _exception_completion_content(error: BaseException) -> str:
+    """Extract provider completion text preserved by length-limit exceptions."""
+
+    completion = getattr(error, "completion", None)
+    if completion is None:
+        return ""
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, (list, tuple)) or not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return ""
+    return _message_content_text(message)
+
+
 def _strip_qwen_thinking(text: str) -> str:
     """Remove Qwen3 thinking blocks before JSON parsing."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
@@ -926,7 +941,7 @@ class LLMAgent(AbstractAIModel):
         except (TypeError, ValueError):
             configured_timeout_value = 0.0
         if fast_expert:
-            request_timeout = min(max(configured_timeout_value or 10.0, 6.0), 12.0)
+            request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 18.0)
         elif max_completion_tokens_override is not None:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 26.0)
         elif self._role == "final_decision":
@@ -941,11 +956,19 @@ class LLMAgent(AbstractAIModel):
         token_stage = completion_stage or (
             "batch_expert"
             if max_completion_tokens_override is not None
-            else ("decision_maker" if self._role == "final_decision" else "expert")
+            else (
+                "fast_expert"
+                if fast_expert
+                else ("decision_maker" if self._role == "final_decision" else "expert")
+            )
         )
-        requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
         if fast_expert:
-            requested_tokens = min(int(requested_tokens or 0), 320)
+            requested_tokens = max(
+                int(getattr(settings, "ai_fast_expert_max_completion_tokens", 480) or 480),
+                180,
+            )
+        else:
+            requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
         max_completion_tokens = completion_token_limit(
             token_stage,
             int(requested_tokens or 0),
@@ -983,9 +1006,14 @@ class LLMAgent(AbstractAIModel):
             extra_body = provider_non_thinking_extra_body(extra_body)
         if extra_body:
             kwargs["extra_body"] = extra_body
-        structured_json_response = bool(
-            fast_expert or json_response or self._role == "final_decision"
-        )
+        # Do not route expert calls through OpenAI's ``parse`` helper.
+        # LangChain switches to ``chat.completions.parse`` whenever a
+        # response_format is present; the OpenAI SDK raises
+        # LengthFinishReasonError before returning the raw completion when a
+        # local provider reaches its token limit.  Experts already use
+        # _extract_json below, which can preserve diagnostics and enforce the
+        # production-permission gate without losing the provider payload.
+        structured_json_response = self._role == "final_decision"
         if structured_json_response:
             model_kwargs = dict(kwargs.get("model_kwargs") or {})
             model_kwargs["response_format"] = {"type": "json_object"}
@@ -1219,6 +1247,35 @@ class LLMAgent(AbstractAIModel):
                         error=last_error,
                     )
                 except Exception as e:
+                    exception_content = _exception_completion_content(e)
+                    if expert_mode and not decision_maker_mode and exception_content:
+                        recovered_payload = _first_balanced_json_object(
+                            _strip_qwen_thinking(exception_content)
+                        )
+                        if recovered_payload is not None:
+                            recovered_payload = dict(recovered_payload)
+                            recovered_payload["provider_model"] = model_name
+                            recovered_payload["provider_truncated"] = True
+                            recovered_payload["production_eligible"] = False
+                            recovered_payload["production_permission"] = False
+                            recovered_payload["truncated_json_recovery"] = True
+                            recovered_payload["provider_response_contract"] = {
+                                **response_contract,
+                                "truncated": True,
+                                "truncated_json_recovery": True,
+                            }
+                            recovered_decision = self._decision_from_parsed(
+                                recovered_payload,
+                                features,
+                                context,
+                            )
+                            logger.warning(
+                                "truncated expert JSON recovered from provider completion",
+                                name=self.name,
+                                model=model_name,
+                                attempt=attempt,
+                            )
+                            return recovered_decision
                     err_msg = safe_error_text(e)
                     if (
                         "model_dump" in err_msg

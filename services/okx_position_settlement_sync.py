@@ -703,7 +703,20 @@ def _deduplicate_closed_lifecycle_rows(
     retained = list(retained_without_identity)
     duplicates: list[Position] = []
     for candidates in grouped.values():
-        canonical = min(candidates, key=lambda item: int(getattr(item, "id", 0) or 0))
+        # A stale projection can contain only a subset of the close orders while
+        # still carrying the same OKX lifecycle identity. Keep the row with the
+        # richest exchange evidence before falling back to its stable local ID.
+        canonical = min(
+            candidates,
+            key=lambda item: (
+                -len(_split_exchange_order_ids(getattr(item, "close_exchange_order_id", None))),
+                -int(
+                    str(getattr(item, "settlement_status", "") or "").lower()
+                    in {"reconciled", "okx_position_history"}
+                ),
+                int(getattr(item, "id", 0) or 0),
+            ),
+        )
         retained.append(canonical)
         for duplicate in candidates:
             if duplicate is canonical:
@@ -738,11 +751,8 @@ def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
     entry_ids = tuple(
         sorted(_split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None)))
     )
-    close_ids = tuple(
-        sorted(_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None)))
-    )
     quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
-    if not pos_id or not entry_ids or not close_ids or quantity <= 0:
+    if not pos_id or not entry_ids or quantity <= 0:
         return None
     return (
         str(getattr(position, "execution_mode", "") or "").lower(),
@@ -750,7 +760,6 @@ def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
         normalize_trading_symbol(str(getattr(position, "symbol", "") or "")),
         str(getattr(position, "side", "") or "").lower(),
         entry_ids,
-        close_ids,
         round(quantity, 12),
     )
 

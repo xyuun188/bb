@@ -297,6 +297,7 @@ class ModelTrainingStateStore:
 
     def read(self) -> dict[str, Any]:
         payload = self._load(strict=False)
+        persisted_status = str(payload.get("status") or "unavailable")
         now = self.now_provider()
         schedulers = payload.get("schedulers")
         schedulers = schedulers if isinstance(schedulers, dict) else {}
@@ -339,14 +340,25 @@ class ModelTrainingStateStore:
                 superseded_ids.append(normalized_id)
             elif raw["heartbeat_effective_stale"]:
                 stale_ids.append(normalized_id)
-        payload["status"] = "warning" if stale_ids else payload.get("status", "ok")
+        payload["status"] = "warning" if stale_ids else persisted_status
         payload["stale_scheduler_ids"] = stale_ids
         payload["superseded_scheduler_ids"] = superseded_ids
         payload["heartbeat_stale"] = bool(stale_ids)
         timed_out_models: list[str] = []
         models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
+        failed_model_ids: list[str] = []
+        interrupted_model_ids: list[str] = []
+        model_state_counts: dict[str, int] = {}
         for model_id, raw in models.items():
-            if not isinstance(raw, dict) or raw.get("state") != "running":
+            if not isinstance(raw, dict):
+                continue
+            state = str(raw.get("state") or "unknown")
+            model_state_counts[state] = model_state_counts.get(state, 0) + 1
+            if state == "failed":
+                failed_model_ids.append(str(model_id))
+            elif state == "interrupted":
+                interrupted_model_ids.append(str(model_id))
+            if state != "running":
                 continue
             started_at = _parse_datetime(raw.get("last_started_at"))
             timeout_seconds = max(float(raw.get("timeout_seconds") or 0.0), 0.0)
@@ -359,7 +371,16 @@ class ModelTrainingStateStore:
                 timed_out_models.append(str(model_id))
         payload["timed_out_model_ids"] = timed_out_models
         payload["training_timeout_exceeded"] = bool(timed_out_models)
-        if timed_out_models:
+        payload["failed_model_ids"] = sorted(failed_model_ids)
+        payload["interrupted_model_ids"] = sorted(interrupted_model_ids)
+        payload["unhealthy_model_ids"] = sorted(
+            set(failed_model_ids) | set(interrupted_model_ids) | set(timed_out_models)
+        )
+        payload["model_state_counts"] = dict(sorted(model_state_counts.items()))
+        payload["model_state_healthy"] = not payload["unhealthy_model_ids"]
+        if failed_model_ids:
+            payload["status"] = "error"
+        elif interrupted_model_ids or timed_out_models:
             payload["status"] = "warning"
         return payload
 
@@ -407,6 +428,8 @@ class ModelTrainingStateStore:
                         "scheduler_id": scheduler_id,
                         "state": "checking",
                         "last_check_at": _iso(now),
+                        "last_error": None,
+                        "next_check_at": None,
                         "last_force": bool(force),
                         "active_run_id": run_id,
                         "owner_pid": os.getpid(),
@@ -436,6 +459,8 @@ class ModelTrainingStateStore:
                         "triggered": True,
                         "trigger_reason": trigger_reason,
                         "last_started_at": _iso(now),
+                        "last_error": None,
+                        "next_check_at": None,
                         "active_run_id": run_id,
                         "active_sample_cursor": dict(sample_cursor or {}),
                         "timeout_seconds": max(float(timeout_seconds), 0.0),
@@ -535,6 +560,29 @@ class ModelTrainingStateStore:
             model_ids=model_ids,
             run_id=run_id,
             result={"trained": False, "reason": "error", "error": error[:1000]},
+            next_check_at=next_check_at,
+        )
+
+    def record_timeout(
+        self,
+        *,
+        scheduler_id: str,
+        model_ids: Iterable[str],
+        run_id: str,
+        error: str,
+        next_check_at: datetime,
+    ) -> None:
+        """Close a lease timeout as a failed run instead of leaving it running."""
+
+        self.finish_check(
+            scheduler_id=scheduler_id,
+            model_ids=model_ids,
+            run_id=run_id,
+            result={
+                "trained": False,
+                "reason": "timeout",
+                "error": error[:1000],
+            },
             next_check_at=next_check_at,
         )
 

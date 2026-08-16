@@ -598,7 +598,12 @@ class ContinuousModelWeightEvidenceService:
             return
         task.exception()
 
-    async def report(self, mode: str) -> dict[str, Any]:
+    async def report(
+        self,
+        mode: str,
+        *,
+        wait_for_refresh: bool = True,
+    ) -> dict[str, Any]:
         selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
         if selected_mode != "paper":
             return {
@@ -623,6 +628,13 @@ class ContinuousModelWeightEvidenceService:
             task = asyncio.create_task(self._refresh_report())
             task.add_done_callback(self._consume_refresh_result)
             self._refresh_task = task
+        if not wait_for_refresh:
+            return {
+                "execution_scope": "paper_only",
+                "available": False,
+                "refresh_in_flight": True,
+                "reason": "background_refresh_in_flight",
+            }
         try:
             return await asyncio.shield(task)
         finally:

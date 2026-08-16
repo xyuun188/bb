@@ -256,6 +256,71 @@ def test_recovery_marks_interrupted_training_and_preserves_history(tmp_path) -> 
     assert row["history"][-1]["event"] == "interrupted"
 
 
+def test_failed_model_makes_fresh_scheduler_state_error(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "model_training_state.json")
+    run_id = "failed-run"
+    store.heartbeat(
+        scheduler_id="platform_model_training_loop",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        interval_seconds=1800,
+    )
+    store.record_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=run_id,
+        force=False,
+    )
+    store.record_exception(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id=run_id,
+        error="remote training failed",
+        next_check_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    status = store.read()
+
+    assert status["heartbeat_stale"] is False
+    assert status["status"] == "error"
+    assert status["model_state_healthy"] is False
+    assert status["failed_model_ids"] == sorted(LOCAL_AI_TOOL_MODEL_IDS)
+    assert status["unhealthy_model_ids"] == sorted(LOCAL_AI_TOOL_MODEL_IDS)
+    assert status["model_state_counts"] == {"failed": len(LOCAL_AI_TOOL_MODEL_IDS)}
+
+
+def test_interrupted_model_makes_fresh_scheduler_state_warning(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "model_training_state.json")
+    run_id = "interrupted-run"
+    store.heartbeat(
+        scheduler_id="platform_model_training_loop",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        interval_seconds=1800,
+    )
+    store.record_check(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        run_id=run_id,
+        force=False,
+    )
+    store.start_run(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        run_id=run_id,
+        trigger_reason="training_due",
+    )
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    payload["models"][LOCAL_ML_MODEL_IDS[0]]["owner_pid"] = 2147483647
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+    store.recover_interrupted_runs()
+
+    status = store.read()
+
+    assert status["heartbeat_stale"] is False
+    assert status["status"] == "warning"
+    assert status["interrupted_model_ids"] == [LOCAL_ML_MODEL_IDS[0]]
+    assert status["model_state_healthy"] is False
+
+
 def test_scheduler_heartbeat_becomes_warning_after_cycle_is_missed(tmp_path) -> None:
     now = [datetime(2026, 7, 12, 1, 0, tzinfo=UTC)]
     store = ModelTrainingStateStore(

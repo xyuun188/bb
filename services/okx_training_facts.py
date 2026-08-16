@@ -102,6 +102,9 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
     average_price = _safe_float(raw.get("avg_price"), None)
     contracts = _safe_float(raw.get("contracts"), None)
     fee = _safe_float(raw.get("fee_abs"), None)
+    fill_pnl = _safe_float(raw.get("fill_pnl"), None)
+    if fill_pnl is None:
+        fill_pnl = _safe_float(_value(order, "okx_fill_pnl"), None)
     execution_slippage = _dict(raw.get("execution_slippage"))
     execution_slippage_usdt = _safe_float(
         execution_slippage.get("adverse_slippage_usdt"),
@@ -167,6 +170,7 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
         "average_price": average_price,
         "contracts": contracts,
         "fee": fee,
+        "fill_pnl": fill_pnl,
         "fee_source": source,
         "execution_slippage_complete": execution_slippage_complete,
         "execution_slippage_usdt": (
@@ -278,6 +282,7 @@ def _authoritative_fill_group(
     execution_slippage_complete = all(
         fact.get("execution_slippage_complete") is True for fact in facts
     )
+    fill_pnl_complete = all(_safe_float(fact.get("fill_pnl"), None) is not None for fact in facts)
     return {
         "complete": True,
         "facts": facts,
@@ -286,6 +291,12 @@ def _authoritative_fill_group(
         "average_price": notional / base_quantity,
         "notional": notional,
         "fee": sum(float(fact["fee"]) for fact in facts),
+        "fill_pnl_complete": fill_pnl_complete,
+        "fill_pnl": (
+            sum(float(fact["fill_pnl"]) for fact in facts)
+            if fill_pnl_complete
+            else None
+        ),
         "fee_source": "+".join(sources),
         "execution_slippage_complete": execution_slippage_complete,
         "execution_slippage_usdt": (
@@ -501,6 +512,74 @@ def _return_consistency_facts(
     }
 
 
+def _historical_contract_notional_reconciliation(
+    *,
+    side: str,
+    entry_price: float,
+    close_price: float,
+    gross_pnl: float,
+    current_notional: float | None,
+    contracts: float,
+    contract_ct_mult: float | None,
+    close_fill_group: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover the historical face value when today's instrument spec changed.
+
+    OKX position-history gross PnL and the matching fills are both authoritative.
+    Their price path determines the historical entry notional without borrowing
+    today's public ``ctVal`` for an older lifecycle.
+    """
+
+    price_return_pct = _directional_price_return_pct(
+        side=side,
+        entry_price=entry_price,
+        close_price=close_price,
+    )
+    close_fill_pnl = _safe_float(close_fill_group.get("fill_pnl"), None)
+    if (
+        price_return_pct is None
+        or abs(price_return_pct) <= 1e-12
+        or abs(gross_pnl) <= 1e-12
+        or gross_pnl * price_return_pct <= 0
+        or contracts <= 0
+        or close_fill_group.get("fill_pnl_complete") is not True
+        or close_fill_pnl is None
+        or not math.isclose(
+            close_fill_pnl,
+            gross_pnl,
+            rel_tol=1e-6,
+            abs_tol=max(1e-8, abs(gross_pnl) * 1e-8),
+        )
+    ):
+        return {"applied": False, "reason": "authoritative_price_pnl_derivation_unavailable"}
+    derived_notional = gross_pnl / (price_return_pct / 100.0)
+    if derived_notional <= 0 or not math.isfinite(derived_notional):
+        return {"applied": False, "reason": "derived_historical_notional_invalid"}
+    if current_notional is None or current_notional <= 0:
+        return {"applied": False, "reason": "current_fill_notional_unavailable"}
+    current_return = gross_pnl / current_notional * 100.0
+    if math.isclose(current_return, price_return_pct, rel_tol=0.01, abs_tol=0.05):
+        return {"applied": False, "reason": "current_contract_spec_already_consistent"}
+    ct_mult = contract_ct_mult if contract_ct_mult is not None and contract_ct_mult > 0 else 1.0
+    effective_base_quantity = derived_notional / entry_price
+    effective_ct_val = effective_base_quantity / contracts / ct_mult
+    if effective_ct_val <= 0 or not math.isfinite(effective_ct_val):
+        return {"applied": False, "reason": "derived_historical_contract_value_invalid"}
+    return {
+        "applied": True,
+        "reason": "current_public_contract_value_mismatches_authoritative_history",
+        "source_authority": "okx_fills_history_pnl_and_position_history_price_path",
+        "current_notional": current_notional,
+        "historical_notional": derived_notional,
+        "notional_scale": derived_notional / current_notional,
+        "historical_base_quantity": effective_base_quantity,
+        "historical_ct_val": effective_ct_val,
+        "close_fill_pnl": close_fill_pnl,
+        "position_history_gross_pnl": gross_pnl,
+        "gross_price_return_pct": price_return_pct,
+    }
+
+
 def build_okx_history_training_sample(
     history: Any,
     *,
@@ -546,8 +625,8 @@ def build_okx_history_training_sample(
         close_order_ids,
         orders_by_exchange_id,
     )
-    canonical_entry_order_id = entry_order_ids[0] if len(entry_order_ids) == 1 else ""
-    canonical_close_order_id = close_order_ids[0] if len(close_order_ids) == 1 else ""
+    canonical_entry_order_id = entry_order_ids[0] if entry_order_ids else ""
+    canonical_close_order_id = close_order_ids[-1] if close_order_ids else ""
     canonical_notional = (
         _safe_float(entry_fill_group.get("notional"), None)
         if entry_fill_group.get("complete") is True
@@ -597,6 +676,28 @@ def build_okx_history_training_sample(
     history_contract_source = _text(raw.get("_bb_contract_spec_source"))
     ct_val = public_or_stored_ct_val
     contract_ct_val_source = history_contract_source
+    historical_contract_reconciliation = _historical_contract_notional_reconciliation(
+        side=side,
+        entry_price=entry_price,
+        close_price=close_price,
+        gross_pnl=gross_pnl,
+        current_notional=canonical_notional,
+        contracts=contracts,
+        contract_ct_mult=ct_mult,
+        close_fill_group=close_fill_group,
+    )
+    if historical_contract_reconciliation.get("applied") is True:
+        canonical_notional = _safe_float(
+            historical_contract_reconciliation.get("historical_notional"),
+            canonical_notional,
+        )
+        ct_val = _safe_float(
+            historical_contract_reconciliation.get("historical_ct_val"),
+            ct_val,
+        )
+        contract_ct_val_source = str(
+            historical_contract_reconciliation.get("source_authority") or ""
+        )
     return_facts = _return_consistency_facts(
         side=side,
         entry_price=entry_price,
@@ -641,10 +742,6 @@ def build_okx_history_training_sample(
         gaps.append("gross_return_price_path_mismatch")
     if abs(realized_pnl - settlement_expected) > settlement_tolerance:
         gaps.append("settlement_algebra_mismatch")
-    if len(entry_order_ids) != 1:
-        gaps.append("profit_contract_requires_one_entry_order")
-    if len(close_order_ids) != 1:
-        gaps.append("profit_contract_requires_one_close_order")
     if entry_fill_group.get("complete") is not True:
         gaps.append("missing_authoritative_entry_fill_facts")
     if close_fill_group.get("complete") is not True:
@@ -655,6 +752,7 @@ def build_okx_history_training_sample(
         and ct_val > 0
         and ct_mult is not None
         and ct_mult > 0
+        and historical_contract_reconciliation.get("applied") is not True
         and not math.isclose(
             _safe_float(entry_fill_group.get("base_quantity"), 0.0) or 0.0,
             (_safe_float(entry_fill_group.get("contracts"), 0.0) or 0.0) * ct_val * ct_mult,
@@ -669,6 +767,7 @@ def build_okx_history_training_sample(
         and ct_val > 0
         and ct_mult is not None
         and ct_mult > 0
+        and historical_contract_reconciliation.get("applied") is not True
         and not math.isclose(
             _safe_float(close_fill_group.get("base_quantity"), 0.0) or 0.0,
             (_safe_float(close_fill_group.get("contracts"), 0.0) or 0.0) * ct_val * ct_mult,
@@ -800,6 +899,15 @@ def build_okx_history_training_sample(
         close_fill_group.get("execution_slippage_usdt"),
         None,
     )
+    slippage_notional_scale = _safe_float(
+        historical_contract_reconciliation.get("notional_scale"),
+        1.0,
+    ) or 1.0
+    if historical_contract_reconciliation.get("applied") is True:
+        if entry_execution_slippage_usdt is not None:
+            entry_execution_slippage_usdt *= slippage_notional_scale
+        if close_execution_slippage_usdt is not None:
+            close_execution_slippage_usdt *= slippage_notional_scale
     execution_slippage_usdt = (
         entry_execution_slippage_usdt + close_execution_slippage_usdt
         if entry_fill_group.get("execution_slippage_complete") is True
@@ -976,12 +1084,15 @@ def build_okx_history_training_sample(
         "fill_contracts": fill_contracts,
         "contract_ct_val": ct_val,
         "contract_ct_val_source": contract_ct_val_source,
+        "historical_contract_reconciliation": historical_contract_reconciliation,
         "public_or_stored_contract_ct_val": public_or_stored_ct_val,
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
         "notional": canonical_notional,
         "notional_source": (
-            "okx_entry_fill_base_quantity_and_average_price"
+            "okx_fills_history_pnl_and_position_history_price_path"
+            if historical_contract_reconciliation.get("applied") is True
+            else "okx_entry_fill_base_quantity_and_average_price"
             if canonical_notional is not None and canonical_notional > 0
             else ""
         ),

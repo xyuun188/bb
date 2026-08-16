@@ -153,6 +153,47 @@ async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_rou
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_recovers_transport_route_after_batch_drains(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    attempts: dict[str, int] = {}
+    reset_count = 0
+
+    async def post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload, request_timeout
+        attempts[path] = attempts.get(path, 0) + 1
+        if path == "/profit/predict" and attempts[path] == 1:
+            raise local_ai_tools_client_module._RetryableLocalAIToolsError(
+                "server quant tool request failed: ReadError"
+            )
+        return {"available": True, "path": path, "best_side": "long"}
+
+    async def reset() -> bool:
+        nonlocal reset_count
+        reset_count += 1
+        return True
+
+    monkeypatch.setattr(client, "_post", post)
+    monkeypatch.setattr(client, "_reset_http_client", reset)
+
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert result["status"] == "completed"
+    assert result["http_connection_reset"] is True
+    assert result["profit_prediction"]["available"] is True
+    assert attempts["/profit/predict"] == 2
+    assert attempts["/sentiment/deep/analyze"] == 1
+    assert attempts["/timeseries/predict"] == 1
+    assert reset_count == 1
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -397,6 +438,33 @@ async def test_local_ai_tools_client_reset_does_not_wait_for_stubborn_close_clea
     assert elapsed < 0.15
     assert client._http_client is None
     await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_reset_does_not_close_active_batch_connections(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+
+    class ActiveClient:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    active_client = ActiveClient()
+    client._http_client = active_client  # type: ignore[assignment]
+    client._http_client_base = "http://local-ai-tools.test"
+    client._active_inference_batches = 1
+
+    assert await client._reset_http_client() is True
+    await asyncio.sleep(0)
+    assert active_client.closed is False
+
+    client._active_inference_batches = 0
+    client._close_deferred_http_clients_if_idle()
+    await asyncio.sleep(0.05)
+    assert active_client.closed is True
 
 
 @pytest.mark.asyncio

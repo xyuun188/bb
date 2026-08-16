@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
+from services.entry_direction_support import assess_paper_model_trade_support
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     COST_MODEL_VERSION,
@@ -382,6 +383,61 @@ def test_unavailable_local_ml_horizon_does_not_hide_native_tool_cohort() -> None
     assert context["decision_source_count"] == 2
     assert context["selected_horizon_minutes"] == 240
     assert context["aggregate_blockers"] == []
+
+
+def test_model_blueprint_authority_blocks_unauthorized_short_observation() -> None:
+    signal = _paper_payload(0.1, 0.2)
+    signal["strategy_blueprint"] = {
+        "version": "blueprint-v1",
+        "model_version": "model-v1",
+        "paper_execution_eligible": True,
+        "live_execution_permission": False,
+        "eligible_sides": ["long"],
+    }
+    tools = {
+        "profit_prediction": _paper_payload(0.1, 1.5),
+    }
+
+    context = _context(
+        ml=signal,
+        tools=tools,
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "long"
+    assert context["model_strategy_direction_authorization"]["short"][
+        "reason"
+    ] == "direction_not_authorized_by_model_blueprint"
+    short_evidence = context["short"]["evidence"]
+    assert short_evidence
+    assert all(item["decision_eligible"] is False for item in short_evidence)
+    assert all(item["paper_eligible"] is False for item in short_evidence)
+    assert all(item["observation_only"] is True for item in short_evidence)
+
+
+def test_authorized_long_can_compare_against_unauthorized_short_observation() -> None:
+    signal = _paper_payload(1.2, 0.3)
+    signal["strategy_blueprint"] = {
+        "version": "blueprint-v1",
+        "model_version": "model-v1",
+        "paper_execution_eligible": True,
+        "live_execution_permission": False,
+        "eligible_sides": ["long"],
+    }
+
+    context = _context(ml=signal, strategy={"execution_mode": "paper"})
+    support = assess_paper_model_trade_support(
+        context,
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert context["preferred_side"] == "long"
+    assert support["eligible"] is True
+    assert support["quant_evidence_families"] == ["local_ml"]
+    assert context["short"]["evidence"][0]["decision_eligible"] is False
+    assert context["short"]["evidence"][0]["direction_comparison_eligible"] is True
 
 
 def test_mismatched_horizons_cannot_enter_direction_aggregation() -> None:

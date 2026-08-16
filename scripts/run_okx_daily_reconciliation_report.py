@@ -145,7 +145,10 @@ def _last_json_object(output: str) -> dict[str, Any]:
         candidate = "\n".join(lines[index:]).strip()
         if not candidate.startswith("{"):
             continue
-        value = json.loads(candidate)
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
         if isinstance(value, dict):
             return value
     raise json.JSONDecodeError("online report JSON object not found", str(output or ""), 0)

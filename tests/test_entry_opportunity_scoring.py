@@ -399,6 +399,40 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     assert "paper_bootstrap_canary" not in decision.raw_response
 
 
+def test_model_blueprint_blocks_unauthorized_short_candidate() -> None:
+    decision = _decision()
+    decision.action = Action.SHORT
+    decision.raw_response["ml_signal"] = _paper_payload(
+        side="short",
+        long_return=0.2,
+        short_return=1.2,
+    )
+    decision.raw_response["ml_signal"]["strategy_blueprint"] = {
+        "version": "blueprint-v1",
+        "model_version": "model-v1",
+        "paper_execution_eligible": True,
+        "live_execution_permission": False,
+        "eligible_sides": ["long"],
+    }
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": _paper_payload(
+            side="short",
+            long_return=0.1,
+            short_return=2.0,
+        )
+    }
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert isinf(score) and score < 0
+    assert opportunity["decision_eligible"] is False
+    assert opportunity["paper_eligible"] is False
+    assert opportunity["expected_net_breakdown"]["components"][0][
+        "eligibility_reason"
+    ] == "direction_not_authorized_by_model_blueprint"
+
+
 def _paper_payload(*, side: str, long_return: float, short_return: float) -> dict:
     payload = _live_payload(
         side=side,

@@ -59,6 +59,7 @@ tmp_*.log
 *.zip
 *.7z
 *.rar
+/tmp/
 .tmp/
 .rtk/
 .codex/

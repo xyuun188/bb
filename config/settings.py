@@ -385,6 +385,8 @@ class Settings(BaseSettings):
     ai_expert_timeout_seconds: float = 30.0
     ai_decision_maker_timeout_seconds: float = 20.0
     ai_expert_max_completion_tokens: int = 360
+    # Fast independent experts need enough room to finish their JSON contract.
+    ai_fast_expert_max_completion_tokens: int = 700
     ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
     ai_batch_expert_max_completion_tokens: int = 560

@@ -204,6 +204,15 @@ def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() 
     assert 'LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000"' in SERVICE_CODE
 
 
+def test_deploy_blocks_python_incompatible_training_executor_arguments() -> None:
+    command = deploy._remote_training_runtime_compatibility_command()
+
+    assert "max_tasks_per_child" not in SERVICE_CODE
+    assert "grep -Fq max_tasks_per_child" in command
+    assert "ProcessPoolExecutor(max_workers=1)" in command
+    assert "phase3_training_executor_compatibility_ok" in command
+
+
 def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,6 +249,128 @@ def test_local_ai_tools_training_rejects_overlapping_registry_mutations(
         "reason": "training_in_progress",
         "message": "A local AI training request is already running.",
     }
+
+
+def test_isolated_training_timeout_terminates_worker_and_clears_runtime_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_training_timeout_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.ISOLATE_TRAINING_PROCESS = True
+    module.TRAIN_REQUEST_TIMEOUT_SECONDS = 0.01
+    module.TRAINING_RUNTIME_STATE_PATH = tmp_path / "training_process.json"
+
+    class FakeProcess:
+        pid = 987654
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.terminated = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+        def join(self, timeout: float) -> None:
+            assert timeout == 2.0
+
+    class TimeoutFuture:
+        def result(self, *, timeout: float) -> dict[str, object]:
+            assert timeout == 0.01
+            raise module.FutureTimeoutError
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.worker = FakeProcess()
+            self._processes = {self.worker.pid: self.worker}
+            self.shutdown_called = False
+
+        def submit(self, _worker: object, _payload: object) -> TimeoutFuture:
+            return TimeoutFuture()
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is False
+            assert cancel_futures is True
+            self.shutdown_called = True
+
+    executor = FakeExecutor()
+    monkeypatch.setattr(module, "_training_executor", lambda: executor)
+
+    request = SimpleNamespace(persist_artifact=False, model_dump=lambda: {})
+    result = module._run_training_request(request)
+
+    assert result["trained"] is False
+    assert result["reason"] == "timeout"
+    assert result["training_worker_terminated"] is True
+    assert executor.shutdown_called is True
+    assert executor.worker.terminated is True
+    assert module.TRAINING_RUNTIME_STATE_PATH.exists() is False
+
+
+def test_isolated_training_success_clears_runtime_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_training_success_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.ISOLATE_TRAINING_PROCESS = True
+    module.TRAINING_RUNTIME_STATE_PATH = tmp_path / "training_process.json"
+
+    class CompletedFuture:
+        def result(self, *, timeout: float) -> dict[str, object]:
+            assert timeout == module.TRAIN_REQUEST_TIMEOUT_SECONDS
+            return {"trained": False, "reason": "phase3_preflight_no_artifact_write"}
+
+    class FakeExecutor:
+        _processes: dict[int, object] = {}
+
+        def submit(self, _worker: object, _payload: object) -> CompletedFuture:
+            return CompletedFuture()
+
+    monkeypatch.setattr(module, "_training_executor", lambda: FakeExecutor())
+
+    request = SimpleNamespace(persist_artifact=False, model_dump=lambda: {})
+    result = module._run_training_request(request)
+
+    assert result["training_process_isolated"] is True
+    assert result["training_request_id"]
+    assert result["training_timeout_seconds"] == module.TRAIN_REQUEST_TIMEOUT_SECONDS
+    assert module.TRAINING_RUNTIME_STATE_PATH.exists() is False
+
+
+def test_startup_cleanup_reaps_only_recorded_stale_training_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_stale_training_cleanup_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.TRAINING_RUNTIME_STATE_PATH = tmp_path / "training_process.json"
+    module.TRAINING_RUNTIME_STATE_PATH.write_text(
+        json.dumps(
+            {
+                "request_id": "stale-request",
+                "owner_pid": module.os.getpid() + 1000,
+                "worker_pids": [1234, 5678],
+                "worker_identities": {"1234": "token-a", "5678": "token-b"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    terminated: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        module,
+        "_terminate_pid",
+        lambda pid, token=None: terminated.append((pid, token)) or True,
+    )
+
+    module._cleanup_stale_training_workers()
+
+    assert terminated == [(1234, "token-a"), (5678, "token-b")]
+    assert module.TRAINING_RUNTIME_STATE_PATH.exists() is False
 
 
 def test_local_ai_tools_torch_patch_is_explicitly_cpu_bound() -> None:

@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 
-PROFIT_TRAINING_CONTRACT_VERSION = "2026-07-24.profit-loop-training.v2"
+PROFIT_TRAINING_CONTRACT_VERSION = "2026-08-16.profit-loop-training.v3"
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 
 DecisionAuthority = Literal["rules", "model", "manual", "system"]
@@ -22,8 +22,6 @@ DecisionAuthority = Literal["rules", "model", "manual", "system"]
 REQUIRED_TEXT_FIELDS = (
     "symbol",
     "side",
-    "entry_order_id",
-    "close_order_id",
     "notional_source",
     "entry_fee_source",
     "close_fee_source",
@@ -64,12 +62,20 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _order_ids(sample: dict[str, Any], plural_key: str, singular_key: str) -> list[str]:
+    raw = sample.get(plural_key)
+    values = raw if isinstance(raw, (list, tuple, set)) else []
+    result = list(dict.fromkeys(_text(value) for value in values if _text(value)))
+    singular = _text(sample.get(singular_key))
+    if singular and singular not in result:
+        result.append(singular)
+    return result
+
+
 def _fingerprint_payload(sample: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "symbol",
         "side",
-        "entry_order_id",
-        "close_order_id",
         "entry_price",
         "close_price",
         "quantity",
@@ -77,7 +83,11 @@ def _fingerprint_payload(sample: dict[str, Any]) -> dict[str, Any]:
         "realized_pnl",
         "net_return_after_all_cost_pct",
     )
-    return {key: sample.get(key) for key in keys}
+    return {
+        **{key: sample.get(key) for key in keys},
+        "entry_order_ids": _order_ids(sample, "entry_order_ids", "entry_order_id"),
+        "close_order_ids": _order_ids(sample, "close_order_ids", "close_order_id"),
+    }
 
 
 def profit_sample_fingerprint(sample: dict[str, Any]) -> str:
@@ -149,6 +159,10 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
         value = _safe_float(sample.get(field))
         if value is None:
             blockers.append(f"{field}_missing_or_invalid")
+    if not _order_ids(sample, "entry_order_ids", "entry_order_id"):
+        blockers.append("entry_order_ids_missing")
+    if not _order_ids(sample, "close_order_ids", "close_order_id"):
+        blockers.append("close_order_ids_missing")
 
     side = _text(sample.get("side")).lower()
     if side not in {"long", "short"}:
@@ -164,9 +178,10 @@ def validate_profit_training_sample(sample: dict[str, Any]) -> ProfitTrainingCon
     if (_safe_float(sample.get("holding_minutes")) or 0.0) < 0:
         blockers.append("holding_minutes_negative")
 
-    if _text(sample.get("notional_source")) != (
-        "okx_entry_fill_base_quantity_and_average_price"
-    ):
+    if _text(sample.get("notional_source")) not in {
+        "okx_entry_fill_base_quantity_and_average_price",
+        "okx_fills_history_pnl_and_position_history_price_path",
+    }:
         blockers.append("notional_source_not_authoritative")
     allowed_fee_sources = {
         "okx_fills_history",

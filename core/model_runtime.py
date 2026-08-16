@@ -10,6 +10,7 @@ HIGH_RISK_REVIEW_TOKEN_FLOOR = 160
 HIGH_RISK_REVIEW_TOKEN_CAP = 600
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
+    "fast_expert": 700,
     "decision_maker": 320,
     # The dedicated expert pool has a 4096-token context window. Production
     # prompts use about 3200 input tokens, so 560 leaves explicit transport and
@@ -27,6 +28,7 @@ COMPLETION_TOKEN_CAPS = {
 # keeps extra headroom on non-batch paths; strict batch JSON is disabled for it.
 THINKING_COMPLETION_TOKEN_CAPS = {
     "expert": 640,
+    "fast_expert": 640,
     "decision_maker": 560,
     "batch_expert": 1100,
     "paper_batch_expert": 1100,

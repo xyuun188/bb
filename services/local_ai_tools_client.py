@@ -56,6 +56,10 @@ _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
 _MAX_CONCURRENT_INFERENCE_BATCHES = 2
 
 
+class _RetryableLocalAIToolsError(RuntimeError):
+    """Transport failure that may be retried after the current batch drains."""
+
+
 class LocalAIToolsClient:
     """Fetch profit, time-series, and sentiment signals without blocking trading."""
 
@@ -76,6 +80,8 @@ class LocalAIToolsClient:
             self._inference_slots.put_nowait(slot)
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_base: str = ""
+        self._active_inference_batches = 0
+        self._stale_http_clients: set[httpx.AsyncClient] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
     def _request_timeout(self) -> float:
@@ -233,6 +239,7 @@ class LocalAIToolsClient:
                     "error": safe_error_text(exc, limit=180),
                     "path": path,
                     "allocated_timeout_sec": round(effective_timeout, 4),
+                    "transport_error": isinstance(exc, _RetryableLocalAIToolsError),
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
@@ -256,6 +263,7 @@ class LocalAIToolsClient:
         inference_slot: int | None = None
         queue_started = monotonic()
         queue_wait_seconds = 0.0
+        http_connection_reset = False
         try:
             # Never queue a whole market round behind the active capacity. The
             # next scheduled round will retry a deferred batch.
@@ -265,6 +273,7 @@ class LocalAIToolsClient:
                 inference_slot = None
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
             if inference_slot is not None:
+                self._active_inference_batches += 1
                 results = list(
                     await asyncio.gather(
                         *(
@@ -274,6 +283,32 @@ class LocalAIToolsClient:
                         return_exceptions=True,
                     )
                 )
+                retry_indexes = [
+                    index
+                    for index, item in enumerate(results)
+                    if isinstance(item, dict) and item.get("transport_error") is True
+                ]
+                remaining_retry_seconds = batch_deadline - monotonic()
+                if (
+                    retry_indexes
+                    and remaining_retry_seconds >= _MIN_INFERENCE_ATTEMPT_SECONDS
+                ):
+                    await self._reset_http_client()
+                    http_connection_reset = True
+                    retry_timeout = min(route_timeout, remaining_retry_seconds)
+                    retried = await asyncio.gather(
+                        *(
+                            call_tool(
+                                tool_specs[index][0],
+                                tool_specs[index][1],
+                                route_timeout=retry_timeout,
+                            )
+                            for index in retry_indexes
+                        ),
+                        return_exceptions=True,
+                    )
+                    for index, item in zip(retry_indexes, retried, strict=False):
+                        results[index] = item
             else:
                 results.extend(
                     {
@@ -287,6 +322,11 @@ class LocalAIToolsClient:
                 )
         finally:
             if inference_slot is not None:
+                self._active_inference_batches = max(
+                    self._active_inference_batches - 1,
+                    0,
+                )
+                self._close_deferred_http_clients_if_idle()
                 self._inference_slots.put_nowait(inference_slot)
         data: dict[str, Any] = {
             "enabled": True,
@@ -300,6 +340,8 @@ class LocalAIToolsClient:
             "batch_budget_seconds": round(request_timeout, 3),
             "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
+        if http_connection_reset:
+            data["http_connection_reset"] = True
         errors: dict[str, str] = {}
         deferred_names: set[str] = set()
         for (name, _path), item in zip(tool_specs, results, strict=False):
@@ -996,8 +1038,9 @@ class LocalAIToolsClient:
                 timeout=request_timeout or self._timeout,
             )
         except httpx.RequestError as exc:
-            await self._reset_http_client()
-            raise RuntimeError(self._request_error_message(exc)) from exc
+            if self._active_inference_batches <= 0:
+                await self._reset_http_client()
+            raise _RetryableLocalAIToolsError(self._request_error_message(exc)) from exc
         return self._parse_response(response, path)
 
     def _post_sync(
@@ -1078,10 +1121,23 @@ class LocalAIToolsClient:
         self._http_client_base = ""
         if client is None:
             return False
-        self._track_background_task(
-            asyncio.create_task(self._close_stale_http_client(client))
-        )
+        if self._active_inference_batches > 0:
+            self._stale_http_clients.add(client)
+        else:
+            self._track_background_task(
+                asyncio.create_task(self._close_stale_http_client(client))
+            )
         return True
+
+    def _close_deferred_http_clients_if_idle(self) -> None:
+        if self._active_inference_batches > 0 or not self._stale_http_clients:
+            return
+        stale_clients = tuple(self._stale_http_clients)
+        self._stale_http_clients.clear()
+        for client in stale_clients:
+            self._track_background_task(
+                asyncio.create_task(self._close_stale_http_client(client))
+            )
 
     async def _close_stale_http_client(self, client: httpx.AsyncClient) -> None:
         close_task = asyncio.create_task(client.aclose())
@@ -1109,8 +1165,12 @@ class LocalAIToolsClient:
         client = self._http_client
         self._http_client = None
         self._http_client_base = ""
+        clients = set(self._stale_http_clients)
+        self._stale_http_clients.clear()
         if client is not None:
-            await client.aclose()
+            clients.add(client)
+        if clients:
+            await asyncio.gather(*(item.aclose() for item in clients))
 
     def _parse_response(self, response: httpx.Response, path: str) -> dict[str, Any]:
         if not response.is_success:

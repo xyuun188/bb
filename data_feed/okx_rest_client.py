@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Any
 
 import structlog
@@ -30,6 +31,23 @@ logger = structlog.get_logger(__name__)
 OKX_REST_URL = "https://{hostname}"
 OKX_HOSTNAME = "www.okx.com"
 SUSPICIOUS_CONTRACT_BASE_TOKENS = ("TEST", "DEMO", "DUMMY", "MOCK", "SAMPLE")
+DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS = 6.0
+DERIVATIVES_ROUTE_TIMEOUT_SECONDS = 2.5
+DERIVATIVES_ROUTE_CACHE_TTL_SECONDS = 20.0
+DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
+REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 1.5
+REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS = 0.35
+REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
+REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
+ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 2.5
+ORDERBOOK_CACHE_TTL_SECONDS = 10.0
+
+
+def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        return
 
 def _is_suspicious_contract_base(base: str | None) -> bool:
     value = str(base or "").upper()
@@ -47,6 +65,18 @@ class OKXRestClient:
         self._exchange_init_lock = asyncio.Lock()
         self._instrument_spec_lock = asyncio.Lock()
         self._exchange_ready = False
+        self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._reference_price_failure_cache: dict[str, float] = {}
+        self._orderbook_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._orderbook_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._derivatives_route_cache: dict[
+            tuple[str, str], tuple[float, dict[str, Any]]
+        ] = {}
+        self._derivatives_route_tasks: dict[
+            tuple[str, str], asyncio.Task[dict[str, Any]]
+        ] = {}
+        self._derivatives_route_retry_at: dict[tuple[str, str], float] = {}
 
     async def _get_exchange(self) -> OkxPerpetualSdkExchange:
         if self._exchange is not None and self._exchange_ready:
@@ -316,6 +346,103 @@ class OKXRestClient:
             "open_interest_value": value,
         }
 
+    async def _cached_derivatives_route(
+        self,
+        route: str,
+        symbol: str,
+        fetcher: Any,
+        *,
+        timeout_seconds: float = DERIVATIVES_ROUTE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Coalesce slow derivative routes and keep their refresh off the round path."""
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        key = (str(route), inst_id)
+        now = time.monotonic()
+        cached = self._derivatives_route_cache.get(key)
+        if cached is not None and now - cached[0] <= DERIVATIVES_ROUTE_CACHE_TTL_SECONDS:
+            return {**cached[1], f"{route}_cached": True}
+        task = self._derivatives_route_tasks.get(key)
+        if task is not None and not task.done():
+            try:
+                return dict(
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=max(float(timeout_seconds or 0.0), 0.1),
+                    )
+                )
+            except TimeoutError:
+                return {
+                    **(cached[1] if cached is not None else {}),
+                    f"{route}_refresh_in_background": True,
+                    f"{route}_timeout": True,
+                }
+        retry_at = self._derivatives_route_retry_at.get(key, 0.0)
+        if retry_at > now:
+            return {
+                f"{route}_refresh_in_background": True,
+                f"{route}_retry_after_seconds": round(retry_at - now, 3),
+                **(cached[1] if cached is not None else {}),
+            }
+
+        if task is None or task.done():
+            task = asyncio.create_task(fetcher())
+            self._derivatives_route_tasks[key] = task
+
+            def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+                if self._derivatives_route_tasks.get(key) is finished:
+                    self._derivatives_route_tasks.pop(key, None)
+                try:
+                    result = finished.result()
+                except BaseException:
+                    self._derivatives_route_retry_at[key] = (
+                        time.monotonic() + DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS
+                    )
+                    return
+                if isinstance(result, dict) and result:
+                    self._derivatives_route_cache[key] = (time.monotonic(), dict(result))
+                    self._derivatives_route_retry_at.pop(key, None)
+                else:
+                    self._derivatives_route_retry_at[key] = (
+                        time.monotonic() + DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS
+                    )
+
+            task.add_done_callback(cleanup)
+        try:
+            return dict(
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(float(timeout_seconds or 0.0), 0.1),
+                )
+            )
+        except TimeoutError:
+            # Keep the single-flight task alive so a late OKX response can seed
+            # the cache; do not cancel and immediately reissue the same route.
+            self._derivatives_route_retry_at[key] = (
+                time.monotonic() + DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS
+            )
+            if cached is not None:
+                return {
+                    **cached[1],
+                    f"{route}_refresh_in_background": True,
+                    f"{route}_timeout": True,
+                }
+            return {
+                f"{route}_refresh_in_background": True,
+                f"{route}_timeout": True,
+            }
+        except Exception as exc:
+            self._derivatives_route_retry_at[key] = (
+                time.monotonic() + DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS
+            )
+            logger.debug(
+                "OKX derivative route failed",
+                route=route,
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+            return dict(cached[1]) if cached is not None else {}
+
     async def fetch_order_book_metrics(
         self,
         symbol: str,
@@ -323,13 +450,101 @@ class OKXRestClient:
         *,
         contract_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return top-book spread, depth and imbalance for the USDT swap."""
-        try:
+        """Return top-book metrics without letting a slow route block the round."""
+        normalized_spec = normalize_okx_contract_spec(contract_spec)
+        inst_id = okx_inst_id_from_symbol(symbol)
+        cached = self._orderbook_cache.get(inst_id)
+        if cached is not None and time.monotonic() - cached[0] <= ORDERBOOK_CACHE_TTL_SECONDS:
+            return {**cached[1], "orderbook_cached": True}
+
+        async def fetch_and_normalize() -> dict[str, Any]:
             book = await self._ccxt_call(
                 "fetch_order_book",
                 self._to_swap_symbol(symbol),
                 limit=limit,
             )
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            bid = self._safe_float(bids[0][0] if bids else 0.0)
+            ask = self._safe_float(asks[0][0] if asks else 0.0)
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+            spread_pct = ((ask - bid) / mid * 100) if mid > 0 and ask >= bid else 0.0
+            bid_depth = sum(
+                self._safe_float(level[0]) * self._safe_float(level[1])
+                for level in bids[:limit]
+                if len(level) >= 2
+            )
+            ask_depth = sum(
+                self._safe_float(level[0]) * self._safe_float(level[1])
+                for level in asks[:limit]
+                if len(level) >= 2
+            )
+            total_depth = bid_depth + ask_depth
+            imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
+            contract_value = self._safe_float(normalized_spec.get("contract_value"))
+            contract_multiplier = self._safe_float(
+                normalized_spec.get("contract_multiplier") or 1.0
+            )
+            contract_base_size = contract_value * contract_multiplier
+            bid_depth_usdt = bid_depth * contract_base_size if contract_base_size > 0 else 0.0
+            ask_depth_usdt = ask_depth * contract_base_size if contract_base_size > 0 else 0.0
+            info = book.get("info") if isinstance(book.get("info"), dict) else {}
+            source_timestamp_ms = int(
+                self._safe_float(book.get("timestamp") or info.get("ts"))
+            )
+            payload = {
+                "spread_pct": spread_pct,
+                "orderbook_bid_depth": bid_depth_usdt,
+                "orderbook_ask_depth": ask_depth_usdt,
+                "orderbook_imbalance": imbalance,
+                "orderbook_data_available": bool(bid > 0 and ask > 0),
+                "orderbook_fact": {
+                    "inst_id": inst_id,
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_rest_market_books",
+                    "source_channel": "books",
+                    "source_timestamp_ms": source_timestamp_ms,
+                    "bid": bid,
+                    "ask": ask,
+                    "bid_depth_usdt": bid_depth_usdt,
+                    "ask_depth_usdt": ask_depth_usdt,
+                    "contract_spec_version": normalized_spec.get("spec_version"),
+                },
+            }
+            if payload["orderbook_data_available"]:
+                self._orderbook_cache[inst_id] = (time.monotonic(), payload)
+            return payload
+
+        task = self._orderbook_tasks.get(inst_id)
+        if task is None or task.done():
+            task = asyncio.create_task(fetch_and_normalize())
+            self._orderbook_tasks[inst_id] = task
+
+            def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+                if self._orderbook_tasks.get(inst_id) is finished:
+                    self._orderbook_tasks.pop(inst_id, None)
+                _consume_cancelled_task(finished)
+
+            task.add_done_callback(cleanup)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=ORDERBOOK_ROUTE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.debug(
+                "OKX orderbook refresh still running; returning unavailable snapshot",
+                symbol=symbol,
+                timeout_seconds=ORDERBOOK_ROUTE_TIMEOUT_SECONDS,
+            )
+            return {
+                "spread_pct": 0.0,
+                "orderbook_bid_depth": 0.0,
+                "orderbook_ask_depth": 0.0,
+                "orderbook_imbalance": 0.0,
+                "orderbook_data_available": False,
+                "orderbook_refresh_in_background": True,
+            }
         except Exception as exc:
             logger.debug("fetch order book failed", symbol=symbol, error=safe_error_text(exc))
             return {
@@ -337,59 +552,63 @@ class OKXRestClient:
                 "orderbook_bid_depth": 0.0,
                 "orderbook_ask_depth": 0.0,
                 "orderbook_imbalance": 0.0,
+                "orderbook_data_available": False,
             }
 
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
-        bid = self._safe_float(bids[0][0] if bids else 0.0)
-        ask = self._safe_float(asks[0][0] if asks else 0.0)
-        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
-        spread_pct = ((ask - bid) / mid * 100) if mid > 0 and ask >= bid else 0.0
-        bid_depth = sum(
-            self._safe_float(level[0]) * self._safe_float(level[1])
-            for level in bids[:limit]
-            if len(level) >= 2
-        )
-        ask_depth = sum(
-            self._safe_float(level[0]) * self._safe_float(level[1])
-            for level in asks[:limit]
-            if len(level) >= 2
-        )
-        total_depth = bid_depth + ask_depth
-        imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
-        normalized_spec = normalize_okx_contract_spec(contract_spec)
-        contract_value = self._safe_float(normalized_spec.get("contract_value"))
-        contract_multiplier = self._safe_float(
-            normalized_spec.get("contract_multiplier") or 1.0
-        )
-        contract_base_size = contract_value * contract_multiplier
-        bid_depth_usdt = bid_depth * contract_base_size if contract_base_size > 0 else 0.0
-        ask_depth_usdt = ask_depth * contract_base_size if contract_base_size > 0 else 0.0
-        info = book.get("info") if isinstance(book.get("info"), dict) else {}
-        source_timestamp_ms = int(
-            self._safe_float(book.get("timestamp") or info.get("ts"))
-        )
-        inst_id = okx_inst_id_from_symbol(symbol)
-        return {
-            "spread_pct": spread_pct,
-            "orderbook_bid_depth": bid_depth_usdt,
-            "orderbook_ask_depth": ask_depth_usdt,
-            "orderbook_imbalance": imbalance,
-            "orderbook_fact": {
-                "inst_id": inst_id,
-                "inst_type": "SWAP",
-                "source_endpoint": "okx_rest_market_books",
-                "source_channel": "books",
-                "source_timestamp_ms": source_timestamp_ms,
-                "bid": bid,
-                "ask": ask,
-                "bid_depth_usdt": bid_depth_usdt,
-                "ask_depth_usdt": ask_depth_usdt,
-                "contract_spec_version": normalized_spec.get("spec_version"),
-            },
-        }
-
     async def fetch_reference_prices(
+        self,
+        symbol: str,
+        *,
+        contract_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return reference prices through a per-instrument single-flight refresh."""
+        normalized_spec = normalize_okx_contract_spec(contract_spec)
+        inst_id = okx_inst_id_from_symbol(symbol)
+        cached = self._reference_price_cache.get(inst_id)
+        if cached is not None and time.monotonic() - cached[0] <= REFERENCE_PRICES_CACHE_TTL_SECONDS:
+            return {**cached[1], "reference_prices_cached": True}
+
+        now = time.monotonic()
+        retry_at = self._reference_price_failure_cache.get(inst_id, 0.0)
+        if retry_at > now:
+            return {
+                "reference_prices_data_available": False,
+                "reference_prices_retry_after_seconds": round(retry_at - now, 3),
+                "reference_prices_refresh_in_background": True,
+            }
+
+        task = self._reference_price_tasks.get(inst_id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._refresh_reference_prices(
+                    symbol,
+                    contract_spec=normalized_spec,
+                )
+            )
+            self._reference_price_tasks[inst_id] = task
+
+            def _finish(completed: asyncio.Task[dict[str, Any]]) -> None:
+                if self._reference_price_tasks.get(inst_id) is completed:
+                    self._reference_price_tasks.pop(inst_id, None)
+                try:
+                    result = completed.result()
+                except BaseException:
+                    self._reference_price_failure_cache[inst_id] = (
+                        time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
+                    )
+                    return
+                if not result.get("mark_price") and not result.get("index_price"):
+                    self._reference_price_failure_cache[inst_id] = (
+                        time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
+                    )
+                else:
+                    self._reference_price_failure_cache.pop(inst_id, None)
+
+            task.add_done_callback(_finish)
+        result = await asyncio.shield(task)
+        return dict(result)
+
+    async def _refresh_reference_prices(
         self,
         symbol: str,
         *,
@@ -398,14 +617,34 @@ class OKXRestClient:
         normalized_spec = normalize_okx_contract_spec(contract_spec)
         inst_id = okx_inst_id_from_symbol(symbol)
         uly = str(normalized_spec.get("uly") or inst_id.removesuffix("-SWAP")).upper()
-        mark_result, index_result = await asyncio.gather(
-            self._ccxt_call(
-                "publicGetPublicMarkPrice",
-                {"instType": "SWAP", "instId": inst_id},
+        route_tasks = {
+            "mark": asyncio.create_task(
+                self._ccxt_call(
+                    "publicGetPublicMarkPrice",
+                    {"instType": "SWAP", "instId": inst_id},
+                )
             ),
-            self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly}),
-            return_exceptions=True,
+            "index": asyncio.create_task(
+                self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly})
+            ),
+        }
+        task_names = {task: name for name, task in route_tasks.items()}
+        done, pending = await asyncio.wait(
+            set(route_tasks.values()),
+            timeout=REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS,
         )
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(_consume_cancelled_task)
+        results: dict[str, Any] = {}
+        for task in done:
+            try:
+                results[task_names[task]] = task.result()
+            except Exception:
+                results[task_names[task]] = {}
+
+        mark_result = results.get("mark")
+        index_result = results.get("index")
         mark_rows = (
             mark_result.get("data", []) if isinstance(mark_result, dict) else []
         )
@@ -416,7 +655,45 @@ class OKXRestClient:
         index_row = index_rows[0] if index_rows and isinstance(index_rows[0], dict) else {}
         mark_price = self._safe_float(mark_row.get("markPx"))
         index_price = self._safe_float(index_row.get("idxPx"))
-        return {
+        fallback_used = False
+        if mark_price <= 0 or index_price <= 0:
+            # A slow public mark/index endpoint must not block an analysis
+            # round.  The ticker is an exchange-native, current price fallback
+            # and is explicitly labelled so downstream training can distinguish
+            # it from a verified mark/index pair.
+            ticker_task: asyncio.Task[Any] | None = None
+            try:
+                ticker_task = asyncio.create_task(
+                    self._ccxt_call(
+                        "publicGetMarketTicker",
+                        {"instId": inst_id},
+                    )
+                )
+                ticker_result = await asyncio.wait_for(
+                    ticker_task,
+                    timeout=REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS,
+                )
+                ticker_rows = (
+                    ticker_result.get("data", [])
+                    if isinstance(ticker_result, dict)
+                    else []
+                )
+                ticker_row = (
+                    ticker_rows[0]
+                    if ticker_rows and isinstance(ticker_rows[0], dict)
+                    else {}
+                )
+                ticker_price = self._safe_float(ticker_row.get("last"))
+                if ticker_price > 0:
+                    mark_price = mark_price or ticker_price
+                    index_price = index_price or ticker_price
+                    fallback_used = True
+            except Exception:
+                if ticker_task is not None and not ticker_task.done():
+                    ticker_task.cancel()
+                    ticker_task.add_done_callback(_consume_cancelled_task)
+
+        payload = {
             "mark_price": mark_price,
             "index_price": index_price,
             "mark_price_fact": {
@@ -436,30 +713,94 @@ class OKXRestClient:
                 "price": index_price,
             },
         }
+        if fallback_used:
+            payload["reference_prices_fallback"] = "ticker_last"
+        if mark_price > 0 or index_price > 0:
+            self._reference_price_cache[inst_id] = (time.monotonic(), payload)
+        return payload
 
     async def fetch_derivatives_snapshot(
         self,
         symbol: str,
         *,
         contract_spec: dict[str, Any] | None = None,
+        timeout_seconds: float = DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Fetch compact perpetual-swap features used by AI experts."""
-        results = await asyncio.gather(
-            self.fetch_funding_rate(symbol),
-            self.fetch_open_interest(symbol),
-            self.fetch_order_book_metrics(symbol, contract_spec=contract_spec),
-            self.fetch_reference_prices(symbol, contract_spec=contract_spec),
-            return_exceptions=True,
-        )
-        funding, open_interest, orderbook, reference_prices = (
-            item if isinstance(item, dict) else {} for item in results
-        )
-        return {
-            **funding,
-            **open_interest,
-            **orderbook,
-            **reference_prices,
+        route_tasks = {
+            "funding": asyncio.create_task(
+                self._cached_derivatives_route(
+                    "funding",
+                    symbol,
+                    lambda: self.fetch_funding_rate(symbol),
+                )
+            ),
+            "open_interest": asyncio.create_task(
+                self._cached_derivatives_route(
+                    "open_interest",
+                    symbol,
+                    lambda: self.fetch_open_interest(symbol),
+                )
+            ),
+            "orderbook": asyncio.create_task(
+                self.fetch_order_book_metrics(symbol, contract_spec=contract_spec)
+            ),
+            "reference_prices": asyncio.create_task(
+                self.fetch_reference_prices(symbol, contract_spec=contract_spec)
+            ),
         }
+        task_names = {task: name for name, task in route_tasks.items()}
+        done, pending = await asyncio.wait(
+            set(task_names),
+            timeout=max(float(timeout_seconds or 0.0), 0.05),
+        )
+        timed_out_routes = sorted(task_names[task] for task in pending)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(_consume_cancelled_task)
+        if pending:
+            await asyncio.sleep(0)
+
+        merged: dict[str, Any] = {}
+        failed_routes: list[str] = []
+        completed_routes: list[str] = []
+        for task in done:
+            route_name = task_names[task]
+            try:
+                result = task.result()
+            except Exception:
+                failed_routes.append(route_name)
+                continue
+            if isinstance(result, dict):
+                merged.update(result)
+                if result.get(f"{route_name}_timeout"):
+                    timed_out_routes.append(route_name)
+                else:
+                    completed_routes.append(route_name)
+            else:
+                failed_routes.append(route_name)
+        timed_out_routes = sorted(set(timed_out_routes))
+
+        merged["derivatives_route_status"] = {
+            "completed": sorted(completed_routes),
+            "failed": sorted(failed_routes),
+            "timed_out": timed_out_routes,
+        }
+        merged["derivatives_snapshot_partial"] = bool(
+            failed_routes
+            or timed_out_routes
+            or merged.get("orderbook_data_available") is False
+            or merged.get("reference_prices_fallback")
+        )
+        if timed_out_routes:
+            logger.warning(
+                "OKX derivatives snapshot returned partial data within deadline",
+                symbol=symbol,
+                timed_out_routes=timed_out_routes,
+                completed_routes=sorted(completed_routes),
+                timeout_seconds=round(max(float(timeout_seconds or 0.0), 0.05), 3),
+            )
+        return merged
 
     async def fetch_balance(self) -> dict:
         return await self._ccxt_call("fetch_balance")

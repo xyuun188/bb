@@ -28,7 +28,10 @@ from services.entry_signal_extraction import (
     signal_return_distribution_eligibility,
 )
 from services.execution_cost_model import execution_cost_estimate
-from services.model_strategy_blueprint import paper_strategy_authorization
+from services.model_strategy_blueprint import (
+    model_strategy_side_authorization,
+    paper_strategy_authorization,
+)
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -119,6 +122,11 @@ class EntryOpportunityScoringPolicy:
         predictions = safe_list(signal.get("predictions"))
         primary = safe_dict(predictions[0] if predictions else {})
         execution_scope = _execution_scope(strategy)
+        direction_authorization = model_strategy_side_authorization(
+            signal,
+            execution_scope=execution_scope,
+            side=side,
+        )
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
         live_claimed = bool(
@@ -182,6 +190,13 @@ class EntryOpportunityScoringPolicy:
         decision_eligible = (
             paper_eligible if execution_scope == "paper" else production_eligible
         )
+        if (
+            direction_authorization.get("enforced") is True
+            and direction_authorization.get("eligible") is not True
+        ):
+            paper_eligible = False
+            production_eligible = False
+            decision_eligible = False
         observation_only = bool(not decision_eligible and primary and contract)
         actual_calibration = safe_dict(
             safe_dict(primary.get("actual_trade_calibration")).get(side)
@@ -207,7 +222,10 @@ class EntryOpportunityScoringPolicy:
                 else "standardized_distribution_and_side_readiness_confirmed"
                 if execution_scope == "live" and decision_eligible
                 else str(
-                    distribution_eligibility.get("reason")
+                    direction_authorization.get("reason")
+                    if direction_authorization.get("enforced") is True
+                    and direction_authorization.get("eligible") is not True
+                    else distribution_eligibility.get("reason")
                     or governance_reason
                     or "local_ml_production_governance_incomplete"
                 )
@@ -215,6 +233,7 @@ class EntryOpportunityScoringPolicy:
             "side": side,
             "execution_scope": execution_scope,
             "paper_strategy_authorization": paper_authorization,
+            "model_strategy_side_authorization": direction_authorization,
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
             "raw_return_pct": contract.get("raw_expected_return_pct"),
@@ -241,6 +260,7 @@ class EntryOpportunityScoringPolicy:
         side: str,
         aliases: tuple[str, ...],
         strategy: dict[str, Any] | None,
+        direction_authorization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = first_tool_payload(raw, *aliases)
         execution_scope = _execution_scope(strategy)
@@ -282,6 +302,14 @@ class EntryOpportunityScoringPolicy:
         decision_eligible = (
             paper_eligible if execution_scope == "paper" else production_eligible
         )
+        model_direction = safe_dict(direction_authorization)
+        if (
+            model_direction.get("enforced") is True
+            and model_direction.get("eligible") is not True
+        ):
+            paper_eligible = False
+            production_eligible = False
+            decision_eligible = False
         observation_only = bool(
             not decision_eligible
             and signal_available(payload)
@@ -303,7 +331,10 @@ class EntryOpportunityScoringPolicy:
                 else "production_governance_allows_live_influence"
                 if execution_scope == "live" and decision_eligible
                 else str(
-                    distribution_eligibility.get("reason")
+                    model_direction.get("reason")
+                    if model_direction.get("enforced") is True
+                    and model_direction.get("eligible") is not True
+                    else distribution_eligibility.get("reason")
                     or (
                         paper_governance.get("reason")
                         if execution_scope == "paper"
@@ -314,6 +345,7 @@ class EntryOpportunityScoringPolicy:
             ),
             "side": side,
             "execution_scope": execution_scope,
+            "model_strategy_side_authorization": model_direction,
             "reported_best_side": payload_side(payload) or "unknown",
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
@@ -350,6 +382,11 @@ class EntryOpportunityScoringPolicy:
         side = "long" if decision.action == Action.LONG else "short"
         execution_scope = _execution_scope(strategy)
         raw = safe_dict(decision.raw_response)
+        model_direction_authorization = model_strategy_side_authorization(
+            safe_dict(raw.get("ml_signal")),
+            execution_scope=execution_scope,
+            side=side,
+        )
         execution_cost = execution_cost_estimate(
             decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
         )
@@ -372,6 +409,7 @@ class EntryOpportunityScoringPolicy:
                     "profit",
                 ),
                 strategy=strategy,
+                direction_authorization=model_direction_authorization,
             ),
             self._server_component(
                 raw,
@@ -385,6 +423,7 @@ class EntryOpportunityScoringPolicy:
                     "time_series",
                 ),
                 strategy=strategy,
+                direction_authorization=model_direction_authorization,
             ),
         ]
         selected_components = [
