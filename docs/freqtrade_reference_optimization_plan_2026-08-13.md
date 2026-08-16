@@ -433,16 +433,20 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 
 ### 15.2 2026-08-16 线上观察证据
 
-- 部署后完整 30 分钟窗口内，交易服务和 Dashboard 均为 `active/running`，`NRestarts=0`。
-- 市场分析 21 条，覆盖 13 个不同币种；单币种最高占比 14.29%，最大分析间隔 208.55 秒。
-- 当前候选欠账 `overdue_count=0`，30 分钟覆盖窗口满足；延后原因为正常冷却，没有轮次超时。
-- 11 个持仓在同一窗口内产生 549 条持仓复核记录，持仓分析持续运行。
-- 自动训练在交易繁忙时先让行，达到约 918 秒上限后自动启动低优先级隔离训练；训练期间服务未重启，市场分析最大间隔仍低于 10 分钟。
+- 最终验收窗口为 `2026-08-16T07:40:40Z` 至 `2026-08-16T08:10:40Z`，覆盖 Local ML 和随后的 Local AI Tools 真实线上训练。交易服务与 Dashboard 全程均为 `active/running`，`NRestarts=0`。
+- 同一窗口内市场分析 19 条，覆盖 9 个不同币种；单币种最高占比 15.79%，最大活动间隔 384.66 秒。
+- 当前候选欠账 `overdue_count=0`，`coverage_due_count=0`，30 分钟覆盖窗口满足；延后原因为正常冷却，没有轮次超时。
+- 11 个持仓在同一窗口内产生 560 条持仓复核记录，持仓分析持续运行；最终线上覆盖审计结果为 `assessment.ready=true`。
+- Local ML 运行 `ee1bff41dfee47f0b414cf9282efa93f` 自然结束后落成 `succeeded`，`active_run_id=null`、`last_error=null`、`retry_count=0`，产物已持久化。
+- Local AI Tools 运行 `0152e6b957154437bb7b507af08c00a6` 随后自然结束，6 个模型状态全部一致落成 `succeeded`、`active_run_id=null`、`last_error=null`、`retry_count=0`，产物已持久化。
+- 两类训练的最终原因均为 `trained_challenger_rejected`：训练已完成，但 challenger 没有通过收益质量晋升门禁，系统正确保留当前 champion，该结果不是训练异常。
+- 从 Local ML 启动至 Local AI Tools 结束的线上日志审计中，服务错误、Traceback、专家 JSON 截断、市场轮次超时、特征向量超时和单币种模型 deadline 均为 0。仍有 22 次 OKX 衍生品 partial 告警：`funding/open_interest` 在 6 秒窗口内未返回，而 orderbook/reference prices 正常返回；系统显式降级且未阻塞分析，因此不将其误报为“零告警”。
+- 公开 Dashboard 地址 `http://38.246.249.80:8002/` 经一次登录跳转后返回 HTTP 200，整体响应约 0.10 秒。
 - 线上训练超时状态机探针通过：超时会记录 `state=failed`、`reason=timeout`、清空 active run 并增加重试计数。
 
 ### 15.3 尚未完成或仍被门禁阻止
 
-- `local_ml_profit_quality` 的最新自动训练仍在真实线上运行，尚未落成最终 `succeeded/skipped/failed`；在最终结果写回前，本项只能标记为观察中。
+- 本轮 Local ML 和 Local AI Tools 自动训练的状态闭环已通过线上验收，但 challenger 均被现有收益质量门禁拒绝；训练成功不等于模型已可晋升。
 - 当前没有新的正费后 long/short 入场样本可以证明方向交易效果已经恢复。没有开仓时不能通过放宽收益、LCB、成本完整性或 OKX 安全门禁来制造验收结果。
 - `live_ml_ready=false`。本地 ML 仍为 `promotion_blocked`，Local AI Tools 仍为 canary；现有阻断包括 walk-forward、市场阶段、留一币种稳定性以及 short 方向费后质量不足。
 - FinQuant 和模型服务 ready 只代表运行时可用，不代表策略模型已经满足 live 晋升条件；`live_routing_enabled=false` 保持不变。
