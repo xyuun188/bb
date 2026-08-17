@@ -288,9 +288,12 @@ def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:
         )
     ]
     assert "已实现盈亏" in pnl_block
+    assert "浮动盈亏" in pnl_block
     assert "平仓收益" in pnl_block
     assert "资金费" in pnl_block
     assert "手续费" in pnl_block
+    assert "floatingPnl + fundingFee - fee" in pnl_block
+    assert "isOpenPosition ? floatingPnl : closeFillPnl" in pnl_block
     assert "盈亏金额（浮动）" not in pnl_block
     assert "总盈亏（浮动 + 资金费）" not in pnl_block
     assert ".position-pnl-link" in style

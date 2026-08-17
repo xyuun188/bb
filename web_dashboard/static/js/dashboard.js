@@ -8740,17 +8740,25 @@ function positionFeeTotal(position) {
 
 function positionPnlBreakdownHtml(position) {
     // Match the OKX position detail popover: show ledger components only.
-    const realizedPnl = mlOptionalNumber(position?.realized_pnl);
+    const isOpenPosition = position?.is_open === true
+        || String(position?.close_status || '').toLowerCase() === 'open';
+    const floatingPnl = mlOptionalNumber(position?.unrealized_pnl);
+    const settledRealizedPnl = mlOptionalNumber(position?.realized_pnl);
     const closeFillPnl = mlOptionalNumber(position?.close_fill_pnl);
     const fundingFee = Number(position?.funding_fee || 0);
     const fee = positionFeeTotal(position);
+    const realizedPnl = isOpenPosition && floatingPnl !== null
+        ? floatingPnl + fundingFee - fee
+        : settledRealizedPnl;
+    const secondaryPnl = isOpenPosition ? floatingPnl : closeFillPnl;
+    const secondaryLabel = isOpenPosition ? '浮动盈亏' : '平仓收益';
     const realizedText = realizedPnl === null ? '待官方结算' : `${signedMoney(realizedPnl)} USDT`;
-    const closeFillText = closeFillPnl === null ? '--' : `${signedMoney(closeFillPnl)} USDT`;
+    const secondaryText = secondaryPnl === null ? '--' : `${signedMoney(secondaryPnl)} USDT`;
     const feeText = fee > 0 ? `-${fmtMoney(fee)} USDT` : '0.00 USDT';
     return `
         <div class="position-ledger-summary position-pnl-breakdown">
             <div><span>已实现盈亏</span><strong style="color:${signedMoneyColor(realizedPnl)};">${realizedText}</strong></div>
-            <div><span>平仓收益</span><strong style="color:${signedMoneyColor(closeFillPnl)};">${closeFillText}</strong></div>
+            <div><span>${secondaryLabel}</span><strong style="color:${signedMoneyColor(secondaryPnl)};">${secondaryText}</strong></div>
             <div><span>资金费</span><strong style="color:${signedMoneyColor(fundingFee)};">${signedMoney(fundingFee)} USDT</strong></div>
             <div><span>手续费</span><strong style="color:${fee > 0 ? 'var(--red)' : 'var(--text-muted)'};">${feeText}</strong></div>
         </div>`;
