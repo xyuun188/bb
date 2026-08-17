@@ -209,7 +209,12 @@ class OKXExecutor(AbstractExecutor):
             raise ExchangeAPIError("OKX exchange is not initialized")
 
         self._ensure_rest_url()
-        response = await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
+        fetch_instruments = getattr(
+            self._exchange,
+            "executionGetPublicInstruments",
+            self._exchange.publicGetPublicInstruments,
+        )
+        response = await fetch_instruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
         filtered = supported_usdt_swap_instruments(instruments)
         markets = self._exchange.parse_markets(filtered)
@@ -3402,7 +3407,9 @@ class OKXExecutor(AbstractExecutor):
         if not inst_id:
             raise ExchangeAPIError(f"Cannot resolve OKX instId for ticker: {symbol}")
         ccxt = await self._get_ccxt()
-        fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
+        fetch_ticker = getattr(ccxt, "executionGetMarketTicker", None)
+        if not callable(fetch_ticker):
+            fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
         if not callable(fetch_ticker):
             raise ExchangeAPIError("OKX native market ticker API is unavailable")
         response = await self._with_retry(fetch_ticker, {"instId": inst_id})
@@ -3430,7 +3437,9 @@ class OKXExecutor(AbstractExecutor):
         if not inst_id:
             raise ExchangeAPIError(f"Cannot resolve OKX instId for price limit: {symbol}")
         ccxt = await self._get_ccxt()
-        fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
+        fetch_price_limit = getattr(ccxt, "executionGetPublicPriceLimit", None)
+        if not callable(fetch_price_limit):
+            fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
         if not callable(fetch_price_limit):
             if isinstance(ccxt, OkxPerpetualSdkExchange):
                 raise ExchangeAPIError("OKX SDK price-limit API is unavailable")
@@ -4876,7 +4885,10 @@ class OKXExecutor(AbstractExecutor):
 
         ccxt = await self._get_ccxt()
         try:
-            tiers = await self._with_retry(ccxt.fetch_market_leverage_tiers, okx_symbol)
+            fetch_tiers = getattr(ccxt, "executionFetchMarketLeverageTiers", None)
+            if not callable(fetch_tiers):
+                fetch_tiers = ccxt.fetch_market_leverage_tiers
+            tiers = await self._with_retry(fetch_tiers, okx_symbol)
             if not isinstance(tiers, list):
                 return []
             return [
@@ -5992,10 +6004,16 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         inst_id = okx_inst_id_from_symbol(symbol)
         ccxt = await self._get_ccxt()
+        fetch_order_book = getattr(ccxt, "executionFetchOrderBook", None)
+        if not callable(fetch_order_book):
+            fetch_order_book = ccxt.fetch_order_book
+        fetch_mark_price = getattr(ccxt, "executionGetPublicMarkPrice", None)
+        if not callable(fetch_mark_price):
+            fetch_mark_price = ccxt.publicGetPublicMarkPrice
         ticker, book, mark_response, specs, fee, balance_snapshot = await asyncio.gather(
             self._fetch_native_ticker(symbol),
-            self._with_retry(ccxt.fetch_order_book, okx_symbol),
-            self._with_retry(ccxt.publicGetPublicMarkPrice, {"instId": inst_id}),
+            self._with_retry(fetch_order_book, okx_symbol),
+            self._with_retry(fetch_mark_price, {"instId": inst_id}),
             self._native_facts_client().fetch_contract_specs(symbols=[symbol]),
             self.fetch_account_fee_snapshot(),
             self.get_balance_snapshot(),

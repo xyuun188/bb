@@ -1969,7 +1969,10 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 "info": {"instId": "BTC-USDT-SWAP"},
             }
 
-        async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must not use live ticker")
+
+        async def executionGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
             return {
                 "data": [
@@ -1983,7 +1986,10 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 ]
             }
 
-        async def fetch_order_book(self, symbol: str) -> dict[str, Any]:
+        async def fetch_order_book(self, _symbol: str) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must not use live order book")
+
+        async def executionFetchOrderBook(self, symbol: str) -> dict[str, Any]:
             assert symbol == "BTC/USDT:USDT"
             return {
                 "bids": [[99.9, 2.0]],
@@ -1991,11 +1997,17 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 "timestamp": 1780000000001,
             }
 
-        async def publicGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
+        async def publicGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must not use live mark price")
+
+        async def executionGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
             return {"data": [{"instId": "BTC-USDT-SWAP", "markPx": "100.05", "ts": "2"}]}
 
-        async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must not use live contract rules")
+
+        async def executionGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params == {"instType": "SWAP"}
             return {
                 "data": [

@@ -228,6 +228,32 @@ def test_public_market_data_stays_live_when_private_paper_account_is_demo(
 
     assert okx_perpetual_sdk.okx_sdk_flag_for_mode("paper") == "1"
     assert exchange._public_kwargs()["flag"] == "0"
+    assert exchange._execution_public_kwargs()["flag"] == "1"
+
+
+def test_live_execution_public_channel_reuses_live_market_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(okx_perpetual_sdk, "okx_sdk_flag_for_mode", lambda _mode: "0")
+    exchange = OkxPerpetualSdkExchange("live")
+
+    assert exchange._public_kwargs()["flag"] == "0"
+    assert exchange._execution_public_kwargs()["flag"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_separates_paper_execution_instruments_from_live_public_instruments() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    live_api = _PublicApi()
+    demo_api = _PublicApi()
+    exchange._public_api = live_api
+    exchange._execution_public_api = demo_api
+
+    await exchange.publicGetPublicInstruments({"instType": "SWAP"})
+    await exchange.executionGetPublicInstruments({"instType": "SWAP"})
+
+    assert [name for name, _ in live_api.calls] == ["get_instruments"]
+    assert [name for name, _ in demo_api.calls] == ["get_instruments"]
 
 
 @pytest.mark.asyncio

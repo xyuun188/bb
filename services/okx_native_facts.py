@@ -387,7 +387,8 @@ class OkxNativeFactsClient:
             if str(row.get("instId") or "").strip()
         }
         contract_specs: dict[str, dict[str, Any]] = {}
-        if callable(getattr(ccxt, "publicGetPublicInstruments", None)):
+        fetch_instruments, _source_endpoint = _contract_instruments_fetcher(ccxt)
+        if callable(fetch_instruments):
             contract_specs = await self.fetch_contract_specs(inst_ids=position_inst_ids)
         return [
             _native_position_to_ccxt_shape(
@@ -667,7 +668,7 @@ class OkxNativeFactsClient:
         """Return the OKX instrument fields needed for SWAP notional accounting."""
 
         ccxt = await self.executor._get_ccxt()
-        fetch_instruments = getattr(ccxt, "publicGetPublicInstruments", None)
+        fetch_instruments, source_endpoint = _contract_instruments_fetcher(ccxt)
         if not callable(fetch_instruments):
             raise RuntimeError("OKX public instruments API is unavailable")
 
@@ -694,6 +695,7 @@ class OkxNativeFactsClient:
                     "minSz": str(row.get("minSz") or ""),
                     "settleCcy": str(row.get("settleCcy") or ""),
                     "source": "okx_public_instruments",
+                    "source_endpoint": source_endpoint,
                 }
         return specs
 
@@ -1405,6 +1407,13 @@ def build_okx_protection_execution_lifecycle(
         "fill_mark_slippage_pct": adverse_slippage(fill_mark_price),
         "algo_row": algo_row,
     }
+
+
+def _contract_instruments_fetcher(exchange: Any) -> tuple[Any, str]:
+    execution_fetch = getattr(exchange, "executionGetPublicInstruments", None)
+    if callable(execution_fetch):
+        return execution_fetch, "okx_execution_public_instruments"
+    return getattr(exchange, "publicGetPublicInstruments", None), "okx_public_instruments"
 
 
 def _target_inst_ids(

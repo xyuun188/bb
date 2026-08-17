@@ -164,3 +164,24 @@ async def test_okx_executor_market_loader_preserves_subunit_contract_size() -> N
 
     assert contracts == pytest.approx(0.07)
     assert base_quantity == pytest.approx(0.0007)
+
+
+@pytest.mark.asyncio
+async def test_okx_executor_market_loader_prefers_paper_execution_contract_rules() -> None:
+    class _PaperContractCcxt(_InstrumentFilteringCcxt):
+        async def publicGetPublicInstruments(self, _params: dict) -> dict:
+            return {"data": [_instrument("STRK-USDT-SWAP", ct_val="1")]}
+
+        async def executionGetPublicInstruments(self, _params: dict) -> dict:
+            return {"data": [_instrument("STRK-USDT-SWAP", ct_val="0.01")]}
+
+    fake_ccxt = _PaperContractCcxt()
+    executor = OKXExecutor(mode="paper")
+    executor._connected = True
+    executor._exchange = fake_ccxt
+
+    await executor._load_usdt_swap_markets()
+
+    market = fake_ccxt.markets["STRK/USDT:USDT"]
+    assert market["contractSize"] == pytest.approx(0.01)
+    assert market["info"]["ctVal"] == "0.01"

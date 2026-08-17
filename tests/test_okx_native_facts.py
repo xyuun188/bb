@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import (
     OkxNativeFactsClient,
     build_okx_protection_execution_lifecycle,
@@ -1343,6 +1344,69 @@ async def test_native_facts_client_marks_private_public_underlying_mismatch() ->
     assert "okx_private_position_underlying_differs_from_public_instrument" in positions[0][
         "exchangeIdentityGaps"
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_facts_client_uses_execution_environment_contract_size_for_paper_position() -> None:
+    class _PaperPositionCcxt:
+        async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instId": "STRK-USDT-SWAP",
+                        "posId": "strk-paper-pos-1",
+                        "posSide": "short",
+                        "pos": "-3949",
+                        "avgPx": "375.95",
+                        "markPx": "379.29",
+                        "notionalUsd": "14962.62",
+                        "upl": "-13.19",
+                        "uly": "STRK-USDT",
+                    }
+                ]
+            }
+
+        async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instType": "SWAP",
+                        "instId": "STRK-USDT-SWAP",
+                        "ctVal": "1",
+                        "ctMult": "1",
+                        "uly": "STRK-USDT",
+                        "settleCcy": "USDT",
+                    }
+                ]
+            }
+
+        async def executionGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instType": "SWAP",
+                        "instId": "STRK-USDT-SWAP",
+                        "ctVal": "0.01",
+                        "ctMult": "1",
+                        "uly": "STRK-USDT",
+                        "settleCcy": "USDT",
+                    }
+                ]
+            }
+
+    positions = await OkxNativeFactsClient(_FakeExecutor(_PaperPositionCcxt())).fetch_positions(
+        symbols=["STRK/USDT"]
+    )
+
+    assert positions[0]["contractSize"] == pytest.approx(0.01)
+    assert positions[0]["exchangeIdentityVerified"] is True
+    snapshot = parse_exchange_position_snapshot(
+        positions[0],
+        symbol_normalizer=lambda value: str(value).replace("-USDT-SWAP", "/USDT"),
+    )
+    assert snapshot is not None
+    assert snapshot["calculated_notional"] == pytest.approx(14984.08, rel=0.01)
+    assert "exchange_position_notional_mismatch" not in snapshot["identity_gaps"]
 
 
 @pytest.mark.asyncio

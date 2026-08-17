@@ -386,6 +386,8 @@ class OkxPerpetualSdkExchange:
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
         self._public_api: Any | None = None
+        self._execution_market_api: Any | None = None
+        self._execution_public_api: Any | None = None
         self._sdk_call_locks: dict[int, asyncio.Lock] = {}
         self._close_http_after_call = bool(close_http_after_call)
         self._disposable_http_call_lock = asyncio.Lock()
@@ -425,6 +427,26 @@ class OkxPerpetualSdkExchange:
             self._public_api = PublicAPI(**self._public_kwargs())
         return self._public_api
 
+    @property
+    def execution_market_api(self) -> Any:
+        if okx_sdk_flag_for_mode(self.mode) == "0":
+            return self.market_api
+        if self._execution_market_api is None:
+            from okx.MarketData import MarketAPI
+
+            self._execution_market_api = MarketAPI(**self._execution_public_kwargs())
+        return self._execution_market_api
+
+    @property
+    def execution_public_api(self) -> Any:
+        if okx_sdk_flag_for_mode(self.mode) == "0":
+            return self.public_api
+        if self._execution_public_api is None:
+            from okx.PublicData import PublicAPI
+
+            self._execution_public_api = PublicAPI(**self._execution_public_kwargs())
+        return self._execution_public_api
+
     def _public_kwargs(self) -> dict[str, Any]:
         proxy = okx_proxy_url()
         return {
@@ -453,6 +475,14 @@ class OkxPerpetualSdkExchange:
             "domain": OKX_DOMAIN,
             "debug": False,
             "proxy": proxy,
+        }
+
+    def _execution_public_kwargs(self) -> dict[str, Any]:
+        """Return public SDK settings aligned with the order/account environment."""
+
+        return {
+            **self._public_kwargs(),
+            "flag": okx_sdk_flag_for_mode(self.mode),
         }
 
     def _configure_private_api(self, api: Any) -> Any:
@@ -552,7 +582,14 @@ class OkxPerpetualSdkExchange:
         except Exception as exc:
             logger.debug("OKX SDK client close failed", error=safe_error_text(exc))
         finally:
-            for attribute in ("_account_api", "_trade_api", "_market_api", "_public_api"):
+            for attribute in (
+                "_account_api",
+                "_trade_api",
+                "_market_api",
+                "_public_api",
+                "_execution_market_api",
+                "_execution_public_api",
+            ):
                 if getattr(self, attribute) is api:
                     setattr(self, attribute, None)
             self._sdk_call_locks.pop(id(api), None)
@@ -566,6 +603,8 @@ class OkxPerpetualSdkExchange:
                     self._trade_api,
                     self._market_api,
                     self._public_api,
+                    self._execution_market_api,
+                    self._execution_public_api,
                 )
                 if api is not None
             )
@@ -651,10 +690,34 @@ class OkxPerpetualSdkExchange:
             instFamily=str(params.get("instFamily") or ""),
         )
 
+    async def executionGetPublicInstruments(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Fetch contract rules from the same environment as private execution."""
+
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.execution_public_api,
+            "get_instruments",
+            instType=OKX_SWAP_INST_TYPE,
+            uly=str(params.get("uly") or ""),
+            instId=str(params.get("instId") or ""),
+            instFamily=str(params.get("instFamily") or ""),
+        )
+
     async def publicGetMarketTicker(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params, require_inst_id=True)
         return await self._call_sdk(
             lambda: self.market_api,
+            "get_ticker",
+            instId=str(params["instId"]),
+        )
+
+    async def executionGetMarketTicker(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params, require_inst_id=True)
+        return await self._call_sdk(
+            lambda: self.execution_market_api,
             "get_ticker",
             instId=str(params["instId"]),
         )
@@ -680,10 +743,35 @@ class OkxPerpetualSdkExchange:
             instId=str(params.get("instId") or ""),
         )
 
+    async def executionGetPublicMarkPrice(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.execution_public_api,
+            "get_mark_price",
+            instType=OKX_SWAP_INST_TYPE,
+            uly=str(params.get("uly") or ""),
+            instFamily=str(params.get("instFamily") or ""),
+            instId=str(params.get("instId") or ""),
+        )
+
     async def publicGetPublicPriceLimit(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params, require_inst_id=True)
         return await self._call_sdk(
             lambda: self.public_api,
+            "get_price_limit",
+            instId=str(params["instId"]),
+        )
+
+    async def executionGetPublicPriceLimit(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        params = _swap_params(params, require_inst_id=True)
+        return await self._call_sdk(
+            lambda: self.execution_public_api,
             "get_price_limit",
             instId=str(params["instId"]),
         )
@@ -1166,9 +1254,33 @@ class OkxPerpetualSdkExchange:
         }
 
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
+        return await self._fetch_order_book_with(
+            lambda: self.market_api,
+            symbol,
+            limit=limit,
+        )
+
+    async def executionFetchOrderBook(
+        self,
+        symbol: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return await self._fetch_order_book_with(
+            lambda: self.execution_market_api,
+            symbol,
+            limit=limit,
+        )
+
+    async def _fetch_order_book_with(
+        self,
+        api_getter: Callable[[], Any],
+        symbol: str,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
         response = await self._call_sdk(
-            lambda: self.market_api,
+            api_getter,
             "get_orderbook",
             instId=inst_id,
             sz=str(max(1, int(limit or 20))),
@@ -1227,10 +1339,29 @@ class OkxPerpetualSdkExchange:
         )
 
     async def fetch_market_leverage_tiers(self, symbol: str) -> list[dict[str, Any]]:
+        return await self._fetch_market_leverage_tiers_with(
+            lambda: self.public_api,
+            symbol,
+        )
+
+    async def executionFetchMarketLeverageTiers(
+        self,
+        symbol: str,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_market_leverage_tiers_with(
+            lambda: self.execution_public_api,
+            symbol,
+        )
+
+    async def _fetch_market_leverage_tiers_with(
+        self,
+        api_getter: Callable[[], Any],
+        symbol: str,
+    ) -> list[dict[str, Any]]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
         inst_family = inst_id.removesuffix("-SWAP")
         response = await self._call_sdk(
-            lambda: self.public_api,
+            api_getter,
             "get_position_tiers",
             instType=OKX_SWAP_INST_TYPE,
             tdMode=OKX_CROSS_MARGIN_MODE,
