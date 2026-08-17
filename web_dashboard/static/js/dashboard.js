@@ -8749,23 +8749,62 @@ function positionPnlBreakdownHtml(position) {
     const feeText = fee > 0 ? `-${fmtMoney(fee)} USDT` : '0.00 USDT';
     return `
         <div class="position-ledger-summary position-pnl-breakdown">
-            <div><span>已实现收益</span><strong>${realizedText}</strong></div>
-            <div><span>平仓收益</span><strong>${closeFillText}</strong></div>
-            <div><span>资金费</span><strong>${signedMoney(fundingFee)} USDT</strong></div>
-            <div><span>手续费</span><strong>${feeText}</strong></div>
+            <div><span>已实现盈亏</span><strong style="color:${signedMoneyColor(realizedPnl)};">${realizedText}</strong></div>
+            <div><span>平仓收益</span><strong style="color:${signedMoneyColor(closeFillPnl)};">${closeFillText}</strong></div>
+            <div><span>资金费</span><strong style="color:${signedMoneyColor(fundingFee)};">${signedMoney(fundingFee)} USDT</strong></div>
+            <div><span>手续费</span><strong style="color:${fee > 0 ? 'var(--red)' : 'var(--text-muted)'};">${feeText}</strong></div>
         </div>`;
 }
 
-function openOpenPositionPnlModal(positionIndex) {
+let openPositionPnlPopoverAnchor = null;
+
+function positionPnlPopoverPosition(anchor, popover) {
+    const rect = anchor?.getBoundingClientRect?.();
+    const width = popover.offsetWidth;
+    const height = popover.offsetHeight;
+    const gap = 8;
+    const margin = 12;
+    if (!rect) {
+        popover.style.left = `${Math.max(margin, (window.innerWidth - width) / 2)}px`;
+        popover.style.top = `${Math.max(margin, (window.innerHeight - height) / 2)}px`;
+        return;
+    }
+    const left = Math.min(
+        Math.max(margin, rect.left + (rect.width - width) / 2),
+        Math.max(margin, window.innerWidth - width - margin),
+    );
+    let top = rect.top - height - gap;
+    if (top < margin) top = rect.bottom + gap;
+    if (top + height > window.innerHeight - margin) {
+        top = Math.max(margin, window.innerHeight - height - margin);
+    }
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(top)}px`;
+}
+
+function closePositionPnlPopover() {
+    const popover = document.getElementById('position-pnl-popover');
+    if (!popover) return;
+    popover.hidden = true;
+    popover.setAttribute('aria-hidden', 'true');
+    popover.classList.remove('is-open');
+    openPositionPnlPopoverAnchor = null;
+}
+
+function openPositionPnlPopover(positionIndex, anchor = null) {
     const position = (state.openPositions || [])[Number(positionIndex)];
     if (!position) return;
-    const title = document.getElementById('position-linked-orders-modal-title');
-    const body = document.getElementById('position-linked-orders-modal-body');
-    const overlay = document.getElementById('position-linked-orders-modal-overlay');
-    if (!body || !overlay) return;
+    const popover = document.getElementById('position-pnl-popover');
+    const title = document.getElementById('position-pnl-popover-title');
+    const body = document.getElementById('position-pnl-popover-body');
+    if (!popover || !body) return;
     if (title) title.textContent = `${position.symbol || '-'} ${sideLabel(position.side)} · 盈亏明细`;
     body.innerHTML = positionPnlBreakdownHtml(position);
-    overlay.style.display = 'flex';
+    openPositionPnlPopoverAnchor = anchor;
+    popover.hidden = false;
+    popover.setAttribute('aria-hidden', 'false');
+    popover.classList.add('is-open');
+    requestAnimationFrame(() => positionPnlPopoverPosition(openPositionPnlPopoverAnchor, popover));
 }
 
 function positionEvidenceValue(value, suffix = '') {
@@ -9006,7 +9045,7 @@ function initPositionActions() {
         const pnlButton = event.target?.closest?.('.js-open-position-pnl');
         if (pnlButton && tbody.contains(pnlButton)) {
             event.preventDefault();
-            openOpenPositionPnlModal(Number(pnlButton.dataset.positionIndex || 0));
+            openPositionPnlPopover(Number(pnlButton.dataset.positionIndex || 0), pnlButton);
             return;
         }
         const evidenceButton = event.target?.closest?.('.js-position-evidence');
@@ -9744,6 +9783,14 @@ async function showExecutionDetail(tradeId) {
 
 // Close modal on overlay click
 document.addEventListener('click', (e) => {
+    if (e.target?.closest?.('.js-open-position-pnl')) return;
+    const pnlPopoverClose = e.target?.closest?.('.position-pnl-popover-close');
+    if (pnlPopoverClose) {
+        e.preventDefault();
+        closePositionPnlPopover();
+        return;
+    }
+    if (!e.target?.closest?.('#position-pnl-popover')) closePositionPnlPopover();
     const analysisReasonButton = e.target?.closest?.('.js-analysis-reason');
     if (analysisReasonButton) {
         e.preventDefault();
@@ -9783,6 +9830,14 @@ document.addEventListener('click', (e) => {
     if (e.target.id === 'dashboard-user-modal-overlay') {
         closeDashboardUserModal();
     }
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closePositionPnlPopover();
+});
+window.addEventListener('resize', () => {
+    const popover = document.getElementById('position-pnl-popover');
+    if (popover && !popover.hidden) positionPnlPopoverPosition(openPositionPnlPopoverAnchor, popover);
 });
 
 function escHtml(str) {

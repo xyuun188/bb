@@ -4327,6 +4327,56 @@ select.form-input { cursor: pointer; }
     text-align: right;
     font-variant-numeric: tabular-nums;
 }
+.position-pnl-popover {
+    position: fixed;
+    z-index: 1200;
+    width: min(318px, calc(100vw - 24px));
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 6px;
+    background: #17191d;
+    box-shadow: 0 14px 34px rgba(0,0,0,0.42);
+    color: var(--text);
+    overflow: hidden;
+}
+.position-pnl-popover[hidden] {
+    display: none;
+}
+.position-pnl-popover.is-open {
+    display: block;
+}
+.position-pnl-popover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.11);
+    color: var(--text-muted);
+    font-size: 12px;
+}
+.position-pnl-popover-close {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+}
+.position-pnl-popover-close:hover {
+    color: var(--text);
+}
+.position-pnl-popover .position-pnl-breakdown {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+.position-pnl-popover .position-pnl-breakdown > div {
+    padding: 9px 12px;
+}
 .position-ledger-gaps {
     padding: 9px 10px;
     border: 1px solid rgba(245,158,11,0.35);

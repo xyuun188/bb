@@ -284,10 +284,10 @@ def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:
     assert "function positionPnlBreakdownHtml" in script
     pnl_block = script[
         script.index("function positionPnlBreakdownHtml") : script.index(
-            "function openOpenPositionPnlModal"
+            "function positionPnlPopoverPosition"
         )
     ]
-    assert "已实现收益" in pnl_block
+    assert "已实现盈亏" in pnl_block
     assert "平仓收益" in pnl_block
     assert "资金费" in pnl_block
     assert "手续费" in pnl_block
@@ -295,6 +295,10 @@ def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:
     assert "总盈亏（浮动 + 资金费）" not in pnl_block
     assert ".position-pnl-link" in style
     assert ".position-pnl-breakdown > div" in style
+    assert "position-pnl-popover" in html
+    assert "positionPnlPopoverPosition" in script
+    assert "openPositionPnlPopover(Number(pnlButton.dataset.positionIndex || 0), pnlButton)" in script
+    assert "position-pnl-popover-close" in script
 
 
 def test_position_history_separates_confirmed_close_from_official_settlement() -> None:
