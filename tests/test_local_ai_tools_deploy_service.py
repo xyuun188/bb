@@ -2826,6 +2826,37 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
     )
 
 
+def test_local_ai_walk_forward_scopes_each_fold_to_primary_horizon(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _training_shadow_samples(count=80)
+    first_decision_at = datetime(2026, 7, 14, tzinfo=UTC)
+    for index, sample in enumerate(samples):
+        horizon = (5, 15, 60, 240)[index % 4]
+        sample["horizon_minutes"] = horizon
+        sample["label_timestamp"] = (
+            first_decision_at + timedelta(minutes=index * 300 + horizon)
+        ).isoformat()
+
+    result = module.train(_training_request(module, shadow_samples=samples))
+    report = result["walk_forward_report"]
+
+    assert report["primary_horizon_minutes"] == 5
+    assert report["primary_horizon_available"] is True
+    assert report["sides"]["long"] == report["horizon_diagnostics"]["5"]["long"]
+    assert report["folds"]
+    for fold in report["folds"]:
+        assert set(fold["horizon_diagnostics"]) == {"5", "15", "60", "240"}
+        for side in ("long", "short"):
+            assert fold["sides"][side]["count"] == fold["horizon_diagnostics"]["5"][
+                side
+            ]["count"]
+            assert fold["mixed_horizon_diagnostics"][side]["count"] >= fold["sides"][
+                side
+            ]["count"]
+
+
 def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
     tmp_path: Path,
 ) -> None:

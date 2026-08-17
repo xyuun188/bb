@@ -199,3 +199,38 @@ def test_training_trigger_handles_drift_and_rebased_views() -> None:
 
     assert drift_due["reason"] == "distribution_drift_with_new_labels"
     assert rebased["reason"] == "training_view_rebased"
+
+
+def test_training_trigger_scales_batches_and_cools_down_drift_retraining() -> None:
+    now = datetime(2026, 8, 17, 3, tzinfo=UTC)
+    drift = {"detected": True}
+    common = {
+        "force": False,
+        "has_artifact": True,
+        "completed_group_count": 20_049,
+        "previous_group_count": 20_016,
+        "distribution_drift": drift,
+        "batch_threshold": 50,
+        "minimum_increment": 10,
+        "drift_minimum_increment": 10,
+        "maximum_interval_seconds": 86400,
+        "batch_growth_fraction": 0.05,
+        "minimum_retraining_interval_seconds": 6 * 60 * 60,
+    }
+
+    within_cooldown = decision_group_training_trigger(
+        **common,
+        trained_at=(now - timedelta(hours=1)).isoformat(),
+        now=now,
+    )
+    after_cooldown = decision_group_training_trigger(
+        **common,
+        trained_at=(now - timedelta(hours=7)).isoformat(),
+        now=now,
+    )
+
+    assert within_cooldown["reason"] == "not_due"
+    assert within_cooldown["minimum_retraining_interval_elapsed"] is False
+    assert within_cooldown["effective_batch_decision_group_threshold"] == 1001
+    assert after_cooldown["reason"] == "distribution_drift_with_new_labels"
+    assert after_cooldown["minimum_retraining_interval_elapsed"] is True

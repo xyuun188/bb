@@ -102,12 +102,8 @@ def test_local_ml_training_uses_bounded_parallelism(
         lambda _pid: set(range(16)),
         raising=False,
     )
-    classifier = ml_signal_module._make_classifier(
-        pd.Series(([0, 1] * 150), dtype=int)
-    )
-    regressor = ml_signal_module._make_regressor(
-        pd.Series(np.linspace(-1.0, 1.0, 300))
-    )
+    classifier = ml_signal_module._make_classifier(pd.Series(([0, 1] * 150), dtype=int))
+    regressor = ml_signal_module._make_regressor(pd.Series(np.linspace(-1.0, 1.0, 300)))
 
     assert ml_signal_module._adaptive_training_worker_count() == 2
     assert classifier.named_steps["model"].n_jobs == 2
@@ -139,6 +135,41 @@ def test_local_ml_training_cadence_scales_and_enforces_cooldown() -> None:
     assert recent["batch_due"] is False
     assert recent["drift_due"] is False
     assert mature["batch_due"] is True
+
+
+def test_walk_forward_report_scopes_primary_horizon_and_keeps_other_horizons_diagnostic() -> None:
+    frame = _training_frame(80)
+    frame["horizon_minutes"] = [5, 15, 60, 240] * 20
+
+    report = ml_signal_module._walk_forward_return_report(frame)
+
+    assert report["primary_horizon_minutes"] == 5
+    assert report["primary_horizon_available"] is True
+    assert set(report["horizon_diagnostics"]) == {"5", "15", "60", "240"}
+    assert set(report["sides"]) == {"long", "short"}
+    assert report["sides"]["long"] == report["horizon_diagnostics"]["5"]["long"]
+    assert set(report["mixed_horizon_diagnostics"]) == {"long", "short"}
+
+
+def test_holdout_metrics_bind_to_primary_horizon_instead_of_mixed_periods() -> None:
+    frame = _training_frame(80)
+    frame["horizon_minutes"] = [5, 15] * 40
+
+    metadata = train_from_frame(
+        frame,
+        completed_sample_count=80,
+        trade_samples=[],
+        persist_artifact=False,
+    )
+
+    assert metadata["primary_prediction_horizon_minutes"] == 5
+    assert metadata["primary_holdout_horizon_available"] is True
+    assert metadata["holdout_horizon_diagnostics"]["5"]["sample_count"] < len(frame)
+    assert metadata["metrics"] == metadata["holdout_horizon_diagnostics"]["5"]["metrics"]
+    assert (
+        metadata["mixed_horizon_holdout_diagnostics"]["sample_count"]
+        > metadata["holdout_horizon_diagnostics"]["5"]["sample_count"]
+    )
 
 
 def _with_return_objective(metadata: dict) -> dict:
@@ -1304,9 +1335,7 @@ def test_bundle_feature_columns_must_exactly_match_runtime_contract(tmp_path: Pa
 
     assert status["available"] is False
     assert status["status"] == "artifact_incompatible"
-    assert status["model_load_diagnostic"]["details"] == [
-        "artifact_feature_keys_mismatch"
-    ]
+    assert status["model_load_diagnostic"]["details"] == ["artifact_feature_keys_mismatch"]
 
 
 def test_incompatible_artifact_result_is_cached_until_pointer_or_file_changes(
@@ -1421,9 +1450,7 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     assert frame.loc[0, "label_contract_version"] == SHADOW_LABEL_VERSION
     assert frame.loc[0, "short_mfe_pct"] == pytest.approx(0.18)
     assert frame.loc[0, "short_mae_pct"] == pytest.approx(0.0)
-    assert frame.loc[0, "feature_contract_version"] == (
-        ml_signal_module.FEATURE_CONTRACT_VERSION
-    )
+    assert frame.loc[0, "feature_contract_version"] == (ml_signal_module.FEATURE_CONTRACT_VERSION)
 
 
 @pytest.mark.asyncio
@@ -1848,9 +1875,11 @@ def test_cached_dry_run_candidate_is_persisted_without_refitting(
     assert id(metadata) not in ml_signal_module._TRAINING_CANDIDATE_CACHE
 
 
+@pytest.mark.parametrize("contract_kind", ("data_quality", "evaluation"))
 @pytest.mark.asyncio
-async def test_ml_signal_retrains_when_data_quality_contract_changes(
+async def test_ml_signal_retrains_when_training_contract_changes(
     monkeypatch: pytest.MonkeyPatch,
+    contract_kind: str,
 ) -> None:
     service = MLSignalService()
     calls: list[bool] = []
@@ -1885,10 +1914,16 @@ async def test_ml_signal_retrains_when_data_quality_contract_changes(
         artifact_persisted=True,
         ready=False,
     )
-    stale_metadata["quality_report"] = {
-        **stale_metadata["quality_report"],
-        "data_quality_version": "2026-07-14.separated-profit-supervision.v4",
-    }
+    if contract_kind == "data_quality":
+        stale_metadata["quality_report"] = {
+            **stale_metadata["quality_report"],
+            "data_quality_version": "2026-07-14.separated-profit-supervision.v4",
+        }
+    else:
+        stale_metadata["horizons"] = [5, 15, 60, 240]
+        stale_metadata.pop("primary_prediction_horizon_minutes", None)
+        stale_metadata.pop("primary_holdout_horizon_available", None)
+        stale_metadata.pop("holdout_horizon_diagnostics", None)
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: stale_metadata  # type: ignore[method-assign]
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
@@ -1916,8 +1951,23 @@ async def test_ml_signal_retrains_when_data_quality_contract_changes(
 
     assert calls == [False, True]
     assert result["trained"] is True
-    assert result["training_policy"]["trigger"] == "training_data_contract_changed"
-    assert result["training_policy"]["training_data_contract_stale"] is True
+    expected_trigger = (
+        "training_data_contract_changed"
+        if contract_kind == "data_quality"
+        else "training_evaluation_contract_changed"
+    )
+    assert result["training_policy"]["trigger"] == expected_trigger
+    assert result["training_policy"]["training_data_contract_stale"] is (
+        contract_kind == "data_quality"
+    )
+    assert result["training_policy"]["training_evaluation_contract_stale"] is (
+        contract_kind == "evaluation"
+    )
+    if contract_kind == "evaluation":
+        assert (
+            "primary_prediction_horizon_contract_stale"
+            in result["training_policy"]["training_evaluation_contract_errors"]
+        )
     assert len(promotion_evidence) == 2
 
 
@@ -1972,6 +2022,78 @@ async def test_ml_signal_auto_train_does_not_retrain_for_one_new_decision_group(
     assert result["reason"] == "not_due"
     assert result["new_decision_group_count"] == 1
     assert result["training_policy"]["trigger"] == "not_due"
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = MLSignalService(
+        artifact_registry=ModelArtifactRegistry(
+            root=tmp_path / "model_artifacts",
+            model_id=LOCAL_ML_MODEL_IDS[0],
+        ),
+        training_state_store=ModelTrainingStateStore(tmp_path / "training_state.json"),
+    )
+    metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+        completed_sample_count=80,
+    )
+    now = datetime.now(UTC).isoformat()
+    metadata.update(
+        {
+            "last_trained_completed_shadow_decision_group_count": 80,
+            "last_trained_completed_shadow_raw_decision_group_count": 80,
+            "trained_at": now,
+            "full_training_probe_at": now,
+        }
+    )
+
+    async def completed_shadow_sample_count() -> int:
+        return 80
+
+    async def raw_group_count() -> int:
+        return 80
+
+    async def forbidden_rows() -> list[object]:
+        raise AssertionError("not_due must not load the complete shadow training window")
+
+    async def forbidden_trade_samples() -> list[dict[str, object]]:
+        raise AssertionError("not_due must not load authoritative trade samples")
+
+    service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
+    service._current_metadata = lambda: metadata  # type: ignore[method-assign]
+    service._training_cursor_metadata = lambda current: current  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "services.ml_signal_service.build_ml_readiness_report",
+        lambda _metadata, _influence: {
+            "live_ml_ready": False,
+            "state": "shadow_ready",
+            "metrics": {
+                "training_data_version": "same",
+                "required_training_data_version": "same",
+            },
+            "blocking_reasons": [],
+        },
+    )
+    monkeypatch.setattr(
+        "services.ml_signal_service.count_shadow_training_decision_groups",
+        raw_group_count,
+    )
+    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", forbidden_rows)
+    monkeypatch.setattr(
+        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        forbidden_trade_samples,
+    )
+
+    result = await service.maybe_auto_train()
+
+    assert result["trained"] is False
+    assert result["reason"] == "not_due"
+    assert result["full_training_probe_performed"] is False
+    assert result["training_policy"]["full_probe_throttled"] is True
 
 
 @pytest.mark.asyncio
@@ -2662,12 +2784,12 @@ def test_ml_signal_predict_selects_side_by_fee_after_return() -> None:
         "raw_expected_return_pct"
     ] == pytest.approx(0.50)
     assert primary["best_side"] == "short"
-    assert primary["multitask_prediction"]["long"][
-        "expected_net_return_pct"
-    ] == pytest.approx(-0.10)
-    assert primary["multitask_prediction"]["short"][
-        "expected_net_return_pct"
-    ] == pytest.approx(0.25)
+    assert primary["multitask_prediction"]["long"]["expected_net_return_pct"] == pytest.approx(
+        -0.10
+    )
+    assert primary["multitask_prediction"]["short"]["expected_net_return_pct"] == pytest.approx(
+        0.25
+    )
     assert primary["fee_after_side_selection"]["return_semantics"] == (
         "risk_adjusted_net_after_counterfactual_execution_cost"
     )

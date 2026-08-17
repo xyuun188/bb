@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from services.ml_training_contract import (
+    PRIMARY_PREDICTION_HORIZON_MINUTES,
     WALK_FORWARD_REPORT_VERSION,
     decision_group_partition_errors,
 )
@@ -319,6 +320,74 @@ def _artifact_evidence_blockers(metadata: dict[str, Any]) -> list[dict[str, Any]
             )
         )
     walk_forward = _safe_dict(metadata.get("walk_forward_report"))
+    horizons = [int(value) for value in (metadata.get("horizons") or []) if str(value).isdigit()]
+    if len(horizons) > 1 and PRIMARY_PREDICTION_HORIZON_MINUTES not in horizons:
+        blockers.append(
+            _reason(
+                "artifact_primary_prediction_horizon_missing",
+                "multi-horizon artifact does not contain the runtime primary horizon evidence",
+                actual=horizons,
+                required=PRIMARY_PREDICTION_HORIZON_MINUTES,
+            )
+        )
+    if horizons and len(horizons) > 1:
+        if metadata.get("primary_prediction_horizon_minutes") != PRIMARY_PREDICTION_HORIZON_MINUTES:
+            blockers.append(
+                _reason(
+                    "artifact_primary_prediction_horizon_contract_missing",
+                    "artifact does not bind evaluation evidence to the runtime primary horizon",
+                    actual=metadata.get("primary_prediction_horizon_minutes") or "missing",
+                    required=PRIMARY_PREDICTION_HORIZON_MINUTES,
+                )
+            )
+        holdout_diagnostics = _safe_dict(metadata.get("holdout_horizon_diagnostics"))
+        primary_holdout = _safe_dict(
+            holdout_diagnostics.get(str(PRIMARY_PREDICTION_HORIZON_MINUTES))
+        )
+        if (
+            metadata.get("primary_holdout_horizon_available") is not True
+            or not primary_holdout
+            or int(_safe_float(primary_holdout.get("sample_count"), 0.0) or 0) <= 0
+        ):
+            blockers.append(
+                _reason(
+                    "artifact_primary_holdout_horizon_missing",
+                    "multi-horizon artifact is missing holdout evidence for the runtime primary horizon",
+                    actual={
+                        "primary_holdout_horizon_available": metadata.get(
+                            "primary_holdout_horizon_available"
+                        ),
+                        "available_holdout_horizons": sorted(holdout_diagnostics),
+                    },
+                    required={
+                        "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+                        "sample_count": ">0",
+                    },
+                )
+            )
+        if (
+            walk_forward.get("primary_horizon_minutes")
+            != PRIMARY_PREDICTION_HORIZON_MINUTES
+            or walk_forward.get("primary_horizon_available") is not True
+        ):
+            blockers.append(
+                _reason(
+                    "artifact_primary_walk_forward_horizon_missing",
+                    "multi-horizon artifact is missing walk-forward evidence for the runtime primary horizon",
+                    actual={
+                        "primary_horizon_minutes": walk_forward.get(
+                            "primary_horizon_minutes"
+                        ),
+                        "primary_horizon_available": walk_forward.get(
+                            "primary_horizon_available"
+                        ),
+                    },
+                    required={
+                        "primary_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+                        "primary_horizon_available": True,
+                    },
+                )
+            )
     if (
         walk_forward.get("version") != WALK_FORWARD_REPORT_VERSION
         or walk_forward.get("status") != "complete"

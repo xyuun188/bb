@@ -1,6 +1,6 @@
 # BB 系统借鉴 Freqtrade 优化方案
 
-> 日期：2026-08-13  
+> 日期：2026-08-17（首次编制：2026-08-13）
 > 文档性质：架构与实施建议，不代表已实施，不要求引入 Freqtrade 作为生产交易框架。
 
 ## 1. 文档目的
@@ -416,7 +416,7 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 
 ## 15. 实施与线上验收状态
 
-> 最近更新：2026-08-16  
+> 最近更新：2026-08-17
 > 状态口径：仅把已同步线上并通过线上运行观察的项目标为完成；进程存活、测试通过或代码已上传均不能单独代表整改完成。
 
 ### 15.1 已实施并通过线上验证
@@ -500,3 +500,15 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 - 训练调度器为 `status=ok`、有效心跳新鲜、无超时/失败/中断模型；6 个 Local AI 模型为 `succeeded`，Local ML 因未到重训条件为 `skipped`，所有 `active_run_id=null`、`last_error=null`、`retry_count=0`。线上没有训练租约、训练子进程或已停止的重复窗口实验；被回收的 `bb-model-window-audit-1786914291.service` 保持 `inactive/dead`，没有重复启动。
 - Dashboard、Quant、交易模型、风险模型和 FinQuant 健康端点均返回 HTTP 200，量化端点本次约 264 ms，其余模型端点约 110 至 127 ms。`/data` 使用率约 `28.61%`、可用空间约 `193.6 GiB`。连接复核中 Dashboard 与模型隧道 `CLOSE-WAIT=0`；交易进程在连续抽样中仅有 0 至 1 条 OKX 请求连接，旧 fd 会清除并由后续请求使用新 fd，没有持续累积。
 - 本节修复的是方向授权一致性和部署期可用性，不改变收益质量结论。现有 challenger 的 walk-forward 费后收益、LCB、CVaR 和最大回撤仍未达门禁，`live_ml_ready=false`、`live_routing_enabled=false` 保持不变；后续只能依靠新增干净样本和经验证的市场阶段/周期建模改进，不能强制晋升或放宽安全门禁。
+
+### 15.8 2026-08-17 训练合同收口与最终线上验收
+
+- Local ML 主评估周期已固定为 5 分钟，并补齐同一主周期的 holdout 与 expanding walk-forward 证据。最新 challenger `20260817T021701844340Z-3cdf03dd` 使用修复后的权威数据完成训练，但因费后收益质量未达到晋升门禁被正确拒绝；没有强制晋升，`live_ml_ready=false` 与 `live_routing_enabled=false` 保持不变。
+- YB/USDT 的 OKX 绝对亏损没有被改写。修复内容是按 `realizedPnl/pnlRatio/leverage` 还原名义价值：由错误的约 `81.9432 USDT` 修正为约 `819.432 USDT`，相应费后收益由异常的约 `-299.22%` 修正为约 `-29.92197%`。旧 champion 的不可变元数据继续保留用于审计，新 challenger 只使用修复后的口径。
+- Local AI 自动训练合同升级为 `2026-08-17.scaled-batch-cooldown.v2`。普通新增批次阈值取“至少 50 且至少为上次已评估决策组数的 5%”，普通批次与漂移触发均受 6 小时最短重训间隔约束；首次训练、显式强制训练和训练视图合同升级仍可绕过冷却。线上无副作用探针在 `drift_detected=true`、仅新增 25 个决策组、距上次训练 1 小时、动态阈值 1003 的条件下仍返回 `not_due`，确认漂移分支不再绕过冷却重复训练。
+- `2026-08-17T03:34:54Z` 至 `2026-08-17T04:04:54Z` 的正式覆盖审计为 `assessment.ready=true`：市场分析 22 条、11 个币种，最大活动间隔 `191.302` 秒，最高单币占比 `13.6364%`；`overdue_count=0`、`coverage_due_count=0`、`coverage_window_met=true`。7 个开放仓位产生 462 条持仓复核记录，最近持仓复核距离审计时刻不足 13 秒。
+- 随后的最近 30 分钟全量专家审计覆盖 23 条市场记录和 92 次真实调用：trend、momentum、risk、sentiment 各 23 次，全部为 `completed`；缺失专家、异常混入 position 专家、fallback 和专家失败均为 0。各专家 P95 耗时为 `3.852/4.921/7.092/6.873` 秒，最大单专家耗时 8.506 秒。23 条记录全部绑定 champion `20260813T145130254885Z-10c06715`，long 授权 23/23，short 均以 `direction_not_authorized_by_model_blueprint` 禁止，方向授权缺失和错配均为 0。
+- `2026-08-17T04:05:02Z` 的 fresh OKX 只读日对账为 `status=ok`，4 张审计卡全部通过，未解决项、人工复核项、关键问题和可修复项均为 0；`can_open_new_entries=true`、`can_refresh_training=true`。实时保护单为 7 个仓位、9 个有效保护单，`missing_keys=[]`、`orphan_keys=[]`、`coverage_mismatches=[]`、无效单 0、`repair_blockers=[]`；2 个 split coverage 是同一仓位由多张有效保护单覆盖。历史上 1 条无法自动分类的平仓候选继续保留原始记录并排除出训练集，不伪造事实，也不阻塞当前交易或训练。
+- 最终训练状态为 `status=ok`：Local ML 与 6 个 Local AI 模型全部为 `skipped/not_due`，`active_run_id=null`、`last_error=null`、`retry_count=0`，没有超时、失败或中断模型；训练租约文件和训练子进程均为 0。旧的两个分调度心跳已由新鲜的统一 `platform_model_training_loop` 心跳覆盖，`stale_scheduler_ids=[]`、`training_timeout_exceeded=false`，不存在假健康或重复训练进程。
+- 交易、Dashboard、模型隧道自本次部署后持续为 `active/running`、`NRestarts=0`，最终 PID 对应 FD 数为 `53/15/26`；最近 30 分钟三项服务的 error 和 warning 均为 0。Dashboard 与模型隧道 `CLOSE-WAIT=0`，交易进程抽样为 1 条短暂 OKX 连接，没有持续累积。`/data` 使用率为 29%，可用空间约 193 GiB，系统可用内存约 25.7 GiB。
+- 本地 7 个生产代码文件与线上 `/data/bb/app` 的 SHA-256 已逐一比对一致，排除漏传或版本混用。最终结论只表示本轮训练合同、重复训练、方向权威、专家可用性、覆盖、对账、保护单和服务稳定性整改已通过线上验收；收益质量门禁仍按真实结果保持关闭，不能把“运行正常”表述为“模型已经具备 live 盈利资格”。

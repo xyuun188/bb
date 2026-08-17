@@ -124,6 +124,7 @@ SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
 RETURN_OBJECTIVE_VERSION = "2026-07-27.separated-source-supervision.v3"
+PRIMARY_PREDICTION_HORIZON_MINUTES = 5
 RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
 COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
@@ -861,6 +862,7 @@ def _fit_walk_forward_side(
             {
                 "symbol": str(row.get("symbol") or ""),
                 "market_regime": str(row.get("market_regime") or "unknown"),
+                "horizon_minutes": int(row.get("horizon") or 0),
                 "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": str(row.get("label_timestamp") or ""),
             "return_pct": float(row[return_key]),
@@ -930,6 +932,24 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     folds = []
     oos_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    available_horizons = sorted(
+        {
+            int(row.get("horizon") or 0)
+            for row in ordered
+            if int(row.get("horizon") or 0) > 0
+        }
+    )
+    horizon_oos_rows = {
+        str(horizon): {"long": [], "short": []}
+        for horizon in available_horizons
+    }
+    evaluation_horizon = (
+        PRIMARY_PREDICTION_HORIZON_MINUTES
+        if PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons
+        else available_horizons[0]
+        if len(available_horizons) == 1
+        else PRIMARY_PREDICTION_HORIZON_MINUTES
+    )
     for fold_number, validation_groups in enumerate(blocks, start=1):
         validation_decision_start = min(
             group_bounds[group]["decision_start"]
@@ -958,7 +978,11 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         validation_rows = [
             row for row in ordered if str(row["decision_group"]) in validation_set
         ]
-        side_reports = {}
+        mixed_fold_side_reports = {}
+        fold_horizon_rows = {
+            str(horizon): {"long": [], "short": []}
+            for horizon in available_horizons
+        }
         for side in ("long", "short"):
             evaluated, tail_policy = _fit_walk_forward_side(
                 train_rows,
@@ -966,10 +990,40 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 side=side,
             )
             oos_rows[side].extend(evaluated)
-            side_reports[side] = {
+            for row in evaluated:
+                horizon_key = str(int(row.get("horizon_minutes") or 0))
+                horizon_oos_rows.setdefault(
+                    horizon_key, {"long": [], "short": []}
+                )[side].append(row)
+                fold_horizon_rows.setdefault(
+                    horizon_key, {"long": [], "short": []}
+                )[side].append(row)
+            mixed_fold_side_reports[side] = {
                 **_return_evidence(_select_top_return_rows(evaluated)),
                 "training_tail_loss_policy": tail_policy,
             }
+        fold_horizon_reports = {
+            str(horizon): {
+                side: _return_evidence(
+                    _select_top_return_rows(fold_horizon_rows[str(horizon)][side])
+                )
+                for side in ("long", "short")
+            }
+            for horizon in available_horizons
+        }
+        primary_fold_evidence = fold_horizon_reports.get(str(evaluation_horizon), {})
+        primary_fold_side_reports = {
+            side: {
+                **(
+                    primary_fold_evidence.get(side)
+                    or mixed_fold_side_reports.get(side, {})
+                ),
+                "training_tail_loss_policy": mixed_fold_side_reports.get(side, {}).get(
+                    "training_tail_loss_policy"
+                ),
+            }
+            for side in ("long", "short")
+        }
         folds.append(
             {
                 "fold": fold_number,
@@ -984,17 +1038,36 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
                     purged_training_groups
                 ),
                 "decision_group_overlap_count": 0,
-                "sides": side_reports,
+                "sides": primary_fold_side_reports,
+                "horizon_diagnostics": fold_horizon_reports,
+                "mixed_horizon_diagnostics": mixed_fold_side_reports,
             }
         )
-    side_reports = {}
+    mixed_side_reports = {}
     for side in ("long", "short"):
         evidence = _return_evidence(_select_top_return_rows(oos_rows[side]))
-        side_reports[side] = {
+        mixed_side_reports[side] = {
             **evidence,
             "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
             "market_regime_stability": _market_regime_stability(oos_rows[side]),
         }
+    horizon_diagnostics: dict[str, dict[str, Any]] = {}
+    for horizon in available_horizons:
+        horizon_diagnostics[str(horizon)] = {}
+        for side in ("long", "short"):
+            rows_for_horizon = horizon_oos_rows[str(horizon)][side]
+            evidence = _return_evidence(_select_top_return_rows(rows_for_horizon))
+            horizon_diagnostics[str(horizon)][side] = {
+                **evidence,
+                "leave_one_symbol_out": _leave_one_symbol_out_stability(rows_for_horizon),
+                "market_regime_stability": _market_regime_stability(rows_for_horizon),
+            }
+    side_reports = {
+        side: horizon_diagnostics.get(str(evaluation_horizon), {}).get(
+            side, mixed_side_reports[side]
+        )
+        for side in ("long", "short")
+    }
     return {
         "version": version,
         "status": "complete" if folds else "insufficient_chronological_decision_groups",
@@ -1012,6 +1085,11 @@ def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "model_refit_per_fold": True,
         "chronological": True,
         "sides": side_reports,
+        "primary_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "evaluation_horizon_minutes": evaluation_horizon,
+        "primary_horizon_available": PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons,
+        "horizon_diagnostics": horizon_diagnostics,
+        "mixed_horizon_diagnostics": mixed_side_reports,
         "stable": len(folds) >= 2
         and all(
             report["promotion_math_ready"]
@@ -1145,6 +1223,15 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         blockers.append("artifact_return_evidence_hash_mismatch")
     walk_forward = metadata.get("walk_forward_report") or {}
     folds = list(walk_forward.get("folds") or [])
+    horizons = [int(value) for value in (metadata.get("horizons") or [])]
+    if len(horizons) > 1 and PRIMARY_PREDICTION_HORIZON_MINUTES not in horizons:
+        blockers.append("primary_horizon_evidence_missing")
+    if len(horizons) > 1 and (
+        metadata.get("primary_prediction_horizon_minutes")
+        != PRIMARY_PREDICTION_HORIZON_MINUTES
+        or walk_forward.get("primary_horizon_available") is not True
+    ):
+        blockers.append("primary_horizon_contract_incomplete")
     if (
         walk_forward.get("status") != "complete"
         or walk_forward.get("decision_group_disjoint") is not True
@@ -5301,6 +5388,8 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
         "transformers_sentiment_backend": transformers_sentiment_backend,
         "feature_count": len(FEATURE_KEYS),
         "horizons": sorted(horizon_models),
+        "primary_prediction_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "primary_prediction_horizon_runtime_policy": "runtime_primary_horizon_5m_when_available",
         "profile_count": len(profiles),
         "training_cost_policy": (
             "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
@@ -6074,21 +6163,32 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 if item.get("prediction_distribution_ready") is True
             ]
             if eligible_predictions:
-                primary = max(
-                    eligible_predictions,
-                    key=lambda item: max(
-                        float(
-                            item["return_distribution_inputs"]["long"][
-                                "lower_quantile_return_pct"
-                            ]
+                if metadata.get("primary_prediction_horizon_minutes") == PRIMARY_PREDICTION_HORIZON_MINUTES:
+                    primary = next(
+                        (
+                            item
+                            for item in eligible_predictions
+                            if int(item.get("horizon_minutes") or 0)
+                            == PRIMARY_PREDICTION_HORIZON_MINUTES
                         ),
-                        float(
-                            item["return_distribution_inputs"]["short"][
-                                "lower_quantile_return_pct"
-                            ]
+                        eligible_predictions[0],
+                    )
+                else:
+                    primary = max(
+                        eligible_predictions,
+                        key=lambda item: max(
+                            float(
+                                item["return_distribution_inputs"]["long"][
+                                    "lower_quantile_return_pct"
+                                ]
+                            ),
+                            float(
+                                item["return_distribution_inputs"]["short"][
+                                    "lower_quantile_return_pct"
+                                ]
+                            ),
                         ),
-                    ),
-                )
+                    )
                 best_side = str(primary["best_side"])
                 edge = abs(
                     float(
@@ -6147,7 +6247,10 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "direction": primary["direction"],
                     "horizon_minutes": primary["horizon_minutes"],
                     "horizon_selection_policy": (
-                        "best_governed_lower_quantile_native_horizon"
+                        "runtime_primary_horizon_5m_when_available"
+                        if metadata.get("primary_prediction_horizon_minutes")
+                        == PRIMARY_PREDICTION_HORIZON_MINUTES
+                        else "best_governed_lower_quantile_native_horizon"
                     ),
                     "available_horizon_minutes": sorted(
                         int(item["horizon_minutes"])

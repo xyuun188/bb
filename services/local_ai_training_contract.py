@@ -26,7 +26,7 @@ TRAINING_COST_POLICY = "shadow_market_opportunity_plus_authoritative_okx_executi
 TRAINING_CURSOR_VERSION = "2026-07-27.independent-decision-groups.v1"
 TRAINING_DISTRIBUTION_PROFILE_VERSION = "2026-07-27.training-distribution-profile.v1"
 TRAINING_DISTRIBUTION_DRIFT_VERSION = "2026-07-27.standardized-mean-shift.v1"
-TRAINING_TRIGGER_POLICY_VERSION = "2026-07-27.decision-group-batch.v1"
+TRAINING_TRIGGER_POLICY_VERSION = "2026-08-17.scaled-batch-cooldown.v2"
 LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX = "BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON="
 
 _PROFILE_FEATURES = (
@@ -222,6 +222,8 @@ def decision_group_training_trigger(
     minimum_increment: int,
     drift_minimum_increment: int,
     maximum_interval_seconds: int,
+    batch_growth_fraction: float = 0.0,
+    minimum_retraining_interval_seconds: int = 0,
 ) -> dict[str, Any]:
     """Evaluate cadence without treating elapsed time as new evidence."""
 
@@ -245,14 +247,24 @@ def decision_group_training_trigger(
         if parsed_trained_at is not None
         else None
     )
-    batch_due = new_groups >= int(batch_threshold)
+    effective_batch_threshold = max(
+        int(batch_threshold),
+        int(math.ceil(previous * max(float(batch_growth_fraction), 0.0))),
+    )
+    cooldown_elapsed = bool(
+        seconds_since_training is None
+        or seconds_since_training >= max(int(minimum_retraining_interval_seconds), 0)
+    )
+    batch_due = bool(cooldown_elapsed and new_groups >= effective_batch_threshold)
     interval_due = bool(
         new_groups >= int(minimum_increment)
         and seconds_since_training is not None
         and seconds_since_training >= int(maximum_interval_seconds)
     )
     drift_due = bool(
-        distribution_drift.get("detected") is True and new_groups >= int(drift_minimum_increment)
+        cooldown_elapsed
+        and distribution_drift.get("detected") is True
+        and new_groups >= int(drift_minimum_increment)
     )
     reason = (
         "forced"
@@ -278,6 +290,12 @@ def decision_group_training_trigger(
         "new_mature_decision_group_count": new_groups,
         "training_view_rebased": rebased,
         "batch_decision_group_threshold": int(batch_threshold),
+        "batch_decision_group_growth_fraction": max(float(batch_growth_fraction), 0.0),
+        "effective_batch_decision_group_threshold": effective_batch_threshold,
+        "minimum_retraining_interval_seconds": max(
+            int(minimum_retraining_interval_seconds), 0
+        ),
+        "minimum_retraining_interval_elapsed": cooldown_elapsed,
         "minimum_decision_group_increment": int(minimum_increment),
         "drift_minimum_decision_group_increment": int(drift_minimum_increment),
         "maximum_training_interval_seconds": int(maximum_interval_seconds),

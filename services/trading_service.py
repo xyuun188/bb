@@ -10064,6 +10064,12 @@ class TradingService:
                 maximum_interval_seconds=(
                     LOCAL_ML_TRAINING_PARAMS.maximum_training_interval_seconds
                 ),
+                batch_growth_fraction=(
+                    LOCAL_ML_TRAINING_PARAMS.batch_decision_group_growth_fraction
+                ),
+                minimum_retraining_interval_seconds=(
+                    LOCAL_ML_TRAINING_PARAMS.minimum_retraining_interval_seconds
+                ),
             )
             training_policy = {
                 "learning_only": learning_only,
@@ -10120,26 +10126,33 @@ class TradingService:
             reported_trade_total = result.get("last_trained_completed_trade_sample_count")
             if reported_trade_total is None:
                 reported_trade_total = result.get("completed_trade_sample_count")
-            authoritative_shadow_total = self._safe_int(
-                reported_shadow_total,
-                completed_shadow_total,
-            )
-            authoritative_trade_total = self._safe_int(
-                reported_trade_total,
-                completed_trade_total,
-            )
             reported_group_total = result.get(
                 "last_trained_completed_training_decision_group_count"
             )
             if reported_group_total is None:
                 reported_group_total = result.get("completed_training_decision_group_count")
-            authoritative_group_total = self._safe_int(
-                reported_group_total,
-                completed_group_total,
+            result["training_window_completed_shadow_sample_count"] = self._safe_int(
+                reported_shadow_total,
+                0,
             )
-            result["completed_shadow_sample_count"] = authoritative_shadow_total
-            result["completed_trade_sample_count"] = authoritative_trade_total
-            result["completed_training_decision_group_count"] = authoritative_group_total
+            result["training_window_completed_trade_sample_count"] = self._safe_int(
+                reported_trade_total,
+                0,
+            )
+            result["training_window_completed_decision_group_count"] = self._safe_int(
+                reported_group_total,
+                0,
+            )
+            # The training subprocess receives a bounded fitting window. Its row/group
+            # totals are diagnostics, not cumulative scheduler cursors. Advancing with
+            # the lightweight probe prevents a rejected challenger from retraining the
+            # same historical window every check.
+            authoritative_shadow_total = completed_shadow_total
+            authoritative_trade_total = completed_trade_total
+            authoritative_group_total = completed_group_total
+            result["completed_shadow_sample_count"] = completed_shadow_total
+            result["completed_trade_sample_count"] = completed_trade_total
+            result["completed_training_decision_group_count"] = completed_group_total
             result["new_shadow_sample_count"] = new_shadow
             result["new_trade_sample_count"] = new_trade
             result["new_decision_group_count"] = trigger["new_mature_decision_group_count"]
