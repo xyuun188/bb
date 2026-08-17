@@ -563,6 +563,25 @@ def _group_open_dashboard_positions(
         group["local_unrealized_pnl"] = (
             _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
         ) + local_unrealized
+        group["entry_fee"] = (
+            abs(_safe_float(group.get("entry_fee"), 0.0) or 0.0)
+            + abs(_safe_float(item.get("entry_fee"), 0.0) or 0.0)
+        )
+        group["close_fee"] = (
+            abs(_safe_float(group.get("close_fee"), 0.0) or 0.0)
+            + abs(_safe_float(item.get("close_fee"), 0.0) or 0.0)
+        )
+        group_funding_source = str(group.get("funding_fee_source") or "")
+        item_funding_source = str(item.get("funding_fee_source") or "")
+        if group_funding_source != "current_position_management_contract":
+            if item_funding_source == "current_position_management_contract":
+                group["funding_fee"] = _safe_float(item.get("funding_fee"), 0.0) or 0.0
+                group["funding_fee_source"] = item_funding_source
+            else:
+                group["funding_fee"] = (
+                    _safe_float(group.get("funding_fee"), 0.0) or 0.0
+                ) + (_safe_float(item.get("funding_fee"), 0.0) or 0.0)
+        group["fee"] = group["entry_fee"] + group["close_fee"]
         group["_local_notional"] = (
             _safe_float(group.get("_local_notional"), 0.0) or 0.0
         ) + _local_group_notional(local_qty, local_entry)
@@ -639,6 +658,9 @@ def _group_open_dashboard_positions(
             group["entry_price"] = local_entry
             group["unrealized_pnl"] = _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
             group["pnl_source"] = "local_group"
+        group["total_pnl"] = (
+            _safe_float(group.get("unrealized_pnl"), 0.0) or 0.0
+        ) + (_safe_float(group.get("funding_fee"), 0.0) or 0.0)
         position_ids = [pid for pid in group.get("position_ids", []) if pid is not None]
         group["position_ids"] = position_ids
         group["id"] = min(position_ids) if position_ids else None
@@ -5080,6 +5102,9 @@ def _dashboard_position_history_official_rows_as_groups_legacy(
         )
         if "linked_fills" not in payload:
             payload["linked_fills"] = []
+        payload["fee"] = abs(_safe_float(payload.get("entry_fee"), 0.0) or 0.0) + abs(
+            _safe_float(payload.get("close_fee"), 0.0) or 0.0
+        )
         payload["linked_order_count"] = len(payload.get("linked_fills") or [])
         payload.setdefault("entry_order_ids", [])
         payload.setdefault("close_order_ids", [])
@@ -5227,6 +5252,7 @@ def _dashboard_position_history_official_rows_as_groups(
                 "close_fill_pnl": close_fill_pnl,
                 "entry_fee": order_payload["entry_fee"],
                 "close_fee": order_payload["close_fee"],
+                "fee": abs(order_payload["entry_fee"]) + abs(order_payload["close_fee"]),
                 "funding_fee": _safe_float(row.get("fundingFee"), 0.0) or 0.0,
                 "funding_bill_count": 0,
                 "funding_fee_source": "okx_positions_history.fundingFee",
@@ -5890,6 +5916,32 @@ async def _get_display_open_positions_snapshot(
                     _safe_float(getattr(row, "unrealized_pnl", None), 0.0) or 0.0
                     for row in group_rows
                 )
+                entry_fee = sum(
+                    abs(_safe_float(getattr(row, "entry_fee", None), 0.0) or 0.0)
+                    for row in group_rows
+                )
+                close_fee = sum(
+                    abs(_safe_float(getattr(row, "close_fee", None), 0.0) or 0.0)
+                    for row in group_rows
+                )
+                local_funding_fee = sum(
+                    _safe_float(getattr(row, "funding_fee", None), 0.0) or 0.0
+                    for row in group_rows
+                )
+                management_funding_fee = None
+                for row in group_rows:
+                    management = _safe_dict(getattr(row, "current_management_contract", None))
+                    if "funding_fee_usdt" in management:
+                        management_funding_fee = _safe_float(
+                            management.get("funding_fee_usdt"), 0.0
+                        ) or 0.0
+                        break
+                funding_fee = (
+                    management_funding_fee
+                    if management_funding_fee is not None
+                    else local_funding_fee
+                )
+                fee = entry_fee + close_fee
                 current_price = p.current_price
                 unrealized_pnl = local_unrealized_pnl
                 entry_price = local_entry_price or p.entry_price
@@ -5934,6 +5986,16 @@ async def _get_display_open_positions_snapshot(
                         "current_price": current_price,
                         "change_24h": change_24h,
                         "unrealized_pnl": unrealized_pnl,
+                        "funding_fee": funding_fee,
+                        "funding_fee_source": (
+                            "current_position_management_contract"
+                            if management_funding_fee is not None
+                            else "position_funding_fee"
+                        ),
+                        "entry_fee": entry_fee,
+                        "close_fee": close_fee,
+                        "fee": fee,
+                        "total_pnl": unrealized_pnl + funding_fee,
                         "pnl_source": pnl_source,
                         "local_quantity": local_quantity,
                         "local_entry_price": local_entry_price or p.entry_price,
@@ -6021,6 +6083,36 @@ async def _get_display_open_positions_snapshot(
                     "current_price": valuation["current_price"],
                     "change_24h": change_24h,
                     "unrealized_pnl": valuation["unrealized_pnl"],
+                    "funding_fee": _safe_float(
+                        getattr(local_position, "funding_fee", None), 0.0
+                    )
+                    if local_position is not None
+                    else 0.0,
+                    "funding_fee_source": (
+                        "position_funding_fee" if local_position is not None else "none"
+                    ),
+                    "entry_fee": abs(
+                        _safe_float(getattr(local_position, "entry_fee", None), 0.0)
+                    )
+                    if local_position is not None
+                    else 0.0,
+                    "close_fee": abs(
+                        _safe_float(getattr(local_position, "close_fee", None), 0.0)
+                    )
+                    if local_position is not None
+                    else 0.0,
+                    "fee": (
+                        abs(_safe_float(getattr(local_position, "entry_fee", None), 0.0))
+                        + abs(_safe_float(getattr(local_position, "close_fee", None), 0.0))
+                    )
+                    if local_position is not None
+                    else 0.0,
+                    "total_pnl": valuation["unrealized_pnl"]
+                    + (
+                        _safe_float(getattr(local_position, "funding_fee", None), 0.0)
+                        if local_position is not None
+                        else 0.0
+                    ),
                     "pnl_source": valuation["pnl_source"],
                     "local_quantity": getattr(local_position, "quantity", None),
                     "local_entry_price": getattr(local_position, "entry_price", None),
@@ -6907,6 +6999,16 @@ async def get_positions(
             current_price = p.current_price
             unrealized_pnl = p.unrealized_pnl
             realized_pnl = p.realized_pnl
+            current_management_contract = _safe_dict(
+                getattr(p, "current_management_contract", None)
+            )
+            management_funding_available = "funding_fee_usdt" in current_management_contract
+            funding_fee = (
+                _safe_float(current_management_contract.get("funding_fee_usdt"), 0.0)
+                or 0.0
+                if management_funding_available
+                else _safe_float(p.funding_fee, 0.0) or 0.0
+            )
             closed_at = p.closed_at
             entry_price = p.entry_price
             quantity = p.quantity
@@ -6987,13 +7089,22 @@ async def get_positions(
                     "local_entry_price": p.entry_price,
                     "local_unrealized_pnl": p.unrealized_pnl,
                     "realized_pnl": realized_pnl,
+                    "close_fill_pnl": p.close_fill_pnl,
+                    "entry_fee": abs(_safe_float(p.entry_fee, 0.0) or 0.0),
+                    "close_fee": abs(_safe_float(p.close_fee, 0.0) or 0.0),
+                    "funding_fee": funding_fee,
+                    "funding_fee_source": (
+                        "current_position_management_contract"
+                        if management_funding_available
+                        else "position_funding_fee"
+                    ),
+                    "fee": abs(_safe_float(p.entry_fee, 0.0) or 0.0)
+                    + abs(_safe_float(p.close_fee, 0.0) or 0.0),
+                    "total_pnl": unrealized_pnl + funding_fee,
                     "leverage": p.leverage,
                     "stop_loss": p.stop_loss_price,
                     "take_profit": p.take_profit_price,
-                    "entry_fee": p.entry_fee,
-                    "current_management_contract": _safe_dict(
-                        getattr(p, "current_management_contract", None)
-                    ),
+                    "current_management_contract": current_management_contract,
                     "is_open": display_is_open,
                     "db_is_open": p.is_open,
                     "exchange_synced": exchange_synced,
@@ -7027,6 +7138,9 @@ async def get_positions(
             quantity = _safe_float(item.get("quantity"), 0.0) or 0.0
             entry_price = _safe_float(item.get("entry_price"), 0.0) or 0.0
             realized_pnl = _safe_float(item.get("realized_pnl"), 0.0) or 0.0
+            entry_fee = _safe_float(item.get("entry_fee"), 0.0) or 0.0
+            close_fee = _safe_float(item.get("close_fee"), 0.0) or 0.0
+            funding_fee = _safe_float(item.get("funding_fee"), 0.0) or 0.0
             if key not in grouped_index:
                 item = dict(item)
                 item["position_ids"] = [item.get("id")]
@@ -7047,6 +7161,18 @@ async def get_positions(
             group["realized_pnl"] = (
                 _safe_float(group.get("realized_pnl"), 0.0) or 0.0
             ) + realized_pnl
+            group["entry_fee"] = (
+                _safe_float(group.get("entry_fee"), 0.0) or 0.0
+            ) + entry_fee
+            group["close_fee"] = (
+                _safe_float(group.get("close_fee"), 0.0) or 0.0
+            ) + close_fee
+            group["funding_fee"] = (
+                _safe_float(group.get("funding_fee"), 0.0) or 0.0
+            ) + funding_fee
+            group["fee"] = (
+                _safe_float(group.get("entry_fee"), 0.0) or 0.0
+            ) + (_safe_float(group.get("close_fee"), 0.0) or 0.0)
             group["split_count"] = int(group.get("split_count") or 1) + 1
             group.setdefault("position_ids", []).append(item.get("id"))
             group["id"] = min(

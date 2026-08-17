@@ -4272,6 +4272,31 @@ select.form-input { cursor: pointer; }
     font-size: 11px;
     line-height: 1.5;
 }
+.position-pnl-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-start;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
+}
+.position-pnl-link:hover span,
+.position-pnl-link:focus-visible span {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+.position-pnl-link:disabled {
+    cursor: default;
+}
+.position-pnl-link:disabled span {
+    text-decoration: none;
+}
+.position-pnl-breakdown {
+    margin-bottom: 12px;
+}
 .position-ledger-gaps {
     padding: 9px 10px;
     border: 1px solid rgba(245,158,11,0.35);
@@ -5430,7 +5455,7 @@ select.form-input { cursor: pointer; }
     .ml-bar-row { grid-template-columns: minmax(0, 1fr) 42px; }
     .ml-bar-label { display: none; }
     .trade-reflection-authority { grid-template-columns: 1fr; align-items: start; }
-    #page-positions .table-wrap > table { min-width: 1080px; }
+    #page-positions .table-wrap > table { min-width: 1280px; }
     #page-positions .table-wrap > table th { white-space: nowrap; }
     .opening-funnel-overview,
     .opening-funnel-columns { grid-template-columns: 1fr; }

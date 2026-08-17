@@ -526,6 +526,7 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
                         current_price=103.0,
                         leverage=2.0,
                         unrealized_pnl=6.0,
+                        entry_fee=0.12,
                         is_open=True,
                         entry_exchange_order_id="entry-edge-1",
                         current_management_contract={
@@ -533,6 +534,8 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
                             "management_eligible": True,
                             "can_expand_position": False,
                             "can_increase_leverage": False,
+                            "funding_fee_usdt": 1.5,
+                            "funding_fee_source": "okx_account_bills",
                             "blockers": [],
                         },
                         created_at=datetime(2026, 7, 15, tzinfo=UTC),
@@ -587,6 +590,11 @@ async def test_open_positions_endpoint_returns_risk_and_oco_evidence(
     assert payload["protection_inventory"]["available"] is True
     assert payload["protection_inventory"]["missing_keys"] == []
     row = payload["positions"][0]
+    assert row["unrealized_pnl"] == pytest.approx(6.0)
+    assert row["funding_fee"] == pytest.approx(1.5)
+    assert row["entry_fee"] == pytest.approx(0.12)
+    assert row["fee"] == pytest.approx(0.12)
+    assert row["total_pnl"] == pytest.approx(7.5)
     assert row["current_management_contract"]["management_eligible"] is True
     assert row["risk_contract"]["available"] is True
     risk = row["risk_contract"]["contracts"][0]

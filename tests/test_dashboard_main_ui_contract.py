@@ -271,6 +271,24 @@ def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
     assert ".position-linked-orders-table-wrap" in style
 
 
+def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert "<th>资金费</th>" in html
+    assert "<th>总盈亏</th>" in html
+    assert 'colspan="13"' in html
+    assert "js-open-position-pnl" in script
+    assert "js-position-pnl-detail" in script
+    assert "function positionPnlBreakdownHtml" in script
+    assert "盈亏金额（浮动）" in script
+    assert "资金费" in script
+    assert "手续费" in script
+    assert "总盈亏（浮动 + 资金费）" in script
+    assert ".position-pnl-link" in style
+
+
 def test_position_history_separates_confirmed_close_from_official_settlement() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
