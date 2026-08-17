@@ -276,17 +276,25 @@ def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
-    assert "<th>资金费</th>" in html
-    assert "<th>总盈亏</th>" in html
-    assert 'colspan="13"' in html
+    assert "<th>资金费</th>" not in html
+    assert "<th>总盈亏</th>" not in html
+    assert 'colspan="11"' in html
     assert "js-open-position-pnl" in script
     assert "js-position-pnl-detail" in script
     assert "function positionPnlBreakdownHtml" in script
-    assert "盈亏金额（浮动）" in script
-    assert "资金费" in script
-    assert "手续费" in script
-    assert "总盈亏（浮动 + 资金费）" in script
+    pnl_block = script[
+        script.index("function positionPnlBreakdownHtml") : script.index(
+            "function openOpenPositionPnlModal"
+        )
+    ]
+    assert "已实现收益" in pnl_block
+    assert "平仓收益" in pnl_block
+    assert "资金费" in pnl_block
+    assert "手续费" in pnl_block
+    assert "盈亏金额（浮动）" not in pnl_block
+    assert "总盈亏（浮动 + 资金费）" not in pnl_block
     assert ".position-pnl-link" in style
+    assert ".position-pnl-breakdown > div" in style
 
 
 def test_position_history_separates_confirmed_close_from_official_settlement() -> None:

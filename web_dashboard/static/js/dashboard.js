@@ -8569,16 +8569,13 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
     const pagination = document.getElementById('positions-pagination');
     if (!tbody) return;
     if (!positions.length) {
-        tbody.innerHTML = '<tr><td colspan="13" style="color:var(--text-muted);text-align:center;padding:24px;">暂无正在持仓数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);text-align:center;padding:24px;">暂无正在持仓数据</td></tr>';
         if (pagination) pagination.style.display = 'none';
         return;
     }
     tbody.innerHTML = positions.map((p, positionIndex) => {
         const pnl = Number(p.unrealized_pnl || 0);
-        const fundingFee = Number(p.funding_fee || 0);
-        const totalPnl = Number(p.total_pnl ?? (pnl + fundingFee));
         const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-        const totalPnlColor = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
         const positionId = Number(p.id || 0);
         const splitCount = Number(p.split_count || 1);
         const canManualClose = p.can_manual_close !== false && positionId > 0;
@@ -8626,8 +8623,6 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
                     title="查看盈亏、资金费和手续费"
                 ><span style="color:${pnlColor};">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</span></button>
             </td>
-            <td style="color:${fundingFee >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:600;">${fundingFee >= 0 ? '+' : ''}${fundingFee.toFixed(4)}</td>
-            <td style="color:${totalPnlColor};font-weight:700;">${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)}</td>
             <td>${p.take_profit ? fmtPrice(p.take_profit) : '-'}</td>
             <td>${p.stop_loss ? fmtPrice(p.stop_loss) : '-'}</td>
             <td style="font-size:10px;color:var(--text-muted);">${toBeijingTime(p.opened_at)}</td>
@@ -8743,22 +8738,21 @@ function positionFeeTotal(position) {
     return Math.abs(Number(position?.entry_fee || 0)) + Math.abs(Number(position?.close_fee || 0));
 }
 
-function positionPnlBreakdownHtml(position, { closed = false } = {}) {
-    const pnl = mlOptionalNumber(closed ? position?.realized_pnl : position?.unrealized_pnl);
+function positionPnlBreakdownHtml(position) {
+    // Match the OKX position detail popover: show ledger components only.
+    const realizedPnl = mlOptionalNumber(position?.realized_pnl);
+    const closeFillPnl = mlOptionalNumber(position?.close_fill_pnl);
     const fundingFee = Number(position?.funding_fee || 0);
     const fee = positionFeeTotal(position);
-    const totalPnl = closed ? pnl : (pnl === null ? null : pnl + fundingFee);
-    const closeFillPnl = mlOptionalNumber(position?.close_fill_pnl);
-    const pnlText = pnl === null ? '待官方结算' : `${signedMoney(pnl)} USDT`;
-    const totalText = totalPnl === null ? '待官方结算' : `${signedMoney(totalPnl)} USDT`;
+    const realizedText = realizedPnl === null ? '待官方结算' : `${signedMoney(realizedPnl)} USDT`;
     const closeFillText = closeFillPnl === null ? '--' : `${signedMoney(closeFillPnl)} USDT`;
     const feeText = fee > 0 ? `-${fmtMoney(fee)} USDT` : '0.00 USDT';
     return `
         <div class="position-ledger-summary position-pnl-breakdown">
-            <div><strong>${pnlText}</strong><span>${closed ? '盈亏金额（已实现）' : '盈亏金额（浮动）'}</span></div>
-            <div><strong>${signedMoney(fundingFee)} USDT</strong><span>资金费</span></div>
-            <div><strong>${feeText}</strong><span>手续费</span></div>
-            <div><strong>${closed ? closeFillText : totalText}</strong><span>${closed ? '平仓收益' : '总盈亏（浮动 + 资金费）'}</span></div>
+            <div><span>已实现收益</span><strong>${realizedText}</strong></div>
+            <div><span>平仓收益</span><strong>${closeFillText}</strong></div>
+            <div><span>资金费</span><strong>${signedMoney(fundingFee)} USDT</strong></div>
+            <div><span>手续费</span><strong>${feeText}</strong></div>
         </div>`;
 }
 
@@ -8770,9 +8764,7 @@ function openOpenPositionPnlModal(positionIndex) {
     const overlay = document.getElementById('position-linked-orders-modal-overlay');
     if (!body || !overlay) return;
     if (title) title.textContent = `${position.symbol || '-'} ${sideLabel(position.side)} · 盈亏明细`;
-    body.innerHTML = `
-        ${positionPnlBreakdownHtml(position)}
-        <div class="position-ledger-gaps">浮动盈亏来自当前 OKX 持仓 UPL；资金费和手续费只展示已同步到当前持仓事实的金额。</div>`;
+    body.innerHTML = positionPnlBreakdownHtml(position);
     overlay.style.display = 'flex';
 }
 
@@ -8945,7 +8937,7 @@ function openPositionLinkedOrdersModal(groupId) {
         ? '\u5f85\u5b98\u65b9\u7ed3\u7b97'
         : `${signedMoney(position.realized_pnl || 0)} USDT`;
     const evidenceHtml = `
-        ${positionPnlBreakdownHtml(position, { closed: true })}
+        ${positionPnlBreakdownHtml(position)}
         <div class="position-ledger-summary">
             <div><strong>${escHtml(position.okx_inst_id || '-')}</strong><span>OKX instId</span></div>
             <div><strong>${fmtNum(position.closed_quantity ?? position.quantity)}</strong><span>\u5df2\u5e73\u6570\u91cf</span></div>
