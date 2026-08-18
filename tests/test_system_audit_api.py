@@ -1259,6 +1259,74 @@ async def test_phase3_paper_resume_observation_audit_reports_healthy(
 
 
 @pytest.mark.asyncio
+async def test_model_training_runtime_probe_rechecks_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_data_collection_status(
+        include_feature_coverage: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "ready",
+                    "shadow_sample_count": 73081,
+                    "trade_sample_count": 406,
+                    "training_policy": "current_training_epoch_only",
+                    "pre_epoch_data_training_allowed": False,
+                },
+                "governance": {"status": "ok"},
+            },
+            "sources": [],
+        }
+
+    calls = 0
+
+    async def transient_runtime_status() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "ai_models": [{"model": "phase3-decision", "available": False}],
+                "local_ai_tools": {"available": False, "configured": True},
+            }
+        return {
+            "ai_models": [{"model": "phase3-decision", "available": True}],
+            "local_ai_tools": {"available": True, "configured": True},
+        }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_data_collection_status,
+    )
+    monkeypatch.setattr(system_audit, "collect_platform_runtime_status", transient_runtime_status)
+    monkeypatch.setattr(
+        system_audit,
+        "_specialist_shadow_latest_report",
+        lambda: {
+            "available": True,
+            "completed_count": 1,
+            "eligible_shadow_count": 1,
+            "model_count": 1,
+            "summary": {"promotion_ready_count": 0, "blocked_count": 1},
+            "models": [],
+        },
+    )
+    _patch_historical_trade_fact_audit(monkeypatch)
+    _patch_artifact_retirement_audit(monkeypatch)
+
+    card = await system_audit._model_training_audit()
+
+    assert calls == 2
+    assert card["status"] == "ok"
+    assert card["details"]["runtime_probe"]["status"] == "ok"
+    assert card["details"]["runtime_probe_attempts"] == 2
+    assert card["details"]["runtime_probe_retried"] is True
+
+
+@pytest.mark.asyncio
 async def test_model_training_audit_does_not_run_full_self_check(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -2525,6 +2593,8 @@ async def test_model_training_unconfigured_local_tools_are_observing(
 async def test_model_training_auth_failure_remains_unresolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    runtime_calls = 0
+
     async def fake_data_collection_status(
         include_feature_coverage: bool = True,
     ) -> dict[str, Any]:
@@ -2543,6 +2613,8 @@ async def test_model_training_auth_failure_remains_unresolved(
         }
 
     async def fake_runtime_status() -> dict[str, Any]:
+        nonlocal runtime_calls
+        runtime_calls += 1
         return {
             "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
             "local_ai_tools": {
@@ -2564,6 +2636,7 @@ async def test_model_training_auth_failure_remains_unresolved(
     card = await system_audit._model_training_audit()
     ledger = system_audit._issue_ledger_from_cards([card])
 
+    assert runtime_calls == 2
     assert card["status"] == "critical"
     assert card["details"]["hard_failure"] is True
     assert ledger["summary"] == {"fixed": 0, "unresolved": 1, "observing": 0, "total": 1}

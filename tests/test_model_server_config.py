@@ -202,6 +202,42 @@ async def test_platform_runtime_status_probe_is_singleflight_and_cached(
 
 
 @pytest.mark.asyncio
+async def test_platform_runtime_status_force_refresh_replaces_failed_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def platform_runtime():
+        nonlocal calls
+        calls += 1
+        available = calls > 1
+        return {
+            "ai_models": [{"model": "phase3-decision", "available": available}],
+            "local_ai_tools": {"available": available, "configured": True},
+        }
+
+    monkeypatch.setattr(
+        server_monitor_status,
+        "collect_platform_runtime_status",
+        platform_runtime,
+    )
+    server_monitor_status.clear_server_monitor_cache()
+
+    first = await server_monitor_status.get_cached_platform_runtime_status()
+    refreshed = await server_monitor_status.get_cached_platform_runtime_status(
+        force_refresh=True
+    )
+    cached = await server_monitor_status.get_cached_platform_runtime_status()
+
+    assert calls == 2
+    assert first["ai_models"][0]["available"] is False
+    assert refreshed["cache"]["status"] == "forced_refresh"
+    assert refreshed["ai_models"][0]["available"] is True
+    assert cached["cache"]["status"] == "fresh"
+    assert cached["ai_models"][0]["available"] is True
+
+
+@pytest.mark.asyncio
 async def test_dashboard_ticker_fallback_reads_open_position_prices_from_db(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

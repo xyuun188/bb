@@ -1345,5 +1345,41 @@ async def test_data_collection_status_reuses_runtime_snapshot_cache(
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_data_collection_status_can_wait_for_first_real_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def build(include_feature_coverage: bool) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        return {
+            "status": "ok",
+            "training": {
+                "local_ai_tools": {
+                    "available": True,
+                    "status": "ready",
+                    "shadow_sample_count": 73081,
+                    "trade_sample_count": 406,
+                }
+            },
+            "feature_coverage": {"status": "skipped"},
+        }
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    monkeypatch.setattr(data_collection_module, "_build_data_collection_status", build)
+    monkeypatch.setattr(data_collection_module, "_status_cache", {})
+    monkeypatch.setattr(data_collection_module, "_status_refresh_tasks", {})
+    monkeypatch.setattr(data_collection_module, "_status_refresh_locks", {})
+
+    body = await data_collection_module.get_data_collection_status(
+        include_feature_coverage=False,
+        wait_for_initial_refresh=True,
+    )
+
+    assert body["status"] == "ok"
+    assert body["training"]["local_ai_tools"]["shadow_sample_count"] == 73081
+    assert body["training"]["local_ai_tools"]["trade_sample_count"] == 406
+    assert body["cache"]["cold_start"] is False
+
+
 async def _async_value(value: Any) -> Any:
     return value

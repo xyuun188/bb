@@ -61,6 +61,7 @@ GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT = 500
 STATUS_SECTION_TIMEOUT_SECONDS = 12.0
 STATUS_REMOTE_MODEL_TIMEOUT_SECONDS = 2.0
 STATUS_CACHE_TTL_SECONDS = 60.0
+STATUS_INITIAL_REFRESH_TIMEOUT_SECONDS = 45.0
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _status_cache: dict[bool, tuple[datetime, dict[str, Any]]] = {}
@@ -1284,13 +1285,16 @@ async def _refresh_data_collection_status(include_feature_coverage: bool) -> dic
         return payload
 
 
-def _start_data_collection_status_refresh(include_feature_coverage: bool) -> None:
+def _start_data_collection_status_refresh(
+    include_feature_coverage: bool,
+) -> asyncio.Task[Any]:
     task = _status_refresh_tasks.get(include_feature_coverage)
     if task is not None and not task.done():
-        return
+        return task
     task = asyncio.create_task(_refresh_data_collection_status(include_feature_coverage))
     _status_refresh_tasks[include_feature_coverage] = task
     task.add_done_callback(_consume_status_refresh_task(include_feature_coverage))
+    return task
 
 
 def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str, Any]:
@@ -1340,6 +1344,8 @@ def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str,
 @router.get("/data-collection/status")
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
+    *,
+    wait_for_initial_refresh: bool = False,
 ) -> dict[str, Any]:
     cache_enabled = str(settings.database_url or "").startswith("postgresql")
     if not cache_enabled:
@@ -1357,7 +1363,34 @@ async def get_data_collection_status(
             "refresh_in_progress": age_seconds > STATUS_CACHE_TTL_SECONDS,
         }
         return result
-    _start_data_collection_status_refresh(include_feature_coverage)
+    refresh_task = _start_data_collection_status_refresh(include_feature_coverage)
+    if wait_for_initial_refresh:
+        # The dashboard can render a warming placeholder, but system audit must
+        # inspect the first real snapshot or it will mistake zeroed placeholders
+        # for missing training data.
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(refresh_task),
+                timeout=STATUS_INITIAL_REFRESH_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            payload = _warming_data_collection_status(include_feature_coverage)
+            payload["cache"]["initial_refresh_timeout"] = True
+            return payload
+        cached = _status_cache.get(include_feature_coverage)
+        if cached is not None:
+            cached_at, payload = cached
+            result = dict(payload)
+            result["cache"] = {
+                "age_seconds": round(
+                    max((datetime.now(UTC) - cached_at).total_seconds(), 0.0),
+                    3,
+                ),
+                "ttl_seconds": STATUS_CACHE_TTL_SECONDS,
+                "refresh_in_progress": False,
+                "cold_start": False,
+            }
+            return result
     return _warming_data_collection_status(include_feature_coverage)
 
 

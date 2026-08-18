@@ -1477,14 +1477,17 @@ def _platform_runtime_cache_result(
     return result
 
 
-async def _cached_platform_runtime_status() -> dict[str, Any]:
+async def _cached_platform_runtime_status(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     """Single-flight the platform model probes and retain truthful stale evidence."""
 
     global _platform_runtime_cache, _platform_runtime_cache_lock
     source_id = id(collect_platform_runtime_status)
     now = monotonic()
     cached = _platform_runtime_cache
-    if cached is not None and cached[1] == source_id:
+    if not force_refresh and cached is not None and cached[1] == source_id:
         cached_at, _source_id, payload = cached
         age = max(now - cached_at, 0.0)
         ttl = _platform_runtime_cache_ttl(payload)
@@ -1501,7 +1504,7 @@ async def _cached_platform_runtime_status() -> dict[str, Any]:
     async with _platform_runtime_cache_lock:
         now = monotonic()
         cached = _platform_runtime_cache
-        if cached is not None and cached[1] == source_id:
+        if not force_refresh and cached is not None and cached[1] == source_id:
             cached_at, _source_id, payload = cached
             age = max(now - cached_at, 0.0)
             ttl = _platform_runtime_cache_ttl(payload)
@@ -1528,16 +1531,19 @@ async def _cached_platform_runtime_status() -> dict[str, Any]:
         _platform_runtime_cache = (monotonic(), source_id, copy.deepcopy(payload))
         return _platform_runtime_cache_result(
             payload,
-            status="refreshed",
+            status="forced_refresh" if force_refresh else "refreshed",
             age_seconds=0.0,
             ttl_seconds=_platform_runtime_cache_ttl(payload),
         )
 
 
-async def get_cached_platform_runtime_status() -> dict[str, Any]:
+async def get_cached_platform_runtime_status(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     """Return the shared single-flight platform runtime probe result."""
 
-    return await _cached_platform_runtime_status()
+    return await _cached_platform_runtime_status(force_refresh=force_refresh)
 
 
 async def get_server_monitor_status_async() -> dict[str, Any]:

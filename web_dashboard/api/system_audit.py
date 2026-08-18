@@ -3613,26 +3613,85 @@ def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
         return
 
 
-async def _audit_platform_runtime_status() -> dict[str, Any]:
+async def _audit_platform_runtime_status(
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     """Use the shared probe cache while preserving test/provider overrides."""
 
     if collect_platform_runtime_status is not _DEFAULT_PLATFORM_RUNTIME_PROVIDER:
         return await collect_platform_runtime_status()
-    return await get_cached_platform_runtime_status()
+    return await get_cached_platform_runtime_status(force_refresh=force_refresh)
+
+
+async def _data_collection_status_for_audit() -> dict[str, Any]:
+    """Request a real cold-start snapshot when the provider supports it."""
+
+    getter = data_collection_api.get_data_collection_status
+    kwargs: dict[str, Any] = {"include_feature_coverage": False}
+    try:
+        parameters = inspect.signature(getter).parameters.values()
+        supports_wait = any(
+            parameter.name == "wait_for_initial_refresh"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_wait = False
+    if supports_wait:
+        kwargs["wait_for_initial_refresh"] = True
+    return await getter(**kwargs)
+
+
+def _runtime_status_needs_retry(runtime_status: Any) -> bool:
+    """Identify a probe result that may be a transient tunnel/model failure."""
+
+    if isinstance(runtime_status, Exception):
+        return True
+    if not isinstance(runtime_status, dict):
+        return True
+    models = runtime_status.get("ai_models")
+    if isinstance(models, list) and any(
+        isinstance(row, dict) and not bool(row.get("available")) for row in models
+    ):
+        return True
+    local_tools = runtime_status.get("local_ai_tools")
+    return (
+        isinstance(local_tools, dict)
+        and bool(local_tools)
+        and bool(local_tools.get("configured", True))
+        and not bool(local_tools.get("available"))
+    )
+
+
+async def _probe_platform_runtime_with_retry() -> tuple[Any, int, bool]:
+    """Recheck one transient runtime failure before exposing a hard audit fault."""
+
+    try:
+        first: Any = await _audit_platform_runtime_status()
+    except Exception as exc:
+        first = exc
+    if not _runtime_status_needs_retry(first):
+        return first, 1, False
+    # A failed cached result is deliberately bypassed for the second check.
+    # Test/provider overrides still use their injected implementation.
+    try:
+        second: Any = await _audit_platform_runtime_status(force_refresh=True)
+    except Exception as exc:
+        second = exc
+    return second, 2, True
 
 
 async def _model_training_audit() -> dict[str, Any]:
     runtime_task = asyncio.create_task(
         asyncio.wait_for(
-            _audit_platform_runtime_status(),
-            timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS,
+            _probe_platform_runtime_with_retry(),
+            timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS * 2,
         )
     )
     runtime_task.add_done_callback(_consume_background_task_exception)
     try:
-        data_status = await data_collection_api.get_data_collection_status(
-            include_feature_coverage=False
-        )
+        data_status = await _data_collection_status_for_audit()
     except Exception as exc:
         data_status = exc
     try:
@@ -3646,8 +3705,10 @@ async def _model_training_audit() -> dict[str, Any]:
         artifact_retirement = await ArtifactRetirementAuditService().report()
     except Exception as exc:
         artifact_retirement = exc
+    runtime_probe_attempts = 1
+    runtime_probe_retried = False
     try:
-        runtime_status = await runtime_task
+        runtime_status, runtime_probe_attempts, runtime_probe_retried = await runtime_task
     except Exception as exc:
         runtime_status = exc
     if isinstance(data_status, Exception):
@@ -3756,6 +3817,10 @@ async def _model_training_audit() -> dict[str, Any]:
         }
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
     local_tools_status = str(local_tools.get("status") or "").lower()
+    data_collection_status = str(data_status.get("status") or "").lower()
+    data_collection_warming = (
+        data_collection_status == "warming" or local_tools_status == "warming"
+    )
     local_tools_probe_timeout = local_tools_status in {"timeout", "status_error", "error"} and (
         str(local_tools.get("section") or "") == "local_ai_training_status"
         or "timeout" in str(local_tools.get("error") or "").lower()
@@ -3784,6 +3849,7 @@ async def _model_training_audit() -> dict[str, Any]:
         not bool(local_tools.get("available"))
         and not local_tools_unconfigured
         and not local_tools_status_probe_slow
+        and not data_collection_warming
     )
     runtime_probe_timeout_is_observing = runtime_probe_timeout and (
         bool(local_tools.get("available"))
@@ -3808,6 +3874,7 @@ async def _model_training_audit() -> dict[str, Any]:
         local_tools_status == "learning_only"
         or local_tools_status_probe_slow
         or local_tools_unconfigured
+        or data_collection_warming
         or runtime_probe_timeout
         or historical_trade_fact_audit_warning
         or artifact_retirement_audit_warning
@@ -3877,6 +3944,8 @@ async def _model_training_audit() -> dict[str, Any]:
             observing_reasons.append("模型仍在学习观察")
         if local_tools_unconfigured:
             observing_reasons.append("本地量化工具未配置")
+        if data_collection_warming:
+            observing_reasons.append("训练状态首次快照刷新中")
         if artifact_retirement_required:
             observing_reasons.append("需要按三期干净训练视图重建旧模型产物")
         if artifact_retirement_audit_warning:
@@ -3952,12 +4021,16 @@ async def _model_training_audit() -> dict[str, Any]:
             "model_training_scheduler_state": training_scheduler_state,
             "governance_status": governance.get("status") if isinstance(governance, dict) else None,
             "runtime_probe": runtime_probe,
+            "runtime_probe_attempts": runtime_probe_attempts,
+            "runtime_probe_retried": runtime_probe_retried,
             "hard_failure": hard_failure,
             "observing": observing,
             "clean_training_view_available": clean_training_view_available,
             "local_tools_status_probe_slow": local_tools_status_probe_slow,
             "local_tools_probe_timeout": local_tools_probe_timeout,
             "runtime_probe_timeout_is_observing": runtime_probe_timeout_is_observing,
+            "data_collection_status": data_collection_status or "unknown",
+            "data_collection_warming": data_collection_warming,
             "source_warnings": hard_source_warnings[:8],
             "optional_source_warnings": optional_source_warnings[:8],
             "hard_source_warning_count": len(hard_source_warnings),
