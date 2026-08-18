@@ -266,9 +266,14 @@ def test_position_history_uses_okx_grouped_ledger_linked_orders_modal() -> None:
     assert "position-close-origin" in script
     assert "function openPositionLinkedOrdersModal" in script
     assert "function closePositionLinkedOrdersModal" in script
+    assert "function compactIdentifier" in script
+    assert "identifierCell(fill.trade_id" in script
+    assert "position-linked-trade-id" in script
     assert ".js-position-linked-orders" in script
     assert ".position-ledger-summary" in style
     assert ".position-linked-orders-table-wrap" in style
+    assert "table-layout: fixed" in style
+    assert "text-overflow: ellipsis" in style
 
 
 def test_position_pnl_cells_open_fee_and_funding_breakdown() -> None:

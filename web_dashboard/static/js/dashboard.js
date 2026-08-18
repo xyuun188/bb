@@ -7670,6 +7670,17 @@ function executionStatusPresentation(record, explicitSuccess = null) {
 function fmtPrice(p) { return p ? Number(p).toFixed(4) : '0.0000'; }
 function fmtPct(p) { return p ? Number(p).toFixed(2) + '%' : '0.00%'; }
 function fmtNum(n) { return n ? Number(n).toFixed(4) : '0'; }
+function compactIdentifier(value, maxLength = 20) {
+    const text = String(value ?? '').trim() || '-';
+    if (text === '-' || text.length <= maxLength) return text;
+    const suffixLength = 5;
+    const prefixLength = Math.max(6, maxLength - suffixLength - 3);
+    return `${text.slice(0, prefixLength)}...${text.slice(-suffixLength)}`;
+}
+function identifierCell(value, className, maxLength = 20) {
+    const text = String(value ?? '').trim() || '-';
+    return `<span class="${className}" title="${escHtml(text)}">${escHtml(compactIdentifier(text, maxLength))}</span>`;
+}
 function fmtSecondsLabel(value) {
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds <= 0) return '-';
@@ -9162,8 +9173,8 @@ function openPositionLinkedOrdersModal(groupId) {
                 <td>${fmtPrice(fill.price)}</td>
                 <td style="color:${pnlColor};font-weight:700;">${signedMoney(fill.pnl || 0)}</td>
                 <td>${fmtNum(fill.fee)}</td>
-                <td>${escHtml(fill.order_id || '-')}</td>
-                <td>${escHtml(fill.trade_id || '-')}</td>
+                <td>${identifierCell(fill.order_id, 'position-linked-order-id', 18)}</td>
+                <td>${identifierCell(fill.trade_id, 'position-linked-trade-id', 22)}</td>
                 <td>${toBeijingTime(fill.filled_at)}</td>
                 <td>${okxBadge}</td>
             </tr>`;
