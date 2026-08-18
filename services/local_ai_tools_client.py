@@ -58,6 +58,10 @@ _HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
 _BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
 _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
 _MAX_CONCURRENT_INFERENCE_BATCHES = 2
+# Sentiment may use the heavyweight 14B shadow specialist. It is useful for
+# diagnostics, but it must not hold the profit/time-series evidence batch open
+# while position review is using the same model queue.
+_OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS = 5.0
 
 
 class _RetryableLocalAIToolsError(RuntimeError):
@@ -192,6 +196,11 @@ class LocalAIToolsClient:
             _MIN_INFERENCE_ATTEMPT_SECONDS,
         )
 
+        def route_budget(name: str, budget: float) -> float:
+            if name == "sentiment_analysis":
+                return min(budget, _OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS)
+            return budget
+
         async def call_tool(
             name: str,
             path: str,
@@ -281,7 +290,11 @@ class LocalAIToolsClient:
                 results = list(
                     await asyncio.gather(
                         *(
-                            call_tool(name, path, route_timeout=route_timeout)
+                            call_tool(
+                                name,
+                                path,
+                                route_timeout=route_budget(name, route_timeout),
+                            )
                             for name, path in tool_specs
                         ),
                         return_exceptions=True,
@@ -305,7 +318,10 @@ class LocalAIToolsClient:
                             call_tool(
                                 tool_specs[index][0],
                                 tool_specs[index][1],
-                                route_timeout=retry_timeout,
+                                route_timeout=route_budget(
+                                    tool_specs[index][0],
+                                    retry_timeout,
+                                ),
                             )
                             for index in retry_indexes
                         ),
@@ -342,6 +358,15 @@ class LocalAIToolsClient:
             "max_concurrent_batches": _MAX_CONCURRENT_INFERENCE_BATCHES,
             "batch_budget_policy": "shared_batch_deadline_concurrent_routes",
             "batch_budget_seconds": round(request_timeout, 3),
+            "optional_route_budget_seconds": {
+                "sentiment_analysis": round(
+                    min(
+                        request_timeout,
+                        _OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS,
+                    ),
+                    3,
+                )
+            },
             "queue_wait_seconds": round(queue_wait_seconds, 4),
         }
         if http_connection_reset:
@@ -383,7 +408,15 @@ class LocalAIToolsClient:
                 isinstance(item, dict) and item.get("http_connection_reset") is True
                 for item in results
             )
-            if not http_connection_reset:
+            # A heavyweight optional sentiment shadow can time out while the
+            # HTTP connection is healthy. Resetting the shared client in that
+            # case adds churn and can delay the core routes on the next round.
+            reset_candidate_tools = [
+                name
+                for name in soft_timeout_tools
+                if name != "sentiment_analysis"
+            ]
+            if not http_connection_reset and reset_candidate_tools:
                 http_connection_reset = await self._reset_http_client()
             data["http_connection_reset"] = http_connection_reset
         if errors:

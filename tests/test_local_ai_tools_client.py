@@ -139,17 +139,56 @@ async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_rou
     assert result["status"] == "completed"
     assert len(timeouts) == 3
     assert all(timeout is not None and 0 < timeout <= 8.0 for timeout in timeouts)
-    assert len(set(timeouts)) == 1
+    assert len({timeout for timeout in timeouts if timeout > 5.0}) == 1
     assert 7.5 < timeouts[0] <= 8.0
+    assert timeouts[1] <= 5.0
+    assert 7.5 < timeouts[2] <= 8.0
     assert result["execution_mode"] == "concurrent_routes_bounded_batches"
     assert result["max_concurrent_batches"] == 2
     assert result["batch_budget_policy"] == (
         "shared_batch_deadline_concurrent_routes"
     )
     assert result["batch_budget_seconds"] == 8.0
+    assert result["optional_route_budget_seconds"] == {"sentiment_analysis": 5.0}
     assert result["profit_prediction"]["duration_sec"] > 0
     assert result["time_series_prediction"]["duration_sec"] > 0
     assert result["sentiment_analysis"]["duration_sec"] > 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_optional_sentiment_timeout_keeps_core_routes(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_timeout_seconds", 0.5)
+    monkeypatch.setattr(
+        local_ai_tools_client_module,
+        "_OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    client = LocalAIToolsClient()
+
+    async def post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        del payload, request_timeout
+        if path == "/sentiment/deep/analyze":
+            await asyncio.sleep(1.0)
+        return {"available": True, "path": path, "best_side": "long"}
+
+    monkeypatch.setattr(client, "_post", post)
+    started = monotonic()
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+
+    assert monotonic() - started < 0.4
+    assert result["status"] == "partial"
+    assert result["profit_prediction"]["available"] is True
+    assert result["time_series_prediction"]["available"] is True
+    assert result["sentiment_analysis"]["status"] == "timeout"
+    assert result["soft_timeout_tools"] == ["sentiment_analysis"]
+    assert result["http_connection_reset"] is False
 
 
 @pytest.mark.asyncio
