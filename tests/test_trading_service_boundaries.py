@@ -5956,9 +5956,64 @@ def test_market_symbol_context_and_model_budgets_are_independent(
     monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
-    assert service.market_symbol_context_timeout_seconds() == pytest.approx(16.25)
+    assert service.market_symbol_context_timeout_seconds() == pytest.approx(10.25)
     assert service.market_model_inference_timeout_seconds() == pytest.approx(105.0)
-    assert service.market_symbol_total_budget_seconds() == pytest.approx(121.25)
+    assert service.market_symbol_total_budget_seconds() == pytest.approx(115.25)
+
+
+@pytest.mark.asyncio
+async def test_market_quant_sources_start_concurrently_without_cross_source_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    local_tools_started = asyncio.Event()
+
+    async def memory_context(_symbol: str) -> dict[str, Any]:
+        return {"memory_feedback": {"status": "ok"}}
+
+    async def local_ml_context(
+        _fv: Any,
+        *,
+        lock_wait_seconds: float,
+        remaining_seconds_at_start: float,
+        timings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        del lock_wait_seconds, remaining_seconds_at_start, timings
+        await asyncio.wait_for(local_tools_started.wait(), timeout=0.5)
+        return {"available": True, "source": "local_ml"}
+
+    async def local_tools_context(
+        _fv: Any,
+        ml_signal: dict[str, Any] | None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        assert ml_signal is None
+        local_tools_started.set()
+        return {"status": "completed", "source": "local_ai_tools"}
+
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
+    monkeypatch.setattr(service, "_memory_context_with_vector_feedback", memory_context)
+    monkeypatch.setattr(service, "_market_local_ml_context_value", local_ml_context)
+    monkeypatch.setattr(service, "_local_ai_tools_context", local_tools_context)
+    now = asyncio.get_running_loop().time()
+
+    memory, local_ml, local_tools = await service._market_independent_quant_contexts(
+        symbol="BTC/USDT",
+        fv=SimpleNamespace(symbol="BTC/USDT"),
+        open_positions=[],
+        context_deadline_monotonic=now + 2.0,
+        market_ai_deadline_monotonic=now + 10.0,
+        timings=[],
+    )
+
+    assert memory["memory_feedback"]["status"] == "ok"
+    assert local_ml["source"] == "local_ml"
+    assert local_tools["source"] == "local_ai_tools"
 
 
 def test_market_model_budget_covers_live_batch_failure_and_independent_retry(

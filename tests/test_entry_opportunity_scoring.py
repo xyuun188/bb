@@ -448,7 +448,7 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     assert "paper_bootstrap_canary" not in decision.raw_response
 
 
-def test_model_blueprint_blocks_unauthorized_short_candidate() -> None:
+def test_model_blueprint_blocks_owned_short_but_not_independent_server_candidate() -> None:
     decision = _decision()
     decision.action = Action.SHORT
     decision.raw_response["ml_signal"] = _paper_payload(
@@ -474,12 +474,21 @@ def test_model_blueprint_blocks_unauthorized_short_candidate() -> None:
     score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
 
     opportunity = decision.raw_response["opportunity_score"]
-    assert isinf(score) and score < 0
-    assert opportunity["decision_eligible"] is False
-    assert opportunity["paper_eligible"] is False
-    assert opportunity["expected_net_breakdown"]["components"][0][
-        "eligibility_reason"
-    ] == "direction_not_authorized_by_model_blueprint"
+    assert not isinf(score)
+    assert opportunity["decision_eligible"] is True
+    assert opportunity["paper_eligible"] is True
+    components = {
+        item["key"]: item
+        for item in opportunity["expected_net_breakdown"]["components"]
+    }
+    assert components["local_ml"]["decision_eligible"] is False
+    assert components["local_ml"]["eligibility_reason"] == (
+        "direction_not_authorized_by_model_blueprint"
+    )
+    assert components["server_profit"]["decision_eligible"] is True
+    assert components["server_profit"]["model_strategy_side_authorization"][
+        "enforced"
+    ] is False
 
 
 def _paper_payload(*, side: str, long_return: float, short_return: float) -> dict:

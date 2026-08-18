@@ -1338,15 +1338,108 @@ class TradingService:
             max(
                 MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
                 MARKET_LOCAL_ML_CONTEXT_ESTIMATE_SECONDS,
+                local_tools_timeout + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS,
             )
-            + local_tools_timeout
-            + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
             + MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS
         )
         return round(
             min(max(requested, 1.0), MARKET_SYMBOL_CONTEXT_MAX_SECONDS),
             3,
         )
+
+    async def _market_independent_quant_contexts(
+        self,
+        *,
+        symbol: str,
+        fv: Any,
+        open_positions: list[dict[str, Any]],
+        context_deadline_monotonic: float,
+        market_ai_deadline_monotonic: float,
+        timings: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Fetch independent quant sources concurrently before combining them."""
+
+        loop = asyncio.get_running_loop()
+        started_monotonic = loop.time()
+        remaining_context_seconds = max(
+            context_deadline_monotonic - started_monotonic,
+            0.0,
+        )
+        ml_lock_wait_seconds = min(
+            MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS,
+            max(
+                remaining_context_seconds - MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS,
+                0.0,
+            ),
+        )
+        remaining_round_context_seconds = max(
+            market_ai_deadline_monotonic
+            - started_monotonic
+            - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            0.0,
+        )
+        local_tools_timeout_seconds = min(
+            max(float(settings.local_ai_tools_timeout_seconds or 0.0), 0.0),
+            remaining_round_context_seconds,
+        )
+        local_tools_deadline_monotonic = min(
+            context_deadline_monotonic,
+            max(
+                market_ai_deadline_monotonic - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+                started_monotonic,
+            ),
+        )
+
+        # The Phase 3 quant API owns independent models and does not consume the
+        # local ML payload. Both sources are combined after they finish, so a
+        # slow local model cannot spend the remote inference budget first.
+        memory_context, ml_signal_context, local_ai_tools_context = await asyncio.gather(
+            self._bounded_market_context_value(
+                "memory_vector_context",
+                self._memory_context_with_vector_feedback(symbol),
+                {
+                    "memory_feedback": {
+                        "status": "analysis_budget_deferred",
+                        "production_permission": False,
+                    }
+                },
+                deadline_monotonic=context_deadline_monotonic,
+                timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
+                timings=timings,
+            ),
+            self._market_local_ml_context_value(
+                fv,
+                lock_wait_seconds=ml_lock_wait_seconds,
+                remaining_seconds_at_start=remaining_context_seconds,
+                timings=timings,
+            ),
+            self._bounded_market_context_value(
+                "local_ai_tools_context",
+                self._local_ai_tools_context(
+                    fv,
+                    None,
+                    open_positions=open_positions,
+                    include_exit_advice=False,
+                ),
+                {
+                    "enabled": bool(settings.local_ai_tools_enabled),
+                    "status": "analysis_budget_deferred",
+                    "production_permission": False,
+                },
+                deadline_monotonic=local_tools_deadline_monotonic,
+                timeout_seconds=(
+                    local_tools_timeout_seconds + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
+                ),
+                timings=timings,
+                timeout_fallback={
+                    "enabled": bool(settings.local_ai_tools_enabled),
+                    "status": "timeout",
+                    "reason": "local_ai_tools_context_timeout",
+                    "production_permission": False,
+                },
+            ),
+        )
+        return memory_context, ml_signal_context, local_ai_tools_context
 
     def market_model_inference_timeout_seconds(self) -> float:
         """Return enough time for the configured expert execution strategy.
@@ -8816,85 +8909,17 @@ class TradingService:
                 )
                 market_analysis_progress["symbol_timeout_isolated"] = True
                 market_context_timings: list[dict[str, Any]] = []
-                ml_started_monotonic = asyncio.get_running_loop().time()
-                ml_remaining_seconds = max(
-                    context_deadline_monotonic - ml_started_monotonic,
-                    0.0,
-                )
-                ml_lock_wait_seconds = min(
-                    MARKET_LOCAL_ML_QUEUE_TIMEOUT_SECONDS,
-                    max(
-                        ml_remaining_seconds - MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS,
-                        0.0,
-                    ),
-                )
-
-                memory_context, ml_signal_context = await asyncio.gather(
-                    self._bounded_market_context_value(
-                        "memory_vector_context",
-                        self._memory_context_with_vector_feedback(symbol),
-                        {
-                            "memory_feedback": {
-                                "status": "analysis_budget_deferred",
-                                "production_permission": False,
-                            }
-                        },
-                        deadline_monotonic=context_deadline_monotonic,
-                        timeout_seconds=MARKET_MEMORY_CONTEXT_TIMEOUT_SECONDS,
-                        timings=market_context_timings,
-                    ),
-                    self._market_local_ml_context_value(
-                        fv,
-                        lock_wait_seconds=ml_lock_wait_seconds,
-                        remaining_seconds_at_start=ml_remaining_seconds,
-                        timings=market_context_timings,
-                    ),
-                )
-                remaining_round_context_seconds = max(
-                    market_ai_deadline_monotonic
-                    - asyncio.get_running_loop().time()
-                    - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
-                    0.0,
-                )
-                local_tools_timeout_seconds = min(
-                    max(
-                        float(settings.local_ai_tools_timeout_seconds or 0.0),
-                        0.0,
-                    ),
-                    remaining_round_context_seconds,
-                )
-                local_tools_stage_timeout_seconds = (
-                    local_tools_timeout_seconds + MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS
-                )
-                local_tools_deadline_monotonic = min(
-                    context_deadline_monotonic,
-                    max(
-                        market_ai_deadline_monotonic - MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
-                        asyncio.get_running_loop().time(),
-                    ),
-                )
-                local_ai_tools_context = await self._bounded_market_context_value(
-                    "local_ai_tools_context",
-                    self._local_ai_tools_context(
-                        fv,
-                        ml_signal_context,
-                        open_positions=open_positions,
-                        include_exit_advice=False,
-                    ),
-                    {
-                        "enabled": bool(settings.local_ai_tools_enabled),
-                        "status": "analysis_budget_deferred",
-                        "production_permission": False,
-                    },
-                    deadline_monotonic=local_tools_deadline_monotonic,
-                    timeout_seconds=local_tools_stage_timeout_seconds,
+                (
+                    memory_context,
+                    ml_signal_context,
+                    local_ai_tools_context,
+                ) = await self._market_independent_quant_contexts(
+                    symbol=symbol,
+                    fv=fv,
+                    open_positions=open_positions,
+                    context_deadline_monotonic=context_deadline_monotonic,
+                    market_ai_deadline_monotonic=market_ai_deadline_monotonic,
                     timings=market_context_timings,
-                    timeout_fallback={
-                        "enabled": bool(settings.local_ai_tools_enabled),
-                        "status": "timeout",
-                        "reason": "local_ai_tools_context_timeout",
-                        "production_permission": False,
-                    },
                 )
                 direction_competition_context = self._direction_competition_context(
                     fv,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -456,6 +457,34 @@ def test_local_ai_tools_loaded_bundle_forces_single_worker_inference(
     assert loaded is not None
     assert all(loaded[name].n_jobs == 1 for name in estimator_names)
     assert loaded["horizon_models"][10]["long_model"].n_jobs == 1
+
+
+def test_specialist_cache_lock_cannot_block_live_bundle_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_cache_lock_isolation_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_specialist_loader() -> str:
+        started.set()
+        assert release.wait(timeout=2.0)
+        return "specialist"
+
+    worker = threading.Thread(
+        target=lambda: module._cache_get_or_load("slow", slow_specialist_loader),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=2.0)
+    monkeypatch.setattr(module, "_load_bundle_unlocked", lambda: {"live": True})
+
+    assert module.load_bundle() == {"live": True}
+    release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert module._BUNDLE_CACHE_LOCK is not module._SPECIALIST_MODEL_CACHE_LOCK
 
 
 def test_text_sentiment_training_uses_available_distribution_without_fixed_sample_gate() -> None:
@@ -3260,6 +3289,13 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert "Environment=BB_PHASE3_ROOT=/data/BB" in service
     assert "Environment=PHASE3_QUANT_API_PORT=8101" in service
     assert "Environment=LOCAL_AI_TOOLS_MODEL_DIR=/data/BB/models/local_ai_tools" in service
+    assert "Environment=LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS=1" in service
+    assert "Environment=LOCAL_AI_TOOLS_SPECIALIST_NUM_THREADS=1" in service
+    assert "Environment=OMP_NUM_THREADS=1" in service
+    assert "Environment=MKL_NUM_THREADS=1" in service
+    assert "Environment=OPENBLAS_NUM_THREADS=1" in service
+    assert "Environment=NUMEXPR_NUM_THREADS=1" in service
+    assert "Environment=TOKENIZERS_PARALLELISM=false" in service
     assert "EnvironmentFile=-/data/BB/env/phase3.env" in service
     assert "--host 127.0.0.1 --port 8101" in service
     assert "KillMode=mixed" in service

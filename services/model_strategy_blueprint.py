@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-27.paper-live-permission.v3"
+MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE = "local_ml"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -172,19 +173,20 @@ def model_strategy_side_authorization(
     *,
     execution_scope: str,
     side: str,
+    source: str = MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE,
 ) -> dict[str, Any]:
-    """Resolve the trained model blueprint as the directional authority.
+    """Resolve the trained model blueprint for the source that owns it.
 
-    Legacy or server-only signals may not carry a blueprint. In that case this
-    policy is not enforced and the source's own governance remains authoritative.
-    Once a blueprint is present, however, every model source must respect its
-    execution scope and eligible sides.
+    The local profit-quality blueprint governs only ``local_ml``. Independent
+    server models retain their own artifact, return-distribution, and execution
+    governance; one model artifact must never suppress another model family.
     """
 
     model_signal = _safe_dict(signal)
     blueprint = _safe_dict(model_signal.get("strategy_blueprint"))
     normalized_scope = "paper" if str(execution_scope).lower() == "paper" else "live"
     normalized_side = str(side or "").lower()
+    normalized_source = str(source or "").strip().lower()
     eligible_sides = sorted(
         {
             str(value).lower()
@@ -201,7 +203,17 @@ def model_strategy_side_authorization(
         "eligible_sides": eligible_sides,
         "blueprint_version": blueprint.get("version"),
         "model_version": blueprint.get("model_version"),
+        "source": normalized_source,
+        "owner_source": MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE,
+        "authority_scope": "model_source",
     }
+    if normalized_source != MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE:
+        return {
+            **result,
+            "enforced": False,
+            "eligible": True,
+            "reason": "independent_model_source_uses_own_governance",
+        }
     if not blueprint:
         return result
     if blueprint.get("authority_available") is False:

@@ -381,20 +381,36 @@ class EntryDirectionCompetitionPolicy:
             ),
             execution_scope=execution_scope,
         )
-        direction_authorization = {
-            side: model_strategy_side_authorization(
-                ml_signal_context,
-                execution_scope=execution_scope,
-                side=side,
-            )
-            for side in ("long", "short")
+        evidence_sources = sorted(
+            {
+                str(item.get("source") or "")
+                for side in ("long", "short")
+                for item in evidence[side]
+                if str(item.get("source") or "")
+            }
+        )
+        source_authorization = {
+            source: {
+                side: model_strategy_side_authorization(
+                    ml_signal_context,
+                    execution_scope=execution_scope,
+                    side=side,
+                    source=source,
+                )
+                for side in ("long", "short")
+            }
+            for source in evidence_sources
         }
+        direction_authorization = source_authorization.get("local_ml", {})
         for side in ("long", "short"):
-            authorization = direction_authorization[side]
-            if authorization.get("enforced") is not True:
-                continue
             for item in evidence[side]:
+                source = str(item.get("source") or "")
+                authorization = _safe_dict(
+                    _safe_dict(source_authorization.get(source)).get(side)
+                )
                 item["model_strategy_side_authorization"] = authorization
+                if authorization.get("enforced") is not True:
+                    continue
                 if authorization.get("eligible") is True:
                     continue
                 # Keep otherwise-valid evidence as a counterfactual baseline.
@@ -542,6 +558,7 @@ class EntryDirectionCompetitionPolicy:
             "production_source_count": production_source_count,
             "production_permission": False,
             "model_strategy_direction_authorization": direction_authorization,
+            "model_strategy_source_authorization": source_authorization,
             "funding_projection": funding_projection,
             "policy": "execution_scoped_gross_market_observation_only_no_fixed_gap",
             "aggregate_blockers": aggregate_blockers,
@@ -558,7 +575,7 @@ class EntryDirectionCompetitionPolicy:
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-08-13.native-horizon-direction-observation.v5",
+                "strategy_version": "2026-08-18.source-owned-direction-observation.v6",
                 "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }

@@ -194,7 +194,8 @@ _CURRENT_MODEL_MTIME_NS: int | None = None
 _CURRENT_MODEL_PATH: Path | None = None
 _STATUS_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
 _TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
-_MODEL_CACHE_LOCK = threading.RLock()
+_BUNDLE_CACHE_LOCK = threading.RLock()
+_SPECIALIST_MODEL_CACHE_LOCK = threading.RLock()
 _SHADOW_EXECUTOR: ThreadPoolExecutor | None = None
 _SHADOW_EXECUTOR_LOCK = threading.RLock()
 _SHADOW_INFLIGHT: dict[str, Future] = {}
@@ -208,11 +209,15 @@ _SHADOW_FAILURE_TTL_SECONDS = max(
     2.0,
 )
 _SHADOW_EXECUTOR_MAX_WORKERS = max(
-    int(os.environ.get("LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS", "2")),
+    int(os.environ.get("LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS", "1")),
     1,
 )
 _SHADOW_MAX_INFLIGHT = _SHADOW_EXECUTOR_MAX_WORKERS * 2
 _SHADOW_MAX_CACHE_ENTRIES = 256
+_SPECIALIST_NUM_THREADS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SPECIALIST_NUM_THREADS", "1")),
+    1,
+)
 _TRAIN_LOCK = threading.Lock()
 _TRAIN_EXECUTOR_LOCK = threading.Lock()
 _TRAIN_EXECUTOR: ProcessPoolExecutor | None = None
@@ -327,16 +332,35 @@ def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
 
 
 def _cache_get_or_load(key: str, loader):
-    with _MODEL_CACHE_LOCK:
+    """Load one heavyweight specialist without blocking the live bundle."""
+
+    with _SPECIALIST_MODEL_CACHE_LOCK:
         if key not in _TRANSFORMER_MODEL_CACHE:
             _TRANSFORMER_MODEL_CACHE[key] = loader()
         return _TRANSFORMER_MODEL_CACHE[key]
+
+
+def _configure_specialist_runtime() -> None:
+    """Keep observation-only transformer work from starving real-time routes."""
+
+    try:
+        import torch
+
+        torch.set_num_threads(_SPECIALIST_NUM_THREADS)
+        try:
+            torch.set_num_interop_threads(_SPECIALIST_NUM_THREADS)
+        except RuntimeError:
+            # PyTorch only permits changing inter-op threads before work starts.
+            pass
+    except Exception:
+        pass
 
 
 def _shadow_executor() -> ThreadPoolExecutor:
     global _SHADOW_EXECUTOR
     with _SHADOW_EXECUTOR_LOCK:
         if _SHADOW_EXECUTOR is None:
+            _configure_specialist_runtime()
             _SHADOW_EXECUTOR = ThreadPoolExecutor(max_workers=_SHADOW_EXECUTOR_MAX_WORKERS, thread_name_prefix="phase3-shadow")
         return _SHADOW_EXECUTOR
 
@@ -2329,7 +2353,7 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
 def load_bundle() -> dict[str, Any] | None:
     """Load one verified artifact once when concurrent inference starts."""
 
-    with _MODEL_CACHE_LOCK:
+    with _BUNDLE_CACHE_LOCK:
         return _load_bundle_unlocked()
 
 
@@ -6728,6 +6752,13 @@ def render_phase3_quant_api_service() -> str:
             Environment=BB_PHASE3_ROOT={PHASE3_ROOT}
             Environment=PHASE3_QUANT_API_PORT={PHASE3_API_PORT}
             Environment=LOCAL_AI_TOOLS_MODEL_DIR={PHASE3_MODEL_DIR}
+            Environment=LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS=1
+            Environment=LOCAL_AI_TOOLS_SPECIALIST_NUM_THREADS=1
+            Environment=OMP_NUM_THREADS=1
+            Environment=MKL_NUM_THREADS=1
+            Environment=OPENBLAS_NUM_THREADS=1
+            Environment=NUMEXPR_NUM_THREADS=1
+            Environment=TOKENIZERS_PARALLELISM=false
             Environment=LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK=true
             Environment=LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS=true
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001

@@ -416,7 +416,7 @@ def test_unavailable_local_ml_horizon_does_not_hide_native_tool_cohort() -> None
     assert context["aggregate_blockers"] == []
 
 
-def test_model_blueprint_authority_blocks_unauthorized_short_observation() -> None:
+def test_model_blueprint_only_blocks_its_owned_local_ml_short() -> None:
     signal = _paper_payload(0.1, 0.2)
     signal["strategy_blueprint"] = {
         "version": "blueprint-v1",
@@ -435,18 +435,25 @@ def test_model_blueprint_authority_blocks_unauthorized_short_observation() -> No
         strategy={"execution_mode": "paper"},
     )
 
-    assert context["preferred_side"] == "long"
+    assert context["preferred_side"] == "short"
     assert context["model_strategy_direction_authorization"]["short"][
         "reason"
     ] == "direction_not_authorized_by_model_blueprint"
     short_evidence = context["short"]["evidence"]
     assert short_evidence
-    assert all(item["decision_eligible"] is False for item in short_evidence)
-    assert all(item["paper_eligible"] is False for item in short_evidence)
-    assert all(item["observation_only"] is True for item in short_evidence)
+    local_ml = next(item for item in short_evidence if item["source"] == "local_ml")
+    server_profit = next(
+        item for item in short_evidence if item["source"] == "server_profit"
+    )
+    assert local_ml["decision_eligible"] is False
+    assert local_ml["paper_eligible"] is False
+    assert local_ml["observation_only"] is True
+    assert server_profit["decision_eligible"] is True
+    assert server_profit["paper_eligible"] is True
+    assert server_profit["model_strategy_side_authorization"]["enforced"] is False
 
 
-def test_model_blueprint_still_blocks_short_when_current_local_ml_signal_is_unavailable() -> None:
+def test_model_blueprint_does_not_block_independent_timeseries_when_local_ml_is_unavailable() -> None:
     signal = {
         "available": False,
         "status": "analysis_budget_deferred",
@@ -466,17 +473,21 @@ def test_model_blueprint_still_blocks_short_when_current_local_ml_signal_is_unav
         strategy={"execution_mode": "paper"},
     )
 
-    assert context["preferred_side"] == "long"
+    assert context["preferred_side"] == "short"
     assert context["model_strategy_direction_authorization"]["short"][
         "reason"
     ] == "direction_not_authorized_by_model_blueprint"
     short_evidence = context["short"]["evidence"]
     assert short_evidence
-    assert all(item["decision_eligible"] is False for item in short_evidence)
-    assert all(item["paper_eligible"] is False for item in short_evidence)
+    timeseries = next(
+        item for item in short_evidence if item["source"] == "timeseries"
+    )
+    assert timeseries["decision_eligible"] is True
+    assert timeseries["paper_eligible"] is True
+    assert timeseries["model_strategy_side_authorization"]["enforced"] is False
 
 
-def test_unavailable_blueprint_authority_fails_closed_for_every_side() -> None:
+def test_unavailable_blueprint_authority_does_not_claim_independent_tool_ownership() -> None:
     signal = {
         "available": False,
         "strategy_blueprint": {
@@ -494,15 +505,18 @@ def test_unavailable_blueprint_authority_fails_closed_for_every_side() -> None:
         strategy={"execution_mode": "paper"},
     )
 
-    assert context["preferred_side"] == "neutral"
+    assert context["preferred_side"] == "short"
     for side in ("long", "short"):
         assert context["model_strategy_direction_authorization"][side][
             "reason"
         ] == "model_strategy_blueprint_authority_unavailable"
-        assert all(
-            item["decision_eligible"] is False
+        timeseries = next(
+            item
             for item in context[side]["evidence"]
+            if item["source"] == "timeseries"
         )
+        assert timeseries["decision_eligible"] is True
+        assert timeseries["model_strategy_side_authorization"]["enforced"] is False
 
 
 def test_authorized_long_can_compare_against_unauthorized_short_observation() -> None:

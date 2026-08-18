@@ -126,6 +126,7 @@ class EntryOpportunityScoringPolicy:
             signal,
             execution_scope=execution_scope,
             side=side,
+            source="local_ml",
         )
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
@@ -382,11 +383,16 @@ class EntryOpportunityScoringPolicy:
         side = "long" if decision.action == Action.LONG else "short"
         execution_scope = _execution_scope(strategy)
         raw = safe_dict(decision.raw_response)
-        model_direction_authorization = model_strategy_side_authorization(
-            safe_dict(raw.get("ml_signal")),
-            execution_scope=execution_scope,
-            side=side,
-        )
+        model_signal = safe_dict(raw.get("ml_signal"))
+        model_direction_authorizations = {
+            source: model_strategy_side_authorization(
+                model_signal,
+                execution_scope=execution_scope,
+                side=side,
+                source=source,
+            )
+            for source in ("server_profit", "timeseries")
+        }
         execution_cost = execution_cost_estimate(
             decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
         )
@@ -409,7 +415,9 @@ class EntryOpportunityScoringPolicy:
                     "profit",
                 ),
                 strategy=strategy,
-                direction_authorization=model_direction_authorization,
+                direction_authorization=model_direction_authorizations[
+                    "server_profit"
+                ],
             ),
             self._server_component(
                 raw,
@@ -423,7 +431,7 @@ class EntryOpportunityScoringPolicy:
                     "time_series",
                 ),
                 strategy=strategy,
-                direction_authorization=model_direction_authorization,
+                direction_authorization=model_direction_authorizations["timeseries"],
             ),
         ]
         selected_components = [
