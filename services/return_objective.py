@@ -286,6 +286,7 @@ def _combine_execution_return_distribution(
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
     current_adverse_funding_cost_pct: Any = 0.0,
+    current_funding_cashflow_pct: Any = None,
 ) -> dict[str, Any]:
     """Combine governed market distributions under an explicit execution scope."""
 
@@ -495,12 +496,17 @@ def _combine_execution_return_distribution(
     live_cost = safe_float(live_execution_cost_pct, None)
     live_slippage = safe_float(live_slippage_pct, None)
     adverse_funding_cost = safe_float(current_adverse_funding_cost_pct, None)
+    funding_cashflow = safe_float(current_funding_cashflow_pct, None)
+    if funding_cashflow is None and adverse_funding_cost is not None:
+        funding_cashflow = -adverse_funding_cost
     if live_cost is None or live_cost < 0:
         blockers.append("live_execution_cost_distribution_missing")
     if live_scope and (live_slippage is None or live_slippage < 0):
         blockers.append("live_execution_cost_distribution_missing")
     if adverse_funding_cost is None or adverse_funding_cost < 0:
         blockers.append("current_adverse_funding_cost_invalid")
+    if funding_cashflow is None:
+        blockers.append("current_funding_cashflow_invalid")
     authoritative_slippage_upper = max(slippage_upper_values) if slippage_upper_values else None
     slippage_tail_excess = (
         authoritative_slippage_upper - live_slippage
@@ -513,18 +519,18 @@ def _combine_execution_return_distribution(
     ) if live_scope else 0.0
 
     net_expected = (
-        gross_expected - live_cost - adverse_funding_cost - slippage_tail_excess
+        gross_expected + funding_cashflow - live_cost - slippage_tail_excess
         if gross_expected is not None
         and live_cost is not None
-        and adverse_funding_cost is not None
+        and funding_cashflow is not None
         and slippage_tail_excess is not None
         else None
     )
     net_median = (
-        gross_median - live_cost - adverse_funding_cost - slippage_tail_excess
+        gross_median + funding_cashflow - live_cost - slippage_tail_excess
         if gross_median is not None
         and live_cost is not None
-        and adverse_funding_cost is not None
+        and funding_cashflow is not None
         and slippage_tail_excess is not None
         else None
     )
@@ -549,14 +555,14 @@ def _combine_execution_return_distribution(
         max(
             float(weighted_mean(gross_upper_values))
             - live_cost
-            - adverse_funding_cost
+            + funding_cashflow
             - slippage_tail_excess,
             net_median if net_median is not None else float("-inf"),
             net_expected if net_expected is not None else float("-inf"),
         )
         if gross_upper_values
         and live_cost is not None
-        and adverse_funding_cost is not None
+        and funding_cashflow is not None
         and slippage_tail_excess is not None
         else None
     )
@@ -608,12 +614,13 @@ def _combine_execution_return_distribution(
     }
     contract["transformations"] = {
         "formula": (
-            "gross_market_expected-live_execution_cost-current_adverse_funding_cost-authoritative_slippage_tail_excess"
+            "gross_market_expected+current_funding_cashflow-live_execution_cost-authoritative_slippage_tail_excess"
             if live_scope
-            else "gross_market_expected-current_execution_cost-current_adverse_funding_cost"
+            else "gross_market_expected+current_funding_cashflow-current_execution_cost"
         ),
         "live_execution_cost_pct": live_cost,
         "current_adverse_funding_cost_pct": adverse_funding_cost,
+        "current_funding_cashflow_pct": funding_cashflow,
         "live_slippage_pct": live_slippage,
         "authoritative_slippage_expected_pct": (
             sum(slippage_expected_values) / len(slippage_expected_values)
@@ -629,9 +636,9 @@ def _combine_execution_return_distribution(
         "actual_trade_calibration_uncertainty_pct": (
             max(actual_uncertainties) if actual_uncertainties else None
         ),
-        "cost_deduction_count": (
-            int(live_cost is not None and slippage_tail_excess is not None)
-            + int(adverse_funding_cost is not None and adverse_funding_cost > 0.0)
+            "cost_deduction_count": (
+                int(live_cost is not None and slippage_tail_excess is not None)
+            + int(funding_cashflow is not None and funding_cashflow < 0.0)
         ),
     }
     if requested_weights is not None:
@@ -665,6 +672,7 @@ def combine_production_return_distribution(
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
     current_adverse_funding_cost_pct: Any = 0.0,
+    current_funding_cashflow_pct: Any = None,
 ) -> dict[str, Any]:
     """Build the fee-after live distribution with production evidence gates."""
 
@@ -681,6 +689,7 @@ def combine_production_return_distribution(
         input_blockers=input_blockers,
         model_weights=model_weights,
         current_adverse_funding_cost_pct=current_adverse_funding_cost_pct,
+        current_funding_cashflow_pct=current_funding_cashflow_pct,
     )
 
 
@@ -695,6 +704,7 @@ def combine_paper_return_distribution(
     input_blockers: Iterable[str] = (),
     model_weights: Iterable[Any] | None = None,
     current_adverse_funding_cost_pct: Any = 0.0,
+    current_funding_cashflow_pct: Any = None,
 ) -> dict[str, Any]:
     """Build a paper decision distribution without live promotion evidence."""
 
@@ -711,6 +721,7 @@ def combine_paper_return_distribution(
         input_blockers=input_blockers,
         model_weights=model_weights,
         current_adverse_funding_cost_pct=current_adverse_funding_cost_pct,
+        current_funding_cashflow_pct=current_funding_cashflow_pct,
     )
 
 

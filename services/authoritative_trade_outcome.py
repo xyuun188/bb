@@ -26,11 +26,16 @@ from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
 from db.session import get_read_session_ctx
+from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.trade import Order, Position
 from services.okx_position_history_store import load_okx_position_history_records
-from services.okx_training_facts import build_okx_history_training_sample
+from services.okx_training_facts import (
+    REALIZED_NET_PNL_FORMULA,
+    build_funding_bill_lifecycle_facts,
+    build_okx_history_training_sample,
+)
 from services.profit_training_contract import (
     PROFIT_TRAINING_TARGET,
     validate_profit_training_sample,
@@ -163,6 +168,46 @@ def _profit_label_contract(
     notional = _safe_float(sample.get("notional"), None)
     realized_pnl = _safe_float(sample.get("realized_pnl"), None)
     net_return = _safe_float(sample.get(PROFIT_TRAINING_TARGET), None)
+    gross_pnl = _safe_float(sample.get("gross_pnl"), None)
+    entry_fee = _safe_float(sample.get("entry_fee"), None)
+    close_fee = _safe_float(sample.get("close_fee"), None)
+    funding_fee = _safe_float(sample.get("funding_fee"), None)
+    liquidation_penalty = _safe_float(sample.get("liquidation_penalty"), 0.0)
+    official_fee_signed = _safe_float(sample.get("official_fee_signed"), None)
+    if official_fee_signed is None and entry_fee is not None and close_fee is not None:
+        official_fee_signed = -(entry_fee + close_fee)
+    components = _safe_dict(sample.get("realized_net_pnl_components"))
+    if (
+        not components
+        and gross_pnl is not None
+        and official_fee_signed is not None
+        and funding_fee is not None
+        and liquidation_penalty is not None
+    ):
+        components_total = (
+            gross_pnl + official_fee_signed + funding_fee + liquidation_penalty
+        )
+        components = {
+            "gross_pnl_usdt": gross_pnl,
+            "official_fee_signed_usdt": official_fee_signed,
+            "funding_fee_usdt": funding_fee,
+            "liquidation_penalty_usdt": liquidation_penalty,
+            "components_total_usdt": components_total,
+            "reported_realized_net_pnl_usdt": realized_pnl,
+            "formula_consistent": bool(
+                realized_pnl is not None
+                and math.isclose(
+                    components_total,
+                    realized_pnl,
+                    rel_tol=1e-5,
+                    abs_tol=1e-6,
+                )
+            ),
+        }
+    funding_evidence_status = str(
+        sample.get("funding_evidence_status")
+        or ("verified_position_history" if not evidence_gaps else "unavailable")
+    )
     payload = {
         "version": AUTHORITATIVE_TRADE_LABEL_VERSION,
         "label_name": PROFIT_TRAINING_TARGET,
@@ -176,10 +221,10 @@ def _profit_label_contract(
         "label_timestamp": sample.get("label_timestamp"),
         PROFIT_TRAINING_TARGET: net_return,
         "realized_net_pnl_usdt": realized_pnl,
-        "gross_pnl_usdt": _safe_float(sample.get("gross_pnl"), None),
-        "entry_fee_usdt": _safe_float(sample.get("entry_fee"), None),
-        "close_fee_usdt": _safe_float(sample.get("close_fee"), None),
-        "funding_fee_usdt": _safe_float(sample.get("funding_fee"), None),
+        "gross_pnl_usdt": gross_pnl,
+        "entry_fee_usdt": entry_fee,
+        "close_fee_usdt": close_fee,
+        "funding_fee_usdt": funding_fee,
         "liquidation_penalty_usdt": _safe_float(
             sample.get("liquidation_penalty"), None
         ),
@@ -189,6 +234,20 @@ def _profit_label_contract(
         "entry_fee_source": sample.get("entry_fee_source"),
         "close_fee_source": sample.get("close_fee_source"),
         "funding_fee_source": sample.get("funding_fee_source"),
+        "funding_evidence_status": funding_evidence_status,
+        "funding_fee_to_notional_ratio": _safe_float(
+            sample.get("funding_fee_to_notional_ratio"), None
+        ),
+        "funding_bill_count": int(sample.get("funding_bill_count") or 0),
+        "funding_bill_ids": list(sample.get("funding_bill_ids") or []),
+        "funding_attribution_complete": sample.get(
+            "funding_attribution_complete", not evidence_gaps
+        )
+        is True,
+        "realized_net_pnl_formula": sample.get(
+            "realized_net_pnl_formula", REALIZED_NET_PNL_FORMULA
+        ),
+        "realized_net_pnl_components": components,
         "slippage_source": sample.get("slippage_source"),
         "complete": not evidence_gaps,
         "evidence_gaps": list(evidence_gaps),
@@ -527,6 +586,44 @@ async def load_authoritative_trade_outcomes(
         if requested_result_limit is not None:
             histories = histories[:requested_limit]
 
+        history_inst_ids = {
+            str(history.inst_id or "").strip().upper()
+            for history in histories
+            if str(history.inst_id or "").strip()
+        }
+        history_modes = {
+            "live" if str(history.mode or "").strip().lower() == "live" else "paper"
+            for history in histories
+        }
+        bill_stmt = select(OkxAccountBill)
+        if history_inst_ids:
+            bill_stmt = bill_stmt.where(OkxAccountBill.inst_id.in_(history_inst_ids))
+        if history_modes:
+            bill_stmt = bill_stmt.where(OkxAccountBill.mode.in_(history_modes))
+        lifecycle_windows = [
+            (_as_utc(history.opened_at), _as_utc(history.updated_at_okx))
+            for history in histories
+        ]
+        if lifecycle_windows and all(
+            opened_at is not None
+            and closed_at is not None
+            and closed_at >= opened_at
+            for opened_at, closed_at in lifecycle_windows
+        ):
+            bill_stmt = bill_stmt.where(
+                OkxAccountBill.bill_ts >= min(
+                    opened_at for opened_at, _ in lifecycle_windows if opened_at is not None
+                ),
+                OkxAccountBill.bill_ts <= max(
+                    closed_at for _, closed_at in lifecycle_windows if closed_at is not None
+                ),
+            )
+        account_bills = (
+            list((await session.execute(bill_stmt)).scalars().all())
+            if histories and history_inst_ids
+            else []
+        )
+
         position_ids = {
             int(value)
             for history in histories
@@ -683,6 +780,10 @@ async def load_authoritative_trade_outcomes(
     shadows_by_decision_id: dict[int, list[Any]] = {}
     for row in shadows:
         shadows_by_decision_id.setdefault(int(row.decision_id or 0), []).append(row)
+    funding_bill_facts_by_lifecycle = build_funding_bill_lifecycle_facts(
+        histories,
+        account_bills,
+    )
     results: list[dict[str, Any]] = []
     for history in histories:
         sample = build_okx_history_training_sample(
@@ -692,6 +793,18 @@ async def load_authoritative_trade_outcomes(
             decision_raw_by_order_id=decision_raw_by_order_id,
             decision_feature_by_order_id=decision_feature_by_order_id,
             decision_execution_by_order_id=decision_execution_by_order_id,
+            funding_bill_lifecycle_facts=funding_bill_facts_by_lifecycle.get(
+                str(history.row_identity or ""),
+                {
+                    "mirror_available": True,
+                    "bill_count": 0,
+                    "bill_ids": [],
+                    "signed_funding_fee_usdt": 0.0,
+                    "shared_bill_ids": [],
+                    "attribution_complete": True,
+                    "source": "okx_account_bills",
+                },
+            ),
         )
         reflection = next(
             (

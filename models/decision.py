@@ -42,6 +42,9 @@ class AIDecision(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     analysis_type: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    analysis_idempotency_key: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True
+    )
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True)
     was_executed: Mapped[bool] = mapped_column(Boolean, default=False)
     execution_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

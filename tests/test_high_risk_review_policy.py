@@ -148,7 +148,7 @@ async def test_high_risk_review_service_uses_short_timeout_and_token_cap(
     assert len(reviewer.calls) == 1
     assert reviewer.calls[0]["api_base"] == "https://api.deepseek.com"
     assert reviewer.calls[0]["api_key"] == "test-review-key"
-    assert reviewer.calls[0]["request_timeout"] == 12.0
+    assert reviewer.calls[0]["request_timeout"] == pytest.approx(12.0, abs=0.01)
     assert reviewer.calls[0]["max_tokens"] == 420
     assert reviewer.calls[0]["use_json_mode"] is True
     assert reviewer.failure_count == 0

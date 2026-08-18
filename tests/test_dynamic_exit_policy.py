@@ -261,7 +261,8 @@ def test_trusted_funding_profit_adds_lifecycle_profit_lock_pressure() -> None:
     )
     position["current_management_contract"] = {
         **position["current_management_contract"],
-        "funding_fee_usdt": 10.0,
+            "funding_fee_usdt": 10.0,
+            "settled_funding_fee": 10.0,
         "funding_bill_count": 2,
         "funding_fee_source": "okx_account_bills",
         "funding_evidence_complete": True,
@@ -273,6 +274,11 @@ def test_trusted_funding_profit_adds_lifecycle_profit_lock_pressure() -> None:
 
     assert result.funding_fee_usdt == pytest.approx(10.0)
     assert result.funding_fee_included is True
+    assert result.settled_funding_fee == pytest.approx(10.0)
+    assert result.current_lifecycle_net_pnl > 0.0
+    assert result.projected_hold_net_pnl == pytest.approx(
+        result.current_lifecycle_net_pnl + result.expected_future_funding_cashflow
+    )
     assert result.funding_evidence_eligible is True
     assert result.lifecycle_net_pnl_usdt == pytest.approx(9.0)
     assert result.profit_lock_pressure == pytest.approx(0.45)
@@ -289,7 +295,8 @@ def test_untrusted_funding_is_audited_but_cannot_drive_exit() -> None:
     )
     position["current_management_contract"] = {
         **position["current_management_contract"],
-        "funding_fee_usdt": 2030.93,
+            "funding_fee_usdt": 2030.93,
+            "settled_funding_fee": 2030.93,
         "funding_bill_count": 4,
         "funding_fee_source": "okx_account_bills",
         "funding_evidence_complete": True,
@@ -318,7 +325,8 @@ def test_trusted_adverse_funding_loss_consumes_planned_risk_and_forces_exit() ->
     )
     position["current_management_contract"] = {
         **position["current_management_contract"],
-        "funding_fee_usdt": -25.0,
+            "funding_fee_usdt": -25.0,
+            "settled_funding_fee": -25.0,
         "funding_bill_count": 1,
         "funding_fee_source": "okx_account_bills",
         "funding_evidence_complete": True,
@@ -507,7 +515,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-16.dynamic-exit-funding-risk-budget.v13"
+        "2026-08-17.dynamic-exit-funding-net-pnl.v14"
     )
 
 

@@ -197,6 +197,7 @@ async def init_db(*, migrate_schema: bool = True) -> None:
         await _delete_non_authoritative_expert_memories(conn)
         await _drop_removed_model_performance_snapshots_table(conn)
         await _ensure_ai_decision_model_health_columns(conn)
+        await _ensure_ai_decision_idempotency_column(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_runtime_data_retention_columns(conn)
         await _ensure_trade_fact_indexes(conn)
@@ -656,6 +657,37 @@ async def _ensure_runtime_data_retention_columns(conn: Any) -> None:
                 },
             )
         await conn.execute(text(index_ddl))
+
+
+async def _ensure_ai_decision_idempotency_column(conn: Any) -> None:
+    """Add the durable per-round analysis key used to reject duplicate writes."""
+
+    if "postgresql" in settings.database_url:
+        existing = await _postgres_table_columns(conn, "ai_decisions")
+        if "analysis_idempotency_key" not in existing:
+            await conn.execute(
+                text(
+                    "ALTER TABLE ai_decisions ADD COLUMN "
+                    "analysis_idempotency_key VARCHAR(255)"
+                )
+            )
+    else:
+        result = await conn.execute(text("PRAGMA table_info(ai_decisions)"))
+        existing = {str(row[1]) for row in result.fetchall()}
+        if "analysis_idempotency_key" not in existing:
+            await conn.execute(
+                text(
+                    "ALTER TABLE ai_decisions ADD COLUMN "
+                    "analysis_idempotency_key VARCHAR(255)"
+                )
+            )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_decisions_analysis_idempotency "
+            "ON ai_decisions (analysis_idempotency_key) "
+            "WHERE analysis_idempotency_key IS NOT NULL"
+        )
+    )
 
 
 async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:

@@ -95,7 +95,7 @@ def _legacy_raw_payload(analysis_type: str) -> dict:
         slot for slot in FIXED_AI_MODEL_SLOTS if str(slot.get("name")) != "decision_maker"
     ]
     expert_names = [str(slot["name"]) for slot in expert_slots]
-    return {
+    payload = {
         "analysis_type": analysis_type,
         "opinions": [
             {
@@ -127,6 +127,26 @@ def _legacy_raw_payload(analysis_type: str) -> dict:
             },
         ],
     }
+    if analysis_type == "market":
+        payload["direction_competition"] = {
+            "preferred_side": "short",
+            "long": {"score": 0.2},
+            "short": {"score": 0.4},
+            "funding_projection": {
+                "evidence_complete": True,
+                "long": {"signed_cashflow_pct": -0.1},
+                "short": {"signed_cashflow_pct": 0.1},
+            },
+        }
+    else:
+        payload["dynamic_exit_policy"] = {
+            "settled_funding_fee": 12.5,
+            "expected_future_funding_cashflow": 1.25,
+            "current_lifecycle_net_pnl": 20.0,
+            "projected_hold_net_pnl": 24.0,
+            "funding_fee_included": True,
+        }
+    return payload
 
 
 @pytest.mark.asyncio
@@ -187,6 +207,11 @@ async def test_dashboard_projects_experts_by_analysis_scope_for_legacy_records(
             item["name"] for item in market_record["model_timings"]
         }
         assert market_record["cross_summary"]["total"] == 1
+        assert market_record["cross_summary"]["expected"] == 1
+        assert market_record["direction_competition"]["funding_projection"][
+            "evidence_complete"
+        ] is True
+        assert market_record["dynamic_exit_policy"] == {}
 
         position_response = await dashboard.get_analysis_records(
             decision_id=position_id,
@@ -204,5 +229,8 @@ async def test_dashboard_projects_experts_by_analysis_scope_for_legacy_records(
             item["name"] for item in position_record["model_timings"]
         }
         assert position_record["cross_summary"]["total"] == 2
+        assert position_record["cross_summary"]["expected"] == 2
+        assert position_record["dynamic_exit_policy"]["settled_funding_fee"] == 12.5
+        assert position_record["direction_competition"] == {}
     finally:
         await close_db()

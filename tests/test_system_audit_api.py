@@ -156,6 +156,11 @@ def _patch_specialist_shadow_report_path(
             return getattr(self._wrapped, name)
 
     monkeypatch.setattr(system_audit, "settings", SettingsProxy(system_audit.settings))
+    monkeypatch.setattr(
+        system_audit,
+        "SPECIALIST_SHADOW_EVALUATION_ALT_REL_PATH",
+        str(tmp_path / "missing-specialist-shadow-report.json"),
+    )
 
 
 def _patch_phase3_resume_reports_path(

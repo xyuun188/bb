@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ai_brain.analysis_quality import (
+    build_expert_call_contract,
+    finalize_analysis_quality,
+    usable_expert_opinions,
+)
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.cross_validator import CrossValidator
 from ai_brain.model_registry import ModelRegistry
@@ -100,7 +105,7 @@ class EnsembleCoordinator:
         base_expert_context = self._base_expert_context(context)
         all_attempted: list[str] = []
         all_failures: list[dict[str, Any]] = []
-        opinions, expert_context, expert_timing, model_timings = await self._run_expert_pass(
+        returned_opinions, expert_context, expert_timing, model_timings = await self._run_expert_pass(
             features,
             base_expert_context,
             include_names=self._initial_expert_names(context),
@@ -110,6 +115,8 @@ class EnsembleCoordinator:
         timing_records.append(expert_timing)
         all_attempted.extend(expert_context.get("_attempted_models", []))
         all_failures.extend(expert_context.get("_model_failures", []))
+        quality_contract = expert_context.get("_analysis_quality_contract") or {}
+        opinions = usable_expert_opinions(returned_opinions, quality_contract)
 
         # Market analysis must not let phantom close votes pollute
         # cross-validation. Some local models may still propose close_* even
@@ -118,7 +125,11 @@ class EnsembleCoordinator:
         opinions = self._guard_phantom_exit_opinions(features, context, opinions)
 
         # Step 2/3: requested cross-checks and trend-expert deep consultation.
-        validation_timing: dict[str, Any] = {}
+        validation_timing: dict[str, Any] = {
+            "_analysis_budget_scope": str(
+                context.get("_analysis_budget_scope") or "shared"
+            )
+        }
         cross_validations, consultation = await self.cross_validator.validate_all(
             opinions, validation_timing
         )
@@ -131,6 +142,51 @@ class EnsembleCoordinator:
         combine_started_at = datetime.now(UTC)
         combine_perf_started = time.perf_counter()
         final = self.combine(features, context, opinions, cross_validations, consultation)
+        quality_contract = finalize_analysis_quality(
+            quality_contract,
+            cross_validations,
+            final_action=final.action.value,
+            consultation=consultation,
+        )
+        funding_projection = (
+            context.get("direction_competition", {}).get("funding_projection")
+            if isinstance(context.get("direction_competition"), dict)
+            else None
+        )
+        if (
+            not context.get("review_positions")
+            and isinstance(funding_projection, dict)
+            and funding_projection.get("evidence_complete") is not True
+        ):
+            quality_contract.update(
+                {
+                    "funding_evidence_status": "funding_evidence_unavailable",
+                    "analysis_complete": False,
+                    "decision_eligible": False,
+                    "result": "unclear",
+                    "reason_code": "funding_evidence_unavailable",
+                    "reason": "资金费率、下一结算时间或数据时效证据不完整。",
+                }
+            )
+        elif isinstance(funding_projection, dict):
+            quality_contract["funding_evidence_status"] = "complete"
+        if final.is_entry and not quality_contract.get("decision_eligible"):
+            observed_action = final.action.value
+            raw_observation = (
+                dict(final.raw_response) if isinstance(final.raw_response, dict) else {}
+            )
+            raw_observation["analysis_quality_gate"] = {
+                "blocked": True,
+                "observed_action": observed_action,
+                "reason_code": "insufficient_evidence",
+                "reason": quality_contract.get("reason"),
+            }
+            final = self._hold(
+                features,
+                "专家或交叉验证证据不完整，本轮不允许开仓。",
+                raw_observation,
+            )
+            quality_contract["result"] = "unclear"
         timing_records.append(
             {
                 "stage": "ensemble_rules",
@@ -159,6 +215,7 @@ class EnsembleCoordinator:
             timing_records.append(decision_maker_timing)
         raw["attempted_experts"] = self._unique(all_attempted)
         raw["expert_failures"] = all_failures
+        raw["analysis_quality_contract"] = quality_contract
         raw["model_timings"] = model_timings
         raw["timing_breakdown"] = timing_records
         raw["latency_summary"] = self._latency_summary(timing_records, model_timings)
@@ -224,15 +281,27 @@ class EnsembleCoordinator:
         opinions = await self.registry.decide_all(features, expert_context)
         expert_duration = round(time.perf_counter() - expert_perf_started, 3)
         model_timings = expert_context.get("_model_timings", [])
+        quality_contract = build_expert_call_contract(
+            expected_names=list(include_names or ()),
+            attempted_names=expert_context.get("_attempted_models", []),
+            opinions=opinions,
+            timings=model_timings,
+            failures=expert_context.get("_model_failures", []),
+        )
+        expert_context["_analysis_quality_contract"] = quality_contract
         timing = {
             "stage": stage,
             "label": label,
-            "status": "completed",
+            "status": "completed" if quality_contract["expert_complete"] else "partial",
             "started_at": expert_started_at.isoformat(),
             "duration_sec": expert_duration,
             "attempted": len(expert_context.get("_attempted_models", [])),
-            "completed": len(opinions),
-            "failed": len(expert_context.get("_model_failures", [])),
+            "completed": quality_contract["successful_expert_count"],
+            "returned": quality_contract["returned_expert_count"],
+            "failed": (
+                quality_contract["expected_expert_count"]
+                - quality_contract["successful_expert_count"]
+            ),
             "slowest_model": (
                 max(model_timings, key=lambda row: float(row.get("duration_sec") or 0.0)).get(
                     "name"

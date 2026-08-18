@@ -10,7 +10,7 @@ from typing import Any
 
 from core.symbols import normalize_trading_symbol
 
-CURRENT_POSITION_MANAGEMENT_VERSION = "2026-08-15.current-position-management.v2"
+CURRENT_POSITION_MANAGEMENT_VERSION = "2026-08-17.current-position-management.v3"
 CURRENT_POSITION_MANAGEMENT_KIND = "current_position_takeover"
 ALLOWED_MANAGEMENT_ACTIONS = (
     "hold",
@@ -95,10 +95,14 @@ def build_current_position_management_contract(
     quantity = abs(_safe_float(facts.get("quantity")))
     contracts = abs(_safe_float(facts.get("contracts")))
     contract_size = abs(_safe_float(facts.get("contract_size")))
+    contract_valuation = _safe_dict(facts.get("contract_valuation"))
     entry_price = max(_safe_float(facts.get("entry_price")), 0.0)
     current_price = max(_safe_float(facts.get("current_price")), 0.0)
     entry_fee = max(_safe_float(facts.get("entry_fee_usdt")), 0.0)
-    funding_fee = _safe_float(facts.get("funding_fee_usdt"), 0.0)
+    funding_fee = _safe_float(
+        facts.get("settled_funding_fee", facts.get("funding_fee_usdt")),
+        0.0,
+    )
     funding_bill_count = max(_safe_int(facts.get("funding_bill_count")), 0)
     funding_fee_source = str(
         facts.get("funding_fee_source") or "none"
@@ -120,6 +124,20 @@ def build_current_position_management_contract(
         or (funding_bill_count == 0 and not funding_evidence_gaps)
     )
     requested_funding_eligibility = facts.get("funding_evidence_eligible") is True
+    unrealized_pnl = _safe_float(facts.get("unrealized_pnl_usdt"), 0.0)
+    estimated_exit_slippage = max(
+        _safe_float(facts.get("estimated_exit_slippage_usdt")),
+        0.0,
+    )
+    expected_future_funding_cashflow = _safe_float(
+        facts.get("expected_future_funding_cashflow"),
+        0.0,
+    )
+    expected_future_price_pnl = _safe_float(
+        facts.get("expected_future_price_pnl_usdt"),
+        0.0,
+    )
+    next_funding_time = str(facts.get("next_funding_time") or "").strip() or None
     full_entry_fee = max(_safe_float(facts.get("full_entry_fee_usdt")), 0.0)
     full_entry_notional = max(_safe_float(facts.get("full_entry_notional_usdt")), 0.0)
     stop_loss = max(_safe_float(facts.get("stop_loss_price")), 0.0)
@@ -200,6 +218,13 @@ def build_current_position_management_contract(
         blockers.append("current_position_valuation_incomplete")
     if authoritative_position_notional <= 0:
         blockers.append("current_position_notional_missing")
+    if (
+        "contract_spec_complete" in facts
+        and facts.get("contract_spec_complete") is not True
+    ):
+        blockers.append("contract_specification_evidence_incomplete")
+    if facts.get("notional_consistent") is False:
+        blockers.append("contract_spec_mismatch")
     if identity_gaps:
         blockers.extend(identity_gaps)
     if facts.get("entry_fee_evidence_complete") is not True:
@@ -245,6 +270,36 @@ def build_current_position_management_contract(
     if facts.get("entry_fee_evidence_complete") is True and full_entry_notional <= 0:
         blockers.append("entry_fee_rate_basis_missing")
 
+    estimated_exit_fee = authoritative_position_notional * exit_fee_rate_proxy
+    funding_fee_included = funding_evidence_eligible
+    included_settled_funding = funding_fee if funding_fee_included else 0.0
+    current_lifecycle_net_pnl = (
+        unrealized_pnl
+        + included_settled_funding
+        - entry_fee
+        - estimated_exit_fee
+        - estimated_exit_slippage
+    )
+    projected_hold_net_pnl = (
+        current_lifecycle_net_pnl
+        + expected_future_price_pnl
+        + expected_future_funding_cashflow
+    )
+    settled_funding_evidence_status = (
+        "complete" if funding_evidence_eligible else "unavailable"
+    )
+    future_funding_evidence_status = str(
+        facts.get("future_funding_evidence_status") or "unavailable"
+    ).strip() or "unavailable"
+    funding_evidence_status = (
+        "complete"
+        if settled_funding_evidence_status == "complete"
+        and future_funding_evidence_status == "complete"
+        else "settled_complete_future_unavailable"
+        if settled_funding_evidence_status == "complete"
+        else "settled_funding_unavailable"
+    )
+
     blockers = list(dict.fromkeys(blockers))
     original_entry_status = (
         "complete_at_entry"
@@ -264,6 +319,16 @@ def build_current_position_management_contract(
         "quantity": quantity,
         "contracts": contracts,
         "contract_size": contract_size,
+        "contract_valuation": contract_valuation,
+        "ct_val": _safe_float(facts.get("ct_val")),
+        "ct_mult": _safe_float(facts.get("ct_mult")),
+        "ct_val_ccy": str(facts.get("ct_val_ccy") or ""),
+        "settle_ccy": str(facts.get("settle_ccy") or ""),
+        "ct_type": str(facts.get("ct_type") or ""),
+        "contract_spec_source": str(facts.get("contract_spec_source") or ""),
+        "contract_spec_complete": facts.get("contract_spec_complete") is True,
+        "notional_consistent": facts.get("notional_consistent"),
+        "valuation_timestamp": facts.get("valuation_timestamp"),
         "entry_price": entry_price,
         "current_price": current_price,
         "entry_fee_usdt": entry_fee,
@@ -286,12 +351,25 @@ def build_current_position_management_contract(
         "position_notional_source": position_notional_source,
         "exchange_identity_gaps": identity_gaps,
         "funding_fee_usdt": funding_fee,
+        "settled_funding_fee": funding_fee,
         "funding_bill_count": funding_bill_count,
         "funding_fee_source": funding_fee_source,
         "funding_evidence_complete": funding_evidence_complete,
         "funding_evidence_eligible": funding_evidence_eligible,
         "funding_evidence_gaps": funding_evidence_gaps,
         "funding_window_opened_at": funding_window_opened_at,
+        "unrealized_pnl_usdt": unrealized_pnl,
+        "estimated_exit_fee_usdt": estimated_exit_fee,
+        "estimated_exit_slippage_usdt": estimated_exit_slippage,
+        "expected_future_price_pnl_usdt": expected_future_price_pnl,
+        "expected_future_funding_cashflow": expected_future_funding_cashflow,
+        "current_lifecycle_net_pnl": current_lifecycle_net_pnl,
+        "projected_hold_net_pnl": projected_hold_net_pnl,
+        "next_funding_time": next_funding_time,
+        "funding_fee_included": funding_fee_included,
+        "funding_evidence_status": funding_evidence_status,
+        "settled_funding_evidence_status": settled_funding_evidence_status,
+        "future_funding_evidence_status": future_funding_evidence_status,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "paper_canary_lifecycle": paper_canary_lifecycle,
@@ -324,12 +402,28 @@ def build_current_position_management_contract(
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
         "entry_fee_source": facts.get("entry_fee_source"),
         "funding_fee_usdt": round(funding_fee, 12),
+        "settled_funding_fee": round(funding_fee, 12),
         "funding_bill_count": funding_bill_count,
         "funding_fee_source": funding_fee_source,
         "funding_evidence_complete": funding_evidence_complete,
         "funding_evidence_eligible": funding_evidence_eligible,
         "funding_evidence_gaps": funding_evidence_gaps,
         "funding_window_opened_at": funding_window_opened_at,
+        "unrealized_pnl_usdt": round(unrealized_pnl, 12),
+        "estimated_exit_fee_usdt": round(estimated_exit_fee, 12),
+        "estimated_exit_slippage_usdt": round(estimated_exit_slippage, 12),
+        "expected_future_price_pnl_usdt": round(expected_future_price_pnl, 12),
+        "expected_future_funding_cashflow": round(
+            expected_future_funding_cashflow,
+            12,
+        ),
+        "current_lifecycle_net_pnl": round(current_lifecycle_net_pnl, 12),
+        "projected_hold_net_pnl": round(projected_hold_net_pnl, 12),
+        "next_funding_time": next_funding_time,
+        "funding_fee_included": funding_fee_included,
+        "funding_evidence_status": funding_evidence_status,
+        "settled_funding_evidence_status": settled_funding_evidence_status,
+        "future_funding_evidence_status": future_funding_evidence_status,
         "exit_fee_rate_proxy": round(exit_fee_rate_proxy, 12),
         "exit_fee_rate_source": "authoritative_entry_fill_fee_rate_proxy",
         "stop_loss_price": round(stop_loss, 12),
@@ -337,6 +431,16 @@ def build_current_position_management_contract(
         "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
         "protection_orders": protection_orders,
         "contract_size": round(contract_size, 12),
+        "contract_valuation": contract_valuation,
+        "ct_val": round(_safe_float(facts.get("ct_val")), 12),
+        "ct_mult": round(_safe_float(facts.get("ct_mult")), 12),
+        "ct_val_ccy": str(facts.get("ct_val_ccy") or ""),
+        "settle_ccy": str(facts.get("settle_ccy") or ""),
+        "ct_type": str(facts.get("ct_type") or ""),
+        "contract_spec_source": str(facts.get("contract_spec_source") or ""),
+        "contract_spec_complete": facts.get("contract_spec_complete") is True,
+        "notional_consistent": facts.get("notional_consistent"),
+        "valuation_timestamp": facts.get("valuation_timestamp"),
         "position_notional_usdt": round(
             authoritative_position_notional
             if authoritative_position_notional > 0
@@ -404,6 +508,13 @@ def current_position_management_contract_complete(
         funding_bill_count >= 0
         and isinstance(value.get("funding_evidence_complete"), bool)
         and isinstance(value.get("funding_evidence_eligible"), bool)
+        and isinstance(value.get("funding_fee_included"), bool)
+        and str(value.get("funding_evidence_status") or "").strip()
+        and str(value.get("settled_funding_evidence_status") or "").strip()
+        and "settled_funding_fee" in value
+        and "expected_future_funding_cashflow" in value
+        and "current_lifecycle_net_pnl" in value
+        and "projected_hold_net_pnl" in value
         and (
             (funding_bill_count == 0 and funding_source == "none")
             or (funding_bill_count > 0 and funding_source == "okx_account_bills")

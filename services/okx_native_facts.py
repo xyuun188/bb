@@ -686,6 +686,7 @@ class OkxNativeFactsClient:
                 specs[inst_id] = {
                     "instId": inst_id,
                     "instType": str(row.get("instType") or "SWAP"),
+                    "ctType": str(row.get("ctType") or ""),
                     "ctVal": str(row.get("ctVal") or ""),
                     "ctMult": str(row.get("ctMult") or "1"),
                     "ctValCcy": str(row.get("ctValCcy") or ""),
@@ -1499,6 +1500,7 @@ def _native_position_to_ccxt_shape(
         "contractSizeSource": (
             "okx_public_instruments" if public_contract_size > 0 else "missing"
         ),
+        "contractSpec": dict(public_spec),
         "exchangeIdentityVerified": bool(public_spec and not identity_gaps),
         "exchangeIdentityGaps": identity_gaps,
         "markPrice": mark_price,

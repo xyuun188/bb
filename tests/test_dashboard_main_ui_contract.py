@@ -122,7 +122,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
+    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -671,7 +671,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
+    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -811,7 +811,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
+    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -979,7 +979,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260815-strk-evidence-v2" in html
+    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1233,7 +1233,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260815-strk-evidence-v2" in html
+    assert "/static/js/dashboard.js?v=20260817-analysis-quality-v2" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:
@@ -1913,3 +1913,36 @@ def test_analysis_timeout_and_keyless_experts_are_not_reported_as_uncalled() -> 
     assert "已进入本轮专家协作" in block
     assert "configuration_type === 'keyless_loopback'" in block
     assert block.index("ensembleTimedOut") < block.index("未配置 API Key")
+
+
+def test_analysis_detail_renders_market_and_position_funding_contracts() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    market_start = script.index("function renderMarketFundingAnalysis")
+    position_start = script.index("function renderPositionFundingAnalysis", market_start)
+    detail_start = script.index("function renderAnalysisReasonModal", position_start)
+    detail_end = script.index("function changeAnalysisPage", detail_start)
+
+    market_block = script[market_start:position_start]
+    position_block = script[position_start:detail_start]
+    detail_block = script[detail_start:detail_end]
+    assert "当前费率" in market_block
+    assert "下一次结算" in market_block
+    assert "做多预计资金费" in market_block
+    assert "做空预计资金费" in market_block
+    assert "资金费后净优势" in market_block
+    assert "已结算资金费" in position_block
+    assert "预计未来资金费" in position_block
+    assert "当前生命周期净收益" in position_block
+    assert "继续持仓预计净收益" in position_block
+    assert "只读评估" in position_block
+    assert "record.dynamic_exit_policy" in detail_block
+    assert "record.direction_competition" in detail_block
+
+
+def test_analysis_detail_uses_expected_cross_validation_denominator() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "crossSummary.expected ?? record.cross_requested" in script
+    assert "专家请求 ${expertRequestedCross}" in script
+    assert "自动核验 ${automaticCross}" in script

@@ -162,6 +162,45 @@ async def test_hold_is_recorded_without_risk_assessment() -> None:
     assert result.handled is True
     assert not any(call[0] == "assess" for call in calls)
     assert not any(call[0] == "prepare" for call in calls)
+    persisted_raw = next(call[2] for call in calls if call[0] == "raw")
+    assert persisted_raw["dynamic_exit_policy"]["observation_only"] is True
+    assert persisted_raw["dynamic_exit_policy"]["funding_evidence_status"] == (
+        "settled_funding_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hold_persists_fee_after_position_economics_without_changing_action() -> None:
+    calls: list[tuple[str, Any]] = []
+    decision = _decision(Action.HOLD)
+    position = _profitable_retrace_position()
+
+    result = await _processor(calls).process(
+        decision=decision,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=17,
+        open_positions=[position],
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    policy = decision.raw_response["dynamic_exit_policy"]
+    assert result.handled is True
+    assert decision.action == Action.HOLD
+    assert decision.position_size_pct == 0.0
+    assert policy["observation_only"] is True
+    assert policy["observed_action"] == "hold"
+    assert policy["settled_funding_fee"] == 0.0
+    assert policy["current_lifecycle_net_pnl"] == pytest.approx(9.0)
+    assert policy["projected_hold_net_pnl"] == pytest.approx(9.0)
+    assert policy["by_side"]["long"]["current_lifecycle_net_pnl"] == pytest.approx(
+        9.0
+    )
+    assert not any(call[0] == "assess" for call in calls)
 
 
 @pytest.mark.asyncio

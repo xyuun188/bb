@@ -313,6 +313,40 @@ def test_sync_to_online_server_prunes_only_stale_managed_python_sources() -> Non
     assert sftp.removed == removed
 
 
+def test_sync_to_online_server_can_prune_stale_tests_when_tests_are_included() -> None:
+    from scripts import sync_to_online_server as sync
+
+    remote_app_dir = "/srv/bb/app"
+    current = ROOT / "tests" / "test_model_server_maintenance_scripts.py"
+
+    class FakeSftp:
+        def __init__(self) -> None:
+            self.removed: list[str] = []
+
+        def listdir_attr(self, remote_dir: str) -> list[SimpleNamespace]:
+            if remote_dir == f"{remote_app_dir}/tests":
+                return [
+                    SimpleNamespace(filename=current.name, st_mode=stat.S_IFREG),
+                    SimpleNamespace(filename="test_removed_contract.py", st_mode=stat.S_IFREG),
+                    SimpleNamespace(filename="fixture.json", st_mode=stat.S_IFREG),
+                ]
+            return []
+
+        def remove(self, remote_path: str) -> None:
+            self.removed.append(remote_path)
+
+    sftp = FakeSftp()
+    removed = sync.prune_remote_stale_sources(
+        sftp,
+        [current],
+        remote_app_dir,
+        managed_roots=("tests",),
+    )
+
+    assert removed == [f"{remote_app_dir}/tests/test_removed_contract.py"]
+    assert sftp.removed == removed
+
+
 def test_sync_to_online_server_runtime_env_only_does_not_restart_services() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 

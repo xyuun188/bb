@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.remote_ssh import (  # noqa: E402
+    MAX_REMOTE_OUTPUT_TEXT_LIMIT,
+    connect_remote_ssh,
+    run_remote_text,
+)
 from core.safe_output import safe_print  # noqa: E402
 from services.local_ai_training_contract import (  # noqa: E402
     LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
@@ -72,7 +76,11 @@ def _remote_command(
     argv: list[str],
     execution_timeout_seconds: int,
 ) -> str:
+    result_prefixes = tuple(_PERSISTED_TRAINING_RESULT_PREFIXES.values())
     remote_script = f"""
+import contextlib
+import io
+import json
 from pathlib import Path
 import runpy
 import sys
@@ -83,7 +91,61 @@ root = Path({remote_app_dir!r})
 load_runtime_env_files(project_root=root)
 drop_privileges_to_runtime_user_if_needed(project_root=root)
 sys.argv = {argv!r}
-runpy.run_path({script_path!r}, run_name="__main__")
+captured_stdout = io.StringIO()
+exit_code = 0
+with contextlib.redirect_stdout(captured_stdout):
+    try:
+        runpy.run_path({script_path!r}, run_name="__main__")
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else int(bool(exc.code))
+
+training_output = captured_stdout.getvalue()
+if exit_code != 0:
+    sys.stdout.write(training_output[-10000:])
+    raise SystemExit(exit_code)
+
+prefixes = {result_prefixes!r}
+result_line = next(
+    (
+        line
+        for line in reversed(training_output.splitlines())
+        if any(line.startswith(prefix) for prefix in prefixes)
+    ),
+    None,
+)
+if result_line is None:
+    sys.stdout.write(training_output[-10000:])
+    raise RuntimeError("persisted training result frame missing on remote host")
+result_prefix = next(prefix for prefix in prefixes if result_line.startswith(prefix))
+full_frame = result_line.removeprefix(result_prefix)
+full_payload = json.loads(full_frame)
+if not isinstance(full_payload, dict):
+    raise RuntimeError("persisted training result is not an object on remote host")
+compact_payload = {{
+    key: full_payload.get(key)
+    for key in (
+        "trained",
+        "reason",
+        "error",
+        "artifact_version",
+        "artifact_persisted",
+        "model_stage",
+        "challenger_version",
+        "challenger_rejected",
+        "champion_version",
+        "champion_retained",
+        "challenger_artifact_version",
+        "current_artifact_version",
+        "model_path",
+        "training_data_sha256",
+        "sample_count",
+        "trainable_sample_count",
+    )
+    if key in full_payload
+}}
+compact_payload["full_result_chars"] = len(full_frame)
+compact_payload["full_result_keys"] = sorted(str(key) for key in full_payload)
+print(result_prefix + json.dumps(compact_payload, ensure_ascii=False, sort_keys=True))
 """
     return (
         f"cd {_remote_quote(remote_app_dir)} && "
@@ -144,6 +206,7 @@ def main() -> None:
                 ),
                 timeout=command_timeout,
                 check=True,
+                max_output_chars=MAX_REMOTE_OUTPUT_TEXT_LIMIT,
             )
             if args.persist_artifact:
                 _persisted_training_result(target, output)

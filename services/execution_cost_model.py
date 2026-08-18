@@ -8,7 +8,7 @@ market microstructure and only uses the configured max as a cap.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
@@ -87,6 +87,10 @@ class FundingCostEstimate:
     funding_rate: float | None
     funding_interval_minutes: float | None
     horizon_minutes: float | None
+    estimated_settlement_count: int
+    next_funding_time: str | None
+    funding_rate_observed_at: str | None
+    signed_cashflow_pct: float | None
     adverse_cost_pct: float | None
     signed_return_impact_pct: float | None
     production_eligible: bool
@@ -103,7 +107,7 @@ def funding_cost_estimate(
     side: str,
     horizon_minutes: Any,
 ) -> FundingCostEstimate:
-    """Project adverse funding as a cost; funding income never creates entry alpha."""
+    """Project signed funding cashflow using the actual upcoming settlements."""
 
     snapshot = feature_snapshot if isinstance(feature_snapshot, dict) else {}
     normalized_side = str(side or "").strip().lower()
@@ -115,6 +119,14 @@ def funding_cost_estimate(
         interval = interval_hours * 60.0 if interval_hours is not None else None
 
     reason = ""
+    next_funding_raw = str(snapshot.get("next_funding_time") or "").strip()
+    observed_raw = str(snapshot.get("funding_rate_observed_at") or "").strip()
+    next_funding = _parse_timestamp(next_funding_raw)
+    observed_at = _parse_timestamp(observed_raw)
+    as_of = _parse_timestamp(
+        str(snapshot.get("timestamp") or snapshot.get("funding_as_of") or "")
+    ) or datetime.now(UTC)
+    legacy_projection = not bool(snapshot.get("timestamp") or snapshot.get("funding_as_of"))
     if normalized_side not in {"long", "short"}:
         reason = "funding_side_invalid"
     elif snapshot.get("funding_data_available") is not True:
@@ -125,31 +137,63 @@ def funding_cost_estimate(
         reason = "funding_interval_missing"
     elif horizon is None or horizon <= 0.0:
         reason = "prediction_horizon_missing"
+    elif not next_funding and not legacy_projection:
+        reason = "next_funding_time_missing"
+    elif not observed_at and not legacy_projection:
+        reason = "funding_rate_observed_at_missing"
+    elif observed_at and as_of > observed_at and not legacy_projection:
+        max_age = max(interval * 2.0 if interval and interval > 0 else 480.0, 30.0)
+        if (as_of - observed_at).total_seconds() > max_age * 60.0:
+            reason = "funding_rate_stale"
 
     eligible = not reason
     signed_impact = None
     adverse_cost = None
+    settlement_count = 0
     if eligible and rate is not None and interval is not None and horizon is not None:
-        signed_impact = (
-            (-rate if normalized_side == "long" else rate)
-            * 100.0
-            * horizon
-            / interval
-        )
+        if next_funding is not None:
+            end = as_of + timedelta(minutes=horizon)
+            cursor = next_funding
+            step = timedelta(minutes=interval)
+            while cursor <= end and settlement_count < 1000:
+                if cursor > as_of:
+                    settlement_count += 1
+                cursor += step
+            signed_impact = (
+                (-rate if normalized_side == "long" else rate)
+                * 100.0
+                * settlement_count
+            )
+        else:
+            # Old stored/test snapshots predate next_funding_time. Keep their
+            # result readable, but mark the method so production snapshots can
+            # never silently fall back to continuous prorating.
+            signed_impact = (
+                (-rate if normalized_side == "long" else rate)
+                * 100.0
+                * horizon
+                / interval
+            )
         adverse_cost = max(-signed_impact, 0.0)
 
-    observed_at = str(snapshot.get("funding_rate_observed_at") or "").strip()
+    signed_impact = round(signed_impact, 10) if signed_impact is not None else None
     return FundingCostEstimate(
         side=normalized_side,
         funding_rate=rate,
         funding_interval_minutes=interval,
         horizon_minutes=horizon,
+        estimated_settlement_count=settlement_count,
+        next_funding_time=next_funding_raw or None,
+        funding_rate_observed_at=observed_raw or None,
+        signed_cashflow_pct=signed_impact,
         adverse_cost_pct=(round(adverse_cost, 10) if adverse_cost is not None else None),
-        signed_return_impact_pct=(
-            round(signed_impact, 10) if signed_impact is not None else None
-        ),
+        signed_return_impact_pct=signed_impact,
         production_eligible=eligible,
-        reason="current_direction_funding_cost_ready" if eligible else reason,
+        reason=(
+            "current_direction_funding_cashflow_ready"
+            if eligible
+            else reason
+        ),
         policy_provenance={
             "source": "okx_current_perpetual_funding_rate",
             "observation_window": "current_prediction_horizon",
@@ -157,10 +201,45 @@ def funding_cost_estimate(
             "generated_at": datetime.now(UTC).isoformat(),
             "strategy_version": "2026-08-16.directional-funding-cost.v1",
             "fallback_reason": "" if eligible else reason,
-            "funding_rate_observed_at": observed_at,
-            "income_credit_policy": "adverse_cost_only_no_funding_income_alpha",
+            "funding_rate_observed_at": observed_raw,
+            "income_credit_policy": "signed_cashflow_positive_income_negative_cost",
+            "estimated_settlement_count": settlement_count,
+            "projection_method": (
+                "next_funding_time_and_interval"
+                if next_funding is not None
+                else "legacy_interval_fallback"
+            ),
+            "funding_evidence_status": (
+                "complete" if eligible and next_funding is not None else "legacy_degraded"
+                if eligible
+                else "unavailable"
+            ),
         },
     )
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        epoch = float(text)
+    except ValueError:
+        epoch = 0.0
+    if epoch >= 1_000_000_000.0:
+        if epoch >= 1_000_000_000_000_000.0:
+            epoch /= 1_000_000.0
+        elif epoch >= 1_000_000_000_000.0:
+            epoch /= 1_000.0
+        try:
+            return datetime.fromtimestamp(epoch, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> ExecutionCostEstimate:

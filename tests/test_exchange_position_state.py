@@ -9,6 +9,7 @@ from services.exchange_position_state import (
     ExchangeProtectionMapProvider,
     exchange_position_display_valuation,
     exchange_snapshot_price,
+    exchange_snapshot_quantity,
     exchange_snapshot_unrealized,
     parse_exchange_position_snapshot,
 )
@@ -121,6 +122,76 @@ def test_parse_okx_position_snapshot_blocks_notional_price_unit_mismatch() -> No
 
     assert snapshot is not None
     assert "exchange_position_notional_mismatch" in snapshot["identity_gaps"]
+    assert "contract_spec_mismatch" in snapshot["identity_gaps"]
+    assert snapshot["contract_valuation"]["notional_consistent"] is False
+
+
+def test_parse_okx_linear_contract_uses_ct_val_currency_and_multiplier() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "STRK-USDT-SWAP",
+            "side": "short",
+            "contracts": 3949.0,
+            "contractSize": 0.01,
+            "contractSizeSource": "okx_public_instruments",
+            "contractSpec": {
+                "instId": "STRK-USDT-SWAP",
+                "ctVal": "0.01",
+                "ctMult": "1",
+                "ctValCcy": "STRK",
+                "settleCcy": "USDT",
+                "ctType": "linear",
+                "source": "okx_public_instruments",
+            },
+            "markPrice": 379.29,
+            "entryPrice": 375.95,
+            "notional": 14962.62,
+            "timestamp": 1786950000000,
+            "info": {
+                "instId": "STRK-USDT-SWAP",
+                "pos": "-3949",
+                "markPx": "379.29",
+                "notionalUsd": "14962.62",
+                "uTime": "1786950000000",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["quantity"] == pytest.approx(39.49)
+    assert snapshot["calculated_notional"] == pytest.approx(14978.1621)
+    assert snapshot["notional_consistent"] is True
+    assert "contract_spec_mismatch" not in snapshot["identity_gaps"]
+
+
+def test_parse_okx_quote_denominated_contract_does_not_multiply_mark_price() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "BTC-USD-SWAP",
+            "side": "long",
+            "contracts": 10.0,
+            "contractSpec": {
+                "instId": "BTC-USD-SWAP",
+                "ctVal": "100",
+                "ctMult": "1",
+                "ctValCcy": "USD",
+                "settleCcy": "BTC",
+                "ctType": "inverse",
+                "source": "okx_public_instruments",
+            },
+            "markPrice": 100000.0,
+            "notional": 1000.0,
+            "info": {"instId": "BTC-USD-SWAP", "pos": "10"},
+        },
+        symbol_normalizer=lambda value: str(value),
+    )
+
+    assert snapshot is not None
+    assert snapshot["calculated_notional"] == pytest.approx(1000.0)
+    assert snapshot["quantity"] == pytest.approx(0.01)
+    assert exchange_snapshot_quantity(snapshot) == pytest.approx(0.01)
+    assert snapshot["notional_consistent"] is True
 
 
 def test_parse_okx_position_snapshot_prefers_inst_id_over_ccxt_alias_symbol() -> None:

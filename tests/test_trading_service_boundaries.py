@@ -2420,7 +2420,13 @@ async def test_local_ml_auto_train_process_isolated_from_trading_database_pool(
 
     assert result["reason"] == "not_due"
     assert result["training_process_isolated"] is True
-    script_path = str(captured["args"][1]).replace("\\", "/")
+    script_path = next(
+        str(argument).replace("\\", "/")
+        for argument in captured["args"]
+        if str(argument).replace("\\", "/").endswith(
+            "scripts/run_local_ml_auto_train.py"
+        )
+    )
     assert script_path.endswith("scripts/run_local_ml_auto_train.py")
     assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
 
@@ -4655,7 +4661,9 @@ async def test_trading_service_dashboard_async_boundaries_call_internal_owners()
 
 
 @pytest.mark.asyncio
-async def test_paper_balance_snapshot_refuses_virtual_account_without_okx() -> None:
+async def test_paper_balance_snapshot_refuses_virtual_account_without_okx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._okx_paper = None
@@ -4678,6 +4686,18 @@ async def test_paper_balance_snapshot_refuses_virtual_account_without_okx() -> N
         raise RuntimeError("OKX down")
 
     service._get_okx_executor_for_mode = raise_okx_down
+
+    class UnavailableFallbackExecutor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            raise RuntimeError("OKX down")
+
+        async def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", UnavailableFallbackExecutor)
 
     snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
 
@@ -4811,7 +4831,9 @@ async def test_market_allocated_order_balance_schedules_refresh_when_cache_is_co
 
 
 @pytest.mark.asyncio
-async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advisory() -> None:
+async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advisory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
     service._get_model_execution_mode = lambda _model_name: "paper"
@@ -4831,6 +4853,18 @@ async def test_paper_new_pair_pause_treats_missing_okx_balance_snapshot_as_advis
     service._schedule_okx_balance_snapshot_refresh_for_new_pair_pause = (  # type: ignore[method-assign]
         lambda mode: refresh_calls.append(mode)
     )
+
+    class UnavailableFallbackExecutor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            raise RuntimeError("OKX down")
+
+        async def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", UnavailableFallbackExecutor)
 
     snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
     reason = await service._new_pair_analysis_pause_reason(
@@ -5726,6 +5760,13 @@ def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
     )
 
 
+def test_market_ai_first_symbol_uses_the_same_start_reserve_policy() -> None:
+    source = inspect.getsource(TradingService.run_once)
+
+    assert "if market_index > 0 and budget_defer_reason is not None:" not in source
+    assert "if budget_defer_reason is not None:" in source
+
+
 def test_starting_analysis_round_does_not_preempt_isolated_training_processes() -> None:
     service = TradingService.__new__(TradingService)
     service._active_training_processes = set()
@@ -5856,7 +5897,7 @@ def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
     shared = service.market_symbol_analysis_timeout_seconds(
-        remaining_round_seconds=152.5,
+        remaining_round_seconds=1000.0,
         remaining_symbol_count=5,
     )
     last = service.market_symbol_analysis_timeout_seconds(
@@ -5872,6 +5913,31 @@ def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(
     assert last == pytest.approx(27.0)
     assert after_soft_deadline == 0.0
     assert shared >= 40.0
+
+
+def test_market_model_start_defers_after_context_depletes_viable_window() -> None:
+    service = TradingService.__new__(TradingService)
+
+    depleted_timeout = service.market_symbol_analysis_timeout_seconds(
+        remaining_round_seconds=5.781,
+        remaining_symbol_count=2,
+    )
+
+    assert depleted_timeout == pytest.approx(2.781)
+    assert (
+        service.market_symbol_model_start_defer_reason(depleted_timeout)
+        == "model_start_budget_insufficient"
+    )
+    assert (
+        service.market_symbol_model_start_defer_reason(
+            trading_service.MARKET_SYMBOL_ANALYSIS_MIN_SECONDS
+        )
+        is None
+    )
+    assert service.market_symbol_model_start_defer_reason(0.0) == "time_budget_exhausted"
+    assert "market_symbol_model_start_defer_reason" in inspect.getsource(
+        TradingService.run_once
+    )
 
 
 def test_market_symbol_context_and_model_budgets_are_independent(
@@ -5935,6 +6001,13 @@ def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
     assert decision.raw_response["market_model_timeout"]["expert_coordination_started"] is True
     assert decision.raw_response["attempted_experts"] == ["trend_expert", "risk_expert"]
     assert len(decision.raw_response["expert_failures"]) == 2
+    quality = decision.raw_response["analysis_quality_contract"]
+    assert quality["analysis_complete"] is False
+    assert quality["decision_eligible"] is False
+    assert quality["attempted_expert_count"] == 2
+    assert quality["successful_expert_count"] == 0
+    assert quality["status_counts"]["timeout"] == 2
+    assert quality["reason_code"] == "model_timeout"
     assert TradingService._is_market_analysis_timeout_hold(decision) is True
     assert TradingService._is_market_analysis_timeout_hold(_decision(Action.HOLD)) is False
 
@@ -6416,6 +6489,10 @@ def test_market_round_budget_is_not_used_as_outer_watchdog(
         lambda _self, force=False: True,
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    monkeypatch.setattr(trading_service.settings, "market_analysis_watchdog_seconds", 180)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
 
     assert service.market_round_watchdog_seconds() > service.market_round_time_budget_seconds()
     assert service.market_round_watchdog_seconds() == 180.0

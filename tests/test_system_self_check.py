@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from config.settings import settings
+from core.trading_mode import TradingModeManager
 from tests.paper_canary_fixtures import complete_paper_canary_raw
 from web_dashboard.api import dashboard, system_health
 
@@ -752,6 +753,10 @@ async def test_split_process_stats_use_shared_pause_state_over_stale_heartbeat(
         encoding="utf-8",
     )
     monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    isolated_mode_manager = TradingModeManager(
+        state_path=data_dir / "trading-control-state.json"
+    )
+    monkeypatch.setattr(dashboard, "mode_manager", isolated_mode_manager)
     await dashboard.mode_manager.pause()
 
     async def recent_activity(_hours: int = 6) -> dict[str, Any]:

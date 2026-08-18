@@ -69,6 +69,7 @@ class _ScopedLLMCapacity:
         self._limit = max(int(limit), 1)
         self._active = 0
         self._market_waiters = 0
+        self._consultation_waiters = 0
         self._condition = asyncio.Condition()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -77,13 +78,15 @@ class _ScopedLLMCapacity:
         loop = asyncio.get_running_loop()
         if self._loop is loop:
             return
-        if self._active or self._market_waiters:
+        if self._active or self._market_waiters or self._consultation_waiters:
             raise RuntimeError("LLM capacity cannot be shared across active event loops")
         self._condition = asyncio.Condition()
         self._loop = loop
 
     def _scope(self, context: dict[str, Any]) -> str:
         raw = str(context.get("_analysis_budget_scope") or "")
+        if "consultation" in raw:
+            return "consultation"
         return "market" if raw.startswith("market") else "position" if raw.startswith("position") else "shared"
 
     async def acquire(self, context: dict[str, Any]) -> str:
@@ -92,16 +95,27 @@ class _ScopedLLMCapacity:
         async with self._condition:
             if scope == "market":
                 self._market_waiters += 1
+            elif scope == "consultation":
+                self._consultation_waiters += 1
             try:
                 while True:
+                    consultation_reserved = (
+                        scope != "consultation" and self._consultation_waiters > 0
+                    )
                     market_reserved = scope == "position" and self._market_waiters > 0
-                    if self._active < self._limit and not market_reserved:
+                    if (
+                        self._active < self._limit
+                        and not consultation_reserved
+                        and not market_reserved
+                    ):
                         self._active += 1
                         return scope
                     await self._condition.wait()
             finally:
                 if scope == "market":
                     self._market_waiters = max(self._market_waiters - 1, 0)
+                elif scope == "consultation":
+                    self._consultation_waiters = max(self._consultation_waiters - 1, 0)
 
     async def release(self) -> None:
         self._ensure_loop()
@@ -138,6 +152,12 @@ class _ScopedLLMSlot:
 
 _LLM_CAPACITY = _ScopedLLMCapacity(_LLM_CONCURRENCY)
 _LLM_CALL_DELAY = max(float(settings.ai_llm_call_delay_seconds or 0.0), 0.0)
+
+
+def shared_llm_capacity_slot(context: dict[str, Any]) -> _ScopedLLMSlot:
+    """Return the same provider-capacity slot used by every expert call."""
+
+    return _LLM_CAPACITY.slot(context)
 
 ROLE_TO_CROSS_TARGET = {
     "trend_direction": "trend",

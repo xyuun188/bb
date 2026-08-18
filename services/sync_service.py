@@ -871,6 +871,14 @@ def normalized_open_position_context(
         contract_size_source = "exchange_position_snapshot"
         management_contracts = abs(float_parser(current_management_contract.get("contracts"), 0.0))
         management_quantity = abs(float_parser(current_management_contract.get("quantity"), 0.0))
+        management_valuation = _dict_value(
+            current_management_contract.get("contract_valuation")
+        )
+        management_ct_type = str(
+            current_management_contract.get("ct_type")
+            or management_valuation.get("ct_type")
+            or ""
+        ).strip().lower()
         contract_symbol = symbol_normalizer(current_management_contract.get("symbol"))
         if (
             current_management_contract.get("contract_version")
@@ -890,9 +898,18 @@ def normalized_open_position_context(
                 abs_tol=1e-12,
             )
         ):
-            contract_size = management_quantity / management_contracts
-            quantity = contracts * contract_size
-            contract_size_source = "current_management_contract_okx_contract_spec"
+            if quantity <= 0:
+                quantity = management_quantity
+                contract_size_source = "current_management_contract_base_quantity"
+            management_contract_size = abs(
+                float_parser(current_management_contract.get("contract_size"), 0.0)
+            )
+            if management_contract_size > 0:
+                contract_size = management_contract_size
+                contract_size_source = "current_management_contract_okx_contract_spec"
+            elif management_ct_type != "inverse" and contract_size <= 0:
+                contract_size = management_quantity / management_contracts
+                contract_size_source = "current_management_contract_okx_contract_spec"
         direct_notional = abs(
             float_parser(
                 position_payload.get("notional")
@@ -1005,13 +1022,56 @@ def normalized_open_position_context(
             0.0,
         )
     )
-    quantity = (
-        contracts * contract_size
-        if contracts > 0 and contract_size > 0
-        else raw_quantity
-        if contracts <= 0
-        else 0.0
+    embedded_valuation = _dict_value(
+        position_payload.get("contract_valuation")
+        or current_management_contract.get("contract_valuation")
     )
+    embedded_base_quantity = abs(
+        float_parser(embedded_valuation.get("base_quantity"), 0.0)
+    )
+    embedded_contracts = abs(
+        float_parser(embedded_valuation.get("contracts"), 0.0)
+    )
+    embedded_ct_type = str(
+        position_payload.get("ct_type")
+        or current_management_contract.get("ct_type")
+        or embedded_valuation.get("ct_type")
+        or ""
+    ).strip().lower()
+    matching_management_quantity = abs(
+        float_parser(current_management_contract.get("quantity"), 0.0)
+    )
+    matching_management_contracts = abs(
+        float_parser(current_management_contract.get("contracts"), 0.0)
+    )
+    management_quantity_matches = bool(
+        contracts > 0
+        and matching_management_quantity > 0
+        and matching_management_contracts > 0
+        and isclose(
+            contracts,
+            matching_management_contracts,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    )
+    if (
+        embedded_base_quantity > 0
+        and (embedded_contracts <= 0 or isclose(contracts, embedded_contracts, rel_tol=1e-9, abs_tol=1e-12))
+    ):
+        quantity = embedded_base_quantity
+    elif embedded_ct_type == "inverse":
+        quantity = (
+            matching_management_quantity
+            if management_quantity_matches
+            else raw_quantity
+        )
+    elif contracts > 0 and contract_size > 0:
+        quantity = contracts * contract_size
+    elif management_quantity_matches:
+        quantity = matching_management_quantity
+    else:
+        quantity = raw_quantity if contracts <= 0 else 0.0
     direct_notional = abs(
         float_parser(
             position_payload.get("notional")
@@ -2462,6 +2522,18 @@ class OkxSyncService:
                         float_parser(snapshot.get("contract_size"), 0.0),
                         0.0,
                     ),
+                    "contract_valuation": _dict_value(
+                        snapshot.get("contract_valuation")
+                    ),
+                    "ct_val": float_parser(snapshot.get("ct_val"), 0.0),
+                    "ct_mult": float_parser(snapshot.get("ct_mult"), 0.0),
+                    "ct_val_ccy": snapshot.get("ct_val_ccy"),
+                    "settle_ccy": snapshot.get("settle_ccy"),
+                    "ct_type": snapshot.get("ct_type"),
+                    "contract_spec_source": snapshot.get("contract_spec_source"),
+                    "contract_spec_complete": snapshot.get("contract_spec_complete") is True,
+                    "notional_consistent": snapshot.get("notional_consistent"),
+                    "valuation_timestamp": snapshot.get("valuation_timestamp"),
                     "exchange_identity_gaps": list(snapshot.get("identity_gaps") or []),
                     "protection": protection,
                     "protection_orders": protection_orders,
@@ -2547,7 +2619,21 @@ class OkxSyncService:
                 "contracts": row["contracts"],
                 "entry_price": row["entry_price"],
                 "current_price": row["current_price"],
+                "unrealized_pnl_usdt": float_parser(
+                    row["snapshot"].get("upl"),
+                    0.0,
+                ),
                 "contract_size": row["contract_size"],
+                "contract_valuation": row["contract_valuation"],
+                "ct_val": row["ct_val"],
+                "ct_mult": row["ct_mult"],
+                "ct_val_ccy": row["ct_val_ccy"],
+                "settle_ccy": row["settle_ccy"],
+                "ct_type": row["ct_type"],
+                "contract_spec_source": row["contract_spec_source"],
+                "contract_spec_complete": row["contract_spec_complete"],
+                "notional_consistent": row["notional_consistent"],
+                "valuation_timestamp": row["valuation_timestamp"],
                 "position_notional_usdt": row["position_notional_usdt"]
                 if row["position_notional_usdt"] > 0
                 else row["current_price"] * row["quantity"],

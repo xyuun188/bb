@@ -13,6 +13,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution,
     signal_return_distribution_eligibility,
 )
+from services.execution_cost_model import funding_cost_estimate
 from services.model_strategy_blueprint import model_strategy_side_authorization
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 
@@ -96,21 +97,41 @@ def _authorized_prediction_horizon(
 def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
     eligible_objective = [
         (
-            float(item["objective_expected_return_pct"]),
+            float(
+                item.get(
+                    "funding_adjusted_objective_expected_return_pct",
+                    item["objective_expected_return_pct"],
+                )
+            ),
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
         if item.get("decision_eligible") is True
-        and _safe_float(item.get("objective_expected_return_pct")) is not None
+        and _safe_float(
+            item.get(
+                "funding_adjusted_objective_expected_return_pct",
+                item.get("objective_expected_return_pct"),
+            )
+        )
     ]
     eligible_raw = [
         (
-            float(item["raw_expected_return_pct"]),
+            float(
+                item.get(
+                    "funding_adjusted_raw_expected_return_pct",
+                    item["raw_expected_return_pct"],
+                )
+            ),
             _weight(item.get("continuous_weight_multiplier")),
         )
         for item in values
         if item.get("decision_eligible") is True
-        and _safe_float(item.get("raw_expected_return_pct")) is not None
+        and _safe_float(
+            item.get(
+                "funding_adjusted_raw_expected_return_pct",
+                item.get("raw_expected_return_pct"),
+            )
+        )
     ]
     return {
         "score": _weighted_mean(eligible_objective),
@@ -118,6 +139,86 @@ def _side_summary(values: list[dict[str, Any]]) -> dict[str, Any]:
         "objective_expected_return_pct": _weighted_mean(eligible_objective),
         "decision_source_count": len(eligible_objective),
         "evidence": values,
+    }
+
+
+def _attach_funding_projection(
+    evidence: dict[str, list[dict[str, Any]]],
+    feature_vector: Any,
+    *,
+    selected_horizon_minutes: float | None = None,
+    require_selected_horizon: bool = False,
+) -> dict[str, Any]:
+    snapshot = (
+        dict(feature_vector)
+        if isinstance(feature_vector, dict)
+        else feature_vector.to_dict()
+        if hasattr(feature_vector, "to_dict")
+        else dict(vars(feature_vector))
+        if hasattr(feature_vector, "__dict__")
+        else {}
+    )
+    side_contracts: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        horizons = [
+            float(value)
+            for item in evidence[side]
+            if (value := _safe_float(item.get("horizon_minutes"))) is not None and value > 0
+        ]
+        horizon = (
+            selected_horizon_minutes
+            if require_selected_horizon
+            else min(horizons)
+            if horizons
+            else None
+        )
+        estimate = funding_cost_estimate(snapshot, side=side, horizon_minutes=horizon)
+        side_contract = estimate.to_dict()
+        _safe_dict(side_contract.get("policy_provenance"))["generated_at"] = (
+            str(snapshot.get("timestamp") or snapshot.get("funding_as_of") or "") or None
+        )
+        side_contracts[side] = side_contract
+        for item in evidence[side]:
+            item_horizon = _safe_float(item.get("horizon_minutes"))
+            item_estimate = (
+                estimate
+                if item_horizon == horizon
+                else funding_cost_estimate(snapshot, side=side, horizon_minutes=item_horizon)
+            )
+            item_projection = item_estimate.to_dict()
+            _safe_dict(item_projection.get("policy_provenance"))["generated_at"] = (
+                str(snapshot.get("timestamp") or snapshot.get("funding_as_of") or "") or None
+            )
+            item["funding_projection"] = item_projection
+            item["funding_evidence_status"] = (
+                "complete" if item_estimate.production_eligible else "funding_evidence_unavailable"
+            )
+            cashflow = item_estimate.signed_cashflow_pct
+            objective = _safe_float(item.get("objective_expected_return_pct"))
+            raw_return = _safe_float(item.get("raw_expected_return_pct"))
+            if item_estimate.production_eligible and cashflow is not None:
+                item["funding_adjusted_objective_expected_return_pct"] = (
+                    objective + cashflow if objective is not None else None
+                )
+                item["funding_adjusted_raw_expected_return_pct"] = (
+                    raw_return + cashflow if raw_return is not None else None
+                )
+    return {
+        "long": side_contracts["long"],
+        "short": side_contracts["short"],
+        "evidence_complete": all(
+            side_contracts[side].get("production_eligible") is True
+            for side in ("long", "short")
+        ),
+        "selected_horizon_minutes": selected_horizon_minutes,
+        "horizon_source": (
+            "selected_prediction_cohort"
+            if require_selected_horizon and selected_horizon_minutes is not None
+            else "unavailable"
+            if require_selected_horizon
+            else "eligible_prediction_contract"
+        ),
+        "sign_convention": "positive_income_negative_cost",
     }
 
 
@@ -256,7 +357,7 @@ class EntryDirectionCompetitionPolicy:
         market_regime: dict[str, Any] | None,
         strategy_mode: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        del feature_vector, market_regime
+        del market_regime
         execution_scope = _execution_scope(strategy_mode)
         evidence = {"long": [], "short": []}
         self._append_local_ml(evidence, ml_signal_context, execution_scope)
@@ -324,6 +425,7 @@ class EntryDirectionCompetitionPolicy:
             include_horizon=execution_scope == "live",
         )
         horizon_selection: dict[str, Any] = {}
+        selected_horizon = None
         if execution_scope == "paper" and not aggregate_blockers:
             horizon_selection = select_paper_horizon_cohort(
                 (item for item in all_rows if item.get("decision_eligible") is True),
@@ -343,6 +445,13 @@ class EntryDirectionCompetitionPolicy:
                 item["aggregate_eligible"] = False
                 item["observation_only"] = True
                 item["eligibility_reason"] = "paper_prediction_horizon_not_selected"
+
+        funding_projection = _attach_funding_projection(
+            evidence,
+            feature_vector,
+            selected_horizon_minutes=selected_horizon,
+            require_selected_horizon=execution_scope == "paper",
+        )
 
         training_rows = [item for item in all_rows if item.get("paper_eligible") is True]
         training_horizon_selection = select_paper_horizon_cohort(
@@ -433,6 +542,7 @@ class EntryDirectionCompetitionPolicy:
             "production_source_count": production_source_count,
             "production_permission": False,
             "model_strategy_direction_authorization": direction_authorization,
+            "funding_projection": funding_projection,
             "policy": "execution_scoped_gross_market_observation_only_no_fixed_gap",
             "aggregate_blockers": aggregate_blockers,
             "selected_horizon_minutes": (

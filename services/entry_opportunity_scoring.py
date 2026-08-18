@@ -673,6 +673,11 @@ class EntryOpportunityScoringPolicy:
                     if funding_cost.production_eligible
                     else 0.0
                 ),
+                current_funding_cashflow_pct=(
+                    funding_cost.signed_cashflow_pct
+                    if funding_cost.production_eligible
+                    else None
+                ),
             )
             if execution_scope == "paper"
             else combine_production_return_distribution(
@@ -700,6 +705,11 @@ class EntryOpportunityScoringPolicy:
                     funding_cost.adverse_cost_pct
                     if funding_cost.production_eligible
                     else 0.0
+                ),
+                current_funding_cashflow_pct=(
+                    funding_cost.signed_cashflow_pct
+                    if funding_cost.production_eligible
+                    else None
                 ),
             )
         )
@@ -881,6 +891,9 @@ class EntryOpportunityScoringPolicy:
                 ),
                 "current_adverse_funding_cost_pct": transformations.get(
                     "current_adverse_funding_cost_pct"
+                ),
+                "current_funding_cashflow_pct": transformations.get(
+                    "current_funding_cashflow_pct"
                 ),
                 "historical_counterfactual_cost_expected_pct": (
                     round(historical_cost_expected, 8)

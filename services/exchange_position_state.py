@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from core.safe_output import safe_error_text
+from services.okx_contract_valuation import okx_contract_valuation
 
 logger = structlog.get_logger(__name__)
 ALL_PROTECTION_ORDERS_CACHE_KEY = "__all_position_protection_orders__"
@@ -52,14 +53,24 @@ def exchange_snapshot_price(snapshot: dict[str, Any]) -> float:
 
 
 def exchange_snapshot_quantity(snapshot: dict[str, Any]) -> float:
+    valuation = snapshot.get("contract_valuation")
+    if isinstance(valuation, dict):
+        valuation_quantity = _first_positive_float(
+            valuation.get("base_quantity"),
+            default=0.0,
+        )
+        if valuation_quantity > 0:
+            return valuation_quantity
+    quantity = _first_positive_float(snapshot.get("quantity"), default=0.0)
+    if quantity > 0:
+        return quantity
     contracts = abs(_first_nonzero_float(snapshot.get("contracts"), default=0.0))
     contract_size = abs(
         _first_positive_float(snapshot.get("contract_size"), default=0.0) or 0.0
     )
     if contracts > 0:
         return contracts * contract_size if contract_size > 0 else 0.0
-    quantity = _first_positive_float(snapshot.get("quantity"), default=0.0)
-    return quantity if quantity > 0 else 0.0
+    return 0.0
 
 
 def exchange_snapshot_unrealized(snapshot: dict[str, Any], side: str) -> float:
@@ -236,20 +247,46 @@ def parse_exchange_position_snapshot(
             if str(value or "").strip()
         )
     )
-    contract_size = explicit_contract_size
+    raw_inst_id = str(info.get("instId") or position.get("symbol") or "").strip().upper()
+    explicit_spec = position.get("contractSpec")
+    spec = dict(explicit_spec) if isinstance(explicit_spec, dict) else {}
+    spec.setdefault("instId", raw_inst_id)
+    if not spec.get("ctVal") and explicit_contract_size > 0.0:
+        spec["ctVal"] = explicit_contract_size
+    spec.setdefault("ctMult", info.get("ctMult") or position.get("ctMult") or 1.0)
+    spec.setdefault("ctValCcy", info.get("ctValCcy") or position.get("ctValCcy"))
+    spec.setdefault("settleCcy", info.get("settleCcy") or position.get("settleCcy"))
+    spec.setdefault("ctType", info.get("ctType") or position.get("ctType"))
+    spec.setdefault(
+        "source",
+        position.get("contractSizeSource") or "position_snapshot",
+    )
+    valuation = okx_contract_valuation(
+        contracts=contracts,
+        mark_price=mark_price,
+        reported_notional_usd=notional,
+        contract_spec=spec,
+        inst_id=raw_inst_id,
+        valuation_timestamp=(
+            info.get("uTime") or position.get("timestamp") or info.get("cTime")
+        ),
+    )
+    contract_size = valuation.ct_val * valuation.ct_mult
     quantity = (
-        contracts * contract_size
-        if contracts > 0 and contract_size > 0
+        valuation.base_quantity
+        if valuation.base_quantity > 0.0
         else raw_quantity
         if contracts <= 0
         else 0.0
     )
-    calculated_notional = contracts * contract_size * mark_price if contracts > 0 and contract_size > 0 else 0.0
-    if notional > 0 and calculated_notional > 0:
-        notional_ratio = max(calculated_notional / notional, notional / calculated_notional)
-        if notional_ratio > 10.0:
-            identity_gaps.append("exchange_position_notional_mismatch")
-    raw_inst_id = str(info.get("instId") or position.get("symbol") or "").strip().upper()
+    calculated_notional = valuation.calculated_notional_usd
+    if valuation.notional_consistent is False:
+        identity_gaps.extend(
+            [
+                "contract_spec_mismatch",
+                "exchange_position_notional_mismatch",
+            ]
+        )
     raw_uly = str(info.get("uly") or "").strip().upper()
     if raw_inst_id and raw_uly and raw_inst_id.endswith("-USDT-SWAP"):
         expected_uly = raw_inst_id[: -len("-SWAP")]
@@ -286,6 +323,16 @@ def parse_exchange_position_snapshot(
         "side_inference": side_inference,
         "identity_gaps": identity_gaps,
         "calculated_notional": calculated_notional,
+        "contract_valuation": valuation.to_dict(),
+        "ct_val": valuation.ct_val,
+        "ct_mult": valuation.ct_mult,
+        "ct_val_ccy": valuation.ct_val_ccy,
+        "settle_ccy": valuation.settle_ccy,
+        "ct_type": valuation.ct_type,
+        "contract_spec_complete": valuation.contract_spec_complete,
+        "contract_spec_source": valuation.contract_spec_source,
+        "notional_consistent": valuation.notional_consistent,
+        "valuation_timestamp": valuation.valuation_timestamp,
     }
 
 

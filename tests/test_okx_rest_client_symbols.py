@@ -635,6 +635,7 @@ async def test_fetch_positions_uses_okx_native_positions(monkeypatch) -> None:
 
     assert calls == [
         ("privateGetAccountPositions", ({"instType": "SWAP", "instId": "SPK-USDT-SWAP"},)),
+        ("publicGetPublicInstruments", ({"instType": "SWAP", "instId": "SPK-USDT-SWAP"},)),
     ]
     assert len(positions) == 1
     assert positions[0]["symbol"] == "SPK-USDT-SWAP"

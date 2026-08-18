@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from services.entry_funnel_diagnostics import classify_entry_funnel_reason
 
 
 def _action_value(decision_or_action: DecisionOutput | str) -> str:
@@ -46,5 +47,16 @@ class MarketDecisionResultRecorder:
         }
         if confidence is not None:
             row["confidence"] = confidence
+        if isinstance(decision_or_action, DecisionOutput):
+            raw = decision_or_action.raw_response if isinstance(decision_or_action.raw_response, dict) else {}
+            funnel_reason = classify_entry_funnel_reason(
+                raw=raw,
+                action=row["action"],
+                was_executed=bool(executed),
+                has_order=execution_status not in {"skipped", "hold", "fast_prefilter"},
+                reason=reason or decision_or_action.reasoning,
+            )
+            if funnel_reason:
+                row["funnel_reason"] = funnel_reason
         results["decisions"].append(row)
         return row

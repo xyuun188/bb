@@ -68,10 +68,14 @@ class FakeDecisionRepo:
         self.fill_missing: list[tuple[list[int], str]] = []
         self.finalize_unresolved: list[list[tuple[int, str, dict[str, Any]]]] = []
         self.outcomes: list[tuple[int, str, float]] = []
+        self.by_idempotency_key: dict[str, SimpleNamespace] = {}
 
     async def log_decision(self, data: dict[str, Any]) -> SimpleNamespace:
         self.logged.append(data)
         return SimpleNamespace(id=123)
+
+    async def get_by_analysis_idempotency_key(self, key: str) -> SimpleNamespace | None:
+        return self.by_idempotency_key.get(key)
 
     async def mark_executed(self, decision_id: int, execution_price: float) -> None:
         self.marked_executed.append((decision_id, execution_price))
@@ -205,6 +209,75 @@ async def test_log_decision_attaches_stage_and_sanitizes_payload() -> None:
     assert machine["current_stage"] == DecisionStage.AI_ANALYSIS
     assert machine["current_status"] == DecisionStageStatus.COMPLETED
     assert machine["last_reason"] == "AI 已完成分析并生成裁决。"
+
+
+@pytest.mark.asyncio
+async def test_log_decision_marks_incomplete_analysis_as_failed() -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision(Action.HOLD)
+    decision.raw_response["analysis_quality_contract"] = {
+        "analysis_complete": False,
+        "decision_eligible": False,
+        "reason_code": "insufficient_evidence",
+        "reason": "风险专家调用超时。",
+        "status_counts": {"timeout": 1, "completed": 3},
+    }
+
+    await service.log_decision(decision, is_paper=True)
+
+    machine = repo.logged[0]["raw_llm_response"]["decision_state_machine"]
+    assert machine["current_status"] == DecisionStageStatus.FAILED
+    assert machine["last_reason"] == "风险专家调用超时。"
+    assert machine["stages"][-1]["data"]["decision_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_log_decision_recovers_missing_quality_for_market_model_timeout() -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision(Action.HOLD)
+    decision.raw_response = {
+        "analysis_type": "market",
+        "attempted_experts": ["trend_expert", "risk_expert"],
+        "expert_failures": [
+            {"expert_name": "trend_expert", "reason": "timeout"},
+            {"expert_name": "risk_expert", "reason": "timeout"},
+        ],
+        "market_model_timeout": {
+            "isolated_to_symbol": True,
+            "production_permission": False,
+            "reason": "market model timeout",
+        },
+    }
+
+    await service.log_decision(decision, is_paper=True)
+
+    raw = repo.logged[0]["raw_llm_response"]
+    quality = raw["analysis_quality_contract"]
+    assert quality["analysis_complete"] is False
+    assert quality["decision_eligible"] is False
+    assert quality["status_counts"]["timeout"] == 2
+    assert quality["recovered_at_persistence_boundary"] is True
+    machine = raw["decision_state_machine"]
+    assert machine["current_status"] == DecisionStageStatus.FAILED
+    assert machine["last_reason_code"] == "MODEL_TIMEOUT"
+    assert machine["stages"][-1]["data"]["analysis_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_log_decision_rejects_duplicate_analysis_idempotency_key() -> None:
+    repo = FakeDecisionRepo()
+    repo.by_idempotency_key["analysis-v1:test"] = SimpleNamespace(id=88)
+    service = _service(FakeSession(), repo)
+    decision = _decision(Action.HOLD)
+    decision.raw_response["analysis_idempotency_key"] = "analysis-v1:test"
+
+    decision_id = await service.log_decision(decision, is_paper=True)
+
+    assert decision_id is None
+    assert repo.logged == []
+    assert decision.raw_response["duplicate_analysis"]["existing_decision_id"] == 88
 
 
 def test_analysis_type_detects_position_review_and_exits() -> None:

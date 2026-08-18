@@ -20,6 +20,7 @@ def _facts(**overrides):
         "contracts": 20.0,
         "entry_price": 100.0,
         "current_price": 103.0,
+        "unrealized_pnl_usdt": 6.0,
         "entry_fee_usdt": 0.12,
         "full_entry_fee_usdt": 0.24,
         "full_entry_notional_usdt": 400.0,
@@ -68,6 +69,18 @@ def test_takeover_contract_is_reduce_only_and_preserves_historical_gap() -> None
     assert contract["funding_bill_count"] == 0
     assert contract["funding_evidence_complete"] is True
     assert contract["funding_evidence_eligible"] is True
+    assert contract["funding_fee_included"] is True
+    assert contract["settled_funding_fee"] == 0.0
+    assert contract["expected_future_funding_cashflow"] == 0.0
+    assert contract["current_lifecycle_net_pnl"] == pytest.approx(
+        6.0 - 0.12 - (206.0 * 0.0006)
+    )
+    assert contract["projected_hold_net_pnl"] == pytest.approx(
+        contract["current_lifecycle_net_pnl"]
+    )
+    assert contract["funding_evidence_status"] == (
+        "settled_complete_future_unavailable"
+    )
     assert contract["exit_fee_rate_proxy"] == pytest.approx(0.0006)
     assert contract["policy_provenance"]["contract_fingerprint"]
 
@@ -181,6 +194,34 @@ def test_takeover_contract_uses_authoritative_notional_and_blocks_identity_gap()
     assert contract["funding_fee_usdt"] == pytest.approx(2030.93)
     assert contract["funding_evidence_eligible"] is False
     assert "okx_private_position_underlying_differs_from_public_instrument" in contract["blockers"]
+
+
+def test_takeover_contract_keeps_settled_and_future_funding_separate() -> None:
+    contract = build_current_position_management_contract(
+        _facts(
+            position_notional_usdt=206.0,
+            funding_fee_usdt=10.0,
+            funding_bill_count=2,
+            funding_fee_source="okx_account_bills",
+            funding_evidence_complete=True,
+            funding_evidence_eligible=True,
+            expected_future_funding_cashflow=-1.5,
+            expected_future_price_pnl_usdt=2.0,
+            future_funding_evidence_status="complete",
+            next_funding_time="2026-08-17T08:00:00+00:00",
+            estimated_exit_slippage_usdt=0.2,
+        )
+    )
+
+    expected_current = 6.0 + 10.0 - 0.12 - (206.0 * 0.0006) - 0.2
+    assert contract["settled_funding_fee"] == pytest.approx(10.0)
+    assert contract["expected_future_funding_cashflow"] == pytest.approx(-1.5)
+    assert contract["current_lifecycle_net_pnl"] == pytest.approx(expected_current)
+    assert contract["projected_hold_net_pnl"] == pytest.approx(
+        expected_current + 2.0 - 1.5
+    )
+    assert contract["funding_fee_included"] is True
+    assert contract["funding_evidence_status"] == "complete"
 
 
 def test_split_oco_validates_by_exact_inventory_not_single_position_price() -> None:

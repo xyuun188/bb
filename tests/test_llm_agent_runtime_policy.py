@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,11 +12,38 @@ from ai_brain.llm_agent import (
     _extract_json,
     _format_local_ai_tools,
     _provider_response_contract,
+    _ScopedLLMCapacity,
 )
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import standardized_return_distribution
+
+
+async def test_consultation_waiter_gets_next_shared_llm_capacity_slot() -> None:
+    capacity = _ScopedLLMCapacity(1)
+    holder = capacity.slot({"_analysis_budget_scope": "market_holder"})
+    await holder.__aenter__()
+    acquired_order: list[str] = []
+
+    async def wait_for_slot(label: str, scope: str) -> None:
+        async with capacity.slot({"_analysis_budget_scope": scope}):
+            acquired_order.append(label)
+            await asyncio.sleep(0)
+
+    position_task = asyncio.create_task(wait_for_slot("position", "position_review"))
+    await asyncio.sleep(0)
+    consultation_task = asyncio.create_task(
+        wait_for_slot("consultation", "consultation:position_review")
+    )
+    await asyncio.sleep(0)
+    await holder.__aexit__(None, None, None)
+    await asyncio.wait_for(
+        asyncio.gather(position_task, consultation_task),
+        timeout=0.5,
+    )
+
+    assert acquired_order == ["consultation", "position"]
 
 
 def test_shadow_quant_model_is_visible_to_llm_analysis_without_live_permission() -> None:

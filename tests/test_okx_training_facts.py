@@ -15,7 +15,11 @@ from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     build_okx_fill_mark_slippage,
 )
-from services.okx_training_facts import build_okx_history_training_sample
+from services.okx_training_facts import (
+    _funding_training_evidence,
+    build_funding_bill_lifecycle_facts,
+    build_okx_history_training_sample,
+)
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
@@ -545,7 +549,19 @@ def test_historical_margin_return_recovers_funding_only_changed_contract_value()
         }
     )
 
-    sample = build_okx_history_training_sample(history, **lineage)
+    sample = build_okx_history_training_sample(
+        history,
+        **lineage,
+        funding_bill_lifecycle_facts={
+            "mirror_available": True,
+            "bill_count": 2,
+            "bill_ids": ["yb-funding-1", "yb-funding-2"],
+            "signed_funding_fee_usdt": -244.616625,
+            "shared_bill_ids": [],
+            "attribution_complete": True,
+            "source": "okx_account_bills",
+        },
+    )
 
     assert sample["historical_contract_reconciliation"]["applied"] is True
     assert sample["historical_contract_reconciliation"]["price_path_notional"] is None
@@ -556,8 +572,106 @@ def test_historical_margin_return_recovers_funding_only_changed_contract_value()
     )
     assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(-29.921973684210524)
     assert sample["gross_return_price_consistent"] is True
+    assert sample["funding_evidence_status"] == "verified_extreme_account_bills"
+    assert sample["funding_bill_count"] == 2
+    assert sample["funding_attribution_complete"] is True
     assert sample["trade_fact_trusted"] is True, sample["training_evidence_gaps"]
     assert sample["profit_training_contract"]["eligible"] is True
+
+
+def test_extreme_funding_without_bill_reconciliation_is_pending_review() -> None:
+    evidence = _funding_training_evidence(
+        funding_fee=-244.616625,
+        notional=819.432,
+        official_funding_present=True,
+        bill_facts={
+            "mirror_available": True,
+            "bill_count": 0,
+            "bill_ids": [],
+            "signed_funding_fee_usdt": 0.0,
+            "shared_bill_ids": [],
+            "attribution_complete": True,
+        },
+    )
+
+    assert evidence["status"] == "pending_review_extreme_missing_account_bills"
+    assert evidence["eligible"] is False
+    assert evidence["attribution_complete"] is False
+    assert evidence["gaps"] == [
+        "extreme_funding_missing_account_bill_reconciliation"
+    ]
+
+
+def test_nonzero_funding_also_requires_account_bill_reconciliation() -> None:
+    evidence = _funding_training_evidence(
+        funding_fee=-0.5,
+        notional=100.0,
+        official_funding_present=True,
+        bill_facts={
+            "mirror_available": True,
+            "bill_count": 0,
+            "bill_ids": [],
+            "signed_funding_fee_usdt": 0.0,
+            "shared_bill_ids": [],
+            "attribution_complete": True,
+        },
+    )
+
+    assert evidence["status"] == "pending_review_missing_account_bills"
+    assert evidence["eligible"] is False
+    assert evidence["attribution_complete"] is False
+    assert evidence["gaps"] == ["funding_missing_account_bill_reconciliation"]
+
+
+def test_non_extreme_funding_with_matching_account_bill_is_verified() -> None:
+    evidence = _funding_training_evidence(
+        funding_fee=0.5,
+        notional=100.0,
+        official_funding_present=True,
+        bill_facts={
+            "mirror_available": True,
+            "bill_count": 1,
+            "bill_ids": ["funding-1"],
+            "signed_funding_fee_usdt": 0.5,
+            "shared_bill_ids": [],
+            "attribution_complete": True,
+        },
+    )
+
+    assert evidence["status"] == "verified_account_bills"
+    assert evidence["eligible"] is True
+    assert evidence["attribution_complete"] is True
+    assert evidence["account_bill_ids"] == ["funding-1"]
+
+
+def test_funding_bill_shared_by_overlapping_lifecycles_is_not_attributed() -> None:
+    opened = datetime(2026, 7, 11, 1, tzinfo=UTC)
+    histories = [
+        _history(
+            row_identity=f"paper|BTC-USDT-SWAP|pos-{index}|long|{index}",
+            pos_id=f"pos-{index}",
+            opened_at=opened + timedelta(minutes=index * 5),
+            updated_at_okx=opened + timedelta(hours=1),
+        )
+        for index in (1, 2)
+    ]
+    bill = SimpleNamespace(
+        id=1,
+        mode="paper",
+        bill_id="shared-funding",
+        inst_id="BTC-USDT-SWAP",
+        pos_side="long",
+        bill_ts=opened + timedelta(minutes=30),
+        funding_fee=-0.5,
+    )
+
+    facts = build_funding_bill_lifecycle_facts(histories, [bill])
+
+    assert all(
+        row["attribution_complete"] is False
+        and row["shared_bill_ids"] == ["shared-funding"]
+        for row in facts.values()
+    )
 
 
 def test_conflicting_price_and_margin_notional_authorities_are_quarantined() -> None:

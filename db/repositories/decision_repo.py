@@ -60,6 +60,15 @@ class DecisionRepository(BaseRepository):
         await self.session.flush()
         return decision
 
+    async def get_by_analysis_idempotency_key(self, key: str) -> AIDecision | None:
+        normalized = str(key or "").strip()
+        if not normalized:
+            return None
+        result = await self.session.execute(
+            select(AIDecision).where(AIDecision.analysis_idempotency_key == normalized).limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def get_recent_decisions(
         self,
         model_name: str | None = None,

@@ -10,7 +10,10 @@ import structlog
 
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
-from services.dynamic_exit_policy import apply_dynamic_exit
+from services.dynamic_exit_policy import (
+    apply_dynamic_exit,
+    attach_dynamic_exit_observation,
+)
 from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
 from services.position_review_result_recorder import PositionReviewResultRecorder
@@ -68,6 +71,7 @@ class PositionReviewDecisionProcessor:
         results: dict[str, Any] | None,
     ) -> PositionReviewProcessResult:
         if decision.is_hold:
+            attach_dynamic_exit_observation(decision, open_positions)
             await self.result_recorder.record_hold(
                 decision=decision,
                 model_name=model_name,
@@ -177,6 +181,7 @@ class PositionReviewDecisionProcessor:
             )
 
         if executed.is_hold:
+            attach_dynamic_exit_observation(executed, open_positions)
             await self.result_recorder.record_hold(
                 decision=executed,
                 model_name=model_name,

@@ -42,6 +42,11 @@ from services.account_accounting_service import (
 )
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.decision_state import decision_state_from_raw
+from services.entry_funnel_diagnostics import (
+    ENTRY_FUNNEL_REASONS,
+    build_direction_symmetry_report,
+    classify_entry_funnel_reason,
+)
 from services.entry_signal_extraction import (
     enrich_signal_payload,
     first_tool_payload,
@@ -7593,6 +7598,8 @@ async def get_opening_funnel(
                     "other": 0,
                     "unknown": 0,
                 },
+                "entry_funnel_reasons": {reason: 0 for reason in ENTRY_FUNNEL_REASONS},
+                "direction_symmetry": build_direction_symmetry_report([]),
                 "hold_count": 0,
                 "no_order_after_signal": 0,
                 "bottleneck": "api_error",
@@ -7677,6 +7684,8 @@ async def _build_opening_funnel_payload(
         "other": 0,
         "unknown": 0,
     }
+    entry_funnel_reasons = {reason: 0 for reason in ENTRY_FUNNEL_REASONS}
+    directional_rows: list[dict[str, Any]] = []
     symbol_counts: dict[str, dict[str, int]] = {}
     recent_blocked: list[dict[str, Any]] = []
 
@@ -7703,6 +7712,15 @@ async def _build_opening_funnel_payload(
             pass
 
         if action not in {"long", "short"}:
+            funnel_reason = classify_entry_funnel_reason(
+                raw=raw,
+                action=action,
+                was_executed=bool(row.was_executed),
+                has_order=False,
+                reason=_display_execution_reason(row, None),
+            )
+            if funnel_reason:
+                entry_funnel_reasons[funnel_reason] += 1
             continue
 
         entry_signals += 1
@@ -7713,11 +7731,35 @@ async def _build_opening_funnel_payload(
         if row.was_executed:
             executed_entries += 1
             symbol_state["executed"] += 1
+            directional_rows.append(
+                {
+                    "action": action,
+                    "is_entry": True,
+                    "was_executed": True,
+                    "funnel_reason": None,
+                }
+            )
             continue
         if matched_order is None:
             no_order_after_signal += 1
 
         reason = _display_execution_reason(row, matched_order)
+        funnel_reason = classify_entry_funnel_reason(
+            raw=raw,
+            action=action,
+            was_executed=False,
+            has_order=matched_order is not None,
+            reason=reason,
+        ) or "service_error"
+        entry_funnel_reasons[funnel_reason] += 1
+        directional_rows.append(
+            {
+                "action": action,
+                "is_entry": True,
+                "was_executed": False,
+                "funnel_reason": funnel_reason,
+            }
+        )
         bucket = _opening_funnel_reason_bucket(reason)
         reason_buckets[bucket] += 1
         if len(recent_blocked) < 20:
@@ -7730,6 +7772,7 @@ async def _build_opening_funnel_payload(
                         "action": action,
                         "confidence": row.confidence,
                         "reason_bucket": bucket,
+                        "funnel_reason": funnel_reason,
                         "reason": reason or "未保存具体未执行原因。",
                         "has_order": matched_order is not None,
                     }
@@ -7813,6 +7856,8 @@ async def _build_opening_funnel_payload(
             },
             "action_counts": action_counts,
             "reason_buckets": reason_buckets,
+            "entry_funnel_reasons": entry_funnel_reasons,
+            "direction_symmetry": build_direction_symmetry_report(directional_rows),
             "hold_count": hold_count,
             "no_order_after_signal": no_order_after_signal,
             "bottleneck": bottleneck,
@@ -7965,6 +8010,7 @@ async def get_analysis_records(
         if not raw:
             continue
         analysis_type, analysis_type_label = infer_analysis_type(d, raw)
+        analysis_quality = _safe_dict(raw.get("analysis_quality_contract"))
         expected_expert_names = (
             POSITION_ANALYSIS_EXPERT_NAMES
             if analysis_type == "position"
@@ -8053,16 +8099,32 @@ async def get_analysis_records(
             for item in failure_rows
             if isinstance(item, dict) and item.get("expert_name")
         }
-        cross_requested = sum(1 for e in experts if e.get("cross_check_for"))
+        expert_requested_cross = sum(
+            1
+            for validation in cross_validations
+            if validation.get("validation_origin") == "expert_requested"
+        )
+        automatic_cross = sum(
+            1
+            for validation in cross_validations
+            if validation.get("validation_origin") == "automatic_pairwise"
+        )
         divergent = sum(1 for v in cross_validations if v.get("consistency") == "divergent")
         aligned = sum(1 for v in cross_validations if v.get("consistency") == "aligned")
         major_conflicts = sum(1 for v in cross_validations if v.get("major_conflict"))
         unavailable_validations = sum(
-            1 for v in cross_validations if v.get("validation_status") == "target_missing"
+            1
+            for v in cross_validations
+            if v.get("validation_status", "completed") != "completed"
         )
         completed_validations = sum(
             1 for v in cross_validations if v.get("validation_status", "completed") == "completed"
         )
+        quality_cross = _safe_dict(analysis_quality.get("cross_validation"))
+        expected_cross = int(
+            quality_cross.get("expected_pair_count") or len(cross_validations) or 0
+        )
+        cross_requested = expected_cross
 
         expected_experts = [
             {
@@ -8075,6 +8137,11 @@ async def get_analysis_records(
         ]
         returned_names = {e["expert_name"] for e in experts}
         attempted_names = {str(name) for name in attempted_experts}
+        quality_slots = {
+            str(item.get("name") or ""): item
+            for item in _safe_list(analysis_quality.get("experts"))
+            if isinstance(item, dict) and str(item.get("name") or "") in expected_expert_name_set
+        }
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
         pre_expert_skip = _analysis_pre_expert_skip(raw)
         ensemble_timed_out = pre_expert_skip.get("kind") == "ensemble_timeout"
@@ -8086,6 +8153,8 @@ async def get_analysis_records(
                 **e,
                 "latency": timings_by_name.get(e["expert_name"]),
                 "reason": (
+                    str(_safe_dict(quality_slots.get(e["expert_name"])).get("reason") or "")
+                    or
                     pre_expert_skip.get("reason")
                     if pre_expert_skip.get("skipped")
                     else pre_expert_skip.get("reason")
@@ -8098,6 +8167,8 @@ async def get_analysis_records(
                     )
                 ),
                 "status": (
+                    str(_safe_dict(quality_slots.get(e["expert_name"])).get("status") or "")
+                    or
                     "pre_expert_skipped"
                     if pre_expert_skip.get("skipped")
                     else "ensemble_timeout"
@@ -8107,6 +8178,10 @@ async def get_analysis_records(
                     else "missing"
                 ),
                 "skip_kind": pre_expert_skip.get("kind") or "",
+                "returned": bool(
+                    _safe_dict(quality_slots.get(e["expert_name"])).get("returned")
+                ),
+                "usable": bool(_safe_dict(quality_slots.get(e["expert_name"])).get("usable")),
             }
             for e in expected_experts
             if e["expert_name"] not in returned_names
@@ -8176,6 +8251,8 @@ async def get_analysis_records(
                     display_execution_reason,
                 ),
                 "prediction_economics": _display_prediction_economics(raw),
+                "direction_competition": _safe_dict(raw.get("direction_competition")),
+                "dynamic_exit_policy": _safe_dict(raw.get("dynamic_exit_policy")),
                 "position_review_policy": (
                     raw.get("position_review_policy")
                     if isinstance(raw.get("position_review_policy"), dict)
@@ -8200,6 +8277,7 @@ async def get_analysis_records(
                     conflict_resolution if isinstance(conflict_resolution, dict) else {}
                 ),
                 "vector_memory": vector_memory_context,
+                "analysis_quality_contract": analysis_quality,
             }
             if include_detail
             else {}
@@ -8230,20 +8308,47 @@ async def get_analysis_records(
             "position_lifecycle_label": position_lifecycle_label,
             "created_at": d.created_at.isoformat() if d.created_at else None,
             "symbol": _normalize_dashboard_symbol(d.symbol),
-            "expert_count": len(experts),
-            "expected_expert_count": len(expected_experts),
-            "attempted_expert_count": attempted_expert_count,
+            "expert_count": int(
+                analysis_quality.get("successful_expert_count", len(experts)) or 0
+            ),
+            "returned_expert_count": int(
+                analysis_quality.get("returned_expert_count", len(experts)) or 0
+            ),
+            "expected_expert_count": int(
+                analysis_quality.get("expected_expert_count", len(expected_experts)) or 0
+            ),
+            "attempted_expert_count": int(
+                analysis_quality.get("attempted_expert_count", attempted_expert_count) or 0
+            ),
             "attempted_experts": attempted_experts,
+            "expert_status_counts": _safe_dict(analysis_quality.get("status_counts")),
+            "analysis_complete": (
+                bool(analysis_quality.get("analysis_complete")) if analysis_quality else None
+            ),
+            "decision_eligible": (
+                bool(analysis_quality.get("decision_eligible")) if analysis_quality else None
+            ),
+            "analysis_result": analysis_quality.get("result") if analysis_quality else None,
+            "analysis_reason_code": (
+                analysis_quality.get("reason_code") if analysis_quality else None
+            ),
             "expert_call_status": pre_expert_skip,
             "position_fast_scan": fast_scan_payload,
             "cross_requested": cross_requested,
             "cross_summary": {
                 "total": len(cross_validations),
+                "expected": expected_cross,
                 "completed": completed_validations,
                 "unavailable": unavailable_validations,
                 "aligned": aligned,
                 "divergent": divergent,
                 "major_conflicts": major_conflicts,
+                "expert_requested": expert_requested_cross,
+                "automatic": automatic_cross,
+                "conflicts_resolved": quality_cross.get("conflicts_resolved"),
+                "unresolved_major_conflicts": int(
+                    quality_cross.get("unresolved_major_conflict_count") or 0
+                ),
             },
             "consultation_status": (
                 consultation.get("status") if isinstance(consultation, dict) else None

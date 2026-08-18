@@ -24,6 +24,7 @@ from services.authoritative_trade_outcome import (
 )
 from services.dynamic_policy_values import empirical_policy_value
 from services.execution_cost_model import execution_cost_estimate
+from services.okx_training_facts import REALIZED_NET_PNL_FORMULA
 from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
     apply_correlation_group_weights,
@@ -456,6 +457,18 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
                 exclude=True,
             )
         label_contract = _safe_dict(sample.get("training_label_contract"))
+        label_components = _safe_dict(
+            label_contract.get("realized_net_pnl_components")
+        )
+        funding_audit_fields_present = any(
+            key in label_contract
+            for key in (
+                "funding_evidence_status",
+                "funding_attribution_complete",
+                "realized_net_pnl_formula",
+                "realized_net_pnl_components",
+            )
+        )
         if (
             label_contract.get("version") != AUTHORITATIVE_TRADE_LABEL_VERSION
             or label_contract.get("label_name") != PROFIT_TRAINING_TARGET
@@ -469,6 +482,29 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             or _safe_float(label_contract.get("entry_fee_usdt"), None) is None
             or _safe_float(label_contract.get("close_fee_usdt"), None) is None
             or _safe_float(label_contract.get("funding_fee_usdt"), None) is None
+            or (
+                funding_audit_fields_present
+                and (
+                    _safe_str(label_contract.get("funding_evidence_status"))
+                    not in {
+                        "verified_position_history",
+                        "verified_account_bills",
+                        "verified_extreme_account_bills",
+                    }
+                    or label_contract.get("funding_attribution_complete") is not True
+                    or label_contract.get("realized_net_pnl_formula")
+                    != REALIZED_NET_PNL_FORMULA
+                    or label_components.get("formula_consistent") is not True
+                    or _safe_float(
+                        label_components.get("components_total_usdt"), None
+                    )
+                    is None
+                    or _safe_float(
+                        label_components.get("reported_realized_net_pnl_usdt"), None
+                    )
+                    is None
+                )
+            )
             or _safe_float(label_contract.get("slippage_pct"), None) is None
             or _safe_float(label_contract.get(PROFIT_TRAINING_TARGET), None) is None
         ):

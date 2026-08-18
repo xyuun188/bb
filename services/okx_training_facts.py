@@ -30,6 +30,12 @@ from services.paper_training import paper_training_contract_reasons
 from services.production_trade_gate import validate_production_trade_gate
 from services.profit_training_contract import validate_profit_training_sample
 
+EXTREME_FUNDING_TO_NOTIONAL_RATIO = 0.20
+REALIZED_NET_PNL_FORMULA = (
+    "gross_pnl_usdt + official_fee_signed_usdt + funding_fee_usdt "
+    "+ liquidation_penalty_usdt"
+)
+
 
 def _value(row: Any, name: str, default: Any = None) -> Any:
     if isinstance(row, dict):
@@ -75,6 +81,158 @@ def _as_utc(value: Any) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def build_funding_bill_lifecycle_facts(
+    histories: Iterable[Any],
+    account_bills: Iterable[Any],
+) -> dict[str, dict[str, Any]]:
+    """Attribute mirrored funding bills to non-overlapping OKX lifecycles."""
+
+    history_rows = list(histories)
+    bill_rows = list(account_bills)
+    matched_by_lifecycle: dict[str, list[Any]] = {}
+    lifecycle_by_bill: dict[str, set[str]] = {}
+    for history in history_rows:
+        lifecycle_key = _text(_value(history, "row_identity"))
+        opened_at = _as_utc(_value(history, "opened_at"))
+        closed_at = _as_utc(_value(history, "updated_at_okx"))
+        inst_id = _text(_value(history, "inst_id")).upper()
+        side = _text(_value(history, "side")).lower()
+        mode = _canonical_execution_mode(_value(history, "mode"))
+        matches: list[Any] = []
+        if lifecycle_key and opened_at and closed_at and inst_id and mode:
+            for bill in bill_rows:
+                bill_mode = _canonical_execution_mode(_value(bill, "mode"))
+                bill_inst_id = _text(_value(bill, "inst_id")).upper()
+                bill_side = _text(_value(bill, "pos_side")).lower()
+                bill_at = _as_utc(_value(bill, "bill_ts"))
+                funding_fee = _safe_float(_value(bill, "funding_fee"), 0.0) or 0.0
+                if (
+                    bill_mode != mode
+                    or bill_inst_id != inst_id
+                    or bill_at is None
+                    or bill_at < opened_at
+                    or bill_at > closed_at
+                    or abs(funding_fee) <= 1e-12
+                    or (bill_side in {"long", "short"} and bill_side != side)
+                ):
+                    continue
+                matches.append(bill)
+                bill_id = _text(_value(bill, "bill_id")) or f"db:{_value(bill, 'id', 0)}"
+                lifecycle_by_bill.setdefault(bill_id, set()).add(lifecycle_key)
+        matched_by_lifecycle[lifecycle_key] = matches
+
+    result: dict[str, dict[str, Any]] = {}
+    for lifecycle_key, matches in matched_by_lifecycle.items():
+        bill_ids = [
+            _text(_value(bill, "bill_id")) or f"db:{_value(bill, 'id', 0)}"
+            for bill in matches
+        ]
+        shared_bill_ids = [
+            bill_id
+            for bill_id in bill_ids
+            if len(lifecycle_by_bill.get(bill_id, set())) > 1
+        ]
+        result[lifecycle_key] = {
+            "mirror_available": True,
+            "bill_count": len(matches),
+            "bill_ids": list(dict.fromkeys(bill_ids)),
+            "signed_funding_fee_usdt": sum(
+                _safe_float(_value(bill, "funding_fee"), 0.0) or 0.0
+                for bill in matches
+            ),
+            "shared_bill_ids": list(dict.fromkeys(shared_bill_ids)),
+            "attribution_complete": not shared_bill_ids,
+            "source": "okx_account_bills",
+        }
+    return result
+
+
+def _funding_training_evidence(
+    *,
+    funding_fee: float,
+    notional: float | None,
+    official_funding_present: bool,
+    bill_facts: dict[str, Any] | None,
+) -> dict[str, Any]:
+    ratio = (
+        funding_fee / notional
+        if notional is not None and notional > 0
+        else None
+    )
+    extreme = bool(
+        ratio is not None and abs(ratio) >= EXTREME_FUNDING_TO_NOTIONAL_RATIO
+    )
+    facts = dict(bill_facts or {})
+    legacy_direct_build = bill_facts is None
+    bill_fee = _safe_float(facts.get("signed_funding_fee_usdt"), 0.0) or 0.0
+    bill_count = max(int(_safe_float(facts.get("bill_count"), 0.0) or 0), 0)
+    shared_bill_ids = list(facts.get("shared_bill_ids") or [])
+    tolerance = max(1e-8, abs(funding_fee) * 1e-5)
+    bill_matches = bool(
+        bill_count > 0 and abs(bill_fee - funding_fee) <= tolerance
+    )
+    gaps: list[str] = []
+    if not official_funding_present:
+        status = "unavailable"
+    elif shared_bill_ids:
+        status = "pending_review_lifecycle_conflict"
+        gaps.append("funding_bill_lifecycle_conflict")
+    elif legacy_direct_build:
+        # Direct unit/integration builders may not have loaded the bill mirror;
+        # the production loader always supplies a mirror fact (including empty).
+        status = "verified_position_history"
+    elif abs(funding_fee) <= 1e-12 and bill_count <= 0:
+        status = "verified_position_history"
+    elif bill_matches and facts.get("attribution_complete") is True:
+        status = (
+            "verified_extreme_account_bills"
+            if extreme
+            else "verified_account_bills"
+        )
+    elif bill_count <= 0:
+        status = (
+            "pending_review_extreme_missing_account_bills"
+            if extreme
+            else "pending_review_missing_account_bills"
+        )
+        gaps.append(
+            "extreme_funding_missing_account_bill_reconciliation"
+            if extreme
+            else "funding_missing_account_bill_reconciliation"
+        )
+    else:
+        status = (
+            "pending_review_extreme_account_bill_mismatch"
+            if extreme
+            else "pending_review_account_bill_mismatch"
+        )
+        gaps.append(
+            "extreme_funding_account_bill_mismatch"
+            if extreme
+            else "funding_account_bill_mismatch"
+        )
+    eligible = status in {
+        "verified_position_history",
+        "verified_account_bills",
+        "verified_extreme_account_bills",
+    }
+    return {
+        "status": status,
+        "eligible": eligible,
+        "extreme": extreme,
+        "extreme_threshold_ratio": EXTREME_FUNDING_TO_NOTIONAL_RATIO,
+        "funding_fee_to_notional_ratio": ratio,
+        "position_history_funding_fee_usdt": funding_fee,
+        "account_bill_funding_fee_usdt": bill_fee,
+        "account_bill_count": bill_count,
+        "account_bill_ids": list(facts.get("bill_ids") or []),
+        "shared_bill_ids": shared_bill_ids,
+        "account_bill_difference_usdt": bill_fee - funding_fee,
+        "attribution_complete": bool(eligible and not shared_bill_ids),
+        "gaps": gaps,
+    }
 
 
 def _raw_contract_spec(raw: dict[str, Any]) -> dict[str, Any]:
@@ -648,6 +806,7 @@ def build_okx_history_training_sample(
     decision_raw_by_order_id: dict[str, dict[str, Any]] | None = None,
     decision_feature_by_order_id: dict[str, dict[str, Any]] | None = None,
     decision_execution_by_order_id: dict[str, dict[str, Any]] | None = None,
+    funding_bill_lifecycle_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert one mirrored OKX positions-history lifecycle into one sample."""
 
@@ -769,6 +928,12 @@ def build_okx_history_training_sample(
     )
     settlement_expected = gross_pnl + fee_signed + funding_fee + liquidation_penalty
     settlement_tolerance = max(1e-6, abs(realized_pnl) * 1e-5)
+    funding_training_evidence = _funding_training_evidence(
+        funding_fee=funding_fee,
+        notional=canonical_notional,
+        official_funding_present=_has_raw_key(raw, "fundingFee", "funding_fee"),
+        bill_facts=funding_bill_lifecycle_facts,
+    )
     gaps: list[str] = []
     if historical_contract_reconciliation.get("authority_conflict") is True:
         gaps.append("historical_contract_notional_authorities_conflict")
@@ -792,6 +957,7 @@ def build_okx_history_training_sample(
         gaps.append("missing_official_fee")
     if not _has_raw_key(raw, "fundingFee", "funding_fee"):
         gaps.append("missing_official_funding_fee")
+    gaps.extend(funding_training_evidence["gaps"])
     if ct_val is None or ct_val <= 0:
         gaps.append("missing_contract_ct_val")
     if ct_mult is None or ct_mult <= 0:
@@ -1168,7 +1334,29 @@ def build_okx_history_training_sample(
         "entry_fee_source": _text(entry_fill_group.get("fee_source")),
         "close_fee_source": _text(close_fill_group.get("fee_source")),
         "funding_fee": funding_fee,
+        "funding_evidence_status": funding_training_evidence["status"],
+        "funding_training_evidence": funding_training_evidence,
+        "funding_fee_to_notional_ratio": funding_training_evidence[
+            "funding_fee_to_notional_ratio"
+        ],
+        "funding_bill_count": funding_training_evidence["account_bill_count"],
+        "funding_bill_ids": funding_training_evidence["account_bill_ids"],
+        "funding_attribution_complete": funding_training_evidence[
+            "attribution_complete"
+        ],
         "liquidation_penalty": liquidation_penalty,
+        "official_fee_signed": fee_signed,
+        "realized_net_pnl_formula": REALIZED_NET_PNL_FORMULA,
+        "realized_net_pnl_components": {
+            "gross_pnl_usdt": gross_pnl,
+            "official_fee_signed_usdt": fee_signed,
+            "funding_fee_usdt": funding_fee,
+            "liquidation_penalty_usdt": liquidation_penalty,
+            "components_total_usdt": settlement_expected,
+            "reported_realized_net_pnl_usdt": realized_pnl,
+            "formula_consistent": abs(realized_pnl - settlement_expected)
+            <= settlement_tolerance,
+        },
         "settlement_components_total": settlement_expected,
         "holding_minutes": holding_minutes,
         "leverage": _safe_float(_value(history, "leverage"), 1.0) or 1.0,

@@ -640,12 +640,14 @@ def prune_remote_stale_sources(
     sftp,
     files: list[Path],
     remote_app_dir: str,
+    *,
+    managed_roots: tuple[str, ...] = REMOTE_MANAGED_SOURCE_ROOTS,
 ) -> list[str]:
     """Delete managed remote Python sources absent from the current local tree."""
 
     expected = {remote_path_for(path, remote_app_dir) for path in files}
     stale: list[str] = []
-    stack = [str(PurePosixPath(remote_app_dir) / root) for root in REMOTE_MANAGED_SOURCE_ROOTS]
+    stack = [str(PurePosixPath(remote_app_dir) / root) for root in managed_roots]
     while stack:
         remote_dir = stack.pop()
         try:
@@ -820,8 +822,20 @@ def main() -> None:
         sftp = ssh.open_sftp()
         try:
             uploaded = upload_files(sftp, files, args.remote_app_dir, dry_run=False)
+            managed_roots = (
+                (*REMOTE_MANAGED_SOURCE_ROOTS, "tests")
+                if args.include_tests
+                else REMOTE_MANAGED_SOURCE_ROOTS
+            )
             removed = (
-                [] if args.only else prune_remote_stale_sources(sftp, files, args.remote_app_dir)
+                []
+                if args.only
+                else prune_remote_stale_sources(
+                    sftp,
+                    files,
+                    args.remote_app_dir,
+                    managed_roots=managed_roots,
+                )
             )
             if remote_secret_path:
                 upload_runtime_secret(

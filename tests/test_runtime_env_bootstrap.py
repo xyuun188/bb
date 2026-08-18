@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from scripts import runtime_env_bootstrap
 from scripts.runtime_env_bootstrap import (
+    RUNTIME_ENV_PATH_OVERRIDE_ENV,
     RUNTIME_USER_DROPPED_ENV,
     drop_privileges_to_runtime_user_if_needed,
     load_runtime_env_files,
@@ -57,6 +58,23 @@ def test_runtime_env_bootstrap_ignores_unreadable_runtime_env(monkeypatch, tmp_p
     loaded = load_runtime_env_files(project_root=project_root, runtime_env_path=runtime_env)
 
     assert loaded == {"PROJECT_ONLY": "yes"}
+
+
+def test_runtime_env_bootstrap_supports_explicit_default_path_override(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    project_root = tmp_path / "app"
+    project_root.mkdir()
+    runtime_env = tmp_path / "isolated-runtime.env"
+    runtime_env.write_text("ISOLATED_RUNTIME_KEY=enabled\n", encoding="utf-8")
+    monkeypatch.setenv(RUNTIME_ENV_PATH_OVERRIDE_ENV, str(runtime_env))
+    monkeypatch.delenv("ISOLATED_RUNTIME_KEY", raising=False)
+
+    loaded = load_runtime_env_files(project_root=project_root)
+
+    assert loaded == {"ISOLATED_RUNTIME_KEY": "enabled"}
+    assert runtime_env_bootstrap.os.environ["ISOLATED_RUNTIME_KEY"] == "enabled"
 
 
 def test_runtime_env_bootstrap_drops_root_online_script_to_runtime_user(

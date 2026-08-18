@@ -140,6 +140,26 @@ def test_only_governed_return_models_choose_observed_side() -> None:
     )
 
 
+def test_signed_funding_cashflow_participates_in_long_short_comparison() -> None:
+    context = _context(
+        ml=_governed_ml(0.6, 0.5),
+        feature={
+            "timestamp": "2026-08-17T00:00:00+00:00",
+            "funding_data_available": True,
+            "funding_rate": 0.01,
+            "funding_interval_minutes": 480,
+            "next_funding_time": "2026-08-17T00:15:00+00:00",
+            "funding_rate_observed_at": "2026-08-17T00:00:00+00:00",
+        },
+    )
+
+    assert context["preferred_side"] == "short"
+    assert context["funding_projection"]["evidence_complete"] is True
+    assert context["funding_projection"]["long"]["signed_cashflow_pct"] == -1.0
+    assert context["funding_projection"]["short"]["signed_cashflow_pct"] == 1.0
+    assert context["long"]["score"] < context["short"]["score"]
+
+
 def test_missing_governance_cannot_enter_direction_scores() -> None:
     context = _context(
         ml={
@@ -335,6 +355,14 @@ def test_high_weight_long_horizon_selects_native_model_cohort() -> None:
     context = _context(
         ml=_governed_ml(0.8, -0.2),
         tools={"profit_prediction": server},
+        feature={
+            "timestamp": "2026-08-17T00:00:00+00:00",
+            "funding_data_available": True,
+            "funding_rate": 0.01,
+            "funding_interval_minutes": 480,
+            "next_funding_time": "2026-08-17T00:15:00+00:00",
+            "funding_rate_observed_at": "2026-08-17T00:00:00+00:00",
+        },
         strategy={
             "execution_mode": "paper",
             "continuous_model_weights": {
@@ -350,6 +378,9 @@ def test_high_weight_long_horizon_selects_native_model_cohort() -> None:
     assert context["enabled"] is True
     assert context["preferred_side"] == "short"
     assert context["selected_horizon_minutes"] == 60
+    assert context["funding_projection"]["selected_horizon_minutes"] == 60
+    assert context["funding_projection"]["long"]["horizon_minutes"] == 60
+    assert context["funding_projection"]["short"]["horizon_minutes"] == 60
     assert context["training_long"]["horizon_minutes"] == 60
     assert context["training_short"]["horizon_minutes"] == 60
     assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]

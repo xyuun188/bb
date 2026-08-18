@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
@@ -88,7 +88,13 @@ class DynamicExitAssessment:
     gross_unrealized_pnl_usdt: float
     fee_after_unrealized_pnl_usdt: float
     funding_fee_usdt: float
+    settled_funding_fee: float
+    expected_future_funding_cashflow: float
+    current_lifecycle_net_pnl: float
+    projected_hold_net_pnl: float
+    next_funding_time: str | None
     funding_fee_included: bool
+    funding_evidence_status: str
     funding_evidence_eligible: bool
     funding_loss_budget_crossed: bool
     projected_funding_budget_crossed: bool
@@ -288,7 +294,10 @@ def assess_dynamic_exit(
             seen_funding_contracts.add(funding_identity)
             funding_contract_count += 1
             contract_funding_fee = _safe_float(
-                management.get("funding_fee_usdt"),
+                management.get(
+                    "settled_funding_fee",
+                    management.get("funding_fee_usdt"),
+                ),
                 0.0,
             )
             contract_bill_count = max(
@@ -335,11 +344,17 @@ def assess_dynamic_exit(
         funding_contract_count > 0
         and eligible_funding_contract_count == funding_contract_count
     )
-    funding_fee_included = bool(
-        funding_bill_count > 0 and funding_evidence_eligible
-    )
+    funding_fee_included = funding_evidence_eligible
     included_funding_fee = funding_fee_eligible if funding_fee_included else 0.0
-    lifecycle_net_pnl = price_fee_after_pnl + included_funding_fee
+    estimated_exit_slippage = (
+        notional * max(_safe_float(execution_cost.get("slippage_pct"), 0.0), 0.0) / 200.0
+        if execution_cost.get("production_eligible") is True
+        else 0.0
+    )
+    current_lifecycle_net_pnl = (
+        price_fee_after_pnl + included_funding_fee - estimated_exit_slippage
+    )
+    lifecycle_net_pnl = current_lifecycle_net_pnl
     peak_profit = max(peak_profit, gross_pnl)
     retrace = _clamp((peak_profit - gross_pnl) / peak_profit) if peak_profit > 0 else 0.0
     target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
@@ -364,6 +379,29 @@ def assess_dynamic_exit(
         if funding_projection.production_eligible
         and funding_projection.adverse_cost_pct is not None
         else 0.0
+    )
+    expected_future_funding_cashflow = (
+        notional * float(funding_projection.signed_cashflow_pct) / 100.0
+        if funding_projection.production_eligible
+        and funding_projection.signed_cashflow_pct is not None
+        else 0.0
+    )
+    expected_future_price_return_pct = _safe_float(
+        model_exit.get("expected_future_price_return_pct"),
+        0.0,
+    )
+    expected_future_price_pnl = notional * expected_future_price_return_pct / 100.0
+    projected_hold_net_pnl = (
+        current_lifecycle_net_pnl
+        + expected_future_price_pnl
+        + expected_future_funding_cashflow
+    )
+    funding_evidence_status = (
+        "complete"
+        if funding_fee_included and funding_projection.production_eligible
+        else "settled_complete_future_unavailable"
+        if funding_fee_included
+        else "settled_funding_unavailable"
     )
     funding_adjusted_gross_pnl = gross_pnl + min(included_funding_fee, 0.0)
     funding_adjusted_loss = max(-funding_adjusted_gross_pnl, 0.0)
@@ -511,9 +549,12 @@ def assess_dynamic_exit(
         if current_management_contract_complete
         else 0.0
     )
+    funding_profit_lock_eligible = bool(
+        funding_fee_included and abs(included_funding_fee) > 1e-12
+    )
     profit_lock_pressure = (
         _clamp(max(lifecycle_net_pnl, 0.0) / planned_risk)
-        if funding_fee_included and planned_risk > 0.0
+        if funding_profit_lock_eligible and planned_risk > 0.0
         else 0.0
     )
     # The prediction horizon is a label deadline, not position-exit authority.
@@ -585,7 +626,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-08-16.dynamic-exit-funding-risk-budget.v13",
+            "strategy_version": "2026-08-17.dynamic-exit-funding-net-pnl.v14",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
@@ -601,7 +642,16 @@ def assess_dynamic_exit(
         gross_unrealized_pnl_usdt=round(gross_pnl, 8),
         fee_after_unrealized_pnl_usdt=round(price_fee_after_pnl, 8),
         funding_fee_usdt=round(funding_fee_observed, 8),
+        settled_funding_fee=round(funding_fee_observed, 8),
+        expected_future_funding_cashflow=round(
+            expected_future_funding_cashflow,
+            8,
+        ),
+        current_lifecycle_net_pnl=round(current_lifecycle_net_pnl, 8),
+        projected_hold_net_pnl=round(projected_hold_net_pnl, 8),
+        next_funding_time=funding_projection.next_funding_time,
         funding_fee_included=funding_fee_included,
+        funding_evidence_status=funding_evidence_status,
         funding_evidence_eligible=funding_evidence_eligible,
         funding_loss_budget_crossed=funding_loss_budget_crossed,
         projected_funding_budget_crossed=projected_funding_budget_crossed,
@@ -697,3 +747,130 @@ def apply_dynamic_exit(
     decision.raw_response = raw
     decision.position_size_pct = assessment.close_fraction
     return assessment
+
+
+def attach_dynamic_exit_observation(
+    decision: DecisionOutput,
+    positions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach fee-after position economics without changing a hold decision."""
+
+    symbol = _normalized_symbol(decision.symbol)
+    sides = tuple(
+        side
+        for side in ("long", "short")
+        if any(
+            isinstance(position, dict)
+            and (
+                not _normalized_symbol(position.get("symbol"))
+                or _normalized_symbol(position.get("symbol")) == symbol
+            )
+            and _position_side(position) == side
+            for position in positions
+        )
+    )
+    by_side: dict[str, dict[str, Any]] = {}
+    for side in sides:
+        probe = replace(
+            decision,
+            action=(Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT),
+            raw_response=dict(_safe_dict(decision.raw_response)),
+            position_size_pct=0.0,
+        )
+        by_side[side] = assess_dynamic_exit(probe, positions).to_dict()
+
+    if len(by_side) == 1:
+        summary = dict(next(iter(by_side.values())))
+    elif by_side:
+        children = list(by_side.values())
+        additive_fields = (
+            "gross_unrealized_pnl_usdt",
+            "fee_after_unrealized_pnl_usdt",
+            "funding_fee_usdt",
+            "settled_funding_fee",
+            "expected_future_funding_cashflow",
+            "current_lifecycle_net_pnl",
+            "projected_hold_net_pnl",
+            "lifecycle_net_pnl_usdt",
+            "fee_buffer_usdt",
+            "estimated_exit_cost_usdt",
+            "projected_funding_cost_usdt",
+        )
+        summary = {
+            field: round(sum(_safe_float(item.get(field), 0.0) for item in children), 8)
+            for field in additive_fields
+        }
+        evidence_complete = all(
+            item.get("funding_evidence_eligible") is True for item in children
+        )
+        future_complete = all(
+            item.get("funding_cost_projection_eligible") is True for item in children
+        )
+        summary.update(
+            {
+                "eligible": False,
+                "reason": "observation_only_hold_by_side",
+                "close_fraction": 0.0,
+                "hard_risk": any(item.get("hard_risk") is True for item in children),
+                "next_funding_time": next(
+                    (
+                        item.get("next_funding_time")
+                        for item in children
+                        if item.get("next_funding_time")
+                    ),
+                    None,
+                ),
+                "funding_fee_included": evidence_complete,
+                "funding_evidence_eligible": evidence_complete,
+                "funding_evidence_status": (
+                    "complete"
+                    if evidence_complete and future_complete
+                    else "settled_complete_future_unavailable"
+                    if evidence_complete
+                    else "settled_funding_unavailable"
+                ),
+                "funding_cost_projection_eligible": future_complete,
+                "funding_cost_projection_reason": (
+                    "current_direction_funding_cashflow_ready"
+                    if future_complete
+                    else "one_or_more_position_sides_unavailable"
+                ),
+                "profit_lock_pressure": max(
+                    (_safe_float(item.get("profit_lock_pressure"), 0.0) for item in children),
+                    default=0.0,
+                ),
+                "observed_close_fraction_by_side": {
+                    side: _safe_float(item.get("close_fraction"), 0.0)
+                    for side, item in by_side.items()
+                },
+            }
+        )
+    else:
+        summary = {
+            "eligible": False,
+            "reason": "position_economics_missing",
+            "close_fraction": 0.0,
+            "settled_funding_fee": 0.0,
+            "expected_future_funding_cashflow": 0.0,
+            "current_lifecycle_net_pnl": 0.0,
+            "projected_hold_net_pnl": 0.0,
+            "next_funding_time": None,
+            "funding_fee_included": False,
+            "funding_evidence_eligible": False,
+            "funding_evidence_status": "settled_funding_unavailable",
+            "funding_cost_projection_eligible": False,
+            "funding_cost_projection_reason": "position_economics_missing",
+            "profit_lock_pressure": 0.0,
+        }
+
+    summary.update(
+        {
+            "observation_only": True,
+            "observed_action": decision.action.value,
+            "by_side": by_side,
+        }
+    )
+    raw = dict(_safe_dict(decision.raw_response))
+    raw["dynamic_exit_policy"] = summary
+    decision.raw_response = raw
+    return summary

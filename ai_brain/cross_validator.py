@@ -14,12 +14,14 @@ import re
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ai_brain.base_model import Action, DecisionOutput
+from ai_brain.llm_agent import shared_llm_capacity_slot
 from config.settings import DECISION_MAKER_NAME, settings
 from core.model_runtime import (
     completion_token_limit,
@@ -65,13 +67,26 @@ ACTION_DIRECTION = {
     Action.HOLD: 0,
 }
 
-_CONSULTATION_SEMAPHORE = asyncio.Semaphore(1)
+_CONSULTATION_CONCURRENCY = 2
+_CONSULTATION_SEMAPHORE = asyncio.BoundedSemaphore(_CONSULTATION_CONCURRENCY)
 BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
 _CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
-_CONSULTATION_TIMEOUT_CAP_SECONDS = 12.0
-_CONSULTATION_ATTEMPT_CAP_SECONDS = 8.0
-_CONSULTATION_REASONING_ATTEMPT_CAP_SECONDS = 10.0
+_CONSULTATION_TIMEOUT_CAP_SECONDS = 18.0
+_CONSULTATION_ATTEMPT_CAP_SECONDS = 6.0
+_CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 6.0
+_CONSULTATION_FALLBACK_RESERVE_SECONDS = 2.0
+_CONSULTATION_QUEUE_WAIT_CAP_SECONDS = 1.5
+
+
+class ConsultationQueueTimeoutError(TimeoutError):
+    """Raised when a consultation becomes stale before inference starts."""
+
+    def __init__(self, waited_seconds: float) -> None:
+        self.waited_seconds = max(float(waited_seconds), 0.0)
+        super().__init__(
+            f"deep consultation queue wait exceeded {self.waited_seconds:.3f} seconds"
+        )
 
 
 def _consultation_budget_seconds() -> float:
@@ -88,7 +103,17 @@ def _is_reasoning_model(model: str | None) -> bool:
 
 def _is_local_qwen3_trade_model(model: str | None) -> bool:
     name = str(model or "").lower()
-    return name.startswith("qwen3-") and name.endswith("-trade")
+    return (name.startswith("qwen3-") and name.endswith("-trade")) or name == (
+        "bb-finquant-expert-14b"
+    )
+
+
+def _is_loopback_api_base(api_base: str | None) -> bool:
+    try:
+        hostname = str(urlparse(str(api_base or "").strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in {"127.0.0.1", "localhost", "::1"}
 
 
 def _is_qwen3_model(model: str | None) -> bool:
@@ -131,6 +156,7 @@ class CrossValidator:
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         validations: list[dict[str, Any]] = []
         seen_pairs: set[tuple[str, str, str]] = set()
+        validated_pairs: set[tuple[str, str]] = set()
         cross_started_at = datetime.now(UTC)
         cross_perf_started = time.perf_counter()
 
@@ -150,6 +176,7 @@ class CrossValidator:
             if key in seen_pairs:
                 continue
             seen_pairs.add(key)
+            validated_pairs.add(tuple(sorted((source_name, target_name))))
             if target_name not in opinions:
                 validations.append(
                     {
@@ -165,15 +192,37 @@ class CrossValidator:
                     }
                 )
                 continue
-            validations.append(
-                self.validate_pair(
+            validation = self.validate_pair(
+                source_name,
+                source,
+                target_name,
+                opinions[target_name],
+                question,
+            )
+            validation["validation_origin"] = "expert_requested"
+            validations.append(validation)
+
+        # Every usable expert pair is checked deterministically. This adds no
+        # model call and prevents a missing cross_check_for field from turning
+        # a full expert pass into zero cross-validation evidence.
+        opinion_names = sorted(
+            name for name, decision in opinions.items() if isinstance(decision, DecisionOutput)
+        )
+        for index, source_name in enumerate(opinion_names):
+            for target_name in opinion_names[index + 1 :]:
+                pair = tuple(sorted((source_name, target_name)))
+                if pair in validated_pairs:
+                    continue
+                validation = self.validate_pair(
                     source_name,
-                    source,
+                    opinions[source_name],
                     target_name,
                     opinions[target_name],
-                    question,
+                    "自动核对两位专家的方向与结构化证据是否一致。",
                 )
-            )
+                validation["validation_origin"] = "automatic_pairwise"
+                validations.append(validation)
+                validated_pairs.add(pair)
 
         cross_duration = round(time.perf_counter() - cross_perf_started, 3)
         if timing_context is not None:
@@ -183,7 +232,12 @@ class CrossValidator:
                 "status": "completed",
                 "started_at": cross_started_at.isoformat(),
                 "duration_sec": cross_duration,
-                "requested": sum(1 for v in validations if v.get("question")),
+                "requested": sum(
+                    1 for v in validations if v.get("validation_origin") == "expert_requested"
+                ),
+                "automatic": sum(
+                    1 for v in validations if v.get("validation_origin") == "automatic_pairwise"
+                ),
                 "completed": sum(
                     1 for v in validations if v.get("validation_status", "completed") == "completed"
                 ),
@@ -203,6 +257,13 @@ class CrossValidator:
                     opinions,
                     validations,
                     timeout_seconds=consultation_timeout,
+                    capacity_context={
+                        "_analysis_budget_scope": (
+                            timing_context.get("_analysis_budget_scope", "shared")
+                            if isinstance(timing_context, dict)
+                            else "shared"
+                        )
+                    },
                 ),
                 timeout=consultation_timeout,
             )
@@ -398,9 +459,14 @@ class CrossValidator:
             api_base = (api_base or "").strip()
             api_key = (api_key or "").strip()
             model = (model or "").strip()
-            if not api_key or not model:
+            keyless_loopback = bool(model and not api_key and _is_loopback_api_base(api_base))
+            if not model or (not api_key and not keyless_loopback):
                 return
-            identity = (api_base, model, secret_fingerprint(api_key))
+            identity = (
+                api_base,
+                model,
+                secret_fingerprint(api_key) if api_key else "keyless-loopback",
+            )
             for existing in candidates:
                 if existing.get("_identity") == identity:
                     return
@@ -413,6 +479,9 @@ class CrossValidator:
                     "model": model,
                     "retries": max(int(retries or 1), 1),
                     "source": source,
+                    "configuration_type": (
+                        "keyless_loopback" if keyless_loopback else "api_key"
+                    ),
                     "_identity": identity,
                 }
             )
@@ -427,17 +496,6 @@ class CrossValidator:
             source="primary",
         )
 
-        if settings.high_risk_review_enabled:
-            add_candidate(
-                name="high_risk_review",
-                label="High-risk review model",
-                api_base=settings.high_risk_review_api_base,
-                api_key=settings.high_risk_review_api_key,
-                model=settings.high_risk_review_model,
-                retries=1,
-                source="high_risk_review",
-            )
-
         decision_cfg = self._fixed_model_cfg(DECISION_MAKER_NAME)
         add_candidate(
             name=DECISION_MAKER_NAME,
@@ -448,6 +506,17 @@ class CrossValidator:
             retries=1,
             source="decision_maker",
         )
+
+        if settings.high_risk_review_enabled:
+            add_candidate(
+                name="high_risk_review",
+                label="High-risk review model",
+                api_base=settings.high_risk_review_api_base,
+                api_key=settings.high_risk_review_api_key,
+                model=settings.high_risk_review_model,
+                retries=1,
+                source="high_risk_review",
+            )
 
         primary_api_base = trend_cfg.get("api_base") or ""
         primary_api_key = trend_cfg.get("api_key") or ""
@@ -481,6 +550,7 @@ class CrossValidator:
         message: str,
         raw_content: str | None = None,
         response: Any | None = None,
+        runtime_metrics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         item = {
             "expert": candidate.get("name"),
@@ -491,6 +561,19 @@ class CrossValidator:
             "status": status,
             "message": message,
         }
+        if runtime_metrics:
+            item.update(
+                {
+                    key: runtime_metrics[key]
+                    for key in (
+                        "queue_wait_seconds",
+                        "queue_timeout_seconds",
+                        "inference_duration_seconds",
+                        "consultation_concurrency",
+                    )
+                    if runtime_metrics.get(key) is not None
+                }
+            )
         if raw_content:
             item["raw_content_preview"] = self._shorten(raw_content, 220)
         metadata = getattr(response, "response_metadata", None)
@@ -515,17 +598,28 @@ class CrossValidator:
         messages: list[Any],
         candidate: dict[str, Any],
         request_timeout: float | None = None,
+        *,
+        queue_timeout_seconds: float | None = None,
+        runtime_metrics: dict[str, Any] | None = None,
+        capacity_context: dict[str, Any] | None = None,
     ) -> tuple[Any, str]:
         model = candidate.get("model")
         reasoning_model = _is_reasoning_model(model)
         default_timeout = 20.0 if reasoning_model else 12.0
         llm_timeout = min(max(float(request_timeout or default_timeout), 1.0), default_timeout)
+        api_key = str(candidate.get("api_key") or "").strip()
+        api_base = str(candidate.get("api_base") or "").strip()
+        if not api_key:
+            if not _is_loopback_api_base(api_base):
+                raise RuntimeError("deep consultation requires an API key for non-loopback access")
+            api_key = "local-loopback"
         llm_kwargs: dict[str, Any] = {
-            "base_url": candidate.get("api_base"),
-            "api_key": candidate.get("api_key"),
+            "base_url": api_base,
+            "api_key": api_key,
             "model": model,
             "timeout": llm_timeout,
             "max_retries": 0,
+            "model_kwargs": {"response_format": {"type": "json_object"}},
             "max_completion_tokens": completion_token_limit(
                 "consultation",
                 1400 if reasoning_model else 700,
@@ -543,8 +637,76 @@ class CrossValidator:
             llm_kwargs["extra_body"] = non_thinking_extra_body()
             invoke_messages = self._consultation_messages_for_model(messages, model)
         llm = ChatOpenAI(**llm_kwargs)
-        async with _CONSULTATION_SEMAPHORE:
-            response = await llm.ainvoke(invoke_messages)
+        queue_wait_started = time.perf_counter()
+        queue_timeout = min(
+            max(
+                float(queue_timeout_seconds or _CONSULTATION_QUEUE_WAIT_CAP_SECONDS),
+                0.05,
+            ),
+            _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
+        )
+        consultation_acquired = False
+        shared_capacity_context = dict(capacity_context or {})
+        original_scope = str(
+            shared_capacity_context.get("_analysis_budget_scope") or "shared"
+        )
+        shared_capacity_context["_analysis_budget_scope"] = (
+            f"consultation:{original_scope}"
+        )
+        shared_slot = shared_llm_capacity_slot(shared_capacity_context)
+        shared_acquired = False
+        try:
+            await asyncio.wait_for(_CONSULTATION_SEMAPHORE.acquire(), timeout=queue_timeout)
+            consultation_acquired = True
+            remaining_queue_seconds = max(
+                queue_timeout - (time.perf_counter() - queue_wait_started),
+                0.05,
+            )
+            await asyncio.wait_for(
+                shared_slot.__aenter__(),
+                timeout=remaining_queue_seconds,
+            )
+            shared_acquired = True
+        except TimeoutError as exc:
+            queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
+            if consultation_acquired:
+                _CONSULTATION_SEMAPHORE.release()
+            if runtime_metrics is not None:
+                runtime_metrics.update(
+                    {
+                        "queue_wait_seconds": queue_wait_seconds,
+                        "queue_timeout_seconds": round(queue_timeout, 3),
+                        "inference_duration_seconds": 0.0,
+                        "consultation_concurrency": _CONSULTATION_CONCURRENCY,
+                    }
+                )
+            raise ConsultationQueueTimeoutError(queue_wait_seconds) from exc
+        except BaseException:
+            if shared_acquired:
+                await shared_slot.__aexit__(None, None, None)
+            if consultation_acquired:
+                _CONSULTATION_SEMAPHORE.release()
+            raise
+
+        queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
+        inference_started = time.perf_counter()
+        try:
+            response = await asyncio.wait_for(llm.ainvoke(invoke_messages), timeout=llm_timeout)
+        finally:
+            inference_duration_seconds = round(time.perf_counter() - inference_started, 3)
+            if shared_acquired:
+                await shared_slot.__aexit__(None, None, None)
+            if consultation_acquired:
+                _CONSULTATION_SEMAPHORE.release()
+            if runtime_metrics is not None:
+                runtime_metrics.update(
+                    {
+                        "queue_wait_seconds": queue_wait_seconds,
+                        "queue_timeout_seconds": round(queue_timeout, 3),
+                        "inference_duration_seconds": inference_duration_seconds,
+                        "consultation_concurrency": _CONSULTATION_CONCURRENCY,
+                    }
+                )
         return response, _message_content_text(response).strip()
 
     @staticmethod
@@ -566,6 +728,7 @@ class CrossValidator:
         validations: list[dict[str, Any]],
         *,
         timeout_seconds: float | None = None,
+        capacity_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         major = [v for v in validations if v.get("major_conflict")]
         if not major:
@@ -586,6 +749,9 @@ class CrossValidator:
                 "consultation_expert_label": "行情方向专家",
                 "reason": "行情方向专家未配置可用 API Key，本轮发现重大矛盾但跳过深度会诊。",
                 "major_conflicts": major,
+                "resolution_status": "unresolved",
+                "resolved_action": "unclear",
+                "resolved_conflict_pairs": [],
             }
 
         payload = {
@@ -593,20 +759,27 @@ class CrossValidator:
                 name: {
                     "action": decision.action.value,
                     "confidence": decision.confidence,
-                    "reasoning": self._shorten(decision.reasoning),
+                    "reasoning": self._shorten(decision.reasoning, 160),
                     "cross_check_for": decision.cross_check_for,
                 }
                 for name, decision in opinions.items()
             },
-            "major_conflicts": major,
+            "major_conflicts": [self._compact_conflict(item) for item in major],
         }
         messages = [
             SystemMessage(
                 content=(
                     "你是行情方向专家，也是本轮加密合约交易会诊主持人。"
                     "只处理 listed major_conflicts 中的专家矛盾，结论必须简洁中文。"
-                    "只返回严格 JSON，字段为 conflict_note, observation_summary。"
-                    "结论仅用于解释专家分歧，不得给出交易许可、仓位或杠杆调整。"
+                    "只返回一个严格 JSON 对象，不得使用 Markdown 或增加解释。"
+                    "字段为 conflict_note, observation_summary, "
+                    "resolution_status, resolved_action, resolved_conflict_pairs。"
+                    "conflict_note 和 observation_summary 必须是短字符串，不得嵌套对象。"
+                    "resolution_status 只能是 resolved 或 unresolved；resolved_action 只能是 "
+                    "long、short、hold 或 unclear；resolved_conflict_pairs 只能是已解决专家名"
+                    "二元数组的列表，不得包含对象。"
+                    "只有证据足以确定统一方向并覆盖全部重大冲突时才能返回 resolved。"
+                    "结论仅用于解决分析质量冲突，不得给出交易许可、仓位或杠杆调整。"
                 )
             ),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
@@ -614,27 +787,50 @@ class CrossValidator:
 
         attempts: list[dict[str, Any]] = []
         last_model = primary_model
-        for candidate in candidates:
+        for candidate_index, candidate in enumerate(candidates):
             last_model = str(candidate.get("model") or last_model or "")
             max_attempts = min(max(int(candidate.get("retries") or 1), 1), 1)
             for attempt_no in range(1, max_attempts + 1):
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.5:
                     break
+                runtime_metrics: dict[str, Any] = {}
                 try:
                     model_attempt_cap = (
-                        _CONSULTATION_REASONING_ATTEMPT_CAP_SECONDS
-                        if _is_reasoning_model(candidate.get("model"))
+                        _CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS
+                        if _uses_thinking_tags(candidate.get("model"))
                         else _CONSULTATION_ATTEMPT_CAP_SECONDS
                     )
-                    call_timeout = min(model_attempt_cap, remaining)
+                    has_fallback = candidate_index < len(candidates) - 1
+                    reserve = (
+                        _CONSULTATION_FALLBACK_RESERVE_SECONDS
+                        if has_fallback
+                        and remaining > _CONSULTATION_FALLBACK_RESERVE_SECONDS + 1.0
+                        else 0.0
+                    )
+                    queue_timeout = min(
+                        _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
+                        max(
+                            min(remaining * 0.15, remaining - reserve - 0.5),
+                            0.05,
+                        ),
+                    )
+                    call_timeout = min(
+                        model_attempt_cap,
+                        max(remaining - reserve - queue_timeout, 0.0),
+                    )
+                    if call_timeout <= 0.5:
+                        break
                     response, content = await asyncio.wait_for(
                         self._invoke_consultation_model(
                             messages,
                             candidate,
                             request_timeout=call_timeout,
+                            queue_timeout_seconds=queue_timeout,
+                            runtime_metrics=runtime_metrics,
+                            capacity_context=capacity_context,
                         ),
-                        timeout=call_timeout,
+                        timeout=min(remaining, call_timeout + queue_timeout + 0.1),
                     )
                     if not content:
                         attempts.append(
@@ -644,6 +840,7 @@ class CrossValidator:
                                 "empty_response",
                                 "模型返回空内容，未拿到可解析的会诊结论。",
                                 response=response,
+                                runtime_metrics=runtime_metrics,
                             )
                         )
                         continue
@@ -658,6 +855,7 @@ class CrossValidator:
                                 "模型返回内容不是有效 JSON。",
                                 raw_content=content,
                                 response=response,
+                                runtime_metrics=runtime_metrics,
                             )
                         )
                         continue
@@ -669,6 +867,7 @@ class CrossValidator:
                             "completed",
                             "会诊完成。",
                             response=response,
+                            runtime_metrics=runtime_metrics,
                         )
                     )
                     parsed["model"] = candidate.get("model")
@@ -681,6 +880,34 @@ class CrossValidator:
                     parsed["major_conflicts"] = major
                     parsed["consultation_attempts"] = attempts
                     parsed["fallback_used"] = candidate.get("source") != "primary" or attempt_no > 1
+                    allowed_actions = {"long", "short", "hold"}
+                    resolution_status = str(parsed.get("resolution_status") or "").lower()
+                    resolved_action = str(parsed.get("resolved_action") or "unclear").lower()
+                    major_pairs = {
+                        tuple(sorted(str(name) for name in item.get("expert_pair") or []))
+                        for item in major
+                        if isinstance(item, dict) and len(item.get("expert_pair") or []) == 2
+                    }
+                    resolved_pairs = {
+                        tuple(sorted(str(name) for name in pair))
+                        for pair in parsed.get("resolved_conflict_pairs") or []
+                        if isinstance(pair, (list, tuple)) and len(pair) == 2
+                    }
+                    resolution_is_complete = bool(
+                        resolution_status == "resolved"
+                        and resolved_action in allowed_actions
+                        and major_pairs
+                        and major_pairs.issubset(resolved_pairs)
+                    )
+                    parsed["resolution_status"] = (
+                        "resolved" if resolution_is_complete else "unresolved"
+                    )
+                    parsed["resolved_action"] = (
+                        resolved_action if resolution_is_complete else "unclear"
+                    )
+                    parsed["resolved_conflict_pairs"] = [
+                        list(pair) for pair in sorted(major_pairs & resolved_pairs)
+                    ]
                     parsed = {
                         key: value
                         for key, value in parsed.items()
@@ -696,10 +923,31 @@ class CrossValidator:
                             "major_conflicts",
                             "consultation_attempts",
                             "fallback_used",
+                            "resolution_status",
+                            "resolved_action",
+                            "resolved_conflict_pairs",
                         }
                     }
                     parsed["production_permission"] = False
                     return parsed
+                except ConsultationQueueTimeoutError as exc:
+                    error_text = safe_error_text(exc)
+                    logger.warning(
+                        "deep consultation queue timed out",
+                        expert=candidate.get("name"),
+                        model=candidate.get("model"),
+                        attempt=attempt_no,
+                        **runtime_metrics,
+                    )
+                    attempts.append(
+                        self._consultation_attempt(
+                            candidate,
+                            attempt_no,
+                            "queue_timeout",
+                            error_text,
+                            runtime_metrics=runtime_metrics,
+                        )
+                    )
                 except Exception as exc:
                     error_text = safe_error_text(exc)
                     logger.warning(
@@ -715,6 +963,7 @@ class CrossValidator:
                             attempt_no,
                             "call_failed",
                             error_text,
+                            runtime_metrics=runtime_metrics,
                         )
                     )
             if deadline - time.perf_counter() <= 0.5:
@@ -726,6 +975,20 @@ class CrossValidator:
             "深度会诊多次尝试失败",
             attempts=attempts,
         )
+
+    def _compact_conflict(self, conflict: dict[str, Any]) -> dict[str, Any]:
+        """Keep consultation input within the local model context window."""
+
+        return {
+            "expert_pair": list(conflict.get("expert_pair") or [])[:2],
+            "question": self._shorten(str(conflict.get("question") or ""), 120),
+            "consistency": str(conflict.get("consistency") or "divergent"),
+            "conflict_note": self._shorten(str(conflict.get("conflict_note") or ""), 180),
+            "checked_evidence": [
+                self._shorten(str(item), 80)
+                for item in list(conflict.get("checked_evidence") or [])[:8]
+            ],
+        }
 
     def _extract_json(self, text: str) -> dict[str, Any]:
         text = text.strip()
@@ -760,6 +1023,9 @@ class CrossValidator:
             "production_permission": False,
             "major_conflicts": major,
             "consultation_attempts": attempts or [],
+            "resolution_status": "unresolved",
+            "resolved_action": "unclear",
+            "resolved_conflict_pairs": [],
         }
         if raw_content:
             result["raw_content_preview"] = self._shorten(raw_content, 300)

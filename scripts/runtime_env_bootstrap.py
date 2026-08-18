@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_RUNTIME_ENV_PATH = Path("/etc/bb/bb-runtime.env")
+RUNTIME_ENV_PATH_OVERRIDE_ENV = "BB_RUNTIME_ENV_PATH"
 DEFAULT_RUNTIME_USER = "bb"
 RUNTIME_USER_DROPPED_ENV = "BB_RUNTIME_USER_DROPPED"
 SKIP_RUNTIME_USER_DROP_ENV = "BB_SKIP_RUNTIME_USER_DROP"
@@ -19,6 +20,10 @@ def load_runtime_env_files(
 ) -> dict[str, str]:
     """Load project and systemd runtime env files before importing settings-heavy modules."""
 
+    if runtime_env_path == DEFAULT_RUNTIME_ENV_PATH:
+        override_path = str(os.environ.get(RUNTIME_ENV_PATH_OVERRIDE_ENV) or "").strip()
+        if override_path:
+            runtime_env_path = Path(override_path)
     loaded: dict[str, str] = {}
     for env_path in (project_root / ".env", runtime_env_path):
         loaded.update(_load_env_file(env_path))

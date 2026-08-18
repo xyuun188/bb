@@ -2806,8 +2806,14 @@ function analysisExpertStatusLine(record, missingCount) {
     if (preExpertSkip.skipped) {
         return `${preExpertSkip.label}；没有消耗大模型专家`;
     }
-    if (missingCount) return `${missingCount} 个未返回，点详情查看原因`;
-    return '5 个专家都已返回';
+    const expectedCount = Number(record?.expected_expert_count ?? 0);
+    const successfulCount = Number(record?.expert_count ?? 0);
+    const returnedCount = Number(record?.returned_expert_count ?? successfulCount);
+    if (record?.analysis_complete === false) {
+        return `有效 ${successfulCount}/${expectedCount}，实际返回 ${returnedCount}；分析证据不完整`;
+    }
+    if (missingCount) return `${missingCount} 个未完成，点详情查看原因`;
+    return `${expectedCount} 个专家均已有效返回`;
 }
 
 function pctLabel(value, digits = 0) {
@@ -3242,6 +3248,136 @@ function analysisLocalToolsErrorsText(errors) {
     }).join('；');
 }
 
+function analysisFundingTimeLabel(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    const text = String(value).trim();
+    if (/^\d{10,16}$/.test(text)) {
+        let epoch = Number(text);
+        if (text.length <= 10) epoch *= 1000;
+        if (text.length >= 16) epoch /= 1000;
+        if (Number.isFinite(epoch)) return toBeijingTime(new Date(epoch).toISOString());
+    }
+    return toBeijingTime(text);
+}
+
+function analysisFundingRateLabel(value) {
+    const rate = Number(value);
+    if (!Number.isFinite(rate)) return '-';
+    const sign = rate > 0 ? '+' : '';
+    return `${sign}${(rate * 100).toFixed(6)}%`;
+}
+
+function analysisFundingEvidenceReason(reason) {
+    const labels = {
+        current_direction_funding_cashflow_ready: '证据完整',
+        funding_data_unavailable: '资金费数据不可用',
+        funding_rate_missing: '资金费率缺失',
+        funding_interval_missing: '结算周期缺失',
+        prediction_horizon_missing: '预测持仓周期缺失',
+        next_funding_time_missing: '下次结算时间缺失',
+        funding_rate_observed_at_missing: '资金费率数据时间缺失',
+        funding_rate_stale: '资金费率已过期',
+        funding_side_invalid: '持仓方向无效',
+    };
+    const key = String(reason || '').trim();
+    return labels[key] || (key ? analysisReasonLabel(key) : '未说明');
+}
+
+function analysisFundingSideRisk(projection) {
+    if (!projection || projection.production_eligible !== true) return '证据不可用';
+    const cashflow = Number(projection.signed_cashflow_pct);
+    if (!Number.isFinite(cashflow) || cashflow === 0) return '预计无资金费现金流';
+    return cashflow > 0 ? '预计资金费收入' : '预计资金费支出';
+}
+
+function renderMarketFundingAnalysis(directionCompetition) {
+    const direction = directionCompetition && typeof directionCompetition === 'object'
+        ? directionCompetition : {};
+    const projection = direction.funding_projection && typeof direction.funding_projection === 'object'
+        ? direction.funding_projection : {};
+    const longFunding = projection.long && typeof projection.long === 'object'
+        ? projection.long : {};
+    const shortFunding = projection.short && typeof projection.short === 'object'
+        ? projection.short : {};
+    const longDirection = direction.long && typeof direction.long === 'object'
+        ? direction.long : {};
+    const shortDirection = direction.short && typeof direction.short === 'object'
+        ? direction.short : {};
+    const evidenceComplete = projection.evidence_complete === true;
+    const evidenceReason = evidenceComplete
+        ? '费率、结算时间与预测周期完整'
+        : [longFunding.reason, shortFunding.reason]
+            .map(analysisFundingEvidenceReason)
+            .filter((value, index, list) => value && list.indexOf(value) === index)
+            .join('、') || '资金费证据不可用';
+    const sourceTime = longFunding.funding_rate_observed_at
+        || shortFunding.funding_rate_observed_at;
+    const nextFundingTime = longFunding.next_funding_time || shortFunding.next_funding_time;
+    const intervalMinutes = Number(
+        longFunding.funding_interval_minutes ?? shortFunding.funding_interval_minutes
+    );
+    const intervalText = Number.isFinite(intervalMinutes) && intervalMinutes > 0
+        ? `${intervalMinutes.toFixed(0)} 分钟` : '-';
+    const longEdge = Number(longDirection.score);
+    const shortEdge = Number(shortDirection.score);
+    const preferredSide = String(direction.preferred_side || 'neutral').toLowerCase();
+    return `
+        <div class="analysis-card analysis-final-card">
+            <div class="analysis-card-head">
+                <div class="analysis-card-title">市场资金费与方向净优势</div>
+                <div class="analysis-card-tags">
+                    ${analysisPill(evidenceComplete ? '证据完整' : '证据不可用', evidenceComplete ? 'good' : 'warn')}
+                    ${analysisPill(`方向 ${preferredSide === 'long' ? '做多' : preferredSide === 'short' ? '做空' : '中性'}`, preferredSide === 'neutral' ? 'muted' : 'good')}
+                </div>
+            </div>
+            <div class="analysis-card-text">
+                <div class="analysis-resolution-list">
+                    <div class="analysis-resolution-item"><strong>当前费率</strong><span>${escHtml(analysisFundingRateLabel(longFunding.funding_rate ?? shortFunding.funding_rate))} · 周期 ${escHtml(intervalText)}</span></div>
+                    <div class="analysis-resolution-item"><strong>费率数据时间</strong><span>${escHtml(analysisFundingTimeLabel(sourceTime))}</span></div>
+                    <div class="analysis-resolution-item"><strong>下一次结算</strong><span>${escHtml(analysisFundingTimeLabel(nextFundingTime))}</span></div>
+                    <div class="analysis-resolution-item"><strong>做多预计资金费</strong><span>${escHtml(signedPctValueLabel(longFunding.signed_cashflow_pct))} · ${escHtml(analysisFundingSideRisk(longFunding))} · 预计 ${Number(longFunding.estimated_settlement_count || 0)} 次结算</span></div>
+                    <div class="analysis-resolution-item"><strong>做空预计资金费</strong><span>${escHtml(signedPctValueLabel(shortFunding.signed_cashflow_pct))} · ${escHtml(analysisFundingSideRisk(shortFunding))} · 预计 ${Number(shortFunding.estimated_settlement_count || 0)} 次结算</span></div>
+                    <div class="analysis-resolution-item"><strong>资金费后净优势</strong><span>做多 ${escHtml(Number.isFinite(longEdge) ? signedPctValueLabel(longEdge) : '-')} · 做空 ${escHtml(Number.isFinite(shortEdge) ? signedPctValueLabel(shortEdge) : '-')}</span></div>
+                    <div class="analysis-resolution-item"><strong>证据状态</strong><span>${escHtml(evidenceReason)}</span></div>
+                </div>
+            </div>
+        </div>`;
+}
+
+function renderPositionFundingAnalysis(dynamicExitPolicy) {
+    const policy = dynamicExitPolicy && typeof dynamicExitPolicy === 'object'
+        ? dynamicExitPolicy : {};
+    if (!Object.keys(policy).length) {
+        return '<div class="analysis-empty">本轮没有返回持仓资金费与净收益合同。</div>';
+    }
+    const evidenceComplete = policy.funding_evidence_eligible === true;
+    const fundingIncluded = policy.funding_fee_included === true;
+    const evidenceLabel = evidenceComplete
+        ? '已结算资金费已完成账单与生命周期核验'
+        : analysisFundingEvidenceReason(policy.funding_evidence_status || policy.funding_cost_projection_reason);
+    return `
+        <div class="analysis-card analysis-final-card">
+            <div class="analysis-card-head">
+                <div class="analysis-card-title">持仓资金费与净收益</div>
+                <div class="analysis-card-tags">
+                    ${analysisPill(evidenceComplete ? '已结算证据完整' : '已结算证据不完整', evidenceComplete ? 'good' : 'warn')}
+                    ${policy.observation_only === true ? analysisPill('只读评估', 'muted') : ''}
+                    ${analysisPill(policy.eligible === true ? '退出合同可用' : '退出合同未通过', policy.eligible === true ? 'good' : 'warn')}
+                </div>
+            </div>
+            <div class="analysis-card-text">
+                <div class="analysis-resolution-list">
+                    <div class="analysis-resolution-item"><strong>已结算资金费</strong><span>${escHtml(signedMoneyWithUnit(policy.settled_funding_fee ?? policy.funding_fee_usdt))} · ${fundingIncluded ? '已计入净收益' : '未核验，未计入净收益'}</span></div>
+                    <div class="analysis-resolution-item"><strong>预计未来资金费</strong><span>${escHtml(signedMoneyWithUnit(policy.expected_future_funding_cashflow))} · 下次结算 ${escHtml(analysisFundingTimeLabel(policy.next_funding_time))}</span></div>
+                    <div class="analysis-resolution-item"><strong>当前生命周期净收益</strong><span>${escHtml(signedMoneyWithUnit(policy.current_lifecycle_net_pnl ?? policy.lifecycle_net_pnl_usdt))}</span></div>
+                    <div class="analysis-resolution-item"><strong>继续持仓预计净收益</strong><span>${escHtml(signedMoneyWithUnit(policy.projected_hold_net_pnl))}</span></div>
+                    <div class="analysis-resolution-item"><strong>资金费证据状态</strong><span>${escHtml(evidenceLabel)}</span></div>
+                    <div class="analysis-resolution-item"><strong>动态退出</strong><span>收益保护压力 ${Number(policy.profit_lock_pressure || 0).toFixed(4)} · 建议平仓比例 ${pctLabel(policy.close_fraction, 1)} · ${escHtml(analysisFundingEvidenceReason(policy.reason))}</span></div>
+                </div>
+            </div>
+        </div>`;
+}
+
 function renderAnalysisLocalAiTools(tools, analysisType = 'market') {
     if (!tools) {
         return '<div class="analysis-empty">本轮没有调用服务器量化工具。</div>';
@@ -3525,15 +3661,18 @@ function renderAnalysisPage() {
         const cross = r.cross_summary || {};
         const preExpertSkip = analysisPreExpertSkip(r);
         const expertCount = Number(r.expert_count || (r.experts || []).length || 0); 
-        const expectedCount = Number(r.expected_expert_count || 5); 
+        const expectedCount = Number(r.expected_expert_count ?? 0);
         const attemptedCount = preExpertSkip.skipped ? 0 : Number(r.attempted_expert_count || expectedCount);  
         const missingCount = preExpertSkip.skipped ? 0 : Math.max(expectedCount - expertCount, 0);  
         const hasMajorConflict = Number(cross.major_conflicts || 0) > 0;  
         const completedCross = Number(cross.completed ?? cross.total ?? 0);
+        const expectedCross = Number(cross.expected ?? r.cross_requested ?? cross.total ?? 0);
+        const expertRequestedCross = Number(cross.expert_requested || 0);
+        const automaticCross = Number(cross.automatic || 0);
         const unavailableCross = Number(cross.unavailable || 0);
         const crossText = preExpertSkip.skipped
             ? '预检阶段未发起交叉验证'
-            : `请求 ${Number(r.cross_requested || 0)}，完成 ${completedCross}，无法验证 ${unavailableCross}，分歧 ${Number(cross.divergent || 0)}`;  
+            : `计划 ${expectedCross}，完成 ${completedCross}（专家请求 ${expertRequestedCross} / 自动 ${automaticCross}），无法验证 ${unavailableCross}，分歧 ${Number(cross.divergent || 0)}`;
         const expertStatusLine = analysisExpertStatusLine(r, missingCount);
         const expertStatusColor = missingCount ? 'var(--yellow)' : 'var(--text-muted)';
         const expertSummary = preExpertSkip.skipped
@@ -3718,9 +3857,14 @@ function renderAnalysisReasonModal(record) {
     const crossSummary = record.cross_summary || {};
     const preExpertSkip = analysisPreExpertSkip(record);
     const expertCount = Number(record.expert_count || experts.length || 0);  
-    const expectedCount = Number(record.expected_expert_count || 5);  
+    const expectedCount = Number(record.expected_expert_count ?? 0);
     const attemptedCount = preExpertSkip.skipped ? 0 : Number(record.attempted_expert_count || expectedCount);  
     const completedCross = Number(crossSummary.completed ?? crossSummary.total ?? 0);
+    const expectedCross = Number(
+        crossSummary.expected ?? record.cross_requested ?? crossSummary.total ?? 0
+    );
+    const expertRequestedCross = Number(crossSummary.expert_requested || 0);
+    const automaticCross = Number(crossSummary.automatic || 0);
     const unavailableCross = Number(crossSummary.unavailable || 0);
     const majorConflicts = Number(crossSummary.major_conflicts || 0);
     const finalConfidence = `${(Number(record.final_confidence || 0) * 100).toFixed(0)}%`;
@@ -3747,6 +3891,12 @@ function renderAnalysisReasonModal(record) {
     const newsContext = record.news_context || null;
     const vectorMemory = record.vector_memory || null;
     const attribution = record.decision_attribution || null;
+    const isPositionFundingAnalysis = ['position', 'position_review'].includes(
+        String(record.analysis_type || '').toLowerCase()
+    );
+    const fundingAnalysisHtml = isPositionFundingAnalysis
+        ? renderPositionFundingAnalysis(record.dynamic_exit_policy)
+        : renderMarketFundingAnalysis(record.direction_competition);
  
     const expertsHtml = preExpertSkip.skipped ? `
         <div class="analysis-card analysis-card-warning">
@@ -4070,7 +4220,7 @@ function renderAnalysisReasonModal(record) {
             <div class="analysis-summary">
                 ${analysisMetric('专家返回', preExpertSkip.skipped ? preExpertSkip.label : `${expertCount}/${expectedCount}`, preExpertSkip.skipped || expertCount === expectedCount ? 'good' : 'warn')}
                 ${mlSignal?.available ? analysisMetric('ML目标期望', distributionPctLabel(mlSignalDistribution?.objective_expected_return_pct), mlSignalDistribution && Number(mlSignalDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn') : ''}
-                ${analysisMetric('交叉验证', `${completedCross}/${Number(record.cross_requested || 0)}`, unavailableCross ? 'warn' : 'good')}
+                ${analysisMetric('交叉验证', `${completedCross}/${expectedCross}`, unavailableCross || completedCross < expectedCross ? 'warn' : 'good')}
                 ${analysisMetric('分析耗时', analysisDurationLabel(totalDuration), totalDuration > 60 ? 'warn' : 'muted')}
                 ${analysisMetric('最终方向', analysisActionLabel(record.final_action, record), analysisTone(record.final_action))}
                 ${lifecycleLabel ? analysisMetric('持仓状态', lifecycleLabel, analysisPositionLifecycleTone(record)) : ''}
@@ -4078,6 +4228,7 @@ function renderAnalysisReasonModal(record) {
             </div>
 
             ${attributionHtml ? analysisSection('决策归因面板', attributionHtml) : ''}
+            ${analysisSection(isPositionFundingAnalysis ? '持仓资金费' : '市场资金费', fundingAnalysisHtml)}
             ${analysisSection('Agent/Skills 守门', renderAnalysisAgentSkills(agentSkills))}
             ${analysisSection('本地ML盈亏质量', renderAnalysisMlSignal(mlSignal))}
             ${analysisSection('服务器量化工具', renderAnalysisLocalAiTools(localAiTools, record.analysis_type))}
@@ -4085,7 +4236,7 @@ function renderAnalysisReasonModal(record) {
             ${analysisSection('三期相似样本记忆', renderAnalysisVectorMemory(vectorMemory))}
             ${analysisSection(preExpertSkip.skipped ? preExpertSkip.label : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
             ${missingHtml ? analysisSection('未返回专家', `<div class="analysis-grid">${missingHtml}</div>`) : ''}
-            ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `请求 ${Number(record.cross_requested || 0)} 个，完成 ${completedCross} 个，无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
+            ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `计划 ${expectedCross} 个，完成 ${completedCross} 个（专家请求 ${expertRequestedCross} 个，自动核验 ${automaticCross} 个），无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
             ${analysisSection('深度会诊', consultation)}
             ${analysisSection('分歧处理', resolutionHtml)}
             ${analysisSection('最终交易员', decisionMakerHtml)}

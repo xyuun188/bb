@@ -12,7 +12,7 @@ from typing import Any
 SHADOW_LABEL_VERSION = "2026-07-27.market-opportunity-multitask.v2"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-24.authoritative-trade-outcome.v3"
-AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-07-24.net-return-after-all-cost.v2"
+AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-08-17.net-return-funding-audit.v3"
 AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
 AUTHORITATIVE_EXPERT_MEMORY_SOURCE = "authoritative_trade_outcome"
 AUTHORITATIVE_TRADE_OUTCOME_SOURCES = frozenset(

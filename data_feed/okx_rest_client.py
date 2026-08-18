@@ -812,12 +812,36 @@ class OKXRestClient:
             params["instId"] = next(iter(target_inst_ids))
         response = await self._ccxt_call("privateGetAccountPositions", params)
         rows = response.get("data", []) if isinstance(response, dict) else []
-        return [
-            self._native_position_to_ccxt_shape(row)
+        position_rows = [
+            row
             for row in rows
             if isinstance(row, dict)
             and self._native_position_row_is_open(row)
             and self._row_inst_id_matches(row, target_inst_ids)
+        ]
+        position_inst_ids = {
+            str(row.get("instId") or "").strip().upper()
+            for row in position_rows
+            if str(row.get("instId") or "").strip()
+        }
+        spec_results = await asyncio.gather(
+            *(self.fetch_instrument_spec(inst_id) for inst_id in position_inst_ids),
+            return_exceptions=True,
+        )
+        specs = {
+            inst_id: result
+            for inst_id, result in zip(position_inst_ids, spec_results, strict=True)
+            if isinstance(result, dict) and result
+        }
+        return [
+            self._native_position_to_ccxt_shape(
+                row,
+                contract_spec=specs.get(
+                    str(row.get("instId") or "").strip().upper(),
+                    {},
+                ),
+            )
+            for row in position_rows
         ]
 
     async def create_order(
@@ -1096,8 +1120,14 @@ class OKXRestClient:
     def _native_position_row_is_open(self, row: dict[str, Any]) -> bool:
         return abs(self._safe_float(row.get("pos"))) > 0
 
-    def _native_position_to_ccxt_shape(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _native_position_to_ccxt_shape(
+        self,
+        row: dict[str, Any],
+        *,
+        contract_spec: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         info = dict(row)
+        spec = contract_spec if isinstance(contract_spec, dict) else {}
         inst_id = str(info.get("instId") or "").strip().upper()
         pos = self._safe_float(info.get("pos"))
         pos_side = str(info.get("posSide") or "").lower().strip()
@@ -1105,13 +1135,21 @@ class OKXRestClient:
             side = "short" if pos < 0 else "long" if pos > 0 else ""
         else:
             side = pos_side
-        contract_size = self._safe_float(info.get("ctVal"))
+        contract_size = self._safe_float(spec.get("ctVal") or info.get("ctVal")) * self._safe_float(
+            spec.get("ctMult") or info.get("ctMult") or 1.0
+        )
         return {
             "id": str(info.get("posId") or ""),
             "symbol": inst_id or symbol_from_okx_inst_id(inst_id),
             "side": side,
             "contracts": abs(pos),
             "contractSize": contract_size if contract_size > 0 else None,
+            "contractSizeSource": (
+                str(spec.get("source") or "okx_public_instruments")
+                if spec
+                else "private_position_row"
+            ),
+            "contractSpec": dict(spec),
             "markPrice": self._safe_float(info.get("markPx")),
             "entryPrice": self._safe_float(info.get("avgPx")),
             "unrealizedPnl": self._safe_float(info.get("upl")),

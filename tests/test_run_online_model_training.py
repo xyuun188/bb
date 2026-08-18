@@ -4,6 +4,7 @@ import re
 import pytest
 
 from scripts.run_online_model_training import (
+    MAX_REMOTE_OUTPUT_TEXT_LIMIT,
     _persisted_training_result,
     _remote_command,
     _target_argv,
@@ -41,6 +42,8 @@ def test_online_training_command_terminates_before_ssh_timeout() -> None:
     )
 
     assert "timeout --signal=INT --kill-after=30s 7140s $PYBIN -" in command
+    assert "contextlib.redirect_stdout(captured_stdout)" in command
+    assert 'compact_payload["full_result_chars"]' in command
 
 
 def test_online_training_requires_successful_structured_business_result() -> None:
@@ -51,6 +54,10 @@ def test_online_training_requires_successful_structured_business_result() -> Non
     )
 
     assert _persisted_training_result("ml_signal", output)["trained"] is True
+
+
+def test_online_training_transport_allows_full_structured_result() -> None:
+    assert MAX_REMOTE_OUTPUT_TEXT_LIMIT >= 200_000
 
 
 @pytest.mark.parametrize(

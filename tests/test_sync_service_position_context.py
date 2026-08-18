@@ -233,6 +233,47 @@ def test_normalized_context_does_not_restore_contract_size_after_contracts_chang
     assert context["contract_size_source"] == "exchange_position_snapshot"
 
 
+def test_normalized_context_keeps_inverse_contract_dynamic_base_quantity() -> None:
+    context = normalized_open_position_context(
+        {
+            "symbol": "BTC/USD:BTC",
+            "side": "long",
+            "contracts": 10.0,
+            "entryPrice": 99000.0,
+            "markPrice": 100000.0,
+            "notional": 1000.0,
+            "current_management_contract": {
+                **_management_contract(contracts=10.0, quantity=0.02),
+                "symbol": "BTC/USD",
+                "contract_size": 100.0,
+                "ct_type": "inverse",
+            },
+            "contractSpec": {
+                "instId": "BTC-USD-SWAP",
+                "ctVal": "100",
+                "ctMult": "1",
+                "ctValCcy": "USD",
+                "settleCcy": "BTC",
+                "ctType": "inverse",
+                "source": "okx_public_instruments",
+            },
+            "info": {
+                "instId": "BTC-USD-SWAP",
+                "pos": "10",
+                "avgPx": "99000",
+                "markPx": "100000",
+                "notionalUsd": "1000",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+        float_parser=_float,
+    )
+
+    assert context["quantity"] == pytest.approx(0.01)
+    assert context["contract_size"] == pytest.approx(100.0)
+    assert context["notional"] == pytest.approx(1000.0)
+
+
 def test_merge_local_position_candidates_keeps_order_identity_without_old_plans() -> None:
     merged = _merge_local_position_candidates(
         [

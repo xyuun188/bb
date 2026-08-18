@@ -7,6 +7,7 @@ into the main trading loop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import math
@@ -24,13 +25,14 @@ from typing import Any
 import structlog
 from sqlalchemy import Float, cast, func, select
 
+from ai_brain.analysis_quality import build_expert_call_contract
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
 from config.settings import (
     DECISION_MAKER_NAME,
     ENSEMBLE_TRADER_NAME,
-    FIXED_AI_MODEL_SLOTS,
+    MARKET_ANALYSIS_EXPERT_NAMES,
     settings,
 )
 from core.safe_output import safe_error_tail, safe_error_text
@@ -82,6 +84,7 @@ from services.entry_direction_competition import EntryDirectionCompetitionPolicy
 from services.entry_execution_handoff import await_entry_execution_handoff
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 from services.entry_fee_provider import EntryFeeProvider
+from services.entry_funnel_diagnostics import build_entry_funnel_report
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.entry_market_data_quality import (
     EntryMarketDataQualityPolicy,
@@ -389,6 +392,10 @@ def _feature_fetch_batch_timeout_seconds(
 
 _analysis_scope_context: ContextVar[str | None] = ContextVar(
     "analysis_scope_context",
+    default=None,
+)
+_analysis_round_id_context: ContextVar[str | None] = ContextVar(
+    "analysis_round_id_context",
     default=None,
 )
 
@@ -1302,6 +1309,22 @@ class TradingService:
             0.0,
         )
         return round(min(normal_timeout, budget_limited_timeout), 3)
+
+    @staticmethod
+    def market_symbol_model_start_defer_reason(
+        symbol_timeout_seconds: float,
+    ) -> str | None:
+        """Reject model work that cannot receive a viable expert window."""
+
+        try:
+            available_seconds = max(float(symbol_timeout_seconds or 0.0), 0.0)
+        except (TypeError, ValueError):
+            available_seconds = 0.0
+        if available_seconds <= 0.0:
+            return "time_budget_exhausted"
+        if available_seconds < MARKET_SYMBOL_ANALYSIS_MIN_SECONDS:
+            return "model_start_budget_insufficient"
+        return None
 
     def market_symbol_context_timeout_seconds(self) -> float:
         """Return the independent deadline for memory and local context work."""
@@ -6968,6 +6991,8 @@ class TradingService:
         return {
             "read_only": True,
             "is_entry_gate": False,
+            "funnel_version": "2026-08-17.market-candidate-funnel.v2",
+            "round_id": _analysis_round_id_context.get(),
             "mode": "auto",
             "analysis_scope": analysis_scope,
             "run_market_analysis": bool(run_market_analysis),
@@ -7074,6 +7099,15 @@ class TradingService:
             "本次不会开仓，也不会改变风控条件。"
         )
         symbol = str(getattr(feature, "symbol", "") or "")
+        attempted = list(attempted_experts or [])
+        quality_contract = build_expert_call_contract(
+            expected_names=attempted,
+            attempted_names=attempted,
+            opinions={},
+            timings=[{"name": name, "status": "timeout"} for name in attempted],
+            failures=[],
+        )
+        quality_contract.update({"reason_code": "model_timeout", "reason": reason})
         return DecisionOutput(
             model_name=ENSEMBLE_TRADER_NAME,
             symbol=symbol,
@@ -7104,6 +7138,7 @@ class TradingService:
                     "reason": reason,
                 },
                 "market_context_timings": list(market_context_timings),
+                "analysis_quality_contract": quality_contract,
             },
             feature_snapshot=(feature.to_dict() if hasattr(feature, "to_dict") else {}),
         )
@@ -7858,6 +7893,7 @@ class TradingService:
             run_position_analysis = analysis_scope in {"full", "position"}
         new_pair_market_pause_applied = False
         round_start = datetime.now(UTC)
+        round_id = f"{analysis_scope}:{round_start.strftime('%Y%m%dT%H%M%S.%fZ')}"
         round_deadline_monotonic: float | None = None
         if analysis_scope == "position":
             round_deadline_monotonic = (
@@ -7868,6 +7904,7 @@ class TradingService:
             "mode": mode_manager.mode.value,
             "analysis_scope": analysis_scope,
             "timestamp": round_start.isoformat(),
+            "round_id": round_id,
             "symbols_processed": 0,
             "decisions": [],
             "executions": [],
@@ -7881,6 +7918,7 @@ class TradingService:
         feature_fetch_budget_diagnostics: dict[str, Any] = {}
         rank_diagnostics_snapshot: dict[str, Any] = {}
         scope_token = _analysis_scope_context.set(analysis_scope)
+        round_id_token = _analysis_round_id_context.set(round_id)
         self._start_runtime_round(analysis_scope, round_start)
         self._set_loop_stage("starting")
 
@@ -8627,7 +8665,7 @@ class TradingService:
                     strategy_context=strategy_mode_context,
                     market_symbol_count=len(market_feature_items),
                 )
-                if market_index > 0 and budget_defer_reason is not None:
+                if budget_defer_reason is not None:
                     remaining = [
                         item_symbol for item_symbol, _item_fv in market_feature_items[market_index:]
                     ]
@@ -8986,21 +9024,42 @@ class TradingService:
                     ),
                     remaining_symbol_count=len(market_feature_items) - market_index,
                 )
-                if symbol_timeout_seconds <= 0.0:
+                model_start_defer_reason = self.market_symbol_model_start_defer_reason(
+                    symbol_timeout_seconds
+                )
+                if model_start_defer_reason is not None:
                     remaining = [
                         item_symbol
                         for item_symbol, _item_fv in market_feature_items[market_index:]
                     ]
                     market_round_skipped_by_budget = remaining
-                    market_round_defer_reason = "time_budget_exhausted"
+                    market_round_defer_reason = model_start_defer_reason
                     self._market_defer_tracker().defer_many(
                         remaining,
                         "round_time_budget",
                     )
                     logger.info(
-                        "market model stage deferred because round budget is exhausted",
+                        "market model stage deferred before expert coordination",
                         symbol=symbol,
                         skipped_count=len(remaining),
+                        defer_reason=model_start_defer_reason,
+                        available_model_seconds=round(symbol_timeout_seconds, 3),
+                        required_model_seconds=MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+                    )
+                    results.setdefault("market_analysis_scheduler_deferrals", []).append(
+                        {
+                            "read_only": True,
+                            "is_entry_gate": False,
+                            "reason": model_start_defer_reason,
+                            "symbol": symbol,
+                            "available_model_seconds": round(symbol_timeout_seconds, 3),
+                            "required_model_seconds": MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
+                            "context_preparation_duration_seconds": round(
+                                max(model_started_monotonic - symbol_started_monotonic, 0.0),
+                                3,
+                            ),
+                            "deferred_symbols": remaining[:20],
+                        }
                     )
                     break
                 symbol_deadline_monotonic = model_started_monotonic + max(
@@ -9079,12 +9138,7 @@ class TradingService:
                         fv,
                         timeout_seconds=symbol_timeout_seconds,
                         market_context_timings=market_context_timings,
-                        attempted_experts=[
-                            str(slot.get("name") or "")
-                            for slot in FIXED_AI_MODEL_SLOTS
-                            if slot.get("name") != DECISION_MAKER_NAME
-                            and str(slot.get("name") or "")
-                        ],
+                        attempted_experts=list(MARKET_ANALYSIS_EXPERT_NAMES),
                     )
                     _opinions = {}
                 else:
@@ -9448,10 +9502,14 @@ class TradingService:
                 if isinstance(funnel, dict):
                     self._last_market_candidate_funnel = self._safe_dict(funnel)
                 self._last_market_round_summary = {
+                    "round_id": round_id,
                     "status": results.get("status"),
                     "symbols_processed": int(results.get("symbols_processed") or 0),
                     "decision_count": len(results.get("decisions") or []),
                     "execution_count": len(results.get("executions") or []),
+                    "entry_funnel": build_entry_funnel_report(
+                        results.get("decisions") or []
+                    ),
                     "market_indicator_prewarm": self._safe_dict(
                         results.get("market_indicator_prewarm")
                     ),
@@ -9490,6 +9548,7 @@ class TradingService:
                         error=safe_error_text(exc),
                     )
             _analysis_scope_context.reset(scope_token)
+            _analysis_round_id_context.reset(round_id_token)
         return results
 
     @staticmethod
@@ -12914,6 +12973,7 @@ class TradingService:
         return self.execution_result_factory.rejected(decision, error)
 
     async def _log_decision(self, decision: DecisionOutput, is_paper: bool) -> int | None:
+        self._attach_analysis_idempotency(decision)
         if is_paper:
             raw = self._safe_dict(decision.raw_response)
             attach_initial_trade_recommendation(
@@ -12938,6 +12998,32 @@ class TradingService:
                 },
             )
         return decision_id
+
+    def _attach_analysis_idempotency(self, decision: DecisionOutput) -> None:
+        round_id = _analysis_round_id_context.get()
+        if not round_id:
+            return
+        raw = self._safe_dict(decision.raw_response)
+        analysis_type = self.decision_persistence.analysis_type(decision, raw)
+        snapshot = self._safe_dict(decision.feature_snapshot)
+        timeframe = str(
+            snapshot.get("technical_indicator_timeframe")
+            or snapshot.get("sequence_timeframe")
+            or snapshot.get("short_returns_timeframe")
+            or "mixed"
+        )
+        components = {
+            "round_id": round_id,
+            "symbol": self._normalize_position_symbol(decision.symbol) or decision.symbol,
+            "timeframe": timeframe,
+            "analysis_type": analysis_type,
+        }
+        digest = hashlib.sha256(
+            json.dumps(components, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        raw["analysis_idempotency"] = components
+        raw["analysis_idempotency_key"] = f"analysis-v1:{digest}"
+        decision.raw_response = raw
 
     def _json_safe_payload(self, value: Any) -> Any:
         """Return a JSON-column-safe copy of model/feature payloads."""
