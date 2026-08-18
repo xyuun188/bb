@@ -24,6 +24,9 @@ DEFAULT_MAX_ALGO_DETAIL_QUERIES = 100
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
 OKX_PROTECTION_EXECUTION_VERSION = "2026-07-15.okx-protection-execution.v1"
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
+OKX_ACCOUNT_BILLS_TRADE_SOURCE = "okx_account_bills_archive_trade"
+
+
 def okx_minimum_order_notional_usdt(
     contract_spec: dict[str, Any] | None,
     mark_price: Any,
@@ -176,9 +179,7 @@ class OkxNativeFactsClient:
         fetch_recent_fills = getattr(ccxt, "privateGetTradeFills", None)
         fetch_historical_fills = getattr(ccxt, "privateGetTradeFillsHistory", None)
         if not callable(fetch_recent_fills) or not callable(fetch_historical_fills):
-            raise RuntimeError(
-                "OKX native recent and historical fills APIs are both required"
-            )
+            raise RuntimeError("OKX native recent and historical fills APIs are both required")
         if historical_only:
             fill_endpoints = (fetch_historical_fills,)
         elif include_historical:
@@ -486,6 +487,7 @@ class OkxNativeFactsClient:
         *,
         inst_ids: Iterable[Any] | None = None,
         since: datetime | int | float | None = None,
+        until: datetime | int | float | None = None,
         limit: int = DEFAULT_FILL_LIMIT,
         max_pages: int = DEFAULT_MAX_FILL_PAGES,
         funding_only: bool = False,
@@ -511,6 +513,7 @@ class OkxNativeFactsClient:
         page_limit = _limit(limit)
         page_count = _max_pages(max_pages)
         since_ms = _timestamp_ms(since)
+        until_ms = _timestamp_ms(until)
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for fetch_bills in fetch_bill_methods:
@@ -537,6 +540,7 @@ class OkxNativeFactsClient:
                             fetch_bills,
                             params,
                             since_ms=since_ms,
+                            until_ms=until_ms,
                             target_inst_ids=target_inst_ids,
                             funding_only=funding_only,
                             page_limit=page_limit,
@@ -560,12 +564,61 @@ class OkxNativeFactsClient:
             reverse=True,
         )
 
+    async def fetch_trade_bill_fill_groups(
+        self,
+        *,
+        inst_ids: Iterable[Any] | None = None,
+        since: datetime | int | float | None = None,
+        until: datetime | int | float | None = None,
+        limit: int = DEFAULT_FILL_LIMIT,
+        max_pages: int = DEFAULT_MAX_FILL_PAGES,
+        strict: bool = False,
+    ) -> list[OkxNativeFillGroup]:
+        """Recover authoritative trade fills from OKX account-bill archives.
+
+        Delisted instruments can reject the fills-history ``instId`` query even
+        though their immutable trade bills remain available by time range. The
+        bill rows carry the same order, trade, size, price, fee, PnL and mark
+        fields needed for lifecycle reconstruction.
+        """
+
+        bills = await self.fetch_account_bills(
+            inst_ids=inst_ids,
+            since=since,
+            until=until,
+            limit=limit,
+            max_pages=max_pages,
+            funding_only=False,
+            strict=strict,
+        )
+        rows: list[dict[str, Any]] = []
+        for bill in bills:
+            raw = dict(bill.raw or {})
+            if bill.bill_type != "2" or bill.bill_sub_type not in {"1", "2"}:
+                continue
+            if not str(raw.get("ordId") or "").strip() or not str(raw.get("tradeId") or "").strip():
+                continue
+            side = "buy" if bill.bill_sub_type == "1" else "sell"
+            raw.update(
+                {
+                    "side": side,
+                    "posSide": raw.get("posSide") or bill.pos_side or "net",
+                    "fillSz": raw.get("fillSz") or raw.get("sz"),
+                    "fillPx": raw.get("fillPx") or raw.get("px"),
+                    "fillPnl": raw.get("fillPnl") or raw.get("pnl"),
+                    "_bb_fill_fact_source": OKX_ACCOUNT_BILLS_TRADE_SOURCE,
+                }
+            )
+            rows.append(raw)
+        return group_okx_native_fill_rows(rows, symbol_normalizer=self.symbol_normalizer)
+
     async def _fetch_account_bill_pages(
         self,
         fetch_bills: Any,
         params: dict[str, Any],
         *,
         since_ms: float,
+        until_ms: float,
         target_inst_ids: set[str],
         funding_only: bool,
         page_limit: int,
@@ -579,6 +632,8 @@ class OkxNativeFactsClient:
             page_params["limit"] = str(page_limit)
             if since_ms > 0 and "begin" not in page_params:
                 page_params["begin"] = str(int(since_ms))
+            if until_ms > 0 and "end" not in page_params:
+                page_params["end"] = str(int(until_ms))
             if after_cursor:
                 page_params["after"] = after_cursor
             response = await self.executor._with_retry(fetch_bills, page_params)
@@ -587,6 +642,7 @@ class OkxNativeFactsClient:
                 if _account_bill_row_matches(
                     row,
                     since_ms=since_ms,
+                    until_ms=until_ms,
                     target_inst_ids=target_inst_ids,
                     funding_only=funding_only,
                 ):
@@ -652,11 +708,9 @@ class OkxNativeFactsClient:
     ) -> dict[str, float]:
         specs = await self.fetch_contract_specs(symbols=symbols, inst_ids=inst_ids)
         return {
-            inst_id: _safe_float(spec.get("ctVal"), 0.0)
-            * _safe_float(spec.get("ctMult"), 1.0)
+            inst_id: _safe_float(spec.get("ctVal"), 0.0) * _safe_float(spec.get("ctMult"), 1.0)
             for inst_id, spec in specs.items()
-            if _safe_float(spec.get("ctVal"), 0.0) > 0
-            and _safe_float(spec.get("ctMult"), 1.0) > 0
+            if _safe_float(spec.get("ctVal"), 0.0) > 0 and _safe_float(spec.get("ctMult"), 1.0) > 0
         }
 
     async def fetch_contract_specs(
@@ -1042,9 +1096,7 @@ class OkxNativeFactsClient:
             return []
 
         target_algo_ids = {
-            str(value or "").strip()
-            for value in algo_ids or ()
-            if str(value or "").strip()
+            str(value or "").strip() for value in algo_ids or () if str(value or "").strip()
         }
         target_order_ids = _target_order_ids(order_ids)
         target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
@@ -1061,7 +1113,9 @@ class OkxNativeFactsClient:
                 algo_id = str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
                 order_id = str(row.get("ordId") or "").strip()
                 inst_id = str(row.get("instId") or "").strip().upper()
-                updated_ms = _safe_float(row.get("uTime") or row.get("triggerTime") or row.get("cTime"), 0.0)
+                updated_ms = _safe_float(
+                    row.get("uTime") or row.get("triggerTime") or row.get("cTime"), 0.0
+                )
                 if (
                     (target_algo_ids or target_order_ids)
                     and algo_id not in target_algo_ids
@@ -1091,16 +1145,11 @@ class OkxNativeFactsClient:
                     last_error = exc
 
         unresolved_algo_ids = target_algo_ids - {
-            str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
-            for row in rows
+            str(row.get("algoId") or row.get("algoClOrdId") or "").strip() for row in rows
         }
         needs_history = bool(
             callable(fetch_history)
-            and (
-                not target_algo_ids
-                or unresolved_algo_ids
-                or target_order_ids
-            )
+            and (not target_algo_ids or unresolved_algo_ids or target_order_ids)
         )
         if needs_history:
             for ord_type in ord_types or DEFAULT_PROTECTION_ALGO_ORDER_TYPES:
@@ -1252,10 +1301,7 @@ def build_okx_protection_execution_lifecycle(
     order_row = dict(order_row or {})
     algo_row = dict(algo_row or {})
     algo_id = str(
-        algo_row.get("algoId")
-        or order_row.get("algoId")
-        or algo_row.get("algoClOrdId")
-        or ""
+        algo_row.get("algoId") or order_row.get("algoId") or algo_row.get("algoClOrdId") or ""
     ).strip()
     generated_order_id = str(algo_row.get("ordId") or order_row.get("ordId") or "").strip()
     fill_order_id = str(getattr(fill, "order_id", "") or "").strip()
@@ -1270,11 +1316,7 @@ def build_okx_protection_execution_lifecycle(
         0.0,
     )
     fill_price = _safe_float(getattr(fill, "avg_price", 0.0), 0.0)
-    fill_rows = [
-        dict(row)
-        for row in (getattr(fill, "rows", ()) or ())
-        if isinstance(row, dict)
-    ]
+    fill_rows = [dict(row) for row in (getattr(fill, "rows", ()) or ()) if isinstance(row, dict)]
     fill_start_ms = min(
         (
             _safe_float(row.get("fillTime") or row.get("ts"), 0.0)
@@ -1312,15 +1354,21 @@ def build_okx_protection_execution_lifecycle(
 
     fill_mark_price = weighted_reference("fillMarkPx")
     fill_index_price = weighted_reference("fillIdxPx")
-    close_side = str(
-        order_row.get("side") or algo_row.get("side") or getattr(fill, "side", "") or ""
-    ).strip().lower()
-    position_side = str(
-        algo_row.get("posSide")
-        or order_row.get("posSide")
-        or getattr(fill, "pos_side", "")
-        or ""
-    ).strip().lower()
+    close_side = (
+        str(order_row.get("side") or algo_row.get("side") or getattr(fill, "side", "") or "")
+        .strip()
+        .lower()
+    )
+    position_side = (
+        str(
+            algo_row.get("posSide")
+            or order_row.get("posSide")
+            or getattr(fill, "pos_side", "")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     if position_side not in {"long", "short"}:
         position_side = "short" if close_side == "buy" else "long" if close_side == "sell" else ""
     reduce_only = _native_bool(
@@ -1479,8 +1527,7 @@ def _native_position_to_ccxt_shape(
     contracts = abs(pos)
     public_spec = public_contract_spec if isinstance(public_contract_spec, dict) else {}
     public_contract_size = (
-        _safe_float(public_spec.get("ctVal"), 0.0)
-        * _safe_float(public_spec.get("ctMult"), 1.0)
+        _safe_float(public_spec.get("ctVal"), 0.0) * _safe_float(public_spec.get("ctMult"), 1.0)
         if public_spec
         else _safe_float(public_contract_size, 0.0)
     )
@@ -1497,9 +1544,7 @@ def _native_position_to_ccxt_shape(
         "side": side,
         "contracts": contracts,
         "contractSize": public_contract_size if public_contract_size > 0 else None,
-        "contractSizeSource": (
-            "okx_public_instruments" if public_contract_size > 0 else "missing"
-        ),
+        "contractSizeSource": ("okx_public_instruments" if public_contract_size > 0 else "missing"),
         "contractSpec": dict(public_spec),
         "exchangeIdentityVerified": bool(public_spec and not identity_gaps),
         "exchangeIdentityGaps": identity_gaps,
@@ -1672,11 +1717,14 @@ def _account_bill_row_matches(
     row: dict[str, Any],
     *,
     since_ms: float,
+    until_ms: float = 0.0,
     target_inst_ids: set[str],
     funding_only: bool,
 ) -> bool:
     timestamp_ms = _account_bill_timestamp_ms(row)
     if since_ms > 0 and (timestamp_ms <= 0 or timestamp_ms < since_ms):
+        return False
+    if until_ms > 0 and (timestamp_ms <= 0 or timestamp_ms > until_ms):
         return False
     ccy = str(row.get("ccy") or row.get("currency") or "USDT").strip().upper()
     if ccy and ccy != "USDT":
@@ -1788,11 +1836,7 @@ def _oldest_order_pagination_cursor(rows: Iterable[dict[str, Any]]) -> str:
 
 
 def _oldest_account_bill_timestamp_ms(rows: Iterable[dict[str, Any]]) -> float:
-    timestamps = [
-        _account_bill_timestamp_ms(row)
-        for row in rows
-        if isinstance(row, dict)
-    ]
+    timestamps = [_account_bill_timestamp_ms(row) for row in rows if isinstance(row, dict)]
     timestamps = [item for item in timestamps if item > 0]
     return min(timestamps) if timestamps else 0.0
 
@@ -1871,7 +1915,9 @@ def _account_bill_row_identity(row: dict[str, Any]) -> str:
     inst_id = str(row.get("instId") or "").strip().upper()
     timestamp = str(row.get("ts") or row.get("uTime") or row.get("cTime") or "").strip()
     sub_type = str(row.get("subType") or row.get("billSubType") or "").strip()
-    balance_change = str(row.get("balChg") or row.get("balanceChange") or row.get("pnl") or "").strip()
+    balance_change = str(
+        row.get("balChg") or row.get("balanceChange") or row.get("pnl") or ""
+    ).strip()
     if timestamp or inst_id or sub_type or balance_change:
         return "|".join([timestamp, inst_id, sub_type, balance_change])
     return ""
@@ -1890,10 +1936,7 @@ def _account_bill_from_row(row: dict[str, Any]) -> OkxNativeAccountBill | None:
     bill_type = str(row.get("type") or row.get("billType") or "").strip()
     bill_sub_type = str(row.get("subType") or row.get("billSubType") or "").strip()
     balance_change = _safe_float(
-        row.get("balChg")
-        or row.get("balanceChange")
-        or row.get("cashBalChg")
-        or row.get("chg"),
+        row.get("balChg") or row.get("balanceChange") or row.get("cashBalChg") or row.get("chg"),
         0.0,
     )
     pnl = _safe_float(row.get("pnl") or row.get("realizedPnl") or row.get("realizedPnlChange"), 0.0)

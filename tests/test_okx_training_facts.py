@@ -15,6 +15,11 @@ from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     build_okx_fill_mark_slippage,
 )
+from services.okx_lifecycle_order_allocations import (
+    LIFECYCLE_ORDER_ALLOCATIONS_KEY,
+    build_lifecycle_order_allocation,
+    build_lifecycle_order_allocation_document,
+)
 from services.okx_training_facts import (
     _funding_training_evidence,
     build_funding_bill_lifecycle_facts,
@@ -284,6 +289,115 @@ def test_authoritative_okx_lifecycle_builds_one_contract_aware_sample() -> None:
     assert label["realized_net_pnl_usdt"] == 8.5
 
 
+def test_training_allocates_reversal_entry_order_to_one_lifecycle() -> None:
+    boundary_at = datetime(2026, 7, 11, 1, tzinfo=UTC)
+    reversal_order_id = "reversal-entry"
+    lineage = _complete_lineage()
+    entry = lineage["orders_by_exchange_id"].pop("entry-1")
+    entry.exchange_order_id = reversal_order_id
+    entry.okx_raw_fills["order_id"] = reversal_order_id
+    entry.fee = 0.400002
+    entry.okx_raw_fills["fee_abs"] = 0.400002
+    lineage["orders_by_exchange_id"][reversal_order_id] = entry
+    lineage["decision_raw_by_order_id"][reversal_order_id] = lineage[
+        "decision_raw_by_order_id"
+    ].pop("entry-1")
+    lineage["decision_feature_by_order_id"][reversal_order_id] = lineage[
+        "decision_feature_by_order_id"
+    ].pop("entry-1")
+    close = lineage["orders_by_exchange_id"]["close-1"]
+    close.quantity = 0.01
+    close.fee = 0.3
+    close.okx_fill_contracts = 1.0
+    close.okx_raw_fills.update(
+        {
+            "contracts": 1.0,
+            "base_quantity": 0.01,
+            "fee_abs": 0.3,
+            "execution_slippage": _slippage_fact(
+                order_id="close-1",
+                trade_id="trade-close",
+                side="sell",
+                average_price=100_500.0,
+                mark_price=100_580.0,
+                contracts=1.0,
+            ),
+        }
+    )
+    history = _history(
+        open_max_pos=1.0,
+        close_total_pos=1.0,
+        fee=-0.5,
+        entry_order_ids=[reversal_order_id],
+        linked_order_ids=[reversal_order_id, "close-1"],
+    )
+    history.raw_row = {
+        **history.raw_row,
+        "openMaxPos": "1",
+        "closeTotalPos": "1",
+        "fee": "-0.5",
+        LIFECYCLE_ORDER_ALLOCATIONS_KEY: build_lifecycle_order_allocation_document(
+            entry=[
+                build_lifecycle_order_allocation(
+                    order_id=reversal_order_id,
+                    allocated_contracts=1.0,
+                    order_contracts=2.0,
+                    boundary_at=boundary_at.isoformat(),
+                    peer_history_id=99,
+                    peer_role="close",
+                )
+            ]
+        ),
+    }
+
+    allocated = build_okx_history_training_sample(history, **lineage)
+    unallocated_history = _history(
+        open_max_pos=1.0,
+        close_total_pos=1.0,
+        fee=-0.5,
+        entry_order_ids=[reversal_order_id],
+        linked_order_ids=[reversal_order_id, "close-1"],
+    )
+    unallocated_history.raw_row = {
+        **history.raw_row,
+        "openMaxPos": "1",
+        "closeTotalPos": "1",
+        "fee": "-0.5",
+    }
+    unallocated_history.raw_row.pop(LIFECYCLE_ORDER_ALLOCATIONS_KEY, None)
+    unallocated = build_okx_history_training_sample(unallocated_history, **lineage)
+
+    assert allocated["fill_contracts"] == pytest.approx(1.0)
+    assert allocated["entry_fee"] == pytest.approx(0.2)
+    assert allocated["lifecycle_fee_reconciliation"]["applied"] is True
+    assert "order_fee_total_mismatch" not in allocated["training_evidence_gaps"]
+    assert allocated["lifecycle_order_allocation_failures"] == {
+        "entry": {},
+        "close": {},
+    }
+    assert "entry_fill_contracts_history_mismatch" not in allocated["training_evidence_gaps"]
+    assert "entry_fill_contracts_history_mismatch" in unallocated["training_evidence_gaps"]
+
+
+def test_verified_fill_contract_size_overrides_stale_history_spec() -> None:
+    history = _history()
+    history.raw_row = {
+        **history.raw_row,
+        "_bb_contract_spec": {
+            **history.raw_row["_bb_contract_spec"],
+            "ctVal": "1",
+        },
+    }
+
+    sample = build_okx_history_training_sample(history, **_complete_lineage())
+
+    assert sample["public_or_stored_contract_ct_val"] == pytest.approx(1.0)
+    assert sample["contract_ct_val"] == pytest.approx(0.01)
+    assert sample["contract_ct_val_source"] == "okx_public_instruments_verified_order_fills"
+    assert "entry_fill_contract_quantity_mismatch" not in sample["training_evidence_gaps"]
+    assert "close_fill_contract_quantity_mismatch" not in sample["training_evidence_gaps"]
+
+
 def test_complete_lifecycle_aggregates_multiple_close_orders() -> None:
     lineage = _complete_lineage()
     first_close = lineage["orders_by_exchange_id"]["close-1"]
@@ -442,9 +556,7 @@ def test_historical_price_and_fill_pnl_recover_changed_contract_value() -> None:
     assert sample["historical_contract_reconciliation"]["applied"] is True
     assert sample["contract_ct_val"] == pytest.approx(0.01)
     assert sample["notional"] == pytest.approx(100.0)
-    assert sample["notional_source"] == (
-        "okx_fills_history_pnl_and_position_history_price_path"
-    )
+    assert sample["notional_source"] == ("okx_fills_history_pnl_and_position_history_price_path")
     assert sample["gross_return_price_consistent"] is True
     assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(0.9)
     assert sample["trade_fact_trusted"] is True
@@ -567,9 +679,7 @@ def test_historical_margin_return_recovers_funding_only_changed_contract_value()
     assert sample["historical_contract_reconciliation"]["price_path_notional"] is None
     assert sample["contract_ct_val"] == pytest.approx(10.0)
     assert sample["notional"] == pytest.approx(819.432)
-    assert sample["notional_source"] == (
-        "okx_position_history_realized_pnl_pnl_ratio_and_leverage"
-    )
+    assert sample["notional_source"] == ("okx_position_history_realized_pnl_pnl_ratio_and_leverage")
     assert sample[PROFIT_TRAINING_TARGET] == pytest.approx(-29.921973684210524)
     assert sample["gross_return_price_consistent"] is True
     assert sample["funding_evidence_status"] == "verified_extreme_account_bills"
@@ -597,9 +707,7 @@ def test_extreme_funding_without_bill_reconciliation_is_pending_review() -> None
     assert evidence["status"] == "pending_review_extreme_missing_account_bills"
     assert evidence["eligible"] is False
     assert evidence["attribution_complete"] is False
-    assert evidence["gaps"] == [
-        "extreme_funding_missing_account_bill_reconciliation"
-    ]
+    assert evidence["gaps"] == ["extreme_funding_missing_account_bill_reconciliation"]
 
 
 def test_nonzero_funding_also_requires_account_bill_reconciliation() -> None:
@@ -668,8 +776,7 @@ def test_funding_bill_shared_by_overlapping_lifecycles_is_not_attributed() -> No
     facts = build_funding_bill_lifecycle_facts(histories, [bill])
 
     assert all(
-        row["attribution_complete"] is False
-        and row["shared_bill_ids"] == ["shared-funding"]
+        row["attribution_complete"] is False and row["shared_bill_ids"] == ["shared-funding"]
         for row in facts.values()
     )
 
@@ -688,9 +795,7 @@ def test_conflicting_price_and_margin_notional_authorities_are_quarantined() -> 
     assert reconciliation["applied"] is False, reconciliation
     assert reconciliation["authority_conflict"] is True
     assert reconciliation["reason"] == "authoritative_historical_notional_sources_conflict"
-    assert "historical_contract_notional_authorities_conflict" in sample[
-        "training_evidence_gaps"
-    ]
+    assert "historical_contract_notional_authorities_conflict" in sample["training_evidence_gaps"]
     assert sample["trade_fact_trusted"] is False
 
 

@@ -30,6 +30,7 @@ from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.learning import ShadowBacktest, TradeReflection
 from models.trade import Order, Position
+from services.okx_order_fact_sync import authoritative_orders_by_exchange_id
 from services.okx_position_history_store import load_okx_position_history_records
 from services.okx_training_facts import (
     REALIZED_NET_PNL_FORMULA,
@@ -91,6 +92,7 @@ def _compact_outcome_refresh_done(
             "compact authoritative outcome background refresh failed",
             error=f"{type(exc).__name__}: {exc}"[:240],
         )
+
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -184,9 +186,7 @@ def _profit_label_contract(
         and funding_fee is not None
         and liquidation_penalty is not None
     ):
-        components_total = (
-            gross_pnl + official_fee_signed + funding_fee + liquidation_penalty
-        )
+        components_total = gross_pnl + official_fee_signed + funding_fee + liquidation_penalty
         components = {
             "gross_pnl_usdt": gross_pnl,
             "official_fee_signed_usdt": official_fee_signed,
@@ -225,9 +225,7 @@ def _profit_label_contract(
         "entry_fee_usdt": entry_fee,
         "close_fee_usdt": close_fee,
         "funding_fee_usdt": funding_fee,
-        "liquidation_penalty_usdt": _safe_float(
-            sample.get("liquidation_penalty"), None
-        ),
+        "liquidation_penalty_usdt": _safe_float(sample.get("liquidation_penalty"), None),
         "notional": notional,
         "slippage_pct": _safe_float(sample.get("slippage"), None),
         "settlement_source": sample.get("settlement_source"),
@@ -351,14 +349,10 @@ def _attribution(sample: dict[str, Any]) -> dict[str, Any]:
         "execution_slippage": {
             "status": "measured" if execution_slippage_usdt is not None else "unavailable",
             "contribution_usdt": (
-                -execution_slippage_usdt
-                if execution_slippage_usdt is not None
-                else None
+                -execution_slippage_usdt if execution_slippage_usdt is not None else None
             ),
             "contribution_return_pct": (
-                -abs(execution_slippage_pct)
-                if execution_slippage_pct is not None
-                else None
+                -abs(execution_slippage_pct) if execution_slippage_pct is not None else None
             ),
             "source": sample.get("slippage_source"),
             "entry_slippage_usdt": sample.get("entry_execution_slippage_usdt"),
@@ -398,9 +392,11 @@ def build_authoritative_trade_outcome(
     if source not in AUTHORITATIVE_TRADE_OUTCOME_SOURCES or not lifecycle_key:
         raise ValueError("authoritative outcome requires one verified OKX settlement lifecycle")
 
-    source_execution_mode = str(
-        sample.get("source_execution_mode") or sample.get("execution_mode") or ""
-    ).strip().lower()
+    source_execution_mode = (
+        str(sample.get("source_execution_mode") or sample.get("execution_mode") or "")
+        .strip()
+        .lower()
+    )
     execution_mode = _canonical_execution_mode(sample.get("execution_mode"))
     sample["source_execution_mode"] = source_execution_mode
     sample["execution_mode"] = execution_mode
@@ -426,9 +422,7 @@ def build_authoritative_trade_outcome(
     sample["decision_authority"] = authority
     profit_contract = validate_profit_training_sample(sample)
     sample["profit_training_contract"] = profit_contract.to_dict()
-    gaps.extend(
-        f"profit_training_contract:{blocker}" for blocker in profit_contract.blockers
-    )
+    gaps.extend(f"profit_training_contract:{blocker}" for blocker in profit_contract.blockers)
     gaps = list(dict.fromkeys(gaps))
     label_contract = _profit_label_contract(sample, evidence_gaps=gaps)
     sample["training_label_contract"] = label_contract
@@ -441,9 +435,7 @@ def build_authoritative_trade_outcome(
     }
     outcome_id = f"ato:{_fingerprint(identity)[:24]}"
     immutable_facts = {
-        key: value
-        for key, value in sample.items()
-        if key not in _DERIVED_OUTCOME_KEYS
+        key: value for key, value in sample.items() if key not in _DERIVED_OUTCOME_KEYS
     }
     immutable_facts.update(
         {
@@ -540,19 +532,14 @@ async def load_authoritative_trade_outcomes(
                 limit=limit,
             )
         if not _force_compact_refresh:
-            if (
-                _compact_outcome_refresh_task is None
-                or _compact_outcome_refresh_task.done()
-            ):
+            if _compact_outcome_refresh_task is None or _compact_outcome_refresh_task.done():
                 _compact_outcome_refresh_task = asyncio.create_task(
                     load_authoritative_trade_outcomes(
                         compact=True,
                         _force_compact_refresh=True,
                     )
                 )
-                _compact_outcome_refresh_task.add_done_callback(
-                    _compact_outcome_refresh_done
-                )
+                _compact_outcome_refresh_task.add_done_callback(_compact_outcome_refresh_done)
             return _filter_compact_outcomes(
                 cached_outcomes,
                 mode=mode,
@@ -566,9 +553,7 @@ async def load_authoritative_trade_outcomes(
 
     async with session_factory() as session:
         requested_limit = (
-            max(int(requested_result_limit), 1)
-            if requested_result_limit is not None
-            else 5000
+            max(int(requested_result_limit), 1) if requested_result_limit is not None else 5000
         )
         histories = await load_okx_position_history_records(
             session,
@@ -601,22 +586,17 @@ async def load_authoritative_trade_outcomes(
         if history_modes:
             bill_stmt = bill_stmt.where(OkxAccountBill.mode.in_(history_modes))
         lifecycle_windows = [
-            (_as_utc(history.opened_at), _as_utc(history.updated_at_okx))
-            for history in histories
+            (_as_utc(history.opened_at), _as_utc(history.updated_at_okx)) for history in histories
         ]
         if lifecycle_windows and all(
-            opened_at is not None
-            and closed_at is not None
-            and closed_at >= opened_at
+            opened_at is not None and closed_at is not None and closed_at >= opened_at
             for opened_at, closed_at in lifecycle_windows
         ):
             bill_stmt = bill_stmt.where(
-                OkxAccountBill.bill_ts >= min(
-                    opened_at for opened_at, _ in lifecycle_windows if opened_at is not None
-                ),
-                OkxAccountBill.bill_ts <= max(
-                    closed_at for _, closed_at in lifecycle_windows if closed_at is not None
-                ),
+                OkxAccountBill.bill_ts
+                >= min(opened_at for opened_at, _ in lifecycle_windows if opened_at is not None),
+                OkxAccountBill.bill_ts
+                <= max(closed_at for _, closed_at in lifecycle_windows if closed_at is not None),
             )
         account_bills = (
             list((await session.execute(bill_stmt)).scalars().all())
@@ -642,9 +622,9 @@ async def load_authoritative_trade_outcomes(
         }
         positions = (
             list(
-                (
-                    await session.execute(select(Position).where(Position.id.in_(position_ids)))
-                ).scalars().all()
+                (await session.execute(select(Position).where(Position.id.in_(position_ids))))
+                .scalars()
+                .all()
             )
             if position_ids
             else []
@@ -655,7 +635,9 @@ async def load_authoritative_trade_outcomes(
                     await session.execute(
                         select(Order).where(Order.exchange_order_id.in_(exchange_order_ids))
                     )
-                ).scalars().all()
+                )
+                .scalars()
+                .all()
             )
             if exchange_order_ids
             else []
@@ -676,9 +658,7 @@ async def load_authoritative_trade_outcomes(
             decision_rows = list(
                 (
                     await session.execute(
-                        select(*decision_columns).where(
-                            AIDecision.id.in_(decision_ids)
-                        )
+                        select(*decision_columns).where(AIDecision.id.in_(decision_ids))
                     )
                 ).all()
             )
@@ -688,9 +668,7 @@ async def load_authoritative_trade_outcomes(
                     model_name=row.model_name,
                     stop_loss_pct=row.stop_loss_pct,
                     take_profit_pct=row.take_profit_pct,
-                    feature_snapshot=dict(
-                        row._mapping.get("feature_snapshot") or {}
-                    ),
+                    feature_snapshot=dict(row._mapping.get("feature_snapshot") or {}),
                     decision_learning_snapshot=row.decision_learning_snapshot,
                     raw_llm_response=dict(row.decision_learning_snapshot or {}),
                 )
@@ -703,7 +681,9 @@ async def load_authoritative_trade_outcomes(
                         await session.execute(
                             select(AIDecision).where(AIDecision.id.in_(decision_ids))
                         )
-                    ).scalars().all()
+                    )
+                    .scalars()
+                    .all()
                 )
                 if decision_ids
                 else []
@@ -714,14 +694,14 @@ async def load_authoritative_trade_outcomes(
                     await session.execute(
                         select(TradeReflection).where(TradeReflection.position_id.in_(position_ids))
                     )
-                ).scalars().all()
+                )
+                .scalars()
+                .all()
             )
             if position_ids
             else []
         )
-        shadow_stmt = select(ShadowBacktest).where(
-            ShadowBacktest.decision_id.in_(decision_ids)
-        )
+        shadow_stmt = select(ShadowBacktest).where(ShadowBacktest.decision_id.in_(decision_ids))
         if compact:
             shadow_stmt = shadow_stmt.options(
                 load_only(
@@ -734,42 +714,32 @@ async def load_authoritative_trade_outcomes(
                     ShadowBacktest.best_action,
                 )
             )
-        shadows = (
-            list((await session.execute(shadow_stmt)).scalars().all())
-            if decision_ids
-            else []
-        )
+        shadows = list((await session.execute(shadow_stmt)).scalars().all()) if decision_ids else []
 
     positions_by_id = {int(row.id): row for row in positions}
-    orders_by_exchange_id = {
-        str(row.exchange_order_id): row for row in orders if str(row.exchange_order_id or "").strip()
-    }
+    orders_by_exchange_id = authoritative_orders_by_exchange_id(orders)
     decisions_by_id = {int(row.id): row for row in decisions}
     decision_raw_by_order_id = {
-        str(order.exchange_order_id): _decision_learning_payload(
-            decisions_by_id.get(int(order.decision_id or 0))
-        )
-        for order in orders
-        if str(order.exchange_order_id or "").strip() and int(order.decision_id or 0) > 0
+        order_id: _decision_learning_payload(decisions_by_id.get(int(order.decision_id or 0)))
+        for order_id, order in orders_by_exchange_id.items()
+        if int(order.decision_id or 0) > 0
     }
     decision_feature_by_order_id = {
-        str(order.exchange_order_id): dict(decision.feature_snapshot or {})
-        for order in orders
-        if str(order.exchange_order_id or "").strip()
-        and int(order.decision_id or 0) > 0
+        order_id: dict(decision.feature_snapshot or {})
+        for order_id, order in orders_by_exchange_id.items()
+        if int(order.decision_id or 0) > 0
         and (decision := decisions_by_id.get(int(order.decision_id or 0))) is not None
         and isinstance(decision.feature_snapshot, dict)
     }
     decision_execution_by_order_id = {
-        str(order.exchange_order_id): {
+        order_id: {
             "decision_id": int(decision.id or 0),
             "model_name": str(decision.model_name or ""),
             "stop_loss_pct": _safe_float(decision.stop_loss_pct, None),
             "take_profit_pct": _safe_float(decision.take_profit_pct, None),
         }
-        for order in orders
-        if str(order.exchange_order_id or "").strip()
-        and int(order.decision_id or 0) > 0
+        for order_id, order in orders_by_exchange_id.items()
+        if int(order.decision_id or 0) > 0
         and (decision := decisions_by_id.get(int(order.decision_id or 0))) is not None
     }
     reflections_by_position_id = {

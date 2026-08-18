@@ -27,7 +27,10 @@ from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_VERSION,
     build_okx_fill_mark_slippage,
 )
-from services.okx_native_facts import OkxNativeFillGroup
+from services.okx_native_facts import (
+    OKX_ACCOUNT_BILLS_TRADE_SOURCE,
+    OkxNativeFillGroup,
+)
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
@@ -43,6 +46,8 @@ from services.okx_order_fact_sync import (
     _repair_stored_fill_contract_size_from_instruments,
     _stored_slippage_fact_needs_refresh,
     _target_fill_query_requires_historical,
+    authoritative_order_fee_fact_source,
+    authoritative_orders_by_exchange_id,
 )
 
 
@@ -102,18 +107,24 @@ def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
         rows=({"clOrdId": identity["client_order_id"]},),
     )
 
-    assert _decision_for_order_fact(
-        fill=fill,
-        order_row={"clOrdId": identity["client_order_id"]},
-        decisions_by_id={88: decision},
-    ) is decision
+    assert (
+        _decision_for_order_fact(
+            fill=fill,
+            order_row={"clOrdId": identity["client_order_id"]},
+            decisions_by_id={88: decision},
+        )
+        is decision
+    )
 
     wrong_side_fill = replace(fill, side="sell")
-    assert _decision_for_order_fact(
-        fill=wrong_side_fill,
-        order_row={"clOrdId": identity["client_order_id"]},
-        decisions_by_id={88: decision},
-    ) is None
+    assert (
+        _decision_for_order_fact(
+            fill=wrong_side_fill,
+            order_row={"clOrdId": identity["client_order_id"]},
+            decisions_by_id={88: decision},
+        )
+        is None
+    )
 
 
 class _ScalarResult:
@@ -188,17 +199,21 @@ class _FakeCcxt:
     ) -> None:
         self.fills = list(fills or [])
         self.orders = list(orders or [])
-        self.instruments = list(instruments) if instruments is not None else [
-            {
-                "instId": "BTC-USDT-SWAP",
-                "instType": "SWAP",
-                "ctVal": "0.01",
-                "ctMult": "1",
-                "lotSz": "1",
-                "minSz": "1",
-                "settleCcy": "USDT",
-            }
-        ]
+        self.instruments = (
+            list(instruments)
+            if instruments is not None
+            else [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "instType": "SWAP",
+                    "ctVal": "0.01",
+                    "ctMult": "1",
+                    "lotSz": "1",
+                    "minSz": "1",
+                    "settleCcy": "USDT",
+                }
+            ]
+        )
         self.delay_seconds = delay_seconds
         self.calls: list[str] = []
 
@@ -422,6 +437,52 @@ def _confirmed_order_fact(
     }
 
 
+def test_account_bill_trade_fact_is_authoritative_and_wins_duplicate_selection() -> None:
+    order_id = "delisted-lab-order"
+    authoritative = SimpleNamespace(
+        id=10,
+        exchange_order_id=order_id,
+        okx_inst_id="LAB-USDT-SWAP",
+        quantity=50.0,
+        price=9.7,
+        fee=0.01,
+        decision_id=123,
+        okx_raw_fills={
+            "source": OKX_ACCOUNT_BILLS_TRADE_SOURCE,
+            "account_bills_trade_confirmed": True,
+            "fills_history_confirmed": False,
+            "order_id": order_id,
+            "trade_ids": ["trade-lab"],
+            "inst_id": "LAB-USDT-SWAP",
+            "contracts": 5.0,
+            "avg_price": 9.7,
+            "contract_size": 10.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 50.0,
+            "fee_abs": 0.01,
+            "rows": [{"tradeId": "trade-lab"}],
+        },
+    )
+    incomplete_duplicate = SimpleNamespace(
+        id=11,
+        exchange_order_id=order_id,
+        okx_inst_id="LAB-USDT-SWAP",
+        quantity=50.0,
+        price=9.7,
+        fee=0.01,
+        decision_id=None,
+        okx_raw_fills={},
+    )
+
+    assert (
+        authoritative_order_fee_fact_source(authoritative, order_id=order_id)
+        == OKX_ACCOUNT_BILLS_TRADE_SOURCE
+    )
+    selected = authoritative_orders_by_exchange_id([authoritative, incomplete_duplicate])
+    assert selected[order_id] is authoritative
+
+
 @pytest.mark.asyncio
 async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
     tmp_path,
@@ -514,9 +575,7 @@ async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
         samples: list[dict[str, Any]] = []
         async with get_session_ctx() as session:
             order = (
-                await session.execute(
-                    select(Order).where(Order.exchange_order_id == order_id)
-                )
+                await session.execute(select(Order).where(Order.exchange_order_id == order_id))
             ).scalar_one()
             recovered_count, errors = await service._recover_exit_decision_lineages(
                 session,
@@ -530,9 +589,7 @@ async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
         assert samples[-1]["kind"] == "exit_decision_lineage_auto_recovered"
         async with get_session_ctx() as session:
             order = (
-                await session.execute(
-                    select(Order).where(Order.exchange_order_id == order_id)
-                )
+                await session.execute(select(Order).where(Order.exchange_order_id == order_id))
             ).scalar_one()
             original = await session.get(AIDecision, original_id)
             synthetic = await session.get(AIDecision, synthetic_id)
@@ -935,9 +992,10 @@ def test_database_timeout_stage_classifies_postgres_lock_and_statement_timeouts(
     assert _database_timeout_stage(RuntimeError("canceling statement due to lock timeout")) == (
         "database_lock_timeout"
     )
-    assert _database_timeout_stage(
-        RuntimeError("canceling statement due to statement timeout")
-    ) == "database_statement_timeout"
+    assert (
+        _database_timeout_stage(RuntimeError("canceling statement due to statement timeout"))
+        == "database_statement_timeout"
+    )
     assert _database_timeout_stage(RuntimeError("unrelated failure")) is None
 
 
@@ -1647,27 +1705,24 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
         async with get_session_ctx() as session:
             order = (await session.execute(select(Order))).scalar_one()
             recovered_decision = (
-                await session.execute(
-                    select(AIDecision).where(AIDecision.id == order.decision_id)
-                )
+                await session.execute(select(AIDecision).where(AIDecision.id == order.decision_id))
             ).scalar_one()
         assert ccxt.calls[0] == "fills_targeted"
         assert "fills_account" not in ccxt.calls
         assert report["confirmed_count"] == 1
-        assert report["samples"][0]["kind"] == (
-            "local_order_confirmed_from_completed_submit_stage"
-        )
+        assert report["samples"][0]["kind"] == ("local_order_confirmed_from_completed_submit_stage")
         assert order.status == "filled"
         assert order.exchange_order_id == "okx-timeout-fill"
         assert order.quantity == pytest.approx(0.02)
         assert order.okx_sync_status == OKX_SYNC_CONFIRMED
         assert recovered_decision.was_executed is True
-        assert recovered_decision.raw_llm_response["execution_result"][
-            "exchange_confirmed"
-        ] is True
-        assert recovered_decision.raw_llm_response["completed_submit_fill_recovery"][
-            "exchange_order_id"
-        ] == "okx-timeout-fill"
+        assert recovered_decision.raw_llm_response["execution_result"]["exchange_confirmed"] is True
+        assert (
+            recovered_decision.raw_llm_response["completed_submit_fill_recovery"][
+                "exchange_order_id"
+            ]
+            == "okx-timeout-fill"
+        )
     finally:
         await close_db()
 
@@ -2279,9 +2334,9 @@ async def test_confirmed_fill_queries_public_spec_and_repairs_polluted_quantity(
         assert order.okx_raw_fills["contract_size_verified"] is True
         assert order.okx_raw_fills["base_quantity"] == pytest.approx(4.0)
         assert order.okx_raw_fills["execution_slippage"]["complete"] is True
-        assert order.okx_raw_fills["execution_slippage"][
-            "adverse_slippage_usdt"
-        ] == pytest.approx(0.0002)
+        assert order.okx_raw_fills["execution_slippage"]["adverse_slippage_usdt"] == pytest.approx(
+            0.0002
+        )
     finally:
         await close_db()
 
@@ -2351,9 +2406,9 @@ async def test_stored_fill_slippage_is_refreshed_outside_recent_window(
         assert report["confirmed_count"] == 1
         assert report["skipped_old_count"] == 0
         assert order.okx_raw_fills["execution_slippage"]["complete"] is True
-        assert order.okx_raw_fills["execution_slippage"][
-            "adverse_slippage_usdt"
-        ] == pytest.approx(0.0002)
+        assert order.okx_raw_fills["execution_slippage"]["adverse_slippage_usdt"] == pytest.approx(
+            0.0002
+        )
     finally:
         await close_db()
 

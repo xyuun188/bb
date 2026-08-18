@@ -24,6 +24,11 @@ from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_VERSION,
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
 )
+from services.okx_lifecycle_order_allocations import (
+    apply_lifecycle_order_allocation,
+    lifecycle_order_allocation,
+)
+from services.okx_native_facts import OKX_ACCOUNT_BILLS_TRADE_SOURCE
 from services.okx_order_fact_sync import authoritative_order_fee_fact_source
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
@@ -32,8 +37,7 @@ from services.profit_training_contract import validate_profit_training_sample
 
 EXTREME_FUNDING_TO_NOTIONAL_RATIO = 0.20
 REALIZED_NET_PNL_FORMULA = (
-    "gross_pnl_usdt + official_fee_signed_usdt + funding_fee_usdt "
-    "+ liquidation_penalty_usdt"
+    "gross_pnl_usdt + official_fee_signed_usdt + funding_fee_usdt + liquidation_penalty_usdt"
 )
 
 
@@ -126,21 +130,17 @@ def build_funding_bill_lifecycle_facts(
     result: dict[str, dict[str, Any]] = {}
     for lifecycle_key, matches in matched_by_lifecycle.items():
         bill_ids = [
-            _text(_value(bill, "bill_id")) or f"db:{_value(bill, 'id', 0)}"
-            for bill in matches
+            _text(_value(bill, "bill_id")) or f"db:{_value(bill, 'id', 0)}" for bill in matches
         ]
         shared_bill_ids = [
-            bill_id
-            for bill_id in bill_ids
-            if len(lifecycle_by_bill.get(bill_id, set())) > 1
+            bill_id for bill_id in bill_ids if len(lifecycle_by_bill.get(bill_id, set())) > 1
         ]
         result[lifecycle_key] = {
             "mirror_available": True,
             "bill_count": len(matches),
             "bill_ids": list(dict.fromkeys(bill_ids)),
             "signed_funding_fee_usdt": sum(
-                _safe_float(_value(bill, "funding_fee"), 0.0) or 0.0
-                for bill in matches
+                _safe_float(_value(bill, "funding_fee"), 0.0) or 0.0 for bill in matches
             ),
             "shared_bill_ids": list(dict.fromkeys(shared_bill_ids)),
             "attribution_complete": not shared_bill_ids,
@@ -156,23 +156,15 @@ def _funding_training_evidence(
     official_funding_present: bool,
     bill_facts: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    ratio = (
-        funding_fee / notional
-        if notional is not None and notional > 0
-        else None
-    )
-    extreme = bool(
-        ratio is not None and abs(ratio) >= EXTREME_FUNDING_TO_NOTIONAL_RATIO
-    )
+    ratio = funding_fee / notional if notional is not None and notional > 0 else None
+    extreme = bool(ratio is not None and abs(ratio) >= EXTREME_FUNDING_TO_NOTIONAL_RATIO)
     facts = dict(bill_facts or {})
     legacy_direct_build = bill_facts is None
     bill_fee = _safe_float(facts.get("signed_funding_fee_usdt"), 0.0) or 0.0
     bill_count = max(int(_safe_float(facts.get("bill_count"), 0.0) or 0), 0)
     shared_bill_ids = list(facts.get("shared_bill_ids") or [])
     tolerance = max(1e-8, abs(funding_fee) * 1e-5)
-    bill_matches = bool(
-        bill_count > 0 and abs(bill_fee - funding_fee) <= tolerance
-    )
+    bill_matches = bool(bill_count > 0 and abs(bill_fee - funding_fee) <= tolerance)
     gaps: list[str] = []
     if not official_funding_present:
         status = "unavailable"
@@ -186,11 +178,7 @@ def _funding_training_evidence(
     elif abs(funding_fee) <= 1e-12 and bill_count <= 0:
         status = "verified_position_history"
     elif bill_matches and facts.get("attribution_complete") is True:
-        status = (
-            "verified_extreme_account_bills"
-            if extreme
-            else "verified_account_bills"
-        )
+        status = "verified_extreme_account_bills" if extreme else "verified_account_bills"
     elif bill_count <= 0:
         status = (
             "pending_review_extreme_missing_account_bills"
@@ -209,9 +197,7 @@ def _funding_training_evidence(
             else "pending_review_account_bill_mismatch"
         )
         gaps.append(
-            "extreme_funding_account_bill_mismatch"
-            if extreme
-            else "funding_account_bill_mismatch"
+            "extreme_funding_account_bill_mismatch" if extreme else "funding_account_bill_mismatch"
         )
     eligible = status in {
         "verified_position_history",
@@ -285,6 +271,12 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
         None,
     )
     raw_contract_size = _safe_float(raw.get("contract_size"), None)
+    verified_public_contract_size = (
+        raw_contract_size
+        if raw.get("contract_size_verified") is True
+        and _text(raw.get("contract_size_source")) == "okx_public_instruments"
+        else None
+    )
     raw_trade_ids = set(_list(raw.get("trade_ids")))
     execution_slippage_trade_ids = set(_list(execution_slippage.get("trade_ids")))
     execution_slippage_reasons = _execution_slippage_validation_reasons(
@@ -327,6 +319,7 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
         "base_quantity": base_quantity,
         "average_price": average_price,
         "contracts": contracts,
+        "verified_public_contract_size": verified_public_contract_size,
         "fee": fee,
         "fill_pnl": fill_pnl,
         "fee_source": source,
@@ -400,6 +393,11 @@ def _execution_slippage_validation_reasons(
 def _fill_fact_origin(raw: dict[str, Any]) -> str:
     if raw.get("fills_history_confirmed") is True:
         return "fills_history"
+    if (
+        raw.get("account_bills_trade_confirmed") is True
+        and _text(raw.get("source")) == OKX_ACCOUNT_BILLS_TRADE_SOURCE
+    ):
+        return "account_bills_trade"
     if raw.get("order_detail_confirmed") is True:
         return "order_detail"
     if raw.get("execution_result_confirmed") is True:
@@ -410,11 +408,34 @@ def _fill_fact_origin(raw: dict[str, Any]) -> str:
 def _authoritative_fill_group(
     order_ids: list[str],
     orders_by_exchange_id: dict[str, Any],
+    *,
+    raw_row: dict[str, Any] | None = None,
+    lifecycle_role: str = "",
 ) -> dict[str, Any]:
-    facts = [
-        _authoritative_fill_fact(orders_by_exchange_id.get(order_id), order_id=order_id)
-        for order_id in order_ids
-    ]
+    facts: list[dict[str, Any]] = []
+    allocation_failures: dict[str, list[str]] = {}
+    for order_id in order_ids:
+        fact = _authoritative_fill_fact(
+            orders_by_exchange_id.get(order_id),
+            order_id=order_id,
+        )
+        if fact and raw_row is not None and lifecycle_role:
+            allocation, allocation_error = lifecycle_order_allocation(
+                raw_row,
+                role=lifecycle_role,
+                order_id=order_id,
+                order_contracts=float(fact["contracts"]),
+            )
+            if allocation_error:
+                allocation_failures[order_id] = [allocation_error]
+                fact = {}
+            elif allocation is not None:
+                fact = apply_lifecycle_order_allocation(
+                    fact,
+                    allocation=allocation,
+                    role=lifecycle_role,
+                )
+        facts.append(fact)
     execution_slippage_failures = {
         order_id: (
             list(fact.get("execution_slippage_reasons") or [])
@@ -433,6 +454,7 @@ def _authoritative_fill_group(
             ],
             "execution_slippage_complete": False,
             "execution_slippage_failures": execution_slippage_failures,
+            "lifecycle_order_allocation_failures": allocation_failures,
         }
     base_quantity = sum(float(fact["base_quantity"]) for fact in facts)
     notional = sum(float(fact["base_quantity"]) * float(fact["average_price"]) for fact in facts)
@@ -441,6 +463,18 @@ def _authoritative_fill_group(
         fact.get("execution_slippage_complete") is True for fact in facts
     )
     fill_pnl_complete = all(_safe_float(fact.get("fill_pnl"), None) is not None for fact in facts)
+    verified_contract_size_values = [
+        float(value)
+        for fact in facts
+        if (value := _safe_float(fact.get("verified_public_contract_size"), None)) is not None
+        and value > 0
+    ]
+    verified_contract_sizes = set(verified_contract_size_values)
+    verified_public_contract_size = (
+        next(iter(verified_contract_sizes))
+        if len(verified_contract_sizes) == 1 and len(verified_contract_size_values) == len(facts)
+        else None
+    )
     return {
         "complete": True,
         "facts": facts,
@@ -449,12 +483,9 @@ def _authoritative_fill_group(
         "average_price": notional / base_quantity,
         "notional": notional,
         "fee": sum(float(fact["fee"]) for fact in facts),
+        "verified_public_contract_size": verified_public_contract_size,
         "fill_pnl_complete": fill_pnl_complete,
-        "fill_pnl": (
-            sum(float(fact["fill_pnl"]) for fact in facts)
-            if fill_pnl_complete
-            else None
-        ),
+        "fill_pnl": (sum(float(fact["fill_pnl"]) for fact in facts) if fill_pnl_complete else None),
         "fee_source": "+".join(sources),
         "execution_slippage_complete": execution_slippage_complete,
         "execution_slippage_usdt": (
@@ -466,7 +497,70 @@ def _authoritative_fill_group(
             OKX_FILL_MARK_SLIPPAGE_SOURCE if execution_slippage_complete else ""
         ),
         "execution_slippage_failures": execution_slippage_failures,
+        "lifecycle_order_allocation_failures": allocation_failures,
         "missing_order_ids": [],
+    }
+
+
+def _reconcile_allocated_lifecycle_fees(
+    *,
+    entry_fill_group: dict[str, Any],
+    close_fill_group: dict[str, Any],
+    entry_fee: float | None,
+    close_fee: float | None,
+    official_fee_signed: float,
+) -> tuple[float | None, float | None, dict[str, Any]]:
+    """Apply OKX lifecycle fee rounding to the one proportionally allocated side."""
+
+    if entry_fee is None or close_fee is None:
+        return entry_fee, close_fee, {"applied": False, "reason": "fill_fees_incomplete"}
+    official_total = abs(official_fee_signed)
+    if official_total <= 0:
+        return entry_fee, close_fee, {"applied": False, "reason": "official_fee_unavailable"}
+    allocated_roles = [
+        role
+        for role, group in (("entry", entry_fill_group), ("close", close_fill_group))
+        if any(
+            isinstance(fact.get("lifecycle_order_allocation"), dict)
+            for fact in group.get("facts", [])
+            if isinstance(fact, dict)
+        )
+    ]
+    if len(allocated_roles) != 1:
+        return entry_fee, close_fee, {
+            "applied": False,
+            "reason": "single_allocated_fee_side_required",
+            "allocated_roles": allocated_roles,
+        }
+    calculated_total = entry_fee + close_fee
+    delta = official_total - calculated_total
+    if math.isclose(calculated_total, official_total, rel_tol=1e-6, abs_tol=1e-8):
+        return entry_fee, close_fee, {
+            "applied": False,
+            "reason": "allocated_fee_already_consistent",
+            "allocated_role": allocated_roles[0],
+            "difference_usdt": delta,
+        }
+    tolerance = max(1e-8, official_total * 0.001)
+    allocated_role = allocated_roles[0]
+    adjusted_entry = entry_fee + delta if allocated_role == "entry" else entry_fee
+    adjusted_close = close_fee + delta if allocated_role == "close" else close_fee
+    if abs(delta) > tolerance or adjusted_entry < 0 or adjusted_close < 0:
+        return entry_fee, close_fee, {
+            "applied": False,
+            "reason": "allocated_fee_difference_exceeds_rounding_tolerance",
+            "allocated_role": allocated_role,
+            "difference_usdt": delta,
+            "tolerance_usdt": tolerance,
+        }
+    return adjusted_entry, adjusted_close, {
+        "applied": True,
+        "source_authority": "okx_position_history_total_fee",
+        "allocated_role": allocated_role,
+        "calculated_total_before_usdt": calculated_total,
+        "official_total_usdt": official_total,
+        "difference_usdt": delta,
+        "tolerance_usdt": tolerance,
     }
 
 
@@ -838,10 +932,14 @@ def build_okx_history_training_sample(
     entry_fill_group = _authoritative_fill_group(
         entry_order_ids,
         orders_by_exchange_id,
+        raw_row=raw,
+        lifecycle_role="entry",
     )
     close_fill_group = _authoritative_fill_group(
         close_order_ids,
         orders_by_exchange_id,
+        raw_row=raw,
+        lifecycle_role="close",
     )
     canonical_entry_order_id = entry_order_ids[0] if entry_order_ids else ""
     canonical_close_order_id = close_order_ids[-1] if close_order_ids else ""
@@ -877,6 +975,21 @@ def build_okx_history_training_sample(
         else None
     )
     contracts = fill_contracts or 0.0
+    open_max_contracts = (
+        _safe_float(raw.get("openMaxPos"), None)
+        or _safe_float(_value(history, "open_max_pos"), 0.0)
+        or 0.0
+    )
+    close_total_contracts = (
+        _safe_float(raw.get("closeTotalPos"), None)
+        or _safe_float(_value(history, "close_total_pos"), 0.0)
+        or 0.0
+    )
+    entry_target_contracts = (
+        close_total_contracts
+        if _text(_value(history, "close_status")).lower() == "full" and close_total_contracts > 0
+        else open_max_contracts
+    )
     spec = _raw_contract_spec(raw)
     public_or_stored_ct_val = _safe_float(spec.get("ctVal"), None)
     ct_mult = _safe_float(spec.get("ctMult"), None)
@@ -894,6 +1007,29 @@ def build_okx_history_training_sample(
     history_contract_source = _text(raw.get("_bb_contract_spec_source"))
     ct_val = public_or_stored_ct_val
     contract_ct_val_source = history_contract_source
+    entry_verified_contract_size = _safe_float(
+        entry_fill_group.get("verified_public_contract_size"),
+        None,
+    )
+    close_verified_contract_size = _safe_float(
+        close_fill_group.get("verified_public_contract_size"),
+        None,
+    )
+    verified_fill_contract_sizes = {
+        value
+        for value in (entry_verified_contract_size, close_verified_contract_size)
+        if value is not None and value > 0
+    }
+    if len(verified_fill_contract_sizes) == 1 and ct_mult is not None and ct_mult > 0:
+        verified_fill_ct_val = next(iter(verified_fill_contract_sizes)) / ct_mult
+        if ct_val is None or not math.isclose(
+            ct_val,
+            verified_fill_ct_val,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            ct_val = verified_fill_ct_val
+            contract_ct_val_source = "okx_public_instruments_verified_order_fills"
     historical_contract_reconciliation = _historical_contract_notional_reconciliation(
         side=side,
         entry_price=entry_price,
@@ -919,6 +1055,15 @@ def build_okx_history_training_sample(
         contract_ct_val_source = str(
             historical_contract_reconciliation.get("source_authority") or ""
         )
+    canonical_entry_fee, canonical_close_fee, lifecycle_fee_reconciliation = (
+        _reconcile_allocated_lifecycle_fees(
+            entry_fill_group=entry_fill_group,
+            close_fill_group=close_fill_group,
+            entry_fee=canonical_entry_fee,
+            close_fee=canonical_close_fee,
+            official_fee_signed=fee_signed,
+        )
+    )
     return_facts = _return_consistency_facts(
         side=side,
         entry_price=entry_price,
@@ -976,6 +1121,28 @@ def build_okx_history_training_sample(
         gaps.append("missing_authoritative_entry_fill_facts")
     if close_fill_group.get("complete") is not True:
         gaps.append("missing_authoritative_close_fill_facts")
+    if (
+        entry_fill_group.get("complete") is True
+        and entry_target_contracts > 0
+        and not math.isclose(
+            _safe_float(entry_fill_group.get("contracts"), 0.0) or 0.0,
+            entry_target_contracts,
+            rel_tol=0.02,
+            abs_tol=1e-12,
+        )
+    ):
+        gaps.append("entry_fill_contracts_history_mismatch")
+    if (
+        close_fill_group.get("complete") is True
+        and close_total_contracts > 0
+        and not math.isclose(
+            _safe_float(close_fill_group.get("contracts"), 0.0) or 0.0,
+            close_total_contracts,
+            rel_tol=0.02,
+            abs_tol=1e-12,
+        )
+    ):
+        gaps.append("close_fill_contracts_history_mismatch")
     if (
         entry_fill_group.get("complete") is True
         and ct_val is not None
@@ -1129,10 +1296,13 @@ def build_okx_history_training_sample(
         close_fill_group.get("execution_slippage_usdt"),
         None,
     )
-    slippage_notional_scale = _safe_float(
-        historical_contract_reconciliation.get("notional_scale"),
-        1.0,
-    ) or 1.0
+    slippage_notional_scale = (
+        _safe_float(
+            historical_contract_reconciliation.get("notional_scale"),
+            1.0,
+        )
+        or 1.0
+    )
     if historical_contract_reconciliation.get("applied") is True:
         if entry_execution_slippage_usdt is not None:
             entry_execution_slippage_usdt *= slippage_notional_scale
@@ -1249,9 +1419,7 @@ def build_okx_history_training_sample(
         or legacy_v4_normal_paper
         or legacy_v3_normal_paper
         or legacy_v2_normal_paper
-    ) and (
-        paper_exploration or paper_training or paper_canary
-    ):
+    ) and (paper_exploration or paper_training or paper_canary):
         normal_paper_gaps.append("normal_paper_trade_conflicting_legacy_contract")
     normal_paper_gaps = list(dict.fromkeys(normal_paper_gaps))
     paper_training_gaps = list(dict.fromkeys(paper_training_gaps))
@@ -1315,6 +1483,7 @@ def build_okx_history_training_sample(
         "contract_ct_val": ct_val,
         "contract_ct_val_source": contract_ct_val_source,
         "historical_contract_reconciliation": historical_contract_reconciliation,
+        "lifecycle_fee_reconciliation": lifecycle_fee_reconciliation,
         "public_or_stored_contract_ct_val": public_or_stored_ct_val,
         "contract_ct_mult": ct_mult,
         "contract_lot_size": lot_size,
@@ -1336,14 +1505,10 @@ def build_okx_history_training_sample(
         "funding_fee": funding_fee,
         "funding_evidence_status": funding_training_evidence["status"],
         "funding_training_evidence": funding_training_evidence,
-        "funding_fee_to_notional_ratio": funding_training_evidence[
-            "funding_fee_to_notional_ratio"
-        ],
+        "funding_fee_to_notional_ratio": funding_training_evidence["funding_fee_to_notional_ratio"],
         "funding_bill_count": funding_training_evidence["account_bill_count"],
         "funding_bill_ids": funding_training_evidence["account_bill_ids"],
-        "funding_attribution_complete": funding_training_evidence[
-            "attribution_complete"
-        ],
+        "funding_attribution_complete": funding_training_evidence["attribution_complete"],
         "liquidation_penalty": liquidation_penalty,
         "official_fee_signed": fee_signed,
         "realized_net_pnl_formula": REALIZED_NET_PNL_FORMULA,
@@ -1354,8 +1519,7 @@ def build_okx_history_training_sample(
             "liquidation_penalty_usdt": liquidation_penalty,
             "components_total_usdt": settlement_expected,
             "reported_realized_net_pnl_usdt": realized_pnl,
-            "formula_consistent": abs(realized_pnl - settlement_expected)
-            <= settlement_tolerance,
+            "formula_consistent": abs(realized_pnl - settlement_expected) <= settlement_tolerance,
         },
         "settlement_components_total": settlement_expected,
         "holding_minutes": holding_minutes,
@@ -1378,6 +1542,10 @@ def build_okx_history_training_sample(
         "execution_slippage_failures": {
             "entry": dict(entry_fill_group.get("execution_slippage_failures") or {}),
             "close": dict(close_fill_group.get("execution_slippage_failures") or {}),
+        },
+        "lifecycle_order_allocation_failures": {
+            "entry": dict(entry_fill_group.get("lifecycle_order_allocation_failures") or {}),
+            "close": dict(close_fill_group.get("lifecycle_order_allocation_failures") or {}),
         },
         "protection_execution_supervision_ready": bool(protection_execution),
         "protection_lifecycle_complete": bool(protection_execution and protection_submission),

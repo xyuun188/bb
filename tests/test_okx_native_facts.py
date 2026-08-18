@@ -7,6 +7,7 @@ import pytest
 
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.okx_native_facts import (
+    OKX_ACCOUNT_BILLS_TRADE_SOURCE,
     OkxNativeFactsClient,
     build_okx_protection_execution_lifecycle,
     group_okx_native_fill_rows,
@@ -435,10 +436,7 @@ class _PositionHistoryCcxt:
         if params.get("posId"):
             wanted = {item.strip() for item in str(params["posId"]).split(",") if item.strip()}
             rows = [
-                row
-                for page in self.pages.values()
-                for row in page
-                if row.get("posId") in wanted
+                row for page in self.pages.values() for row in page if row.get("posId") in wanted
             ]
             return {"data": rows}
         cursor = str(params.get("after") or "")
@@ -1341,13 +1339,89 @@ async def test_native_facts_client_marks_private_public_underlying_mismatch() ->
     )
 
     assert positions[0]["exchangeIdentityVerified"] is False
-    assert "okx_private_position_underlying_differs_from_public_instrument" in positions[0][
-        "exchangeIdentityGaps"
+    assert (
+        "okx_private_position_underlying_differs_from_public_instrument"
+        in positions[0]["exchangeIdentityGaps"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_facts_client_recovers_delisted_trade_fills_from_account_bills() -> None:
+    opened_at = datetime(2026, 7, 4, 9, 18, tzinfo=UTC)
+    closed_at = opened_at + timedelta(minutes=1)
+    timestamp = int(opened_at.timestamp() * 1000)
+
+    class TradeBillsCcxt:
+        def __init__(self) -> None:
+            self.current_params: list[dict[str, Any]] = []
+            self.archive_params: list[dict[str, Any]] = []
+
+        async def privateGetAccountBills(self, params: dict[str, Any]) -> dict[str, Any]:
+            self.current_params.append(dict(params))
+            return {"data": []}
+
+        async def privateGetAccountBillsArchive(
+            self,
+            params: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.archive_params.append(dict(params))
+            return {
+                "data": [
+                    {
+                        "billId": f"bill-{index}",
+                        "instId": "LAB-USDT-SWAP",
+                        "ordId": "entry-lab",
+                        "tradeId": f"trade-{index}",
+                        "type": "2",
+                        "subType": "2",
+                        "sz": size,
+                        "px": price,
+                        "fee": fee,
+                        "pnl": "0",
+                        "fillMarkPx": "9.71",
+                        "ccy": "USDT",
+                        "ts": str(timestamp + index),
+                    }
+                    for index, (size, price, fee) in enumerate(
+                        [("3", "9.7", "-0.01"), ("2", "9.8", "-0.02")],
+                        start=1,
+                    )
+                ]
+            }
+
+    ccxt = TradeBillsCcxt()
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_trade_bill_fill_groups(
+        inst_ids=["LAB-USDT-SWAP"],
+        since=opened_at,
+        until=closed_at,
+        limit=100,
+        strict=True,
+    )
+
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.order_id == "entry-lab"
+    assert group.side == "sell"
+    assert group.contracts == pytest.approx(5.0)
+    assert group.avg_price == pytest.approx(9.74)
+    assert group.fee_abs == pytest.approx(0.03)
+    assert all(row["_bb_fill_fact_source"] == OKX_ACCOUNT_BILLS_TRADE_SOURCE for row in group.rows)
+    expected_end = str(int(closed_at.timestamp() * 1000))
+    assert ccxt.archive_params == [
+        {
+            "instType": "SWAP",
+            "ccy": "USDT",
+            "limit": "100",
+            "begin": str(timestamp),
+            "end": expected_end,
+        }
     ]
 
 
 @pytest.mark.asyncio
-async def test_native_facts_client_uses_execution_environment_contract_size_for_paper_position() -> None:
+async def test_native_facts_client_uses_execution_environment_contract_size_for_paper_position() -> (
+    None
+):
     class _PaperPositionCcxt:
         async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -1425,9 +1499,7 @@ async def test_native_facts_client_fetch_contract_sizes_uses_okx_public_instrume
 async def test_native_facts_client_fetch_open_orders_uses_okx_pending_orders() -> None:
     ccxt = _NativeStateCcxt()
 
-    orders = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_open_orders(
-        symbols=["SPK/USDT"]
-    )
+    orders = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_open_orders(symbols=["SPK/USDT"])
 
     assert len(orders) == 1
     assert orders[0]["id"] == "spk-close-1"

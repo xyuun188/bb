@@ -78,6 +78,7 @@ from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
+from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -568,13 +569,11 @@ def _group_open_dashboard_positions(
         group["local_unrealized_pnl"] = (
             _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
         ) + local_unrealized
-        group["entry_fee"] = (
-            abs(_safe_float(group.get("entry_fee"), 0.0) or 0.0)
-            + abs(_safe_float(item.get("entry_fee"), 0.0) or 0.0)
+        group["entry_fee"] = abs(_safe_float(group.get("entry_fee"), 0.0) or 0.0) + abs(
+            _safe_float(item.get("entry_fee"), 0.0) or 0.0
         )
-        group["close_fee"] = (
-            abs(_safe_float(group.get("close_fee"), 0.0) or 0.0)
-            + abs(_safe_float(item.get("close_fee"), 0.0) or 0.0)
+        group["close_fee"] = abs(_safe_float(group.get("close_fee"), 0.0) or 0.0) + abs(
+            _safe_float(item.get("close_fee"), 0.0) or 0.0
         )
         group_funding_source = str(group.get("funding_fee_source") or "")
         item_funding_source = str(item.get("funding_fee_source") or "")
@@ -583,9 +582,9 @@ def _group_open_dashboard_positions(
                 group["funding_fee"] = _safe_float(item.get("funding_fee"), 0.0) or 0.0
                 group["funding_fee_source"] = item_funding_source
             else:
-                group["funding_fee"] = (
-                    _safe_float(group.get("funding_fee"), 0.0) or 0.0
-                ) + (_safe_float(item.get("funding_fee"), 0.0) or 0.0)
+                group["funding_fee"] = (_safe_float(group.get("funding_fee"), 0.0) or 0.0) + (
+                    _safe_float(item.get("funding_fee"), 0.0) or 0.0
+                )
         group["fee"] = group["entry_fee"] + group["close_fee"]
         group["_local_notional"] = (
             _safe_float(group.get("_local_notional"), 0.0) or 0.0
@@ -663,9 +662,9 @@ def _group_open_dashboard_positions(
             group["entry_price"] = local_entry
             group["unrealized_pnl"] = _safe_float(group.get("local_unrealized_pnl"), 0.0) or 0.0
             group["pnl_source"] = "local_group"
-        group["total_pnl"] = (
-            _safe_float(group.get("unrealized_pnl"), 0.0) or 0.0
-        ) + (_safe_float(group.get("funding_fee"), 0.0) or 0.0)
+        group["total_pnl"] = (_safe_float(group.get("unrealized_pnl"), 0.0) or 0.0) + (
+            _safe_float(group.get("funding_fee"), 0.0) or 0.0
+        )
         position_ids = [pid for pid in group.get("position_ids", []) if pid is not None]
         group["position_ids"] = position_ids
         group["id"] = min(position_ids) if position_ids else None
@@ -838,13 +837,21 @@ def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
         dict.fromkeys(
             str(value)
             for value in (
-                (["live_ml_return_distribution_missing"] if strict_live_ml and not distribution else [])
+                (
+                    ["live_ml_return_distribution_missing"]
+                    if strict_live_ml and not distribution
+                    else []
+                )
                 + (["live_execution_cost_missing"] if not execution_cost else [])
                 + (["expected_net_breakdown_missing"] if not breakdown else [])
                 + (["live_ml_profit_contract_missing"] if strict_live_ml and not policy else [])
                 + _safe_list(distribution.get("blockers"))
                 + _safe_list(opportunity.get("blockers"))
-                + ([execution_cost.get("reason")] if execution_cost.get("production_eligible") is not True else [])
+                + (
+                    [execution_cost.get("reason")]
+                    if execution_cost.get("production_eligible") is not True
+                    else []
+                )
             )
             if value
         )
@@ -1119,12 +1126,8 @@ def _extract_primary_ml(raw: dict[str, Any]) -> dict[str, Any]:
         "side": best_side,
         "side_label": _side_label(best_side),
         "raw_expected_return_pct": distribution.get("raw_expected_return_pct"),
-        "objective_expected_return_pct": distribution.get(
-            "objective_expected_return_pct"
-        ),
-        "lower_quantile_return_pct": distribution.get(
-            "lower_quantile_return_pct"
-        ),
+        "objective_expected_return_pct": distribution.get("objective_expected_return_pct"),
+        "lower_quantile_return_pct": distribution.get("lower_quantile_return_pct"),
         "dispersion_pct": distribution.get("dispersion_pct"),
         "tail_loss_probability": distribution.get("tail_loss_probability"),
         "tail_loss_scale_pct": distribution.get("tail_loss_scale_pct"),
@@ -1154,22 +1157,14 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
             "available": signal_payload_available(profit),
             "side": profit_side,
             "side_label": _side_label(profit_side),
-            "raw_expected_return_pct": profit_distribution.get(
-                "raw_expected_return_pct"
-            ),
+            "raw_expected_return_pct": profit_distribution.get("raw_expected_return_pct"),
             "objective_expected_return_pct": profit_distribution.get(
                 "objective_expected_return_pct"
             ),
-            "lower_quantile_return_pct": profit_distribution.get(
-                "lower_quantile_return_pct"
-            ),
+            "lower_quantile_return_pct": profit_distribution.get("lower_quantile_return_pct"),
             "dispersion_pct": profit_distribution.get("dispersion_pct"),
-            "tail_loss_probability": profit_distribution.get(
-                "tail_loss_probability"
-            ),
-            "tail_loss_scale_pct": profit_distribution.get(
-                "tail_loss_scale_pct"
-            ),
+            "tail_loss_probability": profit_distribution.get("tail_loss_probability"),
+            "tail_loss_scale_pct": profit_distribution.get("tail_loss_scale_pct"),
             "return_distribution_contract": profit_distribution,
             "profit_quality_score": _safe_float(profit.get("profit_quality_score"), 0.0) or 0.0,
             "loss_probability": _safe_float(profit.get(f"{profit_side}_loss_probability"), 0.0)
@@ -1180,19 +1175,11 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
             "available": signal_payload_available(ts),
             "side": ts_side,
             "side_label": _side_label(ts_side),
-            "raw_expected_return_pct": ts_distribution.get(
-                "raw_expected_return_pct"
-            ),
-            "objective_expected_return_pct": ts_distribution.get(
-                "objective_expected_return_pct"
-            ),
-            "lower_quantile_return_pct": ts_distribution.get(
-                "lower_quantile_return_pct"
-            ),
+            "raw_expected_return_pct": ts_distribution.get("raw_expected_return_pct"),
+            "objective_expected_return_pct": ts_distribution.get("objective_expected_return_pct"),
+            "lower_quantile_return_pct": ts_distribution.get("lower_quantile_return_pct"),
             "dispersion_pct": ts_distribution.get("dispersion_pct"),
-            "tail_loss_probability": ts_distribution.get(
-                "tail_loss_probability"
-            ),
+            "tail_loss_probability": ts_distribution.get("tail_loss_probability"),
             "tail_loss_scale_pct": ts_distribution.get("tail_loss_scale_pct"),
             "return_distribution_contract": ts_distribution,
             "horizon_minutes": ts.get("horizon_minutes") or ts.get("primary_horizon_minutes"),
@@ -1805,9 +1792,9 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                 fallback_margin_by_key[key] = fallback_margin_by_key.get(
                     key, 0.0
                 ) + _local_position_margin(pos)
-                fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(
-                    key, 0.0
-                ) + (_safe_float(pos.unrealized_pnl, 0.0) or 0.0)
+                fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(key, 0.0) + (
+                    _safe_float(pos.unrealized_pnl, 0.0) or 0.0
+                )
             if exchange_marks:
                 exchange_totals = _exchange_position_totals(exchange_marks, fallback_margin_by_key)
                 open_count = int(exchange_totals["open_count"])
@@ -1885,12 +1872,8 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         "phase3_equity_baseline_at": phase3_equity.get("phase3_equity_baseline_at"),
         "phase3_equity_baseline_source": phase3_equity.get("phase3_equity_baseline_source"),
         "phase3_equity_start_date": phase3_equity.get("phase3_equity_start_date"),
-        "phase3_equity_observed_start_date": phase3_equity.get(
-            "phase3_equity_observed_start_date"
-        ),
-        "phase3_equity_series_complete": bool(
-            phase3_equity.get("phase3_equity_series_complete")
-        ),
+        "phase3_equity_observed_start_date": phase3_equity.get("phase3_equity_observed_start_date"),
+        "phase3_equity_series_complete": bool(phase3_equity.get("phase3_equity_series_complete")),
         "phase3_equity_scope": phase3_equity.get("phase3_equity_scope"),
         "today_total_pnl": today_total_pnl,
         "today_risk_pnl": today_risk_pnl,
@@ -1992,7 +1975,9 @@ def _build_execution_account_status(
     raw_okx_cash = _safe_float(okx_account.get("cash"), raw_okx_total) if okx_account else None
     raw_okx_equity = _safe_float(okx_account.get("equity"), raw_okx_total) if okx_account else None
     raw_okx_allocatable = (
-        _safe_float(okx_account.get("allocatable"), raw_okx_equity or raw_okx_total or raw_okx_available)
+        _safe_float(
+            okx_account.get("allocatable"), raw_okx_equity or raw_okx_total or raw_okx_available
+        )
         if okx_account
         else None
     )
@@ -2101,12 +2086,8 @@ def _build_execution_account_status(
         "phase3_equity_baseline_source": pnl_summary.get("phase3_equity_baseline_source"),
         "phase3_equity_start_date": pnl_summary.get("phase3_equity_start_date")
         or PHASE3_FIRST_CLEAN_DAY,
-        "phase3_equity_observed_start_date": pnl_summary.get(
-            "phase3_equity_observed_start_date"
-        ),
-        "phase3_equity_series_complete": bool(
-            pnl_summary.get("phase3_equity_series_complete")
-        ),
+        "phase3_equity_observed_start_date": pnl_summary.get("phase3_equity_observed_start_date"),
+        "phase3_equity_series_complete": bool(pnl_summary.get("phase3_equity_series_complete")),
         "phase3_equity_scope": pnl_summary.get("phase3_equity_scope"),
         "today_total_pnl": okx_pnl["today_total_pnl"],
         "today_risk_pnl": _safe_float(pnl_summary.get("today_risk_pnl"), None),
@@ -2467,9 +2448,7 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
     provenance = _safe_dict(sizing.get("policy_provenance"))
     portfolio = _safe_dict(sizing.get("portfolio_risk_snapshot"))
     paper_canary = _safe_dict(raw.get("paper_bootstrap_canary"))
-    runtime_guard = _safe_dict(
-        sizing.get("runtime_guard") or paper_canary.get("runtime_guard")
-    )
+    runtime_guard = _safe_dict(sizing.get("runtime_guard") or paper_canary.get("runtime_guard"))
     legacy_paper_canary = bool(
         sizing.get("contract_lifecycle") == "paper_bootstrap_canary"
         and sizing.get("execution_scope") == "paper_only"
@@ -2556,12 +2535,8 @@ def _dashboard_position_risk_contract(decision: Any) -> dict[str, Any]:
         "risk_budget_usdt": sizing.get("risk_budget_usdt"),
         "single_trade_risk_budget_usdt": sizing.get("single_trade_risk_budget_usdt"),
         "portfolio_risk_budget_usdt": sizing.get("portfolio_risk_budget_usdt"),
-        "remaining_portfolio_risk_budget_usdt": sizing.get(
-            "remaining_portfolio_risk_budget_usdt"
-        ),
-        "current_portfolio_stressed_loss_usdt": sizing.get(
-            "current_portfolio_stressed_loss_usdt"
-        ),
+        "remaining_portfolio_risk_budget_usdt": sizing.get("remaining_portfolio_risk_budget_usdt"),
+        "current_portfolio_stressed_loss_usdt": sizing.get("current_portfolio_stressed_loss_usdt"),
         "planned_stressed_loss_usdt": sizing.get("planned_stressed_loss_usdt"),
         "stressed_loss_fraction": sizing.get("stressed_loss_fraction"),
         "target_notional_usdt": sizing.get("target_notional_usdt"),
@@ -2623,9 +2598,7 @@ async def _dashboard_open_position_risk_evidence(
 
     async with get_session_ctx() as session:
         local_rows = list(
-            (
-                await session.execute(select(Position).where(Position.id.in_(position_ids)))
-            )
+            (await session.execute(select(Position).where(Position.id.in_(position_ids))))
             .scalars()
             .all()
         )
@@ -2634,9 +2607,7 @@ async def _dashboard_open_position_risk_evidence(
             for row in local_rows
         }
         entry_ids = {
-            exchange_id
-            for values in entry_ids_by_position_id.values()
-            for exchange_id in values
+            exchange_id for values in entry_ids_by_position_id.values() for exchange_id in values
         }
         order_rows: list[Any] = []
         if entry_ids:
@@ -2650,9 +2621,7 @@ async def _dashboard_open_position_risk_evidence(
             for exchange_id in _dashboard_split_exchange_order_ids(order.exchange_order_id)
         }
         decision_ids = {
-            int(order.decision_id)
-            for order in order_rows
-            if getattr(order, "decision_id", None)
+            int(order.decision_id) for order in order_rows if getattr(order, "decision_id", None)
         }
         decisions_by_id: dict[int, Any] = {}
         if decision_ids:
@@ -2750,9 +2719,7 @@ def _dashboard_position_risk_envelope(
         contract.get("available") is True for contract in contracts
     )
     management = _safe_dict(position.get("current_management_contract"))
-    management_blockers = [
-        value for value in _safe_list(management.get("blockers")) if value
-    ]
+    management_blockers = [value for value in _safe_list(management.get("blockers")) if value]
     current_management_authoritative = bool(management.get("contract_version")) and (
         management.get("management_eligible") is True and not management_blockers
     )
@@ -2975,8 +2942,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
         cached_at, cached_text, cached_executor_identity = cached_error
         if (
             cached_executor_identity is executor_identity
-            and (now - cached_at).total_seconds()
-            <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
+            and (now - cached_at).total_seconds() <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
         ):
             if cached:
                 return copy.deepcopy(cached[1])
@@ -3005,8 +2971,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             cached_at, cached_text, cached_executor_identity = cached_error
             if (
                 cached_executor_identity is executor_identity
-                and
-                (now - cached_at).total_seconds()
+                and (now - cached_at).total_seconds()
                 <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
             ):
                 if cached:
@@ -3351,11 +3316,7 @@ async def _dashboard_closed_position_ledger_rows(
     cache_key = _dashboard_closed_ledger_cache_key(mode, model_names)
     cached = _dashboard_heavy_cache.get(cache_key)
     history_watermark = load_okx_position_history_watermark(mode)
-    if (
-        cached is not None
-        and history_watermark is not None
-        and cached[0] < history_watermark
-    ):
+    if cached is not None and history_watermark is not None and cached[0] < history_watermark:
         _dashboard_heavy_cache.pop(cache_key, None)
         cached = None
     if cached is not None:
@@ -3768,9 +3729,7 @@ async def _dashboard_closed_position_ledger_rows_uncached(
         if official_rows:
             official_total = len(official_rows)
             official_total_pages = (
-                max(1, (official_total + page_size - 1) // page_size)
-                if official_total
-                else 1
+                max(1, (official_total + page_size - 1) // page_size) if official_total else 1
             )
             page = min(max(int(page or 1), 1), official_total_pages)
             selected_official_rows = official_rows
@@ -3886,11 +3845,8 @@ async def _dashboard_pending_closed_position_rows(
     confirmed_order_ids = {
         token
         for order in order_rows
-        if str(getattr(order, "okx_sync_status", "") or "").strip()
-        in confirmed_statuses
-        for token in _dashboard_split_exchange_order_ids(
-            getattr(order, "exchange_order_id", None)
-        )
+        if str(getattr(order, "okx_sync_status", "") or "").strip() in confirmed_statuses
+        for token in _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
     }
     if not confirmed_order_ids:
         return []
@@ -4034,15 +3990,19 @@ async def _dashboard_position_history_rows(
     page: int,
     page_size: int,
 ) -> tuple[list[dict[str, Any]], int, int, int, str, int, int]:
-    settled_rows, _total, _page, _pages, settled_source = (
-        await _dashboard_closed_position_ledger_rows(
-            session,
-            repo,
-            mode=mode,
-            page=1,
-            page_size=5000,
-            paginate=False,
-        )
+    (
+        settled_rows,
+        _total,
+        _page,
+        _pages,
+        settled_source,
+    ) = await _dashboard_closed_position_ledger_rows(
+        session,
+        repo,
+        mode=mode,
+        page=1,
+        page_size=5000,
+        paginate=False,
     )
     settled_rows = [
         {
@@ -4092,17 +4052,11 @@ def _closed_rows_for_selected_ledger_groups(
     selected_groups: list[Any],
 ) -> list[Any]:
     selected_ids = {
-        int(position_id)
-        for group in selected_groups
-        for position_id in group.position_ids
+        int(position_id) for group in selected_groups for position_id in group.position_ids
     }
     if not selected_ids:
         return []
-    return [
-        row
-        for row in closed_rows
-        if row.id is not None and int(row.id) in selected_ids
-    ]
+    return [row for row in closed_rows if row.id is not None and int(row.id) in selected_ids]
 
 
 def _dashboard_ledger_group_refresh_key(group: Any) -> tuple[Any, ...]:
@@ -4158,6 +4112,16 @@ def _dashboard_position_history_is_authoritative_full(row: dict[str, Any]) -> bo
     closed_qty = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
     max_qty = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
     return bool(max_qty > 0 and closed_qty >= max_qty * 0.999)
+
+
+def _dashboard_position_history_entry_target(row: dict[str, Any]) -> float:
+    """Return cumulative entry contracts for lifecycle evidence matching."""
+
+    max_position = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
+    close_total = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
+    if _dashboard_position_history_is_authoritative_full(row) and close_total > 0:
+        return close_total
+    return max_position
 
 
 def _dashboard_position_close_origin(
@@ -4341,7 +4305,9 @@ def _dashboard_position_history_match_score(
     return score
 
 
-def _dashboard_position_history_best_local_group(row: dict[str, Any], groups: list[Any]) -> Any | None:
+def _dashboard_position_history_best_local_group(
+    row: dict[str, Any], groups: list[Any]
+) -> Any | None:
     scored = [
         (score, group)
         for group in groups
@@ -4480,13 +4446,31 @@ def _dashboard_order_raw_fills(order: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _dashboard_order_base_quantity(order: Any) -> float:
+def _dashboard_order_stored_base_quantity(order: Any) -> float:
     raw = _dashboard_order_raw_fills(order)
     for key in ("base_quantity", "baseQuantity", "fill_base_quantity"):
         value = _safe_float(raw.get(key), None)
         if value is not None and abs(value) > 0:
             return abs(value)
     return abs(_safe_float(getattr(order, "quantity", None), 0.0) or 0.0)
+
+
+def _dashboard_order_base_quantity(
+    order: Any,
+    *,
+    contract_size: float | None = None,
+) -> float:
+    """Return base units, preferring current OKX contracts when a spec is known.
+
+    Older cached fill facts can contain a stale ``contract_size`` (for example
+    after an OKX instrument changed its contract value).  The contract count is
+    the exchange-native fact; convert it with the official row's current spec
+    before falling back to the stored base quantity.
+    """
+    contracts = _dashboard_order_contracts(order)
+    if contract_size is not None and contract_size > 0 and contracts > 0:
+        return abs(contracts * contract_size)
+    return _dashboard_order_stored_base_quantity(order)
 
 
 def _dashboard_order_contracts(order: Any) -> float:
@@ -4499,7 +4483,7 @@ def _dashboard_order_contracts(order: Any) -> float:
         if value is not None and abs(value) > 0:
             return abs(value)
     contract_size = _safe_float(raw.get("contract_size"), 0.0) or 0.0
-    base_quantity = _dashboard_order_base_quantity(order)
+    base_quantity = _dashboard_order_stored_base_quantity(order)
     if contract_size > 0 and base_quantity > 0:
         return abs(base_quantity / contract_size)
     return base_quantity
@@ -4626,8 +4610,9 @@ def _dashboard_best_quantity_subset(
             return (
                 sorted(
                     best_subset,
-                    key=lambda order: _dashboard_order_time(order)
-                    or datetime.max.replace(tzinfo=UTC),
+                    key=lambda order: (
+                        _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC)
+                    ),
                 ),
                 True,
             )
@@ -4647,41 +4632,228 @@ def _dashboard_best_quantity_subset(
 def _dashboard_select_orders_by_official_quantity(
     orders: list[Any],
     target: float,
+    *,
+    contract_size: float | None = None,
+    history_row: dict[str, Any] | None = None,
+    lifecycle_role: str = "",
 ) -> tuple[list[Any], str]:
+    def base_quantity_getter(order: Any) -> float:
+        if history_row is not None and lifecycle_role:
+            return _dashboard_order_base_quantity_for_history(
+                history_row,
+                lifecycle_role,
+                order,
+                contract_size=contract_size,
+            )
+        return _dashboard_order_base_quantity(
+            order,
+            contract_size=contract_size,
+        )
+
+    def contracts_getter(order: Any) -> float:
+        if history_row is not None and lifecycle_role:
+            return _dashboard_order_contracts_for_history(
+                history_row,
+                lifecycle_role,
+                order,
+            )
+        return _dashboard_order_contracts(order)
+
     selected, matched = _dashboard_best_quantity_subset(
         orders,
         target,
-        _dashboard_order_base_quantity,
+        base_quantity_getter,
     )
     if matched:
         return selected, "base_quantity"
     selected, matched = _dashboard_best_quantity_subset(
         orders,
         target,
-        _dashboard_order_contracts,
+        contracts_getter,
     )
     if matched:
         return selected, "contracts"
     return selected, "unmatched"
 
 
-def _dashboard_linked_fill_from_order(order: Any) -> dict[str, Any]:
+def _dashboard_orders_match_official_quantity(
+    orders: list[Any],
+    target: float,
+    *,
+    contract_size: float | None = None,
+    history_row: dict[str, Any] | None = None,
+    lifecycle_role: str = "",
+) -> bool:
+    if target <= 0:
+        return True
+    return any(
+        _dashboard_quantities_match(
+            sum(quantity_getter(order) for order in orders),
+            target,
+        )
+        for quantity_getter in (
+            (
+                lambda order: _dashboard_order_contracts_for_history(
+                    history_row,
+                    lifecycle_role,
+                    order,
+                )
+            )
+            if history_row is not None and lifecycle_role
+            else _dashboard_order_contracts,
+            (
+                lambda order: _dashboard_order_base_quantity_for_history(
+                    history_row,
+                    lifecycle_role,
+                    order,
+                    contract_size=contract_size,
+                )
+            )
+            if history_row is not None and lifecycle_role
+            else lambda order: _dashboard_order_base_quantity(
+                order,
+                contract_size=contract_size,
+            ),
+        )
+    )
+
+
+def _dashboard_order_lifecycle_allocation(
+    row: dict[str, Any] | None,
+    lifecycle_role: str,
+    order: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    order_contracts = _dashboard_order_contracts(order)
+    return lifecycle_order_allocation(
+        row,
+        role=lifecycle_role,
+        order_id=order_id,
+        order_contracts=order_contracts if order_contracts > 0 else None,
+    )
+
+
+def _dashboard_order_contracts_for_history(
+    row: dict[str, Any] | None,
+    lifecycle_role: str,
+    order: Any,
+) -> float:
+    allocation, _error = _dashboard_order_lifecycle_allocation(
+        row,
+        lifecycle_role,
+        order,
+    )
+    if allocation is not None:
+        return float(allocation["allocated_contracts"])
+    return _dashboard_order_contracts(order)
+
+
+def _dashboard_order_base_quantity_for_history(
+    row: dict[str, Any] | None,
+    lifecycle_role: str,
+    order: Any,
+    *,
+    contract_size: float | None,
+) -> float:
+    allocation, _error = _dashboard_order_lifecycle_allocation(
+        row,
+        lifecycle_role,
+        order,
+    )
+    if allocation is not None:
+        if contract_size is not None and contract_size > 0:
+            return float(allocation["allocated_contracts"]) * contract_size
+        return _dashboard_order_base_quantity(order) * float(allocation["allocation_ratio"])
+    return _dashboard_order_base_quantity(order, contract_size=contract_size)
+
+
+def _dashboard_order_fee_for_history(
+    row: dict[str, Any] | None,
+    lifecycle_role: str,
+    order: Any,
+) -> float:
+    allocation, _error = _dashboard_order_lifecycle_allocation(
+        row,
+        lifecycle_role,
+        order,
+    )
+    ratio = float(allocation["allocation_ratio"]) if allocation is not None else 1.0
+    return _dashboard_order_fee_abs(order) * ratio
+
+
+def _dashboard_order_fill_pnl_for_history(
+    row: dict[str, Any] | None,
+    lifecycle_role: str,
+    order: Any,
+) -> float | None:
+    fill_pnl = _dashboard_order_fill_pnl(order)
+    allocation, _error = _dashboard_order_lifecycle_allocation(
+        row,
+        lifecycle_role,
+        order,
+    )
+    if allocation is not None and fill_pnl is not None and lifecycle_role == "entry":
+        return 0.0
+    return fill_pnl
+
+
+def _dashboard_linked_fill_from_order(
+    order: Any,
+    *,
+    history_row: dict[str, Any] | None = None,
+    lifecycle_role: str = "",
+    contract_size: float | None = None,
+) -> dict[str, Any]:
     raw = _dashboard_order_raw_fills(order)
     order_time = _dashboard_order_time(order)
+    effective_contract_size = (
+        contract_size
+        if contract_size is not None and contract_size > 0
+        else _safe_float(raw.get("contract_size"), 1.0) or 1.0
+    )
+    allocation, allocation_error = _dashboard_order_lifecycle_allocation(
+        history_row,
+        lifecycle_role,
+        order,
+    )
     return {
         "side": str(getattr(order, "side", "") or "").lower(),
-        "quantity": _dashboard_order_base_quantity(order),
-        "contracts": _dashboard_order_contracts(order),
-        "contract_size": _safe_float(raw.get("contract_size"), 1.0) or 1.0,
+        "quantity": _dashboard_order_base_quantity_for_history(
+            history_row,
+            lifecycle_role,
+            order,
+            contract_size=contract_size,
+        ),
+        "contracts": _dashboard_order_contracts_for_history(
+            history_row,
+            lifecycle_role,
+            order,
+        ),
+        "contract_size": effective_contract_size,
         "price": _dashboard_order_price(order),
-        "pnl": _dashboard_order_fill_pnl(order),
+        "pnl": _dashboard_order_fill_pnl_for_history(
+            history_row,
+            lifecycle_role,
+            order,
+        ),
         "pnl_pct": None,
-        "fee": _dashboard_order_fee_abs(order),
+        "fee": _dashboard_order_fee_for_history(
+            history_row,
+            lifecycle_role,
+            order,
+        ),
         "order_id": str(getattr(order, "exchange_order_id", "") or "").strip(),
         "trade_id": str(getattr(order, "okx_trade_ids", "") or "").strip(),
         "filled_at": order_time.isoformat() if order_time else None,
         "okx_confirmed": _dashboard_order_okx_confirmed(order),
-        "source": "okx_order_fact_cache",
+        "source": (
+            "okx_order_fact_cache_lifecycle_allocated"
+            if allocation is not None
+            else "okx_order_fact_cache"
+        ),
+        "lifecycle_role": lifecycle_role or None,
+        "lifecycle_order_allocation": allocation,
+        "lifecycle_order_allocation_error": allocation_error,
     }
 
 
@@ -4757,18 +4929,22 @@ def _dashboard_position_history_order_payload(
     updated_at = _dashboard_ms_datetime(row.get("uTime") or row.get("updatedTime"))
     raw_close_quantity = _safe_float(row.get("closeTotalPos"), 0.0) or 0.0
     raw_max_quantity = _safe_float(row.get("openMaxPos"), 0.0) or 0.0
+    entry_target_quantity = _dashboard_position_history_entry_target(row)
+    contract_size = _dashboard_position_history_contract_size(row)
     entry_side = "sell" if side == "short" else "buy" if side == "long" else ""
     close_side = "buy" if side == "short" else "sell" if side == "long" else ""
-    candidates = [
-        order
-        for order in order_rows
-        if _dashboard_order_matches_position_history_window(
-            order,
-            inst_id=inst_id,
-            opened_at=opened_at,
-            updated_at=updated_at,
-        )
-    ]
+    candidates = _dashboard_dedupe_orders_by_exchange_id(
+        [
+            order
+            for order in order_rows
+            if _dashboard_order_matches_position_history_window(
+                order,
+                inst_id=inst_id,
+                opened_at=opened_at,
+                updated_at=updated_at,
+            )
+        ]
+    )
     entry_candidates = [
         order
         for order in candidates
@@ -4777,18 +4953,15 @@ def _dashboard_position_history_order_payload(
     close_candidates = [
         order
         for order in candidates
-        if (
-            not close_side
-            or str(getattr(order, "side", "") or "").lower() == close_side
-        )
+        if (not close_side or str(getattr(order, "side", "") or "").lower() == close_side)
         and (_dashboard_order_fill_pnl(order) is not None or _dashboard_order_raw_fills(order))
     ]
-    hinted_entry_ids = _dashboard_split_exchange_order_ids(
-        row.get("_dashboard_entry_order_ids")
-    )
+    hinted_entry_ids = _dashboard_split_exchange_order_ids(row.get("_dashboard_entry_order_ids"))
     hinted_close_ids = _dashboard_split_exchange_order_ids(row.get("_dashboard_close_order_ids"))
     hinted_linked_ids = _dashboard_split_exchange_order_ids(row.get("_dashboard_linked_order_ids"))
     if hinted_entry_ids or hinted_close_ids or hinted_linked_ids:
+        entry_candidate_ids = set(_dashboard_order_ids(entry_candidates))
+        close_candidate_ids = set(_dashboard_order_ids(close_candidates))
         selected_entries = _dashboard_orders_by_exchange_ids(
             order_rows,
             hinted_entry_ids or (hinted_linked_ids - hinted_close_ids),
@@ -4797,6 +4970,16 @@ def _dashboard_position_history_order_payload(
             order_rows,
             hinted_close_ids or (hinted_linked_ids - hinted_entry_ids),
         )
+        selected_entries = [
+            order
+            for order in selected_entries
+            if str(getattr(order, "exchange_order_id", "") or "").strip() in entry_candidate_ids
+        ]
+        selected_closes = [
+            order
+            for order in selected_closes
+            if str(getattr(order, "exchange_order_id", "") or "").strip() in close_candidate_ids
+        ]
         if not selected_entries and not selected_closes and hinted_linked_ids:
             hinted_orders = _dashboard_orders_by_exchange_ids(order_rows, hinted_linked_ids)
             selected_entries = [
@@ -4812,13 +4995,55 @@ def _dashboard_position_history_order_payload(
         selected_entries, entry_augmented = _dashboard_augment_orders_to_official_quantity(
             selected_entries,
             entry_candidates,
-            raw_max_quantity,
+            entry_target_quantity,
+            contract_size=contract_size,
+            history_row=row,
+            lifecycle_role="entry",
         )
         selected_closes, close_augmented = _dashboard_augment_orders_to_official_quantity(
             selected_closes,
             close_candidates,
             raw_close_quantity,
+            contract_size=contract_size,
+            history_row=row,
+            lifecycle_role="close",
         )
+        entry_recomputed = False
+        if not _dashboard_orders_match_official_quantity(
+            selected_entries,
+            entry_target_quantity,
+            contract_size=contract_size,
+            history_row=row,
+            lifecycle_role="entry",
+        ):
+            recomputed_entries, recomputed_source = _dashboard_select_orders_by_official_quantity(
+                entry_candidates,
+                entry_target_quantity,
+                contract_size=contract_size,
+                history_row=row,
+                lifecycle_role="entry",
+            )
+            if recomputed_source != "unmatched":
+                selected_entries = recomputed_entries
+                entry_recomputed = True
+        close_recomputed = False
+        if not _dashboard_orders_match_official_quantity(
+            selected_closes,
+            raw_close_quantity,
+            contract_size=contract_size,
+            history_row=row,
+            lifecycle_role="close",
+        ):
+            recomputed_closes, recomputed_source = _dashboard_select_orders_by_official_quantity(
+                close_candidates,
+                raw_close_quantity,
+                contract_size=contract_size,
+                history_row=row,
+                lifecycle_role="close",
+            )
+            if recomputed_source != "unmatched":
+                selected_closes = recomputed_closes
+                close_recomputed = True
         return _dashboard_position_history_order_payload_from_selected(
             row,
             selected_entries=selected_entries,
@@ -4826,14 +5051,18 @@ def _dashboard_position_history_order_payload(
             raw_close_quantity=raw_close_quantity,
             raw_max_quantity=raw_max_quantity,
             entry_match_source=(
-                "persisted_order_ids_plus_confirmed_fills"
+                "confirmed_fills_recomputed"
+                if entry_recomputed
+                else "persisted_order_ids_plus_confirmed_fills"
                 if entry_augmented
                 else "persisted_order_ids"
                 if selected_entries
                 else "persisted_order_ids_missing"
             ),
             close_match_source=(
-                "persisted_order_ids_plus_confirmed_fills"
+                "confirmed_fills_recomputed"
+                if close_recomputed
+                else "persisted_order_ids_plus_confirmed_fills"
                 if close_augmented
                 else "persisted_order_ids"
                 if selected_closes
@@ -4843,16 +5072,26 @@ def _dashboard_position_history_order_payload(
     selected_closes, close_match_source = _dashboard_select_orders_by_official_quantity(
         close_candidates,
         raw_close_quantity,
+        contract_size=contract_size,
+        history_row=row,
+        lifecycle_role="close",
     )
     entry_match_source = "unmatched"
-    if raw_max_quantity > 0:
+    if entry_target_quantity > 0:
         selected_entries, entry_match_source = _dashboard_select_orders_by_official_quantity(
             entry_candidates,
-            raw_max_quantity,
+            entry_target_quantity,
+            contract_size=contract_size,
+            history_row=row,
+            lifecycle_role="entry",
         )
     else:
         first_close_at = min(
-            (_dashboard_order_time(order) for order in selected_closes if _dashboard_order_time(order)),
+            (
+                _dashboard_order_time(order)
+                for order in selected_closes
+                if _dashboard_order_time(order)
+            ),
             default=None,
         )
         selected_entries = [
@@ -4879,13 +5118,45 @@ def _dashboard_orders_by_exchange_ids(order_rows: list[Any], order_ids: set[str]
     if not order_ids:
         return []
     return sorted(
-        [
-            order
-            for order in order_rows
-            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-            & order_ids
-        ],
+        _dashboard_dedupe_orders_by_exchange_id(
+            [
+                order
+                for order in order_rows
+                if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+                & order_ids
+            ]
+        ),
         key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
+    )
+
+
+def _dashboard_dedupe_orders_by_exchange_id(orders: list[Any]) -> list[Any]:
+    """Prevent duplicate local cache rows from double-counting one OKX order."""
+    selected: dict[str, Any] = {}
+    anonymous: list[Any] = []
+    for order in orders:
+        order_ids = _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+        if not order_ids:
+            anonymous.append(order)
+            continue
+        for order_id in order_ids:
+            current = selected.get(order_id)
+            if current is None or _dashboard_order_fact_quality(
+                order
+            ) > _dashboard_order_fact_quality(current):
+                selected[order_id] = order
+    return [*anonymous, *selected.values()]
+
+
+def _dashboard_order_fact_quality(order: Any) -> tuple[int, int, int, int, int]:
+    raw = _dashboard_order_raw_fills(order)
+    rows = raw.get("rows") if isinstance(raw.get("rows"), list) else []
+    return (
+        int(_dashboard_order_okx_confirmed(order)),
+        int(bool(raw.get("fills_history_confirmed"))),
+        len(rows),
+        int(_dashboard_order_fill_pnl(order) is not None),
+        int(bool(getattr(order, "decision_id", None))),
     )
 
 
@@ -4893,6 +5164,10 @@ def _dashboard_augment_orders_to_official_quantity(
     selected_orders: list[Any],
     candidates: list[Any],
     official_quantity: float,
+    *,
+    contract_size: float | None = None,
+    history_row: dict[str, Any] | None = None,
+    lifecycle_role: str = "",
 ) -> tuple[list[Any], bool]:
     """Fill missing persisted links with confirmed orders from the same lifecycle window."""
 
@@ -4907,7 +5182,31 @@ def _dashboard_augment_orders_to_official_quantity(
         for order in candidates
         if str(getattr(order, "exchange_order_id", "") or "").strip() not in selected_ids
     ]
-    for quantity_getter in (_dashboard_order_contracts, _dashboard_order_base_quantity):
+
+    def contracts_getter(order: Any) -> float:
+        if history_row is not None and lifecycle_role:
+            return _dashboard_order_contracts_for_history(
+                history_row,
+                lifecycle_role,
+                order,
+            )
+        return _dashboard_order_contracts(order)
+
+    def base_quantity_getter(order: Any) -> float:
+        if history_row is not None and lifecycle_role:
+            return _dashboard_order_base_quantity_for_history(
+                history_row,
+                lifecycle_role,
+                order,
+                contract_size=contract_size,
+            )
+        return _dashboard_order_base_quantity(
+            order,
+            contract_size=contract_size,
+        )
+
+    quantity_getters = (contracts_getter, base_quantity_getter)
+    for quantity_getter in quantity_getters:
         selected_quantity = sum(quantity_getter(order) for order in selected)
         if _dashboard_quantities_match(selected_quantity, official_quantity):
             return selected, False
@@ -4923,8 +5222,7 @@ def _dashboard_augment_orders_to_official_quantity(
             continue
         combined = sorted(
             [*selected, *supplement],
-            key=lambda order: _dashboard_order_time(order)
-            or datetime.max.replace(tzinfo=UTC),
+            key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
         )
         if _dashboard_quantities_match(
             sum(quantity_getter(order) for order in combined),
@@ -4944,62 +5242,103 @@ def _dashboard_position_history_order_payload_from_selected(
     entry_match_source: str,
     close_match_source: str,
 ) -> dict[str, Any]:
-    close_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_closes)
-    close_contracts = sum(_dashboard_order_contracts(order) for order in selected_closes)
-    entry_base_quantity = sum(_dashboard_order_base_quantity(order) for order in selected_entries)
-    entry_contracts = sum(_dashboard_order_contracts(order) for order in selected_entries)
     contract_size = _dashboard_position_history_contract_size(row)
-    raw_close_base_quantity = raw_close_quantity * contract_size
-    raw_max_base_quantity = raw_max_quantity * contract_size
+    entry_target_contracts = _dashboard_position_history_entry_target(row)
+    close_base_quantity = sum(
+        _dashboard_order_base_quantity_for_history(
+            row,
+            "close",
+            order,
+            contract_size=contract_size,
+        )
+        for order in selected_closes
+    )
+    close_contracts = sum(
+        _dashboard_order_contracts_for_history(row, "close", order) for order in selected_closes
+    )
+    entry_base_quantity = sum(
+        _dashboard_order_base_quantity_for_history(
+            row,
+            "entry",
+            order,
+            contract_size=contract_size,
+        )
+        for order in selected_entries
+    )
+    entry_contracts = sum(
+        _dashboard_order_contracts_for_history(row, "entry", order) for order in selected_entries
+    )
+    raw_close_base_quantity = (
+        raw_close_quantity * contract_size if contract_size is not None else raw_close_quantity
+    )
+    entry_target_base_quantity = (
+        entry_target_contracts * contract_size
+        if contract_size is not None
+        else entry_target_contracts
+    )
     close_base_matches = bool(
         close_base_quantity > 0
         and _dashboard_quantities_match(close_base_quantity, raw_close_base_quantity)
     )
     close_contracts_match = bool(
-        close_contracts > 0
-        and _dashboard_quantities_match(close_contracts, raw_close_quantity)
+        close_contracts > 0 and _dashboard_quantities_match(close_contracts, raw_close_quantity)
     )
     entry_base_matches = bool(
         entry_base_quantity > 0
-        and _dashboard_quantities_match(entry_base_quantity, raw_max_base_quantity)
+        and _dashboard_quantities_match(entry_base_quantity, entry_target_base_quantity)
     )
     entry_contracts_match = bool(
-        entry_contracts > 0
-        and _dashboard_quantities_match(entry_contracts, raw_max_quantity)
+        entry_contracts > 0 and _dashboard_quantities_match(entry_contracts, entry_target_contracts)
     )
     close_quantity = raw_close_base_quantity
     if close_base_matches:
         close_quantity = close_base_quantity
     elif close_contracts_match:
         close_quantity = close_base_quantity or raw_close_base_quantity
+    raw_max_base_quantity = (
+        raw_max_quantity * contract_size if contract_size is not None else raw_max_quantity
+    )
     max_quantity = raw_max_base_quantity or entry_base_quantity or close_quantity
     if raw_max_quantity > 0:
-        if entry_base_matches:
-            max_quantity = entry_base_quantity
-        elif entry_contracts_match:
-            max_quantity = entry_base_quantity or raw_max_base_quantity
+        max_quantity = raw_max_base_quantity
     elif entry_base_quantity > 0:
         max_quantity = max(entry_base_quantity, close_quantity)
-    linked_orders = sorted(
-        [*selected_entries, *selected_closes],
-        key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
+    linked_order_roles = sorted(
+        [
+            *(("entry", order) for order in selected_entries),
+            *(("close", order) for order in selected_closes),
+        ],
+        key=lambda item: _dashboard_order_time(item[1]) or datetime.max.replace(tzinfo=UTC),
     )
     return {
         "entry_order_ids": _dashboard_order_ids(selected_entries),
         "close_order_ids": _dashboard_order_ids(selected_closes),
-        "linked_fills": [_dashboard_linked_fill_from_order(order) for order in linked_orders],
+        "linked_fills": [
+            _dashboard_linked_fill_from_order(
+                order,
+                history_row=row,
+                lifecycle_role=lifecycle_role,
+                contract_size=contract_size,
+            )
+            for lifecycle_role, order in linked_order_roles
+        ],
         **_dashboard_position_close_origin(row, selected_closes),
         "close_quantity": close_quantity,
         "max_quantity": max_quantity,
-        "entry_fee": sum(_dashboard_order_fee_abs(order) for order in selected_entries),
-        "close_fee": sum(_dashboard_order_fee_abs(order) for order in selected_closes),
+        "entry_fee": sum(
+            _dashboard_order_fee_for_history(row, "entry", order) for order in selected_entries
+        ),
+        "close_fee": sum(
+            _dashboard_order_fee_for_history(row, "close", order) for order in selected_closes
+        ),
         "close_fill_pnl": sum(
-            _dashboard_order_fill_pnl(order) or 0.0 for order in selected_closes
+            _dashboard_order_fill_pnl_for_history(row, "close", order) or 0.0
+            for order in selected_closes
         ),
         "entry_match_source": entry_match_source,
         "close_match_source": close_match_source,
         "entry_quantity_matched": bool(
-            raw_max_quantity <= 0 or entry_base_matches or entry_contracts_match
+            entry_target_contracts <= 0 or entry_base_matches or entry_contracts_match
         ),
         "close_quantity_matched": bool(
             raw_close_quantity <= 0 or close_base_matches or close_contracts_match
@@ -5007,14 +5346,14 @@ def _dashboard_position_history_order_payload_from_selected(
     }
 
 
-def _dashboard_position_history_contract_size(row: dict[str, Any]) -> float:
+def _dashboard_position_history_contract_size(row: dict[str, Any]) -> float | None:
     spec = row.get("_bb_contract_spec")
     if not isinstance(spec, dict):
-        return 1.0
+        return None
     contract_value = _safe_float(spec.get("ctVal") or spec.get("contract_size"), 0.0) or 0.0
     contract_multiplier = _safe_float(spec.get("ctMult"), 1.0) or 1.0
     contract_size = abs(contract_value * contract_multiplier)
-    return contract_size if contract_size > 0 else 1.0
+    return contract_size if contract_size > 0 else None
 
 
 def _dashboard_position_history_official_rows_as_groups_legacy(
@@ -5078,7 +5417,9 @@ def _dashboard_position_history_official_rows_as_groups_legacy(
                 "closed_quantity": close_quantity,
                 "entry_price": _safe_float(row.get("openAvgPx"), payload.get("entry_price", 0.0))
                 or 0.0,
-                "current_price": _safe_float(row.get("closeAvgPx"), payload.get("current_price", 0.0))
+                "current_price": _safe_float(
+                    row.get("closeAvgPx"), payload.get("current_price", 0.0)
+                )
                 or 0.0,
                 "average_entry_price": _safe_float(
                     row.get("openAvgPx"),
@@ -5169,7 +5510,9 @@ def _dashboard_position_history_official_rows_as_groups(
         if not symbol:
             continue
         relevant_closed_rows = positions_by_inst_id.get(inst_id, []) if inst_id else closed_rows
-        relevant_order_rows = list(orders_by_inst_id.get(inst_id, [])) if inst_id else order_rows
+        relevant_order_rows = (
+            list(orders_by_inst_id.get(inst_id, [])) if inst_id else list(order_rows)
+        )
         hinted_order_ids = set().union(
             _dashboard_split_exchange_order_ids(row.get("_dashboard_entry_order_ids")),
             _dashboard_split_exchange_order_ids(row.get("_dashboard_close_order_ids")),
@@ -5181,6 +5524,8 @@ def _dashboard_position_history_official_rows_as_groups(
                 if id(order) not in seen_orders:
                     relevant_order_rows.append(order)
                     seen_orders.add(id(order))
+
+        relevant_order_rows = _dashboard_dedupe_orders_by_exchange_id(relevant_order_rows)
 
         side = _dashboard_position_history_local_side(
             row,
@@ -5374,8 +5719,35 @@ async def _dashboard_okx_position_history_rows(
                 ),
                 timeout=12.0,
             )
+            contract_specs: dict[str, dict[str, Any]] = {}
+            for position in closed_rows:
+                settlement_raw = getattr(position, "settlement_raw", None)
+                settlement_raw = settlement_raw if isinstance(settlement_raw, dict) else {}
+                cached_row = settlement_raw.get("okx_position_history_row")
+                cached_row = cached_row if isinstance(cached_row, dict) else {}
+                spec = cached_row.get("_bb_contract_spec")
+                inst_id = (
+                    str(getattr(position, "okx_inst_id", "") or cached_row.get("instId") or "")
+                    .strip()
+                    .upper()
+                )
+                if inst_id and isinstance(spec, dict) and spec:
+                    existing_spec = contract_specs.get(inst_id)
+                    if existing_spec is None or _dashboard_contract_spec_quality(
+                        spec
+                    ) > _dashboard_contract_spec_quality(existing_spec):
+                        contract_specs[inst_id] = dict(spec)
             return [
-                dict(row)
+                {
+                    **dict(row),
+                    **(
+                        {"_bb_contract_spec": contract_specs[inst_id]}
+                        if not row.get("_bb_contract_spec")
+                        and (inst_id := str(row.get("instId") or "").strip().upper())
+                        and inst_id in contract_specs
+                        else {}
+                    ),
+                }
                 for row in rows
                 if isinstance(row, dict)
             ]
@@ -5400,6 +5772,16 @@ async def _dashboard_okx_position_history_rows(
                     )
 
     return await _dashboard_heavy_cached(cache_key, builder, ttl_seconds=60.0)
+
+
+def _dashboard_contract_spec_quality(spec: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Prefer the complete current public-instrument snapshot over legacy cache facts."""
+    return (
+        int(bool(spec.get("source_endpoint"))),
+        int(bool(spec.get("instFamily"))),
+        int(bool(spec.get("ctType"))),
+        int(bool(spec.get("ctValCcy"))),
+    )
 
 
 def _is_live_position_open(position: dict) -> bool:
@@ -5551,8 +5933,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         cached_at, cached_value, cached_executor_identity = cached_error
         if (
             cached_executor_identity is not executor_identity
-            or (now - cached_at).total_seconds()
-            > _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS
+            or (now - cached_at).total_seconds() > _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS
         ):
             return None
         stale_snapshot = cached_success(now, fresh_only=False)
@@ -5678,8 +6059,8 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                         "source": "isolated_executor",
                         "error_cached": True,
                     },
-                        executor_identity,
-                    )
+                    executor_identity,
+                )
                 return stale_snapshot
             return cache_failure(exc, source="isolated_executor", identity=executor_identity)
 
@@ -5756,7 +6137,9 @@ async def _build_tickers_for_open_positions(
             change_24h = (
                 market_change
                 if market_change is not None and abs(market_change) > 1e-12
-                else public_change if public_change is not None else market_change or 0.0
+                else public_change
+                if public_change is not None
+                else market_change or 0.0
             )
             tickers[symbol] = {
                 "price": price,
@@ -5790,7 +6173,9 @@ async def _build_tickers_for_open_positions(
                 change_24h = (
                     market_change
                     if market_change is not None and abs(market_change) > 1e-12
-                    else public_change if public_change is not None else market_change or 0.0
+                    else public_change
+                    if public_change is not None
+                    else market_change or 0.0
                 )
                 tickers[symbol] = {
                     "price": price,
@@ -5930,16 +6315,15 @@ async def _get_display_open_positions_snapshot(
                     for row in group_rows
                 )
                 local_funding_fee = sum(
-                    _safe_float(getattr(row, "funding_fee", None), 0.0) or 0.0
-                    for row in group_rows
+                    _safe_float(getattr(row, "funding_fee", None), 0.0) or 0.0 for row in group_rows
                 )
                 management_funding_fee = None
                 for row in group_rows:
                     management = _safe_dict(getattr(row, "current_management_contract", None))
                     if "funding_fee_usdt" in management:
-                        management_funding_fee = _safe_float(
-                            management.get("funding_fee_usdt"), 0.0
-                        ) or 0.0
+                        management_funding_fee = (
+                            _safe_float(management.get("funding_fee_usdt"), 0.0) or 0.0
+                        )
                         break
                 funding_fee = (
                     management_funding_fee
@@ -6088,22 +6472,16 @@ async def _get_display_open_positions_snapshot(
                     "current_price": valuation["current_price"],
                     "change_24h": change_24h,
                     "unrealized_pnl": valuation["unrealized_pnl"],
-                    "funding_fee": _safe_float(
-                        getattr(local_position, "funding_fee", None), 0.0
-                    )
+                    "funding_fee": _safe_float(getattr(local_position, "funding_fee", None), 0.0)
                     if local_position is not None
                     else 0.0,
                     "funding_fee_source": (
                         "position_funding_fee" if local_position is not None else "none"
                     ),
-                    "entry_fee": abs(
-                        _safe_float(getattr(local_position, "entry_fee", None), 0.0)
-                    )
+                    "entry_fee": abs(_safe_float(getattr(local_position, "entry_fee", None), 0.0))
                     if local_position is not None
                     else 0.0,
-                    "close_fee": abs(
-                        _safe_float(getattr(local_position, "close_fee", None), 0.0)
-                    )
+                    "close_fee": abs(_safe_float(getattr(local_position, "close_fee", None), 0.0))
                     if local_position is not None
                     else 0.0,
                     "fee": (
@@ -6212,7 +6590,9 @@ def _merge_market_and_public_ticker(market_ticker: dict, public_ticker: dict) ->
     merged["change_24h"] = (
         market_change
         if market_change is not None and abs(market_change) > 1e-12
-        else public_change if public_change is not None else market_change or 0.0
+        else public_change
+        if public_change is not None
+        else market_change or 0.0
     )
     for key in (
         "volume_24h",
@@ -6456,8 +6836,7 @@ async def get_ml_signal_status():
         status["total_shadow_sample_count"] = None
         status["new_shadow_sample_count"] = None
         status["sample_count_blocker"] = (
-            "current_training_epoch_shadow_count_unavailable:"
-            f"{safe_error_text(exc, limit=120)}"
+            f"current_training_epoch_shadow_count_unavailable:{safe_error_text(exc, limit=120)}"
         )
 
     return status
@@ -6466,9 +6845,7 @@ async def get_ml_signal_status():
 def _trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
     """Return the explicit current-epoch cursor; stale values fail closed to zero."""
 
-    cursor = _optional_non_negative_int(
-        status.get("last_trained_completed_shadow_sample_count")
-    )
+    cursor = _optional_non_negative_int(status.get("last_trained_completed_shadow_sample_count"))
     return cursor if cursor is not None and cursor <= completed_total else 0
 
 
@@ -6511,6 +6888,7 @@ async def get_local_ai_tools_status():
                 _completed_shadow_sample_count,
                 _completed_trade_sample_count,
             )
+
             completed_shadow_count, completed_trade_count = await asyncio.gather(
                 _completed_shadow_sample_count(),
                 _completed_trade_sample_count(),
@@ -6542,9 +6920,7 @@ async def get_local_ai_tools_status():
             _log_dashboard_fallback("local ai tools training cursor fallback", exc)
         scheduler_state = MODEL_TRAINING_STATE_STORE.read()
         scheduler_models = (
-            scheduler_state.get("models")
-            if isinstance(scheduler_state.get("models"), dict)
-            else {}
+            scheduler_state.get("models") if isinstance(scheduler_state.get("models"), dict) else {}
         )
         status["model_training_scheduler_state"] = scheduler_state
         status["auto_train_persistent_models"] = {
@@ -6692,15 +7068,19 @@ async def get_positions(
             open_rows = []
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
-            closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
-                await _dashboard_closed_position_ledger_rows(
-                    session,
-                    repo,
-                    mode=mode,
-                    page=1,
-                    page_size=5000,
-                    paginate=False,
-                )
+            (
+                closed_rows,
+                closed_total,
+                _closed_page,
+                _closed_pages,
+                closed_ledger_source,
+            ) = await _dashboard_closed_position_ledger_rows(
+                session,
+                repo,
+                mode=mode,
+                page=1,
+                page_size=5000,
+                paginate=False,
             )
         combined_positions = [*open_rows, *closed_rows]
         display_total = len(combined_positions)
@@ -7009,8 +7389,7 @@ async def get_positions(
             )
             management_funding_available = "funding_fee_usdt" in current_management_contract
             funding_fee = (
-                _safe_float(current_management_contract.get("funding_fee_usdt"), 0.0)
-                or 0.0
+                _safe_float(current_management_contract.get("funding_fee_usdt"), 0.0) or 0.0
                 if management_funding_available
                 else _safe_float(p.funding_fee, 0.0) or 0.0
             )
@@ -7166,18 +7545,12 @@ async def get_positions(
             group["realized_pnl"] = (
                 _safe_float(group.get("realized_pnl"), 0.0) or 0.0
             ) + realized_pnl
-            group["entry_fee"] = (
-                _safe_float(group.get("entry_fee"), 0.0) or 0.0
-            ) + entry_fee
-            group["close_fee"] = (
+            group["entry_fee"] = (_safe_float(group.get("entry_fee"), 0.0) or 0.0) + entry_fee
+            group["close_fee"] = (_safe_float(group.get("close_fee"), 0.0) or 0.0) + close_fee
+            group["funding_fee"] = (_safe_float(group.get("funding_fee"), 0.0) or 0.0) + funding_fee
+            group["fee"] = (_safe_float(group.get("entry_fee"), 0.0) or 0.0) + (
                 _safe_float(group.get("close_fee"), 0.0) or 0.0
-            ) + close_fee
-            group["funding_fee"] = (
-                _safe_float(group.get("funding_fee"), 0.0) or 0.0
-            ) + funding_fee
-            group["fee"] = (
-                _safe_float(group.get("entry_fee"), 0.0) or 0.0
-            ) + (_safe_float(group.get("close_fee"), 0.0) or 0.0)
+            )
             group["split_count"] = int(group.get("split_count") or 1) + 1
             group.setdefault("position_ids", []).append(item.get("id"))
             group["id"] = min(
@@ -7238,8 +7611,7 @@ async def get_positions(
                 mode=mode,
             )
             blocker = (
-                "position_risk_evidence_unavailable:"
-                f"{safe_error_text(risk_result, limit=120)}"
+                f"position_risk_evidence_unavailable:{safe_error_text(risk_result, limit=120)}"
             )
             for item in positions:
                 item["risk_contract"] = {
@@ -7744,13 +8116,16 @@ async def _build_opening_funnel_payload(
             no_order_after_signal += 1
 
         reason = _display_execution_reason(row, matched_order)
-        funnel_reason = classify_entry_funnel_reason(
-            raw=raw,
-            action=action,
-            was_executed=False,
-            has_order=matched_order is not None,
-            reason=reason,
-        ) or "service_error"
+        funnel_reason = (
+            classify_entry_funnel_reason(
+                raw=raw,
+                action=action,
+                was_executed=False,
+                has_order=matched_order is not None,
+                reason=reason,
+            )
+            or "service_error"
+        )
         entry_funnel_reasons[funnel_reason] += 1
         directional_rows.append(
             {
@@ -8032,8 +8407,7 @@ async def get_analysis_records(
         model_timings = [
             item
             for item in model_timings
-            if isinstance(item, dict)
-            and str(item.get("name") or "") in expected_expert_name_set
+            if isinstance(item, dict) and str(item.get("name") or "") in expected_expert_name_set
         ]
         timings_by_name = {
             str(item.get("name")): item
@@ -8113,9 +8487,7 @@ async def get_analysis_records(
         aligned = sum(1 for v in cross_validations if v.get("consistency") == "aligned")
         major_conflicts = sum(1 for v in cross_validations if v.get("major_conflict"))
         unavailable_validations = sum(
-            1
-            for v in cross_validations
-            if v.get("validation_status", "completed") != "completed"
+            1 for v in cross_validations if v.get("validation_status", "completed") != "completed"
         )
         completed_validations = sum(
             1 for v in cross_validations if v.get("validation_status", "completed") == "completed"
@@ -8154,8 +8526,7 @@ async def get_analysis_records(
                 "latency": timings_by_name.get(e["expert_name"]),
                 "reason": (
                     str(_safe_dict(quality_slots.get(e["expert_name"])).get("reason") or "")
-                    or
-                    pre_expert_skip.get("reason")
+                    or pre_expert_skip.get("reason")
                     if pre_expert_skip.get("skipped")
                     else pre_expert_skip.get("reason")
                     if ensemble_timed_out
@@ -8168,8 +8539,7 @@ async def get_analysis_records(
                 ),
                 "status": (
                     str(_safe_dict(quality_slots.get(e["expert_name"])).get("status") or "")
-                    or
-                    "pre_expert_skipped"
+                    or "pre_expert_skipped"
                     if pre_expert_skip.get("skipped")
                     else "ensemble_timeout"
                     if ensemble_timed_out
@@ -8178,9 +8548,7 @@ async def get_analysis_records(
                     else "missing"
                 ),
                 "skip_kind": pre_expert_skip.get("kind") or "",
-                "returned": bool(
-                    _safe_dict(quality_slots.get(e["expert_name"])).get("returned")
-                ),
+                "returned": bool(_safe_dict(quality_slots.get(e["expert_name"])).get("returned")),
                 "usable": bool(_safe_dict(quality_slots.get(e["expert_name"])).get("usable")),
             }
             for e in expected_experts
@@ -8308,9 +8676,7 @@ async def get_analysis_records(
             "position_lifecycle_label": position_lifecycle_label,
             "created_at": d.created_at.isoformat() if d.created_at else None,
             "symbol": _normalize_dashboard_symbol(d.symbol),
-            "expert_count": int(
-                analysis_quality.get("successful_expert_count", len(experts)) or 0
-            ),
+            "expert_count": int(analysis_quality.get("successful_expert_count", len(experts)) or 0),
             "returned_expert_count": int(
                 analysis_quality.get("returned_expert_count", len(experts)) or 0
             ),
@@ -8364,9 +8730,7 @@ async def get_analysis_records(
                 else "信心度来自最终可执行裁决。"
             ),
             "final_reasoning": display_reasoning or sanitize_text(d.reasoning),
-            "observed_reasoning": (
-                sanitize_text(d.reasoning) if observed_action else None
-            ),
+            "observed_reasoning": (sanitize_text(d.reasoning) if observed_action else None),
             "position_size_pct": d.position_size_pct,
             "weighted_score": raw.get("weighted_score"),
             "disagreement": raw.get("disagreement"),
@@ -8488,9 +8852,7 @@ def _strategy_learning_dashboard_summary(payload: Any) -> dict[str, Any]:
         "governed_candidate_count": schedule.get("governed_candidate_count"),
         "rejected_candidate_count": schedule.get("rejected_candidate_count"),
         "scheduler_mode": schedule.get("scheduler_mode"),
-        "current_production_strategy": _safe_dict(
-            schedule.get("current_production_strategy")
-        ),
+        "current_production_strategy": _safe_dict(schedule.get("current_production_strategy")),
     }
     return result
 
@@ -8557,9 +8919,7 @@ async def get_strategy_learning(
             include_historical_replay=False,
         )
         return (
-            payload
-            if selected_detail == "full"
-            else _strategy_learning_dashboard_summary(payload)
+            payload if selected_detail == "full" else _strategy_learning_dashboard_summary(payload)
         )
 
     payload = await _dashboard_heavy_cached(
@@ -8613,19 +8973,11 @@ async def _strategy_learning_watermark_for_request(
                 select(
                     select(func.count(Position.id)).where(*closed_filters).scalar_subquery(),
                     select(func.max(Position.id)).where(*closed_filters).scalar_subquery(),
-                    select(func.max(Position.updated_at))
-                    .where(*closed_filters)
-                    .scalar_subquery(),
+                    select(func.max(Position.updated_at)).where(*closed_filters).scalar_subquery(),
                     select(func.count(Position.id)).where(*open_filters).scalar_subquery(),
-                    select(func.max(Position.updated_at))
-                    .where(*open_filters)
-                    .scalar_subquery(),
-                    select(func.count(ShadowBacktest.id))
-                    .where(*shadow_filters)
-                    .scalar_subquery(),
-                    select(func.max(ShadowBacktest.id))
-                    .where(*shadow_filters)
-                    .scalar_subquery(),
+                    select(func.max(Position.updated_at)).where(*open_filters).scalar_subquery(),
+                    select(func.count(ShadowBacktest.id)).where(*shadow_filters).scalar_subquery(),
+                    select(func.max(ShadowBacktest.id)).where(*shadow_filters).scalar_subquery(),
                     select(func.max(ShadowBacktest.updated_at))
                     .where(*shadow_filters)
                     .scalar_subquery(),
@@ -8638,12 +8990,8 @@ async def _strategy_learning_watermark_for_request(
                     select(func.max(StrategyLearningEvent.updated_at))
                     .where(*event_filters)
                     .scalar_subquery(),
-                    select(func.count(AIDecision.id))
-                    .where(*decision_filters)
-                    .scalar_subquery(),
-                    select(func.max(AIDecision.id))
-                    .where(*decision_filters)
-                    .scalar_subquery(),
+                    select(func.count(AIDecision.id)).where(*decision_filters).scalar_subquery(),
+                    select(func.max(AIDecision.id)).where(*decision_filters).scalar_subquery(),
                     select(func.max(AIDecision.updated_at))
                     .where(*decision_filters)
                     .scalar_subquery(),
@@ -8847,9 +9195,7 @@ async def get_profit_attribution(
         cache_key = (*request_cache_key, watermark)
         cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
         if cached is not None:
-            return sanitize_payload(
-                _dashboard_heavy_cache_set(request_cache_key, cached)
-            )
+            return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, cached))
         position_result = await session.execute(
             select(Position)
             .where(
@@ -8883,9 +9229,7 @@ async def get_profit_attribution(
                 "message": "最近窗口内暂无已平仓记录。",
             }
             _dashboard_heavy_cache_set(cache_key, empty_payload)
-            return sanitize_payload(
-                _dashboard_heavy_cache_set(request_cache_key, empty_payload)
-            )
+            return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, empty_payload))
 
         symbols = {p.symbol for p in positions if p.symbol}
         symbol_variants = _dashboard_symbol_query_variants(symbols)
@@ -8991,9 +9335,7 @@ async def get_profit_attribution(
     }
     dashboard_payload = _profit_attribution_dashboard_payload(result_payload)
     _dashboard_heavy_cache_set(cache_key, dashboard_payload)
-    return sanitize_payload(
-        _dashboard_heavy_cache_set(request_cache_key, dashboard_payload)
-    )
+    return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, dashboard_payload))
 
 
 @router.get("/model-contribution/stats")
@@ -9176,9 +9518,7 @@ async def get_model_contribution_stats(
         item["avg_pnl"] = round(item["pnl"] / count, 6) if count else 0.0
         item["win_rate"] = round(item["wins"] / count, 4) if count else 0.0
         item["profit_factor"] = (
-            round(item["profit"] / item["loss"], 4)
-            if item["loss"] > 0
-            else None
+            round(item["profit"] / item["loss"], 4) if item["loss"] > 0 else None
         )
         result.append(item)
 
@@ -9300,9 +9640,7 @@ async def get_expert_memories(
             offset=reflection_offset,
         )
         reflection_position_ids = {
-            int(row.position_id)
-            for row in reflections
-            if int(row.position_id or 0) > 0
+            int(row.position_id) for row in reflections if int(row.position_id or 0) > 0
         }
         positions = (
             list(
@@ -9310,7 +9648,9 @@ async def get_expert_memories(
                     await session.execute(
                         select(Position).where(Position.id.in_(reflection_position_ids))
                     )
-                ).scalars().all()
+                )
+                .scalars()
+                .all()
             )
             if reflection_position_ids
             else []
@@ -9363,54 +9703,54 @@ async def get_expert_memories(
             reflection_source=str(r.source or ""),
             authoritative_outcome=authoritative_outcome,
         )
-        reflection_rows.append({
-            "id": r.id,
-            "position_id": r.position_id,
-            "symbol": r.symbol,
-            "side": r.side,
-            "entry_price": r.entry_price,
-            "exit_price": r.exit_price,
-            "quantity": r.quantity,
-            "realized_pnl": r.realized_pnl,
-            "fee_estimate": r.fee_estimate,
-            "hold_minutes": r.hold_minutes,
-            "closed_at": r.closed_at.isoformat() if r.closed_at else None,
-            "outcome": r.outcome,
-            "mistake_summary": sanitize_text(r.mistake_summary),
-            "improvement_summary": sanitize_text(r.improvement_summary),
-            "source": r.source,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "evidence_precedence": authority_status["code"],
-            "authority_status": authority_status,
-            "authoritative_outcome": (
-                {
-                    "event_type": authoritative_outcome.get("event_type"),
-                    "outcome_id": authoritative_outcome.get("outcome_id"),
-                    "outcome_version": authoritative_outcome.get("outcome_version"),
-                    "outcome_fingerprint": authoritative_outcome.get("outcome_fingerprint"),
-                    "authority_level": authoritative_outcome.get("authority_level"),
-                    "complete": authoritative_outcome.get("outcome_complete"),
-                    "evidence_gaps": authoritative_outcome.get("outcome_evidence_gaps"),
-                    "decision_id": authoritative_outcome.get("decision_id"),
-                    "entry_order_ids": authoritative_outcome.get("entry_order_ids"),
-                    "close_order_ids": authoritative_outcome.get("close_order_ids"),
-                    "realized_pnl": authoritative_outcome.get("realized_pnl"),
-                    PROFIT_TRAINING_TARGET: authoritative_outcome.get(
-                        PROFIT_TRAINING_TARGET
-                    ),
-                    "attribution": authoritative_outcome.get("attribution"),
-                    "counterfactual_evidence": authoritative_outcome.get(
-                        "counterfactual_evidence"
-                    ),
-                    "counterfactual_production_weight": authoritative_outcome.get(
-                        "counterfactual_production_weight"
-                    ),
-                    "learning_summary": authoritative_outcome.get("learning_summary"),
-                }
-                if authoritative_outcome
-                else None
-            ),
-        })
+        reflection_rows.append(
+            {
+                "id": r.id,
+                "position_id": r.position_id,
+                "symbol": r.symbol,
+                "side": r.side,
+                "entry_price": r.entry_price,
+                "exit_price": r.exit_price,
+                "quantity": r.quantity,
+                "realized_pnl": r.realized_pnl,
+                "fee_estimate": r.fee_estimate,
+                "hold_minutes": r.hold_minutes,
+                "closed_at": r.closed_at.isoformat() if r.closed_at else None,
+                "outcome": r.outcome,
+                "mistake_summary": sanitize_text(r.mistake_summary),
+                "improvement_summary": sanitize_text(r.improvement_summary),
+                "source": r.source,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "evidence_precedence": authority_status["code"],
+                "authority_status": authority_status,
+                "authoritative_outcome": (
+                    {
+                        "event_type": authoritative_outcome.get("event_type"),
+                        "outcome_id": authoritative_outcome.get("outcome_id"),
+                        "outcome_version": authoritative_outcome.get("outcome_version"),
+                        "outcome_fingerprint": authoritative_outcome.get("outcome_fingerprint"),
+                        "authority_level": authoritative_outcome.get("authority_level"),
+                        "complete": authoritative_outcome.get("outcome_complete"),
+                        "evidence_gaps": authoritative_outcome.get("outcome_evidence_gaps"),
+                        "decision_id": authoritative_outcome.get("decision_id"),
+                        "entry_order_ids": authoritative_outcome.get("entry_order_ids"),
+                        "close_order_ids": authoritative_outcome.get("close_order_ids"),
+                        "realized_pnl": authoritative_outcome.get("realized_pnl"),
+                        PROFIT_TRAINING_TARGET: authoritative_outcome.get(PROFIT_TRAINING_TARGET),
+                        "attribution": authoritative_outcome.get("attribution"),
+                        "counterfactual_evidence": authoritative_outcome.get(
+                            "counterfactual_evidence"
+                        ),
+                        "counterfactual_production_weight": authoritative_outcome.get(
+                            "counterfactual_production_weight"
+                        ),
+                        "learning_summary": authoritative_outcome.get("learning_summary"),
+                    }
+                    if authoritative_outcome
+                    else None
+                ),
+            }
+        )
     return {
         "memories": memory_rows,
         "reflections": reflection_rows,
@@ -9717,16 +10057,14 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             _closed_page,
             _closed_total_pages,
             _closed_ledger_source,
-        ) = (
-            await _dashboard_closed_position_ledger_rows(
-                session,
-                repo,
-                mode=selected_mode,
-                model_names=EXECUTION_LEDGER_MODEL_NAMES,
-                page=1,
-                page_size=5000,
-                paginate=False,
-            )
+        ) = await _dashboard_closed_position_ledger_rows(
+            session,
+            repo,
+            mode=selected_mode,
+            model_names=EXECUTION_LEDGER_MODEL_NAMES,
+            page=1,
+            page_size=5000,
+            paginate=False,
         )
         pending_settlement_rows = await _dashboard_pending_closed_position_rows(
             session,
@@ -9850,9 +10188,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             "snapshot_at": snapshot.snapshot_at.isoformat() if snapshot.snapshot_at else None,
             "source": snapshot.source or "okx_snapshot",
         }
-    equity_by_date = {
-        day: value for day, value in all_equity_by_date.items() if day in records
-    }
+    equity_by_date = {day: value for day, value in all_equity_by_date.items() if day in records}
 
     # Pending settlement is a lifecycle-level state.  Counting close fills and
     # subtracting grouped positions overstates it whenever one position has
@@ -9951,9 +10287,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     equity_series_start_date = sorted_equity_dates[0] if sorted_equity_dates else None
     equity_series_complete = equity_series_start_date == PHASE3_FIRST_CLEAN_DAY
     first_okx_equity = (
-        float(all_equity_by_date[sorted_equity_dates[0]]["equity"])
-        if sorted_equity_dates
-        else None
+        float(all_equity_by_date[sorted_equity_dates[0]]["equity"]) if sorted_equity_dates else None
     )
     completed_equity_days: dict[str, dict[str, float]] = {}
     for index in range(len(sorted_equity_dates) - 1):
@@ -9968,9 +10302,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         completed_equity_days[day_key] = {
             "pnl": next_opening_equity - opening_equity,
             "cumulative_pnl": (
-                next_opening_equity - first_okx_equity
-                if first_okx_equity is not None
-                else 0.0
+                next_opening_equity - first_okx_equity if first_okx_equity is not None else 0.0
             ),
         }
     for date_key in sorted(records):
@@ -9996,9 +10328,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
             )
             row["okx_equity_change"] = row["okx_equity_pnl"]
             row["okx_cumulative_equity_pnl"] = (
-                round(completed_day["cumulative_pnl"], 8)
-                if completed_day is not None
-                else None
+                round(completed_day["cumulative_pnl"], 8) if completed_day is not None else None
             )
             row["okx_cumulative_equity_change"] = row["okx_cumulative_equity_pnl"]
         else:

@@ -10,10 +10,16 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.decision import AIDecision
+from services.okx_lifecycle_order_allocations import (
+    LIFECYCLE_ORDER_ALLOCATIONS_KEY,
+    build_lifecycle_order_allocation,
+    build_lifecycle_order_allocation_document,
+)
 from services.okx_order_fact_sync import OKX_SYNC_CONFIRMED, OKX_SYNC_EXECUTION_RESULT_CONFIRMED
 from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api.dashboard import (
     _dashboard_pending_closed_position_rows,
+    _dashboard_position_history_order_payload,
     _dashboard_position_history_rows,
 )
 from web_dashboard.api.dashboard import (
@@ -73,6 +79,382 @@ async def _seed_okx_position_history_rows(
                 close_order_ids=(close_order_ids or {}).get(row.get("posId")),
                 match_status="test_seed",
             )
+
+
+def _history_order(
+    *,
+    order_id: str,
+    side: str,
+    contracts: float,
+    timestamp: datetime,
+    inst_id: str,
+    contract_size: float,
+    base_quantity: float,
+    pnl: float | None = 0.0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        exchange_order_id=order_id,
+        okx_inst_id=inst_id,
+        side=side,
+        quantity=base_quantity,
+        price=375.0,
+        fee=0.1,
+        filled_at=timestamp,
+        created_at=timestamp,
+        okx_fill_contracts=contracts,
+        okx_fill_pnl=pnl,
+        okx_sync_status=OKX_SYNC_CONFIRMED,
+        okx_trade_ids=f"trade-{order_id}",
+        okx_raw_fills={
+            "contracts": contracts,
+            "base_quantity": base_quantity,
+            "contract_size": contract_size,
+            "timestamp": timestamp.isoformat(),
+            "fill_pnl": pnl,
+            "fills_history_confirmed": True,
+        },
+        decision_id=None,
+    )
+
+
+def test_dashboard_history_normalizes_stale_contract_size_and_augments_close_fills() -> None:
+    opened_at = datetime(2026, 8, 15, 2, 45, tzinfo=UTC)
+    closed_at = datetime(2026, 8, 17, 8, 3, tzinfo=UTC)
+    row = {
+        "instId": "STRK-USDT-SWAP",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "openMaxPos": "7746",
+        "closeTotalPos": "7746",
+        "_bb_contract_spec": {"ctVal": "0.01", "ctMult": "1"},
+    }
+    entry = _history_order(
+        order_id="entry",
+        side="sell",
+        contracts=7746,
+        timestamp=opened_at,
+        inst_id="STRK-USDT-SWAP",
+        contract_size=1.0,
+        base_quantity=7746.0,
+    )
+    first_close = _history_order(
+        order_id="close-1",
+        side="buy",
+        contracts=3797,
+        timestamp=opened_at + timedelta(minutes=5),
+        inst_id="STRK-USDT-SWAP",
+        contract_size=0.01,
+        base_quantity=37.97,
+        pnl=-1.0,
+    )
+    final_close = _history_order(
+        order_id="close-2",
+        side="buy",
+        contracts=3949,
+        timestamp=closed_at,
+        inst_id="STRK-USDT-SWAP",
+        contract_size=0.01,
+        base_quantity=39.49,
+        pnl=-153.0,
+    )
+
+    payload = _dashboard_position_history_order_payload(
+        row,
+        side="short",
+        order_rows=[entry, first_close, final_close],
+    )
+
+    assert payload["entry_quantity_matched"] is True
+    assert payload["close_quantity_matched"] is True
+    assert payload["close_quantity"] == pytest.approx(77.46)
+    assert payload["max_quantity"] == pytest.approx(77.46)
+    assert payload["close_order_ids"] == ["close-1", "close-2"]
+    assert [fill["quantity"] for fill in payload["linked_fills"]] == pytest.approx(
+        [77.46, 37.97, 39.49]
+    )
+
+
+def test_dashboard_history_matches_cumulative_entries_to_close_total() -> None:
+    opened_at = datetime(2026, 8, 15, 2, 45, tzinfo=UTC)
+    closed_at = datetime(2026, 8, 17, 8, 3, tzinfo=UTC)
+    row = {
+        "instId": "SUI-USDT-SWAP",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "type": "2",
+        "openMaxPos": "298",
+        "closeTotalPos": "311",
+        "_bb_contract_spec": {"ctVal": "1", "ctMult": "1"},
+    }
+    entry_a = _history_order(
+        order_id="sui-entry-a",
+        side="buy",
+        contracts=298,
+        timestamp=opened_at,
+        inst_id="SUI-USDT-SWAP",
+        contract_size=1.0,
+        base_quantity=298.0,
+    )
+    entry_b = _history_order(
+        order_id="sui-entry-b",
+        side="buy",
+        contracts=13,
+        timestamp=opened_at + timedelta(hours=1),
+        inst_id="SUI-USDT-SWAP",
+        contract_size=1.0,
+        base_quantity=13.0,
+    )
+    close = _history_order(
+        order_id="sui-close",
+        side="sell",
+        contracts=311,
+        timestamp=closed_at,
+        inst_id="SUI-USDT-SWAP",
+        contract_size=1.0,
+        base_quantity=311.0,
+        pnl=-2.0,
+    )
+
+    payload = _dashboard_position_history_order_payload(
+        row,
+        side="long",
+        order_rows=[entry_a, entry_b, close],
+    )
+
+    assert payload["entry_quantity_matched"] is True
+    assert payload["close_quantity_matched"] is True
+    assert payload["max_quantity"] == pytest.approx(298.0)
+    assert payload["entry_order_ids"] == ["sui-entry-a", "sui-entry-b"]
+
+
+def test_dashboard_history_deduplicates_same_exchange_order_before_quantity_match() -> None:
+    opened_at = datetime(2026, 8, 14, 11, 30, tzinfo=UTC)
+    closed_at = datetime(2026, 8, 14, 18, 48, tzinfo=UTC)
+    row = {
+        "instId": "XPL-USDT-SWAP",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "openMaxPos": "244",
+        "closeTotalPos": "244",
+        "_bb_contract_spec": {"ctVal": "10", "ctMult": "1"},
+    }
+    entry = _history_order(
+        order_id="xpl-entry",
+        side="sell",
+        contracts=244,
+        timestamp=opened_at,
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=2440.0,
+    )
+    first_close = _history_order(
+        order_id="xpl-close-1",
+        side="buy",
+        contracts=42,
+        timestamp=opened_at + timedelta(minutes=3),
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=420.0,
+        pnl=-1.0,
+    )
+    duplicate_close = _history_order(
+        order_id="xpl-close-1",
+        side="buy",
+        contracts=42,
+        timestamp=opened_at + timedelta(minutes=3),
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=420.0,
+        pnl=-1.0,
+    )
+    final_close = _history_order(
+        order_id="xpl-close-2",
+        side="buy",
+        contracts=202,
+        timestamp=closed_at,
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=2020.0,
+        pnl=-4.0,
+    )
+
+    payload = _dashboard_position_history_order_payload(
+        row,
+        side="short",
+        order_rows=[entry, first_close, duplicate_close, final_close],
+    )
+
+    assert payload["close_quantity_matched"] is True
+    assert payload["close_order_ids"] == ["xpl-close-1", "xpl-close-2"]
+    assert payload["close_quantity"] == pytest.approx(2440.0)
+    assert len(payload["linked_fills"]) == 3
+
+
+def test_dashboard_history_rejects_persisted_hint_outside_lifecycle_window() -> None:
+    opened_at = datetime(2026, 7, 24, 13, 59, tzinfo=UTC)
+    closed_at = datetime(2026, 7, 24, 14, 29, tzinfo=UTC)
+    row = {
+        "instId": "XPL-USDT-SWAP",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "openMaxPos": "24",
+        "closeTotalPos": "24",
+        "_bb_contract_spec": {"ctVal": "10", "ctMult": "1"},
+        "_dashboard_entry_order_ids": ["xpl-entry"],
+        "_dashboard_close_order_ids": ["stale-close"],
+    }
+    entry = _history_order(
+        order_id="xpl-entry",
+        side="buy",
+        contracts=24,
+        timestamp=opened_at,
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=240.0,
+    )
+    stale_close = _history_order(
+        order_id="stale-close",
+        side="sell",
+        contracts=24,
+        timestamp=opened_at - timedelta(minutes=53),
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=240.0,
+        pnl=1.0,
+    )
+    actual_close = _history_order(
+        order_id="actual-close",
+        side="sell",
+        contracts=24,
+        timestamp=closed_at,
+        inst_id="XPL-USDT-SWAP",
+        contract_size=10.0,
+        base_quantity=240.0,
+        pnl=2.0,
+    )
+
+    payload = _dashboard_position_history_order_payload(
+        row,
+        side="long",
+        order_rows=[entry, stale_close, actual_close],
+    )
+
+    assert payload["entry_quantity_matched"] is True
+    assert payload["close_quantity_matched"] is True
+    assert payload["close_order_ids"] == ["actual-close"]
+    assert "stale-close" not in payload["close_order_ids"]
+
+
+def test_dashboard_history_allocates_one_reversal_order_across_adjacent_lifecycles() -> None:
+    opened_at = datetime(2026, 8, 12, 7, 0, tzinfo=UTC)
+    boundary_at = opened_at + timedelta(hours=1)
+    closed_at = boundary_at + timedelta(hours=1)
+    reversal_order_id = "3713173120610959360"
+    previous_row = {
+        "instId": "TRX-USDT-SWAP",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(boundary_at.timestamp() * 1000)),
+        "type": "2",
+        "openMaxPos": "0.09",
+        "closeTotalPos": "0.09",
+        "_bb_contract_spec": {"ctVal": "1000", "ctMult": "1"},
+        "_dashboard_entry_order_ids": ["previous-entry"],
+        "_dashboard_close_order_ids": [reversal_order_id],
+        LIFECYCLE_ORDER_ALLOCATIONS_KEY: build_lifecycle_order_allocation_document(
+            close=[
+                build_lifecycle_order_allocation(
+                    order_id=reversal_order_id,
+                    allocated_contracts=0.09,
+                    order_contracts=0.38,
+                    boundary_at=boundary_at.isoformat(),
+                    peer_history_id=202,
+                    peer_role="entry",
+                )
+            ]
+        ),
+    }
+    following_row = {
+        "instId": "TRX-USDT-SWAP",
+        "cTime": str(int(boundary_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "type": "2",
+        "openMaxPos": "0.29",
+        "closeTotalPos": "0.29",
+        "_bb_contract_spec": {"ctVal": "1000", "ctMult": "1"},
+        "_dashboard_entry_order_ids": [reversal_order_id],
+        "_dashboard_close_order_ids": ["following-close"],
+        LIFECYCLE_ORDER_ALLOCATIONS_KEY: build_lifecycle_order_allocation_document(
+            entry=[
+                build_lifecycle_order_allocation(
+                    order_id=reversal_order_id,
+                    allocated_contracts=0.29,
+                    order_contracts=0.38,
+                    boundary_at=boundary_at.isoformat(),
+                    peer_history_id=201,
+                    peer_role="close",
+                )
+            ]
+        ),
+    }
+    previous_entry = _history_order(
+        order_id="previous-entry",
+        side="buy",
+        contracts=0.09,
+        timestamp=opened_at,
+        inst_id="TRX-USDT-SWAP",
+        contract_size=1000.0,
+        base_quantity=90.0,
+    )
+    reversal = _history_order(
+        order_id=reversal_order_id,
+        side="sell",
+        contracts=0.38,
+        timestamp=boundary_at,
+        inst_id="TRX-USDT-SWAP",
+        contract_size=1000.0,
+        base_quantity=380.0,
+        pnl=7.5,
+    )
+    following_close = _history_order(
+        order_id="following-close",
+        side="buy",
+        contracts=0.29,
+        timestamp=closed_at,
+        inst_id="TRX-USDT-SWAP",
+        contract_size=1000.0,
+        base_quantity=290.0,
+        pnl=-2.0,
+    )
+    order_rows = [previous_entry, reversal, following_close]
+
+    previous_payload = _dashboard_position_history_order_payload(
+        previous_row,
+        side="long",
+        order_rows=order_rows,
+    )
+    following_payload = _dashboard_position_history_order_payload(
+        following_row,
+        side="short",
+        order_rows=order_rows,
+    )
+
+    previous_close = next(
+        fill for fill in previous_payload["linked_fills"] if fill["order_id"] == reversal_order_id
+    )
+    following_entry = next(
+        fill for fill in following_payload["linked_fills"] if fill["order_id"] == reversal_order_id
+    )
+    assert previous_payload["close_quantity_matched"] is True
+    assert following_payload["entry_quantity_matched"] is True
+    assert previous_close["contracts"] == pytest.approx(0.09)
+    assert previous_close["quantity"] == pytest.approx(90.0)
+    assert previous_close["fee"] == pytest.approx(0.1 * 0.09 / 0.38)
+    assert previous_close["pnl"] == pytest.approx(7.5)
+    assert following_entry["contracts"] == pytest.approx(0.29)
+    assert following_entry["quantity"] == pytest.approx(290.0)
+    assert following_entry["fee"] == pytest.approx(0.1 * 0.29 / 0.38)
+    assert following_entry["pnl"] == pytest.approx(0.0)
+    assert previous_close["fee"] + following_entry["fee"] == pytest.approx(0.1)
 
 
 @pytest.mark.asyncio
@@ -398,8 +780,7 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
     assert payload["pending_settlement_count"] == 1
     assert payload["total"] == 1
     assert payload["ledger_source"] == (
-        "okx_positions_history_official_unavailable_plus_"
-        "okx_confirmed_pending_settlement"
+        "okx_positions_history_official_unavailable_plus_okx_confirmed_pending_settlement"
     )
     row = payload["positions"][0]
     assert row["symbol"] == "DOT/USDT"
@@ -464,14 +845,20 @@ async def test_dashboard_position_history_drops_pending_fragment_covered_by_sett
         fake_pending_rows,
     )
 
-    rows, total, page, pages, source, settled_count, pending_count = (
-        await _dashboard_position_history_rows(
-            None,
-            None,
-            mode="paper",
-            page=1,
-            page_size=20,
-        )
+    (
+        rows,
+        total,
+        page,
+        pages,
+        source,
+        settled_count,
+        pending_count,
+    ) = await _dashboard_position_history_rows(
+        None,
+        None,
+        mode="paper",
+        page=1,
+        page_size=20,
     )
 
     assert [row["id"] for row in rows] == [
@@ -481,9 +868,7 @@ async def test_dashboard_position_history_drops_pending_fragment_covered_by_sett
     assert total == 2
     assert page == 1
     assert pages == 1
-    assert source == (
-        "okx_positions_history_official_plus_okx_confirmed_pending_settlement"
-    )
+    assert source == ("okx_positions_history_official_plus_okx_confirmed_pending_settlement")
     assert settled_count == 1
     assert pending_count == 1
 
@@ -2287,8 +2672,22 @@ async def test_position_history_prefers_final_okx_realized_pnl_over_local_fragme
 
             for order_id, side, qty, price, ts, pnl in (
                 ("ai16z-entry", "sell", 732.0, 0.0737920765027324, opened_at, 0.0),
-                ("ai16z-close-a", "buy", 423.0, 0.0656757446808511, first_close_at, 3.4332083606558053),
-                ("ai16z-close-b", "buy", 216.0, 0.0604861111111111, second_close_at, 2.8740885245901984),
+                (
+                    "ai16z-close-a",
+                    "buy",
+                    423.0,
+                    0.0656757446808511,
+                    first_close_at,
+                    3.4332083606558053,
+                ),
+                (
+                    "ai16z-close-b",
+                    "buy",
+                    216.0,
+                    0.0604861111111111,
+                    second_close_at,
+                    2.8740885245901984,
+                ),
                 ("ai16z-close-c", "buy", 93.0, 0.0598, final_close_at, 1.3012631147541132),
             ):
                 await repo.create_order(
@@ -3536,9 +3935,10 @@ async def test_xrp_final_close_cannot_be_downgraded_by_stale_local_order_links(
         assert stale_link_row["close_order_ids"] == [first_close_id]
         assert stale_link_row["evidence_complete"] is False
         assert stale_link_row["trainable"] is False
-        assert "position_history_close_quantity_not_matched_to_orders" in stale_link_row[
-            "evidence_gaps"
-        ]
+        assert (
+            "position_history_close_quantity_not_matched_to_orders"
+            in stale_link_row["evidence_gaps"]
+        )
 
         async with get_session_ctx() as session:
             await add_order(
@@ -3579,6 +3979,7 @@ def test_trade_detail_numeric_only_reason_falls_back_to_readable_success() -> No
 
     assert "3670054929945042944" not in reason
     assert "订单已成交" in reason
+
 
 def _execution_row(**overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
