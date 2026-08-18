@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -76,6 +77,7 @@ def test_priority_is_continuous_dynamic_exit_fraction() -> None:
                         "stop_loss_pct": 0.02,
                         "stop_loss": 98.0,
                         "take_profit": 110.0,
+                        "created_at": datetime.now(UTC) - timedelta(minutes=20),
                         "current_management_contract": _management_contract(),
                     }
                 ],

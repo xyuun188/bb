@@ -7002,13 +7002,19 @@ class TradingService:
                 "reason": self._safe_dict(facts).get("reason"),
                 "error_code": self._safe_dict(facts).get("error_code"),
                 "cache_hit": self._safe_dict(facts).get("cache_hit"),
+                "environment_compatibility_blockers": list(
+                    self._safe_dict(
+                        self._safe_dict(facts).get("environment_compatibility")
+                    ).get("blockers")
+                    or []
+                ),
             }
             for symbol, facts in availability.items()
             if self._safe_dict(facts).get("available") is False
         ]
         diagnostics = self._safe_dict(getattr(self, "_last_auto_feature_rank_diagnostics", None))
         diagnostics["execution_availability"] = {
-            "source": "okx_private_account_leverage_info",
+            "source": "okx_private_account_and_live_execution_environment",
             "mode": selected_mode,
             "evaluated_count": int(shortlist.get("evaluated_count") or 0),
             "probed_count": int(shortlist.get("probed_count") or 0),

@@ -344,6 +344,35 @@ class _FailingEntryInstrumentAvailabilityCcxt(_EntryInstrumentAvailabilityCcxt):
         raise TimeoutError("private leverage transport timed out")
 
 
+class _IncompatibleEntryEnvironmentCcxt(_EntryInstrumentAvailabilityCcxt):
+    @staticmethod
+    def _instrument(uly: str) -> dict[str, str]:
+        return {
+            "instId": "BTC-USDT-SWAP",
+            "uly": uly,
+            "ctVal": "0.01",
+            "ctMult": "1",
+            "ctValCcy": "BTC",
+            "settleCcy": "USDT",
+            "ctType": "linear",
+            "lotSz": "0.01",
+            "minSz": "0.01",
+            "tickSz": "0.1",
+        }
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [self._instrument("BTC-USDT")]}
+
+    async def executionGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [self._instrument("TEST-USDT")]}
+
+    async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"last": "60000"}]}
+
+    async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"last": "60000"}]}
+
+
 class _ReloadableMarketCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -1622,6 +1651,17 @@ async def test_okx_entry_instrument_prefilter_does_not_retry_transport_failure()
     assert result["available"] is False
     assert result["reason"] == "okx_private_entry_instrument_probe_failed"
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_instrument_prefilter_blocks_live_demo_contract_mismatch() -> None:
+    exchange = _IncompatibleEntryEnvironmentCcxt()
+    result = await _executor(exchange).entry_instrument_availability("BTC/USDT")
+
+    assert result["available"] is False
+    assert result["reason"] == "okx_entry_live_execution_environment_incompatible"
+    assert "uly_mismatch" in result["environment_compatibility"]["blockers"]
+    assert exchange.fetch_leverage_calls == []
 
 
 @pytest.mark.asyncio

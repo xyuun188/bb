@@ -39,6 +39,7 @@ def _position(**overrides: object) -> dict:
         "stop_loss": 98.0,
         "take_profit": 110.0,
         "entry_fee_usdt": 0.5,
+        "created_at": datetime.now(UTC) - timedelta(minutes=20),
     }
     position.update(overrides)
     if not explicit_contract:
@@ -385,7 +386,7 @@ def test_early_non_hard_partial_exit_requires_price_move_to_cover_exit_cost() ->
     assert result.estimated_exit_cost_usdt > abs(result.gross_unrealized_pnl_usdt)
     assert result.economic_exit_evidence_complete is False
     assert result.close_fraction == 0.0
-    assert "early_exit_economic_evidence_insufficient" in result.reason
+    assert "minimum_position_observation_not_elapsed" in result.reason
 
 
 def test_early_loss_magnitude_does_not_count_as_exit_cost_coverage() -> None:
@@ -406,7 +407,7 @@ def test_early_loss_magnitude_does_not_count_as_exit_cost_coverage() -> None:
     assert abs(result.gross_unrealized_pnl_usdt) > result.estimated_exit_cost_usdt
     assert result.economic_exit_evidence_complete is False
     assert result.close_fraction == 0.0
-    assert "early_exit_economic_evidence_insufficient" in result.reason
+    assert "minimum_position_observation_not_elapsed" in result.reason
 
 
 @pytest.mark.parametrize("requested_fraction", [0.00449424, 0.06770709])
@@ -431,10 +432,10 @@ def test_early_small_model_exit_cannot_bypass_economic_debounce(
     assert result.model_exit_pressure < 0.1
     assert result.economic_exit_evidence_complete is False
     assert result.close_fraction == 0.0
-    assert "early_exit_economic_evidence_insufficient" in result.reason
+    assert "minimum_position_observation_not_elapsed" in result.reason
 
 
-def test_early_significant_model_exit_remains_eligible() -> None:
+def test_early_significant_model_exit_cannot_bypass_lifecycle_guard() -> None:
     decision = _decision()
     decision.suggested_close_fraction = 0.25
     position = _position(
@@ -450,8 +451,23 @@ def test_early_significant_model_exit_remains_eligible() -> None:
     assert result.hard_risk is False
     assert result.early_exit_observation_active is True
     assert result.model_exit_pressure == pytest.approx(0.2)
-    assert result.economic_exit_evidence_complete is True
-    assert result.close_fraction == pytest.approx(0.2)
+    assert result.economic_exit_evidence_complete is False
+    assert result.eligible is False
+    assert result.close_fraction == 0.0
+    assert "minimum_position_observation_not_elapsed" in result.reason
+
+
+def test_missing_position_age_fails_closed_for_non_hard_exit() -> None:
+    position = _position(current_price=99.0, unrealized_pnl=-10.0)
+    position.pop("created_at")
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is False
+    assert result.position_age_evidence_complete is False
+    assert result.eligible is False
+    assert result.close_fraction == 0.0
+    assert "position_age_evidence_missing" in result.reason
 
 
 def test_post_observation_subminimum_exit_fraction_fails_closed() -> None:
@@ -515,7 +531,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-17.dynamic-exit-funding-net-pnl.v14"
+        "2026-08-19.dynamic-exit-lifecycle-guard.v15"
     )
 
 

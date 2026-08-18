@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -101,6 +102,7 @@ def _profitable_retrace_position() -> dict[str, Any]:
         "stop_loss": 98.0,
         "take_profit": 110.0,
         "entry_fee_usdt": 0.5,
+        "created_at": datetime.now(UTC) - timedelta(minutes=20),
     }
     position["current_management_contract"] = build_current_position_management_contract(
         {

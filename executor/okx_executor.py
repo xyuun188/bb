@@ -38,6 +38,9 @@ from services.entry_profit_risk_sizing import (
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.normal_paper_trade import normal_paper_order_identity_reasons
+from services.okx_entry_environment_compatibility import (
+    assess_okx_entry_environment_compatibility,
+)
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
@@ -57,6 +60,7 @@ OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
+OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS = 60.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
 OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO = 100.0
 OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS = 7
@@ -5875,8 +5879,38 @@ class OKXExecutor(AbstractExecutor):
             return {**cached[0], "cache_hit": True}
 
         generated_at = datetime.now(UTC).isoformat()
+        compatibility: dict[str, Any] = {}
         try:
             ccxt = await self._get_ccxt()
+            compatibility = await self._entry_environment_compatibility(
+                ccxt,
+                symbol,
+            )
+            if compatibility.get("compatible") is False:
+                result = {
+                    "available": False,
+                    "reason": "okx_entry_live_execution_environment_incompatible",
+                    "source": "okx_private_account_and_live_execution_environment",
+                    "symbol": normalize_trading_symbol(symbol),
+                    "inst_id": inst_id,
+                    "mode": self.executor_mode,
+                    "demo": settings.is_okx_demo(self.executor_mode),
+                    "environment_compatibility": compatibility,
+                    "generated_at": generated_at,
+                    "cache_hit": False,
+                }
+                blockers = set(compatibility.get("blockers") or ())
+                ttl = (
+                    OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
+                    if "environment_price_drift_exceeded" in blockers
+                    else OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
+                )
+                self._entry_instrument_availability_cache[inst_id] = (
+                    dict(result),
+                    now,
+                    ttl,
+                )
+                return result
             fetch_leverage = getattr(ccxt, "fetch_leverage", None)
             if not callable(fetch_leverage):
                 raise ExchangeAPIError("OKX private account leverage API is unavailable")
@@ -5891,12 +5925,17 @@ class OKXExecutor(AbstractExecutor):
             result = {
                 "available": True,
                 "reason": "okx_private_account_instrument_verified",
-                "source": "okx_private_account_leverage_info",
+                "source": (
+                    "okx_private_account_and_live_execution_environment"
+                    if compatibility.get("checked") is True
+                    else "okx_private_account_leverage_info"
+                ),
                 "symbol": normalize_trading_symbol(symbol),
                 "inst_id": inst_id,
                 "mode": self.executor_mode,
                 "demo": settings.is_okx_demo(self.executor_mode),
                 "reported_leverage": self._extract_verified_leverage(response),
+                "environment_compatibility": compatibility,
                 "generated_at": generated_at,
                 "cache_hit": False,
             }
@@ -5912,13 +5951,18 @@ class OKXExecutor(AbstractExecutor):
                     if unavailable
                     else "okx_private_entry_instrument_probe_failed"
                 ),
-                "source": "okx_private_account_leverage_info",
+                "source": (
+                    "okx_private_account_and_live_execution_environment"
+                    if compatibility.get("checked") is True
+                    else "okx_private_account_leverage_info"
+                ),
                 "symbol": normalize_trading_symbol(symbol),
                 "inst_id": inst_id,
                 "mode": self.executor_mode,
                 "demo": settings.is_okx_demo(self.executor_mode),
                 "error_code": error_code or None,
                 "error": error_text,
+                "environment_compatibility": compatibility,
                 "generated_at": generated_at,
                 "cache_hit": False,
             }
@@ -5927,8 +5971,81 @@ class OKXExecutor(AbstractExecutor):
                 if unavailable
                 else OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
             )
+        if result.get("available") is True and compatibility.get("checked") is True:
+            ttl = min(ttl, OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS)
         self._entry_instrument_availability_cache[inst_id] = (dict(result), now, ttl)
         return result
+
+    async def _entry_environment_compatibility(
+        self,
+        ccxt: Any,
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Compare live analysis facts with the paper execution environment."""
+
+        if not settings.is_okx_demo(self.executor_mode):
+            return {
+                "checked": False,
+                "compatible": True,
+                "reason": "single_live_execution_environment",
+                "blockers": [],
+            }
+
+        required = (
+            "publicGetPublicInstruments",
+            "executionGetPublicInstruments",
+            "publicGetMarketTicker",
+            "executionGetMarketTicker",
+        )
+        if any(not callable(getattr(ccxt, name, None)) for name in required):
+            # Lightweight test doubles and legacy adapters do not expose both
+            # public transports. The real SDK adapter always does; leave the
+            # capability unasserted here so the private probe remains usable.
+            return {
+                "checked": False,
+                "compatible": True,
+                "reason": "environment_compatibility_probe_not_supported",
+                "blockers": [],
+            }
+
+        inst_id = okx_inst_id_from_symbol(symbol)
+        live_response, execution_response, live_ticker, execution_ticker = await asyncio.gather(
+            self._with_retry(
+                ccxt.publicGetPublicInstruments,
+                {"instType": "SWAP", "instId": inst_id},
+                _max_attempts=1,
+            ),
+            self._with_retry(
+                ccxt.executionGetPublicInstruments,
+                {"instType": "SWAP", "instId": inst_id},
+                _max_attempts=1,
+            ),
+            self._with_retry(
+                ccxt.publicGetMarketTicker,
+                {"instId": inst_id},
+                _max_attempts=1,
+            ),
+            self._with_retry(
+                ccxt.executionGetMarketTicker,
+                {"instId": inst_id},
+                _max_attempts=1,
+            ),
+        )
+        live_rows = live_response.get("data") if isinstance(live_response, dict) else []
+        execution_rows = (
+            execution_response.get("data") if isinstance(execution_response, dict) else []
+        )
+        assessment = assess_okx_entry_environment_compatibility(
+            live_instrument=live_rows[0] if isinstance(live_rows, list) and live_rows else {},
+            execution_instrument=(
+                execution_rows[0]
+                if isinstance(execution_rows, list) and execution_rows
+                else {}
+            ),
+            live_ticker=live_ticker,
+            execution_ticker=execution_ticker,
+        )
+        return {"checked": True, **assessment}
 
     async def entry_instrument_availability_shortlist(
         self,

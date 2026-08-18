@@ -125,6 +125,7 @@ class DynamicExitAssessment:
     model_exit_pressure: float
     planned_stop_crossed: bool
     position_age_minutes: float | None
+    position_age_evidence_complete: bool
     early_exit_observation_active: bool
     economic_exit_evidence_complete: bool
     paper_canary_horizon_elapsed: bool
@@ -572,27 +573,20 @@ def assess_dynamic_exit(
             profit_lock_pressure,
         )
     )
+    position_age_evidence_complete = bool(
+        matches and len(position_ages_minutes) == len(matches)
+    )
     position_age_minutes = min(position_ages_minutes) if position_ages_minutes else None
     early_exit_observation_active = bool(
         not hard_risk
-        and position_age_minutes is not None
-        and position_age_minutes < EARLY_EXIT_OBSERVATION_MINUTES
         and close_fraction > 0.0
-        and close_fraction < 1.0
+        and (
+            not position_age_evidence_complete
+            or position_age_minutes is None
+            or position_age_minutes < EARLY_EXIT_OBSERVATION_MINUTES
+        )
     )
-    gross_profit_value = max(gross_pnl, 0.0)
-    significant_model_exit_pressure = bool(
-        model_requested_close_fraction + 1e-9 >= MIN_AUTOMATED_EXIT_FRACTION
-        and model_exit_pressure + 1e-9 >= MIN_EARLY_MODEL_EXIT_PRESSURE
-    )
-    economic_exit_evidence_complete = bool(
-        not early_exit_observation_active
-        or gross_profit_value + 1e-9 >= estimated_exit_cost
-        or significant_model_exit_pressure
-        or replacement_pressure > 0.0
-        or portfolio_pressure > 0.0
-        or profit_lock_pressure > 0.0
-    )
+    economic_exit_evidence_complete = not early_exit_observation_active
     reasons: list[str] = []
     if not matches:
         reasons.append("position_economics_missing")
@@ -616,8 +610,10 @@ def assess_dynamic_exit(
         reasons.append("fee_after_profit_not_positive")
     if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
-    if not hard_risk and not economic_exit_evidence_complete:
-        reasons.append("early_exit_economic_evidence_insufficient")
+    if not hard_risk and matches and not position_age_evidence_complete:
+        reasons.append("position_age_evidence_missing")
+    elif not hard_risk and early_exit_observation_active:
+        reasons.append("minimum_position_observation_not_elapsed")
     eligible = not reasons
     provenance = {
         "source": (
@@ -626,7 +622,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-08-17.dynamic-exit-funding-net-pnl.v14",
+        "strategy_version": "2026-08-19.dynamic-exit-lifecycle-guard.v15",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
@@ -688,6 +684,7 @@ def assess_dynamic_exit(
         position_age_minutes=(
             round(position_age_minutes, 8) if position_age_minutes is not None else None
         ),
+        position_age_evidence_complete=position_age_evidence_complete,
         early_exit_observation_active=early_exit_observation_active,
         economic_exit_evidence_complete=economic_exit_evidence_complete,
         paper_canary_horizon_elapsed=paper_canary_horizon_elapsed,

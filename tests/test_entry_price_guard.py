@@ -212,6 +212,48 @@ async def test_pre_order_execution_facts_replace_market_and_fee_snapshot() -> No
 
 
 @pytest.mark.asyncio
+async def test_repeated_guard_keeps_original_analysis_price_as_immutable_basis() -> None:
+    calls = {"quality": 0}
+
+    async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
+        return {
+            "production_eligible": True,
+            "inst_id": "BTC-USDT-SWAP",
+            "feature_snapshot": {
+                "current_price": 101.0,
+                "bid": 100.9,
+                "ask": 101.1,
+                "mark_price": 101.0,
+                "orderbook_bids": [[100.9, 2.0]],
+                "orderbook_asks": [[101.1, 2.0]],
+                "orderbook_bid_depth": 201.8,
+                "orderbook_ask_depth": 202.2,
+                "contract_value_base": 1.0,
+                "taker_fee_rate": 0.0004,
+            },
+            "policy_provenance": {"source": "test_okx_native"},
+        }
+
+    def quality(snapshot: dict[str, Any], **_kwargs: Any) -> None:
+        calls["quality"] += 1
+        assert snapshot.get("current_price") == 100.0
+        return None
+
+    decision = _decision()
+    policy = EntryPriceGuardPolicy(
+        fresh_feature_provider=lambda _symbol: execution_facts("paper", decision),
+        market_data_quality_reason_provider=quality,
+        decision_age_seconds_provider=lambda _decision: 12.0,
+        pre_order_execution_facts_provider=execution_facts,
+    )
+
+    assert await policy.guard_reason(decision, "paper") is None
+    assert await policy.guard_reason(decision, "paper") is None
+    assert calls["quality"] == 1
+    assert decision.raw_response["pre_execution_price_check"]["snapshot_price"] == 100.0
+
+
+@pytest.mark.asyncio
 async def test_pre_order_execution_fact_instrument_mismatch_fails_closed() -> None:
     async def fresh_feature(_symbol: str) -> dict[str, Any]:
         return {
