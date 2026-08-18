@@ -18,7 +18,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from models.account import OkxAccountBill
 from models.decision import AIDecision
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 from services.decision_execution_trace import build_execution_trace
 from services.execution_reason_localizer import localize_execution_reason
 from services.execution_result_classifier import ExecutionResultClassifier
@@ -173,6 +173,8 @@ def _execution_source_from_decision(decision: Any | None, order: Any) -> tuple[s
     if is_manual_close_order(order):
         return "manual", MANUAL_CLOSE_LABEL
     if decision is None:
+        if _is_okx_reconciliation_order(order):
+            return "okx", "OKX同步"
         return "system", "系统执行"
     meta = {
         "raw_llm_response": getattr(decision, "raw_llm_response", None),
@@ -506,7 +508,8 @@ def _deduplicate_execution_orders(orders: list[Any]) -> list[Any]:
     passthrough.extend(selected.values())
     return sorted(
         passthrough,
-        key=lambda row: _as_utc_datetime(getattr(row, "created_at", None)) or datetime.min.replace(tzinfo=UTC),
+        key=lambda row: _as_utc_datetime(getattr(row, "created_at", None))
+        or datetime.min.replace(tzinfo=UTC),
         reverse=True,
     )
 
@@ -656,18 +659,14 @@ async def get_trades(
         )
         raw_order_count = len(orders)
         raw_filled_count = sum(
-            1
-            for order in orders
-            if str(getattr(order, "status", "") or "").lower() == "filled"
+            1 for order in orders if str(getattr(order, "status", "") or "").lower() == "filled"
         )
         orders = _deduplicate_execution_orders(orders)
         hidden_duplicate_count = max(raw_order_count - len(orders), 0)
         hidden_filled_count = max(
             raw_filled_count
             - sum(
-                1
-                for order in orders
-                if str(getattr(order, "status", "") or "").lower() == "filled"
+                1 for order in orders if str(getattr(order, "status", "") or "").lower() == "filled"
             ),
             0,
         )
@@ -744,6 +743,34 @@ async def get_trades(
         position_rows = await session.execute(position_stmt.limit(1000))
         all_positions = list(position_rows.all())
         closed_positions = [p for p in all_positions if not p.is_open]
+        authoritative_history_stmt = select(OkxPositionHistory)
+        if mode:
+            authoritative_history_stmt = authoritative_history_stmt.where(
+                OkxPositionHistory.mode == mode
+            )
+        if position_symbol_variants:
+            authoritative_history_stmt = authoritative_history_stmt.where(
+                OkxPositionHistory.symbol.in_(position_symbol_variants)
+            )
+        else:
+            authoritative_history_stmt = authoritative_history_stmt.where(
+                OkxPositionHistory.id == -1
+            )
+        authoritative_history_rows = list(
+            (
+                await session.execute(
+                    authoritative_history_stmt.order_by(
+                        OkxPositionHistory.updated_at_okx.desc().nullslast(),
+                        OkxPositionHistory.id.desc(),
+                    ).limit(10000)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        authoritative_close_history = _authoritative_close_history_by_order_id(
+            authoritative_history_rows
+        )
 
     def normalize_symbol(symbol: str | None) -> str:
         text = str(symbol or "").replace("-", "/").replace("_", "/").upper()
@@ -796,6 +823,12 @@ async def get_trades(
             return None
         return sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[0][3]
 
+    def authoritative_closed_history(order):
+        exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+        if not exchange_order_id:
+            return None
+        return authoritative_close_history.get(exchange_order_id)
+
     def matching_entry_position(order):
         if order.status != "filled" or not order.filled_at:
             return None
@@ -828,6 +861,11 @@ async def get_trades(
     def display_action(order) -> str:
         if order.side in {"long", "short", "close_long", "close_short"}:
             return order.side
+
+        history = authoritative_closed_history(order)
+        history_side = str(getattr(history, "side", "") or "").lower()
+        if history_side in {"long", "short"}:
+            return "close_long" if history_side == "long" else "close_short"
 
         action = (decision_meta.get(order.decision_id) or {}).get("action")
         if action and action != "hold":
@@ -911,6 +949,13 @@ async def get_trades(
 
         p = matching_closed_position(order)
         if not p:
+            history = authoritative_closed_history(order)
+            if history is not None:
+                close_status = _authoritative_order_close_status(history, order)
+                if close_status == "partial":
+                    return "partial", "部分平仓"
+                if close_status == "full":
+                    return "full", "全部平仓"
             return None, None
         if closed_position_looks_partial(p):
             return "partial", "部分平仓"
@@ -927,6 +972,8 @@ async def get_trades(
             and _close_price_matches_position_protection(order, matched_closed)
         ):
             return "system", SYSTEM_PROTECTION_LABEL
+        if _is_okx_reconciliation_order(order):
+            return "okx", "OKX同步"
         if _is_exchange_sync_decision(raw, snapshot):
             return "okx", "OKX同步"
         return "system", "系统执行"
@@ -1003,6 +1050,15 @@ async def get_trades(
                 )
             if _is_exchange_sync_decision(raw, snapshot):
                 return f"OKX 侧平仓同步，成交价 {close_price:g}，实现盈亏 {float(p.realized_pnl or 0):.4f}。"
+
+        history = authoritative_closed_history(order)
+        if history is not None and display_action(order) in {"close_long", "close_short"}:
+            close_price = order.price or _safe_float(getattr(history, "close_avg_px", None), 0.0)
+            realized_pnl = _safe_float(getattr(history, "realized_pnl", None), 0.0)
+            return (
+                "OKX 历史仓位已确认平仓，"
+                f"成交价 {close_price:g}，该仓位累计已实现盈亏 {realized_pnl:.4f} USDT。"
+            )
 
         if _is_system_protection_reconcile(raw, snapshot):
             close_fill = _safe_dict(raw.get("close_fill"))
@@ -1114,9 +1170,7 @@ async def get_trades(
             "okx_state": sanitize_text(getattr(order, "okx_state", None)),
             "okx_sync_status": sanitize_text(getattr(order, "okx_sync_status", None)),
             "okx_synced_at": (
-                order.okx_synced_at.isoformat()
-                if getattr(order, "okx_synced_at", None)
-                else None
+                order.okx_synced_at.isoformat() if getattr(order, "okx_synced_at", None) else None
             ),
             "okx_last_error": sanitize_text(getattr(order, "okx_last_error", None)),
             "filled_at": order.filled_at.isoformat() if order.filled_at else None,
@@ -1147,6 +1201,7 @@ async def get_trade_detail(trade_id: int):
             )
             decision = result.scalar_one_or_none()
         closed_positions: list[Any] = []
+        authoritative_history_rows: list[OkxPositionHistory] = []
         if order:
             position_stmt = select(Position).where(
                 Position.model_name == order.model_name,
@@ -1166,11 +1221,29 @@ async def get_trade_detail(trade_id: int):
                 )
             position_result = await session.execute(position_stmt.limit(50))
             closed_positions = list(position_result.scalars().all())
+            history_stmt = select(OkxPositionHistory).where(
+                OkxPositionHistory.mode == order.execution_mode,
+                OkxPositionHistory.symbol.in_(_symbol_query_variants({order.symbol})),
+            )
+            history_result = await session.execute(
+                history_stmt.order_by(
+                    OkxPositionHistory.updated_at_okx.desc().nullslast(),
+                    OkxPositionHistory.id.desc(),
+                ).limit(10000)
+            )
+            authoritative_history_rows = list(history_result.scalars().all())
 
     if not order:
         return {"error": "Trade not found"}
 
     raw_response = _safe_dict(getattr(decision, "raw_llm_response", None))
+    authoritative_close_history = _authoritative_close_history_by_order_id(
+        authoritative_history_rows
+    )
+    authoritative_history = authoritative_close_history.get(
+        str(getattr(order, "exchange_order_id", "") or "").strip()
+    )
+    authoritative_side = str(getattr(authoritative_history, "side", "") or "").lower()
     execution_reason = sanitize_text(
         localize_execution_reason(getattr(decision, "execution_reason", None))
     )
@@ -1195,6 +1268,16 @@ async def get_trade_detail(trade_id: int):
     )
     if position_reason:
         fallback_reason = sanitize_text(position_reason)
+    elif authoritative_history is not None and authoritative_side in {"long", "short"}:
+        close_price = order.price or _safe_float(
+            getattr(authoritative_history, "close_avg_px", None),
+            0.0,
+        )
+        fallback_reason = sanitize_text(
+            "OKX 历史仓位已确认平仓，"
+            f"成交价 {close_price:g}，该仓位累计已实现盈亏 "
+            f"{_safe_float(getattr(authoritative_history, 'realized_pnl', None), 0.0):.4f} USDT。"
+        )
     trace = build_execution_trace(
         raw_response,
         order_status=order.status,
@@ -1213,7 +1296,15 @@ async def get_trade_detail(trade_id: int):
             "mode": order.execution_mode,
             "symbol": order.symbol,
             "side": order.side,
-            "action": getattr(decision, "action", None),
+            "action": (
+                "close_long"
+                if authoritative_side == "long"
+                else (
+                    "close_short"
+                    if authoritative_side == "short"
+                    else getattr(decision, "action", None)
+                )
+            ),
             "order_type": order.order_type,
             "quantity": order.quantity,
             "price": order.price,
@@ -1251,9 +1342,7 @@ async def get_trade_detail(trade_id: int):
             "okx_state": sanitize_text(getattr(order, "okx_state", None)),
             "okx_sync_status": sanitize_text(getattr(order, "okx_sync_status", None)),
             "okx_synced_at": (
-                order.okx_synced_at.isoformat()
-                if getattr(order, "okx_synced_at", None)
-                else None
+                order.okx_synced_at.isoformat() if getattr(order, "okx_synced_at", None) else None
             ),
             "okx_last_error": sanitize_text(getattr(order, "okx_last_error", None)),
             "decision": (
@@ -1372,9 +1461,21 @@ def _serialize_open_position_row(p: Position) -> dict[str, Any]:
 
 
 def _split_exchange_order_ids(value: Any) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_split_exchange_order_ids(item))
+        return result
     text = str(value or "").strip()
     if not text:
         return set()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return _split_exchange_order_ids(parsed)
     tokens = {text}
     for separator in (",", ";", "|", "\n", "\t", " "):
         pieces: set[str] = set()
@@ -1382,6 +1483,51 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
             pieces.update(part.strip() for part in token.split(separator) if part.strip())
         tokens = pieces
     return {token for token in tokens if token}
+
+
+def _authoritative_close_history_by_order_id(
+    history_rows: list[OkxPositionHistory],
+) -> dict[str, OkxPositionHistory]:
+    """Index OKX historical close fills by exchange order id.
+
+    A reconciled OKX lifecycle can exist without a matching local ``Position``
+    row (for example after a restart or a partial-fill repair).  The OKX
+    history mirror is still authoritative for deciding whether an order closed
+    a long or short position, so execution records must use it as a fallback.
+    """
+
+    result: dict[str, OkxPositionHistory] = {}
+    for history in history_rows:
+        for order_id in _split_exchange_order_ids(getattr(history, "close_order_ids", None)):
+            if order_id:
+                result.setdefault(order_id, history)
+    return result
+
+
+def _authoritative_order_close_status(
+    history: OkxPositionHistory,
+    order: Any,
+) -> str | None:
+    """Return the lifecycle status for one close fill in an OKX history row."""
+
+    overall = str(getattr(history, "close_status", "") or "").lower()
+    if overall in {"partial", "partially_closed"}:
+        return "partial"
+    if overall not in {"full", "closed", "settled"}:
+        return None
+
+    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    raw_ids = getattr(history, "close_order_ids", None)
+    if isinstance(raw_ids, str) and raw_ids.strip().startswith("["):
+        try:
+            raw_ids = json.loads(raw_ids)
+        except (TypeError, ValueError):
+            raw_ids = None
+    if isinstance(raw_ids, (list, tuple)):
+        ordered_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if len(ordered_ids) > 1 and exchange_order_id in ordered_ids[:-1]:
+            return "partial"
+    return "full"
 
 
 async def _okx_account_bill_rows_for_closed_positions(

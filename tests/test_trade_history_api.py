@@ -10,6 +10,7 @@ from db.repositories.trade_repo import TradeRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.account import OkxAccountBill
 from models.decision import AIDecision
+from models.trade import OkxPositionHistory
 from services.okx_lifecycle_order_allocations import (
     LIFECYCLE_ORDER_ALLOCATIONS_KEY,
     build_lifecycle_order_allocation,
@@ -603,6 +604,82 @@ async def test_trade_history_accepts_okx_execution_result_confirmed_order(
     assert detail["okx_confirmed"] is True
     assert detail["success"] is True
     assert detail["okx_sync_status"] == OKX_SYNC_EXECUTION_RESULT_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_trade_history_uses_okx_history_close_when_local_position_is_missing(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'trade-history-okx-close-fallback.db').as_posix()}",
+    )
+    await init_db()
+    filled_at = datetime(2026, 8, 17, 8, 3, tzinfo=UTC)
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                OkxPositionHistory(
+                    mode="paper",
+                    row_identity="strk-history-fallback",
+                    inst_id="STRK-USDT-SWAP",
+                    symbol="STRK/USDT",
+                    pos_id="strk-pos-1",
+                    side="short",
+                    close_status="full",
+                    opened_at=filled_at - timedelta(days=2),
+                    updated_at_okx=filled_at,
+                    open_avg_px=375.9524,
+                    close_avg_px=377.9507,
+                    close_total_pos=7746.0,
+                    realized_pnl=9821.7595,
+                    close_order_ids=["okx-close-without-local-position"],
+                    match_status="okx_account_position_history",
+                    sync_status="synced",
+                )
+            )
+            await session.flush()
+            repo = TradeRepository(session)
+            order = await repo.create_order(
+                {
+                    "model_name": "okx_authoritative_sync",
+                    "execution_mode": "paper",
+                    "symbol": "STRK/USDT",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": 39.49,
+                    "price": 377.9507,
+                    "status": "filled",
+                    "fee": 0.01,
+                    "exchange_order_id": "okx-close-without-local-position",
+                    "filled_at": filled_at,
+                    "created_at": filled_at,
+                    "okx_sync_status": OKX_SYNC_CONFIRMED,
+                }
+            )
+
+        trades = await get_trades(
+            model_name=None,
+            symbol="STRK/USDT",
+            mode="paper",
+            limit=10,
+            page=1,
+        )
+        detail = await get_trade_detail(order.id)
+    finally:
+        await close_db()
+
+    row = next(item for item in trades["trades"] if item["id"] == order.id)
+    assert row["action"] == "close_short"
+    assert row["close_status"] == "full"
+    assert row["execution_source"] == "okx"
+    assert "OKX" in row["reason"]
+    assert detail["action"] == "close_short"
+    assert detail["execution_source"] == "okx"
+    assert "已确认平仓" in detail["reason"]
 
 
 @pytest.mark.asyncio
