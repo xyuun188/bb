@@ -586,7 +586,29 @@ async def test_open_okx_lifecycle_keeps_closed_child_settling_instead_of_quarant
         assert position.settlement_raw["previous_settlement_status"] == (
             SETTLEMENT_STATUS_QUARANTINED
         )
+        assert position.settlement_raw["lifecycle_open_original_settlement_status"] == (
+            SETTLEMENT_STATUS_QUARANTINED
+        )
+        assert position.settlement_raw["lifecycle_open_previous_attempt_count"] == (
+            POSITION_HISTORY_MATCH_MAX_ATTEMPTS
+        )
+        assert position.settlement_raw["settlement_attempt_count"] == 0
         assert "next_settlement_retry_at" in position.settlement_raw
+
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(
+            now + timedelta(hours=1)
+        )
+        assert candidates == []
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+        assert position is not None
+        assert position.settlement_raw["lifecycle_open_original_settlement_status"] == (
+            SETTLEMENT_STATUS_QUARANTINED
+        )
+        assert position.settlement_raw["lifecycle_open_previous_attempt_count"] == (
+            POSITION_HISTORY_MATCH_MAX_ATTEMPTS
+        )
+        assert position.settlement_raw["settlement_attempt_count"] == 0
     finally:
         await close_db()
 

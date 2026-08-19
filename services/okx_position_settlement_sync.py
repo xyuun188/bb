@@ -1003,6 +1003,16 @@ def _mark_lifecycle_still_open(
 
     previous_status = str(getattr(position, "settlement_status", "") or "")
     previous_source = str(getattr(position, "settlement_source", "") or "")
+    original_status = str(
+        raw.get("lifecycle_open_original_settlement_status") or previous_status
+    )
+    original_source = str(
+        raw.get("lifecycle_open_original_settlement_source") or previous_source
+    )
+    previous_attempt_count = max(
+        _safe_int(raw.get("lifecycle_open_previous_attempt_count"), 0),
+        _safe_int(raw.get("settlement_attempt_count"), 0),
+    )
     next_retry_at = now + timedelta(seconds=POSITION_HISTORY_QUARANTINE_RETRY_SECONDS)
     position.settlement_status = "settling"
     position.settlement_source = SETTLEMENT_LIFECYCLE_OPEN_SOURCE
@@ -1014,6 +1024,10 @@ def _mark_lifecycle_still_open(
         "reason": SETTLEMENT_LIFECYCLE_OPEN_REASON,
         "previous_settlement_status": previous_status,
         "previous_settlement_source": previous_source,
+        "lifecycle_open_original_settlement_status": original_status,
+        "lifecycle_open_original_settlement_source": original_source,
+        "lifecycle_open_previous_attempt_count": previous_attempt_count,
+        "settlement_attempt_count": 0,
         "lifecycle_open_checked_at": now.isoformat(),
         "next_settlement_retry_at": next_retry_at.isoformat(),
         "retry_policy": (
