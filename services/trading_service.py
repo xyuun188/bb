@@ -158,6 +158,7 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
 )
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
     OkxOrderFactSyncService,
@@ -12685,6 +12686,12 @@ class TradingService:
             CCXT request while a brand-new OKX client succeeds. Do one isolated
             balance pull before treating the account as unavailable.
             """
+            if is_okx_temporary_service_error(reason):
+                logger.info(
+                    "fresh OKX balance fallback suppressed during private API outage",
+                    mode=selected_mode,
+                )
+                return None
             fallback = OKXExecutor(mode=selected_mode, load_markets_on_initialize=False)
             try:
                 await asyncio.wait_for(fallback.initialize(), timeout=12.0)

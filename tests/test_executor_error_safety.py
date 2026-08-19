@@ -201,6 +201,21 @@ class _TemporaryServiceOnceCcxt:
         return {"data": []}
 
 
+class _TemporaryServiceCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+
+    def __init__(self) -> None:
+        self.position_calls = 0
+
+    async def privateGetAccountPositions(self, _params: dict[str, Any]) -> dict[str, Any]:
+        self.position_calls += 1
+        raise ExchangeAPIError(
+            "OKX API error [50001]: Service temporarily unavailable. Please try again later.",
+            code="50001",
+        )
+
+
 def _native_position_row(
     inst_id: str,
     *,
@@ -1371,6 +1386,66 @@ async def test_okx_with_retry_recovers_from_temporary_50001(
 
     assert result == {"data": []}
     assert exchange.position_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_okx_temporary_service_circuit_stops_private_request_storm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _TemporaryServiceCcxt()
+    executor = _executor(exchange)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+
+    with pytest.raises(ExchangeAPIError, match="50001"):
+        await executor._with_retry(
+            exchange.privateGetAccountPositions,
+            {"instType": "SWAP"},
+        )
+    first_call_count = exchange.position_calls
+
+    with pytest.raises(ExchangeAPIError, match="circuit open"):
+        await executor._with_retry(
+            exchange.privateGetAccountPositions,
+            {"instType": "SWAP"},
+        )
+
+    assert first_call_count == okx_module.MAX_RETRIES
+    assert exchange.position_calls == first_call_count
+
+
+@pytest.mark.asyncio
+async def test_okx_temporary_service_circuit_uses_one_recovery_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _TemporaryServiceCcxt()
+    executor = _executor(exchange)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+
+    with pytest.raises(ExchangeAPIError, match="50001"):
+        await executor._with_retry(
+            exchange.privateGetAccountPositions,
+            {"instType": "SWAP"},
+        )
+
+    executor._private_api_circuit_open_until = okx_module.time.monotonic() - 1.0
+    executor._private_api_circuit_probe_in_flight = True
+    with pytest.raises(ExchangeAPIError, match="recovery probe in progress"):
+        await executor._with_retry(
+            exchange.privateGetAccountPositions,
+            {"instType": "SWAP"},
+        )
+    executor._private_api_circuit_probe_in_flight = False
+
+    async def recovered(_params: dict[str, Any]) -> dict[str, Any]:
+        exchange.position_calls += 1
+        return {"data": []}
+
+    recovered.__name__ = "privateGetAccountPositions"
+    result = await executor._with_retry(recovered, {"instType": "SWAP"})
+
+    assert result == {"data": []}
+    assert executor._private_api_circuit_open_until == 0.0
+    assert executor._private_api_circuit_failure_count == 0
 
 
 def test_okx_retry_classifier_recognizes_busy_50013() -> None:

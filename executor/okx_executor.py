@@ -55,6 +55,8 @@ RATE_LIMIT_TOKENS = 10  # max requests per second
 RATE_LIMIT_PERIOD = 1.0
 OKX_REST_CALL_TIMEOUT = 10.0
 OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
+OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS = 5.0
+OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS = 30.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
@@ -117,6 +119,9 @@ class OKXExecutor(AbstractExecutor):
         self._entry_instrument_availability_cache: dict[
             str, tuple[dict[str, Any], float, float]
         ] = {}
+        self._private_api_circuit_failure_count = 0
+        self._private_api_circuit_open_until = 0.0
+        self._private_api_circuit_probe_in_flight = False
 
     @property
     def executor_mode(self) -> str:
@@ -431,11 +436,21 @@ class OKXExecutor(AbstractExecutor):
         """Execute an API call with retry + rate limit handling."""
         last_error = None
         method_name = getattr(fn, "__name__", "")
+        private_api_call = self._is_private_api_method(method_name)
+        circuit_probe = self._enter_private_api_circuit(
+            method_name,
+            tracked=private_api_call,
+        )
         attempts = max(1, min(int(_max_attempts or MAX_RETRIES), MAX_RETRIES))
         expected_error_codes = {
             str(code).strip() for code in (_expected_error_codes or set()) if str(code).strip()
         }
         for attempt in range(attempts):
+            if attempt > 0 and private_api_call and not circuit_probe:
+                self._enter_private_api_circuit(
+                    method_name,
+                    tracked=True,
+                )
             try:
                 await self._rate_limiter.wait_for_token()
                 self._ensure_rest_url()
@@ -443,6 +458,8 @@ class OKXExecutor(AbstractExecutor):
                     fn(*args, **kwargs),
                     timeout=OKX_REST_CALL_TIMEOUT,
                 )
+                if private_api_call:
+                    self._record_private_api_available()
                 return result
             except TimeoutError as e:
                 logger.warning(
@@ -455,6 +472,8 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
+                if circuit_probe:
+                    self._private_api_circuit_probe_in_flight = False
                 raise ExchangeAPIError(
                     f"OKX REST call timed out after {OKX_REST_CALL_TIMEOUT:.0f}s: {method_name}"
                 ) from e
@@ -488,17 +507,26 @@ class OKXExecutor(AbstractExecutor):
                     last_error = e
                     continue
                 if error_code in expected_error_codes:
+                    if private_api_call:
+                        self._record_private_api_available()
                     logger.debug(
                         "OKX SDK expected capability rejection",
                         method=method_name,
                         error_code=error_code,
                     )
                 elif self._is_transient_system_error(message):
+                    if private_api_call:
+                        self._open_private_api_circuit(
+                            method_name=method_name,
+                            error_code=error_code,
+                        )
                     logger.info(
                         "OKX SDK temporary system error exhausted retry budget",
                         error=message,
                     )
                 else:
+                    if private_api_call:
+                        self._record_private_api_available()
                     logger.error("OKX SDK exchange error", error=message)
                 raise ExchangeAPIError(
                     message,
@@ -535,9 +563,80 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
+                if circuit_probe:
+                    self._private_api_circuit_probe_in_flight = False
                 raise
 
+        if circuit_probe:
+            self._private_api_circuit_probe_in_flight = False
         raise RateLimitError(f"Max retries exceeded: {safe_error_text(last_error)}")
+
+    @staticmethod
+    def _is_private_api_method(method_name: str) -> bool:
+        """Keep account outages from suppressing independent public market data."""
+
+        return str(method_name or "").lower().startswith("private")
+
+    def _enter_private_api_circuit(self, method_name: str, *, tracked: bool) -> bool:
+        """Fail fast during an OKX private outage and elect one recovery probe."""
+
+        if not tracked:
+            return False
+        now = time.monotonic()
+        if now < self._private_api_circuit_open_until:
+            retry_after = self._private_api_circuit_open_until - now
+            raise ExchangeAPIError(
+                "OKX API error [50001]: private service circuit open; "
+                f"retry after {retry_after:.1f}s ({method_name})",
+                code="50001",
+            )
+        if self._private_api_circuit_open_until <= 0:
+            return False
+        if self._private_api_circuit_probe_in_flight:
+            raise ExchangeAPIError(
+                "OKX API error [50001]: private service recovery probe in progress; "
+                f"retry later ({method_name})",
+                code="50001",
+            )
+        self._private_api_circuit_probe_in_flight = True
+        return True
+
+    def _open_private_api_circuit(
+        self,
+        *,
+        method_name: str,
+        error_code: str | None,
+    ) -> None:
+        self._private_api_circuit_failure_count += 1
+        exponent = min(self._private_api_circuit_failure_count - 1, 8)
+        cooldown = min(
+            OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS * (2**exponent),
+            OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS,
+        )
+        self._private_api_circuit_open_until = time.monotonic() + cooldown
+        self._private_api_circuit_probe_in_flight = False
+        logger.warning(
+            "OKX private API temporary-service circuit opened",
+            mode=self.executor_mode,
+            method=method_name,
+            error_code=error_code or "50001",
+            cooldown_seconds=cooldown,
+            failure_count=self._private_api_circuit_failure_count,
+        )
+
+    def _record_private_api_available(self) -> None:
+        recovered = bool(
+            self._private_api_circuit_open_until > 0
+            or self._private_api_circuit_failure_count > 0
+        )
+        self._private_api_circuit_failure_count = 0
+        self._private_api_circuit_open_until = 0.0
+        self._private_api_circuit_probe_in_flight = False
+        if recovered:
+            logger.info(
+                "OKX private API temporary-service circuit recovered",
+                mode=self.executor_mode,
+            )
 
     @staticmethod
     def _exchange_error_code(exc: BaseException, message: str = "") -> str:

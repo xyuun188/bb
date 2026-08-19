@@ -408,6 +408,37 @@ async def test_okx_balance_snapshot_returns_stale_cache_and_refreshes_in_backgro
 
 
 @pytest.mark.asyncio
+async def test_okx_balance_snapshot_does_not_bypass_temporary_service_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {}
+    service._okx_balance_snapshot_locks = {}
+    service._okx_balance_snapshot_refresh_tasks = {}
+
+    class TemporaryUnavailableExecutor:
+        async def get_balance_snapshot(self, _asset: str) -> dict[str, Any]:
+            return {
+                "error": (
+                    "OKX API error [50001]: private service circuit open; "
+                    "retry after 5.0s"
+                )
+            }
+
+    service._okx_paper = TemporaryUnavailableExecutor()
+    service._okx_live = None
+
+    def unexpected_fallback(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("temporary service errors must not create a fallback executor")
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", unexpected_fallback)
+
+    snapshot = await service._get_okx_balance_snapshot_for_mode("paper")
+
+    assert snapshot is None
+
+
+@pytest.mark.asyncio
 async def test_stop_writes_inactive_runtime_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
