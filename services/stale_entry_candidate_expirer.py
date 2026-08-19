@@ -68,6 +68,12 @@ def _stale_entry_scan_columns() -> tuple[Any, ...]:
         raw["opportunity_score"]["expected_net_return_pct"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}expected_net_return_pct"
         ),
+        raw["opportunity_score"]["policy_provenance"]["valid_for_seconds"].label(
+            f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}valid_for_seconds"
+        ),
+        raw["opportunity_score"]["policy_provenance"]["generated_at"].label(
+            f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}opportunity_generated_at"
+        ),
         raw["entry_candidate_evidence"]["long"]["expected_net_return_pct"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}long_expected_net_return_pct"
         ),
@@ -96,6 +102,21 @@ def _stale_entry_row_from_mapping(mapping: Any) -> SimpleNamespace:
         for key in ("score", "min_score_required", "expected_net_return_pct")
         if mapping.get(f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}{key}") is not None
     }
+    valid_for_seconds = mapping.get(
+        f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}valid_for_seconds"
+    )
+    opportunity_generated_at = mapping.get(
+        f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}opportunity_generated_at"
+    )
+    if valid_for_seconds is not None or opportunity_generated_at is not None:
+        opportunity["policy_provenance"] = {
+            key: value
+            for key, value in (
+                ("valid_for_seconds", valid_for_seconds),
+                ("generated_at", opportunity_generated_at),
+            )
+            if value is not None
+        }
     evidence: dict[str, Any] = {}
     for side in ("long", "short"):
         expected = mapping.get(f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}{side}_expected_net_return_pct")

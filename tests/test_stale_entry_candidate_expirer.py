@@ -104,6 +104,52 @@ async def test_stale_entry_candidate_expirer_marks_waiting_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stale_entry_projection_preserves_dynamic_model_horizon() -> None:
+    generated_at = datetime(2026, 8, 19, 13, 0, 0)
+    row = _stale_entry_row_from_mapping(
+        {
+            "id": 2,
+            "symbol": "THETA/USDT",
+            "action": "short",
+            "execution_reason": "已进入本轮开仓候选排序",
+            "created_at": generated_at,
+            "updated_at": generated_at,
+            "stale_entry_raw__expected_net_return_pct": 1.2,
+            "stale_entry_raw__valid_for_seconds": 14_400.0,
+            "stale_entry_raw__opportunity_generated_at": generated_at.isoformat(),
+        }
+    )
+
+    async def order_count_provider(_decision_id: int) -> int:
+        return 0
+
+    expirer = StaleEntryCandidateExpirer(_float)
+    expired = await expirer.expire_rows(
+        [row],
+        [],
+        now=generated_at + timedelta(minutes=1),
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 0
+    assert row.execution_reason == "已进入本轮开仓候选排序"
+    assert row.raw_llm_response["opportunity_score"]["policy_provenance"] == {
+        "valid_for_seconds": 14_400.0,
+        "generated_at": generated_at.isoformat(),
+    }
+
+    expired = await expirer.expire_rows(
+        [row],
+        [],
+        now=generated_at + timedelta(minutes=241),
+        order_count_provider=order_count_provider,
+    )
+
+    assert expired == 1
+    assert "14400 秒预测周期" in row.execution_reason
+
+
+@pytest.mark.asyncio
 async def test_stale_entry_expirer_repairs_old_expired_reason_with_pending_state() -> None:
     raw = append_decision_stage(
         {
