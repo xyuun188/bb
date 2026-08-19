@@ -524,6 +524,14 @@ class OKXExecutor(AbstractExecutor):
                         "OKX SDK temporary system error exhausted retry budget",
                         error=message,
                     )
+                elif self._is_instrument_capability_rejection(error_code, message):
+                    if private_api_call:
+                        self._record_private_api_available()
+                    logger.info(
+                        "OKX SDK instrument capability rejection",
+                        method=method_name,
+                        error_code=error_code,
+                    )
                 else:
                     if private_api_call:
                         self._record_private_api_available()
@@ -652,6 +660,26 @@ class OKXExecutor(AbstractExecutor):
                 mode=self.executor_mode,
             )
 
+    def private_api_circuit_status(self) -> dict[str, Any]:
+        """Expose shared outage state so optional background work can defer."""
+
+        now = time.monotonic()
+        retry_after_seconds = max(self._private_api_circuit_open_until - now, 0.0)
+        if retry_after_seconds > 0:
+            state = "open"
+        elif self._private_api_circuit_probe_in_flight:
+            state = "half_open_probe_in_flight"
+        elif self._private_api_circuit_open_until > 0:
+            state = "half_open_ready"
+        else:
+            state = "closed"
+        return {
+            "state": state,
+            "background_calls_allowed": state in {"closed", "half_open_ready"},
+            "retry_after_seconds": round(retry_after_seconds, 3),
+            "failure_count": int(self._private_api_circuit_failure_count),
+        }
+
     @staticmethod
     def _exchange_error_code(exc: BaseException, message: str = "") -> str:
         code = str(getattr(exc, "code", "") or "").strip()
@@ -659,6 +687,19 @@ class OKXExecutor(AbstractExecutor):
             return code
         match = re.search(r"\[(\d{5})\]", str(message or ""))
         return match.group(1) if match else ""
+
+    @staticmethod
+    def _is_instrument_capability_rejection(error_code: str | None, message: str) -> bool:
+        code = str(error_code or "").strip()
+        text = str(message or "").lower()
+        return code in {"51001", "52000"} or any(
+            marker in text
+            for marker in (
+                "instrument id doesn't exist",
+                "instrument id, instrument id code",
+                "no market data available",
+            )
+        )
 
     @staticmethod
     def _is_rate_limit_error(message: Any) -> bool:

@@ -281,6 +281,7 @@ MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
+MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
@@ -1253,7 +1254,9 @@ class TradingService:
         target_symbols = min(max(requested_symbols, 1), 8)
         per_symbol_floor = max(
             24.0,
-            min(self.market_symbol_total_budget_seconds(), interval),
+            interval,
+            self.market_symbol_minimum_start_budget_seconds()
+            + MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS,
         )
         market_budget = (
             max(base_budget, target_symbols * per_symbol_floor)
@@ -1263,6 +1266,16 @@ class TradingService:
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
         return min(market_budget, watchdog_ceiling)
 
+    def market_symbol_minimum_start_budget_seconds(self) -> float:
+        """Reserve context, viable inference, and persistence for one symbol."""
+
+        return round(
+            self.market_symbol_context_timeout_seconds()
+            + MARKET_SYMBOL_ANALYSIS_MIN_SECONDS
+            + MARKET_MODEL_COMPLETION_RESERVE_SECONDS,
+            3,
+        )
+
     def market_symbol_start_reserve_seconds(
         self,
         strategy_context: dict[str, Any] | None = None,
@@ -1270,18 +1283,12 @@ class TradingService:
     ) -> float:
         """Return remaining time needed before starting another market AI symbol."""
 
-        settings.refresh_runtime_env()
-        interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        model_reserve = max(
-            MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
-            min(self.market_symbol_total_budget_seconds(), 45.0),
-        )
         budget_seconds = self.market_round_time_budget_seconds(
             strategy_context=strategy_context,
             market_symbol_count=market_symbol_count,
         )
         return round(
-            min(max(model_reserve, interval * 0.20), max(6.0, budget_seconds * 0.45)),
+            min(self.market_symbol_minimum_start_budget_seconds(), budget_seconds),
             3,
         )
 
@@ -2339,6 +2346,7 @@ class TradingService:
                     limit=100,
                     max_pages=5,
                     timeout_seconds=8.0,
+                    executor_provider=self._get_okx_executor_for_mode,
                 ).sync_once()
                 if not isinstance(row, dict):
                     row = {
@@ -3367,6 +3375,13 @@ class TradingService:
         strategy_context: dict[str, Any] | None = None,
         market_symbol_count: int | None = None,
     ) -> bool:
+        if market_symbol_count is None:
+            return self._round_elapsed_seconds(
+                market_ai_started_at
+            ) >= self.market_round_time_budget_seconds(
+                strategy_context=strategy_context,
+                market_symbol_count=market_symbol_count,
+            )
         return (
             self._market_ai_budget_defer_reason(
                 market_ai_started_at,
@@ -7328,6 +7343,10 @@ class TradingService:
             "market_ai_elapsed_seconds_before_symbol": round(market_ai_elapsed_seconds, 3),
             "market_round_time_budget_seconds": round(budget_seconds, 3),
             "market_symbol_start_reserve_seconds": round(start_reserve_seconds, 3),
+            "market_symbol_minimum_start_budget_seconds": round(
+                self.market_symbol_minimum_start_budget_seconds(),
+                3,
+            ),
             "remaining_market_ai_budget_seconds": round(remaining_budget_seconds, 3),
             "can_start_another_market_symbol": bool(
                 remaining_budget_seconds >= start_reserve_seconds

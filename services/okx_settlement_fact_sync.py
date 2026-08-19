@@ -8,7 +8,7 @@ private endpoints.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,6 +41,7 @@ DEFAULT_SETTLEMENT_FACT_MAX_PAGES = 5
 DEFAULT_SETTLEMENT_FACT_TIMEOUT_SECONDS = 8.0
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
+ExecutorProvider = Callable[[str], Awaitable[OKXExecutor]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +108,7 @@ class OkxSettlementFactSyncService:
         max_pages: int = DEFAULT_SETTLEMENT_FACT_MAX_PAGES,
         timeout_seconds: float = DEFAULT_SETTLEMENT_FACT_TIMEOUT_SECONDS,
         executor_factory: Any | None = None,
+        executor_provider: ExecutorProvider | None = None,
         session_context_factory: SessionContextFactory = get_session_ctx,
     ) -> None:
         self.mode = "live" if str(mode or "").lower() == "live" else "paper"
@@ -115,13 +117,19 @@ class OkxSettlementFactSyncService:
         self.max_pages = max(1, min(int(max_pages or DEFAULT_SETTLEMENT_FACT_MAX_PAGES), 20))
         self.timeout_seconds = max(1.0, float(timeout_seconds or 1.0))
         self.executor_factory = executor_factory or OKXExecutor
+        self.executor_provider = executor_provider
         self.session_context_factory = session_context_factory
 
     async def sync_once(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         since = started_at - timedelta(hours=self.lookback_hours)
         deadline = asyncio.get_running_loop().time() + self.timeout_seconds
-        executor = self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
+        owns_executor = self.executor_provider is None
+        executor = (
+            self.executor_factory(mode=self.mode, load_markets_on_initialize=False)
+            if owns_executor
+            else await self.executor_provider(self.mode)
+        )
         completed_stages: list[str] = []
         deferred_stages: list[str] = []
         stage_errors: list[str] = []
@@ -129,6 +137,7 @@ class OkxSettlementFactSyncService:
         account_bills: list[OkxNativeAccountBill] = []
         contract_specs: dict[str, dict[str, Any]] = {}
         initialized = False
+        private_pull_available = False
 
         async def run_stage(
             stage: str,
@@ -175,12 +184,26 @@ class OkxSettlementFactSyncService:
             return result, True
 
         try:
-            _, initialized = await run_stage(
-                "initialize",
-                executor.initialize,
-                cap_seconds=min(2.0, self.timeout_seconds),
+            if owns_executor:
+                _, initialized = await run_stage(
+                    "initialize",
+                    executor.initialize,
+                    cap_seconds=min(2.0, self.timeout_seconds),
+                )
+            else:
+                initialized = True
+                completed_stages.append("shared_executor_reused")
+            circuit_status_reader = getattr(executor, "private_api_circuit_status", None)
+            circuit_status = (
+                circuit_status_reader()
+                if callable(circuit_status_reader)
+                else {"state": "unsupported", "background_calls_allowed": True}
             )
-            if initialized:
+            if circuit_status.get("background_calls_allowed") is not True:
+                deferred_stages.extend(("position_history", "account_bills"))
+                completed_stages.append("private_api_circuit_deferred")
+            elif initialized:
+                private_pull_available = True
                 native_facts = OkxNativeFactsClient(executor)
                 history_result = await run_stage(
                     "position_history",
@@ -222,13 +245,14 @@ class OkxSettlementFactSyncService:
                     )
                     contract_specs = dict(specs or {})
         finally:
-            try:
-                await asyncio.wait_for(executor.shutdown(), timeout=0.5)
-            except Exception as exc:
-                logger.debug(
-                    "OKX settlement fact executor shutdown failed",
-                    error=safe_error_text(exc, limit=120),
-                )
+            if owns_executor:
+                try:
+                    await asyncio.wait_for(executor.shutdown(), timeout=0.5)
+                except Exception as exc:
+                    logger.debug(
+                        "OKX settlement fact executor shutdown failed",
+                        error=safe_error_text(exc, limit=120),
+                    )
 
         if contract_specs:
             await self._persist_contract_specs(contract_specs, synced_at=started_at)
@@ -279,7 +303,7 @@ class OkxSettlementFactSyncService:
             source="okx_settlement_fact_mirror",
             checked_at=started_at,
             since=since,
-            okx_pull_available=initialized,
+            okx_pull_available=private_pull_available,
             position_history_count=len(history_rows),
             position_history_inserted_count=history_stats["inserted"],
             position_history_updated_count=history_stats["updated"],

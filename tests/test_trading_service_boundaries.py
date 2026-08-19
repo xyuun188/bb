@@ -5854,8 +5854,12 @@ def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
-    reserve_defer_started_at = datetime.now(UTC) - timedelta(seconds=60)
-    exhausted_started_at = datetime.now(UTC) - timedelta(seconds=91)
+    budget_seconds = service.market_round_time_budget_seconds(market_symbol_count=3)
+    reserve_seconds = service.market_symbol_start_reserve_seconds(market_symbol_count=3)
+    reserve_defer_started_at = datetime.now(UTC) - timedelta(
+        seconds=budget_seconds - reserve_seconds + 1.0
+    )
+    exhausted_started_at = datetime.now(UTC) - timedelta(seconds=budget_seconds + 1.0)
 
     assert (
         service._market_ai_budget_defer_reason(
@@ -5994,8 +5998,24 @@ def test_market_round_budget_reserves_full_analysis_time_per_candidate(
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
-    assert service.market_round_time_budget_seconds(market_symbol_count=2) == 60.0
-    assert service.market_round_time_budget_seconds(market_symbol_count=3) == 90.0
+    minimum_start = service.market_symbol_minimum_start_budget_seconds()
+    assert minimum_start == pytest.approx(
+        service.market_symbol_context_timeout_seconds()
+        + trading_service.MARKET_SYMBOL_ANALYSIS_MIN_SECONDS
+        + trading_service.MARKET_MODEL_COMPLETION_RESERVE_SECONDS
+    )
+    per_symbol_budget = (
+        minimum_start + trading_service.MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS
+    )
+    assert service.market_round_time_budget_seconds(market_symbol_count=2) == pytest.approx(
+        per_symbol_budget * 2
+    )
+    assert service.market_round_time_budget_seconds(market_symbol_count=3) == pytest.approx(
+        per_symbol_budget * 3
+    )
+    assert service.market_symbol_start_reserve_seconds(market_symbol_count=3) == pytest.approx(
+        minimum_start
+    )
 
 
 def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(

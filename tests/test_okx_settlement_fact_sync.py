@@ -78,14 +78,30 @@ class _FakeCcxt:
 
 
 class _FakeExecutor:
-    def __init__(self, ccxt: _FakeCcxt) -> None:
+    def __init__(
+        self,
+        ccxt: _FakeCcxt,
+        *,
+        circuit_status: dict[str, Any] | None = None,
+    ) -> None:
         self.ccxt = ccxt
+        self.circuit_status = circuit_status
+        self.initialize_calls = 0
+        self.shutdown_calls = 0
 
     async def initialize(self) -> None:
+        self.initialize_calls += 1
         return None
 
     async def shutdown(self) -> None:
+        self.shutdown_calls += 1
         return None
+
+    def private_api_circuit_status(self) -> dict[str, Any]:
+        return self.circuit_status or {
+            "state": "closed",
+            "background_calls_allowed": True,
+        }
 
     async def _get_ccxt(self) -> _FakeCcxt:
         return self.ccxt
@@ -292,5 +308,104 @@ async def test_settlement_fact_sync_defers_slow_private_pulls_under_one_budget(
         assert report["status"] == "deferred"
         assert {"position_history", "account_bills"} <= set(report["deferred_stages"])
         assert report["stage_errors"] == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_fact_sync_reuses_shared_executor_without_owning_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-shared-executor.db")
+    ccxt = _FakeCcxt(history_rows=[], bills=[])
+    executor = _FakeExecutor(ccxt)
+
+    async def executor_provider(mode: str) -> _FakeExecutor:
+        assert mode == "paper"
+        return executor
+
+    try:
+        report = await OkxSettlementFactSyncService(
+            mode="paper",
+            executor_provider=executor_provider,
+        ).sync_once()
+
+        assert report["status"] == "ok"
+        assert report["okx_pull_available"] is True
+        assert "shared_executor_reused" in report["completed_stages"]
+        assert executor.initialize_calls == 0
+        assert executor.shutdown_calls == 0
+        assert {"position_history", "account_bills"} <= set(ccxt.calls)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_fact_sync_defers_shared_private_work_while_circuit_is_open(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-open-circuit.db")
+    ccxt = _FakeCcxt(history_rows=[], bills=[])
+    executor = _FakeExecutor(
+        ccxt,
+        circuit_status={
+            "state": "open",
+            "background_calls_allowed": False,
+            "retry_after_seconds": 12.0,
+        },
+    )
+
+    async def executor_provider(_mode: str) -> _FakeExecutor:
+        return executor
+
+    try:
+        report = await OkxSettlementFactSyncService(
+            mode="paper",
+            executor_provider=executor_provider,
+        ).sync_once()
+
+        assert report["status"] == "deferred"
+        assert report["okx_pull_available"] is False
+        assert "private_api_circuit_deferred" in report["completed_stages"]
+        assert {"position_history", "account_bills"} <= set(report["deferred_stages"])
+        assert ccxt.calls == []
+        assert executor.initialize_calls == 0
+        assert executor.shutdown_calls == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_fact_sync_allows_shared_half_open_recovery_probe(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-half-open.db")
+    ccxt = _FakeCcxt(history_rows=[], bills=[])
+    executor = _FakeExecutor(
+        ccxt,
+        circuit_status={
+            "state": "half_open_ready",
+            "background_calls_allowed": True,
+            "retry_after_seconds": 0.0,
+        },
+    )
+
+    async def executor_provider(_mode: str) -> _FakeExecutor:
+        return executor
+
+    try:
+        report = await OkxSettlementFactSyncService(
+            mode="paper",
+            executor_provider=executor_provider,
+        ).sync_once()
+
+        assert report["status"] == "ok"
+        assert report["okx_pull_available"] is True
+        assert {"position_history", "account_bills"} <= set(ccxt.calls)
+        assert executor.initialize_calls == 0
+        assert executor.shutdown_calls == 0
     finally:
         await close_db()

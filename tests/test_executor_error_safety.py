@@ -20,6 +20,9 @@ class _FakeLogger:
     def warning(self, message: str, **kwargs: Any) -> None:
         self.events.append(("warning", message, kwargs))
 
+    def info(self, message: str, **kwargs: Any) -> None:
+        self.events.append(("info", message, kwargs))
+
     def debug(self, message: str, **kwargs: Any) -> None:
         self.events.append(("debug", message, kwargs))
 
@@ -1839,6 +1842,43 @@ async def test_okx_expected_instrument_rejection_is_not_logged_as_exchange_error
     assert result["reason"] == "okx_private_entry_instrument_unavailable"
     assert not [event for event in fake_logger.events if event[0] == "error"]
     assert ("debug", "OKX SDK expected capability rejection") == tuple(fake_logger.events[-1][:2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "error_message"),
+    [
+        ("51001", "Instrument ID doesn't exist."),
+        ("52000", "No market data available."),
+    ],
+)
+async def test_okx_instrument_capability_rejection_does_not_pollute_system_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_message: str,
+) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(okx_module, "logger", fake_logger)
+    executor = _executor(object())
+
+    async def rejected_call() -> dict[str, Any]:
+        raise ExchangeAPIError(
+            f"OKX API error [{error_code}]: {error_message}",
+            code=error_code,
+        )
+
+    rejected_call.__name__ = "privateGetAccountPositionsHistory"
+    with pytest.raises(ExchangeAPIError, match=error_code):
+        await executor._with_retry(rejected_call)
+
+    assert not [event for event in fake_logger.events if event[0] == "error"]
+    assert any(
+        level == "info"
+        and message == "OKX SDK instrument capability rejection"
+        and fields["error_code"] == error_code
+        for level, message, fields in fake_logger.events
+    )
+    assert executor.private_api_circuit_status()["state"] == "closed"
 
 
 @pytest.mark.asyncio
