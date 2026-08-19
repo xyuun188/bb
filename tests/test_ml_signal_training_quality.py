@@ -2172,6 +2172,44 @@ async def test_rejected_challenger_contract_and_cursor_prevent_rapid_retraining(
     assert result["training_policy"]["minimum_retraining_interval_elapsed"] is False
 
 
+def test_champion_comparison_rejects_stale_evaluation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = _ml_training_metadata(
+        artifact_persisted=True,
+        ready=False,
+        completed_sample_count=1_000,
+    )
+    metadata["horizons"] = [5, 15, 60, 240]
+    metadata.pop("primary_prediction_horizon_minutes", None)
+    metadata.pop("primary_holdout_horizon_available", None)
+    metadata.pop("holdout_horizon_diagnostics", None)
+    artifact = ResolvedModelArtifact(
+        model_id=LOCAL_ML_MODEL_IDS[0],
+        version="stale-champion-v1",
+        model_path=tmp_path / "model.joblib",
+        metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json",
+        sha256="a" * 64,
+        manifest=metadata,
+        pointer_role="current",
+        pointer_path=tmp_path / "current.json",
+    )
+    monkeypatch.setattr(
+        ml_signal_module,
+        "local_ml_artifact_compatibility_errors",
+        lambda *_args, **_kwargs: [],
+    )
+
+    champion, stage, errors = ml_signal_module._champion_comparison_inputs(artifact)
+
+    assert champion is None
+    assert stage is None
+    assert "primary_prediction_horizon_contract_stale" in errors
+    assert "primary_holdout_horizon_evidence_missing" in errors
+
+
 def test_authoritative_trade_return_evidence_prefers_profit_training_target() -> None:
     sample = _authoritative_trade_sample()
     task = sample["profit_supervision"]["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]

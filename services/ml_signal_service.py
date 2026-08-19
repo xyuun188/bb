@@ -2046,6 +2046,7 @@ def _champion_comparison_inputs(
     manifest = current_artifact.manifest
     eligibility_errors = [
         *local_ml_artifact_compatibility_errors(manifest),
+        *_training_evaluation_contract_errors(manifest),
         *decision_group_partition_errors(manifest.get("decision_group_partition")),
     ]
     if not eligibility_errors:
