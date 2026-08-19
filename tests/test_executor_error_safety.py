@@ -359,6 +359,21 @@ class _FailingEntryInstrumentAvailabilityCcxt(_EntryInstrumentAvailabilityCcxt):
         raise TimeoutError("private leverage transport timed out")
 
 
+class _TemporaryServiceEntryInstrumentAvailabilityCcxt(
+    _EntryInstrumentAvailabilityCcxt
+):
+    async def fetch_leverage(
+        self,
+        symbol: str,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.fetch_leverage_calls.append(symbol)
+        raise ExchangeAPIError(
+            "OKX API error [50001]: Service temporarily unavailable. Please try again later.",
+            code="50001",
+        )
+
+
 class _IncompatibleEntryEnvironmentCcxt(_EntryInstrumentAvailabilityCcxt):
     @staticmethod
     def _instrument(uly: str) -> dict[str, str]:
@@ -1414,6 +1429,56 @@ async def test_okx_temporary_service_circuit_stops_private_request_storm(
 
 
 @pytest.mark.asyncio
+async def test_okx_temporary_service_circuit_tracks_unified_fetch_leverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _TemporaryServiceEntryInstrumentAvailabilityCcxt()
+    executor = _executor(exchange)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+
+    first = await executor.entry_instrument_availability("BTC/USDT")
+    second = await executor.entry_instrument_availability("ETH/USDT")
+
+    assert first["available"] is None
+    assert first["analysis_only"] is True
+    assert first["execution_verified"] is False
+    assert first["reason"] == "okx_private_entry_instrument_temporarily_unverified"
+    assert second["available"] is None
+    assert second["error_code"] == "50001"
+    assert "circuit open" in second["error"]
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "privateGetAccountPositions",
+        "fetch_balance",
+        "fetch_leverage",
+        "fetch_positions",
+        "fetch_open_orders",
+        "fetch_orders",
+        "fetch_order",
+        "fetch_my_trades",
+        "create_order",
+        "cancel_order",
+        "set_leverage",
+    ],
+)
+def test_okx_private_api_classifier_covers_unified_account_methods(
+    method_name: str,
+) -> None:
+    assert OKXExecutor._is_private_api_method(method_name) is True
+
+
+@pytest.mark.parametrize("method_name", ["fetch_ticker", "fetch_order_book", "fetch_ohlcv"])
+def test_okx_private_api_classifier_keeps_public_market_methods_open(
+    method_name: str,
+) -> None:
+    assert OKXExecutor._is_private_api_method(method_name) is False
+
+
+@pytest.mark.asyncio
 async def test_okx_temporary_service_circuit_uses_one_recovery_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1723,7 +1788,9 @@ async def test_okx_entry_instrument_prefilter_does_not_retry_transport_failure()
     exchange = _FailingEntryInstrumentAvailabilityCcxt()
     result = await _executor(exchange).entry_instrument_availability("BTC/USDT")
 
-    assert result["available"] is False
+    assert result["available"] is None
+    assert result["analysis_only"] is True
+    assert result["execution_verified"] is False
     assert result["reason"] == "okx_private_entry_instrument_probe_failed"
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
 

@@ -575,7 +575,21 @@ class OKXExecutor(AbstractExecutor):
     def _is_private_api_method(method_name: str) -> bool:
         """Keep account outages from suppressing independent public market data."""
 
-        return str(method_name or "").lower().startswith("private")
+        normalized = str(method_name or "").strip().lower()
+        if normalized.startswith("private"):
+            return True
+        return normalized in {
+            "cancel_order",
+            "create_order",
+            "fetch_balance",
+            "fetch_leverage",
+            "fetch_my_trades",
+            "fetch_open_orders",
+            "fetch_order",
+            "fetch_orders",
+            "fetch_positions",
+            "set_leverage",
+        }
 
     def _enter_private_api_circuit(self, method_name: str, *, tracked: bool) -> bool:
         """Fail fast during an OKX private outage and elect one recovery probe."""
@@ -6043,11 +6057,14 @@ class OKXExecutor(AbstractExecutor):
             error_text = safe_error_text(exc, limit=220)
             error_code = self._exchange_error_code(exc, error_text)
             unavailable = error_code == "51001" or "[51001]" in error_text
+            temporarily_unverified = error_code == "50001" or "[50001]" in error_text
             result = {
-                "available": False,
+                "available": False if unavailable else None,
                 "reason": (
                     "okx_private_entry_instrument_unavailable"
                     if unavailable
+                    else "okx_private_entry_instrument_temporarily_unverified"
+                    if temporarily_unverified
                     else "okx_private_entry_instrument_probe_failed"
                 ),
                 "source": (
@@ -6064,6 +6081,8 @@ class OKXExecutor(AbstractExecutor):
                 "environment_compatibility": compatibility,
                 "generated_at": generated_at,
                 "cache_hit": False,
+                "analysis_only": not unavailable,
+                "execution_verified": False,
             }
             ttl = (
                 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS

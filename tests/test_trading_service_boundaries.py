@@ -3661,14 +3661,96 @@ async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_c
     )
     elapsed = asyncio.get_running_loop().time() - started
 
-    assert list(selected) == ["BTC/USDT"]
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     assert cleanup_started.is_set()
     assert elapsed < 0.2
     assert service._last_auto_feature_rank_diagnostics["execution_availability"][
         "timeout"
     ] is True
+    diagnostics = service._last_auto_feature_rank_diagnostics["execution_availability"]
+    assert diagnostics["execution_verified_selected_count"] == 1
+    assert diagnostics["analysis_only_selected_count"] == 1
     release_cleanup.set()
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only() -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 3,
+        "ranked_symbol_sample": [
+            {"symbol": symbol, "selected": True}
+            for symbol in ("BTC/USDT", "PI/USDT", "ETH/USDT")
+        ],
+    }
+
+    class FakeExecutor:
+        async def entry_instrument_availability_shortlist(
+            self,
+            symbols: list[str],
+            *,
+            target_count: int,
+            concurrency: int,
+        ) -> dict[str, Any]:
+            assert target_count == 2
+            assert concurrency == 4
+            return {
+                "selected_symbols": [],
+                "availability": {
+                    "BTC/USDT": {
+                        "available": None,
+                        "analysis_only": True,
+                        "execution_verified": False,
+                        "reason": "okx_private_entry_instrument_temporarily_unverified",
+                        "error_code": "50001",
+                    },
+                    "PI/USDT": {
+                        "available": False,
+                        "reason": "okx_private_entry_instrument_unavailable",
+                        "error_code": "51001",
+                    },
+                    "ETH/USDT": {
+                        "available": None,
+                        "analysis_only": True,
+                        "execution_verified": False,
+                        "reason": "okx_private_entry_instrument_temporarily_unverified",
+                        "error_code": "50001",
+                    },
+                },
+                "evaluated_count": len(symbols),
+                "probed_count": 1,
+                "cache_hit_count": 0,
+                "skipped_after_target_count": 0,
+            }
+
+    async def executor_provider(_mode: str) -> FakeExecutor:
+        return FakeExecutor()
+
+    service._get_okx_executor_for_mode = executor_provider
+    selected = await service._filter_entry_instrument_shortlist(
+        {
+            "BTC/USDT": object(),
+            "PI/USDT": object(),
+            "ETH/USDT": object(),
+        },
+        2,
+        "paper",
+    )
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    diagnostics = service._last_auto_feature_rank_diagnostics
+    assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 2
+    assert diagnostics["execution_availability"]["execution_verified_selected_count"] == 0
+    ranked = {item["symbol"]: item for item in diagnostics["ranked_symbol_sample"]}
+    assert ranked["BTC/USDT"]["analysis_only"] is True
+    assert ranked["BTC/USDT"]["execution_candidate_state"] == (
+        "analysis_only_execution_unverified"
+    )
+    assert ranked["PI/USDT"]["selected"] is False
+    assert ranked["PI/USDT"]["non_selected_reason"] == (
+        "execution_instrument_unavailable"
+    )
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():

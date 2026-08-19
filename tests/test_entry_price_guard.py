@@ -212,6 +212,29 @@ async def test_pre_order_execution_facts_replace_market_and_fee_snapshot() -> No
 
 
 @pytest.mark.asyncio
+async def test_analysis_only_execution_facts_cannot_submit_even_paper_entry() -> None:
+    async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
+        return {
+            "production_eligible": False,
+            "reason": "okx_private_entry_instrument_temporarily_unverified",
+            "inst_id": "BTC-USDT-SWAP",
+            "feature_snapshot": {"current_price": 100.1},
+        }
+
+    policy = EntryPriceGuardPolicy(
+        fresh_feature_provider=lambda _symbol: {"current_price": 100.0},
+        market_data_quality_reason_provider=lambda _snapshot, **_kwargs: None,
+        decision_age_seconds_provider=lambda _decision: 12.0,
+        pre_order_execution_facts_provider=execution_facts,
+    )
+
+    reason = await policy.guard_reason(_decision(), "paper")
+
+    assert "execution facts are incomplete" in reason
+    assert "temporarily_unverified" in reason
+
+
+@pytest.mark.asyncio
 async def test_repeated_guard_keeps_original_analysis_price_as_immutable_basis() -> None:
     calls = {"quality": 0}
 

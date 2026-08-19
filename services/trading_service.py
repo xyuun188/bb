@@ -6981,13 +6981,30 @@ class TradingService:
         else:
             shortlist = next(iter(done)).result()
         availability = self._safe_dict(shortlist.get("availability"))
+        execution_blocked_reasons = {
+            "okx_private_entry_instrument_unavailable",
+            "okx_entry_live_execution_environment_incompatible",
+        }
+
+        def candidate_state(symbol: str) -> str:
+            facts = self._safe_dict(availability.get(symbol))
+            if facts.get("available") is True:
+                return "execution_verified"
+            if (
+                str(facts.get("error_code") or "") == "51001"
+                or str(facts.get("reason") or "") in execution_blocked_reasons
+            ):
+                return "execution_unavailable"
+            return "analysis_only_execution_unverified"
+
         selected_order = [
             str(symbol)
-            for symbol in (shortlist.get("selected_symbols") or [])
-            if str(symbol) in feature_vectors
-        ]
+            for symbol in feature_vectors
+            if candidate_state(str(symbol)) != "execution_unavailable"
+        ][:target]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
+        selected_states = {symbol: candidate_state(symbol) for symbol in selected_order}
         for symbol, facts in availability.items():
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:
@@ -7013,6 +7030,16 @@ class TradingService:
             for symbol, facts in availability.items()
             if self._safe_dict(facts).get("available") is False
         ]
+        analysis_only = [
+            {
+                "symbol": symbol,
+                "reason": self._safe_dict(facts).get("reason"),
+                "error_code": self._safe_dict(facts).get("error_code"),
+                "cache_hit": self._safe_dict(facts).get("cache_hit"),
+            }
+            for symbol, facts in availability.items()
+            if candidate_state(str(symbol)) == "analysis_only_execution_unverified"
+        ]
         diagnostics = self._safe_dict(getattr(self, "_last_auto_feature_rank_diagnostics", None))
         diagnostics["execution_availability"] = {
             "source": "okx_private_account_and_live_execution_environment",
@@ -7025,9 +7052,17 @@ class TradingService:
             "available_count": sum(
                 self._safe_dict(facts).get("available") is True for facts in availability.values()
             ),
+            "execution_verified_selected_count": sum(
+                state == "execution_verified" for state in selected_states.values()
+            ),
+            "analysis_only_selected_count": sum(
+                state == "analysis_only_execution_unverified"
+                for state in selected_states.values()
+            ),
             "selected_count": len(selected),
             "target_count": target,
             "unavailable": unavailable,
+            "analysis_only_execution_unverified": analysis_only,
         }
         diagnostics["selected_before_execution_availability"] = int(
             diagnostics.get("selected") or len(feature_vectors)
@@ -7043,8 +7078,12 @@ class TradingService:
                 facts = self._safe_dict(availability.get(symbol))
                 item["execution_instrument_available"] = facts.get("available") is True
                 item["execution_instrument_reason"] = facts.get("reason")
+                item["execution_candidate_state"] = candidate_state(symbol)
+                item["analysis_only"] = (
+                    candidate_state(symbol) == "analysis_only_execution_unverified"
+                )
                 item["selected"] = symbol in selected_symbols
-                if facts.get("available") is False:
+                if candidate_state(symbol) == "execution_unavailable":
                     item["non_selected_reason"] = "execution_instrument_unavailable"
         diagnostics["symbols"] = [
             item
