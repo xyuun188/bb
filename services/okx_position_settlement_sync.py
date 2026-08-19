@@ -62,6 +62,8 @@ SUPERSEDED_POSITION_REASONS = frozenset(
 )
 SETTLEMENT_STATUS_QUARANTINED = "settlement_quarantined"
 SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"
+SETTLEMENT_LIFECYCLE_OPEN_SOURCE = "okx_position_lifecycle_still_open"
+SETTLEMENT_LIFECYCLE_OPEN_REASON = "position_lifecycle_still_open"
 NON_RETRYABLE_SETTLEMENT_STATUSES = frozenset(
     {SUPERSEDED_POSITION_STATUS}
 )
@@ -186,6 +188,7 @@ class OkxPositionSettlementSyncService:
                 position_history_rows=position_history_rows,
             )
             if isinstance(result, SettlementSuccess):
+                _claim_history_row_for_position(result.row, candidate.position_id)
                 changed, outcome_change = await self._apply_success(
                     candidate,
                     result,
@@ -276,6 +279,18 @@ class OkxPositionSettlementSyncService:
     async def _load_candidates(self, now: datetime) -> list[SettlementCandidate]:
         since = now - timedelta(hours=self.lookback_hours)
         async with self.session_context_factory() as session:
+            open_pos_ids_result = await session.execute(
+                select(Position.okx_pos_id).where(
+                    Position.execution_mode == self.mode,
+                    Position.is_open.is_(True),
+                    Position.okx_pos_id.is_not(None),
+                )
+            )
+            open_pos_ids = {
+                str(value or "").strip()
+                for value in open_pos_ids_result.scalars().all()
+                if str(value or "").strip()
+            }
             result = await session.execute(
                 select(Position)
                 .where(
@@ -301,6 +316,11 @@ class OkxPositionSettlementSyncService:
                 if is_final_settlement_status(getattr(row, "settlement_status", None)):
                     continue
                 if _is_non_retryable_settlement_status(row):
+                    continue
+                okx_pos_id = str(getattr(row, "okx_pos_id", "") or "").strip()
+                if okx_pos_id and okx_pos_id in open_pos_ids:
+                    _mark_lifecycle_still_open(row, raw, now=now)
+                    restored_superseded = True
                     continue
                 if _retry_after(raw, now):
                     continue
@@ -801,6 +821,9 @@ def _match_position_history_row(
         if row_inst_id and row_inst_id != inst_id:
             continue
         row_pos_id = _position_history_pos_id(row)
+        linked_position_ids = _history_row_position_ids(row)
+        if linked_position_ids and str(candidate.position_id) not in linked_position_ids:
+            continue
         row_side = _position_history_side(row)
         if candidate.okx_pos_id and row_pos_id and row_pos_id != candidate.okx_pos_id:
             continue
@@ -963,6 +986,61 @@ def _restore_superseded_position_status(
         "superseded_status_restored_at": now.isoformat(),
     }
     position.updated_at = now
+
+
+def _mark_lifecycle_still_open(
+    position: Position,
+    raw: dict[str, Any],
+    *,
+    now: datetime,
+) -> None:
+    """Keep a partial local close pending while its OKX posId remains open.
+
+    OKX uses one posId for a position lifecycle, including partial closes.  A
+    closed local child therefore cannot be finalized or quarantined while the
+    exchange still reports that lifecycle as open.
+    """
+
+    previous_status = str(getattr(position, "settlement_status", "") or "")
+    previous_source = str(getattr(position, "settlement_source", "") or "")
+    next_retry_at = now + timedelta(seconds=POSITION_HISTORY_QUARANTINE_RETRY_SECONDS)
+    position.settlement_status = "settling"
+    position.settlement_source = SETTLEMENT_LIFECYCLE_OPEN_SOURCE
+    position.settlement_synced_at = now
+    position.settlement_raw = {
+        **raw,
+        "status": "settling",
+        "source": SETTLEMENT_LIFECYCLE_OPEN_SOURCE,
+        "reason": SETTLEMENT_LIFECYCLE_OPEN_REASON,
+        "previous_settlement_status": previous_status,
+        "previous_settlement_source": previous_source,
+        "lifecycle_open_checked_at": now.isoformat(),
+        "next_settlement_retry_at": next_retry_at.isoformat(),
+        "retry_policy": (
+            "wait for OKX official lifecycle settlement while the same posId "
+            f"remains open; retry every {POSITION_HISTORY_QUARANTINE_RETRY_SECONDS:g}s"
+        ),
+    }
+    position.updated_at = now
+
+
+def _claim_history_row_for_position(row: dict[str, Any], position_id: int) -> None:
+    """Reserve one official history row for one local lifecycle projection."""
+
+    if not isinstance(row, dict) or int(position_id or 0) <= 0:
+        return
+    linked = _history_row_position_ids(row)
+    linked.add(str(int(position_id)))
+    row["_dashboard_position_ids"] = sorted(linked)
+
+
+def _history_row_position_ids(row: dict[str, Any]) -> set[str]:
+    values = row.get("_dashboard_position_ids")
+    if values is None:
+        values = row.get("position_ids")
+    if isinstance(values, (list, tuple, set)):
+        return {str(value).strip() for value in values if str(value).strip()}
+    return _split_exchange_order_ids(values)
 
 
 def _first_present_float(row: dict[str, Any], keys: tuple[str, ...]) -> tuple[float, str | None]:

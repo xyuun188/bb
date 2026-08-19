@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,12 +14,16 @@ from services.okx_position_settlement_sync import (
     DUPLICATE_CLOSED_POSITION_REASON,
     POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
     POSITION_HISTORY_QUARANTINE_RETRY_SECONDS,
+    SETTLEMENT_LIFECYCLE_OPEN_REASON,
+    SETTLEMENT_LIFECYCLE_OPEN_SOURCE,
     SETTLEMENT_QUARANTINE_SOURCE,
     SETTLEMENT_STATUS_QUARANTINED,
     SUPERSEDED_POSITION_STATUS,
     OkxPositionSettlementSyncService,
     SettlementCandidate,
     SettlementFailure,
+    _claim_history_row_for_position,
+    _match_position_history_row,
 )
 
 
@@ -529,3 +534,138 @@ async def test_position_settlement_recovers_quarantined_position_when_official_r
         assert position.realized_pnl == pytest.approx(4.09)
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_open_okx_lifecycle_keeps_closed_child_settling_instead_of_quarantine(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-open-lifecycle.db")
+    now = datetime.now(UTC)
+    closed_at = now - timedelta(hours=8)
+    try:
+        position_id = await _seed_closed_position(
+            closed_at,
+            settlement_status=SETTLEMENT_STATUS_QUARANTINED,
+            settlement_source=SETTLEMENT_QUARANTINE_SOURCE,
+            settlement_raw={
+                "settlement_attempt_count": POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
+                "quarantine_reason": "official_position_history_identity_unresolved",
+            },
+        )
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="rule_strategy",
+                    execution_mode="paper",
+                    symbol="ADA/USDT",
+                    side="long",
+                    quantity=50.0,
+                    entry_price=0.6,
+                    current_price=0.64,
+                    leverage=1.0,
+                    is_open=True,
+                    created_at=closed_at - timedelta(minutes=20),
+                    okx_inst_id="ADA-USDT-SWAP",
+                    okx_pos_id="ada-pos-1",
+                    entry_exchange_order_id="entry-1",
+                )
+            )
+            await session.flush()
+
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(now)
+
+        assert candidates == []
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+        assert position is not None
+        assert position.settlement_status == "settling"
+        assert position.settlement_source == SETTLEMENT_LIFECYCLE_OPEN_SOURCE
+        assert position.settlement_raw["reason"] == SETTLEMENT_LIFECYCLE_OPEN_REASON
+        assert position.settlement_raw["previous_settlement_status"] == (
+            SETTLEMENT_STATUS_QUARANTINED
+        )
+        assert "next_settlement_retry_at" in position.settlement_raw
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_different_open_okx_pos_id_does_not_block_closed_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-different-open-lifecycle.db")
+    now = datetime.now(UTC)
+    try:
+        position_id = await _seed_closed_position(now)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="rule_strategy",
+                    execution_mode="paper",
+                    symbol="ADA/USDT",
+                    side="long",
+                    quantity=50.0,
+                    entry_price=0.6,
+                    current_price=0.64,
+                    leverage=1.0,
+                    is_open=True,
+                    created_at=now - timedelta(minutes=20),
+                    okx_inst_id="ADA-USDT-SWAP",
+                    okx_pos_id="different-pos-id",
+                    entry_exchange_order_id="entry-2",
+                )
+            )
+            await session.flush()
+
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(
+            now + timedelta(minutes=1)
+        )
+
+        assert [candidate.position_id for candidate in candidates] == [position_id]
+    finally:
+        await close_db()
+
+
+def test_official_history_row_is_not_reused_by_another_local_position() -> None:
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "instId": "ADA-USDT-SWAP",
+            "posId": "ada-pos-1",
+            "posSide": "long",
+            "cTime": _ms(now - timedelta(minutes=20)),
+            "uTime": _ms(now),
+            "realizedPnl": "4.09",
+        }
+    ]
+    first = SettlementCandidate(
+        position_id=101,
+        symbol="ADA/USDT",
+        side="long",
+        quantity=50.0,
+        entry_price=0.6,
+        current_price=0.64,
+        leverage=1.0,
+        entry_fee=0.05,
+        close_fee=0.06,
+        okx_inst_id="ADA-USDT-SWAP",
+        okx_pos_id="ada-pos-1",
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id="close-1",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now,
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    second = replace(first, position_id=102)
+
+    matched = _match_position_history_row(first, rows, inst_id="ADA-USDT-SWAP")
+    assert not isinstance(matched, SettlementFailure)
+    _claim_history_row_for_position(matched[0], first.position_id)
+
+    reused = _match_position_history_row(second, rows, inst_id="ADA-USDT-SWAP")
+    assert isinstance(reused, SettlementFailure)
+    assert reused.code == "positions_history_no_matching_row"
