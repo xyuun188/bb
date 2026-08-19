@@ -444,6 +444,48 @@ async def test_trade_order_log_service_persists_native_full_close_pending_backfi
 
 
 @pytest.mark.asyncio
+async def test_trade_order_log_service_persists_regular_exit_fill_pending_backfill() -> None:
+    repo = FakeTradeRepo()
+    result = ExecutionResult(
+        order_id="3846095810174091264",
+        exchange_order_id="3846095810174091264",
+        symbol="ETH/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.081,
+        price=1919.69,
+        status=OrderStatus.PARTIAL,
+        timestamp=datetime(2026, 8, 19, 7, 36, tzinfo=UTC),
+        raw_response={
+            "exit_tracking": True,
+            "requires_okx_fill_backfill": True,
+            "fill_confirmation_basis": "okx_position_delta_pending_order_fill",
+            "filled_contracts": 0.81,
+            "contract_size": 0.1,
+            "base_quantity": 0.081,
+            "position_contracts_before": 5.29,
+            "position_contracts_after": 4.48,
+            "remaining_contracts": 4.48,
+            "okx_symbol": "ETH-USDT-SWAP",
+        },
+    )
+    decision = _decision()
+    decision.symbol = "ETH/USDT"
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda _model_name: "paper",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", decision, decision_id=360058)
+
+    assert repo.orders[0]["exchange_order_id"] == "3846095810174091264"
+    assert repo.orders[0]["status"] == "partial"
+    assert repo.orders[0]["okx_sync_status"] == "okx_exit_fill_pending_backfill"
+    assert repo.orders[0]["okx_raw_fills"]["requires_okx_fill_backfill"] is True
+
+
+@pytest.mark.asyncio
 async def test_trade_order_log_service_persists_native_full_close_with_real_fill_order_id() -> (
     None
 ):

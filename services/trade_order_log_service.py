@@ -21,10 +21,12 @@ from db.session import get_session_ctx
 from executor.base_executor import OrderStatus
 from services.execution_result_classifier import (
     is_confirmed_native_full_close_result,
+    is_exit_fill_backfill_pending_result,
     is_native_full_close_backfill_pending_result,
 )
 
 OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
+OKX_SYNC_EXIT_FILL_BACKFILL_PENDING = "okx_exit_fill_pending_backfill"
 
 logger = structlog.get_logger(__name__)
 
@@ -117,7 +119,7 @@ class TradeOrderLogService:
         if status_text in exchange_confirmed_statuses:
             exchange_order_id = str(getattr(result, "exchange_order_id", "") or "").strip()
             if not exchange_order_id or exchange_order_id in {"hold", "rejected", "no_position"}:
-                return not is_native_full_close_backfill_pending_result(result)
+                return not is_exit_fill_backfill_pending_result(result)
         if quantity <= 0 and status_text in active_or_filled:
             return True
         return price <= 0 and status_text in active_or_filled
@@ -259,8 +261,9 @@ class TradeOrderLogService:
 
     @staticmethod
     def _okx_native_backfill_payload(result: Any, raw: dict[str, Any]) -> dict[str, Any]:
-        if not is_native_full_close_backfill_pending_result(result):
+        if not is_exit_fill_backfill_pending_result(result):
             return {}
+        native_full_close = is_native_full_close_backfill_pending_result(result)
         inst_id = okx_inst_id_from_payload(raw, fallback=getattr(result, "symbol", None))
         contracts = TradeOrderLogService._safe_float(raw.get("filled_contracts"), 0.0)
         contract_size = TradeOrderLogService._safe_float(raw.get("contract_size"), 0.0)
@@ -274,10 +277,14 @@ class TradeOrderLogService:
             else None
         )
         raw_fact = {
-            "source": OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+            "source": (
+                OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+                if native_full_close
+                else OKX_SYNC_EXIT_FILL_BACKFILL_PENDING
+            ),
             "fills_history_confirmed": False,
             "requires_okx_fill_backfill": True,
-            "order_id": None,
+            "order_id": str(getattr(result, "exchange_order_id", "") or "").strip() or None,
             "inst_id": inst_id,
             "contracts": contracts,
             "contract_size": contract_size or None,
@@ -297,7 +304,11 @@ class TradeOrderLogService:
             "okx_fill_contracts": contracts or None,
             "okx_fill_pnl": None,
             "okx_state": "fill_backfill_pending",
-            "okx_sync_status": OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+            "okx_sync_status": (
+                OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+                if native_full_close
+                else OKX_SYNC_EXIT_FILL_BACKFILL_PENDING
+            ),
             "okx_raw_fills": raw_fact,
         }
         return payload

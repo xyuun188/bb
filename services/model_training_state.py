@@ -522,6 +522,8 @@ class ModelTrainingStateStore:
                         "retry_count": retry_count + 1 if failed else 0,
                     }
                 )
+                if trained:
+                    row["last_successful_training_at"] = _iso(now)
                 cursor = {
                     "shadow": summary.get("last_trained_completed_shadow_sample_count")
                     or summary.get("last_trained_completed_sample_count")

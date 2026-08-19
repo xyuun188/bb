@@ -321,6 +321,26 @@ def test_native_full_close_backfill_pending_counts_as_exit_progress() -> None:
     assert "待回填平仓" in policy.reason_from_result(result)
 
 
+def test_regular_exit_position_delta_pending_backfill_is_progress_not_confirmation() -> None:
+    policy = ExecutionResultClassifier()
+    result = _result(
+        OrderStatus.PARTIAL,
+        exchange_order_id="3846095810174091264",
+        quantity=0.081,
+        raw_response={
+            "exit_tracking": True,
+            "requires_okx_fill_backfill": True,
+            "position_contracts_before": 5.29,
+            "position_contracts_after": 4.48,
+            "remaining_contracts": 4.48,
+            "filled_contracts": 0.81,
+        },
+    )
+
+    assert policy.is_exchange_confirmed_execution(result) is False
+    assert policy.is_exit_progress_execution(result) is True
+
+
 def test_exit_progress_requires_tracking_partial_and_order_id() -> None:
     policy = ExecutionResultClassifier()
 

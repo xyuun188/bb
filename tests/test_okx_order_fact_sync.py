@@ -34,7 +34,9 @@ from services.okx_native_facts import (
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+    OKX_SYNC_EXIT_FILL_BACKFILL_PENDING,
     OKX_SYNC_ORDER_DETAIL_CONFIRMED,
+    OKX_SYNC_UNVERIFIED,
     OkxOrderFactSyncService,
     _build_contract_size_catalog,
     _configure_order_fact_write_transaction,
@@ -1877,6 +1879,185 @@ def test_authoritative_stored_fill_is_repaired_before_decision_recovery() -> Non
     assert "recovered_from_decision" not in order.okx_raw_fills
 
 
+def test_exit_position_delta_with_zero_ack_fill_stays_unverified() -> None:
+    now = datetime.now(UTC)
+    order_id = "3846095810174091264"
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ETH/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.081,
+        price=1919.69,
+        status="filled",
+        decision_id=360058,
+        exchange_order_id=order_id,
+        okx_sync_status="okx_unverified",
+        okx_raw_fills={"fills_history_confirmed": False},
+        created_at=now,
+        filled_at=now,
+    )
+    decision = SimpleNamespace(
+        id=360058,
+        raw_llm_response={
+            "execution_result": {
+                "source": "exchange_confirmed",
+                "exchange_confirmed": True,
+                "status": "filled",
+                "exchange_order_id": order_id,
+                "quantity": 0.081,
+                "price": 1919.69,
+                "raw_response": {
+                    "id": order_id,
+                    "symbol": "ETH-USDT-SWAP",
+                    "filled": 0.0,
+                    "filled_contracts": 0.81,
+                    "exit_tracking": True,
+                    "position_contracts_before": 5.29,
+                    "position_contracts_after": 4.48,
+                    "info": {
+                        "ordId": order_id,
+                        "instId": "ETH-USDT-SWAP",
+                        "accFillSz": "0",
+                        "avgPx": "",
+                    },
+                },
+            }
+        },
+    )
+
+    confirmed, unverified, skipped, deferred, samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        [order],
+        fills=[],
+        fills_by_order_id={},
+        order_rows_by_id={},
+        protection_execution_by_order_id={},
+        contract_sizes={"ETH-USDT-SWAP": 0.1},
+        decisions_by_id={360058: decision},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids={order_id},
+    )
+
+    assert (confirmed, unverified, skipped, deferred) == (0, 1, 0, 0)
+    assert samples[0]["kind"] == "local_filled_unverified"
+    assert order.okx_sync_status == OKX_SYNC_UNVERIFIED
+    assert order.okx_fill_contracts is None
+    assert order.quantity == pytest.approx(0.081)
+    assert "confirmation_basis" not in (order.okx_raw_fills or {})
+
+
+def test_regular_exit_fill_pending_state_is_preserved_until_okx_fact_arrives() -> None:
+    now = datetime.now(UTC)
+    order_id = "3846095810174091264"
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ETH/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.081,
+        price=1919.69,
+        status="partial",
+        exchange_order_id=order_id,
+        okx_sync_status=OKX_SYNC_EXIT_FILL_BACKFILL_PENDING,
+        okx_raw_fills={
+            "source": OKX_SYNC_EXIT_FILL_BACKFILL_PENDING,
+            "requires_okx_fill_backfill": True,
+            "fills_history_confirmed": False,
+            "order_id": order_id,
+            "inst_id": "ETH-USDT-SWAP",
+            "contracts": 0.81,
+            "base_quantity": 0.081,
+            "avg_price": 1919.69,
+            "position_contracts_before": 5.29,
+            "position_contracts_after": 4.48,
+        },
+        created_at=now,
+        filled_at=now,
+    )
+
+    confirmed, unverified, skipped, deferred, samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        [order],
+        fills=[],
+        fills_by_order_id={},
+        order_rows_by_id={},
+        protection_execution_by_order_id={},
+        contract_sizes={"ETH-USDT-SWAP": 0.1},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids={order_id},
+    )
+
+    assert (confirmed, unverified, skipped, deferred) == (0, 0, 0, 0)
+    assert samples[0]["kind"] == "local_exit_fill_backfill_pending"
+    assert order.okx_sync_status == OKX_SYNC_EXIT_FILL_BACKFILL_PENDING
+    assert order.okx_state == "fill_backfill_pending"
+    assert "不会把仓位差伪造成权威成交" in order.okx_last_error
+
+
+def test_unconfirmed_or_unmatched_position_delta_cannot_recover_execution_fact() -> None:
+    now = datetime.now(UTC)
+    order_id = "position-delta-mismatch"
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ETH/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.081,
+        price=1919.69,
+        status="filled",
+        decision_id=99,
+        exchange_order_id=order_id,
+        created_at=now,
+        filled_at=now,
+    )
+    decision = SimpleNamespace(
+        id=99,
+        raw_llm_response={
+            "execution_result": {
+                "exchange_confirmed": True,
+                "status": "filled",
+                "exchange_order_id": order_id,
+                "price": 1919.69,
+                "raw_response": {
+                    "id": order_id,
+                    "symbol": "ETH-USDT-SWAP",
+                    "filled_contracts": 0.81,
+                    "exit_tracking": True,
+                    "position_contracts_before": 5.29,
+                    "position_contracts_after": 4.49,
+                    "info": {"accFillSz": "0", "instId": "ETH-USDT-SWAP"},
+                },
+            }
+        },
+    )
+
+    confirmed, unverified, _skipped, deferred, _samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        [order],
+        fills=[],
+        fills_by_order_id={},
+        order_rows_by_id={},
+        protection_execution_by_order_id={},
+        contract_sizes={"ETH-USDT-SWAP": 0.1},
+        decisions_by_id={99: decision},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids={order_id},
+    )
+
+    assert (confirmed, unverified, deferred) == (0, 1, 0)
+    assert order.okx_sync_status == OKX_SYNC_UNVERIFIED
+
+
 def test_already_verified_stored_fill_is_not_counted_as_missing_contract_size() -> None:
     now = datetime.now(UTC)
     order = Order(
@@ -2657,6 +2838,102 @@ async def test_complete_embedded_okx_order_detail_is_promoted_from_execution_res
         assert report["confirmed_count"] == 1
         assert order.okx_sync_status == OKX_SYNC_ORDER_DETAIL_CONFIRMED
         assert order.okx_raw_fills["source"] == "okx_order_detail"
+        assert order.okx_raw_fills["order_detail_confirmed"] is True
+        assert order.okx_raw_fills["execution_result_confirmed"] is False
+        assert order.okx_raw_fills["fills_history_confirmed"] is False
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_terminal_partial_fill_order_detail_is_authoritative(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "terminal-partial-order-detail.db")
+    now = datetime.now(UTC)
+    order_id = "3846322281048145920"
+    trade_id = "103708280"
+    detail_row = {
+        "state": "canceled",
+        "ordId": order_id,
+        "instId": "YGG-USDT-SWAP",
+        "side": "sell",
+        "tradeId": trade_id,
+        "sz": "33045",
+        "accFillSz": "22569.1",
+        "fillSz": "10475",
+        "avgPx": "0.0194709270639946",
+        "fillPx": "0.0194",
+        "fee": "-0.21972065",
+        "fillTime": _ms(now),
+        "uTime": _ms(now),
+    }
+    ccxt = _FakeCcxt(
+        fills=[],
+        orders=[{**detail_row, "ordType": "market", "cTime": _ms(now)}],
+        instruments=[
+            {
+                "instId": "YGG-USDT-SWAP",
+                "instType": "SWAP",
+                "ctVal": "1",
+                "lotSz": "0.1",
+                "minSz": "0.1",
+            }
+        ],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="YGG/USDT",
+                    side="sell",
+                    order_type="market",
+                    quantity=22569.1,
+                    price=0.0194709270639946,
+                    status="partial",
+                    fee=0.21972065,
+                    exchange_order_id=order_id,
+                    okx_inst_id="YGG-USDT-SWAP",
+                    okx_fill_contracts=22569.1,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    okx_raw_fills={
+                        "source": "okx_execution_result",
+                        "fills_history_confirmed": False,
+                        "execution_result_confirmed": True,
+                        "order_id": order_id,
+                        "trade_ids": [trade_id],
+                        "inst_id": "YGG-USDT-SWAP",
+                        "contracts": 22569.1,
+                        "avg_price": 0.0194709270639946,
+                        "fee_abs": 0.21972065,
+                        "fill_pnl": 0.0,
+                        "contract_size": 1.0,
+                        "contract_size_verified": True,
+                        "contract_size_source": "okx_public_instruments",
+                        "base_quantity": 22569.1,
+                        "rows": [detail_row],
+                    },
+                    created_at=now,
+                    filled_at=now,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=5.0,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert report["unverified_count"] == 0
+        assert report["confirmed_count"] == 1
+        assert order.status == "partial"
+        assert order.okx_sync_status == OKX_SYNC_ORDER_DETAIL_CONFIRMED
         assert order.okx_raw_fills["order_detail_confirmed"] is True
         assert order.okx_raw_fills["execution_result_confirmed"] is False
         assert order.okx_raw_fills["fills_history_confirmed"] is False

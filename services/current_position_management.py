@@ -10,7 +10,7 @@ from typing import Any
 
 from core.symbols import normalize_trading_symbol
 
-CURRENT_POSITION_MANAGEMENT_VERSION = "2026-08-17.current-position-management.v3"
+CURRENT_POSITION_MANAGEMENT_VERSION = "2026-08-19.current-position-management.v4"
 CURRENT_POSITION_MANAGEMENT_KIND = "current_position_takeover"
 ALLOWED_MANAGEMENT_ACTIONS = (
     "hold",
@@ -140,6 +140,20 @@ def build_current_position_management_contract(
     next_funding_time = str(facts.get("next_funding_time") or "").strip() or None
     full_entry_fee = max(_safe_float(facts.get("full_entry_fee_usdt")), 0.0)
     full_entry_notional = max(_safe_float(facts.get("full_entry_notional_usdt")), 0.0)
+    previous_lifecycle_entry_quantity = max(
+        _safe_float(previous.get("lifecycle_entry_quantity")),
+        0.0,
+    )
+    derived_lifecycle_entry_quantity = (
+        full_entry_notional / entry_price
+        if full_entry_notional > 0.0 and entry_price > 0.0
+        else 0.0
+    )
+    lifecycle_entry_quantity = max(
+        quantity,
+        previous_lifecycle_entry_quantity,
+        derived_lifecycle_entry_quantity,
+    )
     stop_loss = max(_safe_float(facts.get("stop_loss_price")), 0.0)
     take_profit = max(_safe_float(facts.get("take_profit_price")), 0.0)
     position_stressed_loss = max(
@@ -317,6 +331,7 @@ def build_current_position_management_contract(
         "symbol": symbol,
         "side": side,
         "quantity": quantity,
+        "lifecycle_entry_quantity": lifecycle_entry_quantity,
         "contracts": contracts,
         "contract_size": contract_size,
         "contract_valuation": contract_valuation,
@@ -394,6 +409,7 @@ def build_current_position_management_contract(
         "symbol": symbol,
         "side": side,
         "quantity": round(quantity, 12),
+        "lifecycle_entry_quantity": round(lifecycle_entry_quantity, 12),
         "contracts": round(contracts, 12),
         "entry_price": round(entry_price, 12),
         "current_price": round(current_price, 12),
@@ -557,6 +573,7 @@ def current_position_management_contract_complete(
         return False
 
     position_quantity = abs(_safe_float(_row_value(position, "quantity", "base_quantity")))
+    lifecycle_entry_quantity = abs(_safe_float(value.get("lifecycle_entry_quantity")))
     position_entry = _safe_float(_row_value(position, "entry_price", "entryPrice"))
     position_fee = max(
         _safe_float(_row_value(position, "entry_fee", "entry_fee_usdt")),
@@ -619,6 +636,7 @@ def current_position_management_contract_complete(
         position_symbol == normalize_trading_symbol(value.get("symbol"))
         and position_side == str(value.get("side") or "").lower()
         and position_quantity > 0
+        and lifecycle_entry_quantity + 1e-12 >= position_quantity
         and position_entry > 0
         and isclose(
             position_quantity,

@@ -10166,6 +10166,8 @@ class TradingService:
                     )
                 )
             training_state_cursor = 0
+            training_state_shadow_cursor = 0
+            training_state_trade_cursor = 0
             training_state_trained_at = None
             state_store = self._model_training_state()
             read_training_state = getattr(state_store, "read", None)
@@ -10181,13 +10183,51 @@ class TradingService:
                             0,
                         ),
                     )
+                    training_state_shadow_cursor = max(
+                        training_state_shadow_cursor,
+                        self._safe_int(
+                            (model_row.get("sample_cursor") or {}).get("shadow"),
+                            0,
+                        ),
+                    )
+                    training_state_trade_cursor = max(
+                        training_state_trade_cursor,
+                        self._safe_int(
+                            (model_row.get("sample_cursor") or {}).get("trade"),
+                            0,
+                        ),
+                    )
                     if model_row.get("sample_cursor"):
-                        finished_at = model_row.get("last_finished_at")
-                        if finished_at and (
+                        succeeded_at = model_row.get("last_successful_training_at")
+                        if not succeeded_at:
+                            succeeded_at = next(
+                                (
+                                    event.get("at")
+                                    for event in reversed(model_row.get("history") or [])
+                                    if isinstance(event, dict)
+                                    and event.get("event") == "succeeded"
+                                    and event.get("at")
+                                ),
+                                None,
+                            )
+                        if succeeded_at and (
                             training_state_trained_at is None
-                            or str(finished_at) > str(training_state_trained_at)
+                            or str(succeeded_at) > str(training_state_trained_at)
                         ):
-                            training_state_trained_at = finished_at
+                            training_state_trained_at = succeeded_at
+            previous_completed_shadow_total = max(
+                previous_completed_shadow_total,
+                training_state_shadow_cursor,
+            )
+            previous_completed_trade_total = max(
+                previous_completed_trade_total,
+                training_state_trade_cursor,
+            )
+            new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
+            new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
+            shadow_training_view_rebased = (
+                completed_shadow_total < previous_completed_shadow_total
+            )
             previous_group_total = max(
                 previous_group_total,
                 training_state_cursor,

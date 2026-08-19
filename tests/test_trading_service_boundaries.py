@@ -3235,6 +3235,86 @@ async def test_local_ai_tools_auto_train_waits_for_independent_group_batch(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_uses_persisted_cumulative_cursors_for_not_due_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+
+    class FakeTrainingState:
+        def read(self) -> dict[str, Any]:
+            return {
+                "models": {
+                    "local_ai_profit_prediction": {
+                        "sample_cursor": {
+                            "shadow": 74555,
+                            "trade": 409,
+                            "decision_group": 21918,
+                        },
+                        "last_finished_at": datetime.now(UTC).isoformat(),
+                        "last_successful_training_at": (
+                            datetime.now(UTC) - timedelta(hours=7)
+                        ).isoformat(),
+                        "history": [
+                            {
+                                "event": "interrupted",
+                                "at": datetime.now(UTC).isoformat(),
+                            }
+                        ],
+                    }
+                }
+            }
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "model_bundle_available": True,
+                "last_trained_completed_shadow_sample_count": 1397,
+                "last_trained_completed_trade_sample_count": 64,
+                "last_trained_completed_training_decision_group_count": 1397,
+                "trained_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            }
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate",
+        lambda: {"allowed": True},
+    )
+    service.local_ai_tools = FakeLocalAITools()
+    service.model_training_state_store = FakeTrainingState()
+    service._run_local_ai_tools_training_cursor_subprocess = lambda: _async_value(  # type: ignore[method-assign]
+        {
+            "reason": "cursor_probe_complete",
+            "completed_shadow_sample_count": 75101,
+            "completed_trade_sample_count": 409,
+            "completed_training_decision_group_count": 22074,
+            "training_distribution_profile": {"features": {}},
+        }
+    )
+
+    async def forbidden_training() -> dict[str, Any]:
+        raise AssertionError("156 new groups are below the scaled batch threshold")
+
+    service._run_local_ai_tools_training_subprocess = forbidden_training  # type: ignore[method-assign]
+
+    result = await service._maybe_train_local_ai_tools_process(force=False)
+
+    assert result["reason"] == "not_due"
+    assert result["last_trained_completed_shadow_sample_count"] == 74555
+    assert result["new_shadow_sample_count"] == 546
+    assert result["last_trained_completed_trade_sample_count"] == 409
+    assert result["new_trade_sample_count"] == 0
+    assert result["last_trained_completed_training_decision_group_count"] == 21918
+    assert result["new_decision_group_count"] == 156
+    assert result["training_policy"]["trigger_contract"][
+        "seconds_since_last_successful_training"
+    ] >= 7 * 60 * 60 - 5
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_auto_train_cools_down_small_drift_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

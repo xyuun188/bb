@@ -100,11 +100,20 @@ async def _read_positions_and_protection():
         positions = await executor.get_positions_strict()
         protection_orders = await executor.get_position_protection_orders()
         pending_orders = await executor.get_open_orders_strict()
+        contract_specs = await executor.get_contract_specs_strict(
+            sorted(
+                {
+                    str(position.get("symbol") or "").strip()
+                    for position in positions
+                    if str(position.get("symbol") or "").strip()
+                }
+            )
+        )
         protection = audit_protection_order_integrity(
             positions,
             protection_orders,
             pending_orders,
-            {},
+            contract_specs,
             pending_snapshot_complete=True,
         )
         protection["available"] = True
@@ -115,6 +124,7 @@ async def _read_positions_and_protection():
             "available": True,
             "count": len(positions),
             "total": len(positions),
+            "contract_specs": contract_specs,
             "protection_inventory": protection,
         }
     finally:
@@ -370,11 +380,17 @@ async def main():
     )
     payload["strategy_learning"] = await _read_stage(
         "strategy_learning",
-        get_strategy_learning(mode="paper", detail="full"),
+        get_strategy_learning(
+            mode="paper",
+            detail=("summary" if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else "full"),
+        ),
     )
     payload["expert_learning"] = await _read_stage(
         "expert_learning",
-        get_expert_memories(page_size=20, mode="paper"),
+        get_expert_memories(
+            page_size=(5 if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else 20),
+            mode="paper",
+        ),
     )
     payload["open_positions"] = await _read_stage(
         "open_positions",
@@ -541,10 +557,14 @@ def _summarize_report(report: dict) -> dict:
                 "entry_policy",
                 "exit_policy",
                 "risk_policy",
-                "training_evidence",
                 "historical_replay_policy",
             )
             if key in strategy_blueprint
+        }
+        | {
+            "training_evidence": _summarize_model_training_evidence(
+                strategy_blueprint.get("training_evidence")
+            )
         },
         "model_training_summary": registry.get("summary") or {},
         "training_scheduler_state": _summarize_training_scheduler_state(
@@ -573,6 +593,42 @@ def _summarize_report(report: dict) -> dict:
             report.get("selected_decision")
         ),
         "expert_memory_schema": report.get("expert_memory_schema"),
+    }
+
+
+def _summarize_model_training_evidence(value: object) -> dict:
+    evidence = value if isinstance(value, dict) else {}
+    replay = evidence.get("strategy_replay_holdout")
+    replay = replay if isinstance(replay, dict) else {}
+    return {
+        **{
+            key: evidence.get(key)
+            for key in (
+                "shadow_sample_count",
+                "fit_sample_count",
+                "holdout_sample_count",
+                "horizons",
+                "partition_policy",
+                "training_data_sha256",
+            )
+            if key in evidence
+        },
+        "strategy_replay_holdout": {
+            key: replay.get(key)
+            for key in (
+                "version",
+                "source",
+                "sample_count",
+                "decision_group_count",
+                "prediction_horizon_minutes",
+                "return_lcb_pct",
+                "profit_factor",
+                "cvar_10_pct",
+                "max_drawdown_pct",
+                "blocking_reasons",
+            )
+            if key in replay
+        },
     }
 
 
@@ -1208,6 +1264,7 @@ def _summarize_training_scheduler_state(value: object) -> dict:
         "last_check_at",
         "last_started_at",
         "last_finished_at",
+        "last_successful_training_at",
         "last_error",
         "last_result",
         "next_check_at",

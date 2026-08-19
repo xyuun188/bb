@@ -685,6 +685,51 @@ async def test_persist_exit_closes_native_full_close_pending_backfill_without_sy
 
 
 @pytest.mark.asyncio
+async def test_persist_partial_exit_position_delta_uses_generic_pending_settlement() -> None:
+    session = FakeSession()
+    position = _position(id=1, quantity=2.0)
+    repo = FakeTradeRepo([position])
+    result = _result(
+        quantity=1.0,
+        price=110.0,
+        fee=0.0,
+        status=OrderStatus.PARTIAL,
+        order_id="exit-fill-pending",
+        exchange_order_id="exit-fill-pending",
+        raw_response={
+            "exit_tracking": True,
+            "requires_okx_fill_backfill": True,
+            "request_params": {"instId": "BTC-USDT-SWAP"},
+            "position_contracts_before": 2.0,
+            "position_contracts_after": 1.0,
+            "remaining_contracts": 1.0,
+            "filled_contracts": 1.0,
+            "base_quantity": 1.0,
+        },
+    )
+
+    await _service(
+        session=session,
+        repo=repo,
+        confirmed=False,
+        exit_progress=True,
+    ).persist(
+        model_name="ensemble_trader",
+        decision=_decision(Action.CLOSE_LONG),
+        result=result,
+        execution_mode="paper",
+    )
+
+    assert position.is_open is True
+    assert position.quantity == pytest.approx(1.0)
+    assert repo.opened[0]["is_open"] is False
+    assert repo.opened[0]["quantity"] == pytest.approx(1.0)
+    assert repo.opened[0]["settlement_status"] == "pending_okx_fill_backfill"
+    assert repo.opened[0]["settlement_source"] == "okx_exit_fill_pending_backfill"
+    assert repo.opened[0]["close_exchange_order_id"] == "exit-fill-pending"
+
+
+@pytest.mark.asyncio
 async def test_persist_exit_does_not_leave_or_apply_floating_point_dust() -> None:
     session = FakeSession()
     first = _position(id=1, quantity=0.92)

@@ -11,6 +11,7 @@ import re
 import time
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from math import isclose
 from typing import Any
 
 import structlog
@@ -2129,13 +2130,33 @@ class OKXExecutor(AbstractExecutor):
                         },
                     )
 
+                exchange_reported_filled_contracts = filled_contracts
+                position_delta_only = not isclose(
+                    exchange_reported_filled_contracts,
+                    closed_contracts,
+                    rel_tol=0.001,
+                    abs_tol=tolerance,
+                )
+                if position_delta_only:
+                    order = {
+                        **order,
+                        "requires_okx_fill_backfill": True,
+                        "fill_confirmation_basis": "okx_position_delta_pending_order_fill",
+                        "exchange_reported_filled_contracts": exchange_reported_filled_contracts,
+                    }
                 filled_contracts = closed_contracts
                 filled_base_quantity = filled_contracts * contract_size
                 requested_filled = (
                     requested_exit_contracts <= 0
                     or closed_contracts + tolerance >= requested_exit_contracts
                 )
-                status = OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL
+                status = (
+                    OrderStatus.PARTIAL
+                    if position_delta_only
+                    else OrderStatus.FILLED
+                    if requested_filled
+                    else OrderStatus.PARTIAL
+                )
 
             final_order_id = str(
                 order.get("id")
@@ -3626,7 +3647,10 @@ class OKXExecutor(AbstractExecutor):
             decimal_value = Decimal(str(value))
         except (InvalidOperation, ValueError):
             return str(value)
-        return format(decimal_value.normalize(), "f").rstrip("0").rstrip(".") or "0"
+        formatted = format(decimal_value.normalize(), "f")
+        if "." in formatted:
+            formatted = formatted.rstrip("0").rstrip(".")
+        return formatted or "0"
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
         try:

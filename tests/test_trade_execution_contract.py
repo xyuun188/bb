@@ -9,6 +9,7 @@ from models.decision import _compact_decision_learning_snapshot
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import (
     _decision_report_projection,
+    _is_authoritative_filled_order,
     summarize_trade_execution_contract,
 )
 from tests.paper_canary_fixtures import (
@@ -900,3 +901,70 @@ def test_realized_pnl_summary_uses_closed_positions_only() -> None:
 
     assert report["summary"]["realized_net_pnl_usdt"] == 1.8
     assert report["summary"]["negative_realized_position_count"] == 1
+
+
+def test_partial_order_requires_authoritative_fill_evidence() -> None:
+    order = SimpleNamespace(
+        status="partial",
+        exchange_order_id="okx-partial-1",
+        okx_sync_status="okx_execution_result_confirmed",
+        okx_fill_contracts=4.0,
+        quantity=0.04,
+        price=100.0,
+        filled_at="2026-07-12T08:00:01+00:00",
+        okx_raw_fills={
+            "source": "okx_execution_result",
+            "order_id": "okx-partial-1",
+            "execution_result_confirmed": True,
+            "contracts": 4.0,
+            "base_quantity": 0.04,
+            "avg_price": 100.0,
+            "trade_ids": ["trade-partial-1"],
+        },
+    )
+
+    assert _is_authoritative_filled_order(order) is True
+
+
+def test_partial_order_without_exchange_fill_is_not_counted() -> None:
+    order = SimpleNamespace(
+        status="partial",
+        exchange_order_id="okx-partial-unverified",
+        okx_sync_status="unverified",
+        okx_fill_contracts=4.0,
+        quantity=0.04,
+        price=100.0,
+        filled_at="2026-07-12T08:00:01+00:00",
+        okx_raw_fills={"contracts": 4.0, "base_quantity": 0.04, "avg_price": 100.0},
+    )
+
+    assert _is_authoritative_filled_order(order) is False
+
+
+def test_confirmed_partial_fill_contributes_entry_notional() -> None:
+    raw = _entry_raw()
+    raw["profit_risk_sizing"]["target_notional_usdt"] = 4.0
+    raw["profit_risk_sizing"]["final_notional_usdt"] = 4.0
+    raw["profit_risk_sizing"]["planned_stressed_loss_usdt"] = 0.08
+    decision = _decision(101, "long", raw)
+    decision.was_executed = True
+    order = _filled_order(101, quantity=0.04, price=100.0)
+    order.status = "partial"
+    order.okx_sync_status = "okx_execution_result_confirmed"
+    order.filled_at = "2026-07-12T08:00:01+00:00"
+    order.okx_raw_fills.update(
+        {
+            "source": "okx_execution_result",
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": True,
+        }
+    )
+
+    report = summarize_trade_execution_contract([decision], orders=[order])
+
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["entry_contracts"][0]["filled_order_notional_usdt"] == pytest.approx(4.0)
+    assert report["entry_contracts"][0]["filled_order_notional_source"].startswith(
+        "okx_execution_result_contracts"
+    )

@@ -88,6 +88,7 @@ OKX_SYNC_ORDER_ONLY = "okx_order_only"
 OKX_SYNC_EXECUTION_RESULT_CONFIRMED = "okx_execution_result_confirmed"
 OKX_SYNC_ORDER_DETAIL_CONFIRMED = "okx_order_detail_confirmed"
 OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING = "okx_native_full_close_pending_backfill"
+OKX_SYNC_EXIT_FILL_BACKFILL_PENDING = "okx_exit_fill_pending_backfill"
 NATIVE_FULL_CLOSE_BACKFILL_WINDOW_SECONDS = 20 * 60
 ORDER_FACT_SYNC_ADVISORY_LOCK_BASE = 0x42424F5244455200
 AUTHORITATIVE_FILL_ROW_FIELDS = (
@@ -1745,6 +1746,21 @@ class OkxOrderFactSyncService:
                             )
                         )
                     continue
+                if _order_requires_native_full_close_backfill(order):
+                    order.okx_sync_status = (
+                        str(getattr(order, "okx_sync_status", "") or "").strip()
+                        or OKX_SYNC_EXIT_FILL_BACKFILL_PENDING
+                    )
+                    order.okx_state = "fill_backfill_pending"
+                    order.okx_synced_at = now
+                    order.okx_last_error = (
+                        "OKX 仓位差已确认，但订单/成交明细尚未返回；继续等待 OKX 成交事实回填，"
+                        "不会把仓位差伪造成权威成交。"
+                    )
+                    if order_row:
+                        _apply_order_row_metadata(order, order_row, now=now)
+                    samples.append(_sample(order, kind="local_exit_fill_backfill_pending"))
+                    continue
                 decision = (decisions_by_id or {}).get(int(getattr(order, "decision_id", 0) or 0))
                 if _recover_okx_execution_result_fact_from_decision(order, decision):
                     _repair_execution_contract_size_from_instruments(
@@ -2175,7 +2191,7 @@ def _recover_okx_execution_result_fact_from_decision(
     if not isinstance(execution_result, dict):
         return False
     status = str(execution_result.get("status") or "").lower().strip()
-    if status not in {"filled", "partial"}:
+    if status not in {"filled", "partial"} or execution_result.get("exchange_confirmed") is not True:
         return False
     raw_response = execution_result.get("raw_response")
     raw_response = raw_response if isinstance(raw_response, dict) else {}
@@ -2194,13 +2210,19 @@ def _recover_okx_execution_result_fact_from_decision(
     inst_id = okx_inst_id_from_payload(raw_response, include_fallback=False)
     if not inst_id:
         inst_id = str(info.get("instId") or "").strip().upper()
-    contracts = _safe_float(
-        info.get("accFillSz")
-        or raw_response.get("filled_contracts")
-        or raw_response.get("filled")
-        or execution_result.get("filled_contracts")
-        or execution_result.get("quantity"),
-        0.0,
+    reported_contracts = max(
+        _safe_float(info.get("accFillSz"), 0.0),
+        _safe_float(info.get("fillSz"), 0.0),
+        _safe_float(raw_response.get("filled"), 0.0),
+    )
+    # A reduce-only position delta proves that the position changed, but does
+    # not identify a concrete OKX fill. Never promote that delta to an order
+    # fact when the exchange acknowledgement still reports zero fills.
+    if raw_response.get("exit_tracking") and reported_contracts <= 0:
+        return False
+    contracts = max(
+        reported_contracts,
+        _safe_float(execution_result.get("filled_contracts"), 0.0),
     )
     avg_price = _safe_float(
         info.get("avgPx")
@@ -2331,10 +2353,17 @@ def _embedded_okx_order_detail_complete(order: Order, raw: dict[str, Any]) -> bo
     detail_contracts = _safe_float(detail.get("accFillSz") or detail.get("fillSz"), 0.0)
     detail_price = _safe_float(detail.get("avgPx") or detail.get("fillPx"), 0.0)
     detail_trade_id = str(detail.get("tradeId") or "").strip()
+    detail_state = str(detail.get("state") or "").strip().lower()
+    local_status = str(getattr(order, "status", "") or "").strip().lower()
+    terminal_partial_fill = bool(
+        detail_state in {"canceled", "cancelled"}
+        and local_status in {"partial", "partially_filled"}
+        and detail_contracts > 0
+    )
     return bool(
         exchange_order_id
         and fact_order_id == exchange_order_id
-        and str(detail.get("state") or "").strip().lower() == "filled"
+        and (detail_state == "filled" or terminal_partial_fill)
         and str(detail.get("instId") or "").strip().upper() == fact_inst_id
         and detail_trade_id
         and detail_trade_id in fact_trade_ids
@@ -2655,11 +2684,18 @@ def _order_requires_native_full_close_backfill(order: Order) -> bool:
     sync_status = str(getattr(order, "okx_sync_status", "") or "").strip()
     raw = getattr(order, "okx_raw_fills", None)
     raw = raw if isinstance(raw, dict) else {}
-    if sync_status == OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING:
+    if sync_status in {
+        OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+        OKX_SYNC_EXIT_FILL_BACKFILL_PENDING,
+    }:
         return True
     return bool(
         raw.get("requires_okx_fill_backfill")
-        or raw.get("source") == OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+        or raw.get("source")
+        in {
+            OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING,
+            OKX_SYNC_EXIT_FILL_BACKFILL_PENDING,
+        }
     )
 
 
@@ -2671,6 +2707,13 @@ def _matching_native_full_close_pending_fill(
 ) -> OkxNativeFillGroup | None:
     if not _order_requires_native_full_close_backfill(order):
         return None
+    raw = getattr(order, "okx_raw_fills", None)
+    raw = raw if isinstance(raw, dict) else {}
+    if not (
+        raw.get("source") == OKX_SYNC_NATIVE_CLOSE_BACKFILL_PENDING
+        or raw.get("okx_native_close_position") is True
+    ):
+        return None
     if _split_exchange_order_ids(getattr(order, "exchange_order_id", None)):
         return None
     inst_id = _order_inst_id(order)
@@ -2680,8 +2723,6 @@ def _matching_native_full_close_pending_fill(
     reference_time = _order_time(order)
     if reference_time is None:
         return None
-    raw = getattr(order, "okx_raw_fills", None)
-    raw = raw if isinstance(raw, dict) else {}
     target_contracts = _safe_float(
         raw.get("contracts")
         or raw.get("filled_contracts")

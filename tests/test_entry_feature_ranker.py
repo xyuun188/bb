@@ -141,3 +141,32 @@ def test_fallback_market_anchor_score_is_bounded_when_volatility_is_zero() -> No
 
     assert score < 20.0
     assert score > 0.0
+
+
+def test_fallback_indicator_does_not_pollute_cross_sectional_thresholds() -> None:
+    result = _rank(
+        {
+            "BTC/USDT": _feature(
+                "BTC/USDT",
+                indicator_snapshot_available=True,
+                volatility_20=0.04,
+            ),
+            "KAITO/USDT": _feature(
+                "KAITO/USDT",
+                indicator_snapshot_available=False,
+                volatility_20=0.0,
+            ),
+        },
+        2,
+    )
+
+    policy = result.diagnostics["dynamic_policy"]["values"]
+    assert policy["tradable_volatility_cap"]["value"] == pytest.approx(0.04)
+    assert policy["tradable_volatility_cap"]["sample_count"] == 1
+    fallback_metrics = next(
+        item["filter_metrics"]
+        for bucket in ("symbols", "ranked_symbol_sample", "filtered_symbol_sample")
+        for item in result.diagnostics[bucket]
+        if item["symbol"] == "KAITO/USDT"
+    )
+    assert fallback_metrics["indicator_snapshot_quality"] == "fallback_market_anchor"

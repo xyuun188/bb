@@ -2577,13 +2577,16 @@ class OkxSyncService:
                     for order in entry_orders
                 )
             )
+            fragment_entry_fees: list[tuple[Position, float]] = []
             current_entry_fee = 0.0
             for position in fragments:
-                current_entry_fee += entry_fee_from_orders(
+                fragment_entry_fee = entry_fee_from_orders(
                     position,
                     position.quantity,
                     orders_by_exchange_id=orders_by_id,
                 )
+                fragment_entry_fees.append((position, fragment_entry_fee))
+                current_entry_fee += fragment_entry_fee
             full_entry_fee = sum(
                 abs(float_parser(_dict_value(order.okx_raw_fills).get("fee_abs"), 0.0))
                 for order in entry_orders
@@ -2712,7 +2715,9 @@ class OkxSyncService:
                 facts,
                 previous_contract=previous,
             )
-            for position in fragments:
+            for position, authoritative_entry_fee in fragment_entry_fees:
+                if entry_fee_evidence_complete:
+                    position.entry_fee = authoritative_entry_fee
                 position.current_management_contract = dict(contract)
                 position.updated_at = datetime.now(UTC)
                 refreshed += 1

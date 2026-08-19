@@ -21,6 +21,8 @@ class _Executor:
         fail_algo_id: str = "",
         stuck_algo_id: str = "",
         ignored_amend_algo_id: str = "",
+        created_visibility_delay_reads: int = 0,
+        lot_size: str = "1",
     ) -> None:
         self.position_contracts = position_contracts
         self.protection_contracts = list(protection_contracts)
@@ -31,6 +33,9 @@ class _Executor:
         self.fail_algo_id = fail_algo_id
         self.stuck_algo_id = stuck_algo_id
         self.ignored_amend_algo_id = ignored_amend_algo_id
+        self.created_visibility_delay_reads = created_visibility_delay_reads
+        self.lot_size = lot_size
+        self.hidden_created_reads: dict[str, int] = {}
         self.amend_calls: list[dict[str, Any]] = []
         self.create_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
@@ -51,6 +56,17 @@ class _Executor:
         self,
         _symbol: str | None,
     ) -> list[dict[str, Any]]:
+        visible: list[tuple[str, str]] = []
+        for algo_id, contracts in zip(
+            self.protection_algo_ids,
+            self.protection_contracts,
+            strict=True,
+        ):
+            hidden_reads = self.hidden_created_reads.get(algo_id, 0)
+            if hidden_reads > 0:
+                self.hidden_created_reads[algo_id] = hidden_reads - 1
+                continue
+            visible.append((algo_id, contracts))
         return [
             {
                 "symbol": "IRYS/USDT",
@@ -65,10 +81,7 @@ class _Executor:
                 "created_at_ms": index,
                 "raw": {"info": {"instId": "IRYS-USDT-SWAP"}},
             }
-            for index, (algo_id, contracts) in enumerate(
-                zip(self.protection_algo_ids, self.protection_contracts, strict=True),
-                start=1,
-            )
+            for index, (algo_id, contracts) in enumerate(visible, start=1)
         ]
 
     async def get_open_orders_strict(self, _symbol: str | None) -> list[dict[str, Any]]:
@@ -78,7 +91,9 @@ class _Executor:
         self,
         _symbols: list[str],
     ) -> dict[str, dict[str, str]]:
-        return {"IRYS-USDT-SWAP": {"lotSz": "1", "minSz": "1"}}
+        return {
+            "IRYS-USDT-SWAP": {"lotSz": self.lot_size, "minSz": self.lot_size}
+        }
 
     async def amend_position_protection_size(
         self,
@@ -136,6 +151,7 @@ class _Executor:
         algo_id = f"algo-{self.next_algo_index}"
         self.next_algo_index += 1
         self.protection_algo_ids.append(algo_id)
+        self.hidden_created_reads[algo_id] = self.created_visibility_delay_reads
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
 
@@ -260,6 +276,102 @@ async def test_acknowledged_but_unapplied_amend_uses_verified_replacement(
     ]
     assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
     assert result["applied_actions"][-1]["action"]["action"] == "replace_stuck_amend"
+
+
+@pytest.mark.asyncio
+async def test_stuck_split_oco_replacement_is_created_and_verified_as_one_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("6", "7"),
+        stuck_algo_id="algo-1",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert executor.protection_contracts == ["2", "3"]
+    assert len(executor.create_calls) == 2
+    assert {call["algo_id"] for call in executor.cancel_calls} == {"algo-1", "algo-2"}
+    assert len(result["applied_actions"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_mixed_resize_and_delta_plan_replaces_complete_group_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="3.44",
+        protection_contracts=("1.6", "0.57", "0.93", "0.34", "0.03", "0.03", "0.02", "0.04"),
+        lot_size="0.01",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert result["fallback_reason"] == "mixed_protection_plan_create_before_cancel"
+    assert executor.amend_calls == []
+    assert len(executor.create_calls) == 9
+    assert len(executor.cancel_calls) == 8
+    assert all(call["algo_id"] for call in executor.cancel_calls)
+    assert sum(float(value) for value in executor.protection_contracts) == pytest.approx(3.44)
+    assert result["after"]["coverage_mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_replacement_drops_below_minimum_slice_without_zero_size_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="3.0",
+        protection_contracts=(
+            "0.04",
+            "1.54",
+            "0.55",
+            "0.89",
+            "0.32",
+            "0.02",
+            "0.02",
+            "0.01",
+            "0.05",
+        ),
+        lot_size="0.01",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert result["fallback_reason"] == "mixed_protection_plan_create_before_cancel"
+    assert executor.amend_calls == []
+    assert len(executor.create_calls) == 9
+    assert all(call["contracts"] >= 0.01 for call in executor.create_calls)
+    assert len(executor.cancel_calls) == 9
+    assert sum(float(value) for value in executor.protection_contracts) == pytest.approx(3.0)
+    assert result["after"]["coverage_mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_replacement_waits_for_delayed_okx_algo_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("13",),
+        ignored_amend_algo_id="algo-1",
+        created_visibility_delay_reads=6,
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    replacement = result["applied_actions"][-1]
+    assert replacement["create_verification_attempts"] == 7
+    assert executor.protection_contracts == ["5"]
 
 
 @pytest.mark.asyncio

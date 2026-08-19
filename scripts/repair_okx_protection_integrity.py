@@ -80,48 +80,6 @@ async def _apply_actions(
     return await apply_protection_repair_actions(executor, actions)
 
 
-def _amend_only(actions: list[dict[str, Any]]) -> bool:
-    return bool(actions) and all(
-        str(action.get("action") or "") == "amend_size" for action in actions
-    )
-
-
-async def _repair_unobserved_amends(
-    executor: OKXExecutor,
-    snapshot: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Use the runtime's verified create-before-cancel fallback per position key."""
-
-    report = snapshot["report"]
-    actions = list(report.get("repair_actions") or [])
-    if report.get("repair_ready") is not True or not _amend_only(actions):
-        return []
-    keys = sorted(
-        {
-            (
-                normalize_trading_symbol(str(action.get("inst_id") or "")),
-                str(action.get("position_side") or "").lower(),
-            )
-            for action in actions
-        }
-    )
-    results: list[dict[str, Any]] = []
-    for symbol, side in keys:
-        if not symbol or side not in {"long", "short"}:
-            continue
-        try:
-            result = await rebalance_current_position_protection(
-                executor,
-                symbol=symbol,
-                side=side,
-                observation_window="manual_repair_verified_amend_fallback",
-            )
-        except PositionProtectionRebalanceError as exc:
-            result = exc.report
-        results.append(result)
-    return results
-
-
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     executor = OKXExecutor(mode=args.mode, load_markets_on_initialize=False)
     try:
@@ -150,27 +108,51 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             )
         backup_path = _backup(before)
         output["backup_path"] = str(backup_path)
-        original_actions = list(report.get("repair_actions") or [])
-        output["applied_actions"] = await _apply_actions(
-            executor,
-            original_actions,
-        )
-        after = await _snapshot(executor)
-        initial_positions_unchanged = bool(
+        output["applied_actions"] = []
+        position_rebalances: list[dict[str, Any]] = []
+        rebalance_failed = False
+        for mismatch in report.get("coverage_mismatches") or []:
+            symbol = normalize_trading_symbol(str(mismatch.get("symbol") or ""))
+            side = str(mismatch.get("side") or "").lower()
+            try:
+                rebalance = await rebalance_current_position_protection(
+                    executor,
+                    symbol=symbol,
+                    side=side,
+                    observation_window="manual_repair_position_scoped",
+                )
+            except PositionProtectionRebalanceError as exc:
+                rebalance = exc.report
+                rebalance_failed = True
+            position_rebalances.append(rebalance)
+            output["applied_actions"].extend(rebalance.get("applied_actions") or [])
+
+        intermediate = await _snapshot(executor)
+        positions_unchanged_before_remaining = bool(
             report.get("position_inventory_fingerprint")
-            == after["report"].get("position_inventory_fingerprint")
+            == intermediate["report"].get("position_inventory_fingerprint")
         )
-        fallback_rebalances: list[dict[str, Any]] = []
-        if (
-            initial_positions_unchanged
-            and _amend_only(original_actions)
-            and after["report"].get("coverage_mismatches")
-        ):
-            fallback_rebalances = await _repair_unobserved_amends(executor, after)
-            for fallback in fallback_rebalances:
-                output["applied_actions"].extend(fallback.get("applied_actions") or [])
-            after = await _snapshot(executor)
-        output["fallback_rebalances"] = fallback_rebalances
+        if positions_unchanged_before_remaining:
+            remaining_report = intermediate["report"]
+            if remaining_report.get("repair_ready") is not True:
+                raise RuntimeError(
+                    "Protection repair became blocked after position-scoped rebalances: "
+                    + ",".join(remaining_report.get("repair_blockers") or [])
+                )
+            remaining_actions = list(remaining_report.get("repair_actions") or [])
+            if rebalance_failed:
+                remaining_actions = [
+                    action
+                    for action in remaining_actions
+                    if str(action.get("action") or "") == "cancel"
+                ]
+            if remaining_actions:
+                output["applied_actions"].extend(await _apply_actions(executor, remaining_actions))
+
+        after = await _snapshot(executor)
+        output["fallback_rebalances"] = position_rebalances
+        output["position_rebalances"] = position_rebalances
+        output["rebalance_failed"] = rebalance_failed
         output["after"] = after["report"]
         positions_unchanged = bool(
             report.get("position_inventory_fingerprint")

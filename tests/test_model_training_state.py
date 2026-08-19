@@ -82,6 +82,7 @@ def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
     for model_id in LOCAL_AI_TOOL_MODEL_IDS:
         row = persisted["models"][model_id]
         assert row["state"] == "succeeded"
+        assert row["last_successful_training_at"] == now[0].isoformat()
         assert row["sample_cursor"] == {"shadow": 37655, "trade": 341}
         assert row["last_result"]["artifact_persisted"] is True
         assert [event["event"] for event in row["history"]] == ["started", "succeeded"]
@@ -254,6 +255,7 @@ def test_recovery_marks_interrupted_training_and_preserves_history(tmp_path) -> 
     assert row["last_error"] == "training_process_interrupted"
     assert row["retry_count"] == 1
     assert row["history"][-1]["event"] == "interrupted"
+    assert row.get("last_successful_training_at") is None
 
 
 def test_failed_model_makes_fresh_scheduler_state_error(tmp_path) -> None:

@@ -305,6 +305,6 @@ async def test_apply_replaces_acknowledged_but_unobserved_amend(
     assert result["fallback_rebalances"][0]["fallback_reason"] == (
         "okx_amend_acknowledged_but_not_observed"
     )
-    assert len(executor.amend_calls) == 2
+    assert len(executor.amend_calls) == 1
     assert executor.create_calls[0]["contracts"] == 13.0
     assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-irys"}]

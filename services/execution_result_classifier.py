@@ -78,6 +78,23 @@ def is_confirmed_native_full_close_result(result: ExecutionResult | None) -> boo
 def is_native_full_close_backfill_pending_result(result: ExecutionResult | None) -> bool:
     """Return true when OKX flattened the position but the real fill ordId is pending."""
 
+    if not is_exit_fill_backfill_pending_result(result):
+        return False
+    raw_response = getattr(result, "raw_response", None)
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    if not raw.get("okx_native_close_position"):
+        return False
+    if str(result.exchange_order_id or "").strip():
+        return False
+    before = _safe_float(raw.get("position_contracts_before"), 0.0)
+    after = _safe_float(raw.get("position_contracts_after"), before)
+    tolerance = max(before * 0.001, 1e-8)
+    return min(after, _safe_float(raw.get("remaining_contracts"), after)) <= tolerance
+
+
+def is_exit_fill_backfill_pending_result(result: ExecutionResult | None) -> bool:
+    """Return true when only the OKX position delta is known, not the fill fact."""
+
     status = getattr(result, "status", None)
     status_value = getattr(status, "value", status)
     if result is None or str(status_value or "").lower() != OrderStatus.PARTIAL.value:
@@ -86,18 +103,18 @@ def is_native_full_close_backfill_pending_result(result: ExecutionResult | None)
         return False
     raw_response = getattr(result, "raw_response", None)
     raw = raw_response if isinstance(raw_response, dict) else {}
-    if not raw.get("okx_native_close_position") or not raw.get("requires_okx_fill_backfill"):
-        return False
-    if str(result.exchange_order_id or "").strip():
+    if not raw.get("exit_tracking") or not raw.get("requires_okx_fill_backfill"):
         return False
     before = _safe_float(raw.get("position_contracts_before"), 0.0)
     after = _safe_float(raw.get("position_contracts_after"), before)
-    remaining = _safe_float(raw.get("remaining_contracts"), after)
     filled = _safe_float(raw.get("filled_contracts"), 0.0)
     if before <= 0 or filled <= 0:
         return False
     tolerance = max(before * 0.001, 1e-8)
-    return min(after, remaining) <= tolerance
+    return bool(
+        before > after >= 0
+        and abs((before - after) - filled) <= tolerance
+    )
 
 
 class ExecutionResultClassifier:
@@ -137,6 +154,11 @@ class ExecutionResultClassifier:
                 return (
                     "OKX 原生平仓已确认交易所仓位归零，但成交明细暂时还没有返回真实订单号；"
                     "系统会先按待回填平仓释放本地容量，并由 OKX 成交同步继续补齐真实订单号、手续费和资金费。"
+                )
+            if is_exit_fill_backfill_pending_result(result):
+                return (
+                    "OKX 仓位已经减少，但当前订单回执尚未返回可核验的成交数量；"
+                    "系统已按待回填退出进度更新仓位，并继续通过订单、成交和账单通道补齐权威成交事实。"
                 )
             reason = self._exit_tracking_reason(result, raw)
             if reason:
@@ -271,7 +293,7 @@ class ExecutionResultClassifier:
         return bool(isinstance(raw, dict) and raw.get("exit_tracking"))
 
     def is_exit_progress_execution(self, result: ExecutionResult | None) -> bool:
-        if is_native_full_close_backfill_pending_result(result):
+        if is_exit_fill_backfill_pending_result(result):
             return True
         if not self.is_exit_tracking_execution(result):
             return False

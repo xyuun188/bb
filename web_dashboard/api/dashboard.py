@@ -2784,11 +2784,28 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
                     timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
                 ),
             )
+            get_contract_specs = getattr(executor, "get_contract_specs_strict", None)
+            contract_specs = (
+                await asyncio.wait_for(
+                    get_contract_specs(
+                        sorted(
+                            {
+                                str(position.get("symbol") or "").strip()
+                                for position in raw_positions
+                                if str(position.get("symbol") or "").strip()
+                            }
+                        )
+                    ),
+                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                )
+                if callable(get_contract_specs)
+                else {}
+            )
             audit = audit_protection_order_integrity(
                 raw_positions,
                 protection_orders,
                 pending_orders,
-                {},
+                contract_specs,
                 pending_snapshot_complete=True,
             )
             _dashboard_okx_protection_cache[selected_mode] = (datetime.now(UTC), audit)

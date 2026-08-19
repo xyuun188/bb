@@ -381,7 +381,7 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         side="long",
         quantity=2.0,
         entry_price=100.0,
-        entry_fee=0.2,
+        entry_fee=9.0,
         entry_exchange_order_id="entry-a",
         current_management_contract={},
         updated_at=None,
@@ -394,7 +394,7 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         side="long",
         quantity=1.0,
         entry_price=100.0,
-        entry_fee=0.1,
+        entry_fee=7.0,
         entry_exchange_order_id="entry-b",
         current_management_contract={},
         updated_at=None,
@@ -485,6 +485,8 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     assert contract["position_scope"] == "exchange_net_position_group"
     assert contract["position_fragment_ids"] == [1, 2]
     assert contract["entry_fee_usdt"] == pytest.approx(0.3)
+    assert first.entry_fee == pytest.approx(0.2)
+    assert second.entry_fee == pytest.approx(0.1)
     assert contract["contracts"] == pytest.approx(3.0)
     assert current_position_management_contract_complete(
         SimpleNamespace(

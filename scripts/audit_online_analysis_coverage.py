@@ -130,12 +130,29 @@ async def run():
     market_times = [as_utc(row.created_at) for row in market_rows]
     position_times = [as_utc(row.created_at) for row in position_rows]
     activity_points = [since, *market_times, now]
-    max_activity_gap = max(
+    activity_gaps = sorted(
         (
-            (current - previous).total_seconds()
+            {{
+                "started_at": previous.isoformat(),
+                "finished_at": current.isoformat(),
+                "duration_seconds": round((current - previous).total_seconds(), 3),
+                "boundary": (
+                    "window_start"
+                    if previous == since
+                    else "window_end"
+                    if current == now
+                    else "between_market_decisions"
+                ),
+            }}
             for previous, current in zip(activity_points, activity_points[1:])
         ),
-        default=(now - since).total_seconds(),
+        key=lambda item: item["duration_seconds"],
+        reverse=True,
+    )
+    max_activity_gap = (
+        float(activity_gaps[0]["duration_seconds"])
+        if activity_gaps
+        else (now - since).total_seconds()
     )
     market_symbol_counts = Counter(str(row.symbol or "") for row in market_rows)
     top_symbol, top_count = market_symbol_counts.most_common(1)[0] if market_symbol_counts else ("", 0)
@@ -158,6 +175,7 @@ async def run():
             "first_decision_at": market_times[0].isoformat() if market_times else None,
             "last_decision_at": market_times[-1].isoformat() if market_times else None,
             "max_activity_gap_seconds": round(max_activity_gap, 3),
+            "largest_activity_gaps": activity_gaps[:5],
             "top_symbol": top_symbol or None,
             "top_symbol_count": top_count,
             "top_symbol_share": round(top_count / len(market_rows), 6) if market_rows else None,

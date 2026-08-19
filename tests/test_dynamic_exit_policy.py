@@ -531,8 +531,66 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-19.dynamic-exit-lifecycle-guard.v15"
+        "2026-08-19.dynamic-exit-cumulative-budget.v16"
     )
+
+
+def test_realized_lifecycle_exit_target_is_not_reapplied_to_remaining_position() -> None:
+    position = _position(
+        quantity=5.0,
+        current_price=101.0,
+        notional_usdt=505.0,
+        unrealized_pnl=5.0,
+        peak_unrealized_pnl=10.0,
+    )
+    position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.target_close_fraction == pytest.approx(0.5)
+    assert result.lifecycle_closed_fraction == pytest.approx(0.5)
+    assert result.incremental_close_fraction == 0.0
+    assert result.close_fraction == 0.0
+    assert result.eligible is False
+    assert "dynamic_exit_target_already_realized" in result.reason
+
+
+def test_higher_lifecycle_exit_target_submits_only_new_increment() -> None:
+    position = _position(
+        quantity=5.0,
+        current_price=101.0,
+        notional_usdt=505.0,
+        unrealized_pnl=5.0,
+        peak_unrealized_pnl=20.0,
+    )
+    position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.target_close_fraction == pytest.approx(0.75)
+    assert result.lifecycle_closed_fraction == pytest.approx(0.5)
+    assert result.incremental_close_fraction == pytest.approx(0.5)
+    assert result.close_fraction == pytest.approx(0.5)
+    assert result.eligible is True
+
+
+def test_hard_risk_closes_all_remaining_quantity_after_prior_partial_exit() -> None:
+    position = _position(
+        quantity=5.0,
+        current_price=97.0,
+        notional_usdt=485.0,
+        unrealized_pnl=-15.0,
+        peak_unrealized_pnl=0.0,
+    )
+    position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is True
+    assert result.target_close_fraction == 1.0
+    assert result.lifecycle_closed_fraction == pytest.approx(0.5)
+    assert result.close_fraction == 1.0
+    assert result.eligible is True
 
 
 def test_legacy_hard_risk_flag_without_position_economics_fails_closed() -> None:

@@ -19,7 +19,10 @@ from core.symbols import (
 )
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
-from services.execution_result_classifier import is_native_full_close_backfill_pending_result
+from services.execution_result_classifier import (
+    is_exit_fill_backfill_pending_result,
+    is_native_full_close_backfill_pending_result,
+)
 from services.normal_paper_trade import build_normal_paper_position_lifecycle
 from services.okx_realized_pnl import gross_pnl_with_okx_override
 from services.order_position_reconciliation import reconcile_missing_closed_position_for_exit
@@ -211,7 +214,11 @@ class PositionExecutionPersistenceService:
             "okx_native_full_close_fill_pending",
         }
         raw = getattr(result, "raw_response", None)
-        if isinstance(raw, dict) and raw.get("requires_okx_fill_backfill"):
+        if (
+            isinstance(raw, dict)
+            and raw.get("requires_okx_fill_backfill")
+            and raw.get("okx_native_close_position")
+        ):
             return ""
         return value if value not in synthetic_ids else ""
 
@@ -469,7 +476,8 @@ class PositionExecutionPersistenceService:
                 )
             return
         exchange_backed_ids = await self._exchange_backed_id_provider(session, positions)
-        pending_okx_backfill = is_native_full_close_backfill_pending_result(result)
+        pending_okx_backfill = is_exit_fill_backfill_pending_result(result)
+        native_full_close_pending = is_native_full_close_backfill_pending_result(result)
         positions = sorted(
             positions,
             key=lambda position: (
@@ -522,7 +530,11 @@ class PositionExecutionPersistenceService:
                     else SETTLEMENT_STATUS_SETTLING
                 ),
                 source=(
-                    "okx_native_full_close_pending_backfill"
+                    (
+                        "okx_native_full_close_pending_backfill"
+                        if native_full_close_pending
+                        else "okx_exit_fill_pending_backfill"
+                    )
                     if pending_okx_backfill
                     else "system_execution"
                 ),

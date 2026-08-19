@@ -98,6 +98,11 @@ class EntryFeatureRankerPolicy:
             parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=True)
             if parsed is None:
                 continue
+            if self._uses_fallback_indicator_snapshot(feature):
+                # Fallback market anchors are useful for analysis candidates,
+                # but their zero-filled technical fields must never define a
+                # production threshold for the current market cross-section.
+                continue
             symbol, current_price, volume_24h, volume_ratio, volatility, day_change, adx = parsed
             notional = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
             metrics["volume_ratio"].append(volume_ratio)

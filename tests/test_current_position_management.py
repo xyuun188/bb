@@ -101,6 +101,19 @@ def test_takeover_timestamp_is_stable_while_current_facts_refresh() -> None:
     )
 
 
+def test_takeover_refresh_preserves_lifecycle_entry_quantity_after_partial_exit() -> None:
+    first = build_current_position_management_contract(
+        _facts(quantity=10.0, contracts=10.0, full_entry_notional_usdt=1_000.0)
+    )
+    second = build_current_position_management_contract(
+        _facts(quantity=5.0, contracts=5.0, full_entry_notional_usdt=1_000.0),
+        previous_contract=first,
+    )
+
+    assert first["lifecycle_entry_quantity"] == pytest.approx(10.0)
+    assert second["lifecycle_entry_quantity"] == pytest.approx(10.0)
+
+
 def test_takeover_refresh_preserves_persisted_paper_canary_lifecycle() -> None:
     lifecycle = {
         "version": "2026-07-19.paper-bootstrap-position-lifecycle.v1",

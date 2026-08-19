@@ -13,6 +13,17 @@ from executor.okx_executor import OKXExecutor
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((190.0, "190"), (10.0, "10"), (0.01, "0.01"), (1.2300, "1.23")),
+)
+def test_okx_number_format_preserves_integer_trailing_zeroes(
+    value: float,
+    expected: str,
+) -> None:
+    assert OKXExecutor._format_okx_number(value) == expected
+
+
 class _FakeLogger:
     def __init__(self) -> None:
         self.events: list[tuple[str, str, dict[str, Any]]] = []
@@ -1030,6 +1041,7 @@ class _ExitMaxMarketSizeCcxt:
             "info": {"instId": "USAR-USDT-SWAP", "maxMktSz": "10", "lotSz": "1"},
         }
 
+
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(amount))
 
@@ -1115,6 +1127,56 @@ class _ExitMaxMarketSizeCcxt:
                     "sMsg": "",
                 }
             ],
+        }
+
+
+class _ExitPositionDeltaWithoutFillCcxt(_ExitMaxMarketSizeCcxt):
+    """Simulate OKX reducing a position while the order ack reports no fill."""
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.create_calls.append((symbol, order_type, side, quantity, price, dict(params)))
+        self.position_contracts = max(self.position_contracts - quantity, 0.0)
+        order_id = "exit-live-no-fill"
+        return {
+            "id": order_id,
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": quantity,
+            "filled": 0.0,
+            "price": price or 3.0,
+            "average": 0.0,
+            "status": "open",
+            "fee": {"cost": 0.0},
+            "info": {
+                "state": "live",
+                "ordId": order_id,
+                "side": side,
+                "accFillSz": "0",
+                "reduceOnly": "true",
+            },
+        }
+
+    async def privateGetTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "data": [
+                {
+                    "ordId": str(params.get("ordId")),
+                    "instId": "USAR-USDT-SWAP",
+                    "state": "live",
+                    "sz": "10",
+                    "accFillSz": "0",
+                    "avgPx": "",
+                }
+            ]
         }
 
 
@@ -2567,6 +2629,28 @@ async def test_okx_exit_splits_market_order_above_exchange_max_size() -> None:
     assert result.raw_response["position_contracts_before"] == 100.0
     assert result.raw_response["position_contracts_after"] == 55.0
     assert result.raw_response["requested_exit_contracts"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_position_delta_without_fill_is_pending_backfill() -> None:
+    exchange = _ExitPositionDeltaWithoutFillCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 0.05
+
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.PARTIAL
+    assert result.exchange_order_id == "exit-live-no-fill"
+    assert result.quantity == pytest.approx(5.0)
+    assert result.raw_response["requires_okx_fill_backfill"] is True
+    assert result.raw_response["fill_confirmation_basis"] == (
+        "okx_position_delta_pending_order_fill"
+    )
+    assert result.raw_response["exchange_reported_filled_contracts"] == pytest.approx(0.0)
+    assert result.raw_response["position_contracts_before"] == pytest.approx(100.0)
+    assert result.raw_response["position_contracts_after"] == pytest.approx(95.0)
 
 
 @pytest.mark.asyncio

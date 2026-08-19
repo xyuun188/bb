@@ -90,6 +90,8 @@ def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:
     assert "EnvironmentFile=/etc/bb/bb-runtime.env" in command
     assert "--property=User=bb" in command
     assert "chown bb:bb" in command
+    assert 'detail=("summary" if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else "full")' in command
+    assert "page_size=(5 if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else 20)" in command
 
 
 def test_remote_command_rejects_injection_tokens_and_external_output_paths() -> None:
@@ -121,6 +123,15 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
                     "execution_scope": "paper_only",
                     "paper_execution_eligible": False,
                     "live_execution_permission": False,
+                    "training_evidence": {
+                        "fit_sample_count": 120,
+                        "training_data_sha256": "abc123",
+                        "strategy_replay_holdout": {
+                            "sample_count": 40,
+                            "decision_group_count": 40,
+                            "shadow_source_id_ranges": [[1, 100000]],
+                        },
+                    },
                 },
             },
             "model_training_registry": {
@@ -216,6 +227,10 @@ def test_summary_exposes_return_contract_and_ml_readiness() -> None:
     assert summary["ml_live_ml_ready"] is False
     assert summary["model_strategy_blueprint"]["execution_scope"] == "paper_only"
     assert summary["model_strategy_blueprint"]["live_execution_permission"] is False
+    training_evidence = summary["model_strategy_blueprint"]["training_evidence"]
+    assert training_evidence["fit_sample_count"] == 120
+    assert training_evidence["strategy_replay_holdout"]["sample_count"] == 40
+    assert "shadow_source_id_ranges" not in training_evidence["strategy_replay_holdout"]
     assert summary["model_training_summary"]["trainable_count"] == 8
     assert summary["training_scheduler_state"]["heartbeat_stale"] is True
     assert summary["training_scheduler_state"]["models"][

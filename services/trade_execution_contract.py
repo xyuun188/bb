@@ -53,6 +53,13 @@ from services.training_epoch import load_training_epoch_start
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
 FILLED_STATUSES = {"filled", "closed"}
+PARTIAL_FILLED_STATUSES = {"partial", "partially_filled"}
+PARTIAL_FILL_SYNC_STATUSES = {
+    "okx_confirmed",
+    "okx_execution_result_confirmed",
+    "okx_fills_history_confirmed",
+    "okx_order_detail_confirmed",
+}
 AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS = 10 * 60
 AUTHORITATIVE_FILL_SYNC_PENDING_REASONS = {
     "filled_order_okx_fill_identity_incomplete",
@@ -353,7 +360,7 @@ def _authoritative_fill_sync_pending_deadline(
     reason_set = {str(reason or "").strip() for reason in reasons if str(reason or "").strip()}
     if not reason_set or not reason_set.issubset(AUTHORITATIVE_FILL_SYNC_PENDING_REASONS):
         return None
-    filled_orders = [order for order in orders if _order_status(order) in FILLED_STATUSES]
+    filled_orders = [order for order in orders if _is_authoritative_filled_order(order)]
     if not filled_orders or any(
         not str(_row_get(order, "exchange_order_id") or "").strip()
         for order in filled_orders
@@ -410,7 +417,7 @@ def _entry_contract_row(
         "action": _action(decision),
         "executed": executed,
         "filled_order_count": sum(
-            _order_status(order) in FILLED_STATUSES for order in orders
+            _is_authoritative_filled_order(order) for order in orders
         ),
         **contract,
         "reasons": reasons,
@@ -422,9 +429,7 @@ def _okx_filled_order_notional_usdt(
     raw: dict[str, Any],
     orders: list[Any],
 ) -> tuple[float, list[str], str | None]:
-    filled_orders = [
-        order for order in orders if _order_status(order) in FILLED_STATUSES
-    ]
+    filled_orders = [order for order in orders if _is_authoritative_filled_order(order)]
     if not filled_orders:
         return 0.0, [], None
 
@@ -523,6 +528,10 @@ def _okx_filled_order_notional_usdt(
         notional_source = "okx_fill_contracts_x_pre_order_public_contract_spec_x_fill_price"
     elif total > 0 and execution_sources == {"okx_order_detail"}:
         notional_source = "okx_order_detail_contracts_x_pre_order_public_contract_spec_x_fill_price"
+    elif total > 0 and execution_sources == {"okx_execution_result"}:
+        notional_source = (
+            "okx_execution_result_contracts_x_pre_order_public_contract_spec_x_fill_price"
+        )
     elif total > 0:
         notional_source = "okx_official_execution_contracts_x_pre_order_public_contract_spec_x_fill_price"
     return total, list(dict.fromkeys(reasons)), notional_source
@@ -538,6 +547,15 @@ def _okx_execution_confirmation_source(fact: dict[str, Any]) -> str | None:
         and str(fact.get("source") or "").strip() == "okx_order_detail"
     ):
         return "okx_order_detail"
+    if (
+        fact.get("execution_result_confirmed") is True
+        and str(fact.get("source") or "").strip() == "okx_execution_result"
+        and str(fact.get("order_id") or "").strip()
+        and _safe_float(fact.get("contracts"), 0.0) > 0
+        and _safe_float(fact.get("avg_price"), 0.0) > 0
+        and any(str(item or "").strip() for item in _safe_list(fact.get("trade_ids")))
+    ):
+        return "okx_execution_result"
     return None
 
 
@@ -1898,7 +1916,7 @@ def _exit_contract_row(
             "action": _action(decision),
             "executed": executed,
             "filled_order_count": sum(
-                _order_status(order) in FILLED_STATUSES for order in orders
+                _is_authoritative_filled_order(order) for order in orders
             ),
             "contract_complete": not reasons,
             **protection_contract,
@@ -1917,7 +1935,7 @@ def _exit_contract_row(
             "action": _action(decision),
             "executed": executed,
             "filled_order_count": sum(
-                _order_status(order) in FILLED_STATUSES for order in orders
+                _is_authoritative_filled_order(order) for order in orders
             ),
             "contract_complete": not reasons,
             **external_reconcile_contract,
@@ -1942,7 +1960,7 @@ def _exit_contract_row(
         "symbol": _row_get(decision, "symbol"),
         "action": _action(decision),
         "executed": executed,
-        "filled_order_count": sum(_order_status(order) in FILLED_STATUSES for order in orders),
+        "filled_order_count": sum(_is_authoritative_filled_order(order) for order in orders),
         "contract_complete": not reasons,
         "close_fraction": _safe_float(policy.get("close_fraction")),
         "hard_risk": bool(policy.get("hard_risk")),
@@ -1994,7 +2012,7 @@ def _system_protection_exit_contract(
     filled_order_ids = {
         str(_row_get(order, "exchange_order_id") or "").strip()
         for order in orders
-        if _order_status(order) in FILLED_STATUSES
+        if _is_authoritative_filled_order(order)
         and str(_row_get(order, "exchange_order_id") or "").strip()
     }
     reasons: list[str] = []
@@ -2050,7 +2068,7 @@ def _external_okx_reconcile_exit_contract(
         exchange_order_id = str(_row_get(order, "exchange_order_id") or "").strip()
         fact_order_id = str(fact.get("order_id") or "").strip()
         complete = bool(
-            _order_status(order) in FILLED_STATUSES
+            _is_authoritative_filled_order(order)
             and _okx_execution_confirmation_source(fact)
             and exchange_order_id
             and fact_order_id == exchange_order_id
@@ -2136,12 +2154,79 @@ def _was_executed(decision: Any, orders: list[Any]) -> bool:
 
 
 def _has_filled_order(orders: Sequence[Any]) -> bool:
-    return any(_order_status(order) in FILLED_STATUSES for order in orders)
+    return any(_is_authoritative_filled_order(order) for order in orders)
 
 
 def _order_status(order: Any) -> str:
     value = _row_get(order, "status")
     return str(getattr(value, "value", value) or "").lower()
+
+
+def _is_authoritative_filled_order(order: Any) -> bool:
+    """Return whether an order row proves an exchange fill.
+
+    OKX can return a terminal ``canceled`` order with a non-zero ``accFillSz``.
+    The local order is then stored as ``partial``.  Treating every partial row
+    as filled would either count an unconfirmed submission as a trade or omit a
+    real partial fill from the contract audit.  Partial rows therefore need a
+    concrete exchange id, positive filled quantity, fill timestamp and an OKX
+    confirmation marker (or equivalent native fill evidence).
+    """
+
+    status = _order_status(order)
+    if status in FILLED_STATUSES:
+        return True
+    if status not in PARTIAL_FILLED_STATUSES:
+        return False
+
+    raw = _safe_dict(_row_get(order, "okx_raw_fills"))
+    exchange_order_id = str(_row_get(order, "exchange_order_id") or "").strip()
+    if not exchange_order_id:
+        return False
+    raw_order_id = str(raw.get("order_id") or raw.get("ordId") or "").strip()
+    if raw_order_id and raw_order_id != exchange_order_id:
+        return False
+
+    sync_status = str(_row_get(order, "okx_sync_status") or "").strip().lower()
+    confirmed = (
+        sync_status in PARTIAL_FILL_SYNC_STATUSES
+        or raw.get("execution_result_confirmed") is True
+        or raw.get("fills_history_confirmed") is True
+        or (
+            raw.get("order_detail_confirmed") is True
+            and str(raw.get("source") or "").strip() == "okx_order_detail"
+        )
+    )
+    if not confirmed:
+        return False
+
+    filled_contracts = max(
+        _safe_float(raw.get("contracts"), 0.0),
+        _safe_float(raw.get("filled_contracts"), 0.0),
+        _safe_float(_row_get(order, "okx_fill_contracts"), 0.0),
+    )
+    filled_quantity = max(
+        _safe_float(raw.get("base_quantity"), 0.0),
+        _safe_float(raw.get("filled_quantity"), 0.0),
+    )
+    if filled_contracts <= 0 and filled_quantity <= 0:
+        return False
+
+    fill_timestamp = (
+        _row_get(order, "filled_at")
+        or raw.get("filled_at")
+        or raw.get("fill_time")
+        or raw.get("timestamp")
+        or raw.get("ts")
+    )
+    if _as_utc(fill_timestamp) is None:
+        return False
+    fill_price = max(
+        _safe_float(raw.get("avg_price"), 0.0),
+        _safe_float(raw.get("fill_price"), 0.0),
+        _safe_float(_row_get(order, "price"), 0.0),
+    )
+    return fill_price > 0
 
 
 def _action(row: Any) -> str:
