@@ -19,7 +19,7 @@ import structlog
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
-from executor.base_executor import ExecutionResult
+from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.normal_paper_trade import attach_normal_paper_order_identity
 from services.okx_error_classifier import is_okx_temporary_service_error
@@ -306,6 +306,7 @@ class ExecutionService:
             Callable[[str, DecisionOutput], Awaitable[bool | None]] | None
         ) = None,
         trade_notional_recorder: Callable[[float], None] | None = None,
+        exit_execution_singleflight: Any | None = None,
         production_trade_gate_provider: (
             Callable[
                 [DecisionOutput, str, str, list[dict[str, Any]] | None],
@@ -352,6 +353,7 @@ class ExecutionService:
         self.matching_exit_local_position_checker = matching_exit_local_position_checker
         self.matching_exit_exchange_position_checker = matching_exit_exchange_position_checker
         self.trade_notional_recorder = trade_notional_recorder
+        self.exit_execution_singleflight = exit_execution_singleflight
         self.production_trade_gate_provider = production_trade_gate_provider
 
     def _required_execution_lock(self) -> AbstractAsyncContextManager[Any]:
@@ -700,10 +702,6 @@ class ExecutionService:
         execution_skills_block_reason = self._required_execution_skills_block_reason_provider()
         reconcile_positions = self._required_position_reconciler()
         get_open_positions_context = self._required_open_positions_context_provider()
-        has_matching_local_exit_position = self._required_matching_exit_local_position_checker()
-        has_matching_exchange_exit_position = (
-            self._required_matching_exit_exchange_position_checker()
-        )
         record_trade_notional = self._required_trade_notional_recorder()
         for warning in assessment.warnings:
             results["warnings"].append(
@@ -719,6 +717,7 @@ class ExecutionService:
         model_mode = get_model_execution_mode(model_name)
         stage_started_at: dict[str, float] = {}
         submitted_to_exchange = False
+        exit_execution_lease: Any | None = None
 
         def attach_execution_parameters(source: str) -> None:
             raw_response = decision.raw_response if isinstance(decision.raw_response, dict) else {}
@@ -1350,12 +1349,35 @@ class ExecutionService:
                     execution_guard_reason,
                 )
             else:
-                execution_timeout = 90.0 if decision.is_exit else 60.0
-                submitted_to_exchange = True
-                execution_result = await await_exchange_place_order(
-                    executor,
-                    timeout_seconds=execution_timeout,
-                )
+                if decision.is_exit and self.exit_execution_singleflight is not None:
+                    exit_execution_lease = await self.exit_execution_singleflight.acquire(
+                        model_name=model_name,
+                        execution_mode=model_mode,
+                        decision=decision,
+                        decision_id=decision_db_id,
+                    )
+                if exit_execution_lease is not None and not exit_execution_lease.acquired:
+                    execution_result = self.exit_execution_singleflight.waiting_result(
+                        decision,
+                        exit_execution_lease,
+                    )
+                    await mark_stage(
+                        DecisionStage.EXCHANGE_SUBMIT,
+                        DecisionStageStatus.SKIPPED,
+                        execution_reason_from_result(execution_result),
+                        {
+                            "blocker": "exit_singleflight_wait",
+                            "singleflight_state": exit_execution_lease.state,
+                            "retry_after_seconds": exit_execution_lease.retry_after_seconds,
+                        },
+                    )
+                else:
+                    execution_timeout = 90.0 if decision.is_exit else 60.0
+                    submitted_to_exchange = True
+                    execution_result = await await_exchange_place_order(
+                        executor,
+                        timeout_seconds=execution_timeout,
+                    )
             if submitted_to_exchange and (decision.is_entry or decision.is_exit):
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
@@ -1389,6 +1411,9 @@ class ExecutionService:
                     "本轮按未执行处理，下一轮会继续复盘该仓位。"
                 ),
             )
+            if decision.is_exit and isinstance(execution_result.raw_response, dict):
+                execution_result.raw_response["execution_transport_unknown"] = True
+                execution_result.raw_response["exit_tracking"] = True
             if decision.is_entry or decision.is_exit:
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
@@ -1507,95 +1532,42 @@ class ExecutionService:
             )
 
         if execution_result is None and decision.is_exit:
-            retry_intro = (
-                "平仓裁决已生成，但第一次提交没有返回 OKX 订单结果；"
-                "系统立即同步 OKX 仓位并重试一次平仓，避免错过平仓时机。"
-            )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                retry_intro,
-                {"retry": "exit_missing_execution_result"},
-            )
-            if decision_db_id is not None:
-                await mark_decision_pending_execution(decision_db_id, retry_intro)
-            await log_risk_event(
-                "warning",
-                symbol,
-                f"[{model_name}] {retry_intro}",
-                model_name,
-            )
-            await reconcile_positions("exit missing execution result")
-            exit_positions = await get_open_positions_context()
-            if open_positions is not None:
-                open_positions[:] = exit_positions
-            local_has_position = has_matching_local_exit_position(
-                exit_positions, model_name, decision
-            )
-            exchange_has_position = await has_matching_exchange_exit_position(
-                model_name,
-                decision,
-            )
-            if exchange_has_position is None and not local_has_position:
-                execution_result = rejected_execution_result(
-                    decision,
-                    (
-                        "平仓裁决已生成，但第一次提交没有返回订单结果；系统同步本地持仓后，"
-                        "OKX 持仓快照暂时不可用，无法确认是否仍有可平仓仓位。"
-                        "为避免把查询失败误判为无仓或重复提交平仓单，本轮等待下一轮同步确认。"
+            execution_result = ExecutionResult(
+                order_id="exit_submission_result_unknown",
+                symbol=decision.symbol,
+                side="sell" if decision.action.value == "close_long" else "buy",
+                order_type="market",
+                quantity=0.0,
+                price=0.0,
+                status=OrderStatus.OPEN,
+                raw_response={
+                    "exit_tracking": True,
+                    "execution_transport_unknown": True,
+                    "do_not_persist_order": True,
+                    "message": (
+                        "The exit submission result is unknown. The system will confirm the "
+                        "exchange position before any later retry; no immediate duplicate was sent."
                     ),
-                )
-            elif local_has_position or exchange_has_position is True:
-                try:
-                    retry_executor = await get_okx_executor(model_mode)
-                    execution_result = await await_exchange_place_order(
-                        retry_executor,
-                        timeout_seconds=45.0,
-                        retry=True,
-                    )
-                    if execution_result is not None:
-                        raw = (
-                            execution_result.raw_response
-                            if isinstance(execution_result.raw_response, dict)
-                            else {}
-                        )
-                        raw["exit_missing_result_retry"] = True
-                        raw["retry_reason"] = retry_intro
-                        execution_result.raw_response = raw
-                except TimeoutError:
-                    execution_result = rejected_execution_result(
-                        decision,
-                        (
-                            "平仓重试仍然超时：系统已同步 OKX 仓位并重新提交平仓，"
-                            "但 45 秒内仍没有拿到订单结果。请以 OKX 当前仓位和委托状态为准；"
-                            "下一轮持仓复盘会继续优先处理该仓位。"
-                        ),
-                    )
-                except Exception as e:
-                    error_text = safe_error_text(e, limit=180)
-                    execution_result = rejected_execution_result(
-                        decision,
-                        (
-                            "平仓重试失败：第一次提交没有返回订单结果，系统同步 OKX 仓位后已尝试重提，"
-                            f"但交易接口返回错误：{error_text}"
-                        ),
-                    )
-            else:
-                execution_result = rejected_execution_result(
-                    decision,
-                    (
-                        "平仓裁决已生成，但第一次提交没有返回订单结果；系统随即同步 OKX 仓位，"
-                        "发现本地和 OKX 都已经没有该方向可平仓位，因此没有重复提交平仓单。"
-                    ),
-                )
+                },
+            )
 
-            if execution_result is None:
-                execution_result = rejected_execution_result(
-                    decision,
-                    (
-                        "平仓重试后交易接口仍未返回执行结果。系统已避免把该状态继续标记为等待；"
-                        "下一轮持仓复盘会再次检查 OKX 实际仓位并重新处理。"
-                    ),
+        if (
+            decision.is_exit
+            and exit_execution_lease is not None
+            and exit_execution_lease.acquired
+            and self.exit_execution_singleflight is not None
+        ):
+            try:
+                await self.exit_execution_singleflight.finish(
+                    exit_execution_lease,
+                    execution_result,
+                )
+            except Exception as exc:
+                logger.error(
+                    "failed to finalize persistent exit single-flight state",
+                    symbol=symbol,
+                    model=model_name,
+                    error=safe_error_text(exc),
                 )
 
         missing_result_reason = None
@@ -1608,9 +1580,7 @@ class ExecutionService:
                     execution_result.status.value,
                 )
             )
-            transient_entry_exchange_error = bool(
-                decision.is_entry and is_okx_temporary_service_error(result_text)
-            )
+            transient_exchange_error = is_okx_temporary_service_error(result_text)
             exchange_confirmed = is_exchange_confirmed_execution(execution_result)
             exit_progress = is_exit_progress_execution(execution_result)
             execution_raw = (
@@ -1623,6 +1593,11 @@ class ExecutionService:
                 and execution_raw.get("entry_recovery_only") is True
                 and str(execution_result.exchange_order_id or "").strip()
                 and execution_result.quantity > 0
+            )
+            exit_waiting_confirmation = bool(
+                decision.is_exit
+                and execution_raw.get("exit_tracking")
+                and execution_result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
             )
             confirm_reason = execution_reason_from_result(execution_result)
             local_order_persisted = True
@@ -1696,12 +1671,26 @@ class ExecutionService:
                         "recovery_requested": recovery_requested,
                     },
                 )
+            elif exit_waiting_confirmation:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.PENDING,
+                    confirm_reason,
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                        "singleflight_wait": bool(
+                            execution_raw.get("exit_singleflight_wait")
+                        ),
+                    },
+                )
             else:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
                     (
                         DecisionStageStatus.SKIPPED
-                        if transient_entry_exchange_error
+                        if transient_exchange_error
                         else DecisionStageStatus.FAILED
                     ),
                     confirm_reason,
@@ -1711,7 +1700,7 @@ class ExecutionService:
                         "status": execution_result.status.value,
                         "error_type": (
                             "transient_exchange_error"
-                            if transient_entry_exchange_error
+                            if transient_exchange_error
                             else "execution_not_confirmed"
                         ),
                     },

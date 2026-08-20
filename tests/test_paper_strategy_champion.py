@@ -136,7 +136,7 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     assert "leverage" not in blueprint
 
 
-def test_shadow_artifact_is_paper_eligible_without_live_promotion() -> None:
+def test_negative_quality_shadow_artifact_is_replay_only_without_execution() -> None:
     blueprint = build_model_strategy_blueprint(
         metadata={
             "artifact_version": "shadow-v1",
@@ -156,14 +156,17 @@ def test_shadow_artifact_is_paper_eligible_without_live_promotion() -> None:
     )
 
     assert blueprint["artifact_stage"] == "shadow"
-    assert blueprint["paper_execution_eligible"] is True
+    assert blueprint["paper_execution_eligible"] is False
     assert blueprint["live_execution_permission"] is False
-    assert blueprint["eligible_sides"] == ["long", "short"]
+    assert blueprint["eligible_sides"] == []
+    assert blueprint["model_quality"]["evaluated_sides"] == ["long", "short"]
     assert blueprint["entry_policy"][
         "require_current_fee_after_return_lcb_positive"
-    ] is False
+    ] is True
     assert blueprint["entry_policy"]["require_actual_trade_calibration"] is False
-    assert blueprint["blocking_reasons"] == []
+    assert "trained_model_has_no_positive_fee_after_side" in blueprint[
+        "blocking_reasons"
+    ]
 
 
 def test_challenger_requires_strict_improvement_or_strictly_better_model() -> None:

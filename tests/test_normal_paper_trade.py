@@ -35,6 +35,27 @@ def _support(
         ),
         "loss_probability": 0.4,
         "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": {
+            "local_ml": {
+                "paper_execution_permission": True,
+                "paper_execution_reason": (
+                    "authoritative_fee_after_quality_above_break_even"
+                ),
+                "paper_execution_evidence_source": "test_authoritative_trade",
+                "paper_execution_evidence": {
+                    "sample_count": 20,
+                    "average_return": 0.2,
+                    "return_lcb": 0.1,
+                    "profit_factor": 1.5,
+                    "profit_factor_above_break_even": True,
+                },
+                "break_even_contract": {
+                    "average_return_above_zero": True,
+                    "return_lcb_above_zero": True,
+                    "profit_factor_above_one": True,
+                },
+            }
+        },
         "strong_expert_opposition": False,
     }
 
@@ -95,6 +116,18 @@ def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
     assert selection["selected"] is False
     assert selection["selected_side"] == "neutral"
     assert contract == {}
+
+
+def test_positive_direction_without_quality_permission_cannot_authorize_order() -> None:
+    support = _support("long", expected_net=0.2)
+    support.pop("quant_quality_permissions")
+
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    ) == {}
 
 
 def test_positive_expected_net_with_non_positive_objective_cannot_authorize_order() -> None:

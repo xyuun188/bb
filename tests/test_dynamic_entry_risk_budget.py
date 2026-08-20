@@ -12,6 +12,7 @@ from services.entry_profit_risk_sizing import (
 )
 from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision() -> DecisionOutput:
@@ -132,6 +133,7 @@ def _decision() -> DecisionOutput:
             "objective_net_return_pct": 0.52,
             "loss_probability": 0.25,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )
@@ -376,6 +378,7 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
             "objective_net_return_pct": 0.52,
             "loss_probability": 0.25,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )
@@ -714,6 +717,7 @@ async def test_normal_paper_allows_opposite_side_when_concentration_is_high() ->
             "objective_net_return_pct": 0.52,
             "loss_probability": 0.25,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )

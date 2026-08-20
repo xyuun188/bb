@@ -95,6 +95,57 @@ def _same_number(left: Any, right: Any) -> bool:
         return False
 
 
+def _same_protection_shape(order: dict[str, Any], action: dict[str, Any]) -> bool:
+    """Match an already-created OCO so a retry stays idempotent."""
+
+    return bool(
+        str(order.get("inst_id") or "").upper()
+        == str(action.get("inst_id") or "").upper()
+        and str(order.get("position_side") or "").lower()
+        == str(action.get("position_side") or "").lower()
+        and _same_number(order.get("contracts"), action.get("new_contracts"))
+        and _same_number(order.get("stop_loss_price"), action.get("stop_loss_price"))
+        and _same_number(order.get("take_profit_price"), action.get("take_profit_price"))
+    )
+
+
+def _existing_exact_coverage_subset(
+    orders: list[dict[str, Any]],
+    *,
+    desired_contracts: Any,
+) -> list[dict[str, Any]]:
+    """Find a small exact subset left by an earlier acknowledged replacement."""
+
+    try:
+        desired = float(desired_contracts)
+    except (TypeError, ValueError):
+        return []
+    if desired <= 0:
+        return []
+    ordered = sorted(
+        [item for item in orders if _safe_positive(item.get("contracts"))],
+        key=lambda item: float(item.get("contracts") or 0.0),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    remaining = desired
+    for order in ordered:
+        contracts = float(order.get("contracts") or 0.0)
+        if contracts <= remaining + 1e-9:
+            selected.append(order)
+            remaining -= contracts
+        if abs(remaining) <= 1e-9:
+            return selected
+    return []
+
+
+def _safe_positive(value: Any) -> bool:
+    try:
+        return float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 async def _wait_for_protection_verification(
     executor: Any,
     *,
@@ -416,14 +467,95 @@ async def replace_stuck_protection_amendments(
             }
         )
 
+    # A previous attempt may have received an OKX create acknowledgement but
+    # timed out before the new algo became visible. Reuse an exact existing
+    # shape on the next retry instead of creating another live OCO.
+    available_existing = [
+        order
+        for order in preflight.get("protection_orders", [])
+        if isinstance(order, dict)
+        and str(order.get("algo_id") or "")
+    ]
+    desired_position = next(
+        (
+            _safe_dict(position).get("contracts")
+            for position in preflight.get("positions", [])
+            if isinstance(position, dict)
+            and normalize_trading_symbol(str(position.get("symbol") or "")) == symbol
+            and str(position.get("side") or "").lower() == side
+        ),
+        0.0,
+    )
+    exact_existing = _existing_exact_coverage_subset(
+        available_existing,
+        desired_contracts=desired_position,
+    )
+    if exact_existing:
+        replacement_plan = [
+            {
+                "action": "reuse_existing",
+                "reason": "reuse_acknowledged_replacement_group",
+                "inst_id": str(order.get("inst_id") or first_action.get("inst_id") or ""),
+                "algo_id": str(order.get("algo_id") or ""),
+                "position_side": side,
+                "okx_position_side": str(order.get("okx_position_side") or "net"),
+                "old_contracts": str(order.get("contracts") or "0"),
+                "new_contracts": str(order.get("contracts") or "0"),
+                "stop_loss_price": order.get("stop_loss_price"),
+                "take_profit_price": order.get("take_profit_price"),
+                "rollback": {"action": "none"},
+            }
+            for order in exact_existing
+        ]
+        available_existing = [
+            order
+            for order in available_existing
+            if str(order.get("algo_id") or "")
+            not in {str(item.get("algo_id") or "") for item in exact_existing}
+        ]
+    reused: list[dict[str, Any]] = []
+    pending_create: list[dict[str, Any]] = []
+    for action in replacement_plan:
+        if str(action.get("action") or "") == "reuse_existing":
+            reused.append(
+                {
+                    "action": action,
+                    "created_algo_id": str(action.get("algo_id") or ""),
+                    "create_response": {"already_present": True},
+                    "reused_existing": True,
+                }
+            )
+            continue
+        match = next(
+            (
+                order
+                for order in available_existing
+                if _same_protection_shape(order, action)
+            ),
+            None,
+        )
+        if match is None:
+            pending_create.append(action)
+            continue
+        available_existing.remove(match)
+        reused.append(
+            {
+                "action": action,
+                "created_algo_id": str(match.get("algo_id") or ""),
+                "create_response": {"already_present": True},
+                "reused_existing": True,
+            }
+        )
+
     required_position_fingerprint = str(
         expected_position_fingerprint
         or preflight_report.get("position_inventory_fingerprint")
         or ""
     )
     created: list[dict[str, Any]] = []
+    created.extend(reused)
     try:
-        for action in replacement_plan:
+        for action in pending_create:
             stop_loss_price = float(action.get("stop_loss_price") or 0.0)
             take_profit_price = float(action.get("take_profit_price") or 0.0)
             if stop_loss_price <= 0 or take_profit_price <= 0:
@@ -535,7 +667,10 @@ async def replace_stuck_protection_amendments(
     old_algo_ids = {
         str(order.get("algo_id") or "")
         for order in preflight.get("protection_orders", [])
-        if isinstance(order, dict) and str(order.get("algo_id") or "")
+        if isinstance(order, dict)
+        and str(order.get("algo_id") or "")
+        and str(order.get("algo_id") or "")
+        not in {item["created_algo_id"] for item in reused}
     }
     inst_id = str(first_action.get("inst_id") or "")
     cancel_results_by_id: dict[str, dict[str, Any]] = {}
@@ -609,6 +744,7 @@ async def replace_stuck_protection_amendments(
             ),
             "cancel_verification_attempts": cancel_verification_attempts,
             "applied": True,
+            "reused_existing": bool(item.get("reused_existing")),
         }
         for item in created
     ]

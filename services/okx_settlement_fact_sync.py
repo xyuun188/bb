@@ -15,13 +15,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.account import OkxAccountBill
-from models.trade import OkxPositionHistory
+from models.trade import OkxPositionHistory, Position
 from services.okx_native_facts import (
     OkxNativeAccountBill,
     OkxNativeFactsClient,
@@ -32,6 +32,7 @@ from services.okx_position_history_store import (
     publish_okx_position_history_watermark,
     upsert_okx_position_history_row,
 )
+from services.position_settlement import final_settlement_status_values
 
 logger = structlog.get_logger(__name__)
 
@@ -39,6 +40,7 @@ DEFAULT_SETTLEMENT_FACT_LOOKBACK_HOURS = 72
 DEFAULT_SETTLEMENT_FACT_LIMIT = 100
 DEFAULT_SETTLEMENT_FACT_MAX_PAGES = 5
 DEFAULT_SETTLEMENT_FACT_TIMEOUT_SECONDS = 8.0
+PENDING_SETTLEMENT_INST_BATCH_SIZE = 3
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 ExecutorProvider = Callable[[str], Awaitable[OKXExecutor]]
@@ -60,6 +62,7 @@ class OkxSettlementFactSyncSummary:
     account_bill_inserted_count: int = 0
     account_bill_updated_count: int = 0
     account_bill_unchanged_count: int = 0
+    targeted_pending_settlement_inst_count: int = 0
     completed_stages: tuple[str, ...] = ()
     deferred_stages: tuple[str, ...] = ()
     stage_errors: tuple[str, ...] = ()
@@ -85,6 +88,9 @@ class OkxSettlementFactSyncSummary:
             "account_bill_inserted_count": self.account_bill_inserted_count,
             "account_bill_updated_count": self.account_bill_updated_count,
             "account_bill_unchanged_count": self.account_bill_unchanged_count,
+            "targeted_pending_settlement_inst_count": (
+                self.targeted_pending_settlement_inst_count
+            ),
             "completed_stages": list(self.completed_stages),
             "deferred_stages": list(self.deferred_stages),
             "stage_errors": list(self.stage_errors),
@@ -136,6 +142,7 @@ class OkxSettlementFactSyncService:
         history_rows: list[dict[str, Any]] = []
         account_bills: list[OkxNativeAccountBill] = []
         contract_specs: dict[str, dict[str, Any]] = {}
+        targeted_inst_ids: tuple[str, ...] = ()
         initialized = False
         private_pull_available = False
 
@@ -205,6 +212,26 @@ class OkxSettlementFactSyncService:
             elif initialized:
                 private_pull_available = True
                 native_facts = OkxNativeFactsClient(executor)
+                # Closed local positions awaiting authority are the highest
+                # priority: account-wide history and bills must not consume
+                # the entire round budget before their identity can be pulled.
+                targeted_inst_ids = await self._pending_settlement_inst_ids()
+                if targeted_inst_ids:
+                    targeted_rows_result = await run_stage(
+                        "position_history_targeted_pending_settlements",
+                        lambda: native_facts.fetch_position_history_rows(
+                            inst_ids=targeted_inst_ids,
+                            pos_ids=None,
+                            since=since - timedelta(hours=24),
+                            limit=self.limit,
+                            max_pages=self.max_pages,
+                            strict=True,
+                        ),
+                        cap_seconds=2.0,
+                    )
+                    targeted_rows = list(targeted_rows_result[0] or [])
+                else:
+                    targeted_rows = []
                 history_result = await run_stage(
                     "position_history",
                     lambda: native_facts.fetch_position_history_rows(
@@ -229,6 +256,17 @@ class OkxSettlementFactSyncService:
                     cap_seconds=3.0,
                 )
                 history_rows = list(history_result[0] or [])
+                if targeted_rows:
+                    known = {
+                        okx_position_history_row_identity(row, mode=self.mode)
+                        for row in history_rows
+                    }
+                    history_rows.extend(
+                        row
+                        for row in targeted_rows
+                        if okx_position_history_row_identity(row, mode=self.mode)
+                        not in known
+                    )
                 account_bills = list(bill_result[0] or [])
                 inst_ids = {
                     str(row.get("instId") or "").strip().upper()
@@ -312,6 +350,7 @@ class OkxSettlementFactSyncService:
             account_bill_inserted_count=bill_stats["inserted"],
             account_bill_updated_count=bill_stats["updated"],
             account_bill_unchanged_count=bill_stats["unchanged"],
+            targeted_pending_settlement_inst_count=len(targeted_inst_ids),
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
@@ -332,6 +371,45 @@ class OkxSettlementFactSyncService:
                 for value in result.scalars().all()
                 if str(value or "").strip()
             }
+
+    async def _pending_settlement_inst_ids(self) -> tuple[str, ...]:
+        """Return instruments with local closed rows awaiting OKX authority."""
+
+        async with self.session_context_factory() as session:
+            final_statuses = final_settlement_status_values()
+            result = await session.execute(
+                select(
+                    Position.okx_inst_id,
+                    Position.settlement_synced_at,
+                    Position.closed_at,
+                    Position.id,
+                )
+                .where(
+                    Position.execution_mode == self.mode,
+                    Position.is_open.is_(False),
+                    or_(
+                        Position.settlement_status.is_(None),
+                        Position.settlement_status.notin_(final_statuses),
+                    ),
+                    Position.okx_inst_id.is_not(None),
+                )
+                .order_by(
+                    Position.settlement_synced_at.asc(),
+                    Position.closed_at.asc(),
+                    Position.id.asc(),
+                )
+            )
+            selected: list[str] = []
+            seen: set[str] = set()
+            for row in result.all():
+                value = str(row[0] or "").strip().upper()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                selected.append(value)
+                if len(selected) >= PENDING_SETTLEMENT_INST_BATCH_SIZE:
+                    break
+            return tuple(selected)
 
     async def _persist_contract_specs(
         self,

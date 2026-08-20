@@ -10,6 +10,26 @@ from data_feed.feature_vector import FeatureVector
 SYMBOL = "BTC/USDT"
 
 
+def _quality_governance() -> dict[str, object]:
+    return {
+        "paper_execution_permission": True,
+        "paper_execution_reason": "authoritative_fee_after_quality_above_break_even",
+        "paper_execution_evidence_source": "test_authoritative_trade",
+        "paper_execution_evidence": {
+            "sample_count": 20,
+            "average_return": 0.2,
+            "return_lcb": 0.1,
+            "profit_factor": 1.5,
+            "profit_factor_above_break_even": True,
+        },
+        "break_even_contract": {
+            "average_return_above_zero": True,
+            "return_lcb_above_zero": True,
+            "profit_factor_above_one": True,
+        },
+    }
+
+
 def _coordinator() -> EnsembleCoordinator:
     return EnsembleCoordinator(ModelRegistry())
 
@@ -90,6 +110,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                     {
                         "source": "server_profit",
@@ -97,6 +118,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                 ]
             },
@@ -108,6 +130,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": -0.2,
                         "objective_expected_return_pct": -0.3,
                         "horizon_minutes": 30,
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                     {
                         "source": "server_profit",
@@ -115,6 +138,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": -0.2,
                         "objective_expected_return_pct": -0.3,
                         "horizon_minutes": 30,
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                 ]
             },
@@ -244,6 +268,7 @@ def _training_evidence(
                 "raw_expected_return_pct": raw_return,
                 "objective_expected_return_pct": objective_return,
                 "horizon_minutes": horizon_minutes,
+                "paper_return_quality_governance": _quality_governance(),
             }
             for source in sources[:count]
         ]
@@ -457,6 +482,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "return_distribution_contract": {
                             "tail_loss_probability": 0.3
                         },
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                     {
                         "source": "server_profit",
@@ -468,6 +494,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "return_distribution_contract": {
                             "tail_loss_probability": 0.3
                         },
+                        "paper_return_quality_governance": _quality_governance(),
                     },
                 ]
             },
@@ -480,6 +507,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "raw_expected_return_pct": -0.2,
                         "objective_expected_return_pct": -0.3,
                         "horizon_minutes": 30,
+                        "paper_return_quality_governance": _quality_governance(),
                     }
                     for source in ("local_ml", "server_profit")
                 ]

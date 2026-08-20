@@ -317,6 +317,42 @@ def test_paper_continuous_weights_can_change_direction_without_affecting_live() 
     assert live == equal
 
 
+def test_negative_fee_after_source_quality_cannot_authorize_paper_direction() -> None:
+    context = _context(
+        tools={"time_series_prediction": _paper_payload(-0.5, 0.8)},
+        strategy={
+            "execution_mode": "paper",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "timeseries": {
+                        "effective_multiplier": 0.8,
+                        "paper_execution_permission": False,
+                        "paper_execution_reason": "fee_after_return_lcb_not_positive",
+                        "paper_execution_blockers": [
+                            "fee_after_return_lcb_not_positive"
+                        ],
+                    }
+                },
+            },
+        },
+    )
+
+    assert context["preferred_side"] == "neutral"
+    assert context["decision_source_count"] == 0
+    short = next(
+        item
+        for item in context["short"]["evidence"]
+        if item["source"] == "timeseries"
+    )
+    assert short["observation_only"] is True
+    assert short["decision_eligible"] is False
+    assert short["eligibility_reason"] == "fee_after_return_lcb_not_positive"
+    assert context["continuous_model_weighting"]["quality_permissions"][
+        "timeseries"
+    ]["paper_execution_permission"] is False
+
+
 def test_paper_mixed_horizons_select_highest_weight_native_cohort() -> None:
     server = _paper_payload(0.1, 0.7)
     for side in ("long", "short"):

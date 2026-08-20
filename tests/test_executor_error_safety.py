@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -1342,6 +1343,12 @@ class _NativeFullCloseFillPendingCcxt(_ExitMaxMarketSizeCcxt):
     async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
         self.close_position_calls.append(dict(params))
         self.position_contracts = 0.0
+        return {"code": "0", "data": [{"clOrdId": "native-close-client", "sCode": "0"}]}
+
+
+class _NativeFullCloseUnconfirmedCcxt(_ExitMaxMarketSizeCcxt):
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
         return {"code": "0", "data": [{"clOrdId": "native-close-client", "sCode": "0"}]}
 
 
@@ -2715,6 +2722,35 @@ async def test_okx_native_full_close_without_fill_order_id_waits_for_backfill() 
     assert result.quantity == 100.0
     assert result.raw_response["requires_okx_fill_backfill"] is True
     assert result.raw_response["position_contracts_after"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_okx_native_full_close_unconfirmed_is_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _NativeFullCloseUnconfirmedCcxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+
+    first, second = await asyncio.gather(
+        executor.place_order(decision),
+        executor.place_order(decision),
+    )
+
+    assert first.status == OrderStatus.OPEN
+    assert first.order_id == "native-close-client"
+    assert second.status == OrderStatus.OPEN
+    assert second.order_id == "exit_singleflight_wait"
+    assert second.raw_response["exit_singleflight_wait"] is True
+    assert second.raw_response["do_not_persist_order"] is True
+    assert len(exchange.close_position_calls) == 1
 
 
 @pytest.mark.asyncio

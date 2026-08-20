@@ -29,6 +29,7 @@ from tests.legacy_paper_contract_fixtures import (
 from tests.legacy_paper_contract_fixtures import (
     build_legacy_paper_training_contract as build_paper_training_contract,
 )
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
@@ -149,6 +150,7 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "objective_net_return_pct": 0.4,
             "loss_probability": 0.25,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )
@@ -1349,6 +1351,67 @@ async def test_confirmed_exit_rebalances_protection_after_position_persistence()
         "verified": True,
     }
     assert raw_updates[-1]["post_exit_protection_rebalance"]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() -> None:
+    calls = 0
+
+    class UnknownExitExecutor:
+        async def place_order(
+            self,
+            _decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            return None
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return UnknownExitExecutor()
+
+    service = _test_execution_service(okx_executor_provider=okx_executor_provider)
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ZAMA/USDT",
+        action=Action.CLOSE_SHORT,
+        confidence=1.0,
+        reasoning="hard stop",
+        position_size_pct=1.0,
+        suggested_leverage=1.0,
+        raw_response={
+            "dynamic_exit_policy": {
+                "eligible": True,
+                "close_fraction": 1.0,
+                "policy_provenance": {
+                    "source": "test",
+                    "observation_window": "current_position",
+                    "sample_count": 1,
+                    "generated_at": "2026-08-20T00:00:00+00:00",
+                    "strategy_version": "test",
+                    "fallback_reason": "",
+                },
+            }
+        },
+    )
+
+    result = await service.execute_candidate(
+        "ZAMA/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        369549,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert calls == 1
+    assert result is not None
+    assert result.status == OrderStatus.OPEN
+    assert result.order_id == "exit_submission_result_unknown"
+    assert result.raw_response["execution_transport_unknown"] is True
+    assert result.raw_response["do_not_persist_order"] is True
 
 
 @pytest.mark.asyncio

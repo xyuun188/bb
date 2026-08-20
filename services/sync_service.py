@@ -37,6 +37,7 @@ from services.current_position_management import (
 )
 from services.entry_fee_provider import entry_fee_from_orders
 from services.exchange_position_state import parse_exchange_position_snapshot
+from services.exit_execution_singleflight import preserve_exit_execution_intent
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
 from services.position_open_time import (
@@ -2715,6 +2716,7 @@ class OkxSyncService:
                 facts,
                 previous_contract=previous,
             )
+            contract = preserve_exit_execution_intent(previous, contract)
             for position, authoritative_entry_fee in fragment_entry_fees:
                 if entry_fee_evidence_complete:
                     position.entry_fee = authoritative_entry_fee

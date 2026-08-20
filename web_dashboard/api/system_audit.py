@@ -2149,6 +2149,7 @@ async def _okx_authoritative_sync_summary() -> dict[str, Any]:
                 lookback_hours=OKX_AUTHORITATIVE_SYNC_AUDIT_HOURS,
                 limit=OKX_AUTHORITATIVE_SYNC_AUDIT_LIMIT,
                 timeout_seconds=OKX_AUTHORITATIVE_SYNC_TIMEOUT_SECONDS,
+                recent_fills_only=True,
             ).collect(),
             timeout=timeout_budget,
         )
@@ -2357,6 +2358,8 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
     split_rows: list[dict[str, Any]] = []
     local_only_rows: list[dict[str, Any]] = []
     exchange_only_rows: list[dict[str, Any]] = []
+    pending_local_only_rows: list[dict[str, Any]] = []
+    pending_exchange_only_rows: list[dict[str, Any]] = []
     checked_modes: list[str] = []
     unavailable_modes: list[dict[str, str]] = []
     local_open_count = 0
@@ -2364,6 +2367,22 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
     root_cause_counts: Counter[str] = Counter()
     okx_pos_side_counts: Counter[str] = Counter()
     okx_side_inference_counts: Counter[str] = Counter()
+    authoritative_sync = _cached_okx_authoritative_sync_summary() or {}
+    authoritative_mode = str(authoritative_sync.get("mode") or "").lower().strip()
+    pending_position_keys: dict[str, set[tuple[str, str, str]]] = {
+        "okx_open_position_pending_local_sync": set(),
+        "local_position_pending_okx_close_sync": set(),
+    }
+    for observation in _safe_list(authoritative_sync.get("observations")):
+        if not isinstance(observation, dict):
+            continue
+        kind = str(observation.get("kind") or "")
+        if kind not in pending_position_keys or not authoritative_mode:
+            continue
+        symbol = normalize_trading_symbol(observation.get("symbol"))
+        side = str(observation.get("side") or "").lower().strip()
+        if symbol and side in {"long", "short"}:
+            pending_position_keys[kind].add((authoritative_mode, symbol, side))
 
     for mode in ("paper", "live"):
         executor = dashboard_api._dashboard_okx_executor_for_mode(mode)
@@ -2416,6 +2435,27 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             local_keys.add(key)
             snapshot = exchange_snapshots.get(key)
             if not snapshot:
+                if (
+                    mode,
+                    key[0],
+                    key[1],
+                ) in pending_position_keys["local_position_pending_okx_close_sync"]:
+                    pending_local_only_rows.append(
+                        {
+                            "mode": mode,
+                            "position_id": int(position.id or 0),
+                            "symbol": key[0],
+                            "side": key[1],
+                            "local_quantity": round(_safe_float(position.quantity), 8),
+                            "local_entry_price": round(_safe_float(position.entry_price), 8),
+                            "local_price": round(_safe_float(position.current_price), 8),
+                            "local_unrealized_pnl": round(
+                                _safe_float(position.unrealized_pnl), 8
+                            ),
+                            "root_cause": "local_position_pending_okx_close_sync",
+                        }
+                    )
+                    continue
                 root_cause_counts["local_open_position_missing_on_okx"] += 1
                 local_only_rows.append(
                     {
@@ -2482,6 +2522,24 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
         for key, snapshot in sorted(exchange_snapshots.items()):
             if key in local_keys:
                 continue
+            if (
+                mode,
+                key[0],
+                key[1],
+            ) in pending_position_keys["okx_open_position_pending_local_sync"]:
+                pending_exchange_only_rows.append(
+                    {
+                        "mode": mode,
+                        "symbol": key[0],
+                        "side": key[1],
+                        "okx_contracts": round(_safe_float(snapshot.get("contracts")), 8),
+                        "okx_contract_size": round(
+                            _safe_float(snapshot.get("contract_size")), 8
+                        ),
+                        "root_cause": "okx_open_position_pending_local_sync",
+                    }
+                )
+                continue
             root_cause_counts["okx_open_position_missing_locally"] += 1
             valuation = exchange_position_display_valuation(
                 snapshot,
@@ -2511,9 +2569,19 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             )
 
     mismatch_count = len(split_rows) + len(local_only_rows) + len(exchange_only_rows)
+    pending_sync_count = len(pending_local_only_rows) + len(pending_exchange_only_rows)
     root_cause_summary = {
-        "status": "dirty" if mismatch_count else "incomplete" if unavailable_modes else "clean",
+        "status": (
+            "dirty"
+            if mismatch_count
+            else "incomplete"
+            if unavailable_modes
+            else "synchronizing"
+            if pending_sync_count
+            else "clean"
+        ),
         "mismatch_count": mismatch_count,
+        "pending_sync_count": pending_sync_count,
         "split_count": len(split_rows),
         "local_only_count": len(local_only_rows),
         "exchange_only_count": len(exchange_only_rows),
@@ -2536,7 +2604,11 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             else (
                 "部分模式暂时无法读取 OKX 持仓快照。"
                 if unavailable_modes
-                else "平台持仓价格与 OKX 持仓快照一致。"
+                else (
+                    "OKX 与本地持仓正在完成权威事实同步。"
+                    if pending_sync_count
+                    else "平台持仓价格与 OKX 持仓快照一致。"
+                )
             )
         ),
         details={
@@ -2548,6 +2620,7 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             "split_count": len(split_rows),
             "local_only_count": len(local_only_rows),
             "exchange_only_count": len(exchange_only_rows),
+            "pending_sync_count": pending_sync_count,
             "price_gap_warn_pct": POSITION_PRICE_SPLIT_WARN_PCT * 100,
             "pnl_gap_warn_usdt": POSITION_PNL_SPLIT_WARN_USDT,
             "root_cause_summary": root_cause_summary,
@@ -2556,6 +2629,8 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             "splits": split_rows[:12],
             "local_only_positions": local_only_rows[:12],
             "exchange_only_positions": exchange_only_rows[:12],
+            "pending_local_only_positions": pending_local_only_rows[:12],
+            "pending_exchange_only_positions": pending_exchange_only_rows[:12],
             "read_only": True,
             "audit_only": True,
             "live_repair_mutation": False,
@@ -2564,6 +2639,7 @@ async def _position_price_integrity_audit() -> dict[str, Any]:
             {"label": "价格/浮盈分裂", "value": len(split_rows)},
             {"label": "本地多余持仓", "value": len(local_only_rows)},
             {"label": "OKX多余持仓", "value": len(exchange_only_rows)},
+            {"label": "同步中", "value": pending_sync_count},
             {"label": "本地开仓", "value": local_open_count},
             {"label": "OKX持仓", "value": exchange_open_count},
         ],

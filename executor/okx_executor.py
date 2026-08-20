@@ -67,6 +67,10 @@ OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS = 60.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
 OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO = 100.0
 OKX_MAX_LEVERAGE_RECOVERY_ATTEMPTS = 7
+OKX_EXIT_SINGLEFLIGHT_UNCONFIRMED_SECONDS = 120.0
+OKX_EXIT_SINGLEFLIGHT_UNKNOWN_SECONDS = 180.0
+OKX_EXIT_SINGLEFLIGHT_TEMPORARY_OUTAGE_SECONDS = 60.0
+OKX_EXIT_SINGLEFLIGHT_COMPLETED_SECONDS = 30.0
 
 
 class TokenBucket:
@@ -123,6 +127,8 @@ class OKXExecutor(AbstractExecutor):
         self._private_api_circuit_failure_count = 0
         self._private_api_circuit_open_until = 0.0
         self._private_api_circuit_probe_in_flight = False
+        self._exit_submission_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._exit_submission_states: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     @property
     def executor_mode(self) -> str:
@@ -732,6 +738,58 @@ class OKXExecutor(AbstractExecutor):
         )
 
     async def place_order(
+        self,
+        decision: DecisionOutput,
+        account_id: str | None = None,
+        override_balance: float | None = None,
+    ) -> ExecutionResult:
+        if not decision.is_exit:
+            return await self._place_order_once(
+                decision,
+                account_id=account_id,
+                override_balance=override_balance,
+            )
+
+        key = self._exit_submission_key(decision)
+        lock = self._exit_submission_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            active = self._exit_submission_states.get(key) or {}
+            retry_after = self._safe_float(active.get("retry_after_monotonic"), 0.0)
+            now = time.monotonic()
+            if retry_after > now:
+                return self._exit_singleflight_wait_result(
+                    decision,
+                    state=active,
+                    retry_after_seconds=retry_after - now,
+                )
+            self._exit_submission_states.pop(key, None)
+
+            try:
+                result = await self._place_order_once(
+                    decision,
+                    account_id=account_id,
+                    override_balance=override_balance,
+                )
+            except asyncio.CancelledError:
+                self._set_exit_submission_state(
+                    key,
+                    state="submitted_result_unknown",
+                    delay_seconds=OKX_EXIT_SINGLEFLIGHT_UNKNOWN_SECONDS,
+                )
+                raise
+            except Exception as exc:
+                if is_okx_temporary_service_error(safe_error_text(exc)):
+                    self._set_exit_submission_state(
+                        key,
+                        state="exchange_temporarily_unavailable",
+                        delay_seconds=OKX_EXIT_SINGLEFLIGHT_TEMPORARY_OUTAGE_SECONDS,
+                    )
+                raise
+
+            self._remember_exit_submission_result(key, result)
+            return result
+
+    async def _place_order_once(
         self,
         decision: DecisionOutput,
         account_id: str | None = None,
@@ -2308,6 +2366,93 @@ class OKXExecutor(AbstractExecutor):
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
 
+    def _exit_submission_key(self, decision: DecisionOutput) -> tuple[str, str, str]:
+        target_side = "long" if decision.action == Action.CLOSE_LONG else "short"
+        return (
+            self.executor_mode,
+            normalize_trading_symbol(decision.symbol),
+            target_side,
+        )
+
+    def _set_exit_submission_state(
+        self,
+        key: tuple[str, str, str],
+        *,
+        state: str,
+        delay_seconds: float,
+        result: ExecutionResult | None = None,
+    ) -> None:
+        self._exit_submission_states[key] = {
+            "state": state,
+            "retry_after_monotonic": time.monotonic() + max(float(delay_seconds), 0.0),
+            "price": self._safe_float(getattr(result, "price", 0.0), 0.0),
+            "order_id": str(getattr(result, "exchange_order_id", "") or "").strip() or None,
+        }
+
+    def _remember_exit_submission_result(
+        self,
+        key: tuple[str, str, str],
+        result: ExecutionResult,
+    ) -> None:
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        rendered = " ".join(
+            str(value or "")
+            for value in (raw.get("error"), raw.get("raw_error"), raw, result.order_id)
+        )
+        if is_okx_temporary_service_error(rendered):
+            self._set_exit_submission_state(
+                key,
+                state="exchange_temporarily_unavailable",
+                delay_seconds=OKX_EXIT_SINGLEFLIGHT_TEMPORARY_OUTAGE_SECONDS,
+                result=result,
+            )
+            return
+        if result.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
+            self._set_exit_submission_state(
+                key,
+                state="submitted_unconfirmed",
+                delay_seconds=OKX_EXIT_SINGLEFLIGHT_UNCONFIRMED_SECONDS,
+                result=result,
+            )
+            return
+        if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and result.quantity > 0:
+            self._set_exit_submission_state(
+                key,
+                state="exchange_progress_confirmed",
+                delay_seconds=OKX_EXIT_SINGLEFLIGHT_COMPLETED_SECONDS,
+                result=result,
+            )
+
+    def _exit_singleflight_wait_result(
+        self,
+        decision: DecisionOutput,
+        *,
+        state: dict[str, Any],
+        retry_after_seconds: float,
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            order_id="exit_singleflight_wait",
+            symbol=decision.symbol,
+            side="sell" if decision.action == Action.CLOSE_LONG else "buy",
+            order_type="market",
+            quantity=0.0,
+            price=self._safe_float(state.get("price"), 0.0),
+            status=OrderStatus.OPEN,
+            exchange_order_id=str(state.get("order_id") or "").strip() or None,
+            timestamp=datetime.now(UTC),
+            raw_response={
+                "exit_tracking": True,
+                "exit_singleflight_wait": True,
+                "do_not_persist_order": True,
+                "singleflight_state": str(state.get("state") or "waiting"),
+                "retry_after_seconds": round(max(retry_after_seconds, 0.0), 3),
+                "message": (
+                    "A previous exit submission for this position is still awaiting "
+                    "exchange confirmation. No duplicate exit was submitted."
+                ),
+            },
+        )
+
     def _retryable_attached_protection_rejection_code(
         self,
         error: BaseException,
@@ -2450,6 +2595,8 @@ class OKXExecutor(AbstractExecutor):
         try:
             response = await self._with_retry(close_position, request_params)
         except ExchangeAPIError as exc:
+            if is_okx_temporary_service_error(safe_error_text(exc)):
+                raise
             logger.warning(
                 "OKX native full close failed; will use reduce-only market orders",
                 symbol=okx_symbol,

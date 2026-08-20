@@ -315,6 +315,7 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "strong_expert_opposition",
             "blocking_reasons",
             "production_permission",
+            "quant_quality_permissions",
         )
     }
 
@@ -403,6 +404,24 @@ def assess_directional_entry_support(
         }
     )
     quant_families = sorted(str(item["family"]) for item in directional_families)
+    selected_evidence = _dict(competition.get(side)).get("evidence")
+    selected_evidence = selected_evidence if isinstance(selected_evidence, list) else []
+    quant_quality_permissions: dict[str, dict[str, Any]] = {}
+    for value in selected_evidence:
+        row = _dict(value)
+        source = str(row.get("source") or "")
+        governance = _dict(row.get("paper_return_quality_governance"))
+        if source in quantitative_sources and governance:
+            quant_quality_permissions[source] = {
+                key: governance.get(key)
+                for key in (
+                    "paper_execution_permission",
+                    "paper_execution_reason",
+                    "paper_execution_evidence_source",
+                    "paper_execution_evidence",
+                    "break_even_contract",
+                )
+            }
     expected_net_return_pct = _float(quantitative.get("expected_net_return_pct"))
     objective_net_return_pct = _float(quantitative.get("objective_net_return_pct"))
     loss_probability = _float(quantitative.get("loss_probability"))
@@ -506,6 +525,7 @@ def assess_directional_entry_support(
             if str(item.get("family") or "")
         ),
         "quant_family_summaries": family_summaries,
+        "quant_quality_permissions": quant_quality_permissions,
         "aligned_expert_count": len(aligned),
         "opposition_expert_count": len(opposition),
         "hold_expert_count": len(holds),

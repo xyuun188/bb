@@ -222,6 +222,24 @@ def _attach_funding_projection(
     }
 
 
+def _paper_quant_quality_permissions(
+    strategy_mode: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    strategy = _safe_dict(strategy_mode)
+    if str(strategy.get("execution_mode") or "").lower() != "paper":
+        return {}
+    report = _safe_dict(strategy.get("continuous_model_weights"))
+    if report.get("applied") is not True:
+        return {}
+    rows = _safe_dict(report.get("quant_source_weights"))
+    return {
+        name: _safe_dict(row)
+        for name, row in rows.items()
+        if name in {"local_ml", "server_profit", "timeseries", "sentiment"}
+        and "paper_execution_permission" in _safe_dict(row)
+    }
+
+
 def _training_side_summary(
     values: list[dict[str, Any]],
     selected_horizon_minutes: float | None,
@@ -426,11 +444,26 @@ class EntryDirectionCompetitionPolicy:
                 item["observation_only"] = True
                 item["eligibility_reason"] = authorization.get("reason")
         quant_weights = _paper_quant_weights(strategy_mode)
+        quant_quality_permissions = _paper_quant_quality_permissions(strategy_mode)
         if quant_weights:
             for side in ("long", "short"):
                 for item in evidence[side]:
                     source = str(item.get("source") or "")
                     item["continuous_weight_multiplier"] = quant_weights.get(source, 1.0)
+                    quality_permission = _safe_dict(
+                        quant_quality_permissions.get(source)
+                    )
+                    if not quality_permission:
+                        continue
+                    item["paper_return_quality_governance"] = quality_permission
+                    if quality_permission.get("paper_execution_permission") is True:
+                        continue
+                    item["decision_eligible"] = False
+                    item["aggregate_eligible"] = False
+                    item["observation_only"] = True
+                    item["eligibility_reason"] = quality_permission.get(
+                        "paper_execution_reason"
+                    )
         all_rows = [item for side in ("long", "short") for item in evidence[side]]
         authorized_horizon, authorized_horizon_source = _authorized_prediction_horizon(
             ml_signal_context,
@@ -584,6 +617,7 @@ class EntryDirectionCompetitionPolicy:
                 "applied": True,
                 "execution_scope": "paper_only",
                 "weights": quant_weights,
+                "quality_permissions": quant_quality_permissions,
                 "fallback": "none",
             }
         return result

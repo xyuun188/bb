@@ -7,6 +7,7 @@ from services.normal_paper_trade import (
     build_normal_paper_trade_contract,
 )
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision(action: Action) -> DecisionOutput:
@@ -117,6 +118,7 @@ def _attach_normal_paper(
                 "objective_net_return_pct": 0.1,
                 "loss_probability": 0.4,
                 "quant_evidence_families": ["local_ml"],
+                "quant_quality_permissions": paper_quality_permissions(),
                 "strong_expert_opposition": False,
             },
         )

@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from services.production_source_health import summarize_production_source_health
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision(
@@ -36,6 +37,7 @@ def _decision(
                 "prediction_horizon_minutes": 15,
                 "expected_net_return_pct": 0.1,
                 "objective_net_return_pct": 0.05,
+                "quant_quality_permissions": paper_quality_permissions(),
             },
         )
     return decision

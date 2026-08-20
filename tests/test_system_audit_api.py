@@ -4770,6 +4770,99 @@ async def test_position_price_integrity_reports_unmatched_okx_and_local_position
     assert details["live_repair_mutation"] is False
 
 
+@pytest.mark.asyncio
+async def test_position_price_integrity_treats_authoritative_sync_grace_as_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'position-price-pending.db').as_posix()}",
+    )
+    await init_db()
+
+    class FakeExecutor:
+        async def get_positions_strict(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "symbol": "ETH/USDT:USDT",
+                    "side": "short",
+                    "contracts": 2.0,
+                    "markPrice": 90.0,
+                    "entryPrice": 100.0,
+                    "info": {
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "short",
+                        "pos": "-2",
+                        "ctVal": "1",
+                        "avgPx": "100",
+                        "markPx": "90",
+                        "upl": "20",
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(
+        dashboard_api,
+        "_dashboard_okx_executor_for_mode",
+        lambda mode: FakeExecutor() if mode == "paper" else None,
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_okx_authoritative_sync_cache",
+        (
+            system_audit._now(),
+            {
+                "mode": "paper",
+                "observations": [
+                    {
+                        "kind": "local_position_pending_okx_close_sync",
+                        "symbol": "BTC/USDT",
+                        "side": "long",
+                    },
+                    {
+                        "kind": "okx_open_position_pending_local_sync",
+                        "symbol": "ETH/USDT",
+                        "side": "short",
+                    },
+                ],
+            },
+        ),
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="long",
+                    quantity=1.0,
+                    entry_price=100.0,
+                    current_price=100.0,
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                    is_open=True,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+        card = await system_audit._position_price_integrity_audit()
+    finally:
+        await close_db()
+
+    details = card["details"]
+    root = details["root_cause_summary"]
+    assert card["status"] == "ok"
+    assert root["status"] == "synchronizing"
+    assert root["mismatch_count"] == 0
+    assert root["pending_sync_count"] == 2
+    assert details["pending_local_only_positions"][0]["symbol"] == "BTC/USDT"
+    assert details["pending_exchange_only_positions"][0]["symbol"] == "ETH/USDT"
+
+
 def test_audit_nodes_use_issue_state_for_display_status() -> None:
     cards = [
         system_audit._audit_card(

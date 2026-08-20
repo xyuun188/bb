@@ -14,18 +14,21 @@ from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     legacy_normal_paper_v2_trade_contract_reasons,
     legacy_normal_paper_v3_trade_contract_reasons,
     legacy_normal_paper_v4_trade_contract_reasons,
+    legacy_normal_paper_v5_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
     OKX_PROTECTION_EXECUTION_VERSION,
     okx_minimum_order_notional_usdt,
 )
+from services.okx_sync_policy import AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
 from services.paper_bootstrap_canary import (
     PAPER_BOOTSTRAP_CANARY_VERSION,
     PAPER_BOOTSTRAP_MIN_FILL_DRIFT_RESERVE_FRACTION,
@@ -60,9 +63,9 @@ PARTIAL_FILL_SYNC_STATUSES = {
     "okx_fills_history_confirmed",
     "okx_order_detail_confirmed",
 }
-AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS = 10 * 60
 AUTHORITATIVE_FILL_SYNC_PENDING_REASONS = {
     "filled_order_okx_fill_identity_incomplete",
+    "filled_order_contract_size_not_okx_public_instruments",
 }
 OBSOLETE_POLICY_FIELDS = {
     "entry_evidence",
@@ -1082,6 +1085,9 @@ def validate_normal_paper_entry_contract(
     legacy_objective_v4 = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
     )
+    legacy_quality_v5 = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_fixed_leverage
@@ -1089,6 +1095,8 @@ def validate_normal_paper_entry_contract(
         if allow_legacy_settlement and legacy_dynamic_v3
         else legacy_normal_paper_v4_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_objective_v4
+        else legacy_normal_paper_v5_trade_contract_reasons(normal_trade)
+        if allow_legacy_settlement and legacy_quality_v5
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 

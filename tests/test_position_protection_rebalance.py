@@ -279,6 +279,29 @@ async def test_acknowledged_but_unapplied_amend_uses_verified_replacement(
 
 
 @pytest.mark.asyncio
+async def test_retry_reuses_exact_existing_coverage_without_creating_more_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(position_protection_rebalance, "PROTECTION_VERIFY_DELAY_SECONDS", 0)
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("5", "2"),
+        ignored_amend_algo_id="algo-1",
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert executor.protection_contracts == ["5"]
+    assert executor.create_calls == []
+    assert executor.cancel_calls[-1] == {
+        "inst_id": "IRYS-USDT-SWAP",
+        "algo_id": "algo-2",
+    }
+    assert result["applied_actions"][-1]["reused_existing"] is True
+
+
+@pytest.mark.asyncio
 async def test_stuck_split_oco_replacement_is_created_and_verified_as_one_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,8 +337,8 @@ async def test_mixed_resize_and_delta_plan_replaces_complete_group_atomically(
     assert result["verified"] is True
     assert result["fallback_reason"] == "mixed_protection_plan_create_before_cancel"
     assert executor.amend_calls == []
-    assert len(executor.create_calls) == 9
-    assert len(executor.cancel_calls) == 8
+    assert executor.create_calls == []
+    assert executor.cancel_calls
     assert all(call["algo_id"] for call in executor.cancel_calls)
     assert sum(float(value) for value in executor.protection_contracts) == pytest.approx(3.44)
     assert result["after"]["coverage_mismatches"] == []
@@ -347,9 +370,8 @@ async def test_mixed_replacement_drops_below_minimum_slice_without_zero_size_cre
     assert result["verified"] is True
     assert result["fallback_reason"] == "mixed_protection_plan_create_before_cancel"
     assert executor.amend_calls == []
-    assert len(executor.create_calls) == 9
-    assert all(call["contracts"] >= 0.01 for call in executor.create_calls)
-    assert len(executor.cancel_calls) == 9
+    assert executor.create_calls == []
+    assert executor.cancel_calls
     assert sum(float(value) for value in executor.protection_contracts) == pytest.approx(3.0)
     assert result["after"]["coverage_mismatches"] == []
 

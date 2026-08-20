@@ -11,7 +11,7 @@ from sqlalchemy import event, select
 from config.settings import settings
 from db.session import close_db, get_engine, get_session_ctx, init_db
 from models.account import OkxAccountBill
-from models.trade import OkxPositionHistory
+from models.trade import OkxPositionHistory, Position
 from services import okx_position_history_store as position_history_store
 from services import okx_settlement_fact_sync as settlement_fact_sync_module
 from services.okx_position_history_store import (
@@ -27,12 +27,15 @@ class _FakeCcxt:
         *,
         history_rows: list[dict[str, Any]],
         bills: list[dict[str, Any]],
+        history_rows_by_inst_id: dict[str, list[dict[str, Any]]] | None = None,
         delay_seconds: float = 0.0,
     ) -> None:
         self.history_rows = history_rows
+        self.history_rows_by_inst_id = history_rows_by_inst_id or {}
         self.bills = bills
         self.delay_seconds = delay_seconds
         self.calls: list[str] = []
+        self.history_params: list[dict[str, Any]] = []
         self.active_private_calls = 0
         self.max_active_private_calls = 0
 
@@ -54,8 +57,13 @@ class _FakeCcxt:
         finally:
             self.active_private_calls -= 1
 
-    async def privateGetAccountPositionsHistory(self, _params: dict[str, Any]) -> dict[str, Any]:
-        return await self._private_response("position_history", self.history_rows)
+    async def privateGetAccountPositionsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.history_params.append(dict(params))
+        rows = self.history_rows_by_inst_id.get(
+            str(params.get("instId") or "").upper(),
+            self.history_rows,
+        )
+        return await self._private_response("position_history", rows)
 
     async def privateGetAccountBills(self, _params: dict[str, Any]) -> dict[str, Any]:
         return await self._private_response("account_bills", self.bills)
@@ -193,6 +201,7 @@ async def test_settlement_fact_sync_mirrors_history_and_funding_bills(
 
         assert report["status"] == "ok"
         assert report["position_history_count"] == 1
+        assert report["targeted_pending_settlement_inst_count"] == 0
         assert report["position_history_inserted_count"] == 1
         assert report["account_bill_count"] == 1
         assert report["account_bill_inserted_count"] == 1
@@ -206,6 +215,90 @@ async def test_settlement_fact_sync_mirrors_history_and_funding_bills(
         assert history.raw_row["_bb_contract_spec"]["ctVal"] == "1"
         assert stored_bill.source == "okx_settlement_fact_mirror"
         assert stored_bill.funding_fee == pytest.approx(-0.03)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_settlement_fact_sync_targeted_pull_covers_pending_local_instrument(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-targeted.db")
+    now = datetime.now(UTC)
+    history_row = {
+        "instId": "SUI-USDT-SWAP",
+        "posId": "sui-pos-1",
+        "posSide": "short",
+        "type": "2",
+        "cTime": _ms(now - timedelta(hours=30)),
+        "uTime": _ms(now - timedelta(hours=29)),
+        "openAvgPx": "1.1",
+        "closeAvgPx": "1.0",
+        "openMaxPos": "100",
+        "closeTotalPos": "100",
+        "realizedPnl": "10.0",
+        "fundingFee": "0.2",
+        "fee": "-0.1",
+    }
+    ccxt = _FakeCcxt(
+        history_rows=[],
+        history_rows_by_inst_id={"SUI-USDT-SWAP": [history_row]},
+        bills=[],
+    )
+    async with get_session_ctx() as session:
+        session.add(
+            Position(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="SUI/USDT",
+                side="short",
+                quantity=100.0,
+                entry_price=1.1,
+                current_price=1.0,
+                is_open=False,
+                okx_inst_id="SUI-USDT-SWAP",
+                settlement_status="pending_okx_authority",
+                closed_at=now - timedelta(hours=28),
+            )
+        )
+        session.add(
+            Position(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="ADA/USDT",
+                side="long",
+                quantity=10.0,
+                entry_price=0.6,
+                current_price=0.61,
+                is_open=False,
+                okx_inst_id="ADA-USDT-SWAP",
+                settlement_status="okx_position_history",
+                closed_at=now - timedelta(hours=28),
+            )
+        )
+        await session.flush()
+    try:
+        report = await OkxSettlementFactSyncService(
+            mode="paper",
+            executor_factory=_executor_factory(ccxt),
+        ).sync_once()
+
+        assert report["status"] == "ok"
+        assert report["position_history_count"] == 1
+        assert report["targeted_pending_settlement_inst_count"] == 1
+        assert "position_history_targeted_pending_settlements" in report["completed_stages"]
+        assert ccxt.history_params[0].get("instId") == "SUI-USDT-SWAP"
+        assert all(
+            params.get("instId") != "ADA-USDT-SWAP" for params in ccxt.history_params
+        )
+        assert any(
+            params.get("instId") == "SUI-USDT-SWAP" for params in ccxt.history_params
+        )
+        async with get_session_ctx() as session:
+            stored = (await session.execute(select(OkxPositionHistory))).scalar_one()
+        assert stored.inst_id == "SUI-USDT-SWAP"
+        assert stored.pos_id == "sui-pos-1"
     finally:
         await close_db()
 

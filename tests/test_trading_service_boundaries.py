@@ -4351,6 +4351,17 @@ def test_entry_policy_strategy_context_recovers_valid_normal_paper_contract() ->
                 "objective_net_return_pct": 0.1,
                 "loss_probability": 0.3,
                 "quant_evidence_families": ["local_ml"],
+                "quant_quality_permissions": {
+                    "local_ml": {
+                        "paper_execution_permission": True,
+                        "paper_execution_evidence": {
+                            "sample_count": 20,
+                            "average_return": 0.2,
+                            "return_lcb": 0.1,
+                            "profit_factor": 1.5,
+                        },
+                    }
+                },
                 "strong_expert_opposition": False,
             },
         )
@@ -4636,6 +4647,17 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
         "objective_net_return_pct": 0.3,
         "loss_probability": 0.2,
         "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": {
+            "local_ml": {
+                "paper_execution_permission": True,
+                "paper_execution_evidence": {
+                    "sample_count": 20,
+                    "average_return": 0.2,
+                    "return_lcb": 0.1,
+                    "profit_factor": 1.5,
+                },
+            }
+        },
         "strong_expert_opposition": False,
     }
     decision.raw_response["independent_direction_support"] = direction_support

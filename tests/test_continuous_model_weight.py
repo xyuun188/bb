@@ -115,6 +115,58 @@ def test_negative_fee_after_return_smoothly_downweights_model() -> None:
     assert "smoothed_from_previous_scenario_weight" in change["reasons"]
 
 
+def test_negative_quant_quality_is_observable_but_cannot_authorize_paper_execution() -> None:
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        specialist={
+            "models": [
+                {
+                    "tool": "time_series_prediction",
+                    "direction_count": 100,
+                    "avg_shadow_return_after_all_cost_pct": -0.12,
+                    "shadow_return_lcb_pct": -0.18,
+                    "gross_profit_return_pct": 4.0,
+                    "gross_loss_return_pct": 9.0,
+                    "worst_realized_return_pct": -1.5,
+                }
+            ]
+        },
+    )
+
+    timeseries = report["quant_source_weights"]["timeseries"]
+    assert timeseries["paper_execution_permission"] is False
+    assert timeseries["paper_execution_reason"] == "average_fee_after_return_not_positive"
+    assert timeseries["shadow_observation_and_training_enabled"] is True
+    assert timeseries["paper_execution_evidence_source"] == (
+        "specialist_shadow:time_series_prediction"
+    )
+
+
+def test_positive_authoritative_quant_quality_can_authorize_paper_execution() -> None:
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        contribution={"timeseries_model": _bucket([5.0, 4.0, 3.0] * 10)},
+    )
+
+    timeseries = report["quant_source_weights"]["timeseries"]
+    assert timeseries["paper_execution_permission"] is True
+    assert timeseries["paper_execution_blockers"] == []
+    assert timeseries["paper_execution_evidence_source"] == (
+        "authoritative_trade:timeseries_model"
+    )
+
+
+def test_cold_start_quant_source_requires_shadow_evidence_before_execution() -> None:
+    report = _build(ContinuousModelWeightPolicy())
+
+    server_profit = report["quant_source_weights"]["server_profit"]
+    assert server_profit["paper_execution_permission"] is False
+    assert server_profit["paper_execution_reason"] == (
+        "fee_after_return_quality_evidence_missing"
+    )
+    assert server_profit["cold_start"] is True
+
+
 def test_new_model_starts_low_but_remains_observable() -> None:
     report = _build(ContinuousModelWeightPolicy(), contribution={}, health={"components": {}})
 

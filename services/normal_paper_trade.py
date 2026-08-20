@@ -10,7 +10,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
+NORMAL_PAPER_TRADE_VERSION = "2026-08-19.normal-paper-strategy-trade.v6"
+LEGACY_NORMAL_PAPER_TRADE_V5_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v4"
 NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
@@ -186,8 +187,17 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "uses_shared_position_ledger",
             "continuous_training_after_trusted_settlement",
             "risk_override_permission",
+            "quant_quality_permissions",
         )
     }
+
+
+def _legacy_v5_contract_fingerprint_payload(
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _contract_fingerprint_payload(contract)
+    payload.pop("quant_quality_permissions", None)
+    return payload
 
 
 def _legacy_v3_contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
@@ -325,6 +335,13 @@ def build_normal_paper_trade_contract(
     horizon = _float(support.get("prediction_horizon_minutes"), 0.0) or 0.0
     expected_net = _float(support.get("expected_net_return_pct"), None)
     objective_net = _float(support.get("objective_net_return_pct"), None)
+    quality_permissions = {
+        str(source): _dict(permission)
+        for source, permission in _dict(
+            support.get("quant_quality_permissions")
+        ).items()
+        if str(source).strip() and isinstance(permission, dict)
+    }
     if (
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
@@ -335,6 +352,11 @@ def build_normal_paper_trade_contract(
         or expected_net <= 0.0
         or objective_net is None
         or objective_net <= 0.0
+        or not quality_permissions
+        or any(
+            permission.get("paper_execution_permission") is not True
+            for permission in quality_permissions.values()
+        )
     ):
         return {}
 
@@ -365,6 +387,7 @@ def build_normal_paper_trade_contract(
         "continuous_training_after_trusted_settlement": True,
         "training_eligibility_source": ("trusted_settlement_and_task_specific_training_contract"),
         "risk_override_permission": False,
+        "quant_quality_permissions": quality_permissions,
         "generated_at": datetime.now(UTC).isoformat(),
     }
     contract["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(contract))
@@ -438,6 +461,7 @@ def _normal_strategy_trade_contract_reasons(
     *,
     expected_version: str,
     require_positive_objective: bool,
+    require_quality_permission: bool = True,
 ) -> list[str]:
     contract = _dict(value)
     reasons: list[str] = []
@@ -481,6 +505,19 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_disabled")
     if contract.get("risk_override_permission") is not False:
         reasons.append("normal_paper_trade_risk_override_invalid")
+    if require_quality_permission:
+        quality_permissions = _dict(contract.get("quant_quality_permissions"))
+        if not quality_permissions:
+            reasons.append("normal_paper_trade_quality_permission_missing")
+        for source, permission in quality_permissions.items():
+            if not str(source).strip() or not isinstance(permission, dict):
+                reasons.append("normal_paper_trade_quality_permission_invalid")
+                continue
+            if permission.get("paper_execution_permission") is not True:
+                reasons.append("normal_paper_trade_quality_permission_denied")
+            evidence = _dict(permission.get("paper_execution_evidence"))
+            if int(_float(evidence.get("sample_count"), 0.0) or 0) <= 0:
+                reasons.append("normal_paper_trade_quality_evidence_missing")
     horizon = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
@@ -496,9 +533,12 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_leverage_policy_invalid")
     if contract.get("model_leverage_role") != "upper_bound_when_explicit":
         reasons.append("normal_paper_trade_model_leverage_role_invalid")
-    if contract.get("contract_fingerprint") != _fingerprint(
-        _contract_fingerprint_payload(contract)
-    ):
+    fingerprint_payload = (
+        _legacy_v5_contract_fingerprint_payload(contract)
+        if expected_version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
+        else _contract_fingerprint_payload(contract)
+    )
+    if contract.get("contract_fingerprint") != _fingerprint(fingerprint_payload):
         reasons.append("normal_paper_trade_fingerprint_mismatch")
     return list(dict.fromkeys(reasons))
 
@@ -510,6 +550,18 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=True,
+        require_quality_permission=True,
+    )
+
+
+def legacy_normal_paper_v5_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v5 only for historical settlement and recovery."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
+        require_positive_objective=False,
+        require_quality_permission=False,
     )
 
 
@@ -520,6 +572,7 @@ def legacy_normal_paper_v4_trade_contract_reasons(value: Any) -> list[str]:
         value,
         expected_version=LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
         require_positive_objective=False,
+        require_quality_permission=False,
     )
 
 
@@ -691,6 +744,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION:
+        return legacy_normal_paper_v5_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION:
         return legacy_normal_paper_v4_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION:

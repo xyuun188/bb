@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_freshness import DecisionFreshnessPolicy
 from services.normal_paper_trade import build_normal_paper_trade_contract
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision(
@@ -108,6 +109,7 @@ def _attach_normal_paper_contract(
             "objective_net_return_pct": 0.1,
             "loss_probability": 0.4,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )

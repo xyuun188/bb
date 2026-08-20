@@ -120,6 +120,7 @@ from services.execution_pipelines import EntryExecutionPipeline, ExitExecutionPi
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService
+from services.exit_execution_singleflight import ExitExecutionSingleFlightService
 from services.exit_position_matcher import ExitPositionMatcher
 from services.exit_position_snapshot import ExitPositionSnapshotPolicy
 from services.expert_memory_service import ExpertMemoryService
@@ -516,6 +517,7 @@ class TradingService:
             round_watchdog_provider=self.position_round_watchdog_seconds,
         )
         self._execution_lock = asyncio.Lock()
+        self.exit_execution_singleflight = ExitExecutionSingleFlightService()
         self.entry_execution_pipeline = EntryExecutionPipeline(lambda: self.entry_policy)
         self.exit_execution_pipeline = ExitExecutionPipeline(lambda: self.exit_policy)
         self.execution_service = ExecutionService(
@@ -559,6 +561,7 @@ class TradingService:
                 self.has_matching_exchange_exit_position_for_execution
             ),
             trade_notional_recorder=self.record_executed_trade_notional,
+            exit_execution_singleflight=self.exit_execution_singleflight,
             production_trade_gate_provider=self.production_trade_gate_snapshot,
         )
         self._exchange_reconcile_lock = asyncio.Lock()

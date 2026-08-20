@@ -102,6 +102,63 @@ class _FakeExecutor:
         self.shutdown_called = True
 
 
+class _RecentOnlyFillCcxt(_FakeCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recent_calls = 0
+        self.archive_calls = 0
+
+    async def privateGetTradeFills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.recent_calls += 1
+        assert params["instType"] == "SWAP"
+        assert "ordId" not in params
+        return {
+            "data": [
+                {
+                    "ordId": "recent-order",
+                    "tradeId": "recent-trade",
+                    "instId": "BTC-USDT-SWAP",
+                    "side": "sell",
+                    "fillSz": "2",
+                    "fillPx": "90",
+                    "fee": "-0.01",
+                    "fillPnl": "0",
+                    "ts": str(self.timestamp_ms),
+                }
+            ]
+        }
+
+    async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.archive_calls += 1
+        return await super().privateGetTradeFillsHistory(params)
+
+
+class _RecentOnlyFillExecutor(_FakeExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ccxt = _RecentOnlyFillCcxt()
+
+    async def _get_ccxt(self) -> _RecentOnlyFillCcxt:
+        return self.ccxt
+
+
+@pytest.mark.asyncio
+async def test_recent_only_authoritative_fill_scope_skips_archive_endpoint() -> None:
+    executor = _RecentOnlyFillExecutor()
+    service = OkxAuthoritativeSyncService(recent_fills_only=True)
+
+    fills = await service._fetch_fills(
+        executor,
+        symbols={"BTC/USDT"},
+        since=datetime.now(UTC) - timedelta(hours=24),
+        target_order_ids={"must-not-trigger-per-order-query"},
+    )
+
+    assert len(fills) == 1
+    assert executor.ccxt.recent_calls == 1
+    assert executor.ccxt.archive_calls == 0
+
+
 def test_verified_public_order_contract_size_wins_over_current_catalog() -> None:
     order = Order(
         model_name="ensemble_trader",
@@ -170,13 +227,41 @@ def test_order_contract_size_rejects_non_public_or_incomplete_fill_fact() -> Non
 
 class _AgedUnlinkedFillExecutor(_FakeExecutor):
     async def _get_ccxt(self) -> _FakeCcxt:
-        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=10)).timestamp() * 1000)
+        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=20)).timestamp() * 1000)
         return _FakeCcxt(timestamp_ms=timestamp_ms)
 
 
 class _FreshUnlinkedFillExecutor(_FakeExecutor):
     async def get_positions_strict(self) -> list[dict[str, Any]]:
         return []
+
+
+class _FreshOpenPositionExecutor(_FakeExecutor):
+    async def get_positions_strict(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "short",
+                "contracts": 2,
+                "markPrice": 90,
+                "entryPrice": 90,
+                "info": {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "-2",
+                    "ctVal": "0.01",
+                    "avgPx": "90",
+                    "markPx": "90",
+                    "upl": "0",
+                },
+            }
+        ]
+
+
+class _AgedOpenPositionExecutor(_FreshOpenPositionExecutor):
+    async def _get_ccxt(self) -> _FakeCcxt:
+        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=20)).timestamp() * 1000)
+        return _FakeCcxt(timestamp_ms=timestamp_ms)
 
 
 class _PreEpochFillExecutor(_FakeExecutor):
@@ -1028,7 +1113,7 @@ class _LinkedProtectionFillExecutor(_FakeExecutor):
 class _AgedLinkedProtectionFillExecutor(_LinkedProtectionFillExecutor):
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         super().__init__(*_args, **_kwargs)
-        self.ccxt.timestamp_ms -= 10 * 60 * 1000
+        self.ccxt.timestamp_ms -= 20 * 60 * 1000
 
 
 @pytest.mark.asyncio
@@ -2530,6 +2615,64 @@ async def test_okx_authoritative_sync_expands_exchange_window_for_selected_local
         assert min(_BoundaryFillCcxt.begins) <= _BoundaryFillCcxt.fill_timestamp_ms
         assert report["okx_fill_order_count"] == 1
         assert "local_order_not_found_in_recent_okx_fills" not in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_observes_fresh_open_position_until_local_sync(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-fresh-open.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_FreshOpenPositionExecutor,
+        ).collect()
+
+        assert report["status"] == "ok"
+        assert report["issue_count"] == 0
+        assert report["pending_position_open_sync_count"] == 1
+        assert {item["kind"] for item in report["observations"]} == {
+            "okx_fill_pending_local_order_sync",
+            "okx_open_position_pending_local_sync",
+        }
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_blocks_stale_open_position_without_local_fact(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-stale-open.db').as_posix()}",
+    )
+    await init_db()
+    try:
+        report = await OkxAuthoritativeSyncService(
+            mode="paper",
+            lookback_hours=24,
+            executor_factory=_AgedOpenPositionExecutor,
+        ).collect()
+
+        assert report["status"] == "critical"
+        assert report["pending_position_open_sync_count"] == 0
+        assert "okx_open_position_missing_locally" in {
+            item["kind"] for item in report["issues"]
+        }
     finally:
         await close_db()
 

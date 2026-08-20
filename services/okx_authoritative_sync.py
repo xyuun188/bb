@@ -37,6 +37,10 @@ from services.okx_position_confirmation import (
     find_current_position_entry_confirmation,
     order_has_current_position_snapshot_confirmation,
 )
+from services.okx_sync_policy import (
+    AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
+    is_within_authoritative_sync_grace,
+)
 from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 24
@@ -44,7 +48,7 @@ DEFAULT_LIMIT = 200
 DEFAULT_TIMEOUT_SECONDS = 6.0
 DEFAULT_MAX_PULL_ATTEMPTS = 2
 MAX_AUTHORITATIVE_FILL_PAGES = 10
-LOCAL_ORDER_SYNC_GRACE_SECONDS = 120.0
+LOCAL_ORDER_SYNC_GRACE_SECONDS = AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
 QUANTITY_TOLERANCE_RATIO = 0.02
 
 
@@ -150,6 +154,7 @@ class OkxAuthoritativeSyncService:
         limit: int = DEFAULT_LIMIT,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_pull_attempts: int = DEFAULT_MAX_PULL_ATTEMPTS,
+        recent_fills_only: bool = False,
         executor_factory: Any | None = None,
     ) -> None:
         self.mode = str(mode or "paper")
@@ -157,6 +162,7 @@ class OkxAuthoritativeSyncService:
         self.limit = max(1, min(int(limit or DEFAULT_LIMIT), 1000))
         self.timeout_seconds = max(float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS), 0.5)
         self.max_pull_attempts = max(1, min(int(max_pull_attempts or 1), 3))
+        self.recent_fills_only = bool(recent_fills_only)
         self.executor_factory = executor_factory or OKXExecutor
 
     async def collect(self) -> dict[str, Any]:
@@ -316,6 +322,9 @@ class OkxAuthoritativeSyncService:
             "okx_position_count": len(exchange_positions),
             "okx_fill_order_count": len(exchange_fills),
             "okx_fill_max_pages": MAX_AUTHORITATIVE_FILL_PAGES,
+            "okx_fill_ledger_scope": (
+                "recent" if self.recent_fills_only else "recent_and_archive"
+            ),
             "okx_order_history_context_count": len(exchange_order_contexts),
             "okx_protection_algo_history_count": len(protection_algo_rows),
             "supplemental_local_order_count": len(supplemental_orders),
@@ -337,6 +346,11 @@ class OkxAuthoritativeSyncService:
                 1
                 for item in observations
                 if item.kind == "local_position_pending_okx_close_sync"
+            ),
+            "pending_position_open_sync_count": sum(
+                1
+                for item in observations
+                if item.kind == "okx_open_position_pending_local_sync"
             ),
             "classification_counts": dict(classification_counts),
             "severity_counts": dict(severity_counts),
@@ -768,11 +782,12 @@ class OkxAuthoritativeSyncService:
     ) -> list[OkxFillGroup]:
         groups = await OkxNativeFactsClient(executor).fetch_fill_groups(
             symbols=symbols,
-            order_ids=target_order_ids,
+            order_ids=None if self.recent_fills_only else target_order_ids,
             since=since,
             limit=100,
             max_pages=MAX_AUTHORITATIVE_FILL_PAGES,
             account_wide_only=True,
+            include_historical=not self.recent_fills_only,
             strict=True,
         )
         return [
@@ -901,9 +916,15 @@ class OkxAuthoritativeSyncService:
         pending_close_fills_by_position_key: dict[
             tuple[str, str], OkxFillGroup
         ] = {}
+        pending_open_fills_by_position_key: dict[
+            tuple[str, str], OkxFillGroup
+        ] = {}
         for fill in exchange_fills:
             if not _is_pending_local_order_sync(fill, observed_at=observed_at):
                 continue
+            pending_open_key = _pending_open_position_key(fill)
+            if pending_open_key is not None:
+                pending_open_fills_by_position_key.setdefault(pending_open_key, fill)
             if fill.side == "buy":
                 closed_side = "short"
             elif fill.side == "sell":
@@ -931,6 +952,29 @@ class OkxAuthoritativeSyncService:
             key = (str(snapshot.get("symbol") or ""), str(snapshot.get("side") or ""))
             exchange_position_keys.add(key)
             if key not in open_position_keys:
+                pending_open_fill = pending_open_fills_by_position_key.get(key)
+                if pending_open_fill is not None:
+                    issues.append(
+                        OkxAuthoritativeIssue(
+                            kind="okx_open_position_pending_local_sync",
+                            classification="observation",
+                            severity="info",
+                            reason=(
+                                "OKX reports a newly opened position whose entry fill is "
+                                "still inside the local position synchronization window."
+                            ),
+                            symbol=key[0],
+                            side=key[1],
+                            exchange_order_id=pending_open_fill.order_id,
+                            okx_contracts=_safe_float(snapshot.get("contracts")),
+                            okx_contract_size=_safe_float(snapshot.get("contract_size")),
+                            expected_base_quantity=_safe_float(snapshot.get("quantity")),
+                            okx_price=_safe_float(snapshot.get("mark_price"))
+                            or _safe_float(snapshot.get("last_price")),
+                            okx_timestamp=pending_open_fill.timestamp,
+                        )
+                    )
+                    continue
                 issues.append(
                     OkxAuthoritativeIssue(
                         kind="okx_open_position_missing_locally",
@@ -1268,15 +1312,22 @@ def _is_pending_local_order_sync(
     *,
     observed_at: datetime,
 ) -> bool:
-    timestamp = fill.timestamp
-    if timestamp is None:
-        return False
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=UTC)
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=UTC)
-    age_seconds = (observed_at - timestamp).total_seconds()
-    return -5.0 <= age_seconds <= LOCAL_ORDER_SYNC_GRACE_SECONDS
+    return is_within_authoritative_sync_grace(
+        fill.timestamp,
+        observed_at=observed_at,
+    )
+
+
+def _pending_open_position_key(fill: OkxFillGroup) -> tuple[str, str] | None:
+    if fill.side == "buy":
+        entry_side = "long"
+    elif fill.side == "sell":
+        entry_side = "short"
+    else:
+        return None
+    if fill.pos_side in {"long", "short"} and fill.pos_side != entry_side:
+        return None
+    return fill.symbol, entry_side
 
 
 def _local_orders_by_exchange_id(local_orders: list[Order]) -> dict[str, Order]:

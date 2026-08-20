@@ -38,6 +38,7 @@ from tests.legacy_paper_contract_fixtures import (
 from tests.legacy_paper_contract_fixtures import (
     build_legacy_paper_training_contract as build_paper_training_contract,
 )
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _history(**overrides):
@@ -1053,6 +1054,7 @@ def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
             "objective_net_return_pct": 0.1,
             "loss_probability": 0.3,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )

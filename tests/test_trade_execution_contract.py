@@ -409,6 +409,58 @@ def test_recent_okx_fill_identity_gap_is_pending_until_sync_grace_expires() -> N
     assert entry["contract_complete"] is False
 
 
+def test_recent_okx_contract_size_gap_is_pending_until_sync_grace_expires() -> None:
+    order = _filled_order(108689)
+    order.created_at = datetime.now(UTC) - timedelta(minutes=2)
+    order.filled_at = order.created_at
+    order.okx_raw_fills.update(
+        {
+            "contract_size": None,
+            "contract_size_verified": False,
+            "contract_size_source": "okx_public_instruments_missing",
+            "base_quantity": None,
+        }
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(108689, "long", _entry_raw())],
+        orders=[order],
+    )
+
+    entry = report["entry_contracts"][0]
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["summary"]["entry_authoritative_fill_sync_pending_count"] == 1
+    assert entry["contract_status"] == "pending_authoritative_fill_sync"
+    assert entry["reasons"] == [
+        "filled_order_contract_size_not_okx_public_instruments"
+    ]
+
+
+def test_stale_okx_contract_size_gap_remains_a_contract_violation() -> None:
+    order = _filled_order(108690)
+    order.created_at = datetime.now(UTC) - timedelta(minutes=20)
+    order.filled_at = order.created_at
+    order.okx_raw_fills.update(
+        {
+            "contract_size": None,
+            "contract_size_verified": False,
+            "contract_size_source": "okx_public_instruments_missing",
+            "base_quantity": None,
+        }
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(108690, "long", _entry_raw())],
+        orders=[order],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 1
+    assert report["summary"]["entry_authoritative_fill_sync_pending_count"] == 0
+    assert report["violation_reason_counts"] == {
+        "filled_order_contract_size_not_okx_public_instruments": 1
+    }
+
+
 def test_stale_okx_fill_identity_gap_remains_a_contract_violation() -> None:
     order = _filled_order(108688)
     order.created_at = datetime.now(UTC) - timedelta(minutes=20)

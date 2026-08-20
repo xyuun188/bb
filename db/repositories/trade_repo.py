@@ -125,6 +125,43 @@ class TradeRepository(BaseRepository):
         result = await self.session.execute(stmt.order_by(Position.created_at.asc()))
         return list(result.scalars().all())
 
+    async def get_matching_open_positions_for_update(
+        self,
+        model_name: str,
+        symbol: str,
+        side: str,
+        execution_mode: str,
+    ) -> list[Position]:
+        """Lock one local position lifecycle group before an exit submission."""
+
+        symbol_variants = trading_symbol_variants(symbol) or {symbol}
+        stmt = (
+            select(Position)
+            .where(
+                Position.model_name == model_name,
+                Position.symbol.in_(symbol_variants),
+                Position.side == side,
+                Position.execution_mode == execution_mode,
+                Position.is_open.is_(True),
+            )
+            .order_by(Position.created_at.asc())
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_positions_for_update(self, position_ids: tuple[int, ...]) -> list[Position]:
+        if not position_ids:
+            return []
+        stmt = (
+            select(Position)
+            .where(Position.id.in_(position_ids))
+            .order_by(Position.id.asc())
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_exchange_matching_open_positions(
         self,
         symbol: str,

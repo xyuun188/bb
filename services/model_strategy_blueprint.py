@@ -30,6 +30,16 @@ def _canonical_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:20]
 
 
+def _positive_fee_after_quality(row: dict[str, Any]) -> bool:
+    try:
+        average = float(row.get("avg_return_pct"))
+        return_lcb = float(row.get("return_lcb_pct"))
+        profit_factor = float(row.get("profit_factor"))
+    except (TypeError, ValueError):
+        return False
+    return average > 0.0 and return_lcb > 0.0 and profit_factor > 1.0
+
+
 def build_model_strategy_blueprint(
     *,
     metadata: dict[str, Any] | None,
@@ -66,7 +76,13 @@ def build_model_strategy_blueprint(
         for side in _safe_dict(model.get("oos_return_evaluation"))
         if str(side).lower() in {"long", "short"}
     }
-    eligible_sides = sorted(production_sides or paper_sides or artifact_sides)
+    evaluated_sides = sorted(production_sides or paper_sides or artifact_sides)
+    oos_evaluation = _safe_dict(model.get("oos_return_evaluation"))
+    eligible_sides = [
+        side
+        for side in evaluated_sides
+        if _positive_fee_after_quality(_safe_dict(oos_evaluation.get(side)))
+    ]
     artifact_complete = bool(
         version != "unversioned"
         and str(model.get("trained_at") or model.get("artifact_version") or "")
@@ -78,7 +94,6 @@ def build_model_strategy_blueprint(
         and stage in {"candidate", "shadow", "canary", "active"}
     )
     champion_comparison = _safe_dict(active.get("champion_comparison"))
-    oos_evaluation = _safe_dict(model.get("oos_return_evaluation"))
     model_quality = {
         side: {
             key: _safe_dict(oos_evaluation.get(side)).get(key)
@@ -90,7 +105,7 @@ def build_model_strategy_blueprint(
                 "max_drawdown_pct",
             )
         }
-        for side in eligible_sides
+        for side in evaluated_sides
     }
     identity = {
         "blueprint_version": MODEL_STRATEGY_BLUEPRINT_VERSION,
@@ -103,7 +118,7 @@ def build_model_strategy_blueprint(
     if stage not in {"candidate", "shadow", "canary", "active"}:
         blockers.append("trained_model_lifecycle_not_paper_eligible")
     if not eligible_sides:
-        blockers.append("trained_model_has_no_governed_side")
+        blockers.append("trained_model_has_no_positive_fee_after_side")
     if not paper_execution_eligible:
         blockers.append("trained_model_not_authorized_for_paper_strategy")
     return {
@@ -123,17 +138,19 @@ def build_model_strategy_blueprint(
         "blocking_reasons": blockers,
         "model_quality": {
             "eligible_sides": model_quality,
+            "evaluated_sides": evaluated_sides,
             "champion_comparison": champion_comparison,
             "comparison_accepted": champion_comparison.get("accepted") is True,
             "comparison_reason": champion_comparison.get("reason"),
         },
         "entry_policy": {
             "direction_source": "trained_model_return_distribution",
-            "require_current_fee_after_expected_return_positive": False,
-            "require_current_fee_after_return_lcb_positive": False,
+            "require_current_fee_after_expected_return_positive": True,
+            "require_current_fee_after_return_lcb_positive": True,
+            "require_fee_after_profit_factor_above_break_even": True,
             "require_current_execution_cost_complete": True,
             "require_actual_trade_calibration": False,
-            "negative_expected_return_uses_coverage_risk": True,
+            "negative_expected_return_uses_coverage_risk": False,
             "historical_replay_uses_exact_model_inference": True,
         },
         "exit_policy": {

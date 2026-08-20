@@ -10,7 +10,7 @@ from typing import Any
 from services.model_expert_health import ModelExpertHealthService
 from services.specialist_shadow_evaluation import SpecialistShadowEvaluationService
 
-CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-07-22.paper-continuous-model-weight.v1"
+CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-08-19.paper-quality-permission.v2"
 EXPERT_MODEL_NAMES = (
     "trend_expert",
     "momentum_expert",
@@ -319,6 +319,65 @@ def _combined_multiplier(
     }
 
 
+def _paper_execution_quality_permission(
+    *,
+    actual: dict[str, Any],
+    shadow: dict[str, Any],
+) -> dict[str, Any]:
+    """Allow paper execution only after fee-after evidence beats break-even."""
+
+    authority = (
+        actual
+        if actual.get("available") is True
+        else shadow
+        if shadow.get("available") is True
+        else {}
+    )
+    source = str(authority.get("source") or "")
+    average = _finite(authority.get("average_return"))
+    return_lcb = _finite(authority.get("return_lcb"))
+    profit_factor = _finite(authority.get("profit_factor"))
+    gross_profit = max(_finite(authority.get("gross_profit")) or 0.0, 0.0)
+    gross_loss = max(_finite(authority.get("gross_loss")) or 0.0, 0.0)
+    profit_factor_above_break_even = bool(
+        (profit_factor is not None and profit_factor > 1.0)
+        or (profit_factor is None and gross_profit > 0.0 and gross_loss <= 0.0)
+    )
+    reasons: list[str] = []
+    if not authority:
+        reasons.append("fee_after_return_quality_evidence_missing")
+    else:
+        if average is None or average <= 0.0:
+            reasons.append("average_fee_after_return_not_positive")
+        if return_lcb is None or return_lcb <= 0.0:
+            reasons.append("fee_after_return_lcb_not_positive")
+        if not profit_factor_above_break_even:
+            reasons.append("fee_after_profit_factor_not_above_break_even")
+    return {
+        "paper_execution_permission": not reasons,
+        "paper_execution_reason": (
+            "authoritative_fee_after_quality_above_break_even"
+            if not reasons
+            else reasons[0]
+        ),
+        "paper_execution_blockers": reasons,
+        "paper_execution_evidence_source": source or None,
+        "paper_execution_evidence": {
+            "sample_count": int(_finite(authority.get("sample_count")) or 0),
+            "average_return": average,
+            "return_lcb": return_lcb,
+            "profit_factor": profit_factor,
+            "profit_factor_above_break_even": profit_factor_above_break_even,
+        },
+        "shadow_observation_and_training_enabled": True,
+        "break_even_contract": {
+            "average_return_above_zero": True,
+            "return_lcb_above_zero": True,
+            "profit_factor_above_one": True,
+        },
+    }
+
+
 _NON_REGIME_LABELS = {
     "return_distribution_observation",
     "observation_unavailable",
@@ -507,6 +566,10 @@ class ContinuousModelWeightPolicy:
             current[identity] = float(multiplier["effective_multiplier"])
             quant_weights[source_name] = {
                 **multiplier,
+                **_paper_execution_quality_permission(
+                    actual=actual,
+                    shadow=shadow,
+                ),
                 "actual_fee_after_return": actual,
                 "shadow_fee_after_return": shadow,
                 "production_permission": False,

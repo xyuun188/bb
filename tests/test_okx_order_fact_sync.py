@@ -51,6 +51,7 @@ from services.okx_order_fact_sync import (
     authoritative_order_fee_fact_source,
     authoritative_orders_by_exchange_id,
 )
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
@@ -66,6 +67,7 @@ def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
             "objective_net_return_pct": 0.1,
             "loss_probability": 0.4,
             "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
             "strong_expert_opposition": False,
         },
     )
