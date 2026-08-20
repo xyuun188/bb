@@ -54,6 +54,37 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def _apply_market_funding_quality_contract(
+    quality_contract: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
+    """Require a complete direction-aware funding projection for market analysis."""
+
+    if context.get("review_positions"):
+        return
+    direction_competition = context.get("direction_competition")
+    funding_projection = (
+        direction_competition.get("funding_projection")
+        if isinstance(direction_competition, dict)
+        else None
+    )
+    if not isinstance(funding_projection, dict) or (
+        funding_projection.get("evidence_complete") is not True
+    ):
+        quality_contract.update(
+            {
+                "funding_evidence_status": "funding_evidence_unavailable",
+                "analysis_complete": False,
+                "decision_eligible": False,
+                "result": "unclear",
+                "reason_code": "funding_evidence_unavailable",
+                "reason": "资金费率、下一结算时间或数据时效证据不完整。",
+            }
+        )
+        return
+    quality_contract["funding_evidence_status"] = "complete"
+
+
 def _analysis_budget_snapshot(context: dict[str, Any]) -> dict[str, Any] | None:
     """Return the remaining cooperative market-analysis budget, if supplied."""
 
@@ -148,28 +179,7 @@ class EnsembleCoordinator:
             final_action=final.action.value,
             consultation=consultation,
         )
-        funding_projection = (
-            context.get("direction_competition", {}).get("funding_projection")
-            if isinstance(context.get("direction_competition"), dict)
-            else None
-        )
-        if (
-            not context.get("review_positions")
-            and isinstance(funding_projection, dict)
-            and funding_projection.get("evidence_complete") is not True
-        ):
-            quality_contract.update(
-                {
-                    "funding_evidence_status": "funding_evidence_unavailable",
-                    "analysis_complete": False,
-                    "decision_eligible": False,
-                    "result": "unclear",
-                    "reason_code": "funding_evidence_unavailable",
-                    "reason": "资金费率、下一结算时间或数据时效证据不完整。",
-                }
-            )
-        elif isinstance(funding_projection, dict):
-            quality_contract["funding_evidence_status"] = "complete"
+        _apply_market_funding_quality_contract(quality_contract, context)
         if final.is_entry and not quality_contract.get("decision_eligible"):
             observed_action = final.action.value
             raw_observation = (

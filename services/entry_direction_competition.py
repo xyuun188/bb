@@ -146,8 +146,9 @@ def _attach_funding_projection(
     evidence: dict[str, list[dict[str, Any]]],
     feature_vector: Any,
     *,
-    selected_horizon_minutes: float | None = None,
-    require_selected_horizon: bool = False,
+    reference_horizon_minutes: float | None = None,
+    reference_horizon_source: str = "",
+    require_reference_horizon: bool = False,
 ) -> dict[str, Any]:
     snapshot = (
         dict(feature_vector)
@@ -166,8 +167,8 @@ def _attach_funding_projection(
             if (value := _safe_float(item.get("horizon_minutes"))) is not None and value > 0
         ]
         horizon = (
-            selected_horizon_minutes
-            if require_selected_horizon
+            reference_horizon_minutes
+            if require_reference_horizon
             else min(horizons)
             if horizons
             else None
@@ -210,12 +211,12 @@ def _attach_funding_projection(
             side_contracts[side].get("production_eligible") is True
             for side in ("long", "short")
         ),
-        "selected_horizon_minutes": selected_horizon_minutes,
+        "selected_horizon_minutes": reference_horizon_minutes,
         "horizon_source": (
-            "selected_prediction_cohort"
-            if require_selected_horizon and selected_horizon_minutes is not None
+            reference_horizon_source
+            if require_reference_horizon and reference_horizon_minutes is not None
             else "unavailable"
-            if require_selected_horizon
+            if require_reference_horizon
             else "eligible_prediction_contract"
         ),
         "sign_convention": "positive_income_negative_cost",
@@ -495,13 +496,6 @@ class EntryDirectionCompetitionPolicy:
                 item["observation_only"] = True
                 item["eligibility_reason"] = "paper_prediction_horizon_not_selected"
 
-        funding_projection = _attach_funding_projection(
-            evidence,
-            feature_vector,
-            selected_horizon_minutes=selected_horizon,
-            require_selected_horizon=execution_scope == "paper",
-        )
-
         training_rows = [item for item in all_rows if item.get("paper_eligible") is True]
         training_horizon_selection = select_paper_horizon_cohort(
             training_rows,
@@ -510,6 +504,26 @@ class EntryDirectionCompetitionPolicy:
         training_horizon = _safe_float(
             training_horizon_selection.get("selected_horizon_minutes")
         )
+        funding_horizon = selected_horizon
+        funding_horizon_source = "selected_prediction_cohort"
+        if execution_scope == "paper" and funding_horizon is None:
+            funding_horizon = authorized_horizon
+            funding_horizon_source = authorized_horizon_source
+        if execution_scope == "paper" and funding_horizon is None:
+            funding_horizon = training_horizon
+            funding_horizon_source = (
+                "paper_training_horizon_cohort"
+                if funding_horizon is not None
+                else "unavailable"
+            )
+        funding_projection = _attach_funding_projection(
+            evidence,
+            feature_vector,
+            reference_horizon_minutes=funding_horizon,
+            reference_horizon_source=funding_horizon_source,
+            require_reference_horizon=execution_scope == "paper",
+        )
+
         for item in all_rows:
             item["training_aggregate_eligible"] = bool(
                 item.get("paper_eligible") is True
@@ -608,7 +622,7 @@ class EntryDirectionCompetitionPolicy:
                 "source": f"{execution_scope}_eligible_gross_market_models",
                 "observation_window": "current_decision_model_outputs",
                 "sample_count": source_count,
-                "strategy_version": "2026-08-18.source-owned-direction-observation.v6",
+                "strategy_version": "2026-08-20.funding-reference-horizon.v7",
                 "fallback_reason": "" if source_count else "eligible_return_models_unavailable",
             },
         }

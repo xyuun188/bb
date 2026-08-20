@@ -160,6 +160,84 @@ def test_signed_funding_cashflow_participates_in_long_short_comparison() -> None
     assert context["long"]["score"] < context["short"]["score"]
 
 
+def test_funding_projection_uses_model_horizon_when_quality_gate_blocks_entries() -> None:
+    strategy = {
+        "execution_mode": "paper",
+        "continuous_model_weights": {
+            "applied": True,
+            "quant_source_weights": {
+                source: {
+                    "effective_multiplier": 0.35,
+                    "paper_execution_permission": False,
+                    "paper_execution_reason": "fee_after_return_quality_evidence_missing",
+                }
+                for source in ("local_ml", "server_profit")
+            },
+        },
+    }
+    context = _context(
+        ml=_governed_ml(0.6, 0.5),
+        tools={"profit_prediction": _paper_payload(0.4, 0.3)},
+        feature={
+            "timestamp": "2026-08-20T05:00:00+00:00",
+            "funding_data_available": True,
+            "funding_rate": 0.0001,
+            "funding_interval_minutes": 480,
+            "next_funding_time": "2026-08-20T08:00:00+00:00",
+            "funding_rate_observed_at": "2026-08-20T05:00:00+00:00",
+        },
+        strategy=strategy,
+    )
+
+    assert context["enabled"] is False
+    assert context["selected_horizon_minutes"] is None
+    assert context["authorized_prediction_horizon_minutes"] == 30
+    assert context["funding_projection"]["selected_horizon_minutes"] == 30
+    assert context["funding_projection"]["horizon_source"] == (
+        "local_ml_primary_horizon"
+    )
+    assert context["funding_projection"]["evidence_complete"] is True
+    assert all(
+        item["funding_evidence_status"] == "complete"
+        for side in ("long", "short")
+        for item in context[side]["evidence"]
+        if item["available"] is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_reason"),
+    [
+        ("funding_rate", "funding_rate_missing"),
+        ("next_funding_time", "next_funding_time_missing"),
+        ("funding_rate_observed_at", "funding_rate_observed_at_missing"),
+    ],
+)
+def test_missing_funding_fact_keeps_market_projection_incomplete(
+    missing_field: str,
+    expected_reason: str,
+) -> None:
+    feature = {
+        "timestamp": "2026-08-20T05:00:00+00:00",
+        "funding_data_available": True,
+        "funding_rate": 0.0001,
+        "funding_interval_minutes": 480,
+        "next_funding_time": "2026-08-20T08:00:00+00:00",
+        "funding_rate_observed_at": "2026-08-20T05:00:00+00:00",
+    }
+    feature.pop(missing_field)
+
+    context = _context(
+        ml=_governed_ml(0.6, 0.5),
+        feature=feature,
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["funding_projection"]["evidence_complete"] is False
+    assert context["funding_projection"]["long"]["reason"] == expected_reason
+    assert context["funding_projection"]["short"]["reason"] == expected_reason
+
+
 def test_missing_governance_cannot_enter_direction_scores() -> None:
     context = _context(
         ml={
