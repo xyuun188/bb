@@ -11722,7 +11722,7 @@ class TradingService:
         *,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> list[dict]:
-        """Execute the unified dynamic exit policy before slow position review."""
+        """Execute only hard protection before the governed position review."""
         auto_closes: list[dict[str, Any]] = []
         if open_positions is None:
             open_positions = await self.okx_sync_service.get_open_positions_context()
@@ -11841,6 +11841,14 @@ class TradingService:
             )
             assessment = apply_dynamic_exit(close_decision, [position_snapshot])
             if not assessment.eligible or assessment.close_fraction <= 0.0:
+                continue
+            # The fast path is reserved for exchange/fee hard protection and
+            # explicit stop or target crossings. Ordinary dynamic pressure must
+            # go through the governed position review, where expert evidence
+            # and conflict gates are available before an order is submitted.
+            if trigger == "dynamic_position_scan" and not (
+                self._fast_dynamic_position_scan_is_allowed(assessment)
+            ):
                 continue
 
             close_fraction = assessment.close_fraction
@@ -12324,6 +12332,12 @@ class TradingService:
 
     def _is_urgent_position_exit_scan(self, scan: dict[str, Any] | None) -> bool:
         return self._position_review_priority_policy().is_urgent_exit_scan(scan)
+
+    @staticmethod
+    def _fast_dynamic_position_scan_is_allowed(assessment: Any) -> bool:
+        """Allow the evidence-free fast path only for hard protection."""
+
+        return bool(getattr(assessment, "hard_risk", False))
 
     def _position_review_batch_policy(self) -> PositionReviewBatchPolicy:
         policy = getattr(self, "position_review_batch", None)

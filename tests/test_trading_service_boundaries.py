@@ -4185,6 +4185,70 @@ async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
 
 
 @pytest.mark.asyncio
+async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, str, float]] = []
+    hard_risk = [False]
+
+    class FakePositionTime:
+        def position_age_minutes(self, _created_at):
+            return 30.0
+
+    class FakeProfitPeaks:
+        def update(self, **_kwargs):
+            return {"peak_unrealized_pnl": 0.0}
+
+    class FakeProcessor:
+        async def execute(self, **kwargs):
+            calls.append(
+                (
+                    kwargs["symbol"],
+                    kwargs["trigger"],
+                    kwargs["close_fraction"],
+                )
+            )
+            return SimpleNamespace(
+                skipped=False,
+                auto_close={"symbol": kwargs["symbol"]},
+            )
+
+    monkeypatch.setattr(
+        "services.trading_service.apply_dynamic_exit",
+        lambda _decision, _positions: SimpleNamespace(
+            eligible=True,
+            close_fraction=0.62,
+            hard_risk=hard_risk[0],
+            reason="dynamic_exit_policy_passed",
+            policy_provenance={},
+        ),
+    )
+    service.position_time = FakePositionTime()
+    service.position_profit_peaks = FakeProfitPeaks()
+    service.fast_risk_exit_execution_processor = FakeProcessor()
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "LTC/USDT",
+        "side": "short",
+        "is_open": True,
+        "entry_price": 50.0,
+        "current_price": 51.0,
+        "quantity": 2.0,
+        "leverage": 3.0,
+        "unrealized_pnl": -2.0,
+        "created_at": datetime.now(UTC) - timedelta(minutes=30),
+    }
+
+    assert await service._enforce_sl_tp({}, open_positions=[position]) == []
+    assert calls == []
+
+    hard_risk[0] = True
+    assert await service._enforce_sl_tp({}, open_positions=[position]) == [
+        {"symbol": "LTC/USDT"}
+    ]
+    assert calls == [("LTC/USDT", "dynamic_position_scan", 0.62)]
+
+
+@pytest.mark.asyncio
 async def test_expired_canary_does_not_force_exit_with_incomplete_takeover_contract() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []
