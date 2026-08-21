@@ -32,6 +32,10 @@ from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
 from services.okx_native_full_close_evidence import (
     native_full_close_identity_evidence,
 )
+from services.okx_position_settlement_sync import (
+    POSITION_HISTORY_MATCH_MAX_AGE_HOURS,
+    POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
+)
 from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 72
@@ -611,6 +615,26 @@ class OkxTradeFactIntegrityService:
                 and not close_ids
                 and not local_marker_ids
             ):
+                settlement_raw = getattr(position, "settlement_raw", None)
+                settlement_raw = settlement_raw if isinstance(settlement_raw, dict) else {}
+                if (
+                    _is_terminal_settlement_quarantine(position, settlement_raw)
+                ):
+                    issues.append(
+                        TradeFactIssue(
+                            kind="closed_position_settlement_quarantined",
+                            severity=ORPHAN_QUARANTINE_SEVERITY,
+                            position_id=int(position.id),
+                            symbol=position_symbol,
+                            expected_symbol=position_symbol,
+                            reason=(
+                                "OKX settlement identity remained unavailable after the bounded "
+                                "retry/age policy; this historical local residual is quarantined "
+                                "from training and cannot block current paper execution."
+                            ),
+                        )
+                    )
+                    continue
                 native_close_evidence = native_full_close_identity_evidence(position)
                 if native_close_evidence is not None:
                     issues.append(
@@ -1310,6 +1334,53 @@ def _ensure_aware(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _is_terminal_settlement_quarantine(
+    position: Position,
+    settlement_raw: dict[str, Any],
+) -> bool:
+    """Only downgrade a quarantine after its bounded authority policy fired.
+
+    The settlement synchronizer may temporarily use the same status while a
+    lifecycle is still retryable.  Audit severity must follow the recorded
+    retry/age evidence, rather than trusting the status string alone.
+    """
+
+    if (
+        str(getattr(position, "settlement_status", "") or "").strip()
+        != "settlement_quarantined"
+        or str(settlement_raw.get("quarantine_reason") or "").strip()
+        != "official_position_history_identity_unresolved"
+    ):
+        return False
+    evidence = settlement_raw.get("quarantine_evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    triggers = {
+        str(value).strip()
+        for value in evidence.get("triggers") or ()
+        if str(value).strip()
+    }
+    if triggers.intersection({"attempt_limit", "closed_age_limit"}):
+        return True
+    attempts = max(
+        _safe_int_value(settlement_raw.get("settlement_attempt_count")),
+        _safe_int_value(evidence.get("attempt_count")),
+    )
+    if attempts >= POSITION_HISTORY_MATCH_MAX_ATTEMPTS:
+        return True
+    closed_at = _ensure_aware(getattr(position, "closed_at", None))
+    if closed_at is None:
+        return False
+    age_hours = max((datetime.now(UTC) - closed_at).total_seconds() / 3600.0, 0.0)
+    return age_hours >= POSITION_HISTORY_MATCH_MAX_AGE_HOURS
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _position_side_for_action(action: str) -> str | None:

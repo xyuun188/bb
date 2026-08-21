@@ -1425,6 +1425,94 @@ async def test_native_full_close_zero_position_identity_is_quarantined_not_block
 
 
 @pytest.mark.asyncio
+async def test_bounded_settlement_quarantine_is_observable_without_current_blocking(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="MAGIC/USDT",
+                    side="short",
+                    quantity=7.0,
+                    entry_price=0.04134,
+                    current_price=0.04252,
+                    realized_pnl=-0.008,
+                    leverage=1.0,
+                    is_open=False,
+                    okx_inst_id="MAGIC-USDT-SWAP",
+                    okx_pos_id="unresolved-pos-id",
+                    entry_exchange_order_id="entry-ok",
+                    settlement_status="settlement_quarantined",
+                    settlement_raw={
+                        "quarantine_reason": "official_position_history_identity_unresolved",
+                        "settlement_attempt_count": 120,
+                        "requires_okx_fill_backfill": True,
+                    },
+                    closed_at=closed_at,
+                    created_at=closed_at - timedelta(minutes=10),
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        issues = {issue["kind"]: issue for issue in report["issues"]}
+
+        assert report["critical_count"] == 0
+        assert report["status"] == "ok"
+        assert issues["closed_position_settlement_quarantined"]["severity"] == "info"
+        assert "closed_position_missing_close_order_link" not in issues
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_retryable_settlement_quarantine_remains_a_blocking_missing_close_fact(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=20)
+        async with get_session_ctx() as session:
+            session.add(
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="MAGIC/USDT",
+                    side="short",
+                    quantity=7.0,
+                    entry_price=0.04134,
+                    current_price=0.04252,
+                    realized_pnl=-0.008,
+                    leverage=1.0,
+                    is_open=False,
+                    okx_inst_id="MAGIC-USDT-SWAP",
+                    okx_pos_id="retryable-pos-id",
+                    entry_exchange_order_id="entry-ok",
+                    settlement_status="settlement_quarantined",
+                    settlement_raw={
+                        "quarantine_reason": "official_position_history_identity_unresolved",
+                        "settlement_attempt_count": 1,
+                    },
+                    closed_at=closed_at,
+                    created_at=closed_at - timedelta(minutes=10),
+                )
+            )
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        issues = {issue["kind"]: issue for issue in report["issues"]}
+
+        assert report["critical_count"] == 1
+        assert issues["closed_position_missing_close_order_link"]["severity"] == "critical"
+        assert "closed_position_settlement_quarantined" not in issues
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_manual_close_marker_is_not_treated_as_exchange_backed_fact(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

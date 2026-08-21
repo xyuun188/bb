@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-08-14.strict-cooldown-market-analysis.v5"
+    VERSION = "2026-08-21.cooldown-fill-market-analysis.v6"
 
     def __init__(
         self,
@@ -128,12 +128,11 @@ class MarketAnalysisSelectionPolicy:
             reverse=True,
         )
 
-        # A repeat penalty is useful for ranking, but it must not be undone by
-        # the old fallback fill when the candidate pool is smaller than the
-        # requested budget.  A completed expert review owns the full cooldown
-        # window even when short-cycle indicators move materially; those
-        # changes remain diagnostic evidence but cannot trigger another costly
-        # expert call until cooldown expires.
+        # A repeat penalty is useful for ranking.  When the fresh/coverage
+        # candidates cannot fill the actual analysis budget, use the candidates
+        # closest to cooldown expiry as a bounded fallback.  This keeps the
+        # scheduler producing observable rounds without allowing a high-score
+        # symbol to monopolize the queue.
         cooldown_excluded = [row for row in ranked if bool(row["recent"])]
         eligible_ranked = [row for row in ranked if not bool(row["recent"])]
 
@@ -185,6 +184,27 @@ class MarketAnalysisSelectionPolicy:
                     advantage_assigned += 1
                 else:
                     row["selection_role"] = "fallback_fill"
+                selected_rows.append(row)
+                selected_keys.add(str(row["symbol_key"]))
+                if len(selected_rows) >= final_limit:
+                    break
+
+        if len(selected_rows) < final_limit and not eligible_ranked:
+            selected_cooldown_rows = sorted(
+                (
+                    row
+                    for row in cooldown_excluded
+                    if str(row["symbol_key"]) not in selected_keys
+                ),
+                key=lambda row: (
+                    _safe_float(row["recent_age_seconds"], -1.0),
+                    _safe_float(row["evaluation_score"]),
+                    -int(row["rank_before_selection"]),
+                ),
+                reverse=True,
+            )
+            for row in selected_cooldown_rows:
+                row["selection_role"] = "cooldown_fill"
                 selected_rows.append(row)
                 selected_keys.add(str(row["symbol_key"]))
                 if len(selected_rows) >= final_limit:
@@ -367,6 +387,11 @@ class MarketAnalysisSelectionPolicy:
         advantage_selected = [
             str(row["symbol"]) for row in selected_rows if row.get("selection_role") == "advantage"
         ]
+        cooldown_fill_selected = [
+            str(row["symbol"])
+            for row in selected_rows
+            if row.get("selection_role") == "cooldown_fill"
+        ]
         return {
             "version": self.VERSION,
             "read_only": True,
@@ -379,6 +404,8 @@ class MarketAnalysisSelectionPolicy:
             "cooldown_excluded_symbols": [
                 str(row["symbol"]) for row in cooldown_excluded
             ],
+            "cooldown_fill_count": len(cooldown_fill_selected),
+            "cooldown_fill_symbols": cooldown_fill_selected,
             "cooldown_underfilled": bool(
                 cooldown_excluded and len(selected_rows) < final_limit
             ),
@@ -431,8 +458,9 @@ class MarketAnalysisSelectionPolicy:
             "generated_at": selected_at.isoformat(),
             "reason": (
                 "Allocate expert analysis between current advantage and overdue coverage. "
-                "Every completed symbol stays out for the full cooldown, including material "
-                "short-cycle changes; single-slot rounds periodically cover overdue candidates. "
+                "Completed symbols stay out for the normal cooldown whenever fresh or overdue "
+                "coverage candidates exist; if the pool is otherwise empty, the oldest recent "
+                "symbols are used as bounded cooldown fills so the scheduler cannot go silent. "
                 "This controls expert-analysis allocation only."
             ),
             "diagnostic_boundary": (
