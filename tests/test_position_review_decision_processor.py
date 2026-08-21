@@ -297,3 +297,66 @@ async def test_profitable_retrace_exit_executes_with_dynamic_fraction() -> None:
     assert decision.position_size_pct == pytest.approx(0.5)
     assert any(call[0] == "execute" for call in calls)
     assert any(call[0] == "ensure" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_major_conflict_blocks_non_hard_exit() -> None:
+    calls: list[tuple[str, Any]] = []
+    decision = _decision(Action.CLOSE_LONG)
+    decision.raw_response["analysis_quality_contract"] = {
+        "cross_validation": {"unresolved_major_conflict_count": 1},
+    }
+
+    result = await _processor(calls).process(
+        decision=decision,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=18,
+        open_positions=[_profitable_retrace_position()],
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    assert result.handled is True
+    assert result.executed_immediately is False
+    assert not any(call[0] == "execute" for call in calls)
+    assert decision.raw_response["position_exit_conflict_gate"]["reason"] == (
+        "position_exit_unresolved_major_conflict"
+    )
+    assert any(
+        call[0] == "reason" and call[2] == "position_exit_unresolved_major_conflict"
+        for call in calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolved_major_conflict_does_not_block_hard_stop_exit() -> None:
+    calls: list[tuple[str, Any]] = []
+    decision = _decision(Action.CLOSE_LONG)
+    decision.raw_response["analysis_quality_contract"] = {
+        "cross_validation": {"unresolved_major_conflict_count": 2},
+    }
+    position = _profitable_retrace_position()
+    position["current_price"] = 97.0
+    position["unrealized_pnl"] = -30.0
+
+    result = await _processor(calls).process(
+        decision=decision,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=19,
+        open_positions=[position],
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    assert result.executed_immediately is True
+    assert any(call[0] == "execute" for call in calls)
+    assert "position_exit_conflict_gate" not in decision.raw_response
+    assert decision.raw_response["dynamic_exit_policy"]["hard_risk"] is True

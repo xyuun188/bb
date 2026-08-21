@@ -292,6 +292,23 @@ class PositionReviewDecisionProcessor:
         results: dict[str, Any] | None,
     ) -> PositionReviewProcessResult:
         dynamic_exit = apply_dynamic_exit(executed, open_positions)
+        conflict_gate = self._unresolved_exit_conflict_gate(executed, dynamic_exit)
+        if conflict_gate:
+            raw = dict(executed.raw_response or {})
+            raw["position_exit_conflict_gate"] = conflict_gate
+            executed.raw_response = raw
+            await self.result_recorder.record_skip(
+                decision=executed,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                reason=conflict_gate["reason"],
+                decision_db_id=decision_db_id,
+                results=results,
+                risk_alert=risk_alert,
+                append_result=True,
+            )
+            return PositionReviewProcessResult(handled=True)
         if not dynamic_exit.eligible:
             await self.result_recorder.record_skip(
                 decision=executed,
@@ -340,3 +357,41 @@ class PositionReviewDecisionProcessor:
             handled=True,
             executed_immediately=True,
         )
+
+    @staticmethod
+    def _unresolved_exit_conflict_gate(
+        decision: DecisionOutput,
+        dynamic_exit: Any,
+    ) -> dict[str, Any] | None:
+        """Keep model-only exits behind resolved evidence while preserving hard stops.
+
+        Position review may continue to run while experts disagree, but a model
+        close/reduce must not become an order until the major conflict is
+        resolved. Exchange/stop/funding hard-risk exits remain executable.
+        """
+
+        if getattr(dynamic_exit, "hard_risk", False):
+            return None
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        quality = raw.get("analysis_quality_contract")
+        quality = quality if isinstance(quality, dict) else {}
+        cross = quality.get("cross_validation")
+        cross = cross if isinstance(cross, dict) else {}
+        try:
+            unresolved_count = int(cross.get("unresolved_major_conflict_count") or 0)
+        except (TypeError, ValueError):
+            unresolved_count = 0
+        if unresolved_count <= 0:
+            return None
+        return {
+            "version": "2026-08-21.position-exit-conflict-gate.v1",
+            "blocked": True,
+            "reason": "position_exit_unresolved_major_conflict",
+            "unresolved_major_conflict_count": unresolved_count,
+            "dynamic_exit_reason": str(getattr(dynamic_exit, "reason", "") or ""),
+            "dynamic_exit_close_fraction": float(
+                getattr(dynamic_exit, "close_fraction", 0.0) or 0.0
+            ),
+            "hard_risk": False,
+            "production_permission": False,
+        }
