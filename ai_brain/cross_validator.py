@@ -72,8 +72,8 @@ BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
 _CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
 _CONSULTATION_TIMEOUT_CAP_SECONDS = 18.0
-_CONSULTATION_ATTEMPT_CAP_SECONDS = 8.0
-_CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 8.0
+_CONSULTATION_ATTEMPT_CAP_SECONDS = 10.0
+_CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 10.0
 _CONSULTATION_FALLBACK_RESERVE_SECONDS = 2.0
 # A consultation waits on the same capacity scheduler as every other model
 # call. The old separate semaphore added a second FIFO queue and caused
@@ -791,9 +791,15 @@ class CrossValidator:
                         else _CONSULTATION_ATTEMPT_CAP_SECONDS
                     )
                     has_fallback = candidate_index < len(candidates) - 1
+                    # Give the primary consultation the complete first-attempt
+                    # budget. Reserving fallback time here made a normal,
+                    # complex arbitration request expire before its first
+                    # model response; fallback candidates still receive the
+                    # bounded reserve after a real primary failure.
                     reserve = (
                         _CONSULTATION_FALLBACK_RESERVE_SECONDS
                         if has_fallback
+                        and candidate_index > 0
                         and remaining > _CONSULTATION_FALLBACK_RESERVE_SECONDS + 1.0
                         else 0.0
                     )

@@ -260,6 +260,77 @@ async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> No
     ]
 
 
+async def test_primary_consultation_uses_full_first_attempt_budget(monkeypatch) -> None:
+    validator = CrossValidator()
+    candidates = [
+        {
+            "name": "trend_expert",
+            "label": "trend",
+            "api_base": "http://127.0.0.1:18003/v1",
+            "api_key": "",
+            "model": "BB-FinQuant-Expert-14B",
+            "source": "primary",
+            "retries": 1,
+        },
+        {
+            "name": "decision_maker",
+            "label": "fallback",
+            "api_base": "https://decision.example.com/v1",
+            "api_key": "decision-key",
+            "model": "decision-model",
+            "source": "decision_maker",
+            "retries": 1,
+        },
+    ]
+    monkeypatch.setattr(validator, "_consultation_candidates", lambda trend_cfg: candidates)
+    request_timeouts: list[float] = []
+
+    async def fake_invoke(
+        messages,
+        candidate,
+        request_timeout=None,
+        *,
+        queue_timeout_seconds=None,
+        runtime_metrics=None,
+        capacity_context=None,
+    ):
+        del messages, candidate, queue_timeout_seconds, capacity_context
+        request_timeouts.append(float(request_timeout or 0.0))
+        if runtime_metrics is not None:
+            runtime_metrics.update(
+                {
+                    "queue_wait_seconds": 0.0,
+                    "inference_duration_seconds": 0.0,
+                    "consultation_concurrency": 2,
+                }
+            )
+        return (
+            AIMessage(content="ok"),
+            '{"conflict_note":"reviewed",'
+            '"observation_summary":"primary completed",'
+            '"resolution_status":"resolved",'
+            '"resolved_action":"hold",'
+            '"resolved_conflict_pairs":[["risk_expert","trend_expert"]]}',
+        )
+
+    monkeypatch.setattr(validator, "_invoke_consultation_model", fake_invoke)
+    result = await validator.consult_if_needed(
+        {},
+        [
+            {
+                "expert_pair": ["trend_expert", "risk_expert"],
+                "major_conflict": True,
+                "conflict_note": "direction conflict",
+            }
+        ],
+        timeout_seconds=12.0,
+    )
+
+    assert result is not None
+    assert result["status"] == "completed"
+    assert request_timeouts == [pytest.approx(10.0, abs=0.1)]
+
+
 async def test_consultation_allows_two_inferences_without_queue_serialization(
     monkeypatch,
 ) -> None:
