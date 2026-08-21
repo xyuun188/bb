@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -25,6 +26,13 @@ DecisionLogger = Callable[[DecisionOutput, bool], Awaitable[int | None]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True, slots=True)
 class PositionReviewFastScanRecorder:
     """Record HOLD rows for position groups deferred from slow review."""
@@ -42,6 +50,19 @@ class PositionReviewFastScanRecorder:
     decision_reason_marker: DecisionReasonMarker
     result_recorder: PositionReviewResultRecorder
     hold_policy: PositionReviewFastScanHoldPolicy
+    no_action_record_interval_seconds: float = 300.0
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    _no_action_state: dict[tuple[str, str], tuple[tuple[Any, ...], datetime]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def reset_keys(self, keys: set[tuple[str, str]] | None) -> None:
+        """Forget audit state after a group receives its slow governed review."""
+
+        for key in keys or set():
+            self._no_action_state.pop(key, None)
 
     async def record_many(
         self,
@@ -115,6 +136,15 @@ class PositionReviewFastScanRecorder:
         )
         self.defer_count_applier(key, hold_plan.defer_count)
 
+        if not self._should_record_scan(
+            key=key,
+            scan=scan,
+            positions=positions,
+            urgent_exit=urgent_exit,
+            hold_plan=hold_plan,
+        ):
+            return 0
+
         fv = feature_vectors.get(symbol) or feature_vectors.get(normalized)
         decision = DecisionOutput(
             model_name=effective_model_name,
@@ -145,3 +175,65 @@ class PositionReviewFastScanRecorder:
             round_decision_ids.add(decision_db_id)
         await self.decision_reason_marker(decision_db_id, hold_plan.reason)
         return 1
+
+    def _should_record_scan(
+        self,
+        *,
+        key: tuple[str, str],
+        scan: dict[str, Any],
+        positions: list[dict[str, Any]],
+        urgent_exit: bool,
+        hold_plan: Any,
+    ) -> bool:
+        """Throttle only stable, no-action observations from the fast pass."""
+
+        dynamic_exit = scan.get("dynamic_exit_policy")
+        dynamic_exit = dynamic_exit if isinstance(dynamic_exit, dict) else {}
+        eligible = bool(
+            scan.get("dynamic_exit_eligible") is True and dynamic_exit.get("eligible") is True
+        )
+        hard_risk = bool(scan.get("dynamic_exit_hard_risk") or dynamic_exit.get("hard_risk"))
+        if eligible or hard_risk or urgent_exit:
+            return True
+
+        fingerprint = (
+            str(scan.get("reason") or ""),
+            bool(scan.get("dynamic_exit_eligible")),
+            bool(dynamic_exit.get("eligible")),
+            round(_safe_float(dynamic_exit.get("close_fraction")), 4),
+            tuple(
+                sorted(
+                    (
+                        str(position.get("side") or "").lower(),
+                        str(
+                            position.get("id")
+                            or position.get("pos_id")
+                            or position.get("posId")
+                            or ""
+                        ),
+                        round(_safe_float(position.get("contracts") or position.get("size")), 8),
+                    )
+                    for position in positions or []
+                    if isinstance(position, dict)
+                )
+            ),
+            str(getattr(hold_plan, "reason", "") or ""),
+        )
+        now = self.clock()
+        previous = self._no_action_state.get(key)
+        if previous is None:
+            self._no_action_state[key] = (fingerprint, now)
+            return True
+        previous_fingerprint, previous_at = previous
+        if previous_fingerprint != fingerprint:
+            self._no_action_state[key] = (fingerprint, now)
+            return True
+        try:
+            elapsed = (now - previous_at).total_seconds()
+        except (AttributeError, TypeError):
+            self._no_action_state[key] = (fingerprint, now)
+            return True
+        if elapsed < max(float(self.no_action_record_interval_seconds), 0.0):
+            return False
+        self._no_action_state[key] = (fingerprint, now)
+        return True

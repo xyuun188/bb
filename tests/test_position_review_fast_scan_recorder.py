@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -47,6 +48,7 @@ def _recorder(
     calls: list[tuple[str, Any]],
     *,
     decision_id: int | None,
+    clock: Callable[[], datetime] | None = None,
 ) -> PositionReviewFastScanRecorder:
     applied_defer_counts: dict[tuple[str, str], int] = {}
 
@@ -88,6 +90,8 @@ def _recorder(
         hold_policy=PositionReviewFastScanHoldPolicy(
             clock=lambda: datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
         ),
+        no_action_record_interval_seconds=300.0,
+        clock=clock or (lambda: datetime(2026, 6, 10, 12, 0, tzinfo=UTC)),
     )
 
 
@@ -145,3 +149,123 @@ async def test_fast_scan_recorder_keeps_dashboard_row_when_decision_log_fails() 
     assert not any(call[0] == "reason" for call in calls)
     assert results["decisions"][0]["symbol"] == "ETH/USDT"
     assert results["decisions"][0]["execution_status"] == "fast_position_scan"
+
+
+@pytest.mark.asyncio
+async def test_fast_scan_recorder_throttles_stable_no_action_observation() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    now = [datetime(2026, 6, 10, 12, 0, tzinfo=UTC)]
+
+    recorder = _recorder(calls, decision_id=43, clock=lambda: now[0])
+    item = [("ensemble_trader", "BTC/USDT")]
+    scan = {item[0]: {"priority_score": 1.0, "reason": "dynamic_exit_pressure_zero"}}
+
+    assert (
+        await recorder.record_many(
+            skipped_items=[(item[0], [{"side": "long", "id": 7, "contracts": 1}])],
+            fast_scan=scan,
+            feature_vectors={},
+            portfolio_profit_context=None,
+            results=results,
+            round_decision_ids=set(),
+        )
+        == 1
+    )
+    now[0] = now[0].replace(second=30)
+    assert (
+        await recorder.record_many(
+            skipped_items=[(item[0], [{"side": "long", "id": 7, "contracts": 1}])],
+            fast_scan=scan,
+            feature_vectors={},
+            portfolio_profit_context=None,
+            results=results,
+            round_decision_ids=set(),
+        )
+        == 0
+    )
+    assert len([call for call in calls if call[0] == "log"]) == 1
+
+    now[0] += timedelta(seconds=271)
+    assert (
+        await recorder.record_many(
+            skipped_items=[(item[0], [{"side": "long", "id": 7, "contracts": 1}])],
+            fast_scan=scan,
+            feature_vectors={},
+            portfolio_profit_context=None,
+            results=results,
+            round_decision_ids=set(),
+        )
+        == 1
+    )
+    assert len([call for call in calls if call[0] == "log"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_fast_scan_recorder_reopens_audit_when_reason_changes() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    recorder = _recorder(calls, decision_id=44)
+    key = ("ensemble_trader", "BTC/USDT")
+    base = {key: {"priority_score": 1.0, "reason": "dynamic_exit_pressure_zero"}}
+    args = {
+        "skipped_items": [(key, [{"side": "long", "id": 7, "contracts": 1}])],
+        "feature_vectors": {},
+        "portfolio_profit_context": None,
+        "results": results,
+        "round_decision_ids": set(),
+    }
+
+    assert await recorder.record_many(fast_scan=base, **args) == 1
+    changed = {key: {"priority_score": 1.0, "reason": "dynamic_exit_target_already_realized"}}
+    assert await recorder.record_many(fast_scan=changed, **args) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_scan_recorder_reopens_audit_after_slow_review() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    recorder = _recorder(calls, decision_id=46)
+    key = ("ensemble_trader", "BTC/USDT")
+    args = {
+        "skipped_items": [(key, [{"side": "long", "id": 7, "contracts": 1}])],
+        "fast_scan": {key: {"priority_score": 1.0, "reason": "dynamic_exit_pressure_zero"}},
+        "feature_vectors": {},
+        "portfolio_profit_context": None,
+        "results": results,
+        "round_decision_ids": set(),
+    }
+
+    assert await recorder.record_many(**args) == 1
+    assert await recorder.record_many(**args) == 0
+    recorder.reset_keys({key})
+    assert await recorder.record_many(**args) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_scan_recorder_never_throttles_governed_exit() -> None:
+    calls: list[tuple[str, Any]] = []
+    results = {"decisions": []}
+    now = [datetime(2026, 6, 10, 12, 0, tzinfo=UTC)]
+    recorder = _recorder(calls, decision_id=45, clock=lambda: now[0])
+    key = ("ensemble_trader", "BTC/USDT")
+    scan = {
+        key: {
+            "priority_score": 90.0,
+            "dynamic_exit_eligible": True,
+            "dynamic_exit_hard_risk": True,
+            "dynamic_exit_policy": {"eligible": True, "close_fraction": 0.25},
+            "reason": "stop_loss_triggered",
+        }
+    }
+    args = {
+        "skipped_items": [(key, [{"side": "long", "id": 7, "contracts": 1}])],
+        "fast_scan": scan,
+        "feature_vectors": {},
+        "portfolio_profit_context": None,
+        "results": results,
+        "round_decision_ids": set(),
+    }
+    assert await recorder.record_many(**args) == 1
+    now[0] = now[0].replace(second=1)
+    assert await recorder.record_many(**args) == 1
