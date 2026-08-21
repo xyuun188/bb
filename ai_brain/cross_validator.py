@@ -67,16 +67,18 @@ ACTION_DIRECTION = {
     Action.HOLD: 0,
 }
 
-_CONSULTATION_CONCURRENCY = 2
-_CONSULTATION_SEMAPHORE = asyncio.BoundedSemaphore(_CONSULTATION_CONCURRENCY)
+_CONSULTATION_CONCURRENCY = max(int(settings.ai_llm_concurrency or 2), 1)
 BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
 _CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
 _CONSULTATION_TIMEOUT_CAP_SECONDS = 18.0
-_CONSULTATION_ATTEMPT_CAP_SECONDS = 6.0
-_CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 6.0
+_CONSULTATION_ATTEMPT_CAP_SECONDS = 8.0
+_CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 8.0
 _CONSULTATION_FALLBACK_RESERVE_SECONDS = 2.0
-_CONSULTATION_QUEUE_WAIT_CAP_SECONDS = 1.5
+# A consultation waits on the same capacity scheduler as every other model
+# call. The old separate semaphore added a second FIFO queue and caused
+# requests to expire before they reached the shared scheduler.
+_CONSULTATION_QUEUE_WAIT_CAP_SECONDS = 3.0
 
 
 class ConsultationQueueTimeoutError(TimeoutError):
@@ -645,7 +647,6 @@ class CrossValidator:
             ),
             _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
         )
-        consultation_acquired = False
         shared_capacity_context = dict(capacity_context or {})
         original_scope = str(
             shared_capacity_context.get("_analysis_budget_scope") or "shared"
@@ -656,21 +657,13 @@ class CrossValidator:
         shared_slot = shared_llm_capacity_slot(shared_capacity_context)
         shared_acquired = False
         try:
-            await asyncio.wait_for(_CONSULTATION_SEMAPHORE.acquire(), timeout=queue_timeout)
-            consultation_acquired = True
-            remaining_queue_seconds = max(
-                queue_timeout - (time.perf_counter() - queue_wait_started),
-                0.05,
-            )
             await asyncio.wait_for(
                 shared_slot.__aenter__(),
-                timeout=remaining_queue_seconds,
+                timeout=queue_timeout,
             )
             shared_acquired = True
         except TimeoutError as exc:
             queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
-            if consultation_acquired:
-                _CONSULTATION_SEMAPHORE.release()
             if runtime_metrics is not None:
                 runtime_metrics.update(
                     {
@@ -684,8 +677,6 @@ class CrossValidator:
         except BaseException:
             if shared_acquired:
                 await shared_slot.__aexit__(None, None, None)
-            if consultation_acquired:
-                _CONSULTATION_SEMAPHORE.release()
             raise
 
         queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
@@ -696,8 +687,6 @@ class CrossValidator:
             inference_duration_seconds = round(time.perf_counter() - inference_started, 3)
             if shared_acquired:
                 await shared_slot.__aexit__(None, None, None)
-            if consultation_acquired:
-                _CONSULTATION_SEMAPHORE.release()
             if runtime_metrics is not None:
                 runtime_metrics.update(
                     {

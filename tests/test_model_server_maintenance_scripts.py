@@ -530,14 +530,13 @@ def test_start_online_model_tunnels_drain_timeout_without_cutting_active_channel
 
     assert active_training_transport is server.ssh_transport
     assert server.ssh_transport.closed is False
-    retry_transport = server.transport_pool.acquire(0)
-    assert retry_transport is server.ssh_transport
+    assert server.transport_pool.acquire(0) is None
 
-    server.transport_pool.release(retry_transport)
     server.transport_pool.release(active_training_transport)
 
-    assert server.ssh_transport.closed is False
-    assert server.transport_pool.acquire(0) is server.ssh_transport
+    assert server.ssh_transport.closed is True
+    assert server.transport_pool.acquire(0) is None
+    assert server.transport_pool.inactive_transports() == [server.ssh_transport]
 
 
 def test_start_online_model_tunnels_retire_inactive_transport_immediately() -> None:

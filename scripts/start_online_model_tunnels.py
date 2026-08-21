@@ -95,12 +95,13 @@ def _transport_is_active(transport: Any) -> bool:
 def _should_retire_transport(exc: BaseException, transport: Any) -> bool:
     """Retire only a transport failure, never an isolated channel-open refusal."""
 
-    if not _transport_is_active(transport) or isinstance(exc, EOFError):
+    if isinstance(exc, (EOFError, TimeoutError, socket.timeout, ConnectionError, OSError)):
         return True
     message = safe_error_text(exc, limit=240).lower()
     return any(
         marker in message
         for marker in (
+            "timeout opening channel",
             "ssh session not active",
             "transport is closed",
             "socket is closed",

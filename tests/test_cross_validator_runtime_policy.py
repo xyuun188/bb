@@ -285,11 +285,6 @@ async def test_consultation_allows_two_inferences_without_queue_serialization(
                 active -= 1
 
     monkeypatch.setattr("ai_brain.cross_validator.ChatOpenAI", FakeChatOpenAI)
-    monkeypatch.setattr(
-        cross_validator_module,
-        "_CONSULTATION_SEMAPHORE",
-        asyncio.BoundedSemaphore(2),
-    )
     metrics = [{}, {}]
     validator = CrossValidator()
     candidate = {
@@ -333,7 +328,6 @@ async def test_consultation_queue_timeout_includes_shared_expert_capacity(
             invoked = True
             return AIMessage(content="{}")
 
-    semaphore = asyncio.BoundedSemaphore(2)
     shared_slots = [
         shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"})
         for _ in range(2)
@@ -341,7 +335,6 @@ async def test_consultation_queue_timeout_includes_shared_expert_capacity(
     for slot in shared_slots:
         await slot.__aenter__()
     monkeypatch.setattr("ai_brain.cross_validator.ChatOpenAI", FakeChatOpenAI)
-    monkeypatch.setattr(cross_validator_module, "_CONSULTATION_SEMAPHORE", semaphore)
     metrics: dict[str, Any] = {}
 
     try:
@@ -366,13 +359,16 @@ async def test_consultation_queue_timeout_includes_shared_expert_capacity(
     assert metrics["queue_timeout_seconds"] == 0.05
     assert metrics["queue_wait_seconds"] >= 0.04
     assert metrics["inference_duration_seconds"] == 0.0
-    assert semaphore.locked() is False
 
 
 async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) -> None:
     validator = CrossValidator()
-    semaphore = asyncio.BoundedSemaphore(1)
-    await semaphore.acquire()
+    shared_slots = [
+        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"})
+        for _ in range(2)
+    ]
+    for slot in shared_slots:
+        await slot.__aenter__()
 
     class FakeChatOpenAI:
         def __init__(self, **kwargs: Any) -> None:
@@ -382,7 +378,6 @@ async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) ->
             raise AssertionError("a saturated consultation queue must not invoke the model")
 
     monkeypatch.setattr("ai_brain.cross_validator.ChatOpenAI", FakeChatOpenAI)
-    monkeypatch.setattr(cross_validator_module, "_CONSULTATION_SEMAPHORE", semaphore)
     monkeypatch.setattr(
         cross_validator_module,
         "_CONSULTATION_QUEUE_WAIT_CAP_SECONDS",
@@ -404,17 +399,21 @@ async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) ->
         ],
     )
 
-    result = await validator.consult_if_needed(
-        {},
-        [
-            {
-                "expert_pair": ["trend_expert", "risk_expert"],
-                "major_conflict": True,
-                "conflict_note": "direction conflict",
-            }
-        ],
-        timeout_seconds=1.0,
-    )
+    try:
+        result = await validator.consult_if_needed(
+            {},
+            [
+                {
+                    "expert_pair": ["trend_expert", "risk_expert"],
+                    "major_conflict": True,
+                    "conflict_note": "direction conflict",
+                }
+            ],
+            timeout_seconds=1.0,
+        )
+    finally:
+        for slot in reversed(shared_slots):
+            await slot.__aexit__(None, None, None)
 
     assert result is not None
     assert result["status"] == "failed"
@@ -423,7 +422,6 @@ async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) ->
     assert result["consultation_attempts"][0]["status"] == "queue_timeout"
     assert result["consultation_attempts"][0]["queue_timeout_seconds"] == 0.05
     assert result["consultation_attempts"][0]["inference_duration_seconds"] == 0.0
-    semaphore.release()
 
 
 def test_consultation_budget_is_bounded(monkeypatch) -> None:
