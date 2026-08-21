@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-08-21.cooldown-fill-market-analysis.v6"
+    VERSION = "2026-08-21.strict-analysis-cooldown.v7"
 
     def __init__(
         self,
@@ -128,11 +128,13 @@ class MarketAnalysisSelectionPolicy:
             reverse=True,
         )
 
-        # A repeat penalty is useful for ranking.  When the fresh/coverage
-        # candidates cannot fill the actual analysis budget, use the candidates
-        # closest to cooldown expiry as a bounded fallback.  This keeps the
-        # scheduler producing observable rounds without allowing a high-score
-        # symbol to monopolize the queue.
+        # A repeat penalty is useful for ranking, but it is not permission to
+        # call a symbol again.  The cooldown is a hard scheduling contract:
+        # when the current feature pool contains only recently completed
+        # symbols, return an underfilled result and let the upstream rotating
+        # pool provide different symbols on a later round.  Reusing a recent
+        # symbol merely to keep the activity counter non-zero was the source
+        # of sub-minute duplicate analyses in production.
         cooldown_excluded = [row for row in ranked if bool(row["recent"])]
         eligible_ranked = [row for row in ranked if not bool(row["recent"])]
 
@@ -184,27 +186,6 @@ class MarketAnalysisSelectionPolicy:
                     advantage_assigned += 1
                 else:
                     row["selection_role"] = "fallback_fill"
-                selected_rows.append(row)
-                selected_keys.add(str(row["symbol_key"]))
-                if len(selected_rows) >= final_limit:
-                    break
-
-        if len(selected_rows) < final_limit and not eligible_ranked:
-            selected_cooldown_rows = sorted(
-                (
-                    row
-                    for row in cooldown_excluded
-                    if str(row["symbol_key"]) not in selected_keys
-                ),
-                key=lambda row: (
-                    _safe_float(row["recent_age_seconds"], -1.0),
-                    _safe_float(row["evaluation_score"]),
-                    -int(row["rank_before_selection"]),
-                ),
-                reverse=True,
-            )
-            for row in selected_cooldown_rows:
-                row["selection_role"] = "cooldown_fill"
                 selected_rows.append(row)
                 selected_keys.add(str(row["symbol_key"]))
                 if len(selected_rows) >= final_limit:
@@ -404,10 +385,24 @@ class MarketAnalysisSelectionPolicy:
             "cooldown_excluded_symbols": [
                 str(row["symbol"]) for row in cooldown_excluded
             ],
+            # Retained as a compatibility field for existing dashboard clients;
+            # strict v7 never populates it because a recent symbol is never a
+            # valid fill candidate.
             "cooldown_fill_count": len(cooldown_fill_selected),
             "cooldown_fill_symbols": cooldown_fill_selected,
             "cooldown_underfilled": bool(
                 cooldown_excluded and len(selected_rows) < final_limit
+            ),
+            "underfill_reason": (
+                "all_candidates_in_cooldown"
+                if cooldown_excluded
+                and not any(not bool(row["recent"]) for row in rows)
+                and len(selected_rows) < final_limit
+                else (
+                    "fresh_candidate_pool_exhausted"
+                    if len(selected_rows) < final_limit
+                    else None
+                )
             ),
             "selected": selected_details,
             "cooldown_seconds": int(self.params.cooldown_seconds),
@@ -458,9 +453,9 @@ class MarketAnalysisSelectionPolicy:
             "generated_at": selected_at.isoformat(),
             "reason": (
                 "Allocate expert analysis between current advantage and overdue coverage. "
-                "Completed symbols stay out for the normal cooldown whenever fresh or overdue "
-                "coverage candidates exist; if the pool is otherwise empty, the oldest recent "
-                "symbols are used as bounded cooldown fills so the scheduler cannot go silent. "
+                "Completed symbols stay out for the full cooldown. If the current pool is "
+                "entirely recent, the result is intentionally underfilled and the upstream "
+                "rotating pool must supply other symbols; no cooldown fill is permitted. "
                 "This controls expert-analysis allocation only."
             ),
             "diagnostic_boundary": (

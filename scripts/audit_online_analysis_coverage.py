@@ -29,7 +29,7 @@ def _remote_script(*, remote_app_dir: str, window_minutes: int) -> str:
 import asyncio
 import json
 import subprocess
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -155,6 +155,39 @@ async def run():
         else (now - since).total_seconds()
     )
     market_symbol_counts = Counter(str(row.symbol or "") for row in market_rows)
+    symbol_times = defaultdict(list)
+    for row in market_rows:
+        symbol = str(row.symbol or "")
+        timestamp = as_utc(row.created_at)
+        if symbol and timestamp is not None:
+            symbol_times[symbol].append(timestamp)
+    symbol_min_gaps = {{}}
+    duplicate_within_cooldown = []
+    cooldown_seconds = 10 * 60
+    for symbol, timestamps in symbol_times.items():
+        gaps = [
+            max((current - previous).total_seconds(), 0.0)
+            for previous, current in zip(timestamps, timestamps[1:])
+        ]
+        if gaps:
+            symbol_min_gaps[symbol] = round(min(gaps), 3)
+            duplicate_within_cooldown.extend(
+                {{
+                    "symbol": symbol,
+                    "started_at": timestamps[index].isoformat(),
+                    "finished_at": timestamps[index + 1].isoformat(),
+                    "gap_seconds": round(gap, 3),
+                }}
+                for index, gap in enumerate(gaps)
+                if gap < cooldown_seconds
+            )
+    smallest_symbol_gaps = sorted(
+        (
+            {{"symbol": symbol, "min_gap_seconds": gap}}
+            for symbol, gap in symbol_min_gaps.items()
+        ),
+        key=lambda item: item["min_gap_seconds"],
+    )
     top_symbol, top_count = market_symbol_counts.most_common(1)[0] if market_symbol_counts else ("", 0)
     payload = {{
         "generated_at": now.isoformat(),
@@ -180,6 +213,10 @@ async def run():
             "top_symbol_count": top_count,
             "top_symbol_share": round(top_count / len(market_rows), 6) if market_rows else None,
             "symbol_counts": dict(market_symbol_counts.most_common()),
+            "cooldown_seconds": cooldown_seconds,
+            "symbol_min_gaps": smallest_symbol_gaps,
+            "duplicate_within_cooldown_count": len(duplicate_within_cooldown),
+            "duplicate_within_cooldown": duplicate_within_cooldown[:20],
         }},
         "position_review": {{
             "open_position_count": open_position_count,
@@ -277,6 +314,8 @@ def assess_coverage_report(
         float(max_activity_gap_seconds), 1.0
     ):
         blockers.append("market_analysis_activity_gap_too_large")
+    if int(market.get("duplicate_within_cooldown_count") or 0) > 0:
+        blockers.append("market_analysis_duplicate_within_cooldown")
 
     position = (
         report.get("position_review") if isinstance(report.get("position_review"), dict) else {}

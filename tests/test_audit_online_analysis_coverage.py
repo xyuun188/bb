@@ -142,6 +142,17 @@ def test_assessment_rejects_unresolved_due_market_candidates() -> None:
     assert "market_candidate_coverage_has_unresolved_due_symbols" in assessment["blockers"]
 
 
+def test_assessment_rejects_duplicate_market_analysis_inside_cooldown() -> None:
+    now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    report = _report(now)
+    report["market"]["duplicate_within_cooldown_count"] = 1
+
+    assessment = audit.assess_coverage_report(report, now=now)
+
+    assert assessment["ready"] is False
+    assert assessment["blockers"] == ["market_analysis_duplicate_within_cooldown"]
+
+
 def test_assessment_rejects_stale_candidate_selection_evidence() -> None:
     now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
     report = _report(now)
@@ -178,6 +189,7 @@ def test_remote_script_compiles_and_reads_only_runtime_evidence() -> None:
     assert "bb-paper-trading.service" in script
     assert "bb-model-tunnels.service" in script
     assert "ActiveEnterTimestamp" in script
+    assert "duplicate_within_cooldown_count" in script
     assert "strict=True" not in script
 
 

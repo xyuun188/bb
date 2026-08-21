@@ -442,6 +442,7 @@ AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS = AUTO_SCAN_PARAMS.feature_fetch_timeout
 AUTO_SCAN_FEATURE_FETCH_CONCURRENCY = AUTO_SCAN_PARAMS.feature_fetch_concurrency
 ALT_LONG_ALLOWED_SYMBOLS = set(AUTO_SCAN_PARAMS.major_symbols)
 MARKET_ANALYSIS_SELECTION_PARAMS = DEFAULT_TRADING_PARAMS.market_analysis_selection
+MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS = 3.0
 
 
 class TradingService:
@@ -6821,13 +6822,29 @@ class TradingService:
         return "模型分析超过独立时间上限" not in str(reasoning or "")
 
     async def _ensure_market_analysis_selection_history(self) -> None:
-        """Start one non-blocking hydration of the analysis cooldown history."""
+        """Hydrate cooldown history before selecting any market symbol.
+
+        Selection must not race the database read after a service restart.  A
+        bounded wait keeps a slow database from holding the scheduler forever;
+        while the read is still pending, callers receive an explicitly empty
+        shortlist instead of risking a duplicate analysis.
+        """
 
         policy = self._market_analysis_selector_policy()
         if policy.history_loaded:
             return
         existing = getattr(self, "_market_analysis_selection_history_task", None)
         if isinstance(existing, asyncio.Task) and not existing.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(existing),
+                    timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "market analysis cooldown history is still loading; selection deferred",
+                    timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+                )
             return
         cutoff = datetime.now(UTC) - timedelta(
             seconds=max(
@@ -6887,6 +6904,7 @@ class TradingService:
                         feature_snapshot,
                         observed_at=row.created_at,
                     )
+                policy.history_loaded = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -6898,11 +6916,19 @@ class TradingService:
                 if getattr(self, "_market_analysis_selection_history_task", None) is asyncio.current_task():
                     self._market_analysis_selection_history_task = None
 
-        policy.history_loaded = True
         task = asyncio.create_task(hydrate())
         self._market_analysis_selection_history_task = task
         task.add_done_callback(_consume_task_result)
-        await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "market analysis cooldown history load timed out; selection deferred",
+                timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+            )
 
     def _select_market_analysis_candidates(
         self,
@@ -6911,7 +6937,39 @@ class TradingService:
         *,
         analysis_budget_context: dict[str, Any],
     ) -> dict[str, Any]:
-        result = self._market_analysis_selector_policy().select(feature_vectors, limit)
+        policy = self._market_analysis_selector_policy()
+        if not policy.history_loaded:
+            diagnostics = {
+                "version": policy.VERSION,
+                "read_only": True,
+                "is_entry_gate": False,
+                "candidate_count": len(feature_vectors or {}),
+                "final_limit": max(0, int(limit or 0)),
+                "selected_count": 0,
+                "selected_symbols": [],
+                "cooldown_history_ready": False,
+                "underfill_reason": "cooldown_history_not_ready",
+                "generated_at": datetime.now(UTC).isoformat(),
+                "reason": (
+                    "Recent-analysis history is not ready after a bounded load window; "
+                    "defer this shortlist rather than risk duplicate expert calls."
+                ),
+                "diagnostic_boundary": (
+                    "Analysis scheduling only; no entry permission or risk threshold is changed."
+                ),
+            }
+            self._last_market_analysis_selection_diagnostics = diagnostics
+            analysis_budget_context["market_analysis_selection"] = diagnostics
+            analysis_budget_context["recent_market_analysis_dedupe"] = {
+                "read_only": True,
+                "is_entry_gate": False,
+                "skipped_count": len(feature_vectors or {}),
+                "skipped_symbols": list(feature_vectors or {})[:50],
+                "cooldown_history_ready": False,
+                "reason": "cooldown_history_not_ready",
+            }
+            return {}
+        result = policy.select(feature_vectors, limit)
         diagnostics = self._safe_dict(result.diagnostics)
         self._last_market_analysis_selection_diagnostics = diagnostics
         analysis_budget_context["market_analysis_selection"] = diagnostics

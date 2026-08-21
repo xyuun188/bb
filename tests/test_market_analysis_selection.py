@@ -118,7 +118,7 @@ def test_material_market_change_does_not_bypass_strict_cooldown() -> None:
         now=now,
     )
 
-    assert list(result.selected) == ["BTC/USDT"]
+    assert list(result.selected) == []
     candidate = result.diagnostics["candidate_sample"][0]
     assert candidate["symbol"] == "BTC/USDT"
     assert candidate["selection_status"] == "recent_material_change_cooldown"
@@ -127,7 +127,8 @@ def test_material_market_change_does_not_bypass_strict_cooldown() -> None:
     assert candidate["evaluation_score"] == 7.5
     assert candidate["material_change_reasons"][0]["feature"] == "current_price"
     assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
-    assert result.diagnostics["cooldown_fill_symbols"] == ["BTC/USDT"]
+    assert result.diagnostics["cooldown_fill_symbols"] == []
+    assert result.diagnostics["underfill_reason"] == "all_candidates_in_cooldown"
     assert result.diagnostics["recent_material_change_count"] == 1
 
 
@@ -187,7 +188,7 @@ def test_single_slot_rounds_periodically_cover_overdue_candidate() -> None:
     assert third.diagnostics["coverage_selected_symbols"] == ["SOL/USDT"]
 
 
-def test_all_recent_unchanged_candidates_use_bounded_cooldown_fill() -> None:
+def test_all_recent_unchanged_candidates_are_strictly_excluded() -> None:
     now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
     policy = _policy()
     candidates = {
@@ -199,12 +200,13 @@ def test_all_recent_unchanged_candidates_use_bounded_cooldown_fill() -> None:
 
     result = policy.select(candidates, 2, now=now)
 
-    assert list(result.selected) == ["BTC/USDT", "ETH/USDT"]
-    assert result.diagnostics["selected_count"] == 2
+    assert list(result.selected) == []
+    assert result.diagnostics["selected_count"] == 0
     assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT", "ETH/USDT"]
-    assert result.diagnostics["cooldown_underfilled"] is False
-    assert result.diagnostics["cooldown_fill_symbols"] == ["BTC/USDT", "ETH/USDT"]
-    assert result.diagnostics["skipped_count"] == 0
+    assert result.diagnostics["cooldown_underfilled"] is True
+    assert result.diagnostics["cooldown_fill_symbols"] == []
+    assert result.diagnostics["underfill_reason"] == "all_candidates_in_cooldown"
+    assert result.diagnostics["skipped_count"] == 2
 
 
 def test_recent_unchanged_candidate_cannot_fill_budget_over_fresh_candidate() -> None:

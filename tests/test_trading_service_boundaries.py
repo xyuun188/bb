@@ -5500,6 +5500,12 @@ def test_market_analysis_value_selection_populates_runtime_budget_diagnostics() 
     service.entry_feature_ranker = SimpleNamespace(
         feature_opportunity_score=lambda feature: float(feature.score)
     )
+    service.market_analysis_selector = trading_service.MarketAnalysisSelectionPolicy(
+        normalize_symbol=service._normalize_position_symbol,
+        advantage_scorer=lambda feature: float(feature.score),
+        params=trading_service.MARKET_ANALYSIS_SELECTION_PARAMS,
+    )
+    service.market_analysis_selector.history_loaded = True
     analysis_budget: dict[str, Any] = {}
 
     selected = service._select_market_analysis_candidates(
@@ -6484,7 +6490,7 @@ async def test_market_selection_history_projects_only_small_selection_fields(
 
 
 @pytest.mark.asyncio
-async def test_market_selection_history_loads_in_background_without_blocking_round(
+async def test_market_selection_history_defers_selection_until_bounded_load_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
@@ -6513,17 +6519,24 @@ async def test_market_selection_history_loads_in_background_without_blocking_rou
             return None
 
     monkeypatch.setattr(trading_service, "get_read_session_ctx", SessionContext)
+    monkeypatch.setattr(
+        trading_service,
+        "MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS",
+        0.05,
+    )
     started = asyncio.get_running_loop().time()
     await service._ensure_market_analysis_selection_history()
     elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 0.2
+    assert elapsed >= 0.04
     assert query_started.is_set()
     assert cleanup_finished.is_set() is False
-    assert policy.history_loaded is True
+    assert policy.history_loaded is False
 
     release_query.set()
     await asyncio.wait_for(cleanup_finished.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+    assert policy.history_loaded is True
 
 
 def test_market_symbol_timeout_cooldown_yields_to_other_candidates() -> None:
