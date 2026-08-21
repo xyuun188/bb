@@ -10,6 +10,9 @@ from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
 from services.manual_close_marker import ORPHAN_QUARANTINE_EXCHANGE_ID_PREFIX
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
+from services.okx_native_full_close_evidence import (
+    NATIVE_FULL_CLOSE_ZERO_POSITION_EVIDENCE_VERSION,
+)
 from services.okx_trade_fact_integrity import (
     OkxTradeFactIntegrityService,
     _start_consistent_read_snapshot,
@@ -1364,6 +1367,59 @@ async def test_closed_position_with_realized_pnl_requires_close_order_link(
 
         assert report["status"] == "critical"
         assert "closed_position_missing_close_order_link" in kinds
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_native_full_close_zero_position_identity_is_quarantined_not_blocking(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    try:
+        closed_at = _recent_filled_at(minutes_ago=20)
+        position = Position(
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            side="short",
+            quantity=0.0018,
+            entry_price=66712.3,
+            current_price=68188.4,
+            realized_pnl=-2.717,
+            leverage=1.0,
+            is_open=False,
+            okx_inst_id="BTC-USDT-SWAP",
+            okx_pos_id="native-pos-id",
+            entry_exchange_order_id="native-entry-order",
+            settlement_status="settlement_quarantined",
+            closed_at=closed_at,
+            created_at=closed_at - timedelta(minutes=10),
+        )
+        async with get_session_ctx() as session:
+            session.add(position)
+            await session.flush()
+            position.settlement_raw = {
+                "native_full_close_zero_position_evidence": {
+                    "version": NATIVE_FULL_CLOSE_ZERO_POSITION_EVIDENCE_VERSION,
+                    "verified": True,
+                    "identity_authoritative": True,
+                    "economics_authoritative": False,
+                    "training_eligible": False,
+                    "position_id": position.id,
+                    "okx_pos_id": "native-pos-id",
+                    "okx_trade_id": "native-trade-id",
+                    "inst_id": "BTC-USDT-SWAP",
+                    "current_position_contracts": 0.0,
+                }
+            }
+
+        report = await OkxTradeFactIntegrityService(lookback_hours=24).audit()
+        issues = {issue["kind"]: issue for issue in report["issues"]}
+
+        assert report["status"] == "warning"
+        assert issues["native_full_close_identity_quarantined"]["severity"] == "warning"
+        assert "closed_position_missing_close_order_link" not in issues
     finally:
         await close_db()
 

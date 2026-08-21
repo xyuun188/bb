@@ -113,6 +113,17 @@ def test_missing_position_link_repair_imports_online_runtime_bootstrap() -> None
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
 
 
+def test_native_full_close_repair_imports_online_runtime_bootstrap() -> None:
+    source = repair_script.ROOT.joinpath(
+        "scripts",
+        "repair_okx_native_full_close_fills.py",
+    ).read_text(encoding="utf-8")
+
+    assert "from scripts.runtime_env_bootstrap import" in source
+    assert "load_runtime_env_files(project_root=ROOT)" in source
+    assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
+
+
 def test_missing_position_link_repair_redirects_probe_logs_from_stdout() -> None:
     source = repair_script.ROOT.joinpath(
         "scripts",

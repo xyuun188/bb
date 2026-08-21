@@ -30,6 +30,8 @@ from services.position_protection_rebalance import (
 )
 from services.protection_order_integrity import audit_protection_order_integrity
 
+ONLINE_REMOTE_OUTPUT_LIMIT = 200_000
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -182,6 +184,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         await executor.shutdown()
 
 
+def _decode_online_result(output: str) -> dict[str, Any]:
+    lines = str(output or "").splitlines()
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("{"):
+            continue
+        candidate = "\n".join(lines[index:]).strip()
+        try:
+            result = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            return result
+    raise RuntimeError("Online protection repair did not return a complete JSON report")
+
+
 def _run_online(args: argparse.Namespace) -> dict[str, Any]:
     remote_args = [
         ".venv/bin/python",
@@ -206,14 +223,13 @@ def _run_online(args: argparse.Namespace) -> dict[str, Any]:
             "runuser -u bb -- /bin/bash -lc " + shlex.quote(app_script),
             timeout=180,
             check=True,
+            max_output_chars=ONLINE_REMOTE_OUTPUT_LIMIT,
         )
     finally:
         ssh.close()
-    safe_print(output)
-    json_lines = [line for line in output.splitlines() if line.lstrip().startswith("{")]
-    if not json_lines:
-        raise RuntimeError("Online protection repair did not return a JSON report")
-    return json.loads(json_lines[-1])
+    result = _decode_online_result(output)
+    safe_print(json.dumps(result, ensure_ascii=False, default=str))
+    return result
 
 
 def main() -> None:

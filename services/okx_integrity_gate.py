@@ -9,6 +9,7 @@ OKX_TRADE_FACT_QUARANTINED_WARNING_KINDS = frozenset(
     {
         "contract_specification_evidence_missing",
         "manual_close_position_fact_not_exchange_backed",
+        "native_full_close_identity_quarantined",
         "okx_fill_not_linked_to_position",
         "order_position_missing",
         "orphan_position_quarantine_not_exchange_backed",

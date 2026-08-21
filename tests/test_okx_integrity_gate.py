@@ -20,6 +20,27 @@ def test_okx_integrity_gate_quarantines_only_registered_warning_kinds() -> None:
     assert [item["kind"] for item in blocking] == ["new_unregistered_warning"]
 
 
+def test_okx_integrity_gate_quarantines_native_full_close_identity_only_evidence() -> None:
+    blocking, quarantined = partition_okx_integrity_issues(
+        {
+            "issue_count": 1,
+            "warning_count": 1,
+            "severity_counts": {"warning": 1},
+            "issues": [
+                {
+                    "kind": "native_full_close_identity_quarantined",
+                    "severity": "warning",
+                }
+            ],
+        }
+    )
+
+    assert blocking == []
+    assert [item["kind"] for item in quarantined] == [
+        "native_full_close_identity_quarantined"
+    ]
+
+
 def test_okx_integrity_gate_fails_closed_for_missing_warning_details() -> None:
     blocking, quarantined = partition_okx_integrity_issues(
         {

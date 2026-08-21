@@ -26,6 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
+
 from core.symbols import normalize_trading_symbol  # noqa: E402
 from db.session import get_session_ctx  # noqa: E402
 from executor.base_executor import OrderStatus  # noqa: E402
@@ -35,6 +43,11 @@ from models.decision import AIDecision  # noqa: E402
 from models.learning import TradeReflection  # noqa: E402
 from models.trade import Order, Position  # noqa: E402
 from services.entry_fee_provider import EntryFeeProvider  # noqa: E402
+from services.okx_native_full_close_evidence import (  # noqa: E402
+    NATIVE_FULL_CLOSE_ZERO_POSITION_SOURCE,
+    build_native_full_close_state_transition_evidence,
+    build_native_full_close_zero_position_evidence,
+)
 
 DEFAULT_WINDOW_SECONDS = 180
 LOGGER = logging.getLogger(__name__)
@@ -74,6 +87,17 @@ class RepairPlan:
     new_closed_at: datetime
     okx_order_id: str
     delta_pnl: float
+
+
+@dataclass(frozen=True)
+class NativeCloseQuarantinePlan:
+    position_id: int
+    close_order_id: int
+    decision_id: int
+    symbol: str
+    okx_pos_id: str
+    okx_trade_id: str
+    evidence: dict[str, Any]
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -269,8 +293,9 @@ async def _collect_candidate_data(days: int) -> tuple[list[Position], list[Order
         order_result = await session.execute(
             select(Order).where(
                 Order.execution_mode == "paper",
-                Order.status == OrderStatus.FILLED.value,
-                Order.filled_at >= since - timedelta(days=1),
+                Order.status.in_([OrderStatus.FILLED.value, OrderStatus.PARTIAL.value]),
+                (Order.filled_at >= since - timedelta(days=1))
+                | (Order.created_at >= since - timedelta(days=1)),
             )
         )
         orders = list(order_result.scalars().all())
@@ -392,6 +417,171 @@ async def collect_repairs(
     return plans
 
 
+async def collect_native_close_quarantine_plans(
+    *,
+    days: int,
+    window_seconds: int,
+    position_id: int | None = None,
+) -> list[NativeCloseQuarantinePlan]:
+    """Persist identity-only evidence when native close flattened OKX exactly."""
+
+    positions, orders = await _collect_candidate_data(days)
+    if position_id is not None:
+        positions = [position for position in positions if int(position.id) == int(position_id)]
+    candidates: list[tuple[Position, Order, AIDecision]] = []
+    async with get_session_ctx() as session:
+        for position in positions:
+            close_order = _match_close_order(position, orders, window_seconds)
+            if close_order is None or int(close_order.id or 0) <= 0:
+                continue
+            decision_id = int(close_order.decision_id or 0)
+            if decision_id <= 0:
+                continue
+            decision = await session.get(AIDecision, decision_id)
+            if decision is None:
+                continue
+            raw_response = (
+                decision.raw_llm_response
+                if isinstance(decision.raw_llm_response, dict)
+                else {}
+            )
+            execution = raw_response.get("execution_result")
+            execution = execution if isinstance(execution, dict) else {}
+            raw = execution.get("raw_response")
+            raw = raw if isinstance(raw, dict) else {}
+            if raw.get("okx_native_close_position") is not True:
+                continue
+            candidates.append((position, close_order, decision))
+
+    current_rows_by_inst_id, current_position_queries_succeeded = await _fetch_current_position_rows(
+        {
+            str(position.okx_inst_id or "").strip().upper()
+            or f"{normalize_trading_symbol(position.symbol).replace('/', '-')}-SWAP"
+            for position, _order, _decision in candidates
+        }
+    )
+    plans: list[NativeCloseQuarantinePlan] = []
+    for position, close_order, decision in candidates:
+        inst_id = str(position.okx_inst_id or "").strip().upper()
+        if not inst_id:
+            inst_id = f"{normalize_trading_symbol(position.symbol).replace('/', '-')}-SWAP"
+        for current_row in current_rows_by_inst_id.get(inst_id, []):
+            if not isinstance(current_row, dict):
+                continue
+            evidence = build_native_full_close_zero_position_evidence(
+                position=position,
+                close_order=close_order,
+                decision=decision,
+                current_position_row=current_row,
+            )
+            if evidence is None:
+                continue
+            plans.append(
+                NativeCloseQuarantinePlan(
+                    position_id=int(position.id),
+                    close_order_id=int(close_order.id),
+                    decision_id=int(decision.id),
+                    symbol=normalize_trading_symbol(position.symbol),
+                    okx_pos_id=str(evidence["okx_pos_id"]),
+                    okx_trade_id=str(evidence["okx_trade_id"]),
+                    evidence=evidence,
+                )
+            )
+            break
+        if not any(plan.position_id == int(position.id) for plan in plans):
+            transition_evidence = build_native_full_close_state_transition_evidence(
+                position=position,
+                close_order=close_order,
+                decision=decision,
+                current_position_rows=current_rows_by_inst_id.get(inst_id, []),
+                current_position_query_succeeded=inst_id in current_position_queries_succeeded,
+            )
+            if transition_evidence is not None:
+                plans.append(
+                    NativeCloseQuarantinePlan(
+                        position_id=int(position.id),
+                        close_order_id=int(close_order.id),
+                        decision_id=int(decision.id),
+                        symbol=normalize_trading_symbol(position.symbol),
+                        okx_pos_id=str(transition_evidence["okx_pos_id"]),
+                        okx_trade_id="",
+                        evidence=transition_evidence,
+                    )
+                )
+    return plans
+
+
+async def _fetch_current_position_rows(
+    inst_ids: set[str],
+) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+    targets = {
+        str(value or "").strip().upper()
+        for value in inst_ids
+        if str(value or "").strip()
+    }
+    if not targets:
+        return {}, set()
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    result: dict[str, list[dict[str, Any]]] = {}
+    succeeded: set[str] = set()
+    try:
+        await executor.initialize()
+        ccxt = await executor._get_ccxt()
+        fetch_positions = getattr(ccxt, "privateGetAccountPositions", None)
+        if not callable(fetch_positions):
+            return {}, set()
+        for inst_id in sorted(targets):
+            try:
+                response = await executor._with_retry(
+                    fetch_positions,
+                    {"instType": "SWAP", "instId": inst_id},
+                )
+            except Exception as exc:
+                LOGGER.warning("failed to fetch OKX current position for %s: %s", inst_id, exc)
+                continue
+            rows = response.get("data", []) if isinstance(response, dict) else []
+            result[inst_id] = [row for row in rows if isinstance(row, dict)]
+            succeeded.add(inst_id)
+    finally:
+        await executor.shutdown()
+    return result, succeeded
+
+
+async def apply_native_close_quarantine_plans(
+    plans: list[NativeCloseQuarantinePlan],
+) -> dict[str, Any]:
+    if not plans:
+        return {"applied": 0}
+    async with get_session_ctx() as session:
+        applied = 0
+        for plan in plans:
+            position = await session.get(Position, plan.position_id)
+            if position is None or bool(position.is_open):
+                continue
+            raw = position.settlement_raw if isinstance(position.settlement_raw, dict) else {}
+            position.settlement_status = "settlement_quarantined"
+            position.settlement_source = str(
+                plan.evidence.get("source") or NATIVE_FULL_CLOSE_ZERO_POSITION_SOURCE
+            )
+            position.settlement_synced_at = datetime.now(UTC)
+            position.settlement_raw = {
+                **raw,
+                "status": "settlement_quarantined",
+                "source": NATIVE_FULL_CLOSE_ZERO_POSITION_SOURCE,
+                "native_full_close_zero_position_evidence": plan.evidence,
+                "native_full_close_identity_evidence": plan.evidence,
+                "identity_authority": "okx_current_position_zero",
+                "economics_authority": "pending_okx_position_history_or_bills",
+                "requires_okx_fill_backfill": True,
+                "training_eligible": False,
+                "quarantine_reason": "native_full_close_order_id_unavailable",
+            }
+            position.updated_at = datetime.now(UTC)
+            applied += 1
+        await session.flush()
+    return {"applied": applied}
+
+
 def _plan_payload(plan: RepairPlan) -> dict[str, Any]:
     return {
         "position_id": plan.position_id,
@@ -414,7 +604,22 @@ def _plan_payload(plan: RepairPlan) -> dict[str, Any]:
     }
 
 
-async def _backup_rows(plans: list[RepairPlan], backup_dir: Path) -> Path:
+def _quarantine_plan_payload(plan: NativeCloseQuarantinePlan) -> dict[str, Any]:
+    return {
+        "position_id": plan.position_id,
+        "close_order_id": plan.close_order_id,
+        "decision_id": plan.decision_id,
+        "symbol": plan.symbol,
+        "okx_pos_id": plan.okx_pos_id,
+        "okx_trade_id": plan.okx_trade_id,
+        "evidence": plan.evidence,
+    }
+
+
+async def _backup_rows(
+    plans: list[RepairPlan | NativeCloseQuarantinePlan],
+    backup_dir: Path,
+) -> Path:
     await asyncio.to_thread(backup_dir.mkdir, parents=True, exist_ok=True)
     path = backup_dir / f"okx_native_full_close_before_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
     ids = [plan.position_id for plan in plans]
@@ -451,7 +656,12 @@ async def _backup_rows(plans: list[RepairPlan], backup_dir: Path) -> Path:
         )
         accounts = (await session.execute(select(VirtualAccount))).scalars().all()
     payload = {
-        "plans": [_plan_payload(plan) for plan in plans],
+        "plans": [
+            _plan_payload(plan)
+            if isinstance(plan, RepairPlan)
+            else _quarantine_plan_payload(plan)
+            for plan in plans
+        ],
         "positions": [_model_payload(row) for row in positions],
         "orders": [_model_payload(row) for row in orders],
         "decisions": [_model_payload(row) for row in decisions],
@@ -602,15 +812,56 @@ async def main() -> int:
         window_seconds=args.window_seconds,
         position_id=args.position_id,
     )
-    print(json.dumps({"repairs": len(plans), "apply": bool(args.apply)}, ensure_ascii=False))
+    quarantine_plans = await collect_native_close_quarantine_plans(
+        days=args.days,
+        window_seconds=args.window_seconds,
+        position_id=args.position_id,
+    )
+    fill_repair_position_ids = {plan.position_id for plan in plans}
+    quarantine_plans = [
+        plan for plan in quarantine_plans if plan.position_id not in fill_repair_position_ids
+    ]
+    print(
+        json.dumps(
+            {
+                "repairs": len(plans),
+                "identity_quarantines": len(quarantine_plans),
+                "apply": bool(args.apply),
+            },
+            ensure_ascii=False,
+        )
+    )
     for plan in plans[:80]:
         print(json.dumps(_plan_payload(plan), ensure_ascii=False, sort_keys=True))
+    for plan in quarantine_plans[:80]:
+        print(json.dumps(_quarantine_plan_payload(plan), ensure_ascii=False, sort_keys=True))
     if len(plans) > 80:
         print(json.dumps({"truncated": len(plans) - 80}, ensure_ascii=False))
-    if args.apply and plans:
-        backup_path = await _backup_rows(plans, args.backup_dir)
-        result = await apply_repairs(plans)
-        print(json.dumps({"backup": str(backup_path), **result}, ensure_ascii=False))
+    if len(quarantine_plans) > 80:
+        print(
+            json.dumps(
+                {"identity_quarantines_truncated": len(quarantine_plans) - 80},
+                ensure_ascii=False,
+            )
+        )
+    all_plans: list[RepairPlan | NativeCloseQuarantinePlan] = [
+        *plans,
+        *quarantine_plans,
+    ]
+    if args.apply and all_plans:
+        backup_path = await _backup_rows(all_plans, args.backup_dir)
+        fill_result = await apply_repairs(plans)
+        quarantine_result = await apply_native_close_quarantine_plans(quarantine_plans)
+        print(
+            json.dumps(
+                {
+                    "backup": str(backup_path),
+                    "fill_repairs_applied": fill_result.get("applied", 0),
+                    "identity_quarantines_applied": quarantine_result.get("applied", 0),
+                },
+                ensure_ascii=False,
+            )
+        )
     return 0
 
 

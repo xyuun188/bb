@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from math import isclose
@@ -73,6 +75,15 @@ OKX_EXIT_SINGLEFLIGHT_TEMPORARY_OUTAGE_SECONDS = 60.0
 OKX_EXIT_SINGLEFLIGHT_COMPLETED_SECONDS = 30.0
 
 
+@dataclass
+class _PrivateApiCircuitState:
+    """Process-local private API outage state for one trading mode."""
+
+    failure_count: int = 0
+    open_until: float = 0.0
+    probe_in_flight: bool = False
+
+
 class TokenBucket:
     """Simple token bucket for rate limiting API requests."""
 
@@ -105,6 +116,9 @@ class OKXExecutor(AbstractExecutor):
     In production mode, real orders are placed.
     """
 
+    _private_api_circuit_states: dict[str, _PrivateApiCircuitState] = {}
+    _private_api_circuit_states_lock = threading.Lock()
+
     def __init__(
         self,
         mode: str | None = None,
@@ -124,15 +138,63 @@ class OKXExecutor(AbstractExecutor):
         self._entry_instrument_availability_cache: dict[
             str, tuple[dict[str, Any], float, float]
         ] = {}
-        self._private_api_circuit_failure_count = 0
-        self._private_api_circuit_open_until = 0.0
-        self._private_api_circuit_probe_in_flight = False
         self._exit_submission_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._exit_submission_states: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     @property
     def executor_mode(self) -> str:
         return self._mode_override or mode_manager.mode.value
+
+    @property
+    def _private_api_circuit_key(self) -> str:
+        mode = str(self.executor_mode or "unknown").strip().lower()
+        return mode or "unknown"
+
+    @classmethod
+    def _private_api_circuit_state_for_mode(cls, mode: str) -> _PrivateApiCircuitState:
+        key = str(mode or "unknown").strip().lower() or "unknown"
+        state = cls._private_api_circuit_states.get(key)
+        if state is None:
+            state = _PrivateApiCircuitState()
+            cls._private_api_circuit_states[key] = state
+        return state
+
+    @classmethod
+    def reset_private_api_circuit_states(cls) -> None:
+        """Clear process-local outage state (used by isolated test runs)."""
+
+        with cls._private_api_circuit_states_lock:
+            cls._private_api_circuit_states.clear()
+
+    @property
+    def _private_api_circuit_failure_count(self) -> int:
+        with self._private_api_circuit_states_lock:
+            return self._private_api_circuit_state_for_mode(self._private_api_circuit_key).failure_count
+
+    @_private_api_circuit_failure_count.setter
+    def _private_api_circuit_failure_count(self, value: int) -> None:
+        with self._private_api_circuit_states_lock:
+            self._private_api_circuit_state_for_mode(self._private_api_circuit_key).failure_count = int(value)
+
+    @property
+    def _private_api_circuit_open_until(self) -> float:
+        with self._private_api_circuit_states_lock:
+            return self._private_api_circuit_state_for_mode(self._private_api_circuit_key).open_until
+
+    @_private_api_circuit_open_until.setter
+    def _private_api_circuit_open_until(self, value: float) -> None:
+        with self._private_api_circuit_states_lock:
+            self._private_api_circuit_state_for_mode(self._private_api_circuit_key).open_until = float(value)
+
+    @property
+    def _private_api_circuit_probe_in_flight(self) -> bool:
+        with self._private_api_circuit_states_lock:
+            return self._private_api_circuit_state_for_mode(self._private_api_circuit_key).probe_in_flight
+
+    @_private_api_circuit_probe_in_flight.setter
+    def _private_api_circuit_probe_in_flight(self, value: bool) -> None:
+        with self._private_api_circuit_states_lock:
+            self._private_api_circuit_state_for_mode(self._private_api_circuit_key).probe_in_flight = bool(value)
 
     async def initialize(self) -> None:
         mode = self.executor_mode
@@ -612,23 +674,24 @@ class OKXExecutor(AbstractExecutor):
         if not tracked:
             return False
         now = time.monotonic()
-        if now < self._private_api_circuit_open_until:
-            retry_after = self._private_api_circuit_open_until - now
-            raise ExchangeAPIError(
-                "OKX API error [50001]: private service circuit open; "
-                f"retry after {retry_after:.1f}s ({method_name})",
-                code="50001",
-            )
-        if self._private_api_circuit_open_until <= 0:
-            return False
-        if self._private_api_circuit_probe_in_flight:
-            raise ExchangeAPIError(
-                "OKX API error [50001]: private service recovery probe in progress; "
-                f"retry later ({method_name})",
-                code="50001",
-            )
-        self._private_api_circuit_probe_in_flight = True
-        return True
+        with self._private_api_circuit_states_lock:
+            circuit = self._private_api_circuit_state_for_mode(self._private_api_circuit_key)
+            if now < circuit.open_until:
+                message = (
+                    "OKX API error [50001]: private service circuit open; "
+                    f"retry after {circuit.open_until - now:.1f}s ({method_name})"
+                )
+            elif circuit.open_until <= 0:
+                return False
+            elif circuit.probe_in_flight:
+                message = (
+                    "OKX API error [50001]: private service recovery probe in progress; "
+                    f"retry later ({method_name})"
+                )
+            else:
+                circuit.probe_in_flight = True
+                return True
+        raise ExchangeAPIError(message, code="50001")
 
     def _open_private_api_circuit(
         self,
@@ -636,31 +699,33 @@ class OKXExecutor(AbstractExecutor):
         method_name: str,
         error_code: str | None,
     ) -> None:
-        self._private_api_circuit_failure_count += 1
-        exponent = min(self._private_api_circuit_failure_count - 1, 8)
-        cooldown = min(
-            OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS * (2**exponent),
-            OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS,
-        )
-        self._private_api_circuit_open_until = time.monotonic() + cooldown
-        self._private_api_circuit_probe_in_flight = False
+        with self._private_api_circuit_states_lock:
+            circuit = self._private_api_circuit_state_for_mode(self._private_api_circuit_key)
+            circuit.failure_count += 1
+            exponent = min(circuit.failure_count - 1, 8)
+            cooldown = min(
+                OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS * (2**exponent),
+                OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS,
+            )
+            circuit.open_until = time.monotonic() + cooldown
+            circuit.probe_in_flight = False
+            failure_count = circuit.failure_count
         logger.warning(
             "OKX private API temporary-service circuit opened",
             mode=self.executor_mode,
             method=method_name,
             error_code=error_code or "50001",
             cooldown_seconds=cooldown,
-            failure_count=self._private_api_circuit_failure_count,
+            failure_count=failure_count,
         )
 
     def _record_private_api_available(self) -> None:
-        recovered = bool(
-            self._private_api_circuit_open_until > 0
-            or self._private_api_circuit_failure_count > 0
-        )
-        self._private_api_circuit_failure_count = 0
-        self._private_api_circuit_open_until = 0.0
-        self._private_api_circuit_probe_in_flight = False
+        with self._private_api_circuit_states_lock:
+            circuit = self._private_api_circuit_state_for_mode(self._private_api_circuit_key)
+            recovered = bool(circuit.open_until > 0 or circuit.failure_count > 0)
+            circuit.failure_count = 0
+            circuit.open_until = 0.0
+            circuit.probe_in_flight = False
         if recovered:
             logger.info(
                 "OKX private API temporary-service circuit recovered",
@@ -671,20 +736,23 @@ class OKXExecutor(AbstractExecutor):
         """Expose shared outage state so optional background work can defer."""
 
         now = time.monotonic()
-        retry_after_seconds = max(self._private_api_circuit_open_until - now, 0.0)
-        if retry_after_seconds > 0:
-            state = "open"
-        elif self._private_api_circuit_probe_in_flight:
-            state = "half_open_probe_in_flight"
-        elif self._private_api_circuit_open_until > 0:
-            state = "half_open_ready"
-        else:
-            state = "closed"
+        with self._private_api_circuit_states_lock:
+            circuit = self._private_api_circuit_state_for_mode(self._private_api_circuit_key)
+            retry_after_seconds = max(circuit.open_until - now, 0.0)
+            if retry_after_seconds > 0:
+                state = "open"
+            elif circuit.probe_in_flight:
+                state = "half_open_probe_in_flight"
+            elif circuit.open_until > 0:
+                state = "half_open_ready"
+            else:
+                state = "closed"
+            failure_count = circuit.failure_count
         return {
             "state": state,
             "background_calls_allowed": state in {"closed", "half_open_ready"},
             "retry_after_seconds": round(retry_after_seconds, 3),
-            "failure_count": int(self._private_api_circuit_failure_count),
+            "failure_count": int(failure_count),
         }
 
     @staticmethod

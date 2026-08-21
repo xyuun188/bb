@@ -25,6 +25,16 @@ def isolate_model_training_scheduler_state(tmp_path, monkeypatch):
         monkeypatch.setattr(data_collection, "MODEL_TRAINING_STATE_STORE", store)
 
 
+@pytest.fixture(autouse=True)
+def isolate_okx_private_api_circuit_state():
+    """Prevent process-wide circuit state from leaking between tests."""
+    from executor.okx_executor import OKXExecutor
+
+    OKXExecutor.reset_private_api_circuit_states()
+    yield
+    OKXExecutor.reset_private_api_circuit_states()
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create a single event loop for all async tests."""

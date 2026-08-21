@@ -29,6 +29,9 @@ from services.manual_close_marker import (
     is_manual_close_order,
 )
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
+from services.okx_native_full_close_evidence import (
+    native_full_close_identity_evidence,
+)
 from services.training_epoch import load_training_epoch_start
 
 DEFAULT_LOOKBACK_HOURS = 72
@@ -608,19 +611,37 @@ class OkxTradeFactIntegrityService:
                 and not close_ids
                 and not local_marker_ids
             ):
-                issues.append(
-                    TradeFactIssue(
-                        kind="closed_position_missing_close_order_link",
-                        severity=POSITION_LINK_MISSING_SEVERITY,
-                        position_id=int(position.id),
-                        symbol=position_symbol,
-                        expected_symbol=position_symbol,
-                        reason=(
-                            "Closed position has realized PnL but no close_exchange_order_id; "
-                            "profit, replay, and training cannot prove the OKX close fill."
-                        ),
+                native_close_evidence = native_full_close_identity_evidence(position)
+                if native_close_evidence is not None:
+                    issues.append(
+                        TradeFactIssue(
+                            kind="native_full_close_identity_quarantined",
+                            severity="warning",
+                            position_id=int(position.id),
+                            symbol=position_symbol,
+                            expected_symbol=position_symbol,
+                            reason=(
+                                "OKX confirms the exact native-close posId is zero and exposes "
+                                "the last tradeId, but no ordId or official settlement economics. "
+                                "The lifecycle is closed for account safety and remains excluded "
+                                "from profit training until official settlement history arrives."
+                            ),
+                        )
                     )
-                )
+                else:
+                    issues.append(
+                        TradeFactIssue(
+                            kind="closed_position_missing_close_order_link",
+                            severity=POSITION_LINK_MISSING_SEVERITY,
+                            position_id=int(position.id),
+                            symbol=position_symbol,
+                            expected_symbol=position_symbol,
+                            reason=(
+                                "Closed position has realized PnL but no close_exchange_order_id; "
+                                "profit, replay, and training cannot prove the OKX close fill."
+                            ),
+                        )
+                    )
             recent_entry = _is_recent(position.created_at, since)
             recent_close = _is_recent(position.closed_at, since)
             for linked_order_id in entry_ids if recent_entry else ():
@@ -1352,6 +1373,16 @@ def _summary(
     critical_count = int(severity_counts.get("critical", 0))
     warning_count = int(severity_counts.get("warning", 0))
     status = "critical" if critical_count else "warning" if warning_count else "ok"
+    severity_order = {"critical": 0, "warning": 1, "info": 2, "observation": 3}
+    ordered_issues = sorted(
+        issues,
+        key=lambda issue: (
+            severity_order.get(str(issue.severity or "").lower(), 9),
+            str(issue.kind or ""),
+            int(issue.position_id or 0),
+            int(issue.order_id or 0),
+        ),
+    )
     return {
         "read_only": True,
         "status": status,
@@ -1367,7 +1398,8 @@ def _summary(
         "warning_count": warning_count,
         "severity_counts": dict(severity_counts.most_common()),
         "kind_counts": dict(kind_counts.most_common()),
-        "issues": [issue.as_dict() for issue in issues[:20]],
+        "issues": [issue.as_dict() for issue in ordered_issues[:20]],
+        "issues_truncated": max(len(ordered_issues) - 20, 0),
         "diagnostic_boundary": (
             "Read-only trade fact integrity audit. Local order quantity is base quantity; "
             "OKX filled_contracts must be converted by contract_size before comparison. "

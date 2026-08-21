@@ -1585,6 +1585,30 @@ async def test_okx_temporary_service_circuit_uses_one_recovery_probe(
     assert executor._private_api_circuit_failure_count == 0
 
 
+def test_okx_private_api_circuit_state_is_shared_per_mode() -> None:
+    paper_first = OKXExecutor(mode="paper")
+    paper_second = OKXExecutor(mode="paper")
+    live = OKXExecutor(mode="live")
+
+    paper_first._private_api_circuit_failure_count = 2
+    paper_first._private_api_circuit_open_until = okx_module.time.monotonic() + 10.0
+
+    assert paper_second.private_api_circuit_status()["state"] == "open"
+    assert paper_second.private_api_circuit_status()["failure_count"] == 2
+    assert live.private_api_circuit_status()["state"] == "closed"
+    assert live.private_api_circuit_status()["failure_count"] == 0
+
+
+def test_okx_private_api_circuit_elects_one_probe_across_instances() -> None:
+    paper_first = OKXExecutor(mode="paper")
+    paper_second = OKXExecutor(mode="paper")
+    paper_first._private_api_circuit_open_until = okx_module.time.monotonic() - 1.0
+
+    assert paper_first._enter_private_api_circuit("privateGetAccountBalance", tracked=True) is True
+    with pytest.raises(ExchangeAPIError, match="recovery probe in progress"):
+        paper_second._enter_private_api_circuit("privateGetAccountPositions", tracked=True)
+
+
 def test_okx_retry_classifier_recognizes_busy_50013() -> None:
     assert (
         OKXExecutor._is_transient_system_error(

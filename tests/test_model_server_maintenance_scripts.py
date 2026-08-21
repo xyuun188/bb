@@ -52,9 +52,12 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert 'REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"' in source
     assert "scripts/start_online_model_tunnels.py" in source
     assert "systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}" in source
-    assert "for port in (18000, 18001, 18002, 18003)" in source
-    assert "http.client.HTTPConnection('127.0.0.1', 18001" in source
-    assert "connection.request('GET', '/health/live'" in source
+    assert "endpoints = ((18000, '/v1/models'), (18001, '/health/live')" in source
+    assert "(18002, '/v1/models'), (18003, '/v1/models')" in source
+    assert "deadline = time.time() + {MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS}" in source
+    assert "http.client.HTTPConnection('127.0.0.1', port, timeout=8)" in source
+    assert "connection.request('GET', path" in source
+    assert "response.status == 200" in source
     assert "model-tunnels-ok" in source
     assert "model-tunnels-degraded" in source
     assert "--require-model-tunnels" in source

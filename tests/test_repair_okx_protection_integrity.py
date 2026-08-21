@@ -183,6 +183,25 @@ def _is_file(path: str) -> bool:
     return Path(path).is_file()
 
 
+def test_online_output_parser_handles_logs_and_multiline_json() -> None:
+    output = """2026-08-21 00:00:00 [info] repair started
+{"mode": "paper",
+ "verified": true,
+ "applied_actions": []}
+"""
+
+    assert repair._decode_online_result(output) == {
+        "mode": "paper",
+        "verified": True,
+        "applied_actions": [],
+    }
+
+
+def test_online_output_parser_rejects_truncated_result() -> None:
+    with pytest.raises(RuntimeError, match="complete JSON report"):
+        repair._decode_online_result('{"mode":"paper","verified":')
+
+
 def _backup_to(directory: Path):
     def backup(_payload: dict[str, Any]) -> Path:
         path = directory / "protection-backup.json"
