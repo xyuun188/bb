@@ -58,12 +58,6 @@ class PositionReviewFastScanRecorder:
         compare=False,
     )
 
-    def reset_keys(self, keys: set[tuple[str, str]] | None) -> None:
-        """Forget audit state after a group receives its slow governed review."""
-
-        for key in keys or set():
-            self._no_action_state.pop(key, None)
-
     async def record_many(
         self,
         *,

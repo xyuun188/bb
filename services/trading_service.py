@@ -11949,7 +11949,6 @@ class TradingService:
         grouped_items = batch_selection.selected_items
         self._position_review_cursor = batch_selection.next_cursor
         self.position_review_defer_tracker.clear_many(batch_selection.selected_keys)
-        self.position_review_fast_scan_recorder.reset_keys(batch_selection.selected_keys)
         if batch_selection.limited:
             self._decision_count += await self.position_review_fast_scan_recorder.record_many(
                 skipped_items=batch_selection.skipped_items,

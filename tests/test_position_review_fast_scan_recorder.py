@@ -222,27 +222,6 @@ async def test_fast_scan_recorder_reopens_audit_when_reason_changes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fast_scan_recorder_reopens_audit_after_slow_review() -> None:
-    calls: list[tuple[str, Any]] = []
-    results = {"decisions": []}
-    recorder = _recorder(calls, decision_id=46)
-    key = ("ensemble_trader", "BTC/USDT")
-    args = {
-        "skipped_items": [(key, [{"side": "long", "id": 7, "contracts": 1}])],
-        "fast_scan": {key: {"priority_score": 1.0, "reason": "dynamic_exit_pressure_zero"}},
-        "feature_vectors": {},
-        "portfolio_profit_context": None,
-        "results": results,
-        "round_decision_ids": set(),
-    }
-
-    assert await recorder.record_many(**args) == 1
-    assert await recorder.record_many(**args) == 0
-    recorder.reset_keys({key})
-    assert await recorder.record_many(**args) == 1
-
-
-@pytest.mark.asyncio
 async def test_fast_scan_recorder_never_throttles_governed_exit() -> None:
     calls: list[tuple[str, Any]] = []
     results = {"decisions": []}
