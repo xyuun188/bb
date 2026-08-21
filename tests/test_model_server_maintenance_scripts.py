@@ -483,7 +483,64 @@ def test_start_online_model_tunnels_bound_ssh_channel_open_time() -> None:
     assert tunnels.FORWARD_CHANNELS_PER_TRANSPORT <= 10
 
 
-def test_start_online_model_tunnels_close_transport_after_open_timeout() -> None:
+def test_start_online_model_tunnels_drain_timeout_without_cutting_active_channel() -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeRequest:
+        def settimeout(self, _seconds: float) -> None:
+            return None
+
+        def getpeername(self) -> tuple[str, int]:
+            return ("127.0.0.1", 12345)
+
+        def shutdown(self, *_args) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.closed = False
+            self.active = True
+
+        def is_active(self) -> bool:
+            return self.active
+
+        def open_channel(self, *_args, **_kwargs):
+            raise TimeoutError("open timed out")
+
+        def close(self) -> None:
+            self.closed = True
+            self.active = False
+
+    server = object.__new__(tunnels.ForwardServer)
+    server.spec = tunnels.build_default_tunnels()[1]
+    server.ssh_transport = FakeTransport()
+    server.transport_pool = tunnels.TransportPool(
+        [server.ssh_transport],
+        slots_per_transport=2,
+    )
+    active_training_transport = server.transport_pool.acquire(0)
+    handler = object.__new__(tunnels.ForwardHandler)
+    handler.server = server
+    handler.request = FakeRequest()
+
+    handler.handle()
+
+    assert active_training_transport is server.ssh_transport
+    assert server.ssh_transport.closed is False
+    retry_transport = server.transport_pool.acquire(0)
+    assert retry_transport is server.ssh_transport
+
+    server.transport_pool.release(retry_transport)
+    server.transport_pool.release(active_training_transport)
+
+    assert server.ssh_transport.closed is False
+    assert server.transport_pool.acquire(0) is server.ssh_transport
+
+
+def test_start_online_model_tunnels_retire_inactive_transport_immediately() -> None:
     from scripts import start_online_model_tunnels as tunnels
 
     class FakeRequest:
@@ -503,8 +560,12 @@ def test_start_online_model_tunnels_close_transport_after_open_timeout() -> None
         def __init__(self) -> None:
             self.closed = False
 
+        def is_active(self) -> bool:
+            return not self.closed
+
         def open_channel(self, *_args, **_kwargs):
-            raise TimeoutError("open timed out")
+            self.closed = True
+            raise EOFError("SSH session closed")
 
         def close(self) -> None:
             self.closed = True
@@ -512,6 +573,10 @@ def test_start_online_model_tunnels_close_transport_after_open_timeout() -> None
     server = object.__new__(tunnels.ForwardServer)
     server.spec = tunnels.build_default_tunnels()[1]
     server.ssh_transport = FakeTransport()
+    server.transport_pool = tunnels.TransportPool(
+        [server.ssh_transport],
+        slots_per_transport=1,
+    )
     handler = object.__new__(tunnels.ForwardHandler)
     handler.server = server
     handler.request = FakeRequest()
@@ -519,6 +584,26 @@ def test_start_online_model_tunnels_close_transport_after_open_timeout() -> None
     handler.handle()
 
     assert server.ssh_transport.closed is True
+    assert server.transport_pool.inactive_transports() == [server.ssh_transport]
+
+
+def test_start_online_model_tunnels_cli_preserves_connection_limits(monkeypatch) -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    captured: list[tunnels.TunnelSpec] = []
+    monkeypatch.setattr(tunnels, "run_tunnels", lambda specs: captured.extend(specs))
+
+    tunnels.main([])
+
+    specs = {spec.name: spec for spec in captured}
+    assert (
+        specs["phase3-quant-api"].max_connection_seconds
+        == tunnels.FORWARD_QUANT_MAX_CONNECTION_SECONDS
+    )
+    assert (
+        specs["qwen3-14b-trade"].max_connection_seconds
+        == tunnels.FORWARD_DEFAULT_MAX_CONNECTION_SECONDS
+    )
 
 
 def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch) -> None:

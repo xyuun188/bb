@@ -321,6 +321,41 @@ def test_capacity_audit_classifies_okx_protection_exit_without_dynamic_gap() -> 
     assert row["exit_contract_complete"] is True
 
 
+def test_capacity_audit_does_not_count_external_okx_reconciliation_as_dynamic_gap() -> None:
+    service = PositionCapacityReleaseAuditService()
+    decision = _decision(
+        decision_id=41,
+        raw={
+            "system_sync": True,
+            "source": "okx_position_reconcile",
+            "reconcile_origin": "external_okx_sync",
+            "close_fill": {"reconcile_origin": "external_okx_sync"},
+        },
+        executed=True,
+    )
+    filled = SimpleNamespace(
+        decision_id=41,
+        status="filled",
+        exchange_order_id="external-close-41",
+        okx_raw_fills={
+            "order_id": "external-close-41",
+            "fills_history_confirmed": True,
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": 2.0,
+            "avg_price": 103.0,
+            "trade_ids": ["external-trade-41"],
+        },
+    )
+
+    report = service._summarize([_position()], [decision], [filled])
+
+    assert report["executed_dynamic_exit_count"] == 0
+    assert report["executed_dynamic_exit_contract_gap_count"] == 0
+    row = report["dynamic_exit_decisions"][0]
+    assert row["exit_contract_kind"] == "okx_external_reconciliation"
+    assert row["exit_contract_complete"] is False
+
+
 def test_capacity_audit_joins_filled_order_by_exact_exit_exchange_id() -> None:
     service = PositionCapacityReleaseAuditService()
     decision = _decision(

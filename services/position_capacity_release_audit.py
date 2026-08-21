@@ -142,7 +142,11 @@ class PositionCapacityReleaseAuditService:
         executed_exit_gaps = [
             row
             for row in exit_rows
-            if row["executed"] and not row["exit_contract_complete"]
+            if (
+                row["executed"]
+                and row["exit_contract_kind"] == "dynamic_exit"
+                and not row["exit_contract_complete"]
+            )
         ]
         return {
             "read_only": True,

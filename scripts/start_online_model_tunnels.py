@@ -92,15 +92,40 @@ def _transport_is_active(transport: Any) -> bool:
         return False
 
 
-def _should_retire_transport(exc: BaseException) -> bool:
-    """Retire a transport only when the channel-open failure makes it unsafe to reuse."""
+def _should_retire_transport(exc: BaseException, transport: Any) -> bool:
+    """Retire only a transport failure, never an isolated channel-open refusal."""
 
-    if isinstance(exc, (EOFError, TimeoutError, socket.timeout, ConnectionError, OSError)):
+    if not _transport_is_active(transport) or isinstance(exc, EOFError):
         return True
     message = safe_error_text(exc, limit=240).lower()
     return any(
-        marker in message for marker in ("timeout opening channel", "ssh session not active", "eof")
+        marker in message
+        for marker in (
+            "ssh session not active",
+            "transport is closed",
+            "socket is closed",
+            "connection reset by peer",
+            "session closed",
+            "eof",
+        )
     )
+
+
+def _should_retire_transport_immediately(exc: BaseException, transport: Any) -> bool:
+    """Return whether an open failure proves the whole SSH session is already unusable."""
+
+    if not _transport_is_active(transport):
+        return True
+    if isinstance(exc, EOFError):
+        return True
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return False
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    message = safe_error_text(exc, limit=240).lower()
+    if "timeout opening channel" in message:
+        return False
+    return any(marker in message for marker in ("ssh session not active", "eof", "session closed"))
 
 
 class TransportPool:
@@ -112,6 +137,7 @@ class TransportPool:
         self._condition = threading.Condition()
         self._transports = list(transports)
         self._in_use = {id(transport): 0 for transport in transports}
+        self._draining: set[int] = set()
         self._slots_per_transport = max(int(slots_per_transport), 1)
         self._next_index = 0
 
@@ -130,6 +156,7 @@ class TransportPool:
                     transport = self._transports[index]
                     if (
                         _transport_is_active(transport)
+                        and id(transport) not in self._draining
                         and self._in_use.get(id(transport), 0) < self._slots_per_transport
                     ):
                         self._next_index = (index + 1) % count
@@ -141,11 +168,39 @@ class TransportPool:
                 self._condition.wait(timeout=remaining)
 
     def release(self, transport: Any) -> None:
+        close_transport = False
         with self._condition:
             transport_id = id(transport)
             if transport_id in self._in_use:
                 self._in_use[transport_id] = max(self._in_use[transport_id] - 1, 0)
+                close_transport = (
+                    transport_id in self._draining and self._in_use[transport_id] == 0
+                )
             self._condition.notify_all()
+        if close_transport:
+            self._close_transport(transport)
+
+    @staticmethod
+    def _close_transport(transport: Any) -> None:
+        try:
+            transport.close()
+        except (AttributeError, OSError):
+            pass
+
+    def request_retirement(self, transport: Any, *, immediate: bool) -> bool:
+        """Drain a suspect transport, preserving unrelated active channels when possible."""
+
+        with self._condition:
+            transport_id = id(transport)
+            if transport_id not in self._in_use:
+                return False
+            self._draining.add(transport_id)
+            active_channels = self._in_use[transport_id]
+            close_transport = immediate or active_channels <= 1
+            self._condition.notify_all()
+        if close_transport:
+            self._close_transport(transport)
+        return close_transport
 
     def replace(self, old_transport: Any, new_transport: Any) -> bool:
         """Replace one failed transport while keeping all listeners and other channels alive."""
@@ -163,6 +218,7 @@ class TransportPool:
                 return False
             self._transports[index] = new_transport
             self._in_use.pop(id(old_transport), None)
+            self._draining.discard(id(old_transport))
             self._in_use[id(new_transport)] = 0
             self._next_index = index % len(self._transports)
             self._condition.notify_all()
@@ -296,14 +352,20 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                 )
             except Exception as exc:  # pragma: no cover - live SSH transport only.
                 _log(f"{server.spec.name} tunnel open failed: {safe_error_text(exc)}")
-                if _should_retire_transport(exc):
-                    # Paramiko can receive a late channel-open success after its timeout.
-                    # Closing this endpoint's dedicated transport prevents that response
-                    # from leaving an orphaned TCP connection on the model server.
-                    try:
-                        ssh_transport.close()
-                    except (AttributeError, OSError):
-                        pass
+                if _should_retire_transport(exc, ssh_transport):
+                    immediate = _should_retire_transport_immediately(exc, ssh_transport)
+                    if transport_pool is not None:
+                        closed = transport_pool.request_retirement(
+                            ssh_transport,
+                            immediate=immediate,
+                        )
+                        if not closed:
+                            _log(
+                                f"{server.spec.name} tunnel transport draining; "
+                                "active channels preserved"
+                            )
+                    elif immediate:
+                        TransportPool._close_transport(ssh_transport)
                 return
             if channel is None:
                 _log(f"{server.spec.name} tunnel rejected by SSH server")
@@ -597,6 +659,7 @@ def main(argv: list[str] | None = None) -> None:
             }[spec.name],
             remote_host=spec.remote_host,
             remote_port=spec.remote_port,
+            max_connection_seconds=spec.max_connection_seconds,
         )
         for spec in specs
     ]
