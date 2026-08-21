@@ -1583,6 +1583,77 @@ async def test_shadow_backtest_maintenance_reuses_running_background_task() -> N
 
 
 @pytest.mark.asyncio
+async def test_market_shadow_sample_write_has_an_independent_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    cancelled = asyncio.Event()
+
+    class SlowShadowBacktestService:
+        async def create(self, *_args: Any, **_kwargs: Any) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    service.shadow_backtest_service = SlowShadowBacktestService()
+    monkeypatch.setattr(
+        trading_service,
+        "MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    await service._persist_market_shadow_sample(
+        decision_id=9,
+        decision=_decision(Action.HOLD),
+        feature_vector=SimpleNamespace(symbol="BTC/USDT", current_price=100.0),
+        model_mode="paper",
+        local_ai_tools_context={},
+    )
+
+    await asyncio.wait_for(cancelled.wait(), timeout=0.2)
+    assert service._market_shadow_sample_write_success_count == 0
+    assert service._market_shadow_sample_write_failure_count == 1
+    assert service._shadow_backtest_maintenance_status()["market_shadow_sample_write"][
+        "last_error"
+    ] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_okx_executor_initialization_cancellation_does_not_publish_partial_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_paper = None
+    service._okx_live = None
+    service._okx_executor_init_locks = {}
+    shutdown_called = asyncio.Event()
+    initialize_started = asyncio.Event()
+
+    class SlowExecutor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            initialize_started.set()
+            await asyncio.Event().wait()
+
+        async def shutdown(self) -> None:
+            shutdown_called.set()
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", SlowExecutor)
+    task = asyncio.create_task(service._get_okx_executor_for_mode("paper"))
+    await asyncio.wait_for(initialize_started.wait(), timeout=0.2)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(task, timeout=0.01)
+
+    assert service._okx_paper is None
+    await asyncio.wait_for(shutdown_called.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_stale_entry_maintenance_runs_in_background_for_market_round() -> None:
     service = TradingService.__new__(TradingService)
     started = asyncio.Event()
@@ -5895,7 +5966,7 @@ async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking
     assert len(published) == 1
 
 
-def test_market_ai_budget_clock_ignores_pre_ai_round_work(
+def test_market_budget_clock_includes_pre_ai_round_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
@@ -5907,10 +5978,10 @@ def test_market_ai_budget_clock_ignores_pre_ai_round_work(
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
     full_round_started_at = datetime.now(UTC) - timedelta(seconds=60)
-    market_ai_started_at = datetime.now(UTC) - timedelta(seconds=2)
+    market_ai_started_at = full_round_started_at
 
     assert service._round_budget_exhausted(full_round_started_at) is True
-    assert service._market_ai_budget_exhausted(market_ai_started_at) is False
+    assert service._market_ai_budget_exhausted(market_ai_started_at) is True
 
     progress = service._market_analysis_progress_snapshot(
         symbol="ETH/USDT",
@@ -5920,14 +5991,14 @@ def test_market_ai_budget_clock_ignores_pre_ai_round_work(
         market_ai_started_at=market_ai_started_at,
     )
 
-    assert progress["budget_clock_scope"] == "market_ai_phase"
+    assert progress["budget_clock_scope"] == "full_market_round"
     assert progress["full_round_elapsed_seconds_before_ai"] >= 60.0
     assert (
         progress["round_elapsed_seconds_before_ai"]
         == progress["full_round_elapsed_seconds_before_ai"]
     )
-    assert progress["market_ai_elapsed_seconds_before_symbol"] < 3.0
-    assert progress["budget_used_ratio_before_ai"] < 0.12
+    assert progress["market_ai_elapsed_seconds_before_symbol"] >= 60.0
+    assert progress["budget_used_ratio_before_ai"] >= 0.49
 
 
 def test_market_round_time_budget_tracks_runtime_decision_interval(
@@ -5943,6 +6014,20 @@ def test_market_round_time_budget_tracks_runtime_decision_interval(
 
     assert service.market_round_time_budget_seconds() == 27.0
     assert service.market_round_watchdog_seconds() >= 180.0
+
+
+def test_market_round_time_budget_has_a_scheduler_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 60)
+
+    assert service.market_round_time_budget_seconds(market_symbol_count=8) == 120.0
 
 
 def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
@@ -6110,10 +6195,10 @@ def test_market_round_budget_reserves_full_analysis_time_per_candidate(
         minimum_start + trading_service.MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS
     )
     assert service.market_round_time_budget_seconds(market_symbol_count=2) == pytest.approx(
-        per_symbol_budget * 2
+        min(per_symbol_budget * 2, trading_service.MARKET_ROUND_SCHEDULER_MAX_SECONDS)
     )
     assert service.market_round_time_budget_seconds(market_symbol_count=3) == pytest.approx(
-        per_symbol_budget * 3
+        min(per_symbol_budget * 3, trading_service.MARKET_ROUND_SCHEDULER_MAX_SECONDS)
     )
     assert service.market_symbol_start_reserve_seconds(market_symbol_count=3) == pytest.approx(
         minimum_start

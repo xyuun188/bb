@@ -265,6 +265,10 @@ MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 6.0
+MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
+OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
+MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
+MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS = 2.0
 MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS = (
     "current_price",
     "entry_activity_volume_ratio",
@@ -283,6 +287,11 @@ MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
+# The market loop runs more frequently than the decision interval. Keep one
+# round bounded so feature discovery and model work cannot create multi-minute
+# gaps for the next rotation. Symbols that do not fit are explicitly deferred
+# and remain eligible through the defer tracker.
+MARKET_ROUND_SCHEDULER_MAX_SECONDS = 120.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
@@ -951,6 +960,10 @@ class TradingService:
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._okx_balance_snapshot_locks: dict[str, asyncio.Lock] = {}
         self._okx_balance_snapshot_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._okx_executor_init_locks: dict[str, asyncio.Lock] = {
+            "paper": asyncio.Lock(),
+            "live": asyncio.Lock(),
+        }
         self._shadow_backtest_update_task: asyncio.Task | None = None
         self._shadow_backtest_update_last_started_at: datetime | None = None
         self._shadow_backtest_update_last_finished_at: datetime | None = None
@@ -958,6 +971,10 @@ class TradingService:
         self._shadow_backtest_update_last_error: str | None = None
         self._shadow_backtest_update_success_count = 0
         self._shadow_backtest_update_failure_count = 0
+        self._market_shadow_sample_write_success_count = 0
+        self._market_shadow_sample_write_failure_count = 0
+        self._market_shadow_sample_write_last_finished_at: datetime | None = None
+        self._market_shadow_sample_write_last_error: str | None = None
         self._stale_entry_expire_task: asyncio.Task | None = None
         self._stale_entry_expire_last_started_at: datetime | None = None
         self._stale_entry_expire_last_finished_at: datetime | None = None
@@ -1267,7 +1284,7 @@ class TradingService:
             else base_budget
         )
         watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
-        return min(market_budget, watchdog_ceiling)
+        return min(market_budget, watchdog_ceiling, MARKET_ROUND_SCHEDULER_MAX_SECONDS)
 
     def market_symbol_minimum_start_budget_seconds(self) -> float:
         """Reserve context, viable inference, and persistence for one symbol."""
@@ -1455,7 +1472,7 @@ class TradingService:
     def market_model_inference_timeout_seconds(self) -> float:
         """Return enough time for the configured expert execution strategy.
 
-        Paper analysis calls experts independently. With five experts and the
+        Paper analysis calls configured experts independently. With multiple experts and the
         default global concurrency of two, their tasks can occupy three queue
         batches. Live batch analysis may first consume its batch timeout and
         then retry independently, so its outer boundary must cover both phases.
@@ -2494,6 +2511,68 @@ class TradingService:
         self._shadow_backtest_update_last_started_at = datetime.now(UTC)
         return await self.shadow_backtest_service.update_due(limit=limit)
 
+    async def _persist_market_shadow_sample(
+        self,
+        *,
+        decision_id: int | None,
+        decision: DecisionOutput,
+        feature_vector: Any,
+        model_mode: str,
+        local_ai_tools_context: dict[str, Any] | None,
+    ) -> bool:
+        """Persist one delayed market label without holding up the round."""
+
+        try:
+            await asyncio.wait_for(
+                self.shadow_backtest_service.create(
+                    decision_id,
+                    decision,
+                    feature_vector,
+                    model_mode,
+                    analysis_type="market",
+                    local_ai_tools_context=local_ai_tools_context,
+                ),
+                timeout=MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS,
+            )
+            self._market_shadow_sample_write_success_count = int(
+                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+            ) + 1
+            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
+            self._market_shadow_sample_write_last_error = None
+            return True
+        except TimeoutError:
+            self._market_shadow_sample_write_success_count = int(
+                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+            )
+            self._market_shadow_sample_write_failure_count = int(
+                getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
+            ) + 1
+            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
+            self._market_shadow_sample_write_last_error = "timeout"
+            logger.warning(
+                "market shadow sample write timed out; maintenance will retry from the next decision",
+                symbol=decision.symbol,
+                decision_id=decision_id,
+                timeout_seconds=MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS,
+            )
+            return False
+        except Exception as exc:
+            self._market_shadow_sample_write_success_count = int(
+                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+            )
+            self._market_shadow_sample_write_failure_count = int(
+                getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
+            ) + 1
+            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
+            self._market_shadow_sample_write_last_error = safe_error_text(exc, limit=180)
+            logger.warning(
+                "market shadow sample write failed",
+                symbol=decision.symbol,
+                decision_id=decision_id,
+                error=safe_error_text(exc, limit=180),
+            )
+            return False
+
     def _shadow_backtest_maintenance_status(self) -> dict[str, Any]:
         task = getattr(self, "_shadow_backtest_update_task", None)
         started_at = getattr(self, "_shadow_backtest_update_last_started_at", None)
@@ -2516,6 +2595,22 @@ class TradingService:
             "last_error": getattr(self, "_shadow_backtest_update_last_error", None),
             "success_count": int(getattr(self, "_shadow_backtest_update_success_count", 0) or 0),
             "failure_count": int(getattr(self, "_shadow_backtest_update_failure_count", 0) or 0),
+            "market_shadow_sample_write": {
+                "success_count": int(
+                    getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+                ),
+                "failure_count": int(
+                    getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
+                ),
+                "last_finished_at": (
+                    getattr(self, "_market_shadow_sample_write_last_finished_at", None).isoformat()
+                    if isinstance(
+                        getattr(self, "_market_shadow_sample_write_last_finished_at", None), datetime
+                    )
+                    else None
+                ),
+                "last_error": getattr(self, "_market_shadow_sample_write_last_error", None),
+            },
             "diagnostic_boundary": (
                 "影子复盘维护只负责训练/记忆回灌，不是开仓门槛；market-only 轮次只触发后台刷新，"
                 "不能同步拖慢 market AI 启动。"
@@ -6941,10 +7036,22 @@ class TradingService:
         if target <= 0 or not feature_vectors:
             return {}
         selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
-        executor = await self._get_okx_executor_for_mode(selected_mode)
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
         verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
+        try:
+            executor = await asyncio.wait_for(
+                self._get_okx_executor_for_mode(selected_mode),
+                timeout=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "market instrument executor initialization timed out; using verified cache",
+                mode=selected_mode,
+                timeout_seconds=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
+            )
+            selected = [symbol for symbol in feature_vectors if symbol in verified_symbols][:target]
+            return {symbol: feature_vectors[symbol] for symbol in selected}
         shortlist_task = asyncio.create_task(
             executor.entry_instrument_availability_shortlist(
                 list(feature_vectors),
@@ -7368,13 +7475,14 @@ class TradingService:
                 market_ai_elapsed_seconds / max(budget_seconds, 1e-6),
                 6,
             ),
-            "budget_clock_scope": "market_ai_phase",
+            "budget_clock_scope": "full_market_round",
             "runtime_stage_durations": self._stage_durations_for_scope("market"),
             "diagnostic_boundary": (
                 "Read-only market AI throughput diagnostics; it explains how many ranked "
                 "symbols this round can analyze before soft scheduling budget is exhausted. "
-                "The soft budget clock starts when the market AI phase begins, not at full "
-                "round startup. It is not entry permission, sizing, leverage, ML readiness, "
+                "The scheduler budget starts at full market-round startup and includes "
+                "feature discovery, shortlist, indicator hydration, context preparation, "
+                "and model inference. It is not entry permission, sizing, leverage, ML readiness, "
                 "or risk veto."
             ),
         }
@@ -7968,21 +8076,20 @@ class TradingService:
         # Initialize OKX demo/live connections for balance sync, position checks,
         # and actual order execution. Paper mode means OKX demo trading, not a
         # local fake fill.
-        self._okx_paper = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+        paper_executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
         try:
-            await self._okx_paper.initialize()
+            await paper_executor.initialize()
+            self._okx_paper = paper_executor
             logger.info("okx paper executor initialized")
         except Exception as e:
             logger.warning("okx paper executor init failed", error=safe_error_text(e))
             self._okx_paper = None
-        self._okx_live = (
-            OKXExecutor(mode="live", load_markets_on_initialize=False)
-            if self._has_live_models()
-            else None
-        )
-        if self._okx_live is not None:
+        self._okx_live = None
+        if self._has_live_models():
+            live_executor = OKXExecutor(mode="live", load_markets_on_initialize=False)
             try:
-                await self._okx_live.initialize()
+                await live_executor.initialize()
+                self._okx_live = live_executor
                 logger.info("okx live executor initialized")
             except Exception as e:
                 logger.warning("okx live executor init failed", error=safe_error_text(e))
@@ -8167,7 +8274,10 @@ class TradingService:
                 scan_symbols = []
             else:
                 try:
-                    available = await self.data_service.get_available_symbols()
+                    available = await asyncio.wait_for(
+                        self.data_service.get_available_symbols(),
+                        timeout=MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS,
+                    )
                     limit = max(1, int(settings.auto_scan_symbol_limit))
                     pool_limit = min(
                         len(available),
@@ -8812,13 +8922,18 @@ class TradingService:
 
             market_feature_items = list(market_feature_vectors.items())
             market_execution_cost_facts: dict[str, dict[str, Any]] = {}
-            market_ai_started_at = datetime.now(UTC)
+            # The scheduler budget covers the complete market round. Starting
+            # this clock after feature discovery made the apparent AI budget
+            # healthy while the real round already consumed most of its time.
+            market_ai_started_at = round_start
             market_ai_budget_seconds = self.market_round_time_budget_seconds(
                 strategy_context=strategy_mode_context,
                 market_symbol_count=len(market_feature_items),
             )
+            elapsed_before_market_ai = self._round_elapsed_seconds(market_ai_started_at)
             market_ai_deadline_monotonic = (
-                asyncio.get_running_loop().time() + market_ai_budget_seconds
+                asyncio.get_running_loop().time()
+                + max(market_ai_budget_seconds - elapsed_before_market_ai, 0.0)
             )
             for market_index, (symbol, fv) in enumerate(market_feature_items):
                 budget_defer_reason = self._market_ai_budget_defer_reason(
@@ -9096,6 +9211,18 @@ class TradingService:
                             "decision_persistence_failed",
                         )
                     self._decision_count += 1
+                    # Fast prefilter decisions are still valid market
+                    # observations. Persist their delayed outcomes so model
+                    # training can advance even when most candidates are
+                    # filtered before expensive expert calls and no entries
+                    # are opened.
+                    await self._persist_market_shadow_sample(
+                        decision_id=decision_db_id,
+                        decision=quick_decision,
+                        feature_vector=fv,
+                        model_mode=model_mode,
+                        local_ai_tools_context=local_ai_tools_context,
+                    )
                     self.market_decision_result_recorder.append_result(
                         results=results,
                         model_name=model_name,
@@ -9281,12 +9408,11 @@ class TradingService:
                         "decision_persistence_failed",
                     )
                 self._decision_count += 1
-                await self.shadow_backtest_service.create(
-                    decision_db_id,
-                    decision,
-                    fv,
-                    model_mode,
-                    analysis_type="market",
+                await self._persist_market_shadow_sample(
+                    decision_id=decision_db_id,
+                    decision=decision,
+                    feature_vector=fv,
+                    model_mode=model_mode,
                     local_ai_tools_context=local_ai_tools_context,
                 )
 
@@ -9395,7 +9521,7 @@ class TradingService:
                         ),
                         3,
                     ),
-                    "budget_clock_scope": "market_ai_phase",
+                    "budget_clock_scope": "full_market_round",
                     "processed_symbols": int(results.get("symbols_processed") or 0),
                     "deferred_symbols": market_round_skipped_by_budget[:50],
                     "deferred_count": len(market_round_skipped_by_budget),
@@ -12317,7 +12443,19 @@ class TradingService:
 
     async def _open_positions_context_for_round(self, analysis_scope: str) -> list[dict]:
         if analysis_scope != "market":
-            positions = await self._get_open_positions_context()
+            try:
+                positions = await asyncio.wait_for(
+                    self._get_open_positions_context(),
+                    timeout=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                positions = self._cached_open_positions_context(ignore_age=True) or []
+                logger.warning(
+                    "open positions context timed out; using last cached context",
+                    scope=analysis_scope,
+                    timeout_seconds=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+                    cached_count=len(positions),
+                )
             self._remember_open_positions_context(positions)
             return positions
 
@@ -12334,9 +12472,19 @@ class TradingService:
 
         if self._okx_authoritative_sync_context_is_usable_for_market_scan():
             try:
-                local_positions = await self._get_local_open_positions_context(
-                    strict=True,
+                local_positions = await asyncio.wait_for(
+                    self._get_local_open_positions_context(strict=True),
+                    timeout=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
                 )
+            except TimeoutError:
+                logger.warning(
+                    "local open positions context timed out for market scan; using cache",
+                    timeout_seconds=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+                )
+                fallback = self._cached_open_positions_context(ignore_age=True)
+                if fallback is not None:
+                    return fallback
+                logger.warning("no cached open positions context after timeout")
             except Exception as exc:
                 logger.warning(
                     "failed to load local open positions for market scan; falling back to OKX",
@@ -12347,7 +12495,17 @@ class TradingService:
                 self._schedule_open_positions_context_refresh()
                 return local_positions
 
-        positions = await self._get_open_positions_context()
+        try:
+            positions = await asyncio.wait_for(
+                self._get_open_positions_context(),
+                timeout=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "authoritative open positions context timed out for market scan",
+                timeout_seconds=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+            )
+            positions = self._cached_open_positions_context(ignore_age=True) or []
         self._remember_open_positions_context(positions)
         return positions
 
@@ -12652,28 +12810,49 @@ class TradingService:
     async def _get_okx_executor_for_mode(self, mode: str) -> OKXExecutor:
         """Return the OKX executor for paper/demo or live/real mode."""
         selected_mode = "live" if mode == "live" else "paper"
-        if selected_mode == "paper":
-            if self._okx_paper is None:
-                self._okx_paper = OKXExecutor(
-                    mode="paper",
+        attribute_name = "_okx_live" if selected_mode == "live" else "_okx_paper"
+        locks = getattr(self, "_okx_executor_init_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._okx_executor_init_locks = locks
+        init_lock = locks.setdefault(selected_mode, asyncio.Lock())
+
+        async with init_lock:
+            executor = getattr(self, attribute_name, None)
+            if executor is None:
+                candidate = OKXExecutor(
+                    mode=selected_mode,
                     load_markets_on_initialize=False,
                 )
-                await self._okx_paper.initialize()
-            return self._okx_paper
-
-        if self._okx_live is None:
-            self._okx_live = OKXExecutor(
-                mode="live",
-                load_markets_on_initialize=False,
-            )
-            await self._okx_live.initialize()
-        return self._okx_live
+                # Publish only after initialize succeeds. A cancelled or failed
+                # initialization must not leave a half-ready executor in service.
+                try:
+                    await candidate.initialize()
+                except BaseException:
+                    try:
+                        await candidate.shutdown()
+                    except BaseException as cleanup_exc:
+                        logger.warning(
+                            "failed to clean up cancelled OKX executor initialization",
+                            mode=selected_mode,
+                            error=safe_error_text(cleanup_exc, limit=180),
+                        )
+                    raise
+                setattr(self, attribute_name, candidate)
+                executor = candidate
+            return executor
 
     async def _shadow_execution_cost_facts(self, mode: str) -> dict[str, Any]:
         """Read current account fee facts once for each due-shadow mode batch."""
 
-        executor = await self._get_okx_executor_for_mode(mode)
-        return await executor.fetch_account_fee_snapshot()
+        executor = await asyncio.wait_for(
+            self._get_okx_executor_for_mode(mode),
+            timeout=MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS,
+        )
+        return await asyncio.wait_for(
+            executor.fetch_account_fee_snapshot(),
+            timeout=MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS,
+        )
 
     async def _market_execution_cost_facts(self, mode: str) -> dict[str, Any]:
         """Read the same authoritative fee facts used by shadow evaluation."""

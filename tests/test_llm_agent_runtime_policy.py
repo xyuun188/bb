@@ -46,6 +46,38 @@ async def test_consultation_waiter_gets_next_shared_llm_capacity_slot() -> None:
     assert acquired_order == ["consultation", "position"]
 
 
+async def test_position_waiter_gets_a_bounded_turn_during_market_backlog() -> None:
+    capacity = _ScopedLLMCapacity(2)
+    first = capacity.slot({"_analysis_budget_scope": "market:first"})
+    second = capacity.slot({"_analysis_budget_scope": "market:second"})
+    await first.__aenter__()
+    await second.__aenter__()
+    acquired_order: list[str] = []
+    release_position = asyncio.Event()
+
+    async def wait_for_position() -> None:
+        async with capacity.slot({"_analysis_budget_scope": "position_review"}):
+            acquired_order.append("position")
+            await release_position.wait()
+
+    async def wait_for_market() -> None:
+        async with capacity.slot({"_analysis_budget_scope": "market:backlog"}):
+            acquired_order.append("market")
+
+    position_task = asyncio.create_task(wait_for_position())
+    market_task = asyncio.create_task(wait_for_market())
+    await asyncio.sleep(0)
+    await first.__aexit__(None, None, None)
+    await asyncio.sleep(0)
+
+    assert acquired_order == ["position"]
+
+    release_position.set()
+    await second.__aexit__(None, None, None)
+    await asyncio.wait_for(asyncio.gather(position_task, market_task), timeout=0.5)
+    assert acquired_order == ["position", "market"]
+
+
 def test_shadow_quant_model_is_visible_to_llm_analysis_without_live_permission() -> None:
     contract = standardized_return_distribution(
         side="long",

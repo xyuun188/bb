@@ -69,7 +69,9 @@ class _ScopedLLMCapacity:
         self._limit = max(int(limit), 1)
         self._active = 0
         self._market_waiters = 0
+        self._position_waiters = 0
         self._consultation_waiters = 0
+        self._consecutive_market_grants = 0
         self._condition = asyncio.Condition()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -78,10 +80,16 @@ class _ScopedLLMCapacity:
         loop = asyncio.get_running_loop()
         if self._loop is loop:
             return
-        if self._active or self._market_waiters or self._consultation_waiters:
+        if (
+            self._active
+            or self._market_waiters
+            or self._position_waiters
+            or self._consultation_waiters
+        ):
             raise RuntimeError("LLM capacity cannot be shared across active event loops")
         self._condition = asyncio.Condition()
         self._loop = loop
+        self._consecutive_market_grants = 0
 
     def _scope(self, context: dict[str, Any]) -> str:
         raw = str(context.get("_analysis_budget_scope") or "")
@@ -95,6 +103,8 @@ class _ScopedLLMCapacity:
         async with self._condition:
             if scope == "market":
                 self._market_waiters += 1
+            elif scope == "position":
+                self._position_waiters += 1
             elif scope == "consultation":
                 self._consultation_waiters += 1
             try:
@@ -102,18 +112,38 @@ class _ScopedLLMCapacity:
                     consultation_reserved = (
                         scope != "consultation" and self._consultation_waiters > 0
                     )
-                    market_reserved = scope == "position" and self._market_waiters > 0
+                    position_turn = bool(
+                        self._position_waiters > 0
+                        and self._consecutive_market_grants >= self._limit
+                    )
+                    market_reserved = (
+                        scope == "position"
+                        and self._market_waiters > 0
+                        and self._active >= max(self._limit - 1, 1)
+                        and not position_turn
+                    )
+                    position_reserved = bool(
+                        scope == "market"
+                        and position_turn
+                    )
                     if (
                         self._active < self._limit
                         and not consultation_reserved
                         and not market_reserved
+                        and not position_reserved
                     ):
                         self._active += 1
+                        if scope == "market":
+                            self._consecutive_market_grants += 1
+                        elif scope == "position":
+                            self._consecutive_market_grants = 0
                         return scope
                     await self._condition.wait()
             finally:
                 if scope == "market":
                     self._market_waiters = max(self._market_waiters - 1, 0)
+                elif scope == "position":
+                    self._position_waiters = max(self._position_waiters - 1, 0)
                 elif scope == "consultation":
                     self._consultation_waiters = max(self._consultation_waiters - 1, 0)
 
