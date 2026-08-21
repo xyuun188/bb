@@ -8838,25 +8838,23 @@ class TradingService:
                     for symbol in selection_diagnostics.get("cooldown_excluded_symbols") or []
                     if self._normalize_position_symbol(symbol)
                 }
-                self._market_defer_tracker().defer_many(
-                    [
-                        symbol
-                        for symbol in selectable_market_symbols
-                        if (
-                            self._normalize_position_symbol(symbol) not in selected_market_keys
-                            and self._normalize_position_symbol(symbol) not in cooldown_excluded_keys
-                        )
-                    ],
-                    "shortlist_capacity",
-                )
-                self._market_defer_tracker().defer_many(
-                    [
-                        symbol
-                        for symbol in selectable_market_symbols
-                        if self._normalize_position_symbol(symbol) in cooldown_excluded_keys
-                    ],
-                    "analysis_cooldown",
-                )
+                if selection_diagnostics.get("cooldown_history_ready", True) is not False:
+                    self._market_defer_tracker().defer_many(
+                        [
+                            symbol
+                            for symbol in selectable_market_symbols
+                            if (
+                                self._normalize_position_symbol(symbol) not in selected_market_keys
+                                and self._normalize_position_symbol(symbol) not in cooldown_excluded_keys
+                            )
+                        ],
+                        "shortlist_capacity",
+                    )
+                # A normal cooldown is not a failed/deferred task.  Keeping
+                # it in the retry queue would make the next feature-fetch
+                # budget prioritize the same recently analyzed symbols and
+                # starve the rotating market universe.  The selection
+                # diagnostics already retain the excluded symbols and age.
                 self._market_defer_tracker().begin_many(market_feature_vectors)
                 market_feature_vectors = self._rotate_market_feature_vectors_for_deferred_coverage(
                     market_feature_vectors,
