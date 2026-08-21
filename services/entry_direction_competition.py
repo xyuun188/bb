@@ -459,12 +459,21 @@ class EntryDirectionCompetitionPolicy:
                     item["paper_return_quality_governance"] = quality_permission
                     if quality_permission.get("paper_execution_permission") is True:
                         continue
-                    item["decision_eligible"] = False
-                    item["aggregate_eligible"] = False
-                    item["observation_only"] = True
-                    item["eligibility_reason"] = quality_permission.get(
+                    # Historical fee-after-return quality controls promotion,
+                    # not whether a complete paper prediction can be observed
+                    # and settled for training.
+                    item["paper_quality_observation_only"] = True
+                    item["paper_quality_governance_reason"] = quality_permission.get(
                         "paper_execution_reason"
                     )
+                    item["paper_quality_observation_reasons"] = list(
+                        quality_permission.get("paper_execution_blockers") or []
+                    ) or [
+                        str(
+                            quality_permission.get("paper_execution_reason")
+                            or "historical_quality_permission_not_granted"
+                        )
+                    ]
         all_rows = [item for side in ("long", "short") for item in evidence[side]]
         authorized_horizon, authorized_horizon_source = _authorized_prediction_horizon(
             ml_signal_context,

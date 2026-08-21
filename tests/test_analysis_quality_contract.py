@@ -120,6 +120,41 @@ def test_unresolved_major_conflict_cannot_complete_analysis() -> None:
     assert final["cross_validation"]["unresolved_major_conflict_count"] == 1
 
 
+def test_unresolved_major_conflict_can_be_recorded_for_paper_market_observation() -> None:
+    opinions = {
+        "trend_expert": _decision("trend_expert"),
+        "risk_expert": _decision("risk_expert"),
+    }
+    contract = build_expert_call_contract(
+        expected_names=tuple(opinions),
+        attempted_names=tuple(opinions),
+        opinions=opinions,
+        timings=[{"name": name, "status": "completed"} for name in opinions],
+        failures=[],
+    )
+    validations = [
+        {
+            "expert_pair": ["trend_expert", "risk_expert"],
+            "validation_status": "completed",
+            "major_conflict": True,
+            "needs_resolution": True,
+        }
+    ]
+
+    final = finalize_analysis_quality(
+        contract,
+        validations,
+        final_action="short",
+        execution_scope="paper",
+        allow_paper_conflict_observation=True,
+    )
+
+    assert final["analysis_complete"] is False
+    assert final["decision_eligible"] is False
+    assert final["paper_observation_eligible"] is True
+    assert final["paper_observation_mode"] == "model_led_conflict_observation"
+
+
 def test_major_conflict_requires_matching_explicit_resolution() -> None:
     opinions = {
         "trend_expert": _decision("trend_expert"),

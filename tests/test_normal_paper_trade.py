@@ -3,6 +3,7 @@ from __future__ import annotations
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
+    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     attach_normal_paper_order_identity,
     build_normal_paper_trade_contract,
@@ -128,6 +129,40 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
         selection_reason="strategy_edge_selected",
         direction_support=support,
     ) == {}
+
+
+def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> None:
+    support = _support("short", expected_net=0.4)
+    permission = support["quant_quality_permissions"]["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "fee_after_return_lcb_not_positive",
+            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    support["paper_quality_observation_only"] = True
+    support["paper_quality_observation_reasons"] = [
+        "fee_after_return_lcb_not_positive"
+    ]
+
+    selection = select_normal_paper_trade_side({"short": support})
+    contract = build_normal_paper_trade_contract(
+        symbol="LTC/USDT",
+        side=selection["selected_side"],
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert normal_paper_trade_contract_reasons(contract) == []
+    assert contract["paper_quality_mode"] == "quality_observation"
+    assert contract["paper_quality_observation_only"] is True
+    assert contract["production_permission"] is False
+    assert contract["single_trade_risk_fraction_cap"] == (
+        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+    )
 
 
 def test_positive_expected_net_with_non_positive_objective_cannot_authorize_order() -> None:

@@ -199,6 +199,8 @@ def finalize_analysis_quality(
     *,
     final_action: str,
     consultation: dict[str, Any] | None = None,
+    execution_scope: str = "live",
+    allow_paper_conflict_observation: bool = False,
 ) -> dict[str, Any]:
     result = dict(contract)
     completed_names = [
@@ -241,6 +243,14 @@ def finalize_analysis_quality(
         and major_conflict_pairs.issubset(resolved_pairs)
     )
     unresolved_major_conflicts = major_conflict_pairs - resolved_pairs
+    paper_observation_eligible = bool(
+        str(execution_scope or "").lower() == "paper"
+        and allow_paper_conflict_observation
+        and result.get("expert_complete")
+        and cross_complete
+        and unresolved_major_conflicts
+        and str(final_action or "").lower() in {"long", "short"}
+    )
     analysis_complete = (
         bool(result.get("expert_complete"))
         and cross_complete
@@ -262,6 +272,12 @@ def finalize_analysis_quality(
     result["cross_validation_complete"] = cross_complete
     result["analysis_complete"] = analysis_complete
     result["decision_eligible"] = analysis_complete
+    result["paper_observation_eligible"] = paper_observation_eligible
+    result["paper_observation_mode"] = (
+        "model_led_conflict_observation"
+        if paper_observation_eligible
+        else None
+    )
     if analysis_complete:
         result["result"] = final_action if final_action in {"long", "short", "hold"} else "hold"
         result["reason_code"] = "analysis_complete"
@@ -276,4 +292,8 @@ def finalize_analysis_quality(
         else:
             result["reason_code"] = "direction_conflict"
             result["reason"] = "交叉验证发现重大方向冲突，深度会诊未明确解决全部冲突。"
+            if paper_observation_eligible:
+                result["reason"] = (
+                    "纸面市场分析保留模型主导观察；专家冲突已记录，生产权限仍关闭。"
+                )
     return result

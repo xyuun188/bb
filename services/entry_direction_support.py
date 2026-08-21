@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-18.paper-model-direction.v9"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-21.paper-model-direction.v10"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
@@ -316,6 +316,8 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "blocking_reasons",
             "production_permission",
             "quant_quality_permissions",
+            "paper_quality_observation_only",
+            "paper_quality_observation_reasons",
         )
     }
 
@@ -417,6 +419,7 @@ def assess_directional_entry_support(
                 for key in (
                     "paper_execution_permission",
                     "paper_execution_reason",
+                    "paper_execution_blockers",
                     "paper_execution_evidence_source",
                     "paper_execution_evidence",
                     "break_even_contract",
@@ -456,6 +459,22 @@ def assess_directional_entry_support(
     )
     strong_expert_opposition = bool(
         len(opposition_groups) >= 2 and len(opposition) > len(aligned)
+    )
+    quality_observation_reasons = sorted(
+        {
+            str(reason)
+            for permission in quant_quality_permissions.values()
+            if permission.get("paper_execution_permission") is not True
+            for reason in (
+                permission.get("paper_execution_blockers")
+                or [permission.get("paper_execution_reason")]
+            )
+            if str(reason).strip()
+        }
+    )
+    quality_observation_only = bool(quant_quality_permissions) and any(
+        permission.get("paper_execution_permission") is not True
+        for permission in quant_quality_permissions.values()
     )
 
     blockers: list[str] = []
@@ -526,6 +545,8 @@ def assess_directional_entry_support(
         ),
         "quant_family_summaries": family_summaries,
         "quant_quality_permissions": quant_quality_permissions,
+        "paper_quality_observation_only": quality_observation_only,
+        "paper_quality_observation_reasons": quality_observation_reasons,
         "aligned_expert_count": len(aligned),
         "opposition_expert_count": len(opposition),
         "hold_expert_count": len(holds),
@@ -594,6 +615,14 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             reasons.append("direction_support_quant_family_conflict")
         if support.get("strong_expert_opposition") is True:
             reasons.append("direction_support_strong_expert_opposition")
+        observation_only = support.get("paper_quality_observation_only") is True
+        observation_reasons = [
+            str(reason)
+            for reason in support.get("paper_quality_observation_reasons") or []
+            if str(reason).strip()
+        ]
+        if observation_only and not observation_reasons:
+            reasons.append("direction_support_quality_observation_reason_missing")
     else:
         if int(support.get("aligned_expert_count") or 0) < (
             MIN_GOVERNED_ALIGNED_EXPERT_COUNT

@@ -15,6 +15,7 @@ from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
@@ -22,6 +23,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v3_trade_contract_reasons,
     legacy_normal_paper_v4_trade_contract_reasons,
     legacy_normal_paper_v5_trade_contract_reasons,
+    legacy_normal_paper_v6_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
@@ -1088,6 +1090,9 @@ def validate_normal_paper_entry_contract(
     legacy_quality_v5 = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
     )
+    legacy_quality_v6 = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_fixed_leverage
@@ -1097,6 +1102,8 @@ def validate_normal_paper_entry_contract(
         if allow_legacy_settlement and legacy_objective_v4
         else legacy_normal_paper_v5_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_quality_v5
+        else legacy_normal_paper_v6_trade_contract_reasons(normal_trade)
+        if allow_legacy_settlement and legacy_quality_v6
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 

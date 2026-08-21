@@ -189,12 +189,12 @@ def test_funding_projection_uses_model_horizon_when_quality_gate_blocks_entries(
         strategy=strategy,
     )
 
-    assert context["enabled"] is False
-    assert context["selected_horizon_minutes"] is None
+    assert context["enabled"] is True
+    assert context["selected_horizon_minutes"] == 30
     assert context["authorized_prediction_horizon_minutes"] == 30
     assert context["funding_projection"]["selected_horizon_minutes"] == 30
     assert context["funding_projection"]["horizon_source"] == (
-        "local_ml_primary_horizon"
+        "selected_prediction_cohort"
     )
     assert context["funding_projection"]["evidence_complete"] is True
     assert all(
@@ -395,7 +395,7 @@ def test_paper_continuous_weights_can_change_direction_without_affecting_live() 
     assert live == equal
 
 
-def test_negative_fee_after_source_quality_cannot_authorize_paper_direction() -> None:
+def test_negative_fee_after_source_quality_enters_paper_observation_mode() -> None:
     context = _context(
         tools={"time_series_prediction": _paper_payload(-0.5, 0.8)},
         strategy={
@@ -416,16 +416,16 @@ def test_negative_fee_after_source_quality_cannot_authorize_paper_direction() ->
         },
     )
 
-    assert context["preferred_side"] == "neutral"
-    assert context["decision_source_count"] == 0
+    assert context["preferred_side"] == "short"
+    assert context["decision_source_count"] == 2
     short = next(
         item
         for item in context["short"]["evidence"]
         if item["source"] == "timeseries"
     )
-    assert short["observation_only"] is True
-    assert short["decision_eligible"] is False
-    assert short["eligibility_reason"] == "fee_after_return_lcb_not_positive"
+    assert short["paper_quality_observation_only"] is True
+    assert short["decision_eligible"] is True
+    assert short["paper_quality_governance_reason"] == "fee_after_return_lcb_not_positive"
     assert context["continuous_model_weighting"]["quality_permissions"][
         "timeseries"
     ]["paper_execution_permission"] is False

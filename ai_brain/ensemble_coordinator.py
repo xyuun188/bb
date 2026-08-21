@@ -178,9 +178,17 @@ class EnsembleCoordinator:
             cross_validations,
             final_action=final.action.value,
             consultation=consultation,
+            execution_scope=str(context.get("execution_mode") or "live"),
+            allow_paper_conflict_observation=bool(
+                str(context.get("execution_mode") or "").lower() == "paper"
+                and not context.get("review_positions")
+            ),
         )
         _apply_market_funding_quality_contract(quality_contract, context)
-        if final.is_entry and not quality_contract.get("decision_eligible"):
+        if final.is_entry and not (
+            quality_contract.get("decision_eligible")
+            or quality_contract.get("paper_observation_eligible")
+        ):
             observed_action = final.action.value
             raw_observation = (
                 dict(final.raw_response) if isinstance(final.raw_response, dict) else {}
