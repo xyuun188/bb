@@ -9953,8 +9953,21 @@ class TradingService:
     def _start_ml_auto_train_loop(self) -> None:
         if self._ml_auto_train_task and not self._ml_auto_train_task.done():
             return
+        state_store = self._model_training_state()
+        for scheduler_id in ("local_ai_tools_auto_train", "local_ml_auto_train"):
+            try:
+                self._reclaim_training_subprocess_lease(
+                    store=state_store,
+                    scheduler_id=scheduler_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "training lease recovery failed at scheduler startup",
+                    scheduler_id=scheduler_id,
+                    error=safe_error_text(exc, limit=180),
+                )
         try:
-            recovered = self._model_training_state().recover_interrupted_runs()
+            recovered = state_store.recover_interrupted_runs()
             if recovered:
                 logger.warning("recovered interrupted model training runs", model_ids=recovered)
         except Exception as exc:
