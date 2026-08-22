@@ -77,6 +77,8 @@ REMOTE_PLATFORM_EXPORT_DIR = f"{REMOTE_PLATFORM_APP_DIR}/data/finquant_expert_tr
 REMOTE_PLATFORM_EXPORT_WRAPPER = f"{REMOTE_PLATFORM_EXPORT_DIR}/export_wrapper.py"
 MODEL_NAME = "BB-FinQuant-Expert-14B"
 BASE_MODEL_NAME = "qwen3-14b-trade"
+FINQUANT_GATEWAY_RUNTIME_VERSION = "4.0"
+FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE = 128
 DATASET_SCHEMA_VERSION = "bb_finquant_expert_sft.v2"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
 RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
@@ -1771,38 +1773,8 @@ runpy.run_path("scripts/finquant_expert_lora_training.py", run_name="__main__")
         ssh.close()
 
 
-def _remote_service_update_script(*, adapter_path: str) -> str:
-    if not str(adapter_path or "").startswith(f"{REMOTE_ADAPTER_ROOT}/"):
-        raise ValueError("8003 cannot start without a verified BB-FinQuant adapter")
-    lora_args = "  --enable-lora \\\n" f"  --lora-modules {MODEL_NAME}={adapter_path} \\\n"
-    qwen_script = f"""#!/usr/bin/env bash
-set -euo pipefail
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate trade_vllm
-export CUDA_VISIBLE_DEVICES=0
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_USE_V1=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/data/trade_ai/hf_cache
-export HF_HUB_CACHE=/data/trade_ai/hf_cache/hub
-export TRANSFORMERS_CACHE=/data/trade_ai/hf_cache/transformers
-LOG=/data/trade_ai/logs/finquant_expert_14b.log
-exec python -m vllm.entrypoints.openai.api_server \\
-  --host 0.0.0.0 \\
-  --port 8000 \\
-  --model {REMOTE_INFERENCE_BASE_MODEL} \\
-  --served-model-name {BASE_MODEL_NAME} \\
-  --trust-remote-code \\
-  --max-model-len 4096 \\
-  --gpu-memory-utilization 0.72 \\
-  --dtype half \\
-  --quantization awq_marlin \\
-  --max-num-seqs 2 \\
-  --max-num-batched-tokens 4096 \\
-{lora_args}  --enable-prefix-caching \\
-  --enable-chunked-prefill > "$LOG" 2>&1
-"""
-    gateway_script = f"""from __future__ import annotations
+def _render_finquant_gateway_script() -> str:
+    return f"""from __future__ import annotations
 
 import json
 import sys
@@ -1815,10 +1787,19 @@ PORT = 8003
 UPSTREAM = "http://127.0.0.1:8000"
 GATEWAY_MODEL = "{MODEL_NAME}"
 UPSTREAM_MODEL = "{MODEL_NAME}"
+RUNTIME_VERSION = "{FINQUANT_GATEWAY_RUNTIME_VERSION}"
+REQUEST_QUEUE_SIZE = {FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE}
+
+
+class GatewayHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = True
+    request_queue_size = REQUEST_QUEUE_SIZE
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BBFinQuantVerifiedGateway/3.0"
+    server_version = "BBFinQuantVerifiedGateway/{FINQUANT_GATEWAY_RUNTIME_VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\\n" % (self.address_string(), fmt % args))
@@ -1828,10 +1809,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
+        self.send_header("connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self) -> None:
+        if self.path.rstrip("/") == "/health/live":
+            self._write_json(200, {{
+                "ok": True,
+                "service": "bb_finquant_verified_gateway",
+                "runtime_version": RUNTIME_VERSION,
+                "request_queue_size": REQUEST_QUEUE_SIZE,
+            }})
+            return
         if self.path.rstrip("/") == "/v1/models":
             try:
                 with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=10) as response:
@@ -1871,10 +1861,11 @@ class Handler(BaseHTTPRequestHandler):
                 data = response.read()
                 self.send_response(response.status)
                 for key, value in response.headers.items():
-                    if key.lower() in {{"transfer-encoding", "connection"}}:
+                    if key.lower() in {{"transfer-encoding", "connection", "content-length"}}:
                         continue
                     self.send_header(key, value)
                 self.send_header("content-length", str(len(data)))
+                self.send_header("connection", "close")
                 self.end_headers()
                 self.wfile.write(data)
         except urllib.error.HTTPError as exc:
@@ -1882,6 +1873,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(exc.code)
             self.send_header("content-type", exc.headers.get("content-type", "application/json"))
             self.send_header("content-length", str(len(data)))
+            self.send_header("connection", "close")
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
@@ -1889,9 +1881,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    GatewayHTTPServer((HOST, PORT), Handler).serve_forever()
 """
-    gateway_service = f"""[Unit]
+
+
+def _render_finquant_gateway_service() -> str:
+    return f"""[Unit]
 Description=BB FinQuant verified adapter gateway
 After=network-online.target {REMOTE_QWEN_SERVICE}
 Wants=network-online.target
@@ -1908,6 +1903,160 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def deploy_finquant_gateway_runtime_only() -> dict[str, Any]:
+    """Update the verified gateway without restarting the underlying vLLM model."""
+
+    info = load_model_server_info_from_platform(ROOT)
+    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
+    gateway_script = _render_finquant_gateway_script()
+    gateway_service = _render_finquant_gateway_service()
+    gateway_service_upload = f"{REMOTE_SERVICE_DIR}/{REMOTE_GATEWAY_SERVICE}"
+    backup_path = f"{REMOTE_GATEWAY_SCRIPT}.bak.{int(time.time())}"
+    try:
+        run_remote_text(
+            ssh,
+            f"if [ -f {sh(REMOTE_GATEWAY_SCRIPT)} ]; then "
+            f"cp --preserve=mode {sh(REMOTE_GATEWAY_SCRIPT)} {sh(backup_path)}; fi",
+            timeout=30,
+            check=True,
+        )
+        _upload_text_atomic(
+            ssh,
+            REMOTE_GATEWAY_SCRIPT,
+            gateway_script,
+            mode=0o755,
+        )
+        _upload_text_atomic(
+            ssh,
+            gateway_service_upload,
+            gateway_service,
+            mode=0o644,
+        )
+        run_remote_text(
+            ssh,
+            textwrap.dedent(
+                f"""
+                set -euo pipefail
+                /usr/bin/python3 -m py_compile {sh(REMOTE_GATEWAY_SCRIPT)}
+                sudo -n install -m 0644 {sh(gateway_service_upload)} {sh(REMOTE_GATEWAY_SERVICE_PATH)}
+                sudo -n systemctl daemon-reload
+                sudo -n systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}
+                for _attempt in $(seq 1 30); do
+                  if curl -fsS --max-time 3 http://127.0.0.1:8003/health/live >/dev/null; then
+                    exit 0
+                  fi
+                  sleep 1
+                done
+                exit 1
+                """
+            ).strip(),
+            timeout=60,
+            check=True,
+        )
+        concurrency_probe = textwrap.dedent(
+            f"""
+            import concurrent.futures
+            import json
+            import urllib.request
+
+            URL = "http://127.0.0.1:8003/health/live"
+
+            def fetch(_index):
+                with urllib.request.urlopen(URL, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    return int(response.status), payload
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+                rows = list(executor.map(fetch, range(64)))
+
+            statuses = [status for status, _payload in rows]
+            payloads = [payload for _status, payload in rows]
+            print(json.dumps({{
+                "request_count": len(rows),
+                "success_count": sum(status == 200 for status in statuses),
+                "runtime_versions": sorted({{str(item.get("runtime_version") or "") for item in payloads}}),
+                "request_queue_sizes": sorted({{int(item.get("request_queue_size") or 0) for item in payloads}}),
+            }}, sort_keys=True))
+            """
+        ).strip()
+        raw_probe = run_remote_text(
+            ssh,
+            f"/usr/bin/python3 -c {sh(concurrency_probe)}",
+            timeout=45,
+            check=True,
+        )
+        probe = _json_object_from_remote_output(raw_probe)
+        model_probe = run_remote_text(
+            ssh,
+            "curl -fsS --max-time 15 http://127.0.0.1:8003/v1/models",
+            timeout=20,
+            check=True,
+        )
+        if int(probe.get("success_count") or 0) != int(probe.get("request_count") or 0):
+            raise RuntimeError(f"FinQuant gateway concurrency probe failed: {probe}")
+        if probe.get("runtime_versions") != [FINQUANT_GATEWAY_RUNTIME_VERSION]:
+            raise RuntimeError(f"FinQuant gateway runtime version mismatch: {probe}")
+        if probe.get("request_queue_sizes") != [FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE]:
+            raise RuntimeError(f"FinQuant gateway request queue mismatch: {probe}")
+        if MODEL_NAME not in model_probe:
+            raise RuntimeError("FinQuant gateway model identity probe failed")
+        service_state = run_remote_text(
+            ssh,
+            f"systemctl show {sh(REMOTE_GATEWAY_SERVICE)} "
+            "--property=ActiveState --property=SubState --property=NRestarts "
+            "--property=ActiveEnterTimestamp",
+            timeout=20,
+            check=True,
+        )
+        return {
+            "deployed": True,
+            "runtime_version": FINQUANT_GATEWAY_RUNTIME_VERSION,
+            "request_queue_size": FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE,
+            "concurrency_probe": probe,
+            "model_identity_verified": True,
+            "underlying_model_restarted": False,
+            "backup_path": backup_path,
+            "service_state": service_state.strip(),
+        }
+    finally:
+        ssh.close()
+
+
+def _remote_service_update_script(*, adapter_path: str) -> str:
+    if not str(adapter_path or "").startswith(f"{REMOTE_ADAPTER_ROOT}/"):
+        raise ValueError("8003 cannot start without a verified BB-FinQuant adapter")
+    lora_args = "  --enable-lora \\\n" f"  --lora-modules {MODEL_NAME}={adapter_path} \\\n"
+    qwen_script = f"""#!/usr/bin/env bash
+set -euo pipefail
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate trade_vllm
+export CUDA_VISIBLE_DEVICES=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_USE_V1=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HOME=/data/trade_ai/hf_cache
+export HF_HUB_CACHE=/data/trade_ai/hf_cache/hub
+export TRANSFORMERS_CACHE=/data/trade_ai/hf_cache/transformers
+LOG=/data/trade_ai/logs/finquant_expert_14b.log
+exec python -m vllm.entrypoints.openai.api_server \\
+  --host 0.0.0.0 \\
+  --port 8000 \\
+  --model {REMOTE_INFERENCE_BASE_MODEL} \\
+  --served-model-name {BASE_MODEL_NAME} \\
+  --trust-remote-code \\
+  --max-model-len 4096 \\
+  --gpu-memory-utilization 0.72 \\
+  --dtype half \\
+  --quantization awq_marlin \\
+  --max-num-seqs 2 \\
+  --max-num-batched-tokens 4096 \\
+{lora_args}  --enable-prefix-caching \\
+  --enable-chunked-prefill > "$LOG" 2>&1
+"""
+    gateway_script = _render_finquant_gateway_script()
+    gateway_service = _render_finquant_gateway_service()
     gateway_service_upload = f"{REMOTE_SERVICE_DIR}/{REMOTE_GATEWAY_SERVICE}"
     return textwrap.dedent(f"""
         set -euo pipefail
@@ -2247,10 +2396,32 @@ async def _main() -> None:
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--switch-service", action="store_true")
     parser.add_argument("--rollback-service", action="store_true")
+    parser.add_argument(
+        "--refresh-gateway",
+        action="store_true",
+        help="Deploy only the concurrent FinQuant gateway runtime; do not restart vLLM.",
+    )
     parser.add_argument("--registry-status", action="store_true")
     parser.add_argument("--sync-registry-evidence", action="store_true")
     parser.add_argument("--stop-inference-for-training", action="store_true")
     args = parser.parse_args()
+
+    if args.refresh_gateway:
+        if any(
+            bool(getattr(args, name))
+            for name in (
+                "train",
+                "switch_service",
+                "rollback_service",
+                "export_only",
+                "registry_status",
+                "sync_registry_evidence",
+                "stop_inference_for_training",
+            )
+        ):
+            raise SystemExit("--refresh-gateway cannot be combined with other operations")
+        safe_print(json.dumps(deploy_finquant_gateway_runtime_only(), ensure_ascii=False, indent=2))
+        return
 
     if args.registry_status:
         if (

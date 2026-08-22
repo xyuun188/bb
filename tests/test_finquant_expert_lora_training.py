@@ -298,6 +298,33 @@ def test_8003_gateway_requires_a_real_adapter_and_does_not_rename_base_model() -
     assert "systemctl disable --now 'bb-finquant-expert-alias.service'" in rendered
 
 
+def test_finquant_gateway_runtime_is_threaded_and_has_backlog_health_probe() -> None:
+    rendered = training._render_finquant_gateway_script()
+
+    compile(rendered, "remote_finquant_gateway.py", "exec")
+    assert "class GatewayHTTPServer(ThreadingHTTPServer)" in rendered
+    assert "daemon_threads = True" in rendered
+    assert "request_queue_size = REQUEST_QUEUE_SIZE" in rendered
+    assert 'RUNTIME_VERSION = "4.0"' in rendered
+    assert 'self.path.rstrip("/") == "/health/live"' in rendered
+    assert '"request_queue_size": REQUEST_QUEUE_SIZE' in rendered
+    assert "content-length\", \"connection\"" in rendered
+
+
+def test_gateway_runtime_only_deploy_is_explicitly_non_vllm_mutating() -> None:
+    source = (training.ROOT / "scripts" / "finquant_expert_lora_training.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--refresh-gateway" in source
+    refresh_start = source.index("def deploy_finquant_gateway_runtime_only")
+    refresh_end = source.index("def _remote_service_update_script", refresh_start)
+    refresh_source = source[refresh_start:refresh_end]
+    assert "underlying_model_restarted\": False" in refresh_source
+    assert "systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}" in refresh_source
+    assert "systemctl restart {sh(REMOTE_QWEN_SERVICE)}" not in refresh_source
+
+
 def test_remote_trainer_and_registry_enforce_hashes_atomic_pointers_and_rollback() -> None:
     compile(training.REMOTE_TRAINER_CODE, "remote_finquant_trainer.py", "exec")
     compile(training.REMOTE_REGISTRY_TOOL_CODE, "remote_finquant_registry.py", "exec")
