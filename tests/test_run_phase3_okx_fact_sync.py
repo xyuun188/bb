@@ -139,8 +139,9 @@ async def test_phase3_okx_fact_sync_apply_runs_order_fact_sync(monkeypatch: pyte
         return {"status": "created", "equity": 4998.15}
 
     class FakeOrderSync:
-        def __init__(self, *, mode: str) -> None:
+        def __init__(self, *, mode: str, timeout_seconds: float) -> None:
             self.mode = mode
+            assert timeout_seconds == script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS
 
         async def sync(self) -> dict:
             calls.append(f"sync:{self.mode}")
@@ -231,6 +232,7 @@ async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
     assert captured == {
         "mode": "paper",
         "recovery_order_ids": (recovery_order_id, protection_order_id),
+        "timeout_seconds": script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS,
     }
     assert result["recovery_order_ids"] == [recovery_order_id, protection_order_id]
     assert result["order_sync_result"]["backfilled_count"] == 1
@@ -252,8 +254,9 @@ async def test_phase3_okx_fact_sync_reset_is_explicit(monkeypatch: pytest.Monkey
         return {"status": "created"}
 
     class FakeOrderSync:
-        def __init__(self, *, mode: str) -> None:
+        def __init__(self, *, mode: str, timeout_seconds: float) -> None:
             self.mode = mode
+            assert timeout_seconds == script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS
 
         async def sync(self) -> dict:
             calls.append(f"sync:{self.mode}")

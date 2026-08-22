@@ -414,6 +414,7 @@ async def collect_report(*, allow_cache: bool = False) -> dict[str, Any]:
     if not allow_cache:
         system_audit._okx_reconciliation_cache = None
         system_audit._okx_authoritative_sync_cache = None
+        system_audit._trade_execution_contract_cache = None
     token = system_audit._skip_okx_daily_reconciliation_latest.set(True)
     try:
         cards = [

@@ -3,10 +3,17 @@ Pytest fixtures and configuration for the AI trading system.
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# Test collection imports some operational scripts. Keep those imports from
+# loading the host's production runtime environment before fixtures can run.
+os.environ["BB_RUNTIME_ENV_PATH"] = str(
+    Path(__file__).resolve().parent / ".runtime-env-disabled"
+)
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -35,6 +42,25 @@ def isolate_okx_private_api_circuit_state():
     OKXExecutor.reset_private_api_circuit_states()
 
 
+@pytest.fixture(autouse=True)
+async def dispose_shared_db_engine_after_test():
+    """Cancel test-owned background work before releasing the async DB engine."""
+    yield
+    current_task = asyncio.current_task()
+    pending_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current_task and not task.done()
+    ]
+    for task in pending_tasks:
+        task.cancel()
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+    from db.session import close_db
+
+    await close_db()
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create a single event loop for all async tests."""
@@ -42,7 +68,15 @@ def event_loop():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.new_event_loop()
     yield loop
-    loop.close()
+    # Dispose SQLAlchemy/aiosqlite workers before closing the loop.  Otherwise
+    # a worker can finish after loop shutdown and raise an unhandled callback
+    # exception even though the test assertions all passed.
+    try:
+        from db.session import close_db
+
+        loop.run_until_complete(close_db())
+    finally:
+        loop.close()
 
 
 @pytest.fixture

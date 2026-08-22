@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from models.decision import _compact_decision_learning_snapshot
+from services import trade_execution_contract as trade_execution_contract_module
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import (
+    TradeExecutionContractService,
     _decision_report_projection,
     _is_authoritative_filled_order,
     summarize_trade_execution_contract,
@@ -31,6 +34,45 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["live_entry_requires_production_trade_gate"] is True
     assert policy["live_entry_requires_positive_return_lcb"] is True
     assert "paper_exploration_live_permission" not in policy
+
+
+@pytest.mark.asyncio
+async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    monkeypatch.setattr(
+        trade_execution_contract_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class _Result:
+        def mappings(self) -> _Result:
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return []
+
+    class _Session:
+        async def execute(self, statement: object) -> _Result:
+            statements.append(str(statement))
+            return _Result()
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield _Session()
+
+    report = await TradeExecutionContractService(_session_factory).report(
+        hours=24,
+        limit=500,
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+
+    assert report["summary"]["decision_count"] == 0
+    assert statements
+    assert "anon_1" in statements[0]
+    assert "LIMIT" in statements[0]
 
 
 def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, object]:

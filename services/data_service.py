@@ -259,6 +259,8 @@ class DataService:
         self._instrument_spec_cache: dict[str, dict[str, Any]] = {}
         self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
         self._instrument_spec_failed_at: dict[str, datetime] = {}
+        self._ticker_persist_tasks: set[asyncio.Task] = set()
+        self._started = False
         self._stopping = False
 
         # Register ticker callback for real-time price updates
@@ -267,6 +269,13 @@ class DataService:
     def _on_ticker_update(self, symbol: str, data: dict) -> None:
         """Callback invoked by WebSocket client on each ticker update."""
         try:
+            # Only a running service owns ticker persistence.  This prevents
+            # callbacks delivered during construction/teardown from creating
+            # database work on a loop that is about to close.
+            if bool(getattr(self, "_stopping", False)) or not bool(
+                getattr(self, "_started", False)
+            ):
+                return
             normalized = self._normalize_symbols([symbol])[0]
             last_persisted = getattr(self, "_ticker_persisted_at", {}).get(normalized)
             now = datetime.now(UTC)
@@ -280,7 +289,19 @@ class DataService:
                 return
             loop = asyncio.get_running_loop()
             inflight.add(normalized)
-            loop.create_task(self._persist_ticker_snapshot(symbol, data))
+            task = loop.create_task(self._persist_ticker_snapshot(symbol, data))
+            persist_tasks = getattr(self, "_ticker_persist_tasks", None)
+            if not isinstance(persist_tasks, set):
+                persist_tasks = set()
+                self._ticker_persist_tasks = persist_tasks
+            persist_tasks.add(task)
+
+            def cleanup(done: asyncio.Task) -> None:
+                persist_tasks.discard(done)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(cleanup)
         except RuntimeError:
             return
         except Exception as exc:
@@ -359,6 +380,7 @@ class DataService:
     async def start(self) -> None:
         """Start all data feed connections."""
         self._stopping = False
+        self._started = True
         # Fetch all available USDT pairs for auto mode WS subscription
         try:
             available = await self._refresh_available_symbols_cache()
@@ -391,6 +413,8 @@ class DataService:
     async def stop(self) -> None:
         """Stop all data feed connections."""
         self._stopping = True
+        self._started = False
+        await self._stop_ticker_persistence()
         derivative_tasks = list(self._derivatives_refresh_task_map().values())
         for task in derivative_tasks:
             if not task.done():
@@ -415,6 +439,17 @@ class DataService:
         await self.sentiment_scraper.close()
         await self.external_event_service.stop()
         logger.info("data service stopped")
+
+    async def _stop_ticker_persistence(self) -> None:
+        tasks = getattr(self, "_ticker_persist_tasks", None)
+        if not isinstance(tasks, set):
+            return
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        tasks.clear()
 
     async def refresh_sentiment(self, symbols: list[str] | None = None) -> None:
         """Fetch latest news/social sentiment and cache it for requested symbols."""

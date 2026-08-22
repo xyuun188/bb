@@ -112,14 +112,23 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     missing_policy.extend(
         key for key in required_false_trade_policy if trade_policy.get(key) is not False
     )
-    if trade.get("report_available") is False:
+    report_available = trade.get("report_available", True)
+    if report_available is False:
         blockers.append(
             _blocker(
                 "dynamic_return_contract_unavailable",
                 "Dynamic return execution contract report is unavailable.",
+                evidence={
+                    "error": trade.get("error"),
+                    "error_type": trade.get("error_type"),
+                    "timeout": bool(trade.get("timeout")),
+                },
             )
         )
-    if missing_policy:
+    # An unavailable audit cannot prove or disprove individual policy fields.
+    # Keep the single availability blocker instead of misreporting a timeout as
+    # a malformed contract payload.
+    if report_available is not False and missing_policy:
         blockers.append(
             _blocker(
                 "dynamic_return_contract_policy_incomplete",
@@ -128,7 +137,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         )
     violation_count = _safe_int(trade_summary.get("contract_violation_count"))
-    if violation_count > 0:
+    if report_available is not False and violation_count > 0:
         blockers.append(
             _blocker(
                 "dynamic_return_contract_current_violations",
@@ -136,7 +145,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                 evidence=trade_summary,
             )
         )
-    elif trade_summary:
+    elif report_available is not False and trade_summary:
         passed.append("dynamic_return_contract_current_window_clean")
 
     capacity = _details(by_key.get("position_capacity_release", {}))

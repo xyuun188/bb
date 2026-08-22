@@ -126,6 +126,9 @@ STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_LIMIT = 500
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
 TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
+TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS = 15.0
+TRADE_EXECUTION_CONTRACT_CACHE_TTL_SECONDS = 30.0
+TRADE_EXECUTION_CONTRACT_FAILURE_CACHE_TTL_SECONDS = 5.0
 OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
 OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
 OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 40.0
@@ -249,6 +252,12 @@ _system_audit_refresh_task: asyncio.Task[Any] | None = None
 _system_audit_subprocess_task: asyncio.Task[dict[str, Any]] | None = None
 _okx_authoritative_sync_cache: tuple[datetime, dict[str, Any]] | None = None
 _system_audit_collect_lock: asyncio.Lock | None = None
+_trade_execution_contract_cache: tuple[
+    float,
+    tuple[int, int],
+    dict[str, Any],
+] | None = None
+_trade_execution_contract_report_task: asyncio.Task[dict[str, Any]] | None = None
 
 
 def _system_audit_lock() -> asyncio.Lock:
@@ -768,6 +777,7 @@ def _safe_position_capacity_release_report(report: dict[str, Any]) -> dict[str, 
 
 def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, Any]:
     safe = copy.deepcopy(report if isinstance(report, dict) else {})
+    safe.setdefault("report_available", True)
     safe["audit_only"] = True
     safe["read_only"] = True
     safe["live_entry_mutation"] = False
@@ -3298,11 +3308,29 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
     try:
         root_report, contract_report = await asyncio.gather(
             StrategySignalRootCauseAuditService().report(),
-            TradeExecutionContractService().report(
-                hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
-                limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
-            ),
+            _load_trade_execution_contract_report(),
         )
+        if contract_report.get("report_available") is False:
+            return _audit_card(
+                "strategy_closed_loop",
+                "dynamic return closed-loop audit",
+                "warning",
+                "Contract audit is unavailable; do not interpret the failure as missing contract fields.",
+                details={
+                    "audit_only": True,
+                    "read_only": True,
+                    "report_available": False,
+                    "trade_execution_contract": contract_report,
+                    "strategy_signal": root_report,
+                    "error": contract_report.get("error"),
+                    "error_type": contract_report.get("error_type"),
+                    "timeout": bool(contract_report.get("timeout")),
+                    "live_entry_mutation": False,
+                    "live_exit_mutation": False,
+                    "can_bypass_risk_controls": False,
+                },
+                owner_path="services/trade_execution_contract.py",
+            )
         root_report = _safe_strategy_signal_root_cause_report(root_report)
         contract_report = _safe_trade_execution_contract_report(contract_report)
     except Exception as exc:
@@ -3341,6 +3369,76 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         ],
         owner_path="services/trade_execution_contract.py",
     )
+
+
+async def _load_trade_execution_contract_report() -> dict[str, Any]:
+    """Share one bounded read-only contract report across the audit graph.
+
+    The closed-loop and contract cards used to issue identical database scans in
+    one system-audit pass.  Keep a short-lived result (including a structured
+    failure) so a slow database cannot be queried again while the same pass is
+    still assembling its dependent cards.
+    """
+
+    global _trade_execution_contract_cache, _trade_execution_contract_report_task
+    cache_key = (TRADE_EXECUTION_CONTRACT_AUDIT_HOURS, TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT)
+    now = time.monotonic()
+    cached = _trade_execution_contract_cache
+    if cached is not None:
+        cached_at, cached_key, cached_report = cached
+        ttl = (
+            TRADE_EXECUTION_CONTRACT_FAILURE_CACHE_TTL_SECONDS
+            if cached_report.get("report_available") is False
+            else TRADE_EXECUTION_CONTRACT_CACHE_TTL_SECONDS
+        )
+        if cached_key == cache_key and now - cached_at <= ttl:
+            return copy.deepcopy(cached_report)
+
+    task = _trade_execution_contract_report_task
+    if task is None or task.done():
+        async def collect() -> dict[str, Any]:
+            try:
+                report = await asyncio.wait_for(
+                    TradeExecutionContractService().report(
+                        hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
+                        limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+                    ),
+                    timeout=TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return {
+                    "report_available": False,
+                    "error": safe_error_text(exc, limit=240),
+                    "error_type": type(exc).__name__,
+                    "timeout": isinstance(exc, TimeoutError),
+                    "audit_only": True,
+                    "read_only": True,
+                    "live_entry_mutation": False,
+                    "live_exit_mutation": False,
+                    "can_bypass_risk_controls": False,
+                    "summary": {},
+                }
+
+            normalized = copy.deepcopy(report if isinstance(report, dict) else {})
+            normalized["report_available"] = True
+            return normalized
+
+        task = asyncio.create_task(collect())
+        _trade_execution_contract_report_task = task
+
+    try:
+        # A section-level timeout must not cancel the shared read.  A later
+        # dependent card can still consume its structured result instead of
+        # starting another identical query.
+        report = await asyncio.shield(task)
+    finally:
+        if task.done() and _trade_execution_contract_report_task is task:
+            _trade_execution_contract_report_task = None
+
+    _trade_execution_contract_cache = (time.monotonic(), cache_key, copy.deepcopy(report))
+    return copy.deepcopy(report)
 
 
 async def _strategy_signal_root_cause_audit() -> dict[str, Any]:
@@ -3407,12 +3505,29 @@ async def _strategy_signal_root_cause_audit() -> dict[str, Any]:
 
 async def _trade_execution_contract_audit() -> dict[str, Any]:
     try:
-        report = _safe_trade_execution_contract_report(
-            await TradeExecutionContractService().report(
-                hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
-                limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+        raw_report = await _load_trade_execution_contract_report()
+        if raw_report.get("report_available") is False:
+            return _audit_card(
+                "trade_execution_contract",
+                "dynamic return execution contract",
+                "warning",
+                "Contract audit is unavailable; timeout or database errors are not contract-field violations.",
+                details={
+                    "error": raw_report.get("error"),
+                    "error_type": raw_report.get("error_type"),
+                    "timeout": bool(raw_report.get("timeout")),
+                    "report_available": False,
+                    "audit_only": True,
+                    "read_only": True,
+                    "live_entry_mutation": False,
+                    "live_exit_mutation": False,
+                    "can_bypass_risk_controls": False,
+                    "summary": {},
+                },
+                next_actions=["先恢复只读执行合同审计，再判断当前合同是否存在真实违规。"],
+                owner_path="services/trade_execution_contract.py",
             )
-        )
+        report = _safe_trade_execution_contract_report(raw_report)
     except Exception as exc:
         return _audit_card(
             "trade_execution_contract",
@@ -3422,6 +3537,10 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
             details={
                 "error": safe_error_text(exc, limit=180),
                 "audit_only": True,
+                "read_only": True,
+                "report_available": False,
+                "error_type": type(exc).__name__,
+                "timeout": isinstance(exc, TimeoutError),
                 "live_entry_mutation": False,
                 "live_exit_mutation": False,
                 "can_bypass_risk_controls": False,
@@ -5942,6 +6061,14 @@ async def _collect_system_audit_status_unlocked(
                     details={
                         "section_key": section_key,
                         "error": safe_error_text(result, limit=180),
+                        "error_type": type(result).__name__,
+                        "timeout": isinstance(result, TimeoutError),
+                        "report_available": False,
+                        "audit_only": True,
+                        "read_only": True,
+                        "live_entry_mutation": False,
+                        "live_exit_mutation": False,
+                        "can_bypass_risk_controls": False,
                     },
                     owner_path=_owner_path_for_card(section_key),
                 )

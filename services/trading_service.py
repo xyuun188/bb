@@ -10437,6 +10437,7 @@ class TradingService:
         self._running = False
         self._write_runtime_heartbeat()
         await self._stop_ml_auto_train_loop()
+        await self._stop_strategy_context_background_tasks()
         for task in (
             getattr(self, "_position_analysis_task", None),
             getattr(self, "_market_analysis_task", None),
@@ -10503,6 +10504,25 @@ class TradingService:
             logger.debug("local AI tools client shutdown failed", error=safe_error_text(exc))
         await self.models.shutdown_all()
         logger.info("trading service stopped")
+
+    async def _stop_strategy_context_background_tasks(self) -> None:
+        """Cancel optional strategy-context refreshes before their DB loop closes."""
+
+        task_stores = (
+            getattr(self, "_strategy_context_performance_refresh_task_store", None),
+            getattr(self, "_strategy_learning_context_refresh_tasks", None),
+        )
+        tasks: list[asyncio.Task] = []
+        for store in task_stores:
+            if not isinstance(store, dict):
+                continue
+            tasks.extend(task for task in store.values() if isinstance(task, asyncio.Task))
+            store.clear()
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _start_ml_auto_train_loop(self) -> None:
         if self._ml_auto_train_task and not self._ml_auto_train_task.done():

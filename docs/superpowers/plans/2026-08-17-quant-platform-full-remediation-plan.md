@@ -611,3 +611,73 @@ The plan remains active until the fresh deployment window completes the
 required 24-hour online continuity, coverage, expert-call, training-heartbeat,
 and audit gates.  Current model quality blockers (fee-after-return, LCB, and
 profit-factor evidence) remain authoritative and were not bypassed.
+
+### 7.15 Execution contract audit timeout closure (2026-08-22)
+
+The post-deployment audit found that the dynamic execution-contract report was
+queried twice in one audit graph.  A slow database read could exceed the
+20-second section deadline, and the resulting exception was then misread by the
+Phase 3 gate as missing contract fields.  This pass closes that failure chain:
+
+- The closed-loop and execution-contract cards share one short-lived,
+  read-only report and one in-flight task.  A repeated timeout is not allowed to
+  start a second identical database scan during the same observation window.
+- The contract service now loads only the columns required by validation for
+  orders and positions instead of full ORM rows and large unused JSON payloads.
+- Successful reports expose `report_available=true`.  Timeout, cancellation or
+  database failures expose `report_available=false`, `error_type` and `timeout`
+  without fabricating a contract violation.
+- Phase 3 go/no-go emits one authoritative
+  `dynamic_return_contract_unavailable` blocker for an unavailable report and
+  does not add a second false `policy_incomplete` blocker.
+- Online daily reconciliation after deployment reported
+  `can_open_new_entries=true`, `can_refresh_training=true`, and an execution
+  contract card with `status=ok` and zero contract violations.  The focused
+  online regression passed 59 tests.
+
+The first narrow projection still left the recent-decision query as the
+dominant database cost: PostgreSQL was decompressing the large decision JSON
+payload for every eligible row before applying the outer limit.  The query is
+now two-stage: it first selects a bounded, ordered set of decision IDs, then
+joins that bounded set to load only the fields needed by the contract validator.
+The online `EXPLAIN ANALYZE`/service measurement improved the decision read from
+about 20.95 seconds to about 4.10 seconds, while preserving the same validation
+semantics.  A regression test asserts that the bounded ID query and its limit
+remain in place.
+
+The focused regression for the complete change passes `60 tests`.  The isolated
+full online regression is rerun after the final deployment with an explicit
+pytest root outside the production symlink, so production `.env` and source
+discovery cannot contaminate the result.  The new deployment still requires a
+fresh 24-hour online continuity, coverage, expert-call, training-heartbeat and
+audit observation before final acceptance; no model-quality or OKX safety gate
+is bypassed to increase order count.
+
+### 7.16 Clean online regression and current acceptance state (2026-08-22)
+
+本轮按照“先完成整改、再测试”的顺序完成了最终验证：
+
+- 本地全量回归：`3538 passed, 4 skipped`；没有
+  `PytestUnhandledThreadExceptionWarning`，仅保留第三方 `StarletteDeprecationWarning`。
+- 线上全新隔离目录全量回归：`3542 passed`，退出码为 0；隔离目录位于生产源码和生产 `.env` 之外，排除了环境污染，未发现业务失败、线程回调异常或测试超时。
+- 线上最新只读 OKX 对账：`status=ok`，`can_open_new_entries=true`、`can_refresh_training=true`，未解决项、人工复核项和可修复项均为 0。
+- 线上执行合同审计：`report_available=true`、`status=ok`，合同违规数为 0；审计耗时约 4 秒，未再出现“超时被误判为字段缺失”。
+- 线上服务复核：交易服务、Dashboard 和模型隧道均正常运行；本轮验证没有改动线上交易数据，也没有绕过 OKX、训练或模型质量门禁。
+
+上述结果证明本轮代码和部署已通过即时功能验收。计划中的“连续运行 24--48 小时无超时、重复任务、服务假死，并覆盖训练心跳、轮次连续性、动态退出合同和系统审计”仍是时间性观察项，必须从本次部署时间起完成后，才能将本方案标记为最终全部验收通过。当前模型质量门禁仍保持原状态，不因测试通过而强行开仓。
+
+### 7.17 后台异步任务生命周期闭环与正式同步验收（2026-08-22）
+
+本轮继续追查线上隔离回归中残留的 `aiosqlite` 线程回调异常，确认不是业务断言失败，而是两个后台刷新链路在测试事件循环关闭后仍持有数据库工作：行情快照持久化任务，以及策略上下文的绩效/学习刷新任务。整改已落到生产生命周期边界：
+
+- `DataService` 只有在 `start()` 后才接受行情持久化回调，并登记所有持久化任务；`stop()` 会取消、等待并清空任务集合。
+- `TradingService.stop()` 在关闭数据库和模型客户端前，统一取消并等待策略上下文绩效刷新、学习上下文刷新任务。
+- 测试夹具在每个异步测试结束时先取消当前循环中残留的测试任务，再释放共享数据库引擎；新增回归测试锁定策略上下文任务必须被回收。
+
+本地全量回归通过 `3539 passed, 4 skipped, 1 warning`；线上全新隔离目录使用严格门禁 `-W error::pytest.PytestUnhandledThreadExceptionWarning` 回归通过 `3543 passed, 1 warning`。两端仅保留第三方 `StarletteDeprecationWarning`，没有 `PytestUnhandledThreadExceptionWarning`、`Event loop is closed`、业务断言失败或测试超时。诊断探针确认 SQLite worker 只在真实数据库连接期间短暂存在，并在事件循环关闭前确定性退出，不再残留线程回调异常。
+
+Phase 3 正式维护同步为订单事实同步配置独立的 60 秒上限，实时交易默认超时没有被放宽。线上正式同步全部阶段完成，`deferred_stages=[]`、`error=null`、`okx_pull_available=true`；最新对账未解决项为 0，`can_open_new_entries=true`、`can_refresh_training=true`。对账总状态仍为 `warning`，仅因为两项信息级历史残留和方向集中度处于观察态；它们不要求人工处理、不阻断开仓或训练，也没有被伪装成 `ok`。
+
+最终线上即时健康检查确认交易服务、Dashboard、模型隧道和每日对账 timer 均为 active/enabled，最近 10 分钟没有 hard deadline、traceback、unhandled、`Timeout opening channel`、`RemoteProtocolError` 或 transport-draining 日志。执行合同最近窗口违规数为 0，训练调度状态为 `ok`、心跳未过期、模型运行时和工件均可用。当前没有新增开仓的直接原因仍是模型费后平均收益、收益下界和 profit factor 未通过质量门禁，不是 OKX、后台任务、轮次调度或模型隧道故障；这些质量门禁没有被人为放宽。
+
+这仍不替代计划要求的连续 24--48 小时观察。观察期间模型质量门禁、OKX 对账门禁和训练调度门禁继续按合同执行，不通过人为放宽阈值来制造开仓数量。

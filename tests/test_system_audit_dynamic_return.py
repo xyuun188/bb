@@ -388,3 +388,82 @@ async def test_strategy_closed_loop_is_critical_for_execution_contract_gap(
     assert card["status"] == "critical"
     assert card["details"]["audit_only"] is True
     assert "live_mutation" not in card["details"]
+
+
+@pytest.mark.asyncio
+async def test_trade_execution_contract_timeout_is_explicitly_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimeoutService:
+        async def report(self, **_kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("contract query exceeded deadline")
+
+    monkeypatch.setattr(system_audit, "TradeExecutionContractService", TimeoutService)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_cache", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_task", None)
+
+    card = await system_audit._trade_execution_contract_audit()
+
+    assert card["status"] == "warning"
+    assert card["details"]["report_available"] is False
+    assert card["details"]["timeout"] is True
+    assert card["details"]["summary"] == {}
+
+
+@pytest.mark.asyncio
+async def test_strategy_closed_loop_does_not_turn_contract_timeout_into_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRootService:
+        async def report(self) -> dict[str, Any]:
+            return {"live_ml_blocked_count": 0}
+
+    class TimeoutService:
+        async def report(self, **_kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("contract query exceeded deadline")
+
+    monkeypatch.setattr(system_audit, "StrategySignalRootCauseAuditService", FakeRootService)
+    monkeypatch.setattr(system_audit, "TradeExecutionContractService", TimeoutService)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_cache", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_task", None)
+
+    card = await system_audit._strategy_closed_loop_audit()
+
+    assert card["status"] == "warning"
+    assert card["details"]["report_available"] is False
+    assert card["details"]["timeout"] is True
+
+
+@pytest.mark.asyncio
+async def test_trade_execution_contract_report_is_shared_across_audit_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class FakeRootService:
+        async def report(self) -> dict[str, Any]:
+            return {"live_ml_blocked_count": 0}
+
+    class FakeContractService:
+        async def report(self, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {
+                "summary": {
+                    "contract_violation_count": 0,
+                    "entry_authoritative_fill_sync_pending_count": 0,
+                    "realized_net_pnl_usdt": 0.0,
+                }
+            }
+
+    monkeypatch.setattr(system_audit, "TradeExecutionContractService", FakeContractService)
+    monkeypatch.setattr(system_audit, "StrategySignalRootCauseAuditService", FakeRootService)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_cache", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_task", None)
+
+    contract_card = await system_audit._trade_execution_contract_audit()
+    closed_loop_card = await system_audit._strategy_closed_loop_audit()
+
+    assert contract_card["details"]["report_available"] is True
+    assert closed_loop_card["status"] == "ok"
+    assert calls == 1

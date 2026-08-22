@@ -48,6 +48,7 @@ from services.okx_order_fact_sync import (  # noqa: E402
 )
 
 PHASE3_CLEAN_SNAPSHOT_DATE = "2026-06-28"
+PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS = 60.0
 BEIJING_TZ = timezone(timedelta(hours=8))
 logger = logging.getLogger(__name__)
 OKX_ORDER_RECOVERY_ISSUE_KINDS = frozenset(
@@ -159,7 +160,10 @@ async def run(
             if reset_local_cache:
                 cleanup_result = await _cleanup_phase3_local_okx_cache(mode=mode)
             equity_snapshot_result = await _sync_okx_equity_snapshot(mode=mode)
-            sync_kwargs: dict[str, Any] = {"mode": mode}
+            sync_kwargs: dict[str, Any] = {
+                "mode": mode,
+                "timeout_seconds": PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS,
+            }
             if recovery_order_ids:
                 sync_kwargs["recovery_order_ids"] = recovery_order_ids
             sync_result = await OkxOrderFactSyncService(**sync_kwargs).sync()

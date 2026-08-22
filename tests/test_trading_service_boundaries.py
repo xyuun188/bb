@@ -6775,6 +6775,29 @@ def test_training_subprocess_uses_lower_cpu_priority_on_linux() -> None:
     assert unchanged == command
 
 
+@pytest.mark.asyncio
+async def test_stop_cancels_strategy_context_refresh_tasks() -> None:
+    service = TradingService.__new__(TradingService)
+    release = asyncio.Event()
+
+    async def blocked_refresh() -> None:
+        await release.wait()
+
+    performance_task = asyncio.create_task(blocked_refresh())
+    learning_task = asyncio.create_task(blocked_refresh())
+    service._strategy_context_performance_refresh_task_store = {
+        "paper": performance_task
+    }
+    service._strategy_learning_context_refresh_tasks = {"paper": learning_task}
+
+    await service._stop_strategy_context_background_tasks()
+
+    assert performance_task.cancelled()
+    assert learning_task.cancelled()
+    assert service._strategy_context_performance_refresh_task_store == {}
+    assert service._strategy_learning_context_refresh_tasks == {}
+
+
 def test_training_subprocess_environment_bounds_native_thread_pools() -> None:
     env = trading_service._training_process_env({"PATH": "test"})
 

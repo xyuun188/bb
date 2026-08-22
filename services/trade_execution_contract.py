@@ -117,6 +117,20 @@ class TradeExecutionContractService:
         since_naive = since_utc.replace(tzinfo=None)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
+            # Select the bounded decision id window before reading JSON payloads.
+            # PostgreSQL otherwise has to decompress every eligible decision in
+            # the time window before applying the LIMIT, which made this
+            # read-only audit exceed its deadline during a busy analysis day.
+            recent_decision_ids = (
+                select(AIDecision.id)
+                .where(
+                    AIDecision.created_at >= since_naive,
+                    AIDecision.decision_learning_snapshot_version >= 1,
+                )
+                .order_by(AIDecision.id.desc())
+                .limit(capped_limit)
+                .subquery()
+            )
             decisions = [
                 _decision_report_projection(row)
                 for row in (
@@ -133,33 +147,53 @@ class TradeExecutionContractService:
                                 "execution_reconciliations"
                             ].label("execution_reconciliations"),
                         )
-                        .where(
-                            AIDecision.created_at >= since_naive,
-                            AIDecision.decision_learning_snapshot_version >= 1,
+                        .join(
+                            recent_decision_ids,
+                            recent_decision_ids.c.id == AIDecision.id,
                         )
                         .order_by(AIDecision.id.desc())
+                    )
+                )
+                .mappings()
+                .all()
+            ]
+            # The contract validator only needs a narrow, immutable projection.
+            # Loading full ORM rows (especially JSON blobs) made this read-only
+            # audit contend with the trading loop and occasionally exceed its
+            # section deadline.
+            orders = [
+                dict(row)
+                for row in (
+                    await session.execute(
+                        select(
+                            Order.decision_id,
+                            Order.status,
+                            Order.quantity,
+                            Order.price,
+                            Order.exchange_order_id,
+                            Order.filled_at,
+                            Order.created_at,
+                            Order.okx_fill_contracts,
+                            Order.okx_sync_status,
+                            Order.okx_raw_fills,
+                        )
+                        .where(Order.created_at >= since_naive)
+                        .order_by(Order.id.desc())
                         .limit(capped_limit)
                     )
                 )
                 .mappings()
                 .all()
             ]
-            orders = list(
-                (
+            positions = [
+                dict(row)
+                for row in (
                     await session.execute(
-                        select(Order)
-                        .where(Order.created_at >= since_naive)
-                        .order_by(Order.id.desc())
-                        .limit(capped_limit)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            positions = list(
-                (
-                    await session.execute(
-                        select(Position)
+                        select(
+                            Position.side,
+                            Position.realized_pnl,
+                            Position.closed_at,
+                        )
                         .where(
                             or_(
                                 Position.created_at >= since_naive,
@@ -170,9 +204,9 @@ class TradeExecutionContractService:
                         .limit(capped_limit)
                     )
                 )
-                .scalars()
+                .mappings()
                 .all()
-            )
+            ]
         report = summarize_trade_execution_contract(
             decisions,
             orders=orders,

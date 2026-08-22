@@ -90,6 +90,25 @@ def test_phase3_go_no_go_rejects_executed_contract_violations() -> None:
     assert "dynamic_return_contract_current_violations" in report["blocker_codes"]
 
 
+def test_phase3_go_no_go_keeps_unavailable_contract_audit_as_one_blocker() -> None:
+    cards = deepcopy(_cards())
+    trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+    trade["status"] = "warning"
+    trade["details"] = {
+        "report_available": False,
+        "error": "isolated report exceeded 20 seconds",
+        "error_type": "TimeoutError",
+        "timeout": True,
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is False
+    assert report["blocker_codes"] == ["dynamic_return_contract_unavailable"]
+    assert "dynamic_return_contract_policy_incomplete" not in report["blocker_codes"]
+    assert "dynamic_return_contract_current_violations" not in report["blocker_codes"]
+
+
 def test_phase3_go_no_go_rejects_position_economics_or_exit_gaps() -> None:
     cards = deepcopy(_cards())
     capacity = next(card for card in cards if card["key"] == "position_capacity_release")
