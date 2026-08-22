@@ -138,7 +138,8 @@ def parse_exchange_position_snapshot(
 ) -> dict[str, Any] | None:
     if not ExchangePositionStatePolicy.is_open(position):
         return None
-    info = position.get("info") or {}
+    raw_info = position.get("info")
+    info = raw_info if isinstance(raw_info, dict) else {}
     symbol = symbol_normalizer(info.get("instId") or position.get("symbol"))
     raw_pos_value = (
         info.get("pos")
@@ -348,7 +349,8 @@ class ExchangePositionStatePolicy:
 
     @staticmethod
     def is_open(position: dict[str, Any]) -> bool:
-        info = position.get("info") or {}
+        raw_info = position.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
         raw_size = (
             position.get("contracts")
             or position.get("size")

@@ -208,6 +208,151 @@ async def test_position_review_decision_service_returns_none_when_model_missing(
     assert await service.decide(_request("missing_model")) is None
 
 
+def test_position_consultation_reuse_key_changes_with_lifecycle_and_funding_state() -> None:
+    first = _request()
+    first_position = {
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "position_id": 101,
+        "entry_price": 100.0,
+        "current_price": 100.1,
+        "unrealized_pnl": 1.0,
+        "funding_fee": 0.5,
+    }
+    second_position = dict(first_position, position_id=102, funding_fee=1.5)
+    first = replace(first, open_positions=[first_position])
+    second = replace(first, open_positions=[second_position])
+
+    first_key = PositionReviewDecisionService._consultation_reuse_key(first)
+    second_key = PositionReviewDecisionService._consultation_reuse_key(second)
+
+    assert first_key != second_key
+
+
+def test_position_consultation_reuse_key_normalizes_ccxt_swap_symbol() -> None:
+    request = replace(
+        _request(),
+        open_positions=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "posId": "ccxt-lifecycle-1",
+                "entry_price": 100.0,
+                "current_price": 100.2,
+            }
+        ],
+    )
+
+    key = PositionReviewDecisionService._consultation_reuse_key(request)
+
+    assert key
+    assert "ccxt-lifecycle-1" not in key
+
+
+def test_position_consultation_reuse_key_is_disabled_without_matching_position() -> None:
+    request = replace(
+        _request(),
+        open_positions=[{"symbol": "ETH/USDT", "posId": "other-lifecycle"}],
+    )
+
+    assert PositionReviewDecisionService._consultation_reuse_key(request) == ""
+
+
+def test_position_consultation_reuse_key_handles_malformed_info_and_nested_funding() -> None:
+    request = replace(
+        _request(),
+        open_positions=[
+            {
+                "symbol": "BTC/USDT",
+                "position_id": "lifecycle-1",
+                "funding_fee": 0.5,
+                "info": "malformed-okx-payload",
+                "current_management_contract": {
+                    "settled_funding_fee": 0.75,
+                    "position_notional_usdt": 120.0,
+                },
+            }
+        ],
+        market_regime_context={"regime": object()},
+    )
+
+    key = PositionReviewDecisionService._consultation_reuse_key(request)
+
+    assert key
+
+
+def test_position_consultation_reuse_key_is_disabled_for_empty_request_symbol() -> None:
+    request = replace(
+        _request(),
+        symbol="",
+        normalized_symbol="",
+        open_positions=[{"symbol": "BTC/USDT", "position_id": "lifecycle-1"}],
+    )
+
+    assert PositionReviewDecisionService._consultation_reuse_key(request) == ""
+
+
+def test_position_consultation_reuse_key_covers_all_matching_okx_lifecycles() -> None:
+    base = {
+        "symbol": "BTC-USDT-SWAP",
+        "info": {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "okx-1",
+            "posSide": "long",
+            "pos": "2",
+            "avgPx": "100",
+            "markPx": "101",
+            "upl": "2",
+        },
+    }
+    second = {
+        "symbol": "BTC/USDT:USDT",
+        "info": {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "okx-2",
+            "posSide": "short",
+            "pos": "1",
+            "avgPx": "100",
+            "markPx": "99",
+            "upl": "1",
+        },
+    }
+    request = replace(_request(), open_positions=[base, second])
+    first_key = PositionReviewDecisionService._consultation_reuse_key(request)
+
+    changed_second = dict(second, info=dict(second["info"], posId="okx-2-reopened"))
+    changed_request = replace(request, open_positions=[base, changed_second])
+
+    assert first_key != PositionReviewDecisionService._consultation_reuse_key(changed_request)
+
+
+def test_position_consultation_reuse_key_ignores_micro_price_ticks() -> None:
+    position = {
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "position_id": "lifecycle-1",
+        "entry_price": 100.0,
+        "current_price": 100.0,
+        "unrealized_pnl": 1.0,
+    }
+    request = replace(_request(), open_positions=[position])
+    micro_tick = replace(
+        request,
+        open_positions=[dict(position, current_price=100.01, unrealized_pnl=1.01, info={"uTime": "tick-2"})],
+    )
+    material_move = replace(
+        request,
+        open_positions=[dict(position, current_price=100.5)],
+    )
+
+    assert PositionReviewDecisionService._consultation_reuse_key(request) == (
+        PositionReviewDecisionService._consultation_reuse_key(micro_tick)
+    )
+    assert PositionReviewDecisionService._consultation_reuse_key(request) != (
+        PositionReviewDecisionService._consultation_reuse_key(material_move)
+    )
+
+
 async def _async_dict(value: dict[str, Any]) -> dict[str, Any]:
     return value
 

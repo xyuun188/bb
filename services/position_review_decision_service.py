@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -180,6 +183,8 @@ class PositionReviewDecisionService:
             "position_profit_peak": request.position_profit_peak_context,
             "stronger_opportunity": request.stronger_opportunity_context,
         }
+        context["_consultation_reuse_key"] = self._consultation_reuse_key(request)
+        context["_consultation_reuse_ttl_seconds"] = 120.0
         if request.analysis_deadline_monotonic is not None:
             context.update(
                 {
@@ -189,6 +194,279 @@ class PositionReviewDecisionService:
                 }
             )
         return context
+
+    @staticmethod
+    def _consultation_reuse_key(request: PositionReviewDecisionRequest) -> str:
+        """Build a short-lived fingerprint for one position lifecycle state.
+
+        The key deliberately contains lifecycle identity and fee/PnL state so a
+        changed position cannot reuse a stale arbitration result. Prices are
+        bucketed to avoid invalidating the result on every tiny tick.
+        """
+
+        def number(value: Any, default: float = 0.0) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if math.isfinite(parsed) else default
+
+        def bucket_price(value: Any) -> float:
+            price = number(value)
+            if price <= 0:
+                return 0.0
+            # Use logarithmic buckets so the boundary is a true percentage
+            # band.  Deriving the step from the same price would make
+            # ``price / step`` constant and would silently disable bucketing.
+            log_step = math.log1p(0.0025)
+            bucket = round(math.log(price) / log_step)
+            return round(math.exp(bucket * log_step), 12)
+
+        def bucket_amount(value: Any, step: float) -> float:
+            amount = number(value)
+            if step <= 0:
+                return round(amount, 8)
+            return round(round(amount / step) * step, 8)
+
+        def normalize_symbol(value: Any) -> str:
+            text = str(value or "").upper().strip()
+            if not text:
+                return ""
+            # CCXT may expose swap symbols as ``BTC/USDT:USDT`` while OKX
+            # native records use ``BTC-USDT-SWAP``.  The suffix is a contract
+            # namespace, not a different position lifecycle.
+            text = text.split(":", 1)[0]
+            text = text.replace("-SWAP", "")
+            text = text.replace("-", "/")
+            return text
+
+        normalized = normalize_symbol(request.normalized_symbol or request.symbol)
+        if not normalized:
+            return ""
+
+        candidates: list[dict[str, Any]] = []
+        for item in request.open_positions:
+            if not isinstance(item, dict):
+                continue
+            raw_info = item.get("info")
+            info = raw_info if isinstance(raw_info, dict) else {}
+            candidate_symbols = {
+                normalize_symbol(value)
+                for value in (
+                    item.get("symbol"),
+                    item.get("instId"),
+                    item.get("instrument_id"),
+                    info.get("instId"),
+                )
+            }
+            candidate_symbols.discard("")
+            if normalized in candidate_symbols:
+                candidates.append(item)
+        # A position review without an authoritative matching position must
+        # not reuse another lifecycle's arbitration result.  It can still run
+        # a fresh consultation; only the short-lived cache is disabled.
+        if not candidates:
+            return ""
+
+        def field(
+            position: dict[str, Any],
+            info: dict[str, Any],
+            management: dict[str, Any],
+            *names: str,
+        ) -> Any:
+            for name in names:
+                value = position.get(name)
+                if value not in (None, ""):
+                    return value
+                value = info.get(name)
+                if value not in (None, ""):
+                    return value
+                value = management.get(name)
+                if value not in (None, ""):
+                    return value
+            return None
+
+        position_states: list[dict[str, Any]] = []
+        for position in candidates:
+            raw_info = position.get("info")
+            info = raw_info if isinstance(raw_info, dict) else {}
+            raw_management = position.get("current_management_contract")
+            management = raw_management if isinstance(raw_management, dict) else {}
+            lifecycle = {
+                key: field(position, info, management, key)
+                for key in (
+                    "lifecycle_id",
+                    "position_id",
+                    "local_position_id",
+                    "id",
+                    "pos_id",
+                    "posId",
+                    "okx_pos_id",
+                    "okx_inst_id",
+                    "open_time",
+                    "opened_at",
+                    "created_at",
+                    "entry_time",
+                    "open_order_id",
+                    "entry_exchange_order_id",
+                    "cTime",
+                )
+                if field(position, info, management, key) not in (None, "")
+            }
+            position_states.append(
+                {
+                    "side": str(
+                        field(position, info, management, "side", "posSide") or ""
+                    ).lower(),
+                    "lifecycle": lifecycle,
+                    "quantity": number(
+                        field(position, info, management, "quantity", "base_quantity", "qty")
+                    ),
+                    "contracts": number(
+                        field(position, info, management, "contracts", "pos", "size")
+                    ),
+                    "contract_size": number(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "contract_size",
+                            "contractSize",
+                            "ctVal",
+                        )
+                    ),
+                    "entry_price": bucket_price(
+                        field(position, info, management, "entry_price", "entryPrice", "avgPx")
+                    ),
+                    "current_price": bucket_price(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "current_price",
+                            "mark_price",
+                            "markPrice",
+                            "markPx",
+                        )
+                    ),
+                    # Money values are grouped into material bands so a tiny
+                    # mark-price tick does not trigger a fresh deep consultation.
+                    "unrealized_pnl": bucket_amount(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "unrealized_pnl",
+                            "unrealized_pnl_usdt",
+                            "unrealizedPnl",
+                            "upl",
+                        ),
+                        0.05,
+                    ),
+                    "funding_fee": bucket_amount(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "funding_fee",
+                            "funding_fee_amount",
+                            "funding_fee_usdt",
+                            "settled_funding_fee",
+                        ),
+                        0.01,
+                    ),
+                    "expected_future_funding": bucket_amount(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "expected_future_funding_cashflow",
+                        ),
+                        0.01,
+                    ),
+                    "fee": bucket_amount(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "fee",
+                            "fees",
+                            "entry_fee",
+                            "entry_fee_usdt",
+                        ),
+                        0.01,
+                    ),
+                    "funding_evidence": {
+                        key: field(position, info, management, key)
+                        for key in (
+                            "funding_fee_source",
+                            "funding_bill_count",
+                            "funding_evidence_complete",
+                            "funding_evidence_eligible",
+                            "funding_evidence_status",
+                            "settled_funding_evidence_status",
+                            "next_funding_time",
+                        )
+                        if field(position, info, management, key) not in (None, "")
+                    },
+                    "notional": bucket_amount(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "notional",
+                            "notional_usd",
+                            "notional_usdt",
+                            "position_notional_usdt",
+                            "position_value_usdt",
+                            "notionalUsd",
+                        ),
+                        0.10,
+                    ),
+                    "liquidation_price": bucket_price(
+                        field(
+                            position,
+                            info,
+                            management,
+                            "liquidation_price",
+                            "liquidationPrice",
+                            "liqPx",
+                        )
+                    ),
+                }
+            )
+        position_states.sort(
+            key=lambda state: json.dumps(
+                state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+        state = {
+            "symbol": normalized,
+            # Include every matching lifecycle (including hedged long/short
+            # rows) so a change to any authoritative OKX row invalidates the
+            # short-lived consultation reuse.
+            "positions": position_states,
+            "feature": {
+                "current_price": bucket_price(getattr(request.feature_vector, "current_price", 0.0)),
+                "funding_rate": round(number(getattr(request.feature_vector, "funding_rate", 0.0)), 8),
+                "volatility_20": round(number(getattr(request.feature_vector, "volatility_20", 0.0)), 6),
+                "atr_14": round(number(getattr(request.feature_vector, "atr_14", 0.0)), 8),
+            },
+            "market_regime": request.market_regime_context,
+            "strategy_mode": request.strategy_mode_context,
+        }
+        payload = json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _single_model_context(

@@ -541,6 +541,29 @@ async def test_feature_vector_timeout_does_not_wait_for_stubborn_source_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_completed_snapshot_failure_is_consumed_during_outer_cancellation() -> None:
+    loop = asyncio.get_running_loop()
+    unhandled_contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled_contexts.append(context))
+
+    async def fail_after_parent_started() -> None:
+        raise TimeoutError("snapshot source timeout")
+
+    try:
+        task = asyncio.create_task(fail_after_parent_started())
+        await asyncio.sleep(0)
+        assert task.done()
+
+        data_service_module._cancel_and_consume_task_result(task)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert unhandled_contexts == []
+
+
+@pytest.mark.asyncio
 async def test_feature_vector_fetches_sentiment_concurrently_with_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

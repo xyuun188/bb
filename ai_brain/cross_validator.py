@@ -9,6 +9,7 @@ uses the configured trend expert model to arbitrate major conflicts.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import time
@@ -152,8 +153,114 @@ def _message_content_text(response: Any) -> str:
     return _strip_qwen_thinking(str(content or ""))
 
 
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Consume a cancelled/expired task so its late exception is never logged."""
+
+    try:
+        task.result()
+    except BaseException:
+        return
+
+
+async def _await_hard_deadline(awaitable: Any, timeout_seconds: float) -> Any:
+    """Await an operation to a hard deadline without wait_for cancellation races."""
+
+    task = asyncio.create_task(awaitable)
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=max(float(timeout_seconds), 0.0),
+        )
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(_consume_task_result)
+        raise
+    if not done:
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(_consume_task_result)
+        raise TimeoutError
+    return task.result()
+
+
 class CrossValidator:
     """Build and evaluate cross-checks requested by expert models."""
+
+    def __init__(self) -> None:
+        self._completed_consultation_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _consultation_cache_key(
+        self,
+        opinions: dict[str, DecisionOutput],
+        major_conflicts: list[dict[str, Any]],
+        timing_context: dict[str, Any] | None,
+    ) -> str | None:
+        if not isinstance(timing_context, dict):
+            return None
+        reuse_key = str(timing_context.get("_consultation_reuse_key") or "").strip()
+        if not reuse_key:
+            return None
+        compact_opinions = {
+            name: {
+                "action": getattr(decision.action, "value", str(decision.action)),
+                "confidence": round(float(decision.confidence or 0.0), 2),
+            }
+            for name, decision in sorted(opinions.items())
+            if isinstance(decision, DecisionOutput)
+        }
+        compact_conflicts = [self._compact_conflict(item) for item in major_conflicts]
+        return json.dumps(
+            {"reuse_key": reuse_key, "opinions": compact_opinions, "conflicts": compact_conflicts},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _get_cached_consultation(
+        self,
+        key: str | None,
+        *,
+        ttl_seconds: float | None = None,
+    ) -> dict[str, Any] | None:
+        if not key:
+            return None
+        now = time.monotonic()
+        cached = self._completed_consultation_cache.get(key)
+        if cached is None:
+            return None
+        cached_at, result = cached
+        age = max(now - cached_at, 0.0)
+        configured_ttl = (
+            float(ttl_seconds)
+            if ttl_seconds is not None
+            else float(settings.ai_decision_maker_timeout_seconds or 20.0) * 6.0
+        )
+        ttl = max(
+            configured_ttl,
+            1.0,
+        )
+        if age > ttl:
+            self._completed_consultation_cache.pop(key, None)
+            return None
+        reused = copy.deepcopy(result)
+        reused["reused"] = True
+        reused["invocation_status"] = "reused"
+        reused["reuse_age_seconds"] = round(age, 3)
+        reused["consultation_attempts"] = []
+        return reused
+
+    def _cache_completed_consultation(self, key: str | None, result: dict[str, Any] | None) -> None:
+        if not key or not isinstance(result, dict) or result.get("status") != "completed":
+            return
+        self._completed_consultation_cache[key] = (time.monotonic(), copy.deepcopy(result))
+        if len(self._completed_consultation_cache) > 256:
+            oldest = sorted(
+                self._completed_consultation_cache.items(),
+                key=lambda item: item[1][0],
+            )[: max(len(self._completed_consultation_cache) - 256, 1)]
+            for old_key, _ in oldest:
+                self._completed_consultation_cache.pop(old_key, None)
 
     async def validate_all(
         self,
@@ -256,6 +363,19 @@ class CrossValidator:
         consultation_started_at = datetime.now(UTC)
         consultation_perf_started = time.perf_counter()
         major_conflicts = [v for v in validations if v.get("major_conflict")]
+        consultation_cache_key = self._consultation_cache_key(
+            opinions,
+            major_conflicts,
+            timing_context,
+        )
+        cached_consultation = self._get_cached_consultation(
+            consultation_cache_key,
+            ttl_seconds=(
+                timing_context.get("_consultation_reuse_ttl_seconds")
+                if isinstance(timing_context, dict)
+                else None
+            ),
+        )
         consultation_timeout = _consultation_budget_seconds()
         analysis_deadline = None
         if isinstance(timing_context, dict):
@@ -276,66 +396,67 @@ class CrossValidator:
                 consultation_timeout,
                 max(remaining_analysis_seconds - 0.25, 0.0),
             )
-        try:
-            if major_conflicts and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS:
-                consultation = self._fallback_consultation(
-                    major_conflicts,
-                    "deadline",
-                    "分析剩余预算不足以启动完整会诊",
-                    status="skipped",
-                    reason_code="analysis_deadline_budget_exhausted",
+        if cached_consultation is not None:
+            consultation = cached_consultation
+        else:
+            try:
+                if major_conflicts and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS:
+                    consultation = self._fallback_consultation(
+                        major_conflicts,
+                        "deadline",
+                        "分析剩余预算不足以启动完整会诊",
+                        status="skipped",
+                        reason_code="analysis_deadline_budget_exhausted",
+                    )
+                else:
+                    consultation = await _await_hard_deadline(
+                        self.consult_if_needed(
+                            opinions,
+                            validations,
+                            timeout_seconds=consultation_timeout,
+                            capacity_context={
+                                "_analysis_budget_scope": (
+                                    timing_context.get("_analysis_budget_scope", "shared")
+                                    if isinstance(timing_context, dict)
+                                    else "shared"
+                                )
+                            },
+                        ),
+                        max(consultation_timeout, 0.1),
+                    )
+            except TimeoutError:
+                # ``_await_hard_deadline`` expires at the analysis deadline
+                # without leaving a late task exception behind.
+                deadline_exhausted = bool(
+                    analysis_deadline
+                    and analysis_deadline > 0
+                    and analysis_deadline - asyncio.get_running_loop().time() <= 0.5
                 )
-            else:
-                consultation = await asyncio.wait_for(
-                    self.consult_if_needed(
-                        opinions,
-                        validations,
-                        timeout_seconds=consultation_timeout,
-                        capacity_context={
-                            "_analysis_budget_scope": (
-                                timing_context.get("_analysis_budget_scope", "shared")
-                                if isinstance(timing_context, dict)
-                                else "shared"
-                            )
-                        },
-                    ),
-                    timeout=max(consultation_timeout, 0.1),
-                )
-        except TimeoutError:
-            # ``asyncio.wait_for`` can expire at the analysis deadline before
-            # ``consult_if_needed`` gets a chance to return its own fallback.
-            # When no complete consultation window remains this is a planning
-            # skip, not a model/service failure.  Keep real call timeouts as
-            # failures so the runtime and quality contracts remain truthful.
-            deadline_exhausted = bool(
-                analysis_deadline
-                and analysis_deadline > 0
-                and analysis_deadline - asyncio.get_running_loop().time() <= 0.5
-            )
-            if deadline_exhausted:
-                logger.info(
-                    "deep consultation skipped after analysis deadline budget was exhausted",
-                    timeout=consultation_timeout,
-                    major_conflicts=len(major_conflicts),
-                )
-                consultation = self._fallback_consultation(
-                    major_conflicts,
-                    "deadline",
-                    "分析剩余预算不足以完成完整会诊",
-                    status="skipped",
-                    reason_code="analysis_deadline_budget_exhausted",
-                )
-            else:
-                logger.warning(
-                    "deep consultation timed out; using fallback",
-                    timeout=consultation_timeout,
-                    major_conflicts=len(major_conflicts),
-                )
-                consultation = self._fallback_consultation(
-                    major_conflicts,
-                    "timeout",
-                    f"深度会诊超过 {consultation_timeout:.0f} 秒未返回",
-                )
+                if deadline_exhausted:
+                    logger.info(
+                        "deep consultation skipped after analysis deadline budget was exhausted",
+                        timeout=consultation_timeout,
+                        major_conflicts=len(major_conflicts),
+                    )
+                    consultation = self._fallback_consultation(
+                        major_conflicts,
+                        "deadline",
+                        "分析剩余预算不足以完成完整会诊",
+                        status="skipped",
+                        reason_code="analysis_deadline_budget_exhausted",
+                    )
+                else:
+                    logger.warning(
+                        "deep consultation timed out; using fallback",
+                        timeout=consultation_timeout,
+                        major_conflicts=len(major_conflicts),
+                    )
+                    consultation = self._fallback_consultation(
+                        major_conflicts,
+                        "timeout",
+                        f"深度会诊超过 {consultation_timeout:.0f} 秒未返回",
+                    )
+        self._cache_completed_consultation(consultation_cache_key, consultation)
         consultation_duration = round(time.perf_counter() - consultation_perf_started, 3)
         if timing_context is not None:
             timing_context["_consultation_timing"] = {
@@ -351,7 +472,9 @@ class CrossValidator:
                 "triggered": bool(
                     consultation
                     and str(consultation.get("status") or "").lower() != "skipped"
+                    and not consultation.get("reused")
                 ),
+                "reused": bool(consultation and consultation.get("reused")),
                 "major_conflicts": sum(1 for v in validations if v.get("major_conflict")),
                 "remaining_analysis_seconds": (
                     round(remaining_analysis_seconds, 3)
@@ -723,15 +846,13 @@ class CrossValidator:
             f"consultation:{original_scope}"
         )
         shared_slot = shared_llm_capacity_slot(shared_capacity_context)
-        shared_acquired = False
         try:
-            await asyncio.wait_for(
-                shared_slot.__aenter__(),
-                timeout=queue_timeout,
-            )
-            shared_acquired = True
+            async with asyncio.timeout(queue_timeout):
+                await shared_slot.__aenter__()
         except TimeoutError as exc:
             queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
+            if getattr(shared_slot, "_acquired", False):
+                await shared_slot.__aexit__(None, None, None)
             if runtime_metrics is not None:
                 runtime_metrics.update(
                     {
@@ -743,17 +864,20 @@ class CrossValidator:
                 )
             raise ConsultationQueueTimeoutError(queue_wait_seconds) from exc
         except BaseException:
-            if shared_acquired:
+            if getattr(shared_slot, "_acquired", False):
                 await shared_slot.__aexit__(None, None, None)
             raise
 
         queue_wait_seconds = round(time.perf_counter() - queue_wait_started, 3)
         inference_started = time.perf_counter()
         try:
-            response = await asyncio.wait_for(llm.ainvoke(invoke_messages), timeout=llm_timeout)
+            response = await _await_hard_deadline(
+                llm.ainvoke(invoke_messages),
+                timeout_seconds=llm_timeout,
+            )
         finally:
             inference_duration_seconds = round(time.perf_counter() - inference_started, 3)
-            if shared_acquired:
+            if getattr(shared_slot, "_acquired", False):
                 await shared_slot.__aexit__(None, None, None)
             if runtime_metrics is not None:
                 runtime_metrics.update(
@@ -843,13 +967,25 @@ class CrossValidator:
         ]
 
         attempts: list[dict[str, Any]] = []
+        skipped_candidates: list[dict[str, Any]] = []
         last_model = primary_model
         for candidate_index, candidate in enumerate(candidates):
             last_model = str(candidate.get("model") or last_model or "")
             max_attempts = min(max(int(candidate.get("retries") or 1), 1), 1)
             for attempt_no in range(1, max_attempts + 1):
                 remaining = deadline - time.perf_counter()
-                if remaining <= 0.5:
+                minimum_attempt_budget = (
+                    0.5 + _CONSULTATION_MIN_INFERENCE_SECONDS + 0.75
+                )
+                if remaining < minimum_attempt_budget:
+                    skipped_candidates.append(
+                        {
+                            "expert": candidate.get("name"),
+                            "model": candidate.get("model"),
+                            "reason": "insufficient_remaining_budget",
+                            "remaining_seconds": round(max(remaining, 0.0), 3),
+                        }
+                    )
                     break
                 runtime_metrics: dict[str, Any] = {}
                 try:
@@ -886,8 +1022,16 @@ class CrossValidator:
                         max(remaining - reserve - queue_timeout, 0.0),
                     )
                     if call_timeout <= 0.5:
+                        skipped_candidates.append(
+                            {
+                                "expert": candidate.get("name"),
+                                "model": candidate.get("model"),
+                                "reason": "insufficient_attempt_budget",
+                                "remaining_seconds": round(max(remaining, 0.0), 3),
+                            }
+                        )
                         break
-                    response, content = await asyncio.wait_for(
+                    response, content = await _await_hard_deadline(
                         self._invoke_consultation_model(
                             messages,
                             candidate,
@@ -896,7 +1040,7 @@ class CrossValidator:
                             runtime_metrics=runtime_metrics,
                             capacity_context=capacity_context,
                         ),
-                        timeout=min(remaining, call_timeout + queue_timeout + 0.1),
+                        min(remaining, call_timeout + queue_timeout + 0.1),
                     )
                     if not content:
                         attempts.append(
@@ -1014,6 +1158,24 @@ class CrossValidator:
                             runtime_metrics=runtime_metrics,
                         )
                     )
+                except TimeoutError as exc:
+                    error_text = safe_error_text(exc)
+                    logger.warning(
+                        "deep consultation model timed out",
+                        expert=candidate.get("name"),
+                        model=candidate.get("model"),
+                        attempt=attempt_no,
+                        **runtime_metrics,
+                    )
+                    attempts.append(
+                        self._consultation_attempt(
+                            candidate,
+                            attempt_no,
+                            "timeout",
+                            error_text,
+                            runtime_metrics=runtime_metrics,
+                        )
+                    )
                 except Exception as exc:
                     error_text = safe_error_text(exc)
                     logger.warning(
@@ -1035,19 +1197,21 @@ class CrossValidator:
             if deadline - time.perf_counter() <= 0.5:
                 break
 
-        if not attempts and deadline - time.perf_counter() <= 0.5:
+        if not attempts and skipped_candidates:
             return self._fallback_consultation(
                 major,
                 last_model or primary_model or "deadline",
                 "分析剩余预算不足以启动完整会诊",
                 status="skipped",
                 reason_code="analysis_deadline_budget_exhausted",
+                skipped_candidates=skipped_candidates,
             )
         return self._fallback_consultation(
             major,
             last_model or primary_model,
             "深度会诊多次尝试失败",
             attempts=attempts,
+            skipped_candidates=skipped_candidates,
         )
 
     def _compact_conflict(self, conflict: dict[str, Any]) -> dict[str, Any]:
@@ -1086,6 +1250,7 @@ class CrossValidator:
         attempts: list[dict[str, Any]] | None = None,
         status: str = "failed",
         reason_code: str | None = None,
+        skipped_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Return an observation-only failure record."""
         note = f"{reason}，重大分歧未能完成观察性复核。"
@@ -1099,6 +1264,7 @@ class CrossValidator:
             "production_permission": False,
             "major_conflicts": major,
             "consultation_attempts": attempts or [],
+            "skipped_candidates": skipped_candidates or [],
             "resolution_status": "unresolved",
             "resolved_action": "unclear",
             "resolved_conflict_pairs": [],

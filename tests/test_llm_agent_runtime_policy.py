@@ -78,6 +78,74 @@ async def test_position_waiter_gets_a_bounded_turn_during_market_backlog() -> No
     assert acquired_order == ["position", "market"]
 
 
+@pytest.mark.asyncio
+async def test_consultation_overflow_slot_is_released_after_context_exit() -> None:
+    capacity = _ScopedLLMCapacity(1)
+    holder = capacity.slot({"_analysis_budget_scope": "market:holder"})
+    await holder.__aenter__()
+
+    overflow = capacity.slot({"_analysis_budget_scope": "consultation:position_review"})
+    await overflow.__aenter__()
+    assert capacity._consultation_overflow_active is True
+    await overflow.__aexit__(None, None, None)
+    assert capacity._consultation_overflow_active is False
+
+    acquired = capacity.slot({"_analysis_budget_scope": "consultation:position_review"})
+    await acquired.__aenter__()
+    await acquired.__aexit__(None, None, None)
+    await holder.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_consultation_overflow_does_not_reduce_regular_capacity() -> None:
+    capacity = _ScopedLLMCapacity(2)
+    first = capacity.slot({"_analysis_budget_scope": "market:first"})
+    second = capacity.slot({"_analysis_budget_scope": "market:second"})
+    await first.__aenter__()
+    await second.__aenter__()
+
+    overflow = capacity.slot({"_analysis_budget_scope": "consultation:position_review"})
+    await overflow.__aenter__()
+    await first.__aexit__(None, None, None)
+
+    regular = capacity.slot({"_analysis_budget_scope": "market:replacement"})
+    await asyncio.wait_for(regular.__aenter__(), timeout=0.2)
+    assert capacity._active == 3
+
+    await regular.__aexit__(None, None, None)
+    await overflow.__aexit__(None, None, None)
+    await second.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_capacity_slot_release_completes_when_context_exit_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacity = _ScopedLLMCapacity(1)
+    slot = capacity.slot({"_analysis_budget_scope": "consultation:position_review"})
+    await slot.__aenter__()
+
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    original_release = capacity.release
+
+    async def delayed_release(token: str | None = None) -> None:
+        release_started.set()
+        await allow_release.wait()
+        await original_release(token)
+
+    monkeypatch.setattr(capacity, "release", delayed_release)
+    exit_task = asyncio.create_task(slot.__aexit__(None, None, None))
+    await release_started.wait()
+    exit_task.cancel()
+    allow_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await exit_task
+    assert capacity._active == 0
+    assert capacity._consultation_overflow_active is False
+
+
 def test_shadow_quant_model_is_visible_to_llm_analysis_without_live_permission() -> None:
     contract = standardized_return_distribution(
         side="long",

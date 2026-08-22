@@ -15,6 +15,26 @@ from services.exchange_position_state import (
 )
 
 
+def test_parse_position_treats_non_mapping_info_as_empty() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "long",
+            "contracts": 2.0,
+            "contractSize": 0.01,
+            "entryPrice": 100.0,
+            "markPrice": 101.0,
+            "info": "malformed-okx-payload",
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["symbol"] == "BTC/USDT"
+    assert snapshot["side"] == "long"
+    assert snapshot["contracts"] == pytest.approx(2.0)
+
+
 def test_parse_position_does_not_infer_contract_size_from_notional() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

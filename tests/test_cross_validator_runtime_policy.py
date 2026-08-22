@@ -7,8 +7,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 import ai_brain.cross_validator as cross_validator_module
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.cross_validator import (
-    ConsultationQueueTimeoutError,
     CrossValidator,
+    _await_hard_deadline,
     _is_local_qwen3_trade_model,
 )
 from ai_brain.llm_agent import shared_llm_capacity_slot
@@ -247,7 +247,7 @@ async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> No
                 "conflict_note": "方向冲突",
             }
         ],
-        timeout_seconds=1.0,
+        timeout_seconds=4.0,
     )
 
     assert result is not None
@@ -256,7 +256,7 @@ async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> No
     assert result["resolved_action"] == "hold"
     assert result["fallback_used"] is True
     assert [item["status"] for item in result["consultation_attempts"]] == [
-        "call_failed",
+        "timeout",
         "completed",
     ]
 
@@ -386,7 +386,7 @@ async def test_consultation_allows_two_inferences_without_queue_serialization(
     assert all(item["queue_wait_seconds"] < 0.1 for item in metrics)
 
 
-async def test_consultation_queue_timeout_includes_shared_expert_capacity(
+async def test_consultation_can_use_one_controlled_overflow_slot(
     monkeypatch,
 ) -> None:
     invoked = False
@@ -410,34 +410,36 @@ async def test_consultation_queue_timeout_includes_shared_expert_capacity(
     metrics: dict[str, Any] = {}
 
     try:
-        with pytest.raises(ConsultationQueueTimeoutError):
-            await CrossValidator()._invoke_consultation_model(
-                [HumanMessage(content="payload")],
-                {
-                    "api_base": "http://127.0.0.1:18003/v1",
-                    "api_key": "",
-                    "model": "BB-FinQuant-Expert-14B",
-                },
-                request_timeout=1.0,
-                queue_timeout_seconds=0.05,
-                runtime_metrics=metrics,
-                capacity_context={"_analysis_budget_scope": "position_test"},
-            )
+        response, content = await CrossValidator()._invoke_consultation_model(
+            [HumanMessage(content="payload")],
+            {
+                "api_base": "http://127.0.0.1:18003/v1",
+                "api_key": "",
+                "model": "BB-FinQuant-Expert-14B",
+            },
+            request_timeout=1.0,
+            queue_timeout_seconds=0.05,
+            runtime_metrics=metrics,
+            capacity_context={"_analysis_budget_scope": "position_test"},
+        )
     finally:
         for slot in reversed(shared_slots):
             await slot.__aexit__(None, None, None)
 
-    assert invoked is False
+    assert response is not None
+    assert content == "{}"
+    assert invoked is True
     assert metrics["queue_timeout_seconds"] == 0.05
-    assert metrics["queue_wait_seconds"] >= 0.04
-    assert metrics["inference_duration_seconds"] == 0.0
+    assert metrics["queue_wait_seconds"] < 0.05
+    assert metrics["inference_duration_seconds"] >= 0.0
 
 
 async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) -> None:
     validator = CrossValidator()
     shared_slots = [
-        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"})
-        for _ in range(2)
+        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"}),
+        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"}),
+        shared_llm_capacity_slot({"_analysis_budget_scope": "consultation:holder"}),
     ]
     for slot in shared_slots:
         await slot.__aenter__()
@@ -481,7 +483,7 @@ async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) ->
                     "conflict_note": "direction conflict",
                 }
             ],
-            timeout_seconds=1.0,
+            timeout_seconds=4.0,
         )
     finally:
         for slot in reversed(shared_slots):
@@ -572,3 +574,65 @@ async def test_validate_all_keeps_real_consultation_timeout_as_failed(
     assert consultation["model"] == "timeout"
     assert "reason_code" not in consultation
     assert timing["_consultation_timing"]["triggered"] is True
+
+
+@pytest.mark.asyncio
+async def test_position_consultation_reuses_completed_result_for_same_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = CrossValidator()
+    calls = 0
+
+    async def consult(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "completed",
+            "resolution_status": "resolved",
+            "resolved_action": "hold",
+            "resolved_conflict_pairs": [["risk_expert", "trend_expert"]],
+            "consultation_attempts": [{"status": "completed"}],
+        }
+
+    monkeypatch.setattr(validator, "consult_if_needed", consult)
+    first_timing: dict[str, Any] = {
+        "_analysis_budget_scope": "position_review",
+        "_consultation_reuse_key": "lifecycle-1",
+        "_consultation_reuse_ttl_seconds": 120.0,
+    }
+    _validations, first = await validator.validate_all(_conflicting_opinions(), first_timing)
+    second_timing = dict(first_timing)
+    _validations, second = await validator.validate_all(_conflicting_opinions(), second_timing)
+
+    assert calls == 1
+    assert first is not None and first["status"] == "completed"
+    assert second is not None
+    assert second["reused"] is True
+    assert second["invocation_status"] == "reused"
+    assert second["consultation_attempts"] == []
+    assert second_timing["_consultation_timing"]["triggered"] is False
+    assert second_timing["_consultation_timing"]["reused"] is True
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_consumes_late_task_exception() -> None:
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+    async def late_failure() -> None:
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            raise RuntimeError("late model failure") from None
+
+    try:
+        with pytest.raises(TimeoutError):
+            await _await_hard_deadline(late_failure(), 0.001)
+        await asyncio.sleep(0.06)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert unhandled == []

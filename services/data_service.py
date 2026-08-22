@@ -92,6 +92,18 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         task.result()
     except (asyncio.CancelledError, Exception):
         return
+
+
+def _cancel_and_consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Cancel an in-flight task or consume a result that won the cancellation race."""
+
+    if task.done():
+        _consume_task_result(task)
+        return
+    task.cancel()
+    task.add_done_callback(_consume_task_result)
+
+
 NATIVE_MARKET_REMOTE_CONCURRENCY = max(
     1,
     int(_MARKET_DATA_PARAMS.native_market_remote_concurrency),
@@ -843,8 +855,7 @@ class DataService:
             try:
                 done, pending = await asyncio.wait({task}, timeout=total_timeout)
                 if pending:
-                    task.cancel()
-                    task.add_done_callback(_consume_task_result)
+                    _cancel_and_consume_task_result(task)
                     await asyncio.sleep(0)
                     logger.warning(
                         "feature snapshot source timed out",
@@ -860,9 +871,7 @@ class DataService:
                 result = next(iter(done)).result()
                 return result if isinstance(result, dict) else {}
             except asyncio.CancelledError:
-                if not task.done():
-                    task.cancel()
-                    task.add_done_callback(_consume_task_result)
+                _cancel_and_consume_task_result(task)
                 raise
             except Exception as exc:
                 logger.debug(

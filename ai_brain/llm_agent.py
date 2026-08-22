@@ -69,6 +69,7 @@ class _ScopedLLMCapacity:
     def __init__(self, limit: int) -> None:
         self._limit = max(int(limit), 1)
         self._active = 0
+        self._consultation_overflow_active = False
         self._market_waiters = 0
         self._position_waiters = 0
         self._consultation_waiters = 0
@@ -86,6 +87,7 @@ class _ScopedLLMCapacity:
             or self._market_waiters
             or self._position_waiters
             or self._consultation_waiters
+            or self._consultation_overflow_active
         ):
             raise RuntimeError("LLM capacity cannot be shared across active event loops")
         self._condition = asyncio.Condition()
@@ -117,28 +119,47 @@ class _ScopedLLMCapacity:
                         self._position_waiters > 0
                         and self._consecutive_market_grants >= self._limit
                     )
+                    # The overflow consultation slot is included in
+                    # ``_active`` but must not make the regular pool look
+                    # full.  Otherwise a single deep consultation would
+                    # temporarily reduce ordinary market/position capacity.
+                    regular_active = self._active - int(
+                        self._consultation_overflow_active
+                    )
                     market_reserved = (
                         scope == "position"
                         and self._market_waiters > 0
-                        and self._active >= max(self._limit - 1, 1)
+                        and regular_active >= max(self._limit - 1, 1)
                         and not position_turn
                     )
                     position_reserved = bool(
                         scope == "market"
                         and position_turn
                     )
+                    regular_slot_available = regular_active < self._limit
+                    consultation_overflow_available = bool(
+                        scope == "consultation"
+                        and regular_active >= self._limit
+                        and self._active < self._limit + 1
+                        and not self._consultation_overflow_active
+                    )
                     if (
-                        self._active < self._limit
+                        (regular_slot_available or consultation_overflow_available)
                         and not consultation_reserved
                         and not market_reserved
                         and not position_reserved
                     ):
                         self._active += 1
+                        if not regular_slot_available:
+                            self._consultation_overflow_active = True
+                            lease_id = "consultation_overflow"
+                        else:
+                            lease_id = scope
                         if scope == "market":
                             self._consecutive_market_grants += 1
                         elif scope == "position":
                             self._consecutive_market_grants = 0
-                        return scope
+                        return lease_id
                     await self._condition.wait()
             finally:
                 if scope == "market":
@@ -148,9 +169,11 @@ class _ScopedLLMCapacity:
                 elif scope == "consultation":
                     self._consultation_waiters = max(self._consultation_waiters - 1, 0)
 
-    async def release(self) -> None:
+    async def release(self, lease_id: str | None = None) -> None:
         self._ensure_loop()
         async with self._condition:
+            if lease_id == "consultation_overflow":
+                self._consultation_overflow_active = False
             self._active = max(self._active - 1, 0)
             self._condition.notify_all()
 
@@ -169,16 +192,34 @@ class _ScopedLLMSlot:
         self._capacity = capacity
         self._context = context
         self._acquired = False
+        self._lease_id: str | None = None
 
     async def __aenter__(self) -> _ScopedLLMSlot:
-        await self._capacity.acquire(self._context)
-        self._acquired = True
+        lease_id = await self._capacity.acquire(self._context)
+        try:
+            self._lease_id = lease_id
+            self._acquired = True
+        except asyncio.CancelledError:
+            # Keep the capacity invariant even if cancellation lands between
+            # acquire() returning and the slot state being recorded.
+            await self._capacity.release(lease_id)
+            raise
         return self
 
     async def __aexit__(self, *_args: Any) -> None:
         if self._acquired:
             self._acquired = False
-            await self._capacity.release()
+            lease_id = self._lease_id
+            self._lease_id = None
+            # Capacity release must finish even when the caller is cancelled
+            # while leaving the context; otherwise one stale token can make
+            # every later expert wait until its round times out.
+            release_task = asyncio.create_task(self._capacity.release(lease_id))
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError:
+                await release_task
+                raise
 
 
 _LLM_CAPACITY = _ScopedLLMCapacity(_LLM_CONCURRENCY)
@@ -201,7 +242,6 @@ async def _bounded_llm_capacity_slot(context: dict[str, Any]):
     """
 
     slot = _LLM_CAPACITY.slot(context)
-    acquired = False
     try:
         try:
             deadline = float(context.get("_analysis_deadline_monotonic"))
@@ -212,13 +252,13 @@ async def _bounded_llm_capacity_slot(context: dict[str, Any]):
                 deadline - asyncio.get_running_loop().time() - 0.1,
                 0.05,
             )
-            await asyncio.wait_for(slot.__aenter__(), timeout=remaining)
+            async with asyncio.timeout(remaining):
+                await slot.__aenter__()
         else:
             await slot.__aenter__()
-        acquired = True
         yield
     finally:
-        if acquired:
+        if getattr(slot, "_acquired", False):
             await slot.__aexit__(None, None, None)
 
 ROLE_TO_CROSS_TARGET = {

@@ -162,6 +162,10 @@ class EnsembleCoordinator:
             ),
             "_analysis_deadline_monotonic": context.get("_analysis_deadline_monotonic"),
             "_analysis_budget_seconds": context.get("_analysis_budget_seconds"),
+            "_consultation_reuse_key": context.get("_consultation_reuse_key"),
+            "_consultation_reuse_ttl_seconds": context.get(
+                "_consultation_reuse_ttl_seconds"
+            ),
         }
         cross_validations, consultation = await self.cross_validator.validate_all(
             opinions, validation_timing
