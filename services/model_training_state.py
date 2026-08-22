@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ ALL_TRAINABLE_MODEL_IDS = LOCAL_ML_MODEL_IDS + LOCAL_AI_TOOL_MODEL_IDS
 MAX_HISTORY_EVENTS = 30
 WRITE_LOCK_STALE_SECONDS = 30.0
 WRITE_LOCK_WAIT_SECONDS = 3.0
+INTERRUPTED_RETRY_INTERVAL_SECONDS = 5 * 60
 
 
 def _utc_now() -> datetime:
@@ -592,15 +593,45 @@ class ModelTrainingStateStore:
             next_check_at=next_check_at,
         )
 
-    def recover_interrupted_runs(self) -> list[str]:
+    def recover_interrupted_runs(
+        self,
+        *,
+        retry_after_seconds: float = INTERRUPTED_RETRY_INTERVAL_SECONDS,
+    ) -> list[str]:
+        """Mark dead runs interrupted and ensure every interrupted run is retryable.
+
+        Deployments can terminate a training subprocess between its state write and
+        the scheduler's next check.  The historical ``interrupted`` event remains
+        authoritative, but it must carry a retry timestamp so a fresh scheduler can
+        take over instead of leaving the model in a permanently unscheduled state.
+        """
+
         recovered: list[str] = []
+        retry_delay = max(float(retry_after_seconds), 1.0)
 
         def mutate(payload: dict[str, Any], now: datetime) -> None:
             models = payload.get("models")
             if not isinstance(models, dict):
                 return
             for model_id, row in models.items():
-                if not isinstance(row, dict) or row.get("state") not in {"checking", "running"}:
+                if not isinstance(row, dict):
+                    continue
+                state = row.get("state")
+                if state == "interrupted" and not row.get("next_check_at"):
+                    recovered.append(str(model_id))
+                    next_check_at = now + timedelta(seconds=retry_delay)
+                    row["next_check_at"] = _iso(next_check_at)
+                    self._append_history(
+                        row,
+                        {
+                            "at": _iso(now),
+                            "event": "retry_scheduled",
+                            "reason": "interrupted_training_retry",
+                            "next_check_at": _iso(next_check_at),
+                        },
+                    )
+                    continue
+                if state not in {"checking", "running"}:
                     continue
                 owner_host = str(row.get("owner_host") or "")
                 owner_pid = int(row.get("owner_pid") or 0)
@@ -615,6 +646,7 @@ class ModelTrainingStateStore:
                         "last_error": "training_process_interrupted",
                         "active_run_id": None,
                         "active_sample_cursor": None,
+                        "next_check_at": _iso(now + timedelta(seconds=retry_delay)),
                         "retry_count": int(row.get("retry_count") or 0) + 1,
                     }
                 )

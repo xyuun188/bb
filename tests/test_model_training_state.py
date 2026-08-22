@@ -254,8 +254,33 @@ def test_recovery_marks_interrupted_training_and_preserves_history(tmp_path) -> 
     assert row["state"] == "interrupted"
     assert row["last_error"] == "training_process_interrupted"
     assert row["retry_count"] == 1
+    assert row["next_check_at"] is not None
     assert row["history"][-1]["event"] == "interrupted"
     assert row.get("last_successful_training_at") is None
+
+
+def test_recovery_schedules_existing_interrupted_run_without_duplicate_event(tmp_path) -> None:
+    now = [datetime(2026, 8, 22, 1, 0, tzinfo=UTC)]
+    store = ModelTrainingStateStore(tmp_path / "model_training_state.json", now_provider=lambda: now[0])
+    payload = store.read()
+    payload["models"][LOCAL_ML_MODEL_IDS[0]] = {
+        "model_id": LOCAL_ML_MODEL_IDS[0],
+        "state": "interrupted",
+        "last_error": "training_process_interrupted",
+        "next_check_at": None,
+        "retry_count": 1,
+        "history": [{"event": "interrupted", "run_id": "old-run"}],
+    }
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    scheduled = store.recover_interrupted_runs(retry_after_seconds=120)
+    row = store.read()["models"][LOCAL_ML_MODEL_IDS[0]]
+
+    assert scheduled == [LOCAL_ML_MODEL_IDS[0]]
+    assert row["next_check_at"] == "2026-08-22T01:02:00+00:00"
+    assert [event["event"] for event in row["history"]] == ["interrupted", "retry_scheduled"]
+
+    assert store.recover_interrupted_runs(retry_after_seconds=120) == []
 
 
 def test_failed_model_makes_fresh_scheduler_state_error(tmp_path) -> None:

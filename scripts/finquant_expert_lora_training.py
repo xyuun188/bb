@@ -1956,7 +1956,7 @@ def deploy_finquant_gateway_runtime_only() -> dict[str, Any]:
             check=True,
         )
         concurrency_probe = textwrap.dedent(
-            f"""
+            """
             import concurrent.futures
             import json
             import urllib.request
@@ -1973,12 +1973,12 @@ def deploy_finquant_gateway_runtime_only() -> dict[str, Any]:
 
             statuses = [status for status, _payload in rows]
             payloads = [payload for _status, payload in rows]
-            print(json.dumps({{
+            print(json.dumps({
                 "request_count": len(rows),
                 "success_count": sum(status == 200 for status in statuses),
-                "runtime_versions": sorted({{str(item.get("runtime_version") or "") for item in payloads}}),
-                "request_queue_sizes": sorted({{int(item.get("request_queue_size") or 0) for item in payloads}}),
-            }}, sort_keys=True))
+                "runtime_versions": sorted({str(item.get("runtime_version") or "") for item in payloads}),
+                "request_queue_sizes": sorted({int(item.get("request_queue_size") or 0) for item in payloads}),
+            }, sort_keys=True))
             """
         ).strip()
         raw_probe = run_remote_text(

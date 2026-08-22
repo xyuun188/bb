@@ -580,3 +580,34 @@ continuity gates must be observed from this deployment forward for at least 24
 hours. Model quality gates remain authoritative: the current model is not
 production-authorized while fee-after-return, LCB, and profit-factor blockers
 remain present, so no entry is forced to make the count look healthy.
+
+### 7.14 Training interruption recovery and final verification pass (2026-08-22)
+
+The post-deployment audit found that a service restart correctly preserved the
+historical `training_process_interrupted` event, but left the affected model
+rows without `next_check_at`.  That made the scheduler warning durable and
+made recovery dependent on an unrelated lease attempt.  The state contract now
+assigns a bounded retry time both when a dead `checking`/`running` process is
+recovered and when an existing interrupted row is encountered.  Existing
+interrupted rows are scheduled idempotently without duplicating the historical
+interruption event.  A regression test covers both paths.
+
+The same verification pass removed an invalid no-placeholder f-string from the
+remote FinQuant concurrency probe.  Focused regression passed (`50 passed`),
+full repository regression passed (`3533 passed, 4 skipped, 1 warning`), and
+Ruff, compileall, and `git diff --check` all passed.
+
+The corrected source was synchronized to the online server twice, with the
+final deployment reporting model tunnels, trading, and Dashboard active.  The
+online state after deployment is `status=ok`; all trainable models are
+`skipped`/healthy with a future `next_check_at`, and the OKX reconciliation gate
+reports zero unresolved items.  The post-deployment tunnel log contains only
+the ready event and no new `Timeout opening channel`, `RemoteProtocolError`, or
+transport-draining errors.  A five-minute coverage smoke check observed nine
+distinct market symbols, zero duplicate analyses within the ten-minute
+cooldown, and seven position-review records.
+
+The plan remains active until the fresh deployment window completes the
+required 24-hour online continuity, coverage, expert-call, training-heartbeat,
+and audit gates.  Current model quality blockers (fee-after-return, LCB, and
+profit-factor evidence) remain authoritative and were not bypassed.

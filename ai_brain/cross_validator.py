@@ -302,16 +302,40 @@ class CrossValidator:
                     timeout=max(consultation_timeout, 0.1),
                 )
         except TimeoutError:
-            logger.warning(
-                "deep consultation timed out; using fallback",
-                timeout=consultation_timeout,
-                major_conflicts=len(major_conflicts),
+            # ``asyncio.wait_for`` can expire at the analysis deadline before
+            # ``consult_if_needed`` gets a chance to return its own fallback.
+            # When no complete consultation window remains this is a planning
+            # skip, not a model/service failure.  Keep real call timeouts as
+            # failures so the runtime and quality contracts remain truthful.
+            deadline_exhausted = bool(
+                analysis_deadline
+                and analysis_deadline > 0
+                and analysis_deadline - asyncio.get_running_loop().time() <= 0.5
             )
-            consultation = self._fallback_consultation(
-                major_conflicts,
-                "timeout",
-                f"深度会诊超过 {consultation_timeout:.0f} 秒未返回",
-            )
+            if deadline_exhausted:
+                logger.info(
+                    "deep consultation skipped after analysis deadline budget was exhausted",
+                    timeout=consultation_timeout,
+                    major_conflicts=len(major_conflicts),
+                )
+                consultation = self._fallback_consultation(
+                    major_conflicts,
+                    "deadline",
+                    "分析剩余预算不足以完成完整会诊",
+                    status="skipped",
+                    reason_code="analysis_deadline_budget_exhausted",
+                )
+            else:
+                logger.warning(
+                    "deep consultation timed out; using fallback",
+                    timeout=consultation_timeout,
+                    major_conflicts=len(major_conflicts),
+                )
+                consultation = self._fallback_consultation(
+                    major_conflicts,
+                    "timeout",
+                    f"深度会诊超过 {consultation_timeout:.0f} 秒未返回",
+                )
         consultation_duration = round(time.perf_counter() - consultation_perf_started, 3)
         if timing_context is not None:
             timing_context["_consultation_timing"] = {
@@ -324,7 +348,10 @@ class CrossValidator:
                 ),
                 "started_at": consultation_started_at.isoformat(),
                 "duration_sec": consultation_duration,
-                "triggered": bool(consultation),
+                "triggered": bool(
+                    consultation
+                    and str(consultation.get("status") or "").lower() != "skipped"
+                ),
                 "major_conflicts": sum(1 for v in validations if v.get("major_conflict")),
                 "remaining_analysis_seconds": (
                     round(remaining_analysis_seconds, 3)
@@ -1008,6 +1035,14 @@ class CrossValidator:
             if deadline - time.perf_counter() <= 0.5:
                 break
 
+        if not attempts and deadline - time.perf_counter() <= 0.5:
+            return self._fallback_consultation(
+                major,
+                last_model or primary_model or "deadline",
+                "分析剩余预算不足以启动完整会诊",
+                status="skipped",
+                reason_code="analysis_deadline_budget_exhausted",
+            )
         return self._fallback_consultation(
             major,
             last_model or primary_model,

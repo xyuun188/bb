@@ -5,6 +5,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 import ai_brain.cross_validator as cross_validator_module
+from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.cross_validator import (
     ConsultationQueueTimeoutError,
     CrossValidator,
@@ -503,3 +504,71 @@ def test_consultation_budget_is_bounded(monkeypatch) -> None:
 
     monkeypatch.setattr(settings, "ai_decision_maker_timeout_seconds", 2.0)
     assert _consultation_budget_seconds() == 6.0
+
+
+def _conflicting_opinions() -> dict[str, DecisionOutput]:
+    return {
+        "trend_expert": DecisionOutput(
+            model_name="trend_expert",
+            symbol="BTC/USDT",
+            action=Action.LONG,
+            confidence=0.8,
+            reasoning="trend",
+        ),
+        "risk_expert": DecisionOutput(
+            model_name="risk_expert",
+            symbol="BTC/USDT",
+            action=Action.SHORT,
+            confidence=0.8,
+            reasoning="risk",
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_validate_all_marks_exhausted_analysis_budget_as_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = CrossValidator()
+
+    async def should_not_start_consultation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a consultation must not start without a complete analysis window")
+
+    monkeypatch.setattr(validator, "consult_if_needed", should_not_start_consultation)
+    timing: dict[str, Any] = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 0.1,
+        "_analysis_budget_scope": "position_ai",
+    }
+
+    _validations, consultation = await validator.validate_all(_conflicting_opinions(), timing)
+
+    assert consultation is not None
+    assert consultation["status"] == "skipped"
+    assert consultation["reason_code"] == "analysis_deadline_budget_exhausted"
+    assert consultation["consultation_attempts"] == []
+    assert timing["_consultation_timing"]["triggered"] is False
+
+
+@pytest.mark.asyncio
+async def test_validate_all_keeps_real_consultation_timeout_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = CrossValidator()
+    monkeypatch.setattr(cross_validator_module, "_consultation_budget_seconds", lambda: 6.0)
+
+    async def real_timeout(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("model call timed out")
+
+    monkeypatch.setattr(validator, "consult_if_needed", real_timeout)
+    timing: dict[str, Any] = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 6.4,
+        "_analysis_budget_scope": "position_ai",
+    }
+
+    _validations, consultation = await validator.validate_all(_conflicting_opinions(), timing)
+
+    assert consultation is not None
+    assert consultation["status"] == "failed"
+    assert consultation["model"] == "timeout"
+    assert "reason_code" not in consultation
+    assert timing["_consultation_timing"]["triggered"] is True
