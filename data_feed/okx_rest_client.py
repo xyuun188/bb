@@ -453,8 +453,24 @@ class OKXRestClient:
         """Return top-book metrics without letting a slow route block the round."""
         normalized_spec = normalize_okx_contract_spec(contract_spec)
         inst_id = okx_inst_id_from_symbol(symbol)
+        contract_value = self._safe_float(normalized_spec.get("contract_value"))
+        contract_multiplier = self._safe_float(
+            normalized_spec.get("contract_multiplier")
+        )
+        contract_spec_available = bool(
+            contract_value > 0 and contract_multiplier > 0
+        )
         cached = self._orderbook_cache.get(inst_id)
         if cached is not None and time.monotonic() - cached[0] <= ORDERBOOK_CACHE_TTL_SECONDS:
+            if not contract_spec_available:
+                return {
+                    "spread_pct": float(cached[1].get("spread_pct") or 0.0),
+                    "orderbook_bid_depth": 0.0,
+                    "orderbook_ask_depth": 0.0,
+                    "orderbook_imbalance": 0.0,
+                    "orderbook_data_available": False,
+                    "orderbook_unavailable_reason": "contract_spec_missing",
+                }
             return {**cached[1], "orderbook_cached": True}
 
         async def fetch_and_normalize() -> dict[str, Any]:
@@ -481,10 +497,6 @@ class OKXRestClient:
             )
             total_depth = bid_depth + ask_depth
             imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
-            contract_value = self._safe_float(normalized_spec.get("contract_value"))
-            contract_multiplier = self._safe_float(
-                normalized_spec.get("contract_multiplier") or 1.0
-            )
             contract_base_size = contract_value * contract_multiplier
             bid_depth_usdt = bid_depth * contract_base_size if contract_base_size > 0 else 0.0
             ask_depth_usdt = ask_depth * contract_base_size if contract_base_size > 0 else 0.0
@@ -497,7 +509,18 @@ class OKXRestClient:
                 "orderbook_bid_depth": bid_depth_usdt,
                 "orderbook_ask_depth": ask_depth_usdt,
                 "orderbook_imbalance": imbalance,
-                "orderbook_data_available": bool(bid > 0 and ask > 0),
+                "orderbook_data_available": bool(
+                    bid > 0
+                    and ask > 0
+                    and contract_spec_available
+                    and bid_depth_usdt > 0
+                    and ask_depth_usdt > 0
+                ),
+                "orderbook_unavailable_reason": (
+                    None
+                    if contract_spec_available
+                    else "contract_spec_missing"
+                ),
                 "orderbook_fact": {
                     "inst_id": inst_id,
                     "inst_type": "SWAP",
@@ -684,10 +707,34 @@ class OKXRestClient:
                     else {}
                 )
                 ticker_price = self._safe_float(ticker_row.get("last"))
+                ticker_timestamp_ms = int(
+                    self._safe_float(
+                        ticker_row.get("ts")
+                        or ticker_result.get("ts")
+                        if isinstance(ticker_result, dict)
+                        else 0
+                    )
+                )
                 if ticker_price > 0:
-                    mark_price = mark_price or ticker_price
-                    index_price = index_price or ticker_price
-                    fallback_used = True
+                    if mark_price <= 0:
+                        mark_price = ticker_price
+                        mark_row = {
+                            "instId": inst_id,
+                            "instType": "SWAP",
+                            "markPx": ticker_row.get("last"),
+                            "ts": ticker_timestamp_ms,
+                            "fallback": True,
+                        }
+                        fallback_used = True
+                    if index_price <= 0:
+                        index_price = ticker_price
+                        index_row = {
+                            "instId": uly,
+                            "idxPx": ticker_row.get("last"),
+                            "ts": ticker_timestamp_ms,
+                            "fallback": True,
+                        }
+                        fallback_used = True
             except Exception:
                 if ticker_task is not None and not ticker_task.done():
                     ticker_task.cancel()
@@ -699,16 +746,30 @@ class OKXRestClient:
             "mark_price_fact": {
                 "inst_id": str(mark_row.get("instId") or inst_id).upper(),
                 "inst_type": str(mark_row.get("instType") or "SWAP").upper(),
-                "source_endpoint": "okx_rest_public_mark_price",
-                "source_channel": "mark-price",
+                "source_endpoint": (
+                    "okx_rest_market_ticker_fallback"
+                    if mark_row.get("fallback")
+                    else "okx_rest_public_mark_price"
+                ),
+                "source_channel": (
+                    "tickers-fallback" if mark_row.get("fallback") else "mark-price"
+                ),
                 "source_timestamp_ms": int(self._safe_float(mark_row.get("ts"))),
                 "price": mark_price,
             },
             "index_price_fact": {
                 "inst_id": str(index_row.get("instId") or uly).upper(),
                 "inst_type": "INDEX",
-                "source_endpoint": "okx_rest_market_index_tickers",
-                "source_channel": "index-tickers",
+                "source_endpoint": (
+                    "okx_rest_market_ticker_fallback"
+                    if index_row.get("fallback")
+                    else "okx_rest_market_index_tickers"
+                ),
+                "source_channel": (
+                    "tickers-fallback"
+                    if index_row.get("fallback")
+                    else "index-tickers"
+                ),
                 "source_timestamp_ms": int(self._safe_float(index_row.get("ts"))),
                 "price": index_price,
             },

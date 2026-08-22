@@ -30,7 +30,10 @@ from core.safe_output import safe_error_text
 from core.url_safety import normalize_external_http_url
 from data_feed.feature_vector import FeatureVector, build_feature_vector
 from data_feed.news_fetcher import NewsFetcher
-from data_feed.okx_rest_client import OKXRestClient
+from data_feed.okx_rest_client import (
+    DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS,
+    OKXRestClient,
+)
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
 from data_feed.okx_ws_client import OKXWebSocketClient
 from data_feed.sentiment_scraper import SentimentScraper
@@ -127,7 +130,11 @@ INSTRUMENT_SPEC_FAILURE_CACHE_SECONDS = 30.0
 DERIVATIVES_FAILURE_CACHE_SECONDS = 15.0
 DERIVATIVES_REFRESH_TIMEOUT_SECONDS = max(
     float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) * 2.0,
-    5.0,
+    float(DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS) + 1.0,
+)
+DERIVATIVES_PROVIDER_TIMEOUT_SECONDS = max(
+    float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS),
+    float(DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS) + 0.25,
 )
 DERIVATIVES_BACKGROUND_REFRESH_CONCURRENCY = 2
 
@@ -1252,18 +1259,13 @@ class DataService:
                 return {}
             try:
                 result = await asyncio.wait_for(
-                    task,
+                    asyncio.shield(task),
                     timeout=INSTRUMENT_SPEC_TIMEOUT_SECONDS,
                 )
                 return dict(result or {})
             except TimeoutError:
-                # Cancel the shared request instead of shielding a task that can
-                # occupy every later derivatives refresh.
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                tasks.pop(normalized, None)
-                failed_cache[normalized] = datetime.now(UTC)
+                # A caller deadline must not cancel the shared request.  It may
+                # still complete and populate the native contract cache.
                 return {}
 
         async def fetch() -> dict[str, Any]:
@@ -1283,9 +1285,24 @@ class DataService:
 
         task = asyncio.create_task(fetch())
         tasks[normalized] = task
+
+        def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+            if tasks.get(normalized) is finished:
+                tasks.pop(normalized, None)
+            try:
+                value = finished.result()
+            except (asyncio.CancelledError, Exception):
+                failed_cache[normalized] = datetime.now(UTC)
+                return
+            if value:
+                failed_cache.pop(normalized, None)
+            else:
+                failed_cache[normalized] = datetime.now(UTC)
+
+        task.add_done_callback(cleanup)
         try:
             result = await asyncio.wait_for(
-                task,
+                asyncio.shield(task),
                 timeout=INSTRUMENT_SPEC_TIMEOUT_SECONDS,
             )
             if result:
@@ -1294,14 +1311,9 @@ class DataService:
                 failed_cache[normalized] = datetime.now(UTC)
             return dict(result or {})
         except TimeoutError:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            failed_cache[normalized] = datetime.now(UTC)
+            # Keep the single-flight request alive so a slow OKX response can
+            # still be reused by the next derivatives refresh.
             return {}
-        finally:
-            if tasks.get(normalized) is task:
-                tasks.pop(normalized, None)
 
     async def get_latest_market_fact(self, symbol: str) -> dict[str, Any]:
         """Return one executable, native-instrument-bound OKX market fact."""
@@ -2515,16 +2527,17 @@ class DataService:
             if block_on_remote:
                 try:
                     result = await asyncio.wait_for(
-                        existing_task,
+                        asyncio.shield(existing_task),
                         timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
                     )
                     return dict(result or {})
                 except TimeoutError:
-                    existing_task.cancel()
-                    await asyncio.gather(existing_task, return_exceptions=True)
-                    tasks.pop(normalized, None)
-                    failed_cache[normalized] = datetime.now(UTC)
-                    return {}
+                    cached_data = dict((cached or {}).get("data") or {})
+                    if cached_data:
+                        cached_data["derivatives_snapshot_stale"] = True
+                    cached_data["derivatives_refresh_in_background"] = True
+                    cached_data["derivatives_refresh_timeout"] = True
+                    return cached_data
             return {"derivatives_refresh_in_background": True}
         if not block_on_remote:
             if allow_background_refresh:
@@ -2533,24 +2546,29 @@ class DataService:
             return {}
         task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
         tasks[normalized] = task
-        try:
-            try:
-                result = await asyncio.wait_for(
-                    task,
-                    timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
-                )
-                return dict(result or {})
-            except TimeoutError:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                failed_cache[normalized] = datetime.now(UTC)
-                return {}
-            except Exception:
-                failed_cache[normalized] = datetime.now(UTC)
-                return {}
-        finally:
-            if tasks.get(normalized) is task:
+
+        def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+            if tasks.get(normalized) is finished:
                 tasks.pop(normalized, None)
+            _consume_task_result(finished)
+
+        task.add_done_callback(cleanup)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
+            )
+            return dict(result or {})
+        except TimeoutError:
+            cached_data = dict((cached or {}).get("data") or {})
+            if cached_data:
+                cached_data["derivatives_snapshot_stale"] = True
+            cached_data["derivatives_refresh_in_background"] = True
+            cached_data["derivatives_refresh_timeout"] = True
+            return cached_data
+        except Exception:
+            failed_cache[normalized] = datetime.now(UTC)
+            return {}
 
     def _schedule_derivatives_background_refresh(self, symbol: str) -> None:
         try:
@@ -2610,7 +2628,7 @@ class DataService:
                     normalized,
                     contract_spec=contract_spec,
                 ),
-                timeout=max(float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS), 0.5),
+                timeout=max(float(DERIVATIVES_PROVIDER_TIMEOUT_SECONDS), 0.5),
             )
             failed_cache.pop(normalized, None)
         except Exception as e:

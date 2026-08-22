@@ -304,7 +304,15 @@ async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
         if method_name == "publicGetMarketIndexTickers":
             return {"data": []}
         assert method_name == "publicGetMarketTicker"
-        return {"data": [{"instId": "ROBO-USDT-SWAP", "last": "0.01291"}]}
+        return {
+            "data": [
+                {
+                    "instId": "ROBO-USDT-SWAP",
+                    "last": "0.01291",
+                    "ts": "1783990800000",
+                }
+            ]
+        }
 
     monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
     prices = await client.fetch_reference_prices(
@@ -316,6 +324,10 @@ async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
     assert prices["mark_price"] == pytest.approx(0.01291)
     assert prices["index_price"] == pytest.approx(0.01291)
     assert prices["reference_prices_fallback"] == "ticker_last"
+    assert prices["mark_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+    assert prices["index_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+    assert prices["mark_price_fact"]["source_endpoint"] == "okx_rest_market_ticker_fallback"
+    assert prices["index_price_fact"]["source_endpoint"] == "okx_rest_market_ticker_fallback"
 
 
 @pytest.mark.asyncio
@@ -408,17 +420,83 @@ async def test_orderbook_timeout_returns_unavailable_then_reuses_completed_cache
         0.01,
     )
 
-    first = await client.fetch_order_book_metrics("BTC/USDT")
+    contract_spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctVal": "0.01",
+        "ctMult": "1",
+    }
+    first = await client.fetch_order_book_metrics(
+        "BTC/USDT",
+        contract_spec=contract_spec,
+    )
     assert first["orderbook_data_available"] is False
     assert first["orderbook_refresh_in_background"] is True
 
     release.set()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    second = await client.fetch_order_book_metrics("BTC/USDT")
+    second = await client.fetch_order_book_metrics(
+        "BTC/USDT",
+        contract_spec=contract_spec,
+    )
 
     assert second["orderbook_data_available"] is True
     assert second["orderbook_cached"] is True
+
+
+@pytest.mark.asyncio
+async def test_orderbook_without_contract_spec_is_not_marked_available(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_order_book"
+        return {
+            "timestamp": 1_783_990_800_000,
+            "bids": [[100.0, 2.0]],
+            "asks": [[100.1, 3.0]],
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    metrics = await client.fetch_order_book_metrics("BTC/USDT")
+
+    assert metrics["orderbook_data_available"] is False
+    assert metrics["orderbook_unavailable_reason"] == "contract_spec_missing"
+    assert metrics["orderbook_bid_depth"] == 0.0
+    assert metrics["orderbook_ask_depth"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_orderbook_cache_does_not_bypass_missing_contract_spec(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_order_book"
+        return {
+            "timestamp": 1_783_990_800_000,
+            "bids": [[100.0, 2.0]],
+            "asks": [[100.1, 3.0]],
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "ctVal": "0.01",
+        "ctMult": "1",
+    }
+    valid = await client.fetch_order_book_metrics("BTC/USDT", contract_spec=spec)
+    assert valid["orderbook_data_available"] is True
+
+    missing = await client.fetch_order_book_metrics("BTC/USDT")
+    assert missing["orderbook_data_available"] is False
+    assert missing["orderbook_unavailable_reason"] == "contract_spec_missing"
+    assert missing["orderbook_bid_depth"] == 0.0
 
 
 @pytest.mark.asyncio

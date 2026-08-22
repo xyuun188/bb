@@ -1820,6 +1820,43 @@ async def test_blocking_derivatives_read_refreshes_stale_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derivatives_refresh_timeout_keeps_shared_task_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    monkeypatch.setattr(data_service_module, "DERIVATIVES_REFRESH_TIMEOUT_SECONDS", 0.01)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_refresh(_symbol: str) -> dict[str, Any]:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"funding_rate": 0.002}
+
+    service._refresh_derivatives_snapshot = slow_refresh  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot("ETH/USDT", block_on_remote=True)
+
+    assert result["derivatives_refresh_in_background"] is True
+    assert result["derivatives_refresh_timeout"] is True
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    task = service._derivatives_refresh_tasks["ETH/USDT"]
+    assert not task.cancelled()
+
+    release.set()
+    completed = await asyncio.wait_for(task, timeout=0.2)
+    assert completed["funding_rate"] == pytest.approx(0.002)
+    assert not cancelled.is_set()
+    await asyncio.sleep(0)
+    assert "ETH/USDT" not in service._derivatives_refresh_tasks
+
+
+@pytest.mark.asyncio
 async def test_derivatives_refresh_records_success_without_missing_cache_state() -> None:
     service = _service()
     service._derivatives_failed_at = {}
