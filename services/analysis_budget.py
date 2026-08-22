@@ -138,6 +138,44 @@ class AnalysisBudgetPolicy:
         position_group_count = self.open_position_group_counter(open_positions)
         roster_underfilled = position_group_count < runtime.target_position_groups
 
+        # Market and position loops are independent schedulers.  A market-only
+        # round may still observe open positions, but those positions belong to
+        # the position loop and must not reduce the market observation budget.
+        # The previous branch selected the "with positions" policy whenever the
+        # snapshot was non-empty, which made dashboard diagnostics look like the
+        # market loop had no budget and could starve coverage after a restart.
+        if run_market_analysis and not run_position_analysis:
+            market_limit, market_limit_policy = self._market_limit_without_positions(
+                base_market_limit=base_market_limit,
+                run_market_analysis=run_market_analysis,
+                runtime=runtime,
+                roster_underfilled=False,
+                new_pair_pause_reason=new_pair_pause_reason,
+            )
+            return self._result(
+                runtime=runtime,
+                risk_level="market_only",
+                market_symbol_limit=market_limit,
+                configured_market_symbol_limit=base_market_limit,
+                market_limit_policy=(
+                    "market_only_independent_budget"
+                    if market_limit_policy == "no_position_dynamic_market_budget"
+                    else market_limit_policy
+                ),
+                position_max_groups=runtime.position_max_groups_per_round,
+                forced_exit_count=0,
+                urgent_exit_count=0,
+                high_exit_count=0,
+                priority_count=0,
+                total_position_groups=position_group_count,
+                roster_underfilled=roster_underfilled,
+                position_group_count=position_group_count,
+                reason=(
+                    "市场轮使用独立候选预算；当前持仓只供市场上下文观察，"
+                    "不占用 position loop 的复盘预算，也不改变开仓权限。"
+                ),
+            )
+
         if not open_positions:
             market_limit, market_limit_policy = self._market_limit_without_positions(
                 base_market_limit=base_market_limit,

@@ -146,6 +146,9 @@ async def main():
             "stage_duration_sec": [],
             "model_duration_sec": [],
         },
+        "expert_latency_values": defaultdict(list),
+        "expert_status": Counter(),
+        "consultation_latency_values": [],
         "expert_actions": Counter(),
         "expert_actions_by_role": defaultdict(Counter),
         "expert_count_distribution": Counter(),
@@ -198,6 +201,15 @@ async def main():
             value = _float(latency.get(metric))
             if value is not None:
                 summary["latency_values"][metric].append(value)
+        model_timings = _list(raw.get("model_timings")) or _list(row.model_health_timings)
+        for timing in model_timings:
+            if not isinstance(timing, dict):
+                continue
+            name = str(timing.get("name") or timing.get("model") or "unknown")
+            duration = _float(timing.get("duration_sec"))
+            if duration is not None:
+                summary["expert_latency_values"][name].append(duration)
+            summary["expert_status"][f"{name}:{str(timing.get('status') or 'unknown')}"] += 1
         cross_validations = _list(raw.get("cross_validations"))
         summary["cross_validation_count_distribution"][
             str(len(cross_validations))
@@ -401,6 +413,12 @@ async def main():
                 continue
             attempt_status = str(attempt.get("status") or "unknown")
             attempt_statuses.append(attempt_status)
+            duration = _float(
+                attempt.get("duration_sec")
+                or _dict(attempt.get("runtime_metrics")).get("inference_duration_seconds")
+            )
+            if duration is not None:
+                summary["consultation_latency_values"].append(duration)
             summary["consultation"][f"attempt_{attempt_status}"] += 1
             summary["consultation_by_analysis_type"][analysis_type][
                 f"attempt_{attempt_status}"
@@ -446,6 +464,14 @@ async def main():
         metric: _metric_summary(values)
         for metric, values in summary.pop("latency_values").items()
     }
+    summary["expert_latency"] = {
+        name: _metric_summary(values)
+        for name, values in summary.pop("expert_latency_values").items()
+    }
+    summary["expert_status"] = dict(summary["expert_status"])
+    summary["consultation_latency"] = _metric_summary(
+        summary.pop("consultation_latency_values")
+    )
     summary["side_metrics"] = {
         side: {
             metric: _metric_summary(values)

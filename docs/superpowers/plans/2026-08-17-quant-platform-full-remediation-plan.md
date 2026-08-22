@@ -478,3 +478,105 @@ reason
 - 对共享 SSH transport 的 channel-open 超时继续采用排空策略：禁止新 channel，等待现有训练长连接结束后再关闭；已失活、EOF 或明确 session/socket closed 才立即退役并自动恢复。
 
 本次修改后专项会诊/隧道回归 45 项、全量回归 `3507 passed, 4 skipped`，Ruff、compileall 和 diff-check 均通过。该版本部署后必须重新开始至少 24 小时线上观察，重点检查会诊队列超时、模型调用失败、训练长连接断连、轮次空档、重复分析、动态退出合同和系统审计；观察窗口完成前仍不得宣布整改全部验收完成。
+
+### 7.9 Candidate permission boundary and observation scheduling closure (2026-08-22)
+
+This implementation pass closes two code-level gaps found during the post-deployment audit. Market observation candidates are explicitly separated from execution candidates at the single entry-filter boundary. Analysis-only or execution-unverified symbols may be analyzed and persisted, but their entry decisions carry `market_analysis_only_contract` and cannot reach an execution processor.
+
+The observation pool is widened independently from the final expert budget. OKX availability remains an execution permission, preserving rotation and preventing long empty intervals. Shared model-capacity acquisition now honors the per-symbol analysis deadline while waiting for a slot, and local fallbacks retain `timeout`/`call_failed` status instead of being counted as completed expert calls.
+
+Focused regression: 410 passed. Full regression: 3517 passed, 4 skipped. Static lint, compile, and diff checks passed. Online deployment and the new 24-hour observation window remain required before final acceptance.
+
+### 7.10 Consultation deadline propagation and non-blocking OKX capability refresh (2026-08-22)
+
+The post-deployment audit found two remaining latency defects. Deep consultation was using a
+separate 6--18 second budget without inheriting the symbol analysis deadline; when the outer
+round had only a few seconds left, the consultation was started and then cancelled by the
+caller. The validator now receives `_analysis_deadline_monotonic`, records the remaining
+budget, and emits an explicit `skipped`/`analysis_deadline_budget_exhausted` observation when
+there is not enough time to start a complete consultation. It never converts this state into
+`completed` or production permission.
+
+OKX private `fetch_leverage` capability probes are now removed from the market-analysis
+critical path. The market round consumes the verified cache immediately; a bounded background
+refresh updates execution permissions, revoking cached permissions on definitive unavailable
+responses. Symbols without current verification remain analysis-only and are hard-blocked by
+the entry boundary. This preserves safety while preventing private API latency from creating
+long gaps between market analyses.
+
+Focused regression after this pass: cross-validator runtime policy 14 passed; trading-service
+boundary and executor safety suites 403 passed. Full regression and online deployment remain
+required before final acceptance.
+
+### 7.11 Shadow sample durability and OKX probe scheduling closure (2026-08-22)
+
+The online audit then confirmed that shadow-label persistence still awaited one
+database transaction in the market round and abandoned the sample after the old
+2-second timeout. This pass closes that durability gap at the source:
+
+- Market analysis only enqueues a persisted decision payload and returns; a
+  bounded background worker performs the database write with isolated retries.
+- Worker health, queue depth, enqueue/drop counts and the last write error are
+  exposed in maintenance diagnostics. A full queue is recorded as degraded and
+  never reported as a successful sample.
+- The repository now finds market decisions with fewer than the expected horizon
+  rows. Background maintenance reconstructs the decision from durable fields and
+  reuses the idempotent writer, so partial writes and process restarts are
+  recoverable without duplicate samples.
+- OKX private instrument capability refresh remains outside the market critical
+  path. Probes are limited to a bounded batch, use a 30-second independent
+  deadline, preserve verified cache permissions on temporary errors, and publish
+  structured `ok`/`timeout`/`degraded` state with the next retry time instead of
+  repeated warning noise. Unverified symbols remain analysis-only and cannot
+  enter execution.
+
+Focused regression for the new queue/recovery behavior and the shortlist
+boundaries passes. Full regression, online deployment and the fresh 24-hour
+observation window are still required; this section is an implementation record,
+not a final acceptance declaration.
+
+### 7.12 Coverage backlog, prewarm backoff and independent market budget (2026-08-22)
+
+The final scheduling audit found four remaining root-level risks: shadow recovery
+could scan too frequently, indicator prewarm failures could retry without a
+symbol-aware backoff, due coverage could remain behind the 30-minute target, and
+the market-only loop could inherit a zero or reduced budget from the position
+snapshot even though the loops are independent. The implementation now:
+
+- throttles shadow recovery to a bounded five-minute interval with a four-hour
+  lookback and a small recovery batch;
+- applies exponential per-symbol prewarm backoff and normalizes exchange symbol
+  formats before deciding whether a batch failed;
+- reserves a second bounded coverage slot only for an accumulated backlog of
+  previously observed symbols, while keeping first-discovery behavior stable;
+- keeps market-only analysis budget independent from open-position review and
+  records `analysis_scope` in both diagnostics and logs;
+- tracks repeated blockable defer reasons separately from global scheduling
+  deferrals, blocks only after consecutive failures, preserves the concrete
+  reason, and exposes blocked-candidate diagnostics.
+
+The focused regression for these boundaries is to be run only after this entire
+implementation pass is complete. Online deployment, post-deploy verification,
+and a fresh 24-hour observation window remain required before final acceptance.
+
+### 7.13 Unified verification and online rollout (2026-08-22)
+
+The implementation pass is now complete before verification. The unified local
+verification completed with:
+
+- focused scheduling/prewarm/defer/coverage regression: `385 passed`;
+- full repository regression: `3525 passed, 4 skipped, 1 warning`;
+- Ruff, compileall, and `git diff --check`: passed.
+
+The complete source set was synchronized to the online server with the split
+service deployment. Immediately after restart, all three platform services
+were active with zero restarts, OKX entry/training permissions were allowed
+with zero unresolved reconciliation items, and the first 30-minute online
+coverage audit showed zero duplicate analyses within the 10-minute cooldown,
+33 distinct market symbols, and a maximum decision gap of 158 seconds. The
+coverage audit is intentionally not marked complete yet because the new
+service window had only been running for about two minutes; the due backlog and
+continuity gates must be observed from this deployment forward for at least 24
+hours. Model quality gates remain authoritative: the current model is not
+production-authorized while fee-after-return, LCB, and profit-factor blockers
+remain present, so no entry is forced to make the count look healthy.

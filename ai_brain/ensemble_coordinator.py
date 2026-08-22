@@ -159,7 +159,9 @@ class EnsembleCoordinator:
         validation_timing: dict[str, Any] = {
             "_analysis_budget_scope": str(
                 context.get("_analysis_budget_scope") or "shared"
-            )
+            ),
+            "_analysis_deadline_monotonic": context.get("_analysis_deadline_monotonic"),
+            "_analysis_budget_seconds": context.get("_analysis_budget_seconds"),
         }
         cross_validations, consultation = await self.cross_validator.validate_all(
             opinions, validation_timing

@@ -285,6 +285,37 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_service_recovers_missing_horizons_from_persisted_decision() -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=456,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action="long",
+        confidence=0.8,
+        reasoning="durable recovery",
+        position_size_pct=0.05,
+        suggested_leverage=3.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        is_paper=True,
+        created_at=datetime.now(UTC),
+        raw_llm_response={"reason": "recovery"},
+        feature_snapshot={"current_price": 100.0},
+    )
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        return [row]
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    result = await _service(repo).recover_missing_market_samples(limit=10)
+
+    assert result == {"scanned": 1, "recovered": 1, "failed": 0}
+    assert [item["horizon_minutes"] for item in repo.created] == [10, 30]
+    assert all(item["decision_id"] == 456 for item in repo.created)
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_persists_explicit_model_side_for_rules_canary() -> None:
     repo = _FakeRepo()
     feature_vector = SimpleNamespace(current_price=100.0, close=99.0)

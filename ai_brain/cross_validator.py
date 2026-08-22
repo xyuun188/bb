@@ -251,24 +251,52 @@ class CrossValidator:
 
         consultation_started_at = datetime.now(UTC)
         consultation_perf_started = time.perf_counter()
-        consultation_timeout = _consultation_budget_seconds()
         major_conflicts = [v for v in validations if v.get("major_conflict")]
-        try:
-            consultation = await asyncio.wait_for(
-                self.consult_if_needed(
-                    opinions,
-                    validations,
-                    timeout_seconds=consultation_timeout,
-                    capacity_context={
-                        "_analysis_budget_scope": (
-                            timing_context.get("_analysis_budget_scope", "shared")
-                            if isinstance(timing_context, dict)
-                            else "shared"
-                        )
-                    },
-                ),
-                timeout=consultation_timeout,
+        consultation_timeout = _consultation_budget_seconds()
+        analysis_deadline = None
+        if isinstance(timing_context, dict):
+            try:
+                analysis_deadline = float(timing_context.get("_analysis_deadline_monotonic"))
+            except (TypeError, ValueError):
+                analysis_deadline = None
+        remaining_analysis_seconds = None
+        if analysis_deadline and analysis_deadline > 0:
+            remaining_analysis_seconds = max(
+                analysis_deadline - asyncio.get_running_loop().time(),
+                0.0,
             )
+            # A deep consultation requires a real model window. Starting one
+            # with only a few seconds left guarantees an outer cancellation and
+            # turns a useful diagnosis into a misleading timeout.
+            consultation_timeout = min(
+                consultation_timeout,
+                max(remaining_analysis_seconds - 0.25, 0.0),
+            )
+        try:
+            if major_conflicts and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS:
+                consultation = self._fallback_consultation(
+                    major_conflicts,
+                    "deadline",
+                    "分析剩余预算不足以启动完整会诊",
+                    status="skipped",
+                    reason_code="analysis_deadline_budget_exhausted",
+                )
+            else:
+                consultation = await asyncio.wait_for(
+                    self.consult_if_needed(
+                        opinions,
+                        validations,
+                        timeout_seconds=consultation_timeout,
+                        capacity_context={
+                            "_analysis_budget_scope": (
+                                timing_context.get("_analysis_budget_scope", "shared")
+                                if isinstance(timing_context, dict)
+                                else "shared"
+                            )
+                        },
+                    ),
+                    timeout=max(consultation_timeout, 0.1),
+                )
         except TimeoutError:
             logger.warning(
                 "deep consultation timed out; using fallback",
@@ -294,6 +322,15 @@ class CrossValidator:
                 "duration_sec": consultation_duration,
                 "triggered": bool(consultation),
                 "major_conflicts": sum(1 for v in validations if v.get("major_conflict")),
+                "remaining_analysis_seconds": (
+                    round(remaining_analysis_seconds, 3)
+                    if remaining_analysis_seconds is not None
+                    else None
+                ),
+                "budget_exhausted": bool(
+                    major_conflicts
+                    and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS
+                ),
             }
         return validations, consultation
 
@@ -1005,6 +1042,8 @@ class CrossValidator:
         reason: str,
         raw_content: str | None = None,
         attempts: list[dict[str, Any]] | None = None,
+        status: str = "failed",
+        reason_code: str | None = None,
     ) -> dict[str, Any]:
         """Return an observation-only failure record."""
         note = f"{reason}，重大分歧未能完成观察性复核。"
@@ -1012,7 +1051,7 @@ class CrossValidator:
             "model": model,
             "consultation_expert": "trend_expert",
             "consultation_expert_label": "行情方向专家",
-            "status": "failed",
+            "status": status,
             "fallback": True,
             "conflict_note": note,
             "production_permission": False,
@@ -1022,6 +1061,8 @@ class CrossValidator:
             "resolved_action": "unclear",
             "resolved_conflict_pairs": [],
         }
+        if reason_code:
+            result["reason_code"] = reason_code
         if raw_content:
             result["raw_content_preview"] = self._shorten(raw_content, 300)
         return result

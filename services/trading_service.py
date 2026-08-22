@@ -264,7 +264,8 @@ MARKET_CONTEXT_DEADLINE_RESERVE_SECONDS = 0.25
 MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
-MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 6.0
+MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
+MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
 MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
 OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
 MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
@@ -285,6 +286,9 @@ MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
+MARKET_BACKGROUND_PREWARM_INTER_BATCH_SECONDS = 0.75
+MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_BASE_SECONDS = 30.0
+MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_MAX_SECONDS = 300.0
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
 # The market loop runs more frequently than the decision interval. Keep one
@@ -421,6 +425,10 @@ MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 5.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 200
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
+SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS = 300.0
+SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES = 240
+SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT = 25
+SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS = 30.0
 STRATEGY_CONTEXT_IO_CONCURRENCY = 2
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS = 20.0
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS = 300.0
@@ -808,6 +816,7 @@ class TradingService:
         self._market_indicator_prewarm_queue: list[str] = []
         self._market_indicator_prewarm_task: asyncio.Task | None = None
         self._market_indicator_prewarm_last_diagnostics: dict[str, Any] = {}
+        self._market_indicator_prewarm_backoff: dict[str, dict[str, Any]] = {}
         self._vector_memory_context_cache: dict[str, dict[str, Any]] = {}
         self._vector_memory_context_tasks: dict[str, asyncio.Task] = {}
         self._expert_memory_context_cache: dict[str, dict[str, Any]] = {}
@@ -860,7 +869,7 @@ class TradingService:
             wait_sort_reason=self.entry_policy.wait_sort_reason,
         )
         self.entry_candidate_filter = EntryCandidateFilterPolicy(
-            gate_reason=self.entry_policy.gate_reason,
+            gate_reason=self._entry_gate_reason_with_market_boundary,
             market_regime_reason=self.entry_market_regime.reason,
             capacity_reason=self.entry_capacity.reason,
             reserve_capacity=self.entry_capacity.reserve_slot,
@@ -872,7 +881,7 @@ class TradingService:
         )
         self.market_auto_entry_processor = MarketAutoEntryProcessor(
             score_candidate=self.entry_policy.score_candidate,
-            gate_reason=self.entry_policy.gate_reason,
+            gate_reason=self._entry_gate_reason_with_market_boundary,
             immediate_execution=self.entry_immediate_execution,
             annotate_candidate_selection=self._annotate_candidate_selection,
             mark_decision_raw_response=self._mark_decision_raw_response,
@@ -972,10 +981,20 @@ class TradingService:
         self._shadow_backtest_update_last_error: str | None = None
         self._shadow_backtest_update_success_count = 0
         self._shadow_backtest_update_failure_count = 0
+        self._shadow_backtest_market_next_allowed_at: datetime | None = None
+        self._shadow_backtest_market_throttled_count = 0
         self._market_shadow_sample_write_success_count = 0
         self._market_shadow_sample_write_failure_count = 0
         self._market_shadow_sample_write_last_finished_at: datetime | None = None
         self._market_shadow_sample_write_last_error: str | None = None
+        self._market_shadow_sample_queue: asyncio.Queue[dict[str, Any]] | None = None
+        self._market_shadow_sample_worker_task: asyncio.Task | None = None
+        self._market_shadow_sample_queue_enqueued_count = 0
+        self._market_shadow_sample_queue_dropped_count = 0
+        self._market_shadow_sample_recovery_last_result: dict[str, Any] | None = None
+        self._market_shadow_sample_recovery_last_started_at: datetime | None = None
+        self._market_shadow_sample_recovery_next_allowed_at: datetime | None = None
+        self._market_shadow_sample_recovery_throttled_count = 0
         self._stale_entry_expire_task: asyncio.Task | None = None
         self._stale_entry_expire_last_started_at: datetime | None = None
         self._stale_entry_expire_last_finished_at: datetime | None = None
@@ -986,10 +1005,16 @@ class TradingService:
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
         self._auto_scan_feature_cursor = 0
+        # Symbols admitted only to widen market observation must never be
+        # treated as entry candidates later in the same round.  Keep this
+        # runtime set separate from feature vectors so model prompts can still
+        # inspect the market without granting execution permission.
+        self._market_analysis_only_symbols: set[str] = set()
         self._verified_entry_symbols_by_mode: dict[str, set[str]] = {
             "paper": set(),
             "live": set(),
         }
+        self._market_instrument_refresh_status_by_mode: dict[str, dict[str, Any]] = {}
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
         self._market_analysis_task: asyncio.Task | None = None
@@ -2510,7 +2535,123 @@ class TradingService:
 
     async def _run_shadow_backtest_update(self, *, limit: int) -> int:
         self._shadow_backtest_update_last_started_at = datetime.now(UTC)
+        recover = getattr(self.shadow_backtest_service, "recover_missing_market_samples", None)
+        now = datetime.now(UTC)
+        next_allowed = getattr(self, "_market_shadow_sample_recovery_next_allowed_at", None)
+        recovery_due = not isinstance(next_allowed, datetime) or now >= next_allowed
+        if callable(recover) and recovery_due:
+            self._market_shadow_sample_recovery_last_started_at = now
+            self._market_shadow_sample_recovery_next_allowed_at = (
+                now + timedelta(seconds=SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS)
+            )
+            try:
+                recovery = await recover(
+                    lookback_minutes=SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES,
+                    limit=SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
+                )
+            except Exception as exc:
+                recovery = {
+                    "scanned": 0,
+                    "recovered": 0,
+                    "failed": 1,
+                    "error": safe_error_text(exc, limit=180),
+                }
+                logger.error("shadow sample recovery scan failed", error=recovery["error"])
+            recovery["scheduled_interval_seconds"] = (
+                SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS
+            )
+            recovery["scan_limit"] = SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT
+            recovery["throttled"] = False
+            self._market_shadow_sample_recovery_last_result = recovery
+        elif callable(recover):
+            self._market_shadow_sample_recovery_throttled_count = int(
+                getattr(self, "_market_shadow_sample_recovery_throttled_count", 0) or 0
+            ) + 1
+            self._market_shadow_sample_recovery_last_result = {
+                "scanned": 0,
+                "recovered": 0,
+                "failed": 0,
+                "throttled": True,
+                "next_allowed_at": (
+                    next_allowed.isoformat() if isinstance(next_allowed, datetime) else None
+                ),
+                "scheduled_interval_seconds": SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS,
+                "scan_limit": SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
+            }
         return await self.shadow_backtest_service.update_due(limit=limit)
+
+    def _ensure_market_shadow_sample_worker(self) -> None:
+        """Create the bounded writer once; never make market analysis await the DB."""
+
+        for name, default in (
+            ("_market_shadow_sample_write_success_count", 0),
+            ("_market_shadow_sample_write_failure_count", 0),
+            ("_market_shadow_sample_queue_enqueued_count", 0),
+            ("_market_shadow_sample_queue_dropped_count", 0),
+            ("_market_shadow_sample_write_last_error", None),
+            ("_market_shadow_sample_write_last_finished_at", None),
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, default)
+        queue = getattr(self, "_market_shadow_sample_queue", None)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=256)
+            self._market_shadow_sample_queue = queue
+        task = getattr(self, "_market_shadow_sample_worker_task", None)
+        if task is None or task.done():
+            try:
+                task = asyncio.create_task(self._market_shadow_sample_worker_loop())
+            except RuntimeError:
+                return
+            self._market_shadow_sample_worker_task = task
+            task.add_done_callback(_consume_task_result)
+
+    async def _market_shadow_sample_worker_loop(self) -> None:
+        queue = getattr(self, "_market_shadow_sample_queue", None)
+        if queue is None:
+            return
+        while bool(getattr(self, "_running", True)) or not queue.empty():
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except TimeoutError:
+                continue
+            try:
+                last_error: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        await asyncio.wait_for(
+                            self.shadow_backtest_service.create(**payload),
+                            timeout=15.0,
+                        )
+                        self._market_shadow_sample_write_success_count = int(
+                            getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+                        ) + 1
+                        self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
+                        self._market_shadow_sample_write_last_error = None
+                        last_error = None
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 2:
+                            await asyncio.sleep(0.25 * (attempt + 1))
+                if last_error is not None:
+                    self._market_shadow_sample_write_failure_count = int(
+                        getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
+                    ) + 1
+                    self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
+                    self._market_shadow_sample_write_last_error = safe_error_text(
+                        last_error, limit=180
+                    )
+                    logger.error(
+                        "market shadow sample write exhausted retries; durable recovery will retry",
+                        decision_id=payload.get("decision_id"),
+                        symbol=getattr(payload.get("decision"), "symbol", None),
+                        error=self._market_shadow_sample_write_last_error,
+                    )
+            finally:
+                queue.task_done()
 
     async def _persist_market_shadow_sample(
         self,
@@ -2521,58 +2662,37 @@ class TradingService:
         model_mode: str,
         local_ai_tools_context: dict[str, Any] | None,
     ) -> bool:
-        """Persist one delayed market label without holding up the round."""
+        """Queue one delayed label and return immediately to the market round."""
 
+        self._ensure_market_shadow_sample_worker()
+        queue = getattr(self, "_market_shadow_sample_queue", None)
+        if queue is None:
+            return False
+        payload = {
+            "decision_id": decision_id,
+            "decision": decision,
+            "feature_vector": feature_vector,
+            "execution_mode": model_mode,
+            "analysis_type": "market",
+            "local_ai_tools_context": local_ai_tools_context,
+        }
         try:
-            await asyncio.wait_for(
-                self.shadow_backtest_service.create(
-                    decision_id,
-                    decision,
-                    feature_vector,
-                    model_mode,
-                    analysis_type="market",
-                    local_ai_tools_context=local_ai_tools_context,
-                ),
-                timeout=MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS,
-            )
-            self._market_shadow_sample_write_success_count = int(
-                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            self._market_shadow_sample_queue_dropped_count = int(
+                getattr(self, "_market_shadow_sample_queue_dropped_count", 0) or 0
             ) + 1
-            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
-            self._market_shadow_sample_write_last_error = None
-            return True
-        except TimeoutError:
-            self._market_shadow_sample_write_success_count = int(
-                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
-            )
-            self._market_shadow_sample_write_failure_count = int(
-                getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
-            ) + 1
-            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
-            self._market_shadow_sample_write_last_error = "timeout"
-            logger.warning(
-                "market shadow sample write timed out; maintenance will retry from the next decision",
+            self._market_shadow_sample_write_last_error = "queue_full"
+            logger.error(
+                "market shadow sample queue full; durable decision recovery will repair it",
                 symbol=decision.symbol,
                 decision_id=decision_id,
-                timeout_seconds=MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS,
             )
             return False
-        except Exception as exc:
-            self._market_shadow_sample_write_success_count = int(
-                getattr(self, "_market_shadow_sample_write_success_count", 0) or 0
-            )
-            self._market_shadow_sample_write_failure_count = int(
-                getattr(self, "_market_shadow_sample_write_failure_count", 0) or 0
-            ) + 1
-            self._market_shadow_sample_write_last_finished_at = datetime.now(UTC)
-            self._market_shadow_sample_write_last_error = safe_error_text(exc, limit=180)
-            logger.warning(
-                "market shadow sample write failed",
-                symbol=decision.symbol,
-                decision_id=decision_id,
-                error=safe_error_text(exc, limit=180),
-            )
-            return False
+        self._market_shadow_sample_queue_enqueued_count = int(
+            getattr(self, "_market_shadow_sample_queue_enqueued_count", 0) or 0
+        ) + 1
+        return True
 
     def _shadow_backtest_maintenance_status(self) -> dict[str, Any]:
         task = getattr(self, "_shadow_backtest_update_task", None)
@@ -2611,6 +2731,37 @@ class TradingService:
                     else None
                 ),
                 "last_error": getattr(self, "_market_shadow_sample_write_last_error", None),
+                "queue_size": (
+                    getattr(getattr(self, "_market_shadow_sample_queue", None), "qsize", lambda: 0)()
+                ),
+                "queue_enqueued_count": int(
+                    getattr(self, "_market_shadow_sample_queue_enqueued_count", 0) or 0
+                ),
+                "queue_dropped_count": int(
+                    getattr(self, "_market_shadow_sample_queue_dropped_count", 0) or 0
+                ),
+                "recovery_last_result": getattr(
+                    self, "_market_shadow_sample_recovery_last_result", None
+                ),
+                "recovery_last_started_at": (
+                    getattr(self, "_market_shadow_sample_recovery_last_started_at", None).isoformat()
+                    if isinstance(
+                        getattr(self, "_market_shadow_sample_recovery_last_started_at", None),
+                        datetime,
+                    )
+                    else None
+                ),
+                "recovery_next_allowed_at": (
+                    getattr(self, "_market_shadow_sample_recovery_next_allowed_at", None).isoformat()
+                    if isinstance(
+                        getattr(self, "_market_shadow_sample_recovery_next_allowed_at", None),
+                        datetime,
+                    )
+                    else None
+                ),
+                "recovery_throttled_count": int(
+                    getattr(self, "_market_shadow_sample_recovery_throttled_count", 0) or 0
+                ),
             },
             "diagnostic_boundary": (
                 "影子复盘维护只负责训练/记忆回灌，不是开仓门槛；market-only 轮次只触发后台刷新，"
@@ -2653,6 +2804,25 @@ class TradingService:
         if task is not None and not task.done():
             results["shadow_backtest_maintenance"] = self._shadow_backtest_maintenance_status()
             return
+        if analysis_scope == "market":
+            now = datetime.now(UTC)
+            next_allowed = getattr(self, "_shadow_backtest_market_next_allowed_at", None)
+            if isinstance(next_allowed, datetime) and now < next_allowed:
+                self._shadow_backtest_market_throttled_count = int(
+                    getattr(self, "_shadow_backtest_market_throttled_count", 0) or 0
+                ) + 1
+                results["shadow_backtest_maintenance"] = {
+                    **self._shadow_backtest_maintenance_status(),
+                    "started_in_background": False,
+                    "throttled": True,
+                    "scope": analysis_scope,
+                    "next_allowed_at": next_allowed.isoformat(),
+                    "scheduled_interval_seconds": SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS,
+                }
+                return
+            self._shadow_backtest_market_next_allowed_at = (
+                now + timedelta(seconds=SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS)
+            )
 
         update_limit = (
             SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT
@@ -2670,6 +2840,12 @@ class TradingService:
             **self._shadow_backtest_maintenance_status(),
             "started_in_background": True,
             "update_limit": update_limit,
+            "scope": analysis_scope,
+            "scheduled_interval_seconds": (
+                SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS
+                if analysis_scope == "market"
+                else 0.0
+            ),
         }
 
     async def _run_stale_entry_candidate_expire(self) -> int:
@@ -4655,7 +4831,7 @@ class TradingService:
         if policy is not None:
             return policy
         return EntryCandidateFilterPolicy(
-            gate_reason=self.entry_policy.gate_reason,
+            gate_reason=self._entry_gate_reason_with_market_boundary,
             market_regime_reason=self.entry_market_regime.reason,
             capacity_reason=self.entry_capacity.reason,
             reserve_capacity=self.entry_capacity.reserve_slot,
@@ -5097,6 +5273,13 @@ class TradingService:
         self._last_round_finished_at = None
         self._last_round_error = None
         if scope == "market":
+            # Observation-only permissions are scoped to one market round;
+            # never leak a prior ranking pass into a later execution decision.
+            analysis_only_symbols = getattr(self, "_market_analysis_only_symbols", None)
+            if not isinstance(analysis_only_symbols, set):
+                analysis_only_symbols = set()
+                self._market_analysis_only_symbols = analysis_only_symbols
+            analysis_only_symbols.clear()
             self._last_market_round_started_at = started_at
             self._last_market_round_finished_at = None
         elif scope == "position":
@@ -5511,8 +5694,24 @@ class TradingService:
         """Queue shortlist indicator work outside the latency-sensitive market round."""
 
         requested = self.entry_symbol_universe.dedupe_symbols(symbols)
+        now = datetime.now(UTC)
+        deferred_by_backoff: list[str] = []
+        ready_requested: list[str] = []
+        normalize_symbol = getattr(self, "_normalize_position_symbol", lambda value: str(value or ""))
+        backoff = getattr(self, "_market_indicator_prewarm_backoff", {})
+        if not isinstance(backoff, dict):
+            backoff = {}
+            self._market_indicator_prewarm_backoff = backoff
+        for symbol in requested:
+            key = normalize_symbol(symbol)
+            state = backoff.get(key) if key else None
+            next_allowed = state.get("next_allowed_at") if isinstance(state, dict) else None
+            if isinstance(next_allowed, datetime) and now < next_allowed:
+                deferred_by_backoff.append(symbol)
+            else:
+                ready_requested.append(symbol)
         existing = list(getattr(self, "_market_indicator_prewarm_queue", []) or [])
-        queued = self.entry_symbol_universe.dedupe_symbols([*existing, *requested])[
+        queued = self.entry_symbol_universe.dedupe_symbols([*existing, *ready_requested])[
             :MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT
         ]
         self._market_indicator_prewarm_queue = queued
@@ -5525,6 +5724,8 @@ class TradingService:
         return {
             "status": "queued" if requested else "skipped",
             "requested_count": len(requested),
+            "backoff_deferred_count": len(deferred_by_backoff),
+            "backoff_deferred_symbols": deferred_by_backoff[:20],
             "queued_count": len(queued),
             "worker_active": bool(
                 self._market_indicator_prewarm_task
@@ -5547,17 +5748,89 @@ class TradingService:
         ]
 
     async def _market_indicator_prewarm_worker(self) -> None:
-        """Drain rolling prewarm work in bounded batches without blocking analysis."""
+        """Drain rolling prewarm work with bounded pacing and failure backoff."""
 
         try:
             while self._market_indicator_prewarm_queue:
-                batch = self._market_indicator_prewarm_queue[:MARKET_BACKGROUND_PREWARM_BATCH_SIZE]
-                del self._market_indicator_prewarm_queue[: len(batch)]
+                now = datetime.now(UTC)
+                backoff = getattr(self, "_market_indicator_prewarm_backoff", {})
+                ready: list[str] = []
+                next_retry_at: datetime | None = None
+                retained: list[str] = []
+                normalize_symbol = getattr(
+                    self, "_normalize_position_symbol", lambda value: str(value or "")
+                )
+                for symbol in self._market_indicator_prewarm_queue:
+                    key = normalize_symbol(symbol)
+                    state = backoff.get(key) if isinstance(backoff, dict) else None
+                    retry_at = state.get("next_allowed_at") if isinstance(state, dict) else None
+                    if isinstance(retry_at, datetime) and now < retry_at:
+                        retained.append(symbol)
+                        if next_retry_at is None or retry_at < next_retry_at:
+                            next_retry_at = retry_at
+                    else:
+                        ready.append(symbol)
+                if not ready:
+                    self._market_indicator_prewarm_queue = retained
+                    if next_retry_at is not None:
+                        await asyncio.sleep(
+                            min(
+                                max((next_retry_at - now).total_seconds(), 0.05),
+                                MARKET_BACKGROUND_PREWARM_INTER_BATCH_SECONDS * 4,
+                            )
+                        )
+                    continue
+                batch = ready[:MARKET_BACKGROUND_PREWARM_BATCH_SIZE]
+                selected = set(batch)
+                self._market_indicator_prewarm_queue = [
+                    symbol
+                    for symbol in self._market_indicator_prewarm_queue
+                    if symbol not in selected
+                ]
                 diagnostics = await self._prewarm_market_candidate_indicators(batch)
                 diagnostics["background"] = True
                 diagnostics["remaining_queue_count"] = len(self._market_indicator_prewarm_queue)
+                unavailable_symbols = [
+                    str(item.get("symbol") if isinstance(item, dict) else item)
+                    for item in diagnostics.get("unavailable_symbols") or []
+                ]
+                unavailable = {
+                    normalize_symbol(symbol)
+                    for symbol in unavailable_symbols
+                    if normalize_symbol(symbol)
+                }
+                status = str(diagnostics.get("status") or "").lower()
+                now_finished = datetime.now(UTC)
+                for symbol in batch:
+                    key = normalize_symbol(symbol)
+                    if key not in unavailable:
+                        if key:
+                            backoff.pop(key, None)
+                        continue
+                    previous = backoff.get(key, {}) if key else {}
+                    failure_count = int(previous.get("failure_count", 0) or 0) + 1
+                    delay = min(
+                        MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_MAX_SECONDS,
+                        MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_BASE_SECONDS
+                        * (2 ** min(failure_count - 1, 4)),
+                    )
+                    if key:
+                        backoff[key] = {
+                            "failure_count": failure_count,
+                            "last_failure_at": now_finished,
+                            "last_reason": status or "unavailable",
+                            "next_allowed_at": now_finished + timedelta(seconds=delay),
+                        }
+                    if symbol not in self._market_indicator_prewarm_queue:
+                        self._market_indicator_prewarm_queue.append(symbol)
+                if isinstance(backoff, dict):
+                    self._market_indicator_prewarm_backoff = backoff
+                diagnostics["failed_symbols"] = sorted(
+                    symbol for symbol in batch if normalize_symbol(symbol) in unavailable
+                )
+                diagnostics["backoff_count"] = len(backoff) if isinstance(backoff, dict) else 0
                 self._market_indicator_prewarm_last_diagnostics = diagnostics
-                await asyncio.sleep(0)
+                await asyncio.sleep(MARKET_BACKGROUND_PREWARM_INTER_BATCH_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -6605,6 +6878,41 @@ class TradingService:
             suspicious_symbol_policy=EntrySuspiciousSymbolPolicy(self._normalize_position_symbol),
         ).safety_reason(decision)
 
+    def _market_analysis_only_entry_reason(self, decision: DecisionOutput) -> str | None:
+        """Return the hard boundary for observation-only market candidates."""
+
+        if not decision.is_entry:
+            return None
+        symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
+        if symbol not in {
+            self._normalize_position_symbol(item)
+            for item in (getattr(self, "_market_analysis_only_symbols", set()) or set())
+        }:
+            return None
+        raw = self._safe_dict(decision.raw_response)
+        raw["market_analysis_only"] = True
+        raw["market_analysis_only_contract"] = {
+            "selected_for_market_analysis": True,
+            "entry_permission": False,
+            "reason": "ranker_analysis_only_fill",
+        }
+        decision.raw_response = raw
+        return (
+            "该币种仅用于扩大市场观察覆盖，未通过交易候选质量层；"
+            "分析结果不能进入开仓执行链路。"
+        )
+
+    def _entry_gate_reason_with_market_boundary(
+        self,
+        decision: DecisionOutput,
+    ) -> str | None:
+        """Apply the normal entry gate plus the observation-only boundary."""
+
+        observation_reason = self._market_analysis_only_entry_reason(decision)
+        if observation_reason:
+            return observation_reason
+        return self.entry_policy.gate_reason(decision)
+
     async def _today_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
         """Delegate today's long/short realized-PnL feedback to a dedicated service."""
 
@@ -7074,12 +7382,67 @@ class TradingService:
         result = self.entry_feature_ranker.rank(
             feature_vectors,
             limit,
+            # Market analysis coverage is separate from entry permission. The
+            # ranker may fill unused observation slots with valid analysis-only
+            # symbols; execution gates still decide whether an order is allowed.
+            allow_analysis_fallback=True,
         )
+        # A valid snapshot can still fail the dynamic cross-sectional entry
+        # tier. Keep it in the observation pool when the ranker is underfilled;
+        # the execution boundary below marks these symbols observation-only.
+        if len(result.selected) < max(0, int(limit or 0)):
+            selected_keys = {
+                self._normalize_position_symbol(symbol) for symbol in result.selected
+            }
+            fallback_items = [
+                (symbol, feature)
+                for symbol, feature in feature_vectors.items()
+                if self._normalize_position_symbol(symbol) not in selected_keys
+                and self._is_valid_feature_vector(feature)
+            ]
+            fallback_items.sort(
+                key=lambda item: self._feature_opportunity_score(item[1]),
+                reverse=True,
+            )
+            remaining = max(int(limit or 0) - len(result.selected), 0)
+            for symbol, feature in fallback_items[:remaining]:
+                result.selected[symbol] = feature
+            if fallback_items:
+                diagnostics = result.diagnostics
+                existing = list(diagnostics.get("analysis_only_selected_symbols") or [])
+                existing.extend(symbol for symbol, _feature in fallback_items[:remaining])
+                diagnostics["analysis_only_selected_symbols"] = list(dict.fromkeys(existing))
+                diagnostics["analysis_only_selected_count"] = len(
+                    diagnostics["analysis_only_selected_symbols"]
+                )
+                diagnostics["selected"] = len(result.selected)
+                diagnostics["rank_underfilled"] = len(result.selected) < max(
+                    0, int(limit or 0)
+                )
+                diagnostics["rank_underfill_reason"] = (
+                    "insufficient_tradeable_or_secondary_candidates"
+                    if diagnostics["rank_underfilled"]
+                    else ""
+                )
         logger.info(
             "auto opportunity shortlist",
             **result.diagnostics,
         )
         self._last_auto_feature_rank_diagnostics = result.diagnostics
+        selected_symbols = {
+            self._normalize_position_symbol(symbol)
+            for symbol in result.selected
+            if self._normalize_position_symbol(symbol)
+        }
+        analysis_only_symbols = {
+            self._normalize_position_symbol(symbol)
+            for symbol in result.diagnostics.get("analysis_only_selected_symbols", [])
+            if self._normalize_position_symbol(symbol)
+        }
+        self._market_analysis_only_symbols.difference_update(
+            selected_symbols - analysis_only_symbols
+        )
+        self._market_analysis_only_symbols.update(analysis_only_symbols)
         return result.selected
 
     async def _filter_entry_instrument_shortlist(
@@ -7088,81 +7451,102 @@ class TradingService:
         limit: int,
         model_mode: str,
     ) -> dict[str, Any]:
-        """Keep symbols the selected OKX account can address through private APIs."""
+        """Build the observation shortlist and annotate execution eligibility.
+
+        Private OKX availability is an execution permission, not a market
+        observation permission. Unverified instruments remain eligible for
+        read-only analysis and are blocked later by the composed entry gate.
+        """
 
         target = max(0, int(limit or 0))
         if target <= 0 or not feature_vectors:
             return {}
+        analysis_only_symbols = getattr(self, "_market_analysis_only_symbols", None)
+        if not isinstance(analysis_only_symbols, set):
+            analysis_only_symbols = set()
+            self._market_analysis_only_symbols = analysis_only_symbols
         selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
         verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
+        # Private OKX capability checks are execution permissions, not market
+        # observation data. Never wait for a batch of private probes inside
+        # the market-analysis critical path; refresh them independently and
+        # consume only the cache that is already available for this round.
+        executor = None
+        executor_task = asyncio.create_task(self._get_okx_executor_for_mode(selected_mode))
         try:
-            executor = await asyncio.wait_for(
-                self._get_okx_executor_for_mode(selected_mode),
-                timeout=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
+            executor = await asyncio.wait_for(asyncio.shield(executor_task), timeout=0.5)
+        except Exception as exc:
+            if not executor_task.done():
+                def _deferred_executor_ready(task: asyncio.Task) -> None:
+                    try:
+                        ready_executor = task.result()
+                    except (asyncio.CancelledError, Exception) as callback_exc:
+                        logger.warning(
+                            "deferred market instrument executor initialization failed",
+                            mode=selected_mode,
+                            error=safe_error_text(callback_exc, limit=180),
+                        )
+                        return
+                    self._schedule_market_instrument_availability_refresh(
+                        ready_executor,
+                        list(feature_vectors),
+                        target_count=target,
+                        mode=selected_mode,
+                    )
+
+                executor_task.add_done_callback(_deferred_executor_ready)
+            else:
+                _consume_task_result(executor_task)
             logger.warning(
-                "market instrument executor initialization timed out; using verified cache",
+                "market instrument executor unavailable during analysis; using verified cache",
                 mode=selected_mode,
-                timeout_seconds=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
+                error=safe_error_text(exc, limit=180),
             )
-            selected = [symbol for symbol in feature_vectors if symbol in verified_symbols][:target]
-            return {symbol: feature_vectors[symbol] for symbol in selected}
-        shortlist_task = asyncio.create_task(
-            executor.entry_instrument_availability_shortlist(
+
+        if executor is not None:
+            self._schedule_market_instrument_availability_refresh(
+                executor,
                 list(feature_vectors),
                 target_count=target,
-                concurrency=4,
+                mode=selected_mode,
             )
-        )
-        try:
-            done, pending = await asyncio.wait(
-                {shortlist_task},
-                timeout=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
-            )
-        except asyncio.CancelledError:
-            shortlist_task.cancel()
-            shortlist_task.add_done_callback(_consume_task_result)
-            raise
-        if pending:
-            shortlist_task.cancel()
-            shortlist_task.add_done_callback(_consume_task_result)
-            await asyncio.sleep(0)
-            cached_selected = [
-                symbol for symbol in feature_vectors if symbol in verified_symbols
-            ][:target]
-            shortlist = {
-                "selected_symbols": cached_selected,
-                "availability": {
-                    symbol: {
-                        "available": True if symbol in verified_symbols else None,
-                        "reason": (
-                            "cached_okx_private_account_instrument_verified"
-                            if symbol in verified_symbols
-                            else "okx_private_entry_instrument_probe_deferred"
-                        ),
-                        "cache_hit": symbol in verified_symbols,
-                    }
-                    for symbol in feature_vectors
-                },
-                "evaluated_count": len(cached_selected),
-                "probed_count": 0,
-                "cache_hit_count": len(cached_selected),
-                "skipped_after_target_count": max(
-                    len(feature_vectors) - len(cached_selected),
-                    0,
+
+        selected = [symbol for symbol in feature_vectors if symbol in verified_symbols]
+        selected.extend(symbol for symbol in feature_vectors if symbol not in selected)
+        selected = selected[:target]
+        availability = {
+            symbol: {
+                "available": True if symbol in verified_symbols else None,
+                "reason": (
+                    "cached_okx_private_account_instrument_verified"
+                    if symbol in verified_symbols
+                    else "okx_private_entry_instrument_probe_deferred"
                 ),
-                "timeout": True,
+                "cache_hit": symbol in verified_symbols,
+                "analysis_only": symbol not in verified_symbols,
+                "execution_verified": symbol in verified_symbols,
             }
-            logger.warning(
-                "market instrument shortlist timed out; using verified cache",
-                timeout_seconds=MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS,
-                cached_selected_count=len(cached_selected),
-            )
-        else:
-            shortlist = next(iter(done)).result()
+            for symbol in feature_vectors
+        }
+        shortlist = {
+            "selected_symbols": selected,
+            "availability": availability,
+            "evaluated_count": len(verified_symbols.intersection(feature_vectors)),
+            "probed_count": 0,
+            "cache_hit_count": len(verified_symbols.intersection(feature_vectors)),
+            "skipped_after_target_count": max(len(feature_vectors) - len(selected), 0),
+            "timeout": False,
+            "background_refresh_scheduled": executor is not None,
+        }
+        logger.info(
+            "market instrument availability deferred to background refresh",
+            mode=selected_mode,
+            selected_count=len(selected),
+            cached_verified_count=len(verified_symbols.intersection(feature_vectors)),
+            refresh_scheduled=executor is not None,
+        )
         availability = self._safe_dict(shortlist.get("availability"))
         execution_blocked_reasons = {
             "okx_private_entry_instrument_unavailable",
@@ -7180,14 +7564,37 @@ class TradingService:
                 return "execution_unavailable"
             return "analysis_only_execution_unverified"
 
-        selected_order = [
+        # This shortlist controls observation cost only. Execution eligibility
+        # is carried in diagnostics and enforced by the entry gate; dropping
+        # unavailable symbols here underfilled the market loop and created
+        # long gaps between analyses.
+        availability_selected = [
+            str(symbol)
+            for symbol in shortlist.get("selected_symbols") or []
+            if str(symbol) in feature_vectors
+            and candidate_state(str(symbol)) != "execution_unavailable"
+        ]
+        selected_order = list(dict.fromkeys(availability_selected))
+        selected_order.extend(
             str(symbol)
             for symbol in feature_vectors
-            if candidate_state(str(symbol)) != "execution_unavailable"
-        ][:target]
+            if str(symbol) not in selected_order
+            and candidate_state(str(symbol)) != "execution_unavailable"
+        )
+        selected_order.extend(
+            str(symbol)
+            for symbol in feature_vectors
+            if str(symbol) not in selected_order
+        )
+        selected_order = selected_order[:target]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
         selected_states = {symbol: candidate_state(symbol) for symbol in selected_order}
+        self._market_analysis_only_symbols.update(
+            symbol
+            for symbol, state in selected_states.items()
+            if state != "execution_verified"
+        )
         for symbol, facts in availability.items():
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:
@@ -7246,6 +7653,13 @@ class TradingService:
             "target_count": target,
             "unavailable": unavailable,
             "analysis_only_execution_unverified": analysis_only,
+            "background_refresh_status": dict(
+                self._safe_dict(
+                    getattr(self, "_market_instrument_refresh_status_by_mode", {}).get(
+                        selected_mode, {}
+                    )
+                )
+            ),
         }
         diagnostics["selected_before_execution_availability"] = int(
             diagnostics.get("selected") or len(feature_vectors)
@@ -7279,6 +7693,122 @@ class TradingService:
             **diagnostics["execution_availability"],
         )
         return selected
+
+    def _schedule_market_instrument_availability_refresh(
+        self,
+        executor: Any,
+        symbols: list[str],
+        *,
+        target_count: int,
+        mode: str,
+    ) -> None:
+        """Refresh private entry capability without blocking market analysis."""
+
+        tasks = getattr(self, "_market_instrument_refresh_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._market_instrument_refresh_tasks = tasks
+        key = str(mode or "paper")
+        existing = tasks.get(key)
+        if isinstance(existing, asyncio.Task) and not existing.done():
+            return
+
+        async def refresh() -> None:
+            started_at = datetime.now(UTC)
+            status = {
+                "status": "running",
+                "started_at": started_at.isoformat(),
+                "finished_at": None,
+                "evaluated_count": 0,
+                "verified_count": 0,
+                "error": None,
+                "next_retry_at": None,
+            }
+            statuses = getattr(self, "_market_instrument_refresh_status_by_mode", {})
+            if not isinstance(statuses, dict):
+                statuses = {}
+            statuses[key] = status
+            self._market_instrument_refresh_status_by_mode = statuses
+            try:
+                result = await asyncio.wait_for(
+                    executor.entry_instrument_availability_shortlist(
+                        list(dict.fromkeys(symbols))[:MARKET_INSTRUMENT_REFRESH_BATCH_SIZE],
+                        target_count=max(
+                            1,
+                            min(
+                                int(target_count or 1),
+                                len(list(dict.fromkeys(symbols))[:MARKET_INSTRUMENT_REFRESH_BATCH_SIZE]),
+                            ),
+                        ),
+                        concurrency=4,
+                    ),
+                    timeout=max(float(MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS), 0.05),
+                )
+                availability = result.get("availability") if isinstance(result, dict) else {}
+                verified = {
+                    str(symbol)
+                    for symbol, facts in (availability or {}).items()
+                    if isinstance(facts, dict) and facts.get("available") is True
+                }
+                verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+                if not isinstance(verified_by_mode, dict):
+                    verified_by_mode = {}
+                merged = set(verified_by_mode.get(key, set()) or set())
+                for symbol, facts in (availability or {}).items():
+                    if not isinstance(facts, dict):
+                        continue
+                    normalized_symbol = str(symbol)
+                    if facts.get("available") is True:
+                        merged.add(normalized_symbol)
+                    elif facts.get("available") is False:
+                        # A definitive OKX capability response revokes a
+                        # previously cached execution permission. Temporary
+                        # unverified responses do not revoke it.
+                        merged.discard(normalized_symbol)
+                verified_by_mode[key] = merged
+                self._verified_entry_symbols_by_mode = verified_by_mode
+                status.update(
+                    {
+                        "status": "ok",
+                        "finished_at": datetime.now(UTC).isoformat(),
+                        "evaluated_count": int(result.get("evaluated_count") or 0)
+                        if isinstance(result, dict)
+                        else 0,
+                        "verified_count": len(verified),
+                    }
+                )
+                logger.info(
+                    "background market instrument availability refresh completed",
+                    mode=key,
+                    evaluated_count=int(result.get("evaluated_count") or 0)
+                    if isinstance(result, dict)
+                    else 0,
+                    verified_count=len(verified),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = safe_error_text(exc, limit=220)
+                status.update(
+                    {
+                        "status": "timeout" if isinstance(exc, TimeoutError) else "degraded",
+                        "finished_at": datetime.now(UTC).isoformat(),
+                        "error": error,
+                        "next_retry_at": (
+                            datetime.now(UTC) + timedelta(seconds=30)
+                        ).isoformat(),
+                    }
+                )
+                logger.info(
+                    "background market instrument availability refresh degraded",
+                    mode=key,
+                    error=error,
+                    status=status["status"],
+                )
+
+        task = asyncio.create_task(refresh())
+        tasks[key] = task
+        task.add_done_callback(_consume_task_result)
 
     def _market_candidate_funnel_snapshot(
         self,
@@ -7331,6 +7861,19 @@ class TradingService:
             "feature_invalid_count": len(invalid_symbols or []),
             "market_feature_before_rank_count": len(market_feature_vectors_before_rank or {}),
             "market_symbol_budget": int(market_symbol_budget or 0),
+            "market_observation_pool_limit": int(
+                self._safe_dict(analysis_budget_context).get(
+                    "market_observation_pool_limit"
+                )
+                or 0
+            ),
+            "market_execution_analysis_limit": int(
+                self._safe_dict(analysis_budget_context).get(
+                    "market_execution_analysis_limit"
+                )
+                or market_symbol_budget
+                or 0
+            ),
             "rank_selected_count": len(market_feature_vectors_after_rank or {}),
             "rank_tradable_candidates": rank_diagnostics.get("tradable_candidates"),
             "rank_secondary_candidates": rank_diagnostics.get("secondary_candidates"),
@@ -8676,6 +9219,7 @@ class TradingService:
                 new_pair_pause_reason=new_pair_pause_reason,
                 strategy_context=strategy_mode_context,
             )
+            analysis_budget_context["analysis_scope"] = analysis_scope
             market_symbol_budget = int(analysis_budget_context.get("market_symbol_limit") or 0)
             unresolved_market_keys: set[str] = set()
             if run_market_analysis and market_feature_vectors:
@@ -8703,6 +9247,12 @@ class TradingService:
                             market_symbol_budget,
                             len(market_feature_vectors),
                         )
+                    )
+                    analysis_budget_context["market_observation_pool_limit"] = int(
+                        availability_target
+                    )
+                    analysis_budget_context["market_execution_analysis_limit"] = int(
+                        market_symbol_budget
                     )
                     self._set_loop_stage("instrument_shortlist")
                     market_feature_vectors = await self._filter_entry_instrument_shortlist(
@@ -8890,6 +9440,7 @@ class TradingService:
                 target_position_groups=analysis_budget_context.get("target_position_groups"),
                 budget_source=analysis_budget_context.get("budget_source"),
                 reason=analysis_budget_context.get("reason"),
+                analysis_scope=analysis_scope,
             )
             strategy_mode_context["analysis_budget"] = analysis_budget_context
             logger.info(
@@ -9843,6 +10394,7 @@ class TradingService:
         await self.initialize()
         self._running = True
         self._start_time = datetime.now(UTC)
+        self._ensure_market_shadow_sample_worker()
         self._start_ml_auto_train_loop()
 
         logger.info(
@@ -9894,6 +10446,7 @@ class TradingService:
             getattr(self, "_okx_settlement_fact_sync_task", None),
             getattr(self, "_okx_position_settlement_sync_task", None),
             getattr(self, "_shadow_backtest_update_task", None),
+            getattr(self, "_market_shadow_sample_worker_task", None),
             getattr(self, "_stale_entry_expire_task", None),
             getattr(self, "_market_indicator_prewarm_task", None),
         ):
@@ -9912,6 +10465,7 @@ class TradingService:
         self._okx_settlement_fact_sync_task = None
         self._okx_position_settlement_sync_task = None
         self._shadow_backtest_update_task = None
+        self._market_shadow_sample_worker_task = None
         self._stale_entry_expire_task = None
         self._market_indicator_prewarm_task = None
         market_entry_tasks = list(self._market_entry_task_store().values())

@@ -1275,6 +1275,45 @@ async def test_market_candidate_prewarm_runs_in_background_queue() -> None:
     assert service._market_indicator_prewarm_queue == []
 
 
+@pytest.mark.asyncio
+async def test_market_candidate_prewarm_backoff_normalizes_unavailable_symbols() -> None:
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service._market_indicator_prewarm_queue = ["BTC/USDT"]
+    service._market_indicator_prewarm_backoff = {}
+    service._market_indicator_prewarm_last_diagnostics = {}
+    service._normalize_position_symbol = lambda value: str(value or "").replace(
+        "-SWAP", ""
+    ).replace("-", "/").upper()
+    started = asyncio.Event()
+
+    async def prewarm(symbols: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        started.set()
+        return {
+            "status": "ok",
+            "requested_count": len(symbols),
+            "available_count": 0,
+            "unavailable_symbols": [{"symbol": "BTC-USDT-SWAP"}],
+        }
+
+    service.data_service = SimpleNamespace(prewarm_indicator_snapshots=prewarm)
+    task = asyncio.create_task(service._market_indicator_prewarm_worker())
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert service._market_indicator_prewarm_last_diagnostics["failed_symbols"] == [
+        "BTC/USDT"
+    ]
+    assert service._market_indicator_prewarm_queue == ["BTC/USDT"]
+    assert service._market_indicator_prewarm_backoff["BTC/USDT"]["failure_count"] == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 def test_complete_market_indicator_snapshot_does_not_need_background_prewarm() -> None:
     features = {
         "BTC/USDT": SimpleNamespace(
@@ -1583,28 +1622,22 @@ async def test_shadow_backtest_maintenance_reuses_running_background_task() -> N
 
 
 @pytest.mark.asyncio
-async def test_market_shadow_sample_write_has_an_independent_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_market_shadow_sample_write_is_queued_without_blocking_round() -> None:
     service = TradingService.__new__(TradingService)
-    cancelled = asyncio.Event()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
 
     class SlowShadowBacktestService:
         async def create(self, *_args: Any, **_kwargs: Any) -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            started.set()
+            await release.wait()
+            completed.set()
+            return True
 
     service.shadow_backtest_service = SlowShadowBacktestService()
-    monkeypatch.setattr(
-        trading_service,
-        "MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS",
-        0.01,
-    )
-
-    await service._persist_market_shadow_sample(
+    started_at = asyncio.get_running_loop().time()
+    queued = await service._persist_market_shadow_sample(
         decision_id=9,
         decision=_decision(Action.HOLD),
         feature_vector=SimpleNamespace(symbol="BTC/USDT", current_price=100.0),
@@ -1612,12 +1645,21 @@ async def test_market_shadow_sample_write_has_an_independent_timeout(
         local_ai_tools_context={},
     )
 
-    await asyncio.wait_for(cancelled.wait(), timeout=0.2)
-    assert service._market_shadow_sample_write_success_count == 0
-    assert service._market_shadow_sample_write_failure_count == 1
-    assert service._shadow_backtest_maintenance_status()["market_shadow_sample_write"][
-        "last_error"
-    ] == "timeout"
+    assert queued is True
+    assert asyncio.get_running_loop().time() - started_at < 0.1
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    assert not completed.is_set()
+
+    release.set()
+    await asyncio.wait_for(completed.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+    assert service._market_shadow_sample_write_success_count == 1
+    assert service._market_shadow_sample_write_failure_count == 0
+    worker = service._market_shadow_sample_worker_task
+    assert worker is not None
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
 
 
 @pytest.mark.asyncio
@@ -3753,17 +3795,18 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
 
     selected = await service._filter_entry_instrument_shortlist(features, 2, model_mode)
 
-    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    assert list(selected) == ["PI/USDT", "BTC/USDT"]
     assert selected_modes == [model_mode]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["selected"] == 2
-    assert diagnostics["execution_availability"]["probed_count"] == 4
-    assert diagnostics["execution_availability"]["available_count"] == 2
+    assert diagnostics["execution_availability"]["probed_count"] == 0
+    assert diagnostics["execution_availability"]["available_count"] == 0
     assert diagnostics["execution_availability"]["mode"] == model_mode
+    await asyncio.sleep(0)
     assert service._verified_entry_symbols_by_mode[model_mode] == {"BTC/USDT", "ETH/USDT"}
     pi = next(item for item in diagnostics["ranked_symbol_sample"] if item["symbol"] == "PI/USDT")
-    assert pi["selected"] is False
-    assert pi["non_selected_reason"] == "execution_instrument_unavailable"
+    assert pi["selected"] is True
+    assert pi["analysis_only"] is True
     assert not hasattr(TradingService, "_is_pending_execution_reason")
     assert not hasattr(TradingService, "_pending_execution_failed_reason")
     assert not hasattr(TradingService, "_action_label")
@@ -3782,16 +3825,12 @@ async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_c
         ],
     }
     service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT"}}
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
+    refresh_started = asyncio.Event()
 
     class SlowExecutor:
         async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                cleanup_started.set()
-                await release_cleanup.wait()
+            refresh_started.set()
+            await asyncio.sleep(60)
             return {}
 
     async def executor_provider(_mode: str) -> SlowExecutor:
@@ -3813,16 +3852,16 @@ async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_c
     elapsed = asyncio.get_running_loop().time() - started
 
     assert list(selected) == ["BTC/USDT", "ETH/USDT"]
-    assert cleanup_started.is_set()
+    await asyncio.sleep(0)
+    assert refresh_started.is_set()
     assert elapsed < 0.2
     assert service._last_auto_feature_rank_diagnostics["execution_availability"][
         "timeout"
-    ] is True
+    ] is False
     diagnostics = service._last_auto_feature_rank_diagnostics["execution_availability"]
     assert diagnostics["execution_verified_selected_count"] == 1
     assert diagnostics["analysis_only_selected_count"] == 1
-    release_cleanup.set()
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.06)
 
 
 @pytest.mark.asyncio
@@ -3889,7 +3928,7 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
         "paper",
     )
 
-    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    assert list(selected) == ["BTC/USDT", "PI/USDT"]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 2
     assert diagnostics["execution_availability"]["execution_verified_selected_count"] == 0
@@ -3898,10 +3937,8 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
     assert ranked["BTC/USDT"]["execution_candidate_state"] == (
         "analysis_only_execution_unverified"
     )
-    assert ranked["PI/USDT"]["selected"] is False
-    assert ranked["PI/USDT"]["non_selected_reason"] == (
-        "execution_instrument_unavailable"
-    )
+    assert ranked["PI/USDT"]["selected"] is True
+    assert ranked["PI/USDT"]["analysis_only"] is True
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():

@@ -85,7 +85,10 @@ class AutoScanParams:
 class MarketAnalysisSelectionParams:
     """Expert-analysis allocation controls that do not grant trade permission."""
 
-    candidate_pool_multiplier: int = 3
+    # Keep a broad observation pool so cooldown on the highest-ranked symbols
+    # cannot starve the rotating market universe.
+    candidate_pool_multiplier: int = 8
+    candidate_pool_minimum: int = 12
     coverage_slots: int = 1
     single_slot_coverage_interval: int = 3
     coverage_target_seconds: int = 30 * 60

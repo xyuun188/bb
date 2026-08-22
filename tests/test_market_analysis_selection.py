@@ -233,6 +233,26 @@ def test_recent_unchanged_candidate_cannot_fill_budget_over_fresh_candidate() ->
 def test_candidate_pool_expands_before_final_expert_limit() -> None:
     policy = _policy(candidate_pool_multiplier=3)
 
-    assert policy.candidate_pool_limit(3, 20) == 9
+    assert policy.candidate_pool_limit(3, 20) == 12
     assert policy.candidate_pool_limit(3, 5) == 5
     assert policy.candidate_pool_limit(0, 20) == 0
+
+
+def test_coverage_backlog_reserves_two_slots_for_final_limit_three() -> None:
+    now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
+    policy = _policy(coverage_target_seconds=30 * 60)
+    old_a = _feature("SOL/USDT", 2.0)
+    old_b = _feature("XRP/USDT", 1.0)
+    fresh = _feature("BTC/USDT", 10.0)
+    policy.remember("SOL/USDT", old_a, observed_at=now - timedelta(minutes=45))
+    policy.remember("XRP/USDT", old_b, observed_at=now - timedelta(minutes=40))
+    policy.remember("BTC/USDT", fresh, observed_at=now - timedelta(minutes=2))
+
+    result = policy.select(
+        {"BTC/USDT": fresh, "SOL/USDT": old_a, "XRP/USDT": old_b},
+        3,
+        now=now,
+    )
+
+    assert result.diagnostics["coverage_selected_symbols"] == ["SOL/USDT", "XRP/USDT"]
+    assert result.diagnostics["coverage_due_unselected_symbols"] == []

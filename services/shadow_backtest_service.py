@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 
-from ai_brain.base_model import DecisionOutput
+from ai_brain.base_model import Action, DecisionOutput
 from core.market_facts import (
     build_market_fact,
     build_shadow_market_fact_contract,
@@ -464,10 +464,10 @@ class ShadowBacktestService:
         execution_mode: str,
         analysis_type: str = "market",
         local_ai_tools_context: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """Record pending shadow samples for market-analysis decisions."""
         if analysis_type != "market":
-            return
+            return False
         entry_price = self.float_parser(
             getattr(feature_vector, "current_price", 0.0)
             or getattr(feature_vector, "close", 0.0)
@@ -475,7 +475,7 @@ class ShadowBacktestService:
             0.0,
         )
         if entry_price <= 0:
-            return
+            return False
 
         now = datetime.now(UTC)
         try:
@@ -548,12 +548,79 @@ class ShadowBacktestService:
                             "label_version": SHADOW_LABEL_VERSION,
                         }
                     )
+            return True
         except Exception as exc:
-            logger.debug(
-                "failed to create shadow backtests",
+            logger.warning(
+                "failed to create shadow backtests; caller will retry",
                 symbol=decision.symbol,
+                decision_id=decision_id,
                 error=safe_error_text(exc),
             )
+            raise
+
+    async def recover_missing_market_samples(
+        self,
+        *,
+        lookback_minutes: int = 180,
+        limit: int = 200,
+    ) -> dict[str, int]:
+        """Rebuild missing/partial samples from durable AI decisions.
+
+        Market decisions are persisted before this method is called.  A fresh
+        session reads only decisions with fewer than the configured horizons and
+        then reuses ``create`` so duplicate recovery is harmless.
+        """
+
+        since = datetime.now(UTC) - timedelta(minutes=max(int(lookback_minutes or 1), 1))
+        async with self.session_factory() as session:
+            repo = self.repository_factory(session)
+            finder = getattr(repo, "get_market_decisions_missing_shadow_samples", None)
+            if not callable(finder):
+                return {"scanned": 0, "recovered": 0, "failed": 0}
+            rows = await finder(
+                since=since,
+                horizon_count=len(self.horizons_minutes),
+                limit=max(int(limit or 1), 1),
+            )
+
+        recovered = 0
+        failed = 0
+        for row in rows:
+            raw_action = str(getattr(row, "action", "hold") or "hold")
+            decision = DecisionOutput(
+                model_name=str(getattr(row, "model_name", "") or "ensemble_trader"),
+                symbol=str(getattr(row, "symbol", "") or ""),
+                action=Action.from_string(raw_action),
+                confidence=float(getattr(row, "confidence", 0.0) or 0.0),
+                reasoning=str(getattr(row, "reasoning", "") or ""),
+                position_size_pct=float(getattr(row, "position_size_pct", 0.0) or 0.0),
+                suggested_leverage=float(getattr(row, "suggested_leverage", 1.0) or 1.0),
+                stop_loss_pct=float(getattr(row, "stop_loss_pct", 0.0) or 0.0),
+                take_profit_pct=float(getattr(row, "take_profit_pct", 0.0) or 0.0),
+                timestamp=getattr(row, "created_at", None) or datetime.now(UTC),
+                raw_response=(
+                    dict(getattr(row, "raw_llm_response", {}) or {})
+                    if isinstance(getattr(row, "raw_llm_response", None), dict)
+                    else {}
+                ),
+                feature_snapshot=(
+                    dict(getattr(row, "feature_snapshot", {}) or {})
+                    if isinstance(getattr(row, "feature_snapshot", None), dict)
+                    else {}
+                ),
+            )
+            try:
+                created = await self.create(
+                    int(getattr(row, "id", 0) or 0),
+                    decision,
+                    decision.feature_snapshot or {},
+                    "paper" if bool(getattr(row, "is_paper", True)) else "live",
+                    analysis_type="market",
+                )
+                recovered += 1 if created else 0
+            except Exception:
+                failed += 1
+        return {"scanned": len(rows), "recovered": recovered, "failed": failed}
 
     async def update_due(self, limit: int = 200) -> int:
         """Complete due samples without holding a database session during OKX reads."""

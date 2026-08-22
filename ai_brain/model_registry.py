@@ -571,12 +571,24 @@ class ModelRegistry:
                 "duration_sec": duration,
             }
             if isinstance(result, DecisionOutput):
+                fallback_status = ""
+                if isinstance(result.raw_response, dict) and result.raw_response.get(
+                    "local_fallback"
+                ):
+                    fallback_status = str(
+                        result.raw_response.get("call_failure_status") or "call_failed"
+                    )
                 timing.update(
                     {
                         "action": result.action.value,
                         "confidence": result.confidence,
+                        "status": fallback_status or timing["status"],
                     }
                 )
+                if fallback_status:
+                    timing["reason"] = str(
+                        result.raw_response.get("error") or result.reasoning or ""
+                    )[:240]
                 if isinstance(result.raw_response, dict):
                     provider_model = result.raw_response.get("provider_model")
                     fallback_from = result.raw_response.get("fallback_from")

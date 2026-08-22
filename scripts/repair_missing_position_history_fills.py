@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Backfill OKX fills missing from historical-position evidence links.
 
 The regular order-fact sync starts from local order ids.  A historical OKX
@@ -14,12 +15,25 @@ import argparse
 import asyncio
 import json
 import math
+import sys
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from sqlalchemy import select
 
@@ -362,14 +376,10 @@ def _order_fill_fact_needs_refresh(
 
 
 def _plan_needs_history_rebuild(plan: RebuildPlan, history: OkxPositionHistory) -> bool:
-    if not plan.changed:
-        return False
-    current_evidence_gaps = _tokens(history.evidence_gaps)
-    missing_current_links = bool(
-        (plan.entry_target_contracts > 0 and not plan.old_entry_order_ids)
-        or (plan.close_target_contracts > 0 and not plan.old_close_order_ids)
-    )
-    return bool(current_evidence_gaps or missing_current_links)
+    # The canonical fill subset is deterministic. Any complete changed plan
+    # must be replayed, including an old subset that happened to have no gap
+    # marker; otherwise newly discovered partial fills remain invisible.
+    return bool(plan.changed and not plan.evidence_gaps)
 
 
 async def _load_data(days: int) -> tuple[list[OkxPositionHistory], list[Position], list[Order]]:

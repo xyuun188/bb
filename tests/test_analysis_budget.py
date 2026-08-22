@@ -46,6 +46,21 @@ def test_strategy_learning_cannot_restore_fixed_roster_targets() -> None:
     assert result["market_symbol_limit"] <= 8
 
 
+def test_market_only_budget_is_independent_from_open_position_snapshot() -> None:
+    result = _policy().context(
+        [{"symbol": "BTC/USDT", "model_name": "ensemble_trader"}],
+        {},
+        base_market_limit=20,
+        run_position_analysis=False,
+        run_market_analysis=True,
+    )
+
+    assert result["risk_level"] == "market_only"
+    assert result["market_limit_policy"] == "market_only_independent_budget"
+    assert result["market_symbol_limit"] == 5
+    assert result["position_group_count"] == 1
+
+
 def test_account_pause_still_zeroes_analysis_budget() -> None:
     result = _policy().context(
         [],

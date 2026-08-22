@@ -170,3 +170,49 @@ def test_fallback_indicator_does_not_pollute_cross_sectional_thresholds() -> Non
         if item["symbol"] == "KAITO/USDT"
     )
     assert fallback_metrics["indicator_snapshot_quality"] == "fallback_market_anchor"
+
+
+def test_analysis_fallback_fills_observation_slots_without_entry_permission() -> None:
+    features = {
+        "A/USDT": _feature("A/USDT", volume_ratio=0.01),
+        "B/USDT": _feature("B/USDT", volume_ratio=0.02),
+        "C/USDT": _feature("C/USDT", volume_ratio=0.30),
+        "D/USDT": _feature("D/USDT", volume_ratio=0.40),
+    }
+
+    strict = _ranker().rank(features, 4)
+    assert "A/USDT" not in strict.selected
+
+    result = _ranker().rank(features, 4, allow_analysis_fallback=True)
+
+    assert list(result.selected) == ["D/USDT", "C/USDT", "B/USDT", "A/USDT"]
+    assert result.diagnostics["analysis_only_selected_count"] == 1
+    assert result.diagnostics["analysis_only_selected_symbols"] == ["A/USDT"]
+    diagnostic = next(
+        item for item in result.diagnostics["symbols"] if item["symbol"] == "A/USDT"
+    )
+    assert diagnostic["selection_tier"] == "analysis_only_fill"
+    assert diagnostic["non_selected_reason"] == "selected_for_market_analysis_only"
+    assert diagnostic["filter_reasons"] == ["analysis_volume_ratio_below_floor"]
+
+
+def test_analysis_fallback_still_excludes_missing_market_anchor() -> None:
+    missing = _feature(
+        "SOL/USDT",
+        current_price=0.0,
+        close=0.0,
+        volume_24h=0.0,
+        indicator_snapshot_available=False,
+        technical_indicator_timeframe="",
+        short_returns_timeframe="",
+    )
+
+    result = _ranker().rank(
+        {"SOL/USDT": missing},
+        1,
+        allow_analysis_fallback=True,
+    )
+
+    assert result.selected == {}
+    assert result.diagnostics["analysis_only_selected_count"] == 0
+    assert result.diagnostics["rank_underfill_reason"] == "missing_indicator_snapshot"

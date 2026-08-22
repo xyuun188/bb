@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-08-21.strict-analysis-cooldown.v7"
+    VERSION = "2026-08-22.coverage-backlog.v8"
 
     def __init__(
         self,
@@ -97,7 +97,9 @@ class MarketAnalysisSelectionPolicy:
         total = max(0, int(candidate_count or 0))
         if final <= 0 or total <= 0:
             return 0
-        return min(total, max(final, final * max(int(self.params.candidate_pool_multiplier), 1)))
+        multiplier = max(int(self.params.candidate_pool_multiplier), 1)
+        minimum = max(int(getattr(self.params, "candidate_pool_minimum", 0) or 0), final)
+        return min(total, max(final * multiplier, minimum))
 
     def select(
         self,
@@ -140,9 +142,24 @@ class MarketAnalysisSelectionPolicy:
 
         self._selection_round += 1
         coverage_candidates = [row for row in eligible_ranked if bool(row["coverage_due"])]
+        aged_coverage_candidates = [
+            row for row in coverage_candidates if not bool(row.get("never_analyzed"))
+        ]
+        oldest_due_age_seconds = max(
+            (
+                _safe_float(row.get("recent_age_seconds"), 0.0)
+                for row in aged_coverage_candidates
+            ),
+            default=0.0,
+        )
         coverage_slots = self._coverage_slot_count(
             final_limit,
             has_coverage_candidates=bool(coverage_candidates),
+            # Never-analyzed symbols are already handled by the normal
+            # discovery slot.  Only previously observed symbols contribute to
+            # the backlog pressure that reserves an extra coverage slot.
+            coverage_due_count=len(aged_coverage_candidates),
+            oldest_due_age_seconds=oldest_due_age_seconds,
         )
         advantage_slots = final_limit - coverage_slots
         selected_rows = eligible_ranked[:advantage_slots]
@@ -153,7 +170,11 @@ class MarketAnalysisSelectionPolicy:
         coverage_ranked = sorted(
             (row for row in coverage_candidates if str(row["symbol_key"]) not in selected_keys),
             key=lambda row: (
-                bool(row["never_analyzed"]),
+                # Previously observed overdue symbols must converge before a
+                # never-analyzed discovery row can consume the same coverage
+                # slot.  Fresh discovery still remains eligible through the
+                # normal advantage slot and the bounded fallback below.
+                not bool(row["never_analyzed"]),
                 _safe_float(row["recent_age_seconds"], float("inf")),
                 _safe_float(row["evaluation_score"]),
             ),
@@ -167,7 +188,10 @@ class MarketAnalysisSelectionPolicy:
         coverage_assigned = sum(row.get("selection_role") == "coverage" for row in selected_rows)
         if coverage_assigned < coverage_slots:
             for row in reversed(selected_rows):
-                if not bool(row["coverage_due"]):
+                if (
+                    not bool(row["coverage_due"])
+                    or row.get("selection_role") == "coverage"
+                ):
                     continue
                 row["selection_role"] = "coverage"
                 coverage_assigned += 1
@@ -206,6 +230,8 @@ class MarketAnalysisSelectionPolicy:
         final_limit: int,
         *,
         has_coverage_candidates: bool,
+        coverage_due_count: int = 0,
+        oldest_due_age_seconds: float = 0.0,
     ) -> int:
         if not has_coverage_candidates or final_limit <= 0:
             return 0
@@ -213,7 +239,20 @@ class MarketAnalysisSelectionPolicy:
         if configured <= 0:
             return 0
         if final_limit > 1:
-            return min(configured, final_limit - 1)
+            # One coverage slot is enough while the queue is healthy.  Once
+            # due coverage accumulates, reserve a second bounded slot so a
+            # large backlog converges inside the 30-minute contract without
+            # turning the market loop into a coverage-only loop.
+            backlog_slots = 1 if coverage_due_count > 1 else 0
+            overdue_slots = (
+                1
+                if oldest_due_age_seconds >= float(self.params.coverage_target_seconds) * 1.5
+                else 0
+            )
+            return min(
+                final_limit - 1,
+                max(configured, configured + backlog_slots + overdue_slots),
+            )
         interval = max(int(self.params.single_slot_coverage_interval), 1)
         return 1 if self._selection_round % interval == 0 else 0
 

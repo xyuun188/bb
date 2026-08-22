@@ -222,6 +222,8 @@ class EntryFeatureRankerPolicy:
         self,
         feature_vectors: dict[str, Any],
         limit: int,
+        *,
+        allow_analysis_fallback: bool = False,
     ) -> EntryFeatureRankResult:
         all_items = list(feature_vectors.items())
         dynamic_policy = self._cross_sectional_policy(feature_vectors)
@@ -273,8 +275,22 @@ class EntryFeatureRankerPolicy:
             if len(selected_items) >= limit:
                 break
             selected_items.extend(bucket[: max(limit - len(selected_items), 0)])
+        analysis_only_items: list[tuple[str, Any]] = []
+        if allow_analysis_fallback and len(selected_items) < max(0, int(limit or 0)):
+            # Market observation must not disappear just because a symbol is
+            # below the entry-quality cross-section. Keep invalid or missing
+            # anchors excluded; execution eligibility remains a later gate.
+            analysis_only_items = [
+                item
+                for item in ranked_filtered
+                if self.is_auto_analysis_candidate_feature(item[1])
+            ]
+            selected_items.extend(
+                analysis_only_items[: max(limit - len(selected_items), 0)]
+            )
         selected = dict(selected_items)
         selected_symbols = {symbol for symbol, _ in selected_items}
+        analysis_only_symbols = {symbol for symbol, _ in analysis_only_items}
 
         def symbol_diagnostic(
             symbol: str,
@@ -283,14 +299,18 @@ class EntryFeatureRankerPolicy:
             selected_item: bool,
         ) -> dict[str, Any]:
             raw_score = self.feature_opportunity_score(feature)
-            if symbol in tradable_symbols:
+            if symbol in analysis_only_symbols:
+                tier = "analysis_only_fill"
+            elif symbol in tradable_symbols:
                 tier = "hard_filter"
             elif symbol in soft_symbols:
                 tier = "secondary_fill"
             else:
                 tier = "filtered_out"
             filter_diag = filter_diagnostics.get(symbol, {})
-            if selected_item:
+            if selected_item and symbol in analysis_only_symbols:
+                reason = "selected_for_market_analysis_only"
+            elif selected_item:
                 reason = "selected_for_market_analysis"
             elif tier == "filtered_out":
                 reason = "feature_filter_rejected"
@@ -305,7 +325,11 @@ class EntryFeatureRankerPolicy:
                 "non_selected_reason": reason,
                 "filter_reasons": list(
                     filter_diag.get(
-                        ("analysis_reasons" if tier == "filtered_out" else "tradable_reasons"),
+                        (
+                            "analysis_reasons"
+                            if tier in {"filtered_out", "analysis_only_fill"}
+                            else "tradable_reasons"
+                        ),
                         [],
                     )
                 ),
@@ -326,7 +350,7 @@ class EntryFeatureRankerPolicy:
                 "change_24h": round(_feature_float(feature, "change_24h_pct"), 2),
             }
 
-        ranked_candidates = [*ranked_tradable, *ranked_soft]
+        ranked_candidates = [*ranked_tradable, *ranked_soft, *analysis_only_items]
         rank_sample_items = []
         seen_symbols: set[str] = set()
         for symbol, feature in [*selected_items, *ranked_candidates]:
@@ -357,6 +381,12 @@ class EntryFeatureRankerPolicy:
             "tradable_candidates": len(tradable_items),
             "secondary_candidates": len(soft_items),
             "filtered_out_candidates": len(filtered_items),
+            "analysis_only_candidates": len(analysis_only_items),
+            "analysis_only_selected_count": len(analysis_only_items),
+            "analysis_only_selected_symbols": [
+                symbol for symbol, _feature in analysis_only_items
+            ],
+            "analysis_fallback_enabled": bool(allow_analysis_fallback),
             "dynamic_policy": {
                 "version": "2026-07-12.dynamic-market-cross-section.v1",
                 "values": {name: item.to_dict() for name, item in dynamic_policy.items()},

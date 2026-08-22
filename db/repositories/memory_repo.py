@@ -11,6 +11,7 @@ from core.training_contracts import (
     is_authoritative_expert_memory_extra,
 )
 from db.repositories.base import BaseRepository
+from models.decision import AIDecision
 from models.learning import ExpertMemory, ShadowBacktest, TradeReflection
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
@@ -234,6 +235,41 @@ class MemoryRepository(BaseRepository):
             )
             .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
             .limit(max(int(limit or 200), 1))
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_market_decisions_missing_shadow_samples(
+        self,
+        *,
+        since: datetime,
+        horizon_count: int,
+        limit: int = 200,
+    ) -> list[AIDecision]:
+        """Find persisted market decisions whose delayed samples are incomplete.
+
+        The query deliberately checks the expected horizon count instead of only
+        looking for a completely missing decision.  It therefore repairs partial
+        writes after a process restart while the shadow repository's unique index
+        keeps the operation idempotent.
+        """
+
+        expected = max(int(horizon_count or 0), 1)
+        shadow_count = (
+            select(func.count(ShadowBacktest.id))
+            .where(ShadowBacktest.decision_id == AIDecision.id)
+            .correlate(AIDecision)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(AIDecision)
+            .where(
+                AIDecision.analysis_type == "market",
+                AIDecision.created_at >= since,
+                shadow_count < expected,
+            )
+            .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
+            .limit(max(int(limit or 1), 1))
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

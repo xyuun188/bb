@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -188,6 +189,37 @@ def shared_llm_capacity_slot(context: dict[str, Any]) -> _ScopedLLMSlot:
     """Return the same provider-capacity slot used by every expert call."""
 
     return _LLM_CAPACITY.slot(context)
+
+
+@asynccontextmanager
+async def _bounded_llm_capacity_slot(context: dict[str, Any]):
+    """Acquire shared capacity without allowing queue wait to consume a round.
+
+    Model inference already honors ``_analysis_deadline_monotonic``.  The
+    previous implementation only bounded the request after acquisition, so a
+    saturated shared semaphore could consume the entire symbol budget first.
+    """
+
+    slot = _LLM_CAPACITY.slot(context)
+    acquired = False
+    try:
+        try:
+            deadline = float(context.get("_analysis_deadline_monotonic"))
+        except (TypeError, ValueError):
+            deadline = 0.0
+        if deadline > 0:
+            remaining = max(
+                deadline - asyncio.get_running_loop().time() - 0.1,
+                0.05,
+            )
+            await asyncio.wait_for(slot.__aenter__(), timeout=remaining)
+        else:
+            await slot.__aenter__()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            await slot.__aexit__(None, None, None)
 
 ROLE_TO_CROSS_TARGET = {
     "trend_direction": "trend",
@@ -1222,7 +1254,7 @@ class LLMAgent(AbstractAIModel):
                 response_contract: dict[str, Any] = {}
                 try:
                     messages = _messages_for_model(system_prompt, user_prompt, model_name)
-                    async with _LLM_CAPACITY.slot(context):
+                    async with _bounded_llm_capacity_slot(context):
                         if _LLM_CALL_DELAY:
                             await asyncio.sleep(_LLM_CALL_DELAY)
                         request = llm.ainvoke(messages)
@@ -1358,7 +1390,7 @@ class LLMAgent(AbstractAIModel):
                 prompt,
                 self._model_name,
             )
-            async with _LLM_CAPACITY.slot(context):
+            async with _bounded_llm_capacity_slot(context):
                 if _LLM_CALL_DELAY:
                     await asyncio.sleep(_LLM_CALL_DELAY)
                 batch_llm = self._create_llm(
@@ -1663,6 +1695,13 @@ class LLMAgent(AbstractAIModel):
                 "production_eligible": False,
                 "provider_model": self._model_name,
                 "fallback_reason": "model_output_unavailable",
+                "call_failure_status": (
+                    "timeout"
+                    if "timeout" in str(error or "").lower()
+                    or "timed out" in str(error or "").lower()
+                    or "瓒呮椂" in str(error or "")
+                    else "call_failed"
+                ),
                 "error": error,
             },
             feature_snapshot=snapshot,

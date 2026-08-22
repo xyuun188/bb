@@ -148,3 +148,26 @@ def test_trading_service_entry_candidate_filter_delegates_to_policy() -> None:
         == "filtered"
     )
     assert calls == [(candidates, {"strategy": "x"})]
+
+
+def test_market_analysis_only_candidate_is_blocked_before_execution() -> None:
+    service = object.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    decision = _decision("BTC/USDT")
+
+    reason = service._entry_gate_reason_with_market_boundary(decision)
+
+    assert reason == "该币种仅用于扩大市场观察覆盖，未通过交易候选质量层；分析结果不能进入开仓执行链路。"
+    assert decision.raw_response["market_analysis_only"] is True
+    assert decision.raw_response["market_analysis_only_contract"] == {
+        "selected_for_market_analysis": True,
+        "entry_permission": False,
+        "reason": "ranker_analysis_only_fill",
+    }

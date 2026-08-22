@@ -11,6 +11,7 @@ from db.session import close_db, get_session_ctx, init_db
 from models.trade import OkxPositionHistory, Position
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import (
+    DISTINCT_CLOSED_FRAGMENT_REACTIVATED_REASON,
     DUPLICATE_CLOSED_POSITION_REASON,
     POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
     POSITION_HISTORY_QUARANTINE_RETRY_SECONDS,
@@ -23,7 +24,11 @@ from services.okx_position_settlement_sync import (
     SettlementCandidate,
     SettlementFailure,
     _claim_history_row_for_position,
+    _final_fragment_requires_quantity_repair,
+    _group_candidates_by_lifecycle,
     _match_position_history_row,
+    _prepare_lifecycle_allocations,
+    _reactivate_distinct_superseded_fragment,
 )
 
 
@@ -691,3 +696,189 @@ def test_official_history_row_is_not_reused_by_another_local_position() -> None:
     reused = _match_position_history_row(second, rows, inst_id="ADA-USDT-SWAP")
     assert isinstance(reused, SettlementFailure)
     assert reused.code == "positions_history_no_matching_row"
+
+
+def test_shared_official_lifecycle_allocates_pnl_only_by_close_contracts() -> None:
+    now = datetime.now(UTC)
+    first = SettlementCandidate(
+        position_id=201,
+        symbol="ALGO/USDT",
+        side="short",
+        quantity=8300.0,
+        entry_price=0.2,
+        current_price=0.19,
+        leverage=1.0,
+        entry_fee=0.04,
+        close_fee=0.03,
+        okx_inst_id="ALGO-USDT-SWAP",
+        okx_pos_id="shared-pos",
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id="close-1",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now - timedelta(minutes=2),
+        settlement_status="settling",
+            settlement_raw={},
+            close_contracts=83.0,
+            entry_fee_authoritative=0.04,
+            close_fee_authoritative=0.0444374,
+            close_fill_pnl_authoritative=-1.654,
+    )
+    second = replace(
+        first,
+        position_id=202,
+        quantity=5300.0,
+        close_exchange_order_id="close-2",
+        closed_at=now,
+        close_contracts=53.0,
+        close_fee_authoritative=0.0444374,
+        close_fill_pnl_authoritative=-2.486,
+    )
+    groups = _group_candidates_by_lifecycle([first, second])
+    group = next(iter(groups.values()))
+    _prepare_lifecycle_allocations(
+        group,
+        [
+            {
+                "instId": "ALGO-USDT-SWAP",
+                "posId": "shared-pos",
+                "posSide": "short",
+                "cTime": str(int((now - timedelta(minutes=20)).timestamp() * 1000)),
+                "uTime": str(int(now.timestamp() * 1000)),
+                "openMaxPos": "136",
+                "closeTotalPos": "136",
+                "realizedPnl": "-4.2688748",
+            }
+        ],
+    )
+    assert [member.allocation_complete for member in group] == [True, True]
+    assert [member.allocation_ratio for member in group] == pytest.approx([83 / 136, 53 / 136])
+
+
+def test_single_lifecycle_prefers_authoritative_order_economics() -> None:
+    from services.okx_position_settlement_sync import (
+        SettlementSuccess,
+        _scale_settlement_success,
+    )
+    from services.position_settlement import build_position_settlement_snapshot
+
+    now = datetime.now(UTC)
+    candidate = SettlementCandidate(
+        position_id=204,
+        symbol="ALGO/USDT",
+        side="short",
+        quantity=8300.0,
+        entry_price=0.2,
+        current_price=0.19,
+        leverage=1.0,
+        entry_fee=0.03,
+        close_fee=0.03,
+        okx_inst_id="ALGO-USDT-SWAP",
+        okx_pos_id="single-pos",
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id="close-1",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now,
+        settlement_status="settling",
+        settlement_raw={},
+        entry_fee_authoritative=0.021,
+        close_fee_authoritative=0.017,
+        close_fill_pnl_authoritative=-1.654,
+    )
+    success = SettlementSuccess(
+        row={},
+        snapshot=build_position_settlement_snapshot(
+            close_fill_pnl=-9.0,
+            entry_fee=0.3,
+            close_fee=0.3,
+            funding_fee=0.12,
+        ),
+        match_reason="test",
+        fee_source="test",
+        funding_fee_source="test",
+    )
+    scaled = _scale_settlement_success(success, candidate)
+    assert scaled.snapshot.close_fill_pnl == pytest.approx(-1.654)
+    assert scaled.snapshot.entry_fee == pytest.approx(0.021)
+    assert scaled.snapshot.close_fee == pytest.approx(0.017)
+    assert scaled.snapshot.funding_fee == pytest.approx(0.12)
+
+
+def test_shared_lifecycle_is_quarantined_when_fragment_contracts_do_not_conserve() -> None:
+    now = datetime.now(UTC)
+    first = SettlementCandidate(
+        position_id=301,
+        symbol="ALGO/USDT",
+        side="short",
+        quantity=5200.0,
+        entry_price=0.2,
+        current_price=0.19,
+        leverage=1.0,
+        entry_fee=0.04,
+        close_fee=0.03,
+        okx_inst_id="ALGO-USDT-SWAP",
+        okx_pos_id="bad-shared-pos",
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id="close-1",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now,
+        settlement_status="settling",
+        settlement_raw={},
+        close_contracts=52.0,
+    )
+    second = replace(first, position_id=302, quantity=4000.0, close_exchange_order_id="close-2", close_contracts=40.0)
+    group = next(iter(_group_candidates_by_lifecycle([first, second]).values()))
+    _prepare_lifecycle_allocations(
+        group,
+        [{"instId": "ALGO-USDT-SWAP", "posId": "bad-shared-pos", "posSide": "short", "cTime": str(int((now - timedelta(minutes=20)).timestamp() * 1000)), "uTime": str(int(now.timestamp() * 1000)), "closeTotalPos": "136", "realizedPnl": "-4.2"}],
+    )
+    assert [member.allocation_complete for member in group] == [False, False]
+
+
+def test_authoritative_contract_size_flags_local_fragment_quantity_drift() -> None:
+    position = Position(
+        quantity=520.0,
+        settlement_raw={
+            "lifecycle_allocation": {"allocated_contracts": 53.0},
+            "okx_position_history_row": {
+                "_bb_contract_spec": {"ctVal": "10"},
+            },
+        },
+    )
+    assert _final_fragment_requires_quantity_repair(position) is True
+
+
+def test_legacy_superseded_disjoint_close_fragment_is_reactivated() -> None:
+    now = datetime.now(UTC)
+    canonical = Position(id=10, close_exchange_order_id="close-a")
+    fragment = Position(
+        id=11,
+        settlement_status=SUPERSEDED_POSITION_STATUS,
+        close_exchange_order_id="close-b",
+    )
+    raw = {
+        "reason": DUPLICATE_CLOSED_POSITION_REASON,
+        "canonical_position_id": 10,
+    }
+    assert _reactivate_distinct_superseded_fragment(
+        fragment,
+        [canonical, fragment],
+        raw=raw,
+        now=now,
+    )
+    assert fragment.settlement_status == "settling"
+    assert fragment.settlement_raw["reason"] == DISTINCT_CLOSED_FRAGMENT_REACTIVATED_REASON
+
+
+def test_legacy_superseded_overlapping_projection_stays_retired() -> None:
+    now = datetime.now(UTC)
+    canonical = Position(id=10, close_exchange_order_id="close-a,close-b")
+    duplicate = Position(id=11, close_exchange_order_id="close-a")
+    assert not _reactivate_distinct_superseded_fragment(
+        duplicate,
+        [canonical, duplicate],
+        raw={
+            "reason": DUPLICATE_CLOSED_POSITION_REASON,
+            "canonical_position_id": 10,
+        },
+        now=now,
+    )

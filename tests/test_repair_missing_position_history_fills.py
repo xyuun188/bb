@@ -193,7 +193,7 @@ def test_account_bill_fill_refresh_requires_archive_source() -> None:
     assert _order_fill_fact_needs_refresh(order, fill, 10.0) is True
 
 
-def test_history_rebuild_does_not_replace_complete_existing_links_on_pull_churn() -> None:
+def test_history_rebuild_replays_complete_changed_links_deterministically() -> None:
     plan = replace(
         _plan(
             history_id=99,
@@ -207,13 +207,7 @@ def test_history_rebuild_does_not_replace_complete_existing_links_on_pull_churn(
     )
 
     assert plan.changed is True
-    assert (
-        _plan_needs_history_rebuild(
-            plan,
-            SimpleNamespace(evidence_gaps=[]),
-        )
-        is False
-    )
+    assert _plan_needs_history_rebuild(plan, SimpleNamespace(evidence_gaps=[])) is True
     assert (
         _plan_needs_history_rebuild(
             plan,
