@@ -328,7 +328,7 @@ async def test_primary_consultation_uses_full_first_attempt_budget(monkeypatch) 
 
     assert result is not None
     assert result["status"] == "completed"
-    assert request_timeouts == [pytest.approx(10.0, abs=0.1)]
+    assert request_timeouts == [pytest.approx(7.8, abs=0.1)]
 
 
 async def test_consultation_allows_two_inferences_without_queue_serialization(

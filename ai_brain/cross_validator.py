@@ -77,8 +77,12 @@ _CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 10.0
 _CONSULTATION_FALLBACK_RESERVE_SECONDS = 2.0
 # A consultation waits on the same capacity scheduler as every other model
 # call. The old separate semaphore added a second FIFO queue and caused
-# requests to expire before they reached the shared scheduler.
-_CONSULTATION_QUEUE_WAIT_CAP_SECONDS = 3.0
+# requests to expire before they reached the shared scheduler. Queue wait is
+# now allowed a bounded share of the remaining consultation budget instead of
+# consuming only a fixed three-second slice while both model slots are busy.
+_CONSULTATION_QUEUE_WAIT_CAP_SECONDS = 6.0
+_CONSULTATION_QUEUE_WAIT_FRACTION = 0.35
+_CONSULTATION_MIN_INFERENCE_SECONDS = 2.0
 
 
 class ConsultationQueueTimeoutError(TimeoutError):
@@ -843,7 +847,10 @@ class CrossValidator:
                     queue_timeout = min(
                         _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
                         max(
-                            min(remaining * 0.15, remaining - reserve - 0.5),
+                            min(
+                                remaining * _CONSULTATION_QUEUE_WAIT_FRACTION,
+                                remaining - reserve - _CONSULTATION_MIN_INFERENCE_SECONDS,
+                            ),
                             0.05,
                         ),
                     )
