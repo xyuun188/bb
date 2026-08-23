@@ -2600,7 +2600,23 @@ class DataService:
                 self._schedule_derivatives_background_refresh(normalized)
                 return {"derivatives_refresh_in_background": True}
             return {}
-        task = asyncio.create_task(self._refresh_derivatives_snapshot(normalized))
+        # A synchronous market refresh only needs executable facts.  Funding and
+        # open-interest are analytical enrichments and must not compete with
+        # ticker/orderbook requests for the shared OKX public-request gate.
+        required_only = not allow_background_refresh
+
+        async def refresh() -> dict[str, Any]:
+            refresh_fn = self._refresh_derivatives_snapshot
+            try:
+                return await refresh_fn(normalized, required_only=required_only)
+            except TypeError as exc:
+                # Keep older test doubles and integrations source-compatible
+                # while the real implementation adopts the explicit contract.
+                if "required_only" not in safe_error_text(exc):
+                    raise
+                return await refresh_fn(normalized)
+
+        task = asyncio.create_task(refresh())
         tasks[normalized] = task
 
         def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
@@ -2692,15 +2708,29 @@ class DataService:
         symbol: str,
     ) -> dict[str, Any]:
         async with self._derivatives_background_refresh_gate():
-            return await self._refresh_derivatives_snapshot(symbol)
+            refresh_fn = self._refresh_derivatives_snapshot
+            try:
+                return await refresh_fn(symbol, required_only=False)
+            except TypeError as exc:
+                if "required_only" not in safe_error_text(exc):
+                    raise
+                return await refresh_fn(symbol)
 
-    async def _refresh_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
+    async def _refresh_derivatives_snapshot(
+        self,
+        symbol: str,
+        *,
+        required_only: bool = False,
+    ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         tasks = self._derivatives_refresh_task_map()
         failed_cache = getattr(self, "_derivatives_failed_at", None)
         if not isinstance(failed_cache, dict):
             failed_cache = {}
             self._derivatives_failed_at = failed_cache
+        cached_data = dict(
+            (self._derivatives_cache.get(normalized) or {}).get("data") or {}
+        )
         current_task = asyncio.current_task()
         existing_task = tasks.get(normalized)
         if existing_task and existing_task is not current_task and not existing_task.done():
@@ -2711,11 +2741,19 @@ class DataService:
                 normalized,
                 block_on_remote=True,
             )
-            data = await asyncio.wait_for(
-                self.rest_client.fetch_derivatives_snapshot(
+            fetcher = self.rest_client.fetch_derivatives_snapshot
+            try:
+                fetch_call = fetcher(
                     normalized,
                     contract_spec=contract_spec,
-                ),
+                    required_only=required_only,
+                )
+            except TypeError as exc:
+                if "required_only" not in safe_error_text(exc):
+                    raise
+                fetch_call = fetcher(normalized, contract_spec=contract_spec)
+            data = await asyncio.wait_for(
+                fetch_call,
                 timeout=max(float(DERIVATIVES_PROVIDER_TIMEOUT_SECONDS), 0.5),
             )
             failed_cache.pop(normalized, None)
@@ -2727,6 +2765,24 @@ class DataService:
             )
             data = {}
             failed_cache[normalized] = datetime.now(UTC)
+
+        # Preserve the last known optional enrichments when the critical path
+        # deliberately fetched only orderbook/reference facts.  They remain
+        # visible to analysis with their existing provenance, while the fresh
+        # executable facts are never overwritten by stale cache data.
+        if required_only and isinstance(cached_data, dict):
+            for key in (
+                "funding_rate",
+                "funding_data_available",
+                "funding_interval_minutes",
+                "funding_time",
+                "next_funding_time",
+                "funding_rate_observed_at",
+                "open_interest_contracts",
+                "open_interest_value",
+            ):
+                if key not in data and key in cached_data:
+                    data[key] = cached_data[key]
 
         self._derivatives_cache[normalized] = {
             "updated_at": datetime.now(UTC),
