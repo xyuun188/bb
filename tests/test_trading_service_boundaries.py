@@ -6968,6 +6968,7 @@ def test_parallel_loop_intervals_are_not_market_throttles(
     assert service.position_loop_interval_seconds() == pytest.approx(19.5)
     assert service.round_start_reconcile_timeout_seconds() == pytest.approx(15.0)
     assert service.okx_authoritative_sync_timeout_seconds() == pytest.approx(45.0)
+    assert service.okx_settlement_fact_sync_interval_seconds() == pytest.approx(60.0)
     assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
     assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
 

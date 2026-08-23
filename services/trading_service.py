@@ -1667,7 +1667,7 @@ class TradingService:
     def okx_settlement_fact_sync_interval_seconds(self) -> float:
         """Return the cadence for account-level OKX history mirror refresh."""
 
-        return max(30.0, self.okx_authoritative_sync_interval_seconds())
+        return max(60.0, self.okx_authoritative_sync_interval_seconds() * 3.0)
 
     def okx_position_settlement_sync_interval_seconds(self) -> float:
         """Return the retry cadence for official closed-position settlement."""
@@ -2398,8 +2398,7 @@ class TradingService:
                     lookback_hours=72,
                     limit=100,
                     max_pages=5,
-                    timeout_seconds=8.0,
-                    executor_provider=self._get_okx_executor_for_mode,
+                    timeout_seconds=12.0,
                 ).sync_once()
                 if not isinstance(row, dict):
                     row = {
