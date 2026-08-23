@@ -6036,6 +6036,33 @@ def test_market_hydration_unavailable_symbols_extracts_names_from_diagnostics() 
     assert symbols == ["BTC/USDT", "ETH/USDT"]
 
 
+def test_market_hydration_pending_is_not_treated_as_analysis_unavailable() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+
+    diagnostics = {
+        "unavailable_symbols": [
+            {
+                "symbol": "LTC/USDT",
+                "reason": "background_indicator_prewarm_pending",
+                "source": "background_prewarm_pending",
+            },
+            {
+                "symbol": "XLM/USDT",
+                "reason": "prewarmed_feature_refresh_timeout",
+                "source": "unavailable",
+            },
+        ]
+    }
+
+    assert service._market_hydration_pending_symbols(diagnostics) == ["LTC/USDT"]
+    assert service._market_hydration_unavailable_symbols(diagnostics) == ["XLM/USDT"]
+
+
 def test_market_coverage_summary_is_not_evaluable_while_monitoring_is_paused() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(

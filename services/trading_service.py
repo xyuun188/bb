@@ -5999,17 +5999,39 @@ class TradingService:
             for symbol, refreshed, _reason, _source in rows
             if refreshed is not None
         }
+        pending = [
+            symbol
+            for symbol, refreshed, reason, source in rows
+            if refreshed is None and source == "background_prewarm_pending"
+        ]
         unavailable = [
             {"symbol": symbol, "reason": reason}
-            for symbol, refreshed, reason, _source in rows
+            for symbol, refreshed, reason, source in rows
             if refreshed is None
         ]
+        analysis_unavailable_count = sum(
+            source != "background_prewarm_pending"
+            for _symbol, refreshed, _reason, source in rows
+            if refreshed is None
+        )
+        status = (
+            "partial"
+            if analysis_unavailable_count and pending
+            else "pending"
+            if pending
+            else "partial"
+            if analysis_unavailable_count
+            else "ok"
+        )
         return hydrated, {
-            "status": "ok" if not unavailable else "partial",
+            "status": status,
             "requested_count": len(feature_vectors),
             "hydrated_count": len(hydrated),
             "unavailable_count": len(unavailable),
+            "analysis_unavailable_count": analysis_unavailable_count,
             "unavailable_symbols": unavailable,
+            "pending_count": len(pending),
+            "pending_symbols": pending,
             "reused_existing_full_snapshot_count": sum(
                 source == "existing_full_snapshot" for _symbol, _refreshed, _reason, source in rows
             ),
@@ -7173,16 +7195,56 @@ class TradingService:
         self,
         diagnostics: dict[str, Any] | None,
     ) -> list[str]:
+        pending_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in self._market_hydration_pending_symbols(diagnostics)
+            if self._normalize_position_symbol(symbol)
+        }
         symbols: list[str] = []
         seen: set[str] = set()
         for item in self._safe_dict(diagnostics).get("unavailable_symbols") or []:
             symbol = item.get("symbol") if isinstance(item, dict) else item
             key = self._normalize_position_symbol(symbol)
-            if not key or key in seen:
+            if not key or key in seen or key in pending_keys:
                 continue
             seen.add(key)
             symbols.append(str(symbol))
         return symbols
+
+    def _market_hydration_pending_symbols(
+        self,
+        diagnostics: dict[str, Any] | None,
+    ) -> list[str]:
+        """Return symbols waiting for background indicator preparation.
+
+        A background prewarm wait is not an analysis failure.  Keeping it out
+        of the normal defer tracker prevents a healthy cache warm-up from
+        becoming an overdue/blocked analysis candidate while the worker keeps
+        retrying it independently.
+        """
+
+        pending: list[str] = []
+        seen: set[str] = set()
+        safe_diagnostics = self._safe_dict(diagnostics)
+        declared = safe_diagnostics.get("pending_symbols") or []
+        rows = safe_diagnostics.get("unavailable_symbols") or []
+        for item in [*declared, *rows]:
+            if isinstance(item, dict):
+                source = str(item.get("source") or "")
+                reason = str(item.get("reason") or "")
+                if (
+                    source != "background_prewarm_pending"
+                    and reason != "background_indicator_prewarm_pending"
+                ):
+                    continue
+                symbol = item.get("symbol")
+            else:
+                symbol = item
+            key = self._normalize_position_symbol(symbol)
+            if key and key not in seen:
+                seen.add(key)
+                pending.append(str(symbol))
+        return pending
 
     def _complete_resolved_market_candidates(
         self,
@@ -9403,6 +9465,20 @@ class TradingService:
                     "changes_trading_thresholds": False,
                 }
             results["market_prewarmed_feature_hydration"] = hydration_diagnostics
+            hydration_pending_symbols = self._market_hydration_pending_symbols(
+                hydration_diagnostics
+            )
+            if hydration_pending_symbols:
+                # Remove a stale normal defer entry from an earlier round. The
+                # background prewarm worker owns retries for these symbols.
+                for symbol in hydration_pending_symbols:
+                    self._market_defer_tracker().complete(symbol)
+                hydration_diagnostics["pending_count"] = len(hydration_pending_symbols)
+                hydration_diagnostics["pending_symbols"] = hydration_pending_symbols
+                hydration_diagnostics["pending_diagnostic_boundary"] = (
+                    "Background indicator preparation is pending; this is not an "
+                    "analysis timeout, failure, overdue candidate, or entry veto."
+                )
             hydration_unavailable_symbols = self._market_hydration_unavailable_symbols(
                 hydration_diagnostics
             )
@@ -9416,6 +9492,11 @@ class TradingService:
                     for symbol in hydration_unavailable_symbols
                     if self._normalize_position_symbol(symbol)
                 )
+            unresolved_market_keys.update(
+                self._normalize_position_symbol(symbol)
+                for symbol in hydration_pending_symbols
+                if self._normalize_position_symbol(symbol)
+            )
             self._complete_resolved_market_candidates(
                 market_feature_vectors_before_rank,
                 market_feature_vectors,
