@@ -83,7 +83,13 @@ def build_trained_model_strategy_candidates(
     ):
         return []
     eligible_sides = {
-        str(side).lower() for side in model_strategy.get("eligible_sides") or []
+        str(side).lower()
+        for side in (
+            model_strategy.get("paper_execution_sides")
+            or model_strategy.get("paper_bootstrap_sides")
+            or model_strategy.get("eligible_sides")
+            or []
+        )
     }
     results: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -142,6 +148,19 @@ def build_trained_model_strategy_candidates(
                     "can_change_size_or_leverage": False,
                     "can_bypass_order_deduplication": False,
                     "model_quality": _dict(model_strategy.get("model_quality")),
+                    "authorization_basis": (
+                        "paper_bootstrap_canary"
+                        if side
+                        not in {
+                            str(value).lower()
+                            for value in (
+                                model_strategy.get("production_eligible_sides")
+                                or model_strategy.get("eligible_sides")
+                                or []
+                            )
+                        }
+                        else "production_quality"
+                    ),
                 },
                 "backtest_metrics": _dict(candidate.get("backtest")),
                 "shadow_validation": _dict(candidate.get("shadow_validation")),

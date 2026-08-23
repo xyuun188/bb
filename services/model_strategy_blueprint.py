@@ -53,6 +53,23 @@ def build_model_strategy_blueprint(
     ready = _safe_dict(readiness)
     active = _safe_dict(activation)
     paper_gate = _safe_dict(ready.get("paper_canary"))
+    # The runtime rebuilds readiness from artifact metadata, while the atomic
+    # activation manifest keeps the authoritative paper-canary decision.  A
+    # metadata rebuild can omit that report even though the current artifact
+    # is explicitly authorized for a paper canary.  Preserve the canary side
+    # in that case without granting production permission.
+    activation_paper_gate = _safe_dict(active.get("paper_canary_report"))
+    if not activation_paper_gate:
+        activation_paper_gate = _safe_dict(
+            _safe_dict(active.get("return_evidence_report")).get("paper_canary")
+        )
+    if (
+        activation_paper_gate.get("authorized") is True
+        and activation_paper_gate.get("execution_scope") == "paper_only"
+        and activation_paper_gate.get("eligible_sides")
+        and not paper_gate.get("eligible_sides")
+    ):
+        paper_gate = activation_paper_gate
     stage = str(active.get("activation_stage") or "unregistered").lower()
     version = str(
         artifact_version
@@ -76,9 +93,10 @@ def build_model_strategy_blueprint(
         for side in _safe_dict(model.get("oos_return_evaluation"))
         if str(side).lower() in {"long", "short"}
     }
-    evaluated_sides = sorted(production_sides or paper_sides or artifact_sides)
+    # Diagnostics must include every side present in the artifact and readiness report.
+    evaluated_sides = sorted(production_sides | paper_sides | artifact_sides)
     oos_evaluation = _safe_dict(model.get("oos_return_evaluation"))
-    eligible_sides = [
+    production_eligible_sides = [
         side
         for side in evaluated_sides
         if _positive_fee_after_quality(_safe_dict(oos_evaluation.get(side)))
@@ -88,11 +106,34 @@ def build_model_strategy_blueprint(
         and str(model.get("trained_at") or model.get("artifact_version") or "")
         and int(model.get("test_count") or 0) > 0
     )
+    paper_bootstrap_sides = sorted(
+        paper_sides
+        if (
+            artifact_complete
+            and paper_gate.get("authorized") is True
+            and paper_gate.get("execution_scope") == "paper_only"
+            and stage in {"candidate", "shadow", "canary", "active"}
+        )
+        else set()
+    )
+    paper_execution_sides = sorted(
+        set(production_eligible_sides) | set(paper_bootstrap_sides)
+    )
     paper_execution_eligible = bool(
         artifact_complete
-        and eligible_sides
+        and paper_execution_sides
         and stage in {"candidate", "shadow", "canary", "active"}
     )
+    artifact_horizons = sorted(
+        {
+            int(value)
+            for value in _safe_list(model.get("horizons"))
+            if str(value).strip().lstrip("-").isdigit() and int(value) > 0
+        }
+    )
+    primary_horizon = int(model.get("primary_prediction_horizon_minutes") or 0)
+    if primary_horizon <= 0:
+        primary_horizon = artifact_horizons[0] if artifact_horizons else 10
     champion_comparison = _safe_dict(active.get("champion_comparison"))
     model_quality = {
         side: {
@@ -112,12 +153,12 @@ def build_model_strategy_blueprint(
         "model_id": "local_ml_profit_quality",
         "model_version": version,
         "training_data_sha256": model.get("training_data_sha256"),
-        "eligible_sides": eligible_sides,
+        "eligible_sides": production_eligible_sides,
     }
     blockers: list[str] = []
     if stage not in {"candidate", "shadow", "canary", "active"}:
         blockers.append("trained_model_lifecycle_not_paper_eligible")
-    if not eligible_sides:
+    if not production_eligible_sides:
         blockers.append("trained_model_has_no_positive_fee_after_side")
     if not paper_execution_eligible:
         blockers.append("trained_model_not_authorized_for_paper_strategy")
@@ -132,12 +173,18 @@ def build_model_strategy_blueprint(
         "generated_at": datetime.now(UTC).isoformat(),
         "source": "trained_model_artifact",
         "execution_scope": "paper_only",
-        "eligible_sides": eligible_sides,
+        "eligible_sides": production_eligible_sides,
+        "production_eligible_sides": production_eligible_sides,
+        "paper_bootstrap_sides": paper_bootstrap_sides,
+        "paper_execution_sides": paper_execution_sides,
         "paper_execution_eligible": paper_execution_eligible,
         "live_execution_permission": False,
         "blocking_reasons": blockers,
         "model_quality": {
             "eligible_sides": model_quality,
+            "production_eligible_sides": production_eligible_sides,
+            "paper_bootstrap_sides": paper_bootstrap_sides,
+            "paper_execution_sides": paper_execution_sides,
             "evaluated_sides": evaluated_sides,
             "champion_comparison": champion_comparison,
             "comparison_accepted": champion_comparison.get("accepted") is True,
@@ -156,7 +203,7 @@ def build_model_strategy_blueprint(
         "exit_policy": {
             "owner": "dynamic_fee_after_exit",
             "model_may_weaken_hard_exit": False,
-            "historical_replay_horizon_minutes": 10,
+            "historical_replay_horizon_minutes": primary_horizon,
             "historical_replay_exit": "model_primary_prediction_horizon",
         },
         "risk_policy": {
@@ -169,6 +216,7 @@ def build_model_strategy_blueprint(
             "fit_sample_count": model.get("sample_count"),
             "holdout_sample_count": model.get("test_count"),
             "horizons": _safe_list(model.get("horizons")),
+            "primary_prediction_horizon_minutes": primary_horizon,
             "partition_policy": model.get("evaluation_group_policy"),
             "training_data_sha256": model.get("training_data_sha256"),
             "strategy_replay_holdout": _safe_dict(
@@ -204,10 +252,24 @@ def model_strategy_side_authorization(
     normalized_scope = "paper" if str(execution_scope).lower() == "paper" else "live"
     normalized_side = str(side or "").lower()
     normalized_source = str(source or "").strip().lower()
-    eligible_sides = sorted(
+    production_eligible_sides = sorted(
         {
             str(value).lower()
-            for value in _safe_list(blueprint.get("eligible_sides"))
+            for value in _safe_list(
+                blueprint.get("production_eligible_sides")
+                or blueprint.get("eligible_sides")
+            )
+            if str(value).lower() in {"long", "short"}
+        }
+    )
+    paper_execution_sides = sorted(
+        {
+            str(value).lower()
+            for value in _safe_list(
+                blueprint.get("paper_execution_sides")
+                or blueprint.get("paper_bootstrap_sides")
+                or blueprint.get("eligible_sides")
+            )
             if str(value).lower() in {"long", "short"}
         }
     )
@@ -217,7 +279,8 @@ def model_strategy_side_authorization(
         "reason": "model_strategy_blueprint_unavailable",
         "execution_scope": normalized_scope,
         "side": normalized_side,
-        "eligible_sides": eligible_sides,
+        "eligible_sides": production_eligible_sides,
+        "paper_execution_sides": paper_execution_sides,
         "blueprint_version": blueprint.get("version"),
         "model_version": blueprint.get("model_version"),
         "source": normalized_source,
@@ -263,7 +326,12 @@ def model_strategy_side_authorization(
             "eligible": False,
             "reason": "model_strategy_blueprint_live_permission_missing",
         }
-    if normalized_side not in eligible_sides:
+    authorized_sides = (
+        paper_execution_sides
+        if normalized_scope == "paper"
+        else production_eligible_sides
+    )
+    if normalized_side not in authorized_sides:
         return {
             **result,
             "eligible": False,
@@ -272,7 +340,18 @@ def model_strategy_side_authorization(
     return {
         **result,
         "eligible": True,
-        "reason": "direction_authorized_by_model_blueprint",
+        "reason": (
+            "paper_bootstrap_direction_authorized"
+            if normalized_scope == "paper"
+            and normalized_side not in production_eligible_sides
+            else "direction_authorized_by_model_blueprint"
+        ),
+        "authorization_basis": (
+            "paper_bootstrap_canary"
+            if normalized_scope == "paper"
+            and normalized_side not in production_eligible_sides
+            else "production_quality"
+        ),
     }
 
 
@@ -285,7 +364,11 @@ def paper_strategy_replay_available(blueprint: dict[str, Any] | None) -> bool:
         strategy.get("execution_scope") == "paper_only"
         and strategy.get("live_execution_permission") is False
         and str(strategy.get("model_version") or "")
-        and _safe_list(strategy.get("eligible_sides"))
+        and _safe_list(
+            strategy.get("paper_execution_sides")
+            or strategy.get("paper_bootstrap_sides")
+            or strategy.get("eligible_sides")
+        )
         and str(strategy.get("trained_at") or "")
         and int(evidence.get("holdout_sample_count") or 0) > 0
     )

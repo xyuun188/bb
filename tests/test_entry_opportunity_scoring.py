@@ -448,6 +448,52 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     assert "paper_bootstrap_canary" not in decision.raw_response
 
 
+def test_paper_canary_blueprint_allows_side_without_champion() -> None:
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    signal = decision.raw_response["ml_signal"]
+    signal.update(
+        {
+            "route_mode": "shadow_observation",
+            "live_ml_ready": False,
+            "artifact_lifecycle": "canary",
+            "model_version": "model-v1",
+            "paper_canary_authorized": True,
+            "paper_canary": {
+                "authorized": True,
+                "execution_scope": "paper_only",
+                "eligible_sides": ["long"],
+            },
+            "prediction_quality": {
+                "contract_complete": False,
+                "paper_eligible": False,
+                "production_eligible": False,
+                "anomalous": False,
+            },
+            "strategy_blueprint": {
+                "model_version": "model-v1",
+                "paper_execution_eligible": True,
+                "paper_bootstrap_sides": ["long"],
+                "paper_execution_sides": ["long"],
+                "production_eligible_sides": [],
+                "live_execution_permission": False,
+            },
+        }
+    )
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    component = decision.raw_response["opportunity_score"]["expected_net_breakdown"][
+        "components"
+    ][0]
+    assert score == pytest.approx(decision.raw_response["opportunity_score"]["return_lcb_pct"])
+    assert component["decision_eligible"] is True
+    assert component["paper_eligible"] is True
+    assert component["model_strategy_side_authorization"]["reason"] == (
+        "paper_bootstrap_direction_authorized"
+    )
+
+
 def test_model_blueprint_blocks_owned_short_but_not_independent_server_candidate() -> None:
     decision = _decision()
     decision.action = Action.SHORT

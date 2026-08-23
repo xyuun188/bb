@@ -172,6 +172,80 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
     assert replay_row_ids == [1, 2]
 
 
+@pytest.mark.asyncio
+async def test_realtime_strategy_context_does_not_run_model_historical_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feedback_calls: list[dict[str, Any]] = []
+    build_calls: list[dict[str, Any]] = []
+
+    class FakeEngine:
+        def build_from_feedback(self, feedback: StrategyFeedback, **kwargs: Any) -> dict:
+            del feedback
+            build_calls.append(kwargs)
+            return {
+                "schedule": {
+                    "candidates": [],
+                    "continuous_strategy_routing": {"applied": False},
+                }
+            }
+
+        def apply_to_context(
+            self,
+            strategy_context: dict[str, Any],
+            _payload: dict[str, Any],
+            *,
+            paper_strategy_champion: dict[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                **strategy_context,
+                "paper_strategy_champion": paper_strategy_champion,
+            }
+
+    class FakeChampionService:
+        current_calls = 0
+        reconcile_calls = 0
+
+        async def current(self, _mode: str) -> dict[str, Any]:
+            self.current_calls += 1
+            return {"status": "base_strategy"}
+
+        async def reconcile(self, **_kwargs: Any) -> dict[str, Any]:
+            self.reconcile_calls += 1
+            return {"status": "reconciled"}
+
+    async def fake_feedback(**kwargs: Any) -> StrategyFeedback:
+        feedback_calls.append(kwargs)
+        return _feedback()
+
+    champion = FakeChampionService()
+    service = StrategyLearningService(
+        engine=FakeEngine(),
+        champion_service=champion,
+    )
+    monkeypatch.setattr(service, "_feedback", fake_feedback)
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "paper_strategy_replay_available",
+        lambda _blueprint: True,
+    )
+
+    result = await service.apply_to_strategy_context(
+        mode="paper",
+        strategy_context={"source": "trading_loop"},
+        open_positions=[],
+        model_strategy_blueprint={"model_version": "model-v1"},
+        model_predictor=lambda *_args, **_kwargs: {},
+    )
+
+    assert feedback_calls[0]["include_historical_replay"] is False
+    assert build_calls[0]["model_strategy_blueprint"] is None
+    assert build_calls[0]["model_predictor"] is None
+    assert champion.current_calls == 1
+    assert champion.reconcile_calls == 0
+    assert result["paper_strategy_champion"]["status"] == "base_strategy"
+
+
 def _sample(
     source_id: int,
     *,

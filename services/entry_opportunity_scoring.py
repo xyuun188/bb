@@ -155,6 +155,14 @@ class EntryOpportunityScoringPolicy:
             and (
                 paper_quality_claimed
                 or paper_authorization.get("eligible") is True
+                # A canary side is authorized by the immutable model
+                # blueprint even when the normal production-quality payload
+                # is intentionally marked ineligible.  The standardized
+                # return contract is still checked below before entry.
+                or (
+                    execution_scope == "paper"
+                    and direction_authorization.get("eligible") is True
+                )
             )
         )
         governance = signal_production_eligibility(signal)
@@ -175,6 +183,7 @@ class EntryOpportunityScoringPolicy:
             and (
                 paper_governance.get("eligible") is True
                 or paper_authorization.get("eligible") is True
+                or direction_authorization.get("eligible") is True
             )
         )
         cost_distribution = safe_dict(

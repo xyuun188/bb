@@ -46,6 +46,10 @@ async def audit(*, mode: str) -> dict[str, Any]:
         limit=params.dashboard_summary_limit,
         detail="summary",
         include_runtime_prior_records=True,
+        # Scheduler ownership is a lightweight contract audit.  Exact model
+        # replay is a separate governance job and must never run in an audit
+        # invoked from an operational health check.
+        include_historical_replay=False,
     )
     schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
     production = (

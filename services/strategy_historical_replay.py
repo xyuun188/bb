@@ -319,10 +319,22 @@ def _replay_entry(
     if not primary:
         return None, "model_replay_horizon_missing"
     side = str(primary.get("best_side") or "").lower()
-    eligible_sides = {
-        str(value).lower() for value in _list(blueprint.get("eligible_sides"))
+    production_eligible_sides = {
+        str(value).lower()
+        for value in _list(
+            blueprint.get("production_eligible_sides")
+            or blueprint.get("eligible_sides")
+        )
     }
-    if side not in {"long", "short"} or side not in eligible_sides:
+    paper_execution_sides = {
+        str(value).lower()
+        for value in _list(
+            blueprint.get("paper_execution_sides")
+            or blueprint.get("paper_bootstrap_sides")
+            or blueprint.get("eligible_sides")
+        )
+    }
+    if side not in {"long", "short"} or side not in paper_execution_sides:
         return None, "model_replay_side_not_governed"
     return_contract = _dict(
         _dict(primary.get("return_distribution_contract")).get(side)
@@ -334,7 +346,8 @@ def _replay_entry(
     )
     if cost_distribution.get("distribution_ready") is not True:
         return None, "model_replay_cost_distribution_incomplete"
-    if primary.get("actual_trade_calibration_ready") is not True:
+    bootstrap_only = side not in production_eligible_sides
+    if primary.get("actual_trade_calibration_ready") is not True and not bootstrap_only:
         return None, "model_replay_actual_trade_calibration_incomplete"
     expected = _float(return_contract.get("objective_expected_return_pct"))
     lower = _float(return_contract.get("lower_quantile_return_pct"))
@@ -385,8 +398,10 @@ def _partition_observations(
     observations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     trained_at = _timestamp(blueprint.get("trained_at"))
-    expected_test_count = _int(
-        _dict(blueprint.get("training_evidence")).get("holdout_sample_count")
+    evidence = _dict(blueprint.get("training_evidence"))
+    replay_holdout = _dict(evidence.get("strategy_replay_holdout"))
+    expected_test_count = _int(replay_holdout.get("sample_count")) or _int(
+        evidence.get("holdout_sample_count")
     )
     eligible = [row for row in observations if row.get("training_eligible") is True]
     if trained_at is None or expected_test_count <= 0:
@@ -396,7 +411,8 @@ def _partition_observations(
             "exam": [],
             "diagnostics": {
                 "eligible_observation_count": len(eligible),
-                "expected_holdout_sample_count": expected_test_count,
+        "expected_holdout_sample_count": expected_test_count,
+        "artifact_holdout_sample_count": _int(evidence.get("holdout_sample_count")),
             },
         }
     historical = [
@@ -433,7 +449,7 @@ def _partition_observations(
     )
     if explicit_holdout_ids:
         explicit_rows = [
-            row for row in historical if _int(row.get("source_id")) in explicit_holdout_ids
+            row for row in eligible if _int(row.get("source_id")) in explicit_holdout_ids
         ]
         explicit_bounds = _group_bounds(explicit_rows)
         if (
@@ -497,7 +513,15 @@ def _partition_observations(
         row for group in exam_groups for row in historical_bounds[group]["rows"]
     ]
     post_bounds = _group_bounds(post_training)
-    exam = [*historical_exam, *post_training]
+    holdout_row_ids = {
+        _int(row.get("source_id"))
+        for group in holdout_groups
+        for row in historical_bounds[group]["rows"]
+    }
+    post_training_additions = [
+        row for row in post_training if _int(row.get("source_id")) not in holdout_row_ids
+    ]
+    exam = [*historical_exam, *post_training_additions]
     development_ids = {_int(row.get("source_id")) for row in development}
     exam_ids = {_int(row.get("source_id")) for row in exam}
     overlap = development_ids & exam_ids
@@ -516,6 +540,7 @@ def _partition_observations(
             "strategy_development_group_count": len(development_groups),
             "strategy_exam_historical_group_count": len(exam_groups),
             "strategy_exam_post_training_group_count": len(post_bounds),
+            "strategy_exam_post_training_added_count": len(post_training_additions),
             "purged_development_group_count": len(raw_development_groups)
             - len(development_groups),
             "development_exam_overlap_count": len(overlap),

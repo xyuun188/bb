@@ -241,6 +241,25 @@ def _build_historical_replay_observations(
     return observations, excluded
 
 
+def _replay_holdout_source_ids(blueprint: dict[str, Any] | None) -> set[int]:
+    """Return the immutable source IDs bound to the trained replay holdout."""
+
+    strategy = _safe_dict(blueprint)
+    evidence = _safe_dict(strategy.get("training_evidence"))
+    holdout = _safe_dict(evidence.get("strategy_replay_holdout"))
+    source_ids: set[int] = set()
+    for value in _safe_list(holdout.get("shadow_source_id_ranges")):
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            continue
+        try:
+            start, end = int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            continue
+        if start > 0 and end >= start:
+            source_ids.update(range(start, end + 1))
+    return source_ids
+
+
 def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
     """Summarize which governed historical priors recent decisions actually matched."""
 
@@ -1306,6 +1325,7 @@ class StrategyLearningService:
                 and paper_strategy_replay_available(blueprint)
                 and predictor is not None
             ),
+            replay_holdout_source_ids=_replay_holdout_source_ids(blueprint),
         )
         payload = await asyncio.to_thread(
             self.engine.build_from_feedback,
@@ -1339,16 +1359,27 @@ class StrategyLearningService:
         model_predictor: ModelPredictor | None = None,
         hours: int = DEFAULT_LOOKBACK_HOURS,
         limit: int = 500,
+        include_historical_replay: bool = False,
     ) -> dict[str, Any]:
+        """Build the strategy context without blocking the real-time loop.
+
+        Exact trained-model replay is a governance/audit workload.  It may be
+        enabled by an explicit background caller, but the trading loop keeps it
+        disabled so a model artifact with thousands of holdout rows cannot stall
+        entry discovery or position review.
+        """
+        replay_enabled = bool(
+            include_historical_replay
+            and paper_strategy_replay_available(_safe_dict(model_strategy_blueprint))
+            and model_predictor is not None
+        )
         feedback = await self._feedback(
             mode=mode,
             hours=hours,
             limit=limit,
-            include_historical_replay=bool(
-                paper_strategy_replay_available(
-                    _safe_dict(model_strategy_blueprint)
-                )
-                and model_predictor is not None
+            include_historical_replay=replay_enabled,
+            replay_holdout_source_ids=_replay_holdout_source_ids(
+                model_strategy_blueprint if replay_enabled else None
             ),
         )
         if open_positions is not None:
@@ -1358,8 +1389,8 @@ class StrategyLearningService:
             feedback,
             current_context=strategy_context,
             detail="summary",
-            model_strategy_blueprint=model_strategy_blueprint,
-            model_predictor=model_predictor,
+            model_strategy_blueprint=model_strategy_blueprint if replay_enabled else None,
+            model_predictor=model_predictor if replay_enabled else None,
         )
         schedule = _safe_dict(payload.get("schedule"))
         routing = _safe_dict(schedule.get("continuous_strategy_routing"))
@@ -1376,10 +1407,16 @@ class StrategyLearningService:
             runtime["continuous_strategy_routing"] = routing
             schedule["runtime"] = runtime
             payload["schedule"] = schedule
-        champion = await self.champion_service.reconcile(
-            mode=mode,
-            blueprint=model_strategy_blueprint,
-            candidates=list(_safe_dict(payload.get("schedule")).get("candidates") or []),
+        champion = (
+            await self.champion_service.reconcile(
+                mode=mode,
+                blueprint=model_strategy_blueprint,
+                candidates=list(
+                    _safe_dict(payload.get("schedule")).get("candidates") or []
+                ),
+            )
+            if replay_enabled
+            else await self.champion_service.current(mode)
         )
         result = self.engine.apply_to_context(
             strategy_context,
@@ -1396,6 +1433,7 @@ class StrategyLearningService:
         hours: int,
         limit: int,
         include_historical_replay: bool = False,
+        replay_holdout_source_ids: set[int] | None = None,
     ) -> StrategyFeedback:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
         effective_hours = max(int(hours or 1), 1)
@@ -1474,58 +1512,54 @@ class StrategyLearningService:
                 ).all()
             )
             shadows = [SimpleNamespace(**dict(row._mapping)) for row in shadow_rows]
-            replay_shadows = (
-                list(
-                    (
-                        await session.execute(
-                            select(ShadowBacktest)
-                            .where(
-                                ShadowBacktest.execution_mode == "paper",
-                                ShadowBacktest.status == "completed",
-                                ShadowBacktest.created_at >= epoch_start_naive,
-                                ShadowBacktest.long_return_pct.is_not(None),
-                                ShadowBacktest.short_return_pct.is_not(None),
-                                or_(
-                                    ShadowBacktest.decision_action.in_(["long", "short"]),
-                                    and_(
-                                        ShadowBacktest.missed_opportunity.is_(True),
-                                        ShadowBacktest.best_action.in_(["long", "short"]),
-                                    ),
-                                ),
-                            )
-                            .options(
-                                load_only(
-                                    ShadowBacktest.id,
-                                    ShadowBacktest.decision_id,
-                                    ShadowBacktest.created_at,
-                                    ShadowBacktest.updated_at,
-                                    ShadowBacktest.symbol,
-                                    ShadowBacktest.analysis_type,
-                                    ShadowBacktest.decision_action,
-                                    ShadowBacktest.decision_confidence,
-                                    ShadowBacktest.training_feature_snapshot,
-                                    ShadowBacktest.due_at,
-                                    ShadowBacktest.horizon_minutes,
-                                    ShadowBacktest.label_version,
-                                    ShadowBacktest.long_return_pct,
-                                    ShadowBacktest.short_return_pct,
-                                    ShadowBacktest.best_action,
-                                    ShadowBacktest.missed_opportunity,
-                                )
-                            )
-                            .order_by(
-                                ShadowBacktest.created_at.desc(),
-                                ShadowBacktest.id.desc(),
-                            )
-                            .limit(effective_limit)
+            replay_shadows = []
+            if selected_mode == "paper" and include_historical_replay:
+                replay_query = (
+                    select(ShadowBacktest)
+                    .where(
+                        ShadowBacktest.execution_mode == "paper",
+                        ShadowBacktest.status == "completed",
+                        ShadowBacktest.created_at >= epoch_start_naive,
+                        ShadowBacktest.long_return_pct.is_not(None),
+                        ShadowBacktest.short_return_pct.is_not(None),
+                        or_(
+                            ShadowBacktest.decision_action.in_(["long", "short"]),
+                            and_(
+                                ShadowBacktest.missed_opportunity.is_(True),
+                                ShadowBacktest.best_action.in_(["long", "short"]),
+                            ),
+                        ),
+                    )
+                    .options(
+                        load_only(
+                            ShadowBacktest.id,
+                            ShadowBacktest.decision_id,
+                            ShadowBacktest.created_at,
+                            ShadowBacktest.updated_at,
+                            ShadowBacktest.symbol,
+                            ShadowBacktest.analysis_type,
+                            ShadowBacktest.decision_action,
+                            ShadowBacktest.decision_confidence,
+                            ShadowBacktest.training_feature_snapshot,
+                            ShadowBacktest.due_at,
+                            ShadowBacktest.horizon_minutes,
+                            ShadowBacktest.label_version,
+                            ShadowBacktest.long_return_pct,
+                            ShadowBacktest.short_return_pct,
+                            ShadowBacktest.best_action,
+                            ShadowBacktest.missed_opportunity,
                         )
                     )
-                    .scalars()
-                    .all()
+                    .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
                 )
-                if selected_mode == "paper" and include_historical_replay
-                else []
-            )
+                holdout_ids = sorted(replay_holdout_source_ids or set())
+                if holdout_ids:
+                    replay_query = replay_query.where(ShadowBacktest.id.in_(holdout_ids))
+                else:
+                    replay_query = replay_query.limit(effective_limit)
+                replay_shadows = list(
+                    (await session.execute(replay_query)).scalars().all()
+                )
             replay_shadows.reverse()
             decisions = list(
                 (

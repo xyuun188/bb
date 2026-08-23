@@ -169,6 +169,7 @@ from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
+from services.normal_paper_trade import normal_paper_trade_contract_reasons
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -3514,6 +3515,7 @@ class TradingService:
                     ml_signal_service.predict if ml_signal_service is not None else None
                 ),
                 limit=DEFAULT_TRADING_PARAMS.strategy_learning.runtime_context_row_limit,
+                include_historical_replay=False,
             )
             champion = self._safe_dict(learned_context.get("paper_strategy_champion"))
             if selected_mode == "paper" and champion.get("model_rollback_required") is True:
@@ -6890,6 +6892,17 @@ class TradingService:
         }:
             return None
         raw = self._safe_dict(decision.raw_response)
+        if self._market_analysis_only_can_promote(decision):
+            raw["market_analysis_only"] = True
+            raw["market_analysis_only_contract"] = {
+                "selected_for_market_analysis": True,
+                "entry_permission": True,
+                "promoted_for_execution": True,
+                "reason": "full_paper_entry_contract_passed",
+                "original_reason": "ranker_analysis_only_fill",
+            }
+            decision.raw_response = raw
+            return None
         raw["market_analysis_only"] = True
         raw["market_analysis_only_contract"] = {
             "selected_for_market_analysis": True,
@@ -6902,16 +6915,36 @@ class TradingService:
             "分析结果不能进入开仓执行链路。"
         )
 
+    def _market_analysis_only_can_promote(self, decision: DecisionOutput) -> bool:
+        """Allow only a complete, already-authorized paper contract through.
+
+        The shortlist may mark a symbol as observation-only for provenance. That
+        label must not override an independently authorized normal paper entry,
+        but it also must never manufacture permission from scores or signals.
+        """
+
+        if not decision.is_entry:
+            return False
+        raw = self._safe_dict(decision.raw_response)
+        selection = self._safe_dict(raw.get("paper_trade_selection"))
+        permission = self._safe_dict(raw.get("entry_permission"))
+        contract = self._safe_dict(raw.get("normal_paper_trade"))
+        return bool(
+            selection.get("selected") is True
+            and permission.get("granted") is True
+            and not normal_paper_trade_contract_reasons(contract)
+        )
+
     def _entry_gate_reason_with_market_boundary(
         self,
         decision: DecisionOutput,
     ) -> str | None:
         """Apply the normal entry gate plus the observation-only boundary."""
 
-        observation_reason = self._market_analysis_only_entry_reason(decision)
-        if observation_reason:
-            return observation_reason
-        return self.entry_policy.gate_reason(decision)
+        normal_reason = self.entry_policy.gate_reason(decision)
+        if normal_reason:
+            return normal_reason
+        return self._market_analysis_only_entry_reason(decision)
 
     async def _today_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
         """Delegate today's long/short realized-PnL feedback to a dedicated service."""
@@ -7461,10 +7494,8 @@ class TradingService:
         target = max(0, int(limit or 0))
         if target <= 0 or not feature_vectors:
             return {}
-        analysis_only_symbols = getattr(self, "_market_analysis_only_symbols", None)
-        if not isinstance(analysis_only_symbols, set):
-            analysis_only_symbols = set()
-            self._market_analysis_only_symbols = analysis_only_symbols
+        if not isinstance(getattr(self, "_market_analysis_only_symbols", None), set):
+            self._market_analysis_only_symbols = set()
         selected_mode = "live" if str(model_mode).lower() == "live" else "paper"
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
@@ -7590,11 +7621,6 @@ class TradingService:
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
         selected_states = {symbol: candidate_state(symbol) for symbol in selected_order}
-        self._market_analysis_only_symbols.update(
-            symbol
-            for symbol, state in selected_states.items()
-            if state != "execution_verified"
-        )
         for symbol, facts in availability.items():
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:

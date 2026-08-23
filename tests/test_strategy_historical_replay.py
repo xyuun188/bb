@@ -215,6 +215,32 @@ def test_replay_keeps_unprofitable_prediction_for_continuous_paper_evaluation() 
     )
 
 
+def test_paper_bootstrap_replay_does_not_require_existing_trade_calibration() -> None:
+    blueprint = _blueprint()
+    blueprint.update(
+        {
+            "eligible_sides": [],
+            "production_eligible_sides": [],
+            "paper_bootstrap_sides": ["long"],
+            "paper_execution_sides": ["long"],
+        }
+    )
+
+    def paper_predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
+        prediction = _predictor(features, horizons=horizons)
+        prediction["predictions"][0]["actual_trade_calibration_ready"] = False
+        return prediction
+
+    report = build_strategy_historical_replay(
+        blueprint=blueprint,
+        observations=_observations(),
+        predictor=paper_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert report["selected_entry_count"] == 5
+
+
 def test_replay_does_not_wait_for_model_promotion() -> None:
     blueprint = _blueprint()
     blueprint["paper_execution_eligible"] = False
@@ -240,6 +266,26 @@ def test_replay_fails_closed_when_artifact_holdout_cannot_be_reconstructed() -> 
     assert report["status"] == "artifact_holdout_rows_not_reconstructable"
     assert report["development_samples"] == []
     assert report["exam_samples"] == []
+
+
+def test_replay_reconstructs_explicit_holdout_crossing_training_timestamp() -> None:
+    observations = _observations()
+    blueprint = _blueprint()
+    blueprint["training_evidence"]["strategy_replay_holdout"] = {
+        "shadow_source_id_ranges": [[13, 25]],
+        "sample_count": 13,
+    }
+    blueprint["trained_at"] = "2026-07-20T20:00:00+00:00"
+
+    report = build_strategy_historical_replay(
+        blueprint=blueprint,
+        observations=observations,
+        predictor=_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert report["partition"]["post_training_observation_count"] == 1
+    assert report["partition"]["strategy_exam_post_training_added_count"] == 0
 
 
 def test_strategy_candidates_are_built_from_exact_replay_not_legacy_shadow_matching() -> None:

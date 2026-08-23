@@ -3939,6 +3939,7 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
     )
     assert ranked["PI/USDT"]["selected"] is True
     assert ranked["PI/USDT"]["analysis_only"] is True
+    assert service._market_analysis_only_symbols == set()
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():

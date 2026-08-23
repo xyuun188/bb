@@ -7,7 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from models.learning import StrategyProfileSnapshot
-from services.model_strategy_blueprint import build_model_strategy_blueprint
+from services.model_strategy_blueprint import (
+    build_model_strategy_blueprint,
+    model_strategy_side_authorization,
+)
 from services.paper_strategy_champion import (
     PaperStrategyChampionService,
     build_trained_model_strategy_candidates,
@@ -167,6 +170,78 @@ def test_negative_quality_shadow_artifact_is_replay_only_without_execution() -> 
     assert "trained_model_has_no_positive_fee_after_side" in blueprint[
         "blocking_reasons"
     ]
+
+
+def test_authorized_paper_canary_bootstraps_without_production_profitability() -> None:
+    blueprint = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "canary-v1",
+            "trained_at": "2026-08-23T00:00:00+00:00",
+            "test_count": 120,
+            "oos_return_evaluation": {
+                "long": {
+                    "avg_return_pct": -0.04,
+                    "return_lcb_pct": -0.12,
+                    "profit_factor": 0.88,
+                }
+            },
+        },
+        readiness={
+            "paper_canary": {
+                "authorized": True,
+                "state": "ready",
+                "execution_scope": "paper_only",
+                "eligible_sides": ["long"],
+            }
+        },
+        activation={"activation_stage": "canary"},
+    )
+
+    assert blueprint["production_eligible_sides"] == []
+    assert blueprint["paper_bootstrap_sides"] == ["long"]
+    assert blueprint["paper_execution_eligible"] is True
+    assert model_strategy_side_authorization(
+        {"strategy_blueprint": blueprint},
+        execution_scope="paper",
+        side="long",
+    )["authorization_basis"] == "paper_bootstrap_canary"
+
+
+def test_activation_manifest_paper_canary_restores_runtime_blueprint_side() -> None:
+    """Runtime metadata rebuilds must preserve the atomic canary permission."""
+
+    blueprint = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "runtime-canary-v1",
+            "trained_at": "2026-08-23T00:00:00+00:00",
+            "test_count": 120,
+            "oos_return_evaluation": {
+                "long": {
+                    "avg_return_pct": -0.04,
+                    "return_lcb_pct": -0.12,
+                    "profit_factor": 0.88,
+                }
+            },
+        },
+        # This is the shape produced after readiness is rebuilt at runtime:
+        # the persisted activation manifest remains the source of canary truth.
+        readiness={"paper_canary": {"authorized": False}},
+        activation={
+            "activation_stage": "canary",
+            "paper_canary_authorized": True,
+            "paper_canary_report": {
+                "authorized": True,
+                "state": "ready",
+                "execution_scope": "paper_only",
+                "eligible_sides": ["long"],
+            },
+        },
+    )
+
+    assert blueprint["production_eligible_sides"] == []
+    assert blueprint["paper_bootstrap_sides"] == ["long"]
+    assert blueprint["paper_execution_sides"] == ["long"]
+    assert blueprint["paper_execution_eligible"] is True
 
 
 def test_challenger_requires_strict_improvement_or_strictly_better_model() -> None:
