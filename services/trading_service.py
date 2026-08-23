@@ -12334,7 +12334,9 @@ class TradingService:
                 getattr(feature, "current_price", 0.0) if feature is not None else 0.0,
                 0.0,
             )
-            current_price = position_price or feature_price
+            # Hard protection must evaluate the freshest round price first;
+            # the persisted position snapshot may be several seconds old.
+            current_price = feature_price or position_price
             entry_price = self._safe_float(position.get("entry_price"), 0.0)
             if current_price <= 0.0 or entry_price <= 0.0:
                 continue
@@ -13222,7 +13224,7 @@ class TradingService:
 
     async def _strategy_context_account_equity(self, mode: str) -> float:
         selected_mode = "live" if mode == "live" else "paper"
-        if _analysis_scope_context.get() == "market":
+        if _analysis_scope_context.get() in {"market", "position"}:
             cached_snapshot = self.peek_okx_balance_snapshot_for_mode(selected_mode)
             if cached_snapshot:
                 self._last_strategy_context_account_equity_source = "cached_okx_balance_snapshot"
@@ -13233,7 +13235,8 @@ class TradingService:
                 if previous_equity > 0:
                     self._last_strategy_context_account_equity_source = "previous_strategy_context"
                     return previous_equity
-            self._last_strategy_context_account_equity_source = "market_no_cached_balance"
+            self._schedule_okx_balance_snapshot_refresh_for_new_pair_pause(selected_mode)
+            self._last_strategy_context_account_equity_source = "no_cached_balance_background_refresh"
             return 0.0
         balance = await self.allocated_order_balance(selected_mode)
         self._last_strategy_context_account_equity_source = "fresh_okx_balance_snapshot"
@@ -13694,12 +13697,13 @@ class TradingService:
             refresh_cached = cached_snapshot("OKX balance refresh already in progress")
             if refresh_cached:
                 return refresh_cached
-            refresh_fallback = await fresh_executor_snapshot(
-                "shared OKX balance refresh already in progress"
+            logger.warning(
+                "OKX balance refresh already in progress without a usable cache; "
+                "suppressing duplicate fallback request",
+                mode=selected_mode,
+                policy="single_flight_fail_closed",
             )
-            if refresh_fallback:
-                refresh_fallback["refresh_in_progress"] = True
-                return refresh_fallback
+            return None
         stale_cached = cached_snapshot("OKX balance snapshot refresh scheduled")
         if stale_cached and allow_stale_while_refresh:
             self._schedule_okx_balance_snapshot_refresh(selected_mode)

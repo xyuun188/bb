@@ -4222,6 +4222,62 @@ async def test_fixed_take_profit_crossing_cannot_authorize_dynamic_exit():
 
 
 @pytest.mark.asyncio
+async def test_hard_protection_prefers_fresh_feature_price_over_stale_position_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    triggers: list[str] = []
+
+    class FakePositionTime:
+        def position_age_minutes(self, _created_at):
+            return 5.0
+
+    class FakeProfitPeaks:
+        def update(self, **_kwargs):
+            return {"peak_unrealized_pnl": 0.0}
+
+    service.position_time = FakePositionTime()
+    service.position_profit_peaks = FakeProfitPeaks()
+    service._normalize_position_symbol = lambda symbol: str(symbol)
+
+    def fake_apply(decision, _positions):
+        triggers.append(str(decision.raw_response.get("fast_risk_trigger")))
+        return SimpleNamespace(
+            eligible=False,
+            close_fraction=0.0,
+            hard_risk=False,
+            reason="not eligible",
+            policy_provenance={},
+        )
+
+    monkeypatch.setattr("services.trading_service.apply_dynamic_exit", fake_apply)
+
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "is_open": True,
+        "entry_price": 100.0,
+        "current_price": 110.0,
+        "stop_loss": 90.0,
+        "take_profit": 105.0,
+        "quantity": 1.0,
+        "leverage": 1.0,
+        "unrealized_pnl": 10.0,
+        "created_at": datetime.now(UTC) - timedelta(minutes=5),
+    }
+    feature = SimpleNamespace(
+        current_price=100.5,
+        returns_1=0.0,
+        returns_5=0.0,
+        returns_20=0.0,
+    )
+
+    assert await service._enforce_sl_tp({"BTC/USDT": feature}, open_positions=[position]) == []
+    assert triggers == ["dynamic_position_scan"]
+
+
+@pytest.mark.asyncio
 async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[str, str, float]] = []

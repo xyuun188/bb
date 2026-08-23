@@ -389,6 +389,7 @@ class OkxPerpetualSdkExchange:
         self._execution_market_api: Any | None = None
         self._execution_public_api: Any | None = None
         self._sdk_call_locks: dict[int, asyncio.Lock] = {}
+        self._retired_sdk_call_tasks: set[asyncio.Task[None]] = set()
         self._close_http_after_call = bool(close_http_after_call)
         self._disposable_http_call_lock = asyncio.Lock()
         self._server_time_lock = threading.Lock()
@@ -552,22 +553,112 @@ class OkxPerpetualSdkExchange:
             return dict(result)
 
         # python-okx reuses a requests Session inside each API object. Concurrent
-        # to_thread calls can corrupt that session's mutable cookie state.
+        # to_thread calls can corrupt that session's mutable cookie state. An
+        # asyncio timeout cannot stop a running sync request, so a cancelled call
+        # must keep ownership of its client until the worker actually exits.
         if self._close_http_after_call:
-            # Dashboard probes are sparse. Serializing those low-volume reads
-            # lets each call own and close its SDK HTTP client without racing a
-            # second call that already captured the same client instance.
-            async with self._disposable_http_call_lock:
-                api = api_getter()
-                try:
-                    return await asyncio.to_thread(_sync, api)
-                finally:
-                    await self._close_sdk_api(api)
+            await self._disposable_http_call_lock.acquire()
+            api = api_getter()
+            return await self._run_sdk_worker(
+                api,
+                self._disposable_http_call_lock,
+                _sync,
+                close_after_call=True,
+            )
 
-        api = api_getter()
-        call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
-        async with call_lock:
-            return await asyncio.to_thread(_sync, api)
+        while True:
+            api = api_getter()
+            call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
+            await call_lock.acquire()
+            if api_getter() is api:
+                return await self._run_sdk_worker(api, call_lock, _sync)
+            call_lock.release()
+
+    async def _run_sdk_worker(
+        self,
+        api: Any,
+        call_lock: asyncio.Lock,
+        sync_call: Callable[[Any], dict[str, Any]],
+        *,
+        close_after_call: bool = False,
+    ) -> dict[str, Any]:
+        worker = asyncio.create_task(asyncio.to_thread(sync_call, api))
+        release_lock = True
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            if worker.done():
+                try:
+                    worker.result()
+                except BaseException as exc:
+                    logger.debug(
+                        "completed cancelled OKX SDK worker raised",
+                        mode=self.mode,
+                        error=safe_error_text(exc),
+                    )
+            else:
+                self._detach_sdk_api(api)
+                release_lock = False
+                self._track_retired_sdk_call(api, call_lock, worker)
+            raise
+        finally:
+            if release_lock:
+                if close_after_call:
+                    await self._close_sdk_api(api)
+                if call_lock.locked():
+                    call_lock.release()
+
+    def _detach_sdk_api(self, api: Any) -> None:
+        for attribute in (
+            "_account_api",
+            "_trade_api",
+            "_market_api",
+            "_public_api",
+            "_execution_market_api",
+            "_execution_public_api",
+        ):
+            if getattr(self, attribute) is api:
+                setattr(self, attribute, None)
+
+    def _track_retired_sdk_call(
+        self,
+        api: Any,
+        call_lock: asyncio.Lock,
+        worker: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        task = asyncio.create_task(self._finish_retired_sdk_call(api, call_lock, worker))
+        self._retired_sdk_call_tasks.add(task)
+        task.add_done_callback(self._retired_sdk_call_tasks.discard)
+
+    async def _finish_retired_sdk_call(
+        self,
+        api: Any,
+        call_lock: asyncio.Lock,
+        worker: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        cancelled = False
+        try:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
+            try:
+                worker.result()
+            except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.debug(
+                        "retired OKX SDK call finished with error",
+                        mode=self.mode,
+                        error=safe_error_text(exc),
+                    )
+        finally:
+            await self._close_sdk_api(api)
+            if call_lock.locked():
+                call_lock.release()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def load_time_difference(self) -> int:
         return 0
@@ -595,22 +686,47 @@ class OkxPerpetualSdkExchange:
             self._sdk_call_locks.pop(id(api), None)
 
     async def close(self) -> None:
-        clients = tuple(
-            dict.fromkeys(
-                api
-                for api in (
-                    self._account_api,
-                    self._trade_api,
-                    self._market_api,
-                    self._public_api,
-                    self._execution_market_api,
-                    self._execution_public_api,
+        disposable_lock_acquired = False
+        if self._close_http_after_call:
+            await self._disposable_http_call_lock.acquire()
+            disposable_lock_acquired = True
+        try:
+            clients = tuple(
+                dict.fromkeys(
+                    api
+                    for api in (
+                        self._account_api,
+                        self._trade_api,
+                        self._market_api,
+                        self._public_api,
+                        self._execution_market_api,
+                        self._execution_public_api,
+                    )
+                    if api is not None
                 )
-                if api is not None
             )
-        )
-        for api in clients:
-            await self._close_sdk_api(api)
+            for api in clients:
+                # Install a lock before waiting so a call that just obtained
+                # the client cannot race close before registering its lock.
+                call_lock = self._sdk_call_locks.setdefault(id(api), asyncio.Lock())
+                await call_lock.acquire()
+                try:
+                    # A timed-out worker may have detached and retired this API
+                    # while close was waiting. Its finalizer owns the close.
+                    if self._sdk_call_locks.get(id(api)) is call_lock:
+                        await self._close_sdk_api(api)
+                finally:
+                    if call_lock.locked():
+                        call_lock.release()
+        finally:
+            if disposable_lock_acquired and self._disposable_http_call_lock.locked():
+                self._disposable_http_call_lock.release()
+        retired = tuple(self._retired_sdk_call_tasks)
+        if retired:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in retired),
+                return_exceptions=True,
+            )
         self._sdk_call_locks.clear()
 
     def set_sandbox_mode(self, _enabled: bool) -> None:
@@ -720,6 +836,16 @@ class OkxPerpetualSdkExchange:
             lambda: self.execution_market_api,
             "get_ticker",
             instId=str(params["instId"]),
+        )
+
+    async def executionGetMarketTickers(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        params = _swap_params(params)
+        return await self._call_sdk(
+            lambda: self.execution_market_api,
+            "get_tickers",
+            instType=OKX_SWAP_INST_TYPE,
+            uly=str(params.get("uly") or ""),
+            instFamily=str(params.get("instFamily") or ""),
         )
 
     async def publicGetMarketTickers(self, params: Mapping[str, Any]) -> dict[str, Any]:

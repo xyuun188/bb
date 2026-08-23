@@ -232,29 +232,37 @@ class OkxSettlementFactSyncService:
                     targeted_rows = list(targeted_rows_result[0] or [])
                 else:
                     targeted_rows = []
-                history_result = await run_stage(
-                    "position_history",
-                    lambda: native_facts.fetch_position_history_rows(
-                        inst_ids=None,
-                        pos_ids=None,
-                        since=since,
-                        limit=self.limit,
-                        max_pages=self.max_pages,
-                        strict=True,
-                    ),
-                    cap_seconds=5.0,
+                # History and funding bills are independent private endpoints.
+                # Running them sequentially made the 8-second round budget
+                # mathematically incapable of completing both stages.
+                history_task = asyncio.create_task(
+                    run_stage(
+                        "position_history",
+                        lambda: native_facts.fetch_position_history_rows(
+                            inst_ids=None,
+                            pos_ids=None,
+                            since=since,
+                            limit=self.limit,
+                            max_pages=self.max_pages,
+                            strict=True,
+                        ),
+                        cap_seconds=4.5,
+                    )
                 )
-                bill_result = await run_stage(
-                    "account_bills",
-                    lambda: native_facts.fetch_account_bills(
-                        since=since,
-                        limit=self.limit,
-                        max_pages=self.max_pages,
-                        funding_only=True,
-                        strict=True,
-                    ),
-                    cap_seconds=3.0,
+                bill_task = asyncio.create_task(
+                    run_stage(
+                        "account_bills",
+                        lambda: native_facts.fetch_account_bills(
+                            since=since,
+                            limit=self.limit,
+                            max_pages=self.max_pages,
+                            funding_only=True,
+                            strict=True,
+                        ),
+                        cap_seconds=4.5,
+                    )
                 )
+                history_result, bill_result = await asyncio.gather(history_task, bill_task)
                 history_rows = list(history_result[0] or [])
                 if targeted_rows:
                     known = {

@@ -653,6 +653,28 @@ fresh 24-hour online continuity, coverage, expert-call, training-heartbeat and
 audit observation before final acceptance; no model-quality or OKX safety gate
 is bypassed to increase order count.
 
+### 7.16a Model, trading, and training lifecycle audit (2026-08-23)
+
+This pass closed two lifecycle defects found during the full regression:
+
+- OKX ticker reads now use per-instrument single-flight tasks with a bounded
+  join timeout and short failure backoff. A timed-out caller no longer starts a
+  second ticker request while the first request is still running.
+- Dashboard read-only OKX executors now track their creating event loop. A
+  restarted dashboard/test loop retires a stale executor and lock instead of
+  awaiting SDK shutdown on a different loop, which previously produced a
+  cross-loop lock error and could leave the balance refresh path in a failed
+  state.
+- Hard stop-loss/take-profit protection uses the current feature-vector price
+  for the same analysis round and only falls back to the position snapshot when
+  no fresh feature price is available.
+
+Verification for this pass: focused model/entry/exit/training and dashboard
+regressions passed (`231 passed`); the complete repository regression passed
+(`3555 passed, 4 skipped, 1 warning`); Ruff, compileall, and `git diff --check`
+passed. Online deployment and runtime audits remain mandatory before this pass
+is accepted; model-quality and OKX safety gates must remain authoritative.
+
 ### 7.16 Clean online regression and current acceptance state (2026-08-22)
 
 本轮按照“先完成整改、再测试”的顺序完成了最终验证：
@@ -703,3 +725,43 @@ Phase 3 正式维护同步为订单事实同步配置独立的 60 秒上限，�
 - 部署后 30 分钟策略巡检记录 `123` 条分析，执行合同违规 0、废弃策略字段 0、重复执行 0；没有新增开仓是模型质量门禁（fee-after-return、收益 LCB、profit factor）真实阻止的结果，未放宽门禁。
 
 本节是代码整改和即时线上验证记录，不是最终验收声明。新的观察窗口从最终部署时间重新开始，至少需要连续 24 小时（计划目标为 24--48 小时）同时满足分析连续性、专家调用、队列/模型超时、重复分析、训练心跳、OKX 对账、执行合同和系统审计门禁；观察窗口完成前，整改计划必须保持 active。
+
+### 7.19 Model, entry, exit, and training audit snapshot (2026-08-23)
+
+The post-deployment online audit was rerun against the live paper environment.
+The current runtime evidence is:
+
+- The market-analysis pipeline is active. In the latest 60-minute window it
+  produced 145--146 decisions with no service-error examples, four required
+  experts completed on every complete row, cross-validation completed, and no
+  duplicate idempotency keys or cooldown violations were found. The largest
+  observed analysis gap was about 128 seconds; the 30-minute coverage audit
+  reported no overdue symbols and no blocked candidates.
+- New-entry execution is intentionally zero in the window: `entry_contract_ready`
+  is 0, executed entries are 0, and contract violations are 0. The authoritative
+  reason is the fee-after-return/risk quality gate, not an OKX outage or a
+  scheduler failure. OKX reconciliation currently reports
+  `can_open_new_entries=true`, `can_refresh_training=true`, and zero unresolved
+  issues.
+- There are no current open positions, so there is no live position-exit sample
+  in this window. The historical execution-contract audit still shows zero
+  violations and valid dynamic-exit contracts for the observed executed exits;
+  protection inventory has no missing, orphaned, split, or invalid orders.
+- The effective training loop is `platform_model_training_loop`; its heartbeat is
+  fresh, with no timeout, failed, interrupted, or unhealthy model runs. The two
+  legacy scheduler records (`local_ai_tools_auto_train` and
+  `local_ml_auto_train`) have stale raw heartbeat timestamps but are explicitly
+  marked superseded by the fresh platform loop and are not effective training
+  blockers.
+- Model quality remains the real entry blocker. The active/canary artifacts are
+  available, but fee-after-cost return quality is negative or statistically
+  unproven (non-positive return LCB/profit factor and stability evidence gaps),
+  so `live_ml_ready=false` and production entry permission remains disabled.
+  This gate is kept authoritative; no threshold was relaxed to manufacture
+  trades.
+
+This is an immediate runtime acceptance snapshot, not completion of the planned
+24--48 hour continuity observation. The observation window remains active until
+analysis continuity, expert calls, timeout/error absence, training heartbeat,
+OKX reconciliation, and execution-contract checks remain clean for the full
+period.

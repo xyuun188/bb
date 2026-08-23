@@ -73,6 +73,8 @@ ORPHAN_QUARANTINE_CLOSE_PREFIX = "okx_orphan_quarantine:"
 POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
 POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS = 0.1
 POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS = 4.0
+AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS = 30.0
+AUTHORITATIVE_POSITION_PRICE_REUSE_SECONDS = 300.0
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS = 10 * 60.0
 CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO = 0.005
@@ -1218,6 +1220,58 @@ class OkxSyncService:
         self._position_protection_rebalance_retry_at: dict[tuple[str, str], float] = {}
         self._position_protection_rebalance_task: asyncio.Task[list[dict[str, Any]]] | None = None
         self._partial_entry_recovery_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        # Reuse a successful exchange inventory fetch across reconciliation,
+        # position context, and price refresh. Values are keyed by executor
+        # identity so live and demo accounts can never share a snapshot.
+        self._authoritative_position_snapshots: dict[
+            tuple[str, int], tuple[float, list[dict[str, Any]]]
+        ] = {}
+
+    @staticmethod
+    def _copy_position_snapshot(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        copied: list[dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            payload = dict(row)
+            info = payload.get("info")
+            if isinstance(info, dict):
+                payload["info"] = dict(info)
+            copied.append(payload)
+        return copied
+
+    def _remember_authoritative_position_snapshot(
+        self,
+        mode: str,
+        executor: Any,
+        rows: list[dict[str, Any]] | None,
+    ) -> None:
+        if executor is None:
+            return
+        key = ("live" if mode == "live" else "paper", id(executor))
+        self._authoritative_position_snapshots[key] = (
+            time.monotonic(),
+            self._copy_position_snapshot(rows),
+        )
+
+    def _cached_authoritative_position_snapshot(
+        self,
+        mode: str,
+        executor: Any,
+        *,
+        max_age_seconds: float,
+    ) -> list[dict[str, Any]] | None:
+        if executor is None:
+            return None
+        key = ("live" if mode == "live" else "paper", id(executor))
+        entry = self._authoritative_position_snapshots.get(key)
+        if entry is None:
+            return None
+        created_at, rows = entry
+        if time.monotonic() - created_at > max(float(max_age_seconds), 0.0):
+            self._authoritative_position_snapshots.pop(key, None)
+            return None
+        return self._copy_position_snapshot(rows)
 
     def _protection_coverage_mismatch_keys(
         self,
@@ -1804,7 +1858,14 @@ class OkxSyncService:
             async def fetch_source_positions(
                 source_mode: str,
                 executor: Any,
-            ) -> tuple[str, list[dict[str, Any]]]:
+            ) -> tuple[str, list[dict[str, Any]], bool]:
+                cached = self._cached_authoritative_position_snapshot(
+                    source_mode,
+                    executor,
+                    max_age_seconds=AUTHORITATIVE_POSITION_PRICE_REUSE_SECONDS,
+                )
+                if cached is not None:
+                    return source_mode, cached, True
                 task = asyncio.create_task(executor.get_positions_strict())
                 try:
                     done, pending = await asyncio.wait(
@@ -1819,7 +1880,7 @@ class OkxSyncService:
                             source_mode=source_mode,
                             timeout_seconds=POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS,
                         )
-                        return source_mode, []
+                        return source_mode, [], False
                     exchange_positions = next(iter(done)).result()
                 except asyncio.CancelledError:
                     if not task.done():
@@ -1832,8 +1893,10 @@ class OkxSyncService:
                         source_mode=source_mode,
                         error=safe_error_text(exc),
                     )
-                    return source_mode, []
-                return source_mode, list(exchange_positions or [])
+                    return source_mode, [], False
+                rows = list(exchange_positions or [])
+                self._remember_authoritative_position_snapshot(source_mode, executor, rows)
+                return source_mode, rows, False
 
             exchange_fetch_started = time.perf_counter()
             source_snapshots = await asyncio.gather(
@@ -1846,7 +1909,7 @@ class OkxSyncService:
                 (time.perf_counter() - exchange_fetch_started) * 1000,
                 3,
             )
-            for source_mode, exchange_positions in source_snapshots:
+            for source_mode, exchange_positions, cached in source_snapshots:
                 for exchange_pos in exchange_positions or []:
                     snapshot = parse_exchange_position_snapshot(
                         exchange_pos,
@@ -1855,7 +1918,7 @@ class OkxSyncService:
                     if not snapshot:
                         continue
                     key = (source_mode, str(snapshot["symbol"]), str(snapshot["side"]))
-                    exchange_snapshots[key] = snapshot
+                    exchange_snapshots[key] = {**snapshot, "_cached": cached}
             diagnostics["exchange_snapshot_count"] = len(exchange_snapshots)
         except Exception as exc:
             diagnostics["exchange_snapshot_error"] = safe_error_text(exc, limit=180)
@@ -1925,24 +1988,32 @@ class OkxSyncService:
                         str(pos.side or "").lower(),
                     )
                     snapshot = exchange_snapshots.get(key)
-                    if snapshot:
+                    fv = feature_vectors.get(pos.symbol)
+                    fv_price = getattr(fv, "current_price", None) if fv is not None else None
+                    if snapshot and not snapshot.get("_cached"):
                         current_price = (
                             parse_float(snapshot.get("mark_price"), 0.0)
                             or parse_float(snapshot.get("last_price"), 0.0)
+                            or fv_price
                             or pos.current_price
                             or pos.entry_price
                         )
                     else:
-                        fv = feature_vectors.get(pos.symbol)
-                        fv_price = getattr(fv, "current_price", None) if fv is not None else None
                         current_price = (
-                            fv_price if fv_price else pos.current_price or pos.entry_price
+                            fv_price
+                            or (
+                                parse_float(snapshot.get("mark_price"), 0.0)
+                                if snapshot
+                                else 0.0
+                            )
+                            or pos.current_price
+                            or pos.entry_price
                         )
                     if not current_price or current_price <= 0:
                         continue
 
                     snapshot_upl = parse_float(snapshot.get("upl"), 0.0) if snapshot else 0.0
-                    if snapshot and snapshot.get("upl") is not None:
+                    if snapshot and snapshot.get("upl") is not None and not snapshot.get("_cached"):
                         unrealized_pnl = snapshot_upl
                     elif pos.side == "short":
                         unrealized_pnl = (pos.entry_price - current_price) * pos.quantity
@@ -2764,6 +2835,7 @@ class OkxSyncService:
                 error=safe_error_text(e),
             )
             return []
+        self._remember_authoritative_position_snapshot("paper", paper_okx, exchange_positions)
 
         protection_snapshot = await self._fetch_exchange_protection_map_with_timeout(
             fetch_exchange_protection_map,
@@ -4235,17 +4307,30 @@ class OkxSyncService:
             logger.warning("active OKX executor unavailable; position context is fail-closed")
             return []
 
-        try:
-            okx_positions = await asyncio.wait_for(
-                active_okx.get_positions_strict(),
-                timeout=8.0,
+        active_mode = "live" if mode_manager.mode.value == "live" else "paper"
+        okx_positions = self._cached_authoritative_position_snapshot(
+            active_mode,
+            active_okx,
+            max_age_seconds=AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS,
+        )
+        if okx_positions is None:
+            try:
+                okx_positions = await asyncio.wait_for(
+                    active_okx.get_positions_strict(),
+                    timeout=8.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "failed to fetch authoritative OKX position context; returning no positions",
+                    error=safe_error_text(exc),
+                )
+                return []
+            okx_positions = list(okx_positions or [])
+            self._remember_authoritative_position_snapshot(
+                active_mode,
+                active_okx,
+                okx_positions,
             )
-        except Exception as exc:
-            logger.warning(
-                "failed to fetch authoritative OKX position context; returning no positions",
-                error=safe_error_text(exc),
-            )
-            return []
 
         local_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for local_position in local_positions:

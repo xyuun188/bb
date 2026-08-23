@@ -41,6 +41,12 @@ REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
 REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
 ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 2.5
 ORDERBOOK_CACHE_TTL_SECONDS = 10.0
+TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
+# A caller joining an already-running ticker refresh gets a normal bounded
+# wait.  This is deliberately independent from the first caller's short
+# route budget so a completed shared request is not lost as a timeout stub.
+TICKER_ROUTE_JOIN_TIMEOUT_SECONDS = 2.5
+TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 
 
 def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
@@ -68,6 +74,8 @@ class OKXRestClient:
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._reference_price_failure_cache: dict[str, float] = {}
+        self._ticker_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._ticker_retry_at: dict[str, float] = {}
         self._orderbook_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._orderbook_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._derivatives_route_cache: dict[
@@ -158,9 +166,66 @@ class OKXRestClient:
         self._exchange.set_markets(markets)
 
     async def fetch_ticker(self, symbol: str) -> dict:
+        """Fetch one ticker through a bounded per-instrument single-flight."""
         inst_id = okx_inst_id_from_symbol(symbol)
         if not inst_id:
             return {}
+        now = time.monotonic()
+        task = self._ticker_tasks.get(inst_id)
+        joining_inflight = task is not None and not task.done()
+        if task is None or task.done():
+            retry_at = self._ticker_retry_at.get(inst_id, 0.0)
+            if retry_at > now:
+                return {
+                    "ticker_refresh_in_background": True,
+                    "ticker_retry_after_seconds": round(retry_at - now, 3),
+                }
+            task = asyncio.create_task(self._fetch_ticker_uncached(inst_id))
+            self._ticker_tasks[inst_id] = task
+
+            def _finish(finished: asyncio.Task[dict[str, Any]]) -> None:
+                if self._ticker_tasks.get(inst_id) is finished:
+                    self._ticker_tasks.pop(inst_id, None)
+                try:
+                    result = finished.result()
+                except BaseException:
+                    self._ticker_retry_at[inst_id] = (
+                        time.monotonic() + TICKER_ROUTE_FAILURE_BACKOFF_SECONDS
+                    )
+                    return
+                if not isinstance(result, dict) or not result:
+                    self._ticker_retry_at[inst_id] = (
+                        time.monotonic() + TICKER_ROUTE_FAILURE_BACKOFF_SECONDS
+                    )
+                else:
+                    self._ticker_retry_at.pop(inst_id, None)
+
+            task.add_done_callback(_finish)
+
+        try:
+            timeout_seconds = (
+                TICKER_ROUTE_JOIN_TIMEOUT_SECONDS
+                if joining_inflight
+                else TICKER_ROUTE_TIMEOUT_SECONDS
+            )
+            return dict(
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=timeout_seconds,
+                )
+            )
+        except TimeoutError:
+            # Keep the shared request alive. A later analysis round must wait on
+            # this task instead of issuing another request against the same SDK.
+            # Do not mark the instrument as failed here: the in-flight request
+            # may still complete successfully after this caller's short wait.
+            # The done callback owns failure backoff once the shared task settles.
+            return {
+                "ticker_refresh_in_background": True,
+                "ticker_timeout": True,
+            }
+
+    async def _fetch_ticker_uncached(self, inst_id: str) -> dict[str, Any]:
         response = await self._ccxt_call("publicGetMarketTicker", {"instId": inst_id})
         rows = response.get("data", []) if isinstance(response, dict) else []
         if not rows:
@@ -686,33 +751,17 @@ class OKXRestClient:
             # it from a verified mark/index pair.
             ticker_task: asyncio.Task[Any] | None = None
             try:
-                ticker_task = asyncio.create_task(
-                    self._ccxt_call(
-                        "publicGetMarketTicker",
-                        {"instId": inst_id},
-                    )
-                )
+                ticker_task = asyncio.create_task(self.fetch_ticker(symbol))
                 ticker_result = await asyncio.wait_for(
-                    ticker_task,
+                    asyncio.shield(ticker_task),
                     timeout=REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS,
                 )
-                ticker_rows = (
-                    ticker_result.get("data", [])
-                    if isinstance(ticker_result, dict)
-                    else []
-                )
-                ticker_row = (
-                    ticker_rows[0]
-                    if ticker_rows and isinstance(ticker_rows[0], dict)
-                    else {}
-                )
-                ticker_price = self._safe_float(ticker_row.get("last"))
+                ticker_info = ticker_result.get("info") or {}
+                ticker_price = self._safe_float(ticker_result.get("last"))
                 ticker_timestamp_ms = int(
                     self._safe_float(
-                        ticker_row.get("ts")
-                        or ticker_result.get("ts")
-                        if isinstance(ticker_result, dict)
-                        else 0
+                        ticker_result.get("timestamp")
+                        or ticker_info.get("ts")
                     )
                 )
                 if ticker_price > 0:
@@ -721,7 +770,7 @@ class OKXRestClient:
                         mark_row = {
                             "instId": inst_id,
                             "instType": "SWAP",
-                            "markPx": ticker_row.get("last"),
+                            "markPx": ticker_result.get("last"),
                             "ts": ticker_timestamp_ms,
                             "fallback": True,
                         }
@@ -730,7 +779,7 @@ class OKXRestClient:
                         index_price = ticker_price
                         index_row = {
                             "instId": uly,
-                            "idxPx": ticker_row.get("last"),
+                            "idxPx": ticker_result.get("last"),
                             "ts": ticker_timestamp_ms,
                             "fallback": True,
                         }
@@ -1379,6 +1428,14 @@ class OKXRestClient:
         self._exchange_ready = False
 
     async def close(self) -> None:
+        ticker_tasks = list(self._ticker_tasks.values())
+        for task in ticker_tasks:
+            if not task.done():
+                task.cancel()
+        if ticker_tasks:
+            await asyncio.gather(*ticker_tasks, return_exceptions=True)
+        self._ticker_tasks.clear()
+        self._ticker_retry_at.clear()
         if self._exchange:
             await self._exchange.close()
             self._exchange = None

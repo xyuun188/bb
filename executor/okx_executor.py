@@ -10,6 +10,7 @@ import asyncio
 import re
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -6262,6 +6263,7 @@ class OKXExecutor(AbstractExecutor):
         *,
         okx_symbol: str | None = None,
         force: bool = False,
+        environment_compatibility: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Verify that this account and execution mode can address the instrument."""
 
@@ -6275,9 +6277,10 @@ class OKXExecutor(AbstractExecutor):
         compatibility: dict[str, Any] = {}
         try:
             ccxt = await self._get_ccxt()
-            compatibility = await self._entry_environment_compatibility(
-                ccxt,
-                symbol,
+            compatibility = (
+                dict(environment_compatibility)
+                if environment_compatibility is not None
+                else await self._entry_environment_compatibility(ccxt, symbol)
             )
             if compatibility.get("compatible") is False:
                 result = {
@@ -6304,6 +6307,13 @@ class OKXExecutor(AbstractExecutor):
                     ttl,
                 )
                 return result
+            if (
+                compatibility.get("checked") is True
+                and compatibility.get("compatible") is not True
+            ):
+                raise ExchangeAPIError(
+                    "OKX entry environment compatibility probe did not produce a usable result"
+                )
             fetch_leverage = getattr(ccxt, "fetch_leverage", None)
             if not callable(fetch_leverage):
                 raise ExchangeAPIError("OKX private account leverage API is unavailable")
@@ -6407,7 +6417,7 @@ class OKXExecutor(AbstractExecutor):
             }
 
         inst_id = okx_inst_id_from_symbol(symbol)
-        live_response, execution_response, live_ticker, execution_ticker = await asyncio.gather(
+        responses = await asyncio.gather(
             self._with_retry(
                 ccxt.publicGetPublicInstruments,
                 {"instType": "SWAP", "instId": inst_id},
@@ -6428,7 +6438,18 @@ class OKXExecutor(AbstractExecutor):
                 {"instId": inst_id},
                 _max_attempts=1,
             ),
+            return_exceptions=True,
         )
+        if any(isinstance(response, BaseException) for response in responses):
+            errors = [
+                safe_error_text(response, limit=220)
+                for response in responses
+                if isinstance(response, BaseException)
+            ]
+            raise RuntimeError(
+                "environment compatibility probe failed: " + "; ".join(errors[:4])
+            )
+        live_response, execution_response, live_ticker, execution_ticker = responses
         live_rows = live_response.get("data") if isinstance(live_response, dict) else []
         execution_rows = (
             execution_response.get("data") if isinstance(execution_response, dict) else []
@@ -6444,6 +6465,125 @@ class OKXExecutor(AbstractExecutor):
             execution_ticker=execution_ticker,
         )
         return {"checked": True, **assessment}
+
+    async def _entry_environment_compatibility_batch(
+        self,
+        ccxt: Any,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch live/demo instrument and ticker facts once for all symbols."""
+
+        normalized_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if str(symbol)))
+        if not normalized_symbols:
+            return {}
+        unchecked = {
+            symbol: {
+                "checked": False,
+                "compatible": True,
+                "reason": "environment_compatibility_probe_not_supported",
+                "blockers": [],
+            }
+            for symbol in normalized_symbols
+        }
+        if not settings.is_okx_demo(self.executor_mode):
+            return {
+                symbol: {
+                    "checked": False,
+                    "compatible": True,
+                    "reason": "single_live_execution_environment",
+                    "blockers": [],
+                }
+                for symbol in normalized_symbols
+            }
+        required = (
+            "publicGetPublicInstruments",
+            "executionGetPublicInstruments",
+            "publicGetMarketTickers",
+            "executionGetMarketTickers",
+        )
+        if any(not callable(getattr(ccxt, name, None)) for name in required):
+            return unchecked
+
+        try:
+            responses = await asyncio.gather(
+                self._with_retry(
+                    ccxt.publicGetPublicInstruments,
+                    {"instType": "SWAP"},
+                    _max_attempts=1,
+                ),
+                self._with_retry(
+                    ccxt.executionGetPublicInstruments,
+                    {"instType": "SWAP"},
+                    _max_attempts=1,
+                ),
+                self._with_retry(
+                    ccxt.publicGetMarketTickers,
+                    {"instType": "SWAP"},
+                    _max_attempts=1,
+                ),
+                self._with_retry(
+                    ccxt.executionGetMarketTickers,
+                    {"instType": "SWAP"},
+                    _max_attempts=1,
+                ),
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            error = safe_error_text(exc, limit=220)
+            return {
+                symbol: {
+                    "checked": True,
+                    "compatible": None,
+                    "reason": "environment_compatibility_probe_failed",
+                    "blockers": ["environment_compatibility_probe_failed"],
+                    "error": error,
+                }
+                for symbol in normalized_symbols
+            }
+        if any(isinstance(response, BaseException) for response in responses):
+            errors = [
+                safe_error_text(response, limit=220)
+                for response in responses
+                if isinstance(response, BaseException)
+            ]
+            error = "; ".join(errors[:4])
+            return {
+                symbol: {
+                    "checked": True,
+                    "compatible": None,
+                    "reason": "environment_compatibility_probe_failed",
+                    "blockers": ["environment_compatibility_probe_failed"],
+                    "error": error,
+                }
+                for symbol in normalized_symbols
+            }
+        live_response, execution_response, live_tickers, execution_tickers = responses
+
+        def rows_by_inst_id(response: Any) -> dict[str, dict[str, Any]]:
+            rows = response.get("data") if isinstance(response, dict) else []
+            return {
+                str(row.get("instId") or "").strip().upper(): dict(row)
+                for row in rows or []
+                if isinstance(row, Mapping) and str(row.get("instId") or "").strip()
+            }
+
+        live_instruments = rows_by_inst_id(live_response)
+        execution_instruments = rows_by_inst_id(execution_response)
+        live_ticker_rows = rows_by_inst_id(live_tickers)
+        execution_ticker_rows = rows_by_inst_id(execution_tickers)
+        results: dict[str, dict[str, Any]] = {}
+        for symbol in normalized_symbols:
+            inst_id = okx_inst_id_from_symbol(symbol)
+            results[symbol] = {
+                "checked": True,
+                **assess_okx_entry_environment_compatibility(
+                    live_instrument=live_instruments.get(inst_id, {}),
+                    execution_instrument=execution_instruments.get(inst_id, {}),
+                    live_ticker=live_ticker_rows.get(inst_id, {}),
+                    execution_ticker=execution_ticker_rows.get(inst_id, {}),
+                ),
+            }
+        return results
 
     async def entry_instrument_availability_shortlist(
         self,
@@ -6473,12 +6613,33 @@ class OKXExecutor(AbstractExecutor):
         probed_count = 0
         cache_hit_count = 0
 
+        now = time.monotonic()
+        uncached_symbols = [
+            symbol
+            for symbol in ordered_symbols
+            if not (
+                (cached := self._entry_instrument_availability_cache.get(okx_inst_id_from_symbol(symbol)))
+                and now - cached[1] <= cached[2]
+            )
+        ]
+        ccxt = await self._get_ccxt()
+        environment_compatibility = await self._entry_environment_compatibility_batch(
+            ccxt,
+            uncached_symbols,
+        )
+
         for offset in range(0, len(ordered_symbols), batch_size):
             if len(selected) >= target:
                 break
             batch = ordered_symbols[offset : offset + batch_size]
             facts_rows = await asyncio.gather(
-                *(self.entry_instrument_availability(symbol) for symbol in batch)
+                *(
+                    self.entry_instrument_availability(
+                        symbol,
+                        environment_compatibility=environment_compatibility.get(symbol),
+                    )
+                    for symbol in batch
+                )
             )
             for symbol, facts in zip(batch, facts_rows, strict=True):
                 normalized_facts = dict(facts) if isinstance(facts, dict) else {}

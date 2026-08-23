@@ -159,6 +159,50 @@ async def test_fetch_ticker_uses_okx_native_inst_id(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_ticker_timeout_keeps_and_reuses_inflight_request(monkeypatch) -> None:
+    client = OKXRestClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_ccxt_call(method_name: str, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert method_name == "publicGetMarketTicker"
+        started.set()
+        await release.wait()
+        return {
+            "data": [
+                {
+                    "instId": "SPK-USDT-SWAP",
+                    "last": "0.0123",
+                    "ts": "1780000000000",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", slow_ccxt_call)
+    monkeypatch.setattr(
+        "data_feed.okx_rest_client.TICKER_ROUTE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    first = await client.fetch_ticker("SPK/USDT")
+    assert first["ticker_timeout"] is True
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+
+    second_task = asyncio.create_task(client.fetch_ticker("SPK/USDT"))
+    await asyncio.sleep(0)
+    assert not second_task.done()
+    assert calls == 1
+
+    release.set()
+    second = await asyncio.wait_for(second_task, timeout=0.2)
+    assert second["last"] == pytest.approx(0.0123)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch) -> None:
     client = OKXRestClient()
 

@@ -1119,6 +1119,11 @@ class DataService:
             }
         try:
             raw_ticker = await self.rest_client.fetch_ticker(normalized)
+            if not isinstance(raw_ticker, dict) or (
+                raw_ticker.get("ticker_refresh_in_background")
+                and not raw_ticker.get("last")
+            ):
+                raise TimeoutError("ticker refresh is still running in background")
             ticker_info = raw_ticker.get("info") or {}
             bid = self._safe_float(raw_ticker.get("bid") or ticker_info.get("bidPx"), 0.0)
             ask = self._safe_float(raw_ticker.get("ask") or ticker_info.get("askPx"), 0.0)

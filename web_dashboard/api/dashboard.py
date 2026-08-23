@@ -145,6 +145,7 @@ _dashboard_okx_balance_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _dashboard_read_only_okx_executors: dict[str, Any] = {}
 _dashboard_read_only_okx_executor_factories: dict[str, Any] = {}
 _dashboard_read_only_okx_executor_locks: dict[str, asyncio.Lock] = {}
+_dashboard_read_only_okx_executor_loops: dict[str, asyncio.AbstractEventLoop] = {}
 _dashboard_public_rest_client: Any | None = None
 _dashboard_public_rest_client_factory: Any | None = None
 _dashboard_public_rest_client_lock: asyncio.Lock | None = None
@@ -2829,6 +2830,25 @@ async def _dashboard_open_position_protection_evidence(
 ) -> dict[str, Any]:
     selected_mode = "live" if mode == "live" else "paper"
 
+    # Do not start a second OKX executor/read while the position snapshot has
+    # already declared the exchange temporarily unavailable.  That duplicate
+    # path can block the dashboard after the primary bounded read has failed.
+    unavailable = _dashboard_okx_positions_temporarily_unavailable(selected_mode)
+    if unavailable:
+        blocker = "okx_positions_temporarily_unavailable"
+        for item in positions:
+            item["protection_contract"] = {
+                "available": False,
+                "orders": [],
+                "blockers": [blocker],
+            }
+        return {
+            "available": False,
+            "blockers": [blocker],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+        }
+
     try:
         audit = await _dashboard_okx_protection_audit(selected_mode)
     except Exception as exc:
@@ -3057,15 +3077,35 @@ async def _dashboard_read_only_okx_executor(
     shared = _dashboard_okx_executor_for_mode(selected_mode) if prefer_shared else None
     if shared is not None:
         return shared
+    current_loop = asyncio.get_running_loop()
     cached = _dashboard_read_only_okx_executors.get(selected_mode)
+    cached_loop = _dashboard_read_only_okx_executor_loops.get(selected_mode)
+    if cached is not None and cached_loop is not None and cached_loop is not current_loop:
+        # Async SDK clients carry locks/tasks bound to their creating loop. A
+        # dashboard test or a restarted lifespan can create a new loop; do not
+        # await shutdown on the closed loop, just retire the stale client.
+        _dashboard_read_only_okx_executors.pop(selected_mode, None)
+        _dashboard_read_only_okx_executor_factories.pop(selected_mode, None)
+        _dashboard_read_only_okx_executor_loops.pop(selected_mode, None)
+        cached = None
     if (
         cached is not None
         and _dashboard_read_only_okx_executor_factories.get(selected_mode) is OKXExecutor
     ):
         return cached
-    lock = _dashboard_read_only_okx_executor_locks.setdefault(selected_mode, asyncio.Lock())
+    lock = _dashboard_read_only_okx_executor_locks.get(selected_mode)
+    lock_loop = getattr(lock, "_loop", None) if lock is not None else None
+    if lock is None or (lock_loop is not None and lock_loop is not current_loop):
+        lock = asyncio.Lock()
+        _dashboard_read_only_okx_executor_locks[selected_mode] = lock
     async with lock:
         cached = _dashboard_read_only_okx_executors.get(selected_mode)
+        cached_loop = _dashboard_read_only_okx_executor_loops.get(selected_mode)
+        if cached is not None and cached_loop is not None and cached_loop is not current_loop:
+            _dashboard_read_only_okx_executors.pop(selected_mode, None)
+            _dashboard_read_only_okx_executor_factories.pop(selected_mode, None)
+            _dashboard_read_only_okx_executor_loops.pop(selected_mode, None)
+            cached = None
         if (
             cached is not None
             and _dashboard_read_only_okx_executor_factories.get(selected_mode) is OKXExecutor
@@ -3082,6 +3122,7 @@ async def _dashboard_read_only_okx_executor(
                 )
             _dashboard_read_only_okx_executors.pop(selected_mode, None)
             _dashboard_read_only_okx_executor_factories.pop(selected_mode, None)
+            _dashboard_read_only_okx_executor_loops.pop(selected_mode, None)
         executor = _make_lightweight_okx_executor(OKXExecutor, selected_mode)
         try:
             await asyncio.wait_for(
@@ -3103,6 +3144,7 @@ async def _dashboard_read_only_okx_executor(
             raise
         _dashboard_read_only_okx_executors[selected_mode] = executor
         _dashboard_read_only_okx_executor_factories[selected_mode] = OKXExecutor
+        _dashboard_read_only_okx_executor_loops[selected_mode] = current_loop
         return executor
 
 
@@ -3213,6 +3255,7 @@ async def shutdown_dashboard_read_clients() -> None:
     _dashboard_read_only_okx_executors.clear()
     _dashboard_read_only_okx_executor_factories.clear()
     _dashboard_read_only_okx_executor_locks.clear()
+    _dashboard_read_only_okx_executor_loops.clear()
     for executor in executors:
         try:
             await executor.shutdown()
