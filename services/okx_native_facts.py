@@ -8,6 +8,7 @@ guards.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1047,10 +1048,21 @@ class OkxNativeFactsClient:
                     }
                 )
 
+        async def fetch_one(params: dict[str, str]) -> dict[str, Any]:
+            return await self.executor._with_retry(fetch_algos, params)
+
+        if target_inst_ids or len(params_list) <= 1:
+            responses = [await fetch_one(params) for params in params_list]
+        else:
+            # The account-wide inventory is split by OKX algo order type. The
+            # four read-only calls are independent, and serial execution made
+            # a complete protection snapshot routinely exceed the caller's
+            # bounded reconciliation budget.
+            responses = await asyncio.gather(*(fetch_one(params) for params in params_list))
+
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
-        for params in params_list[: self.max_instrument_queries * 3]:
-            response = await self.executor._with_retry(fetch_algos, params)
+        for response in responses[: self.max_instrument_queries * 3]:
             for row in _response_rows(response):
                 row_inst_id = str(row.get("instId") or "").strip().upper()
                 if target_inst_ids and row_inst_id not in target_inst_ids:

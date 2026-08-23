@@ -1047,10 +1047,16 @@ def test_successful_runtime_round_clears_recovered_scope_error(
     assert payload["last_round_error"] is None
 
 
-def test_market_scope_skips_full_reconciliation_at_round_start() -> None:
-    assert TradingService._should_run_full_reconciliation_at_round_start("market") is False
-    assert TradingService._should_run_full_reconciliation_at_round_start("position") is True
-    assert TradingService._should_run_full_reconciliation_at_round_start("full") is True
+def test_round_start_reconciliation_uses_background_authority_when_fresh() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_authoritative_sync_context_is_usable_for_market_scan = lambda: True  # type: ignore[method-assign]
+
+    assert service._should_run_full_reconciliation_at_round_start("market") is False
+    assert service._should_run_full_reconciliation_at_round_start("position") is False
+    assert service._should_run_full_reconciliation_at_round_start("full") is True
+
+    service._okx_authoritative_sync_context_is_usable_for_market_scan = lambda: False  # type: ignore[method-assign]
+    assert service._should_run_full_reconciliation_at_round_start("position") is True
 
 
 def test_market_scope_skips_sync_position_price_refresh_before_ai() -> None:
@@ -7069,6 +7075,11 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     service._recent_model_contribution_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
     service._strategy_context_account_equity = lambda _mode: _async_value(200.0)  # type: ignore[method-assign]
 
+    async def unexpected_bounded_context(*_args, **_kwargs):
+        raise AssertionError("market/position cached equity must not enter the shared I/O queue")
+
+    service._bounded_strategy_context_value = unexpected_bounded_context  # type: ignore[method-assign]
+
     refresh_started = asyncio.Event()
     release_refresh = asyncio.Event()
 
@@ -8270,6 +8281,57 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_paper_okx
     )
 
     assert await service.reconcile_exchange_positions() == []
+
+
+@pytest.mark.asyncio
+async def test_sync_service_reuses_recent_authoritative_snapshot_after_position_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePaperOKX:
+        async def get_positions_strict(self):
+            raise TimeoutError
+
+    class FakeTradeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def get_open_positions(self):
+            return []
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield object()
+
+    async def protection_map(_paper_okx, exchange_positions):
+        assert exchange_positions == []
+        return {}
+
+    async def fallback_protection(_session, **_kwargs):
+        return {}
+
+    paper_okx = FakePaperOKX()
+    monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
+    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    service = OkxSyncService(
+        symbol_normalizer=lambda symbol: str(symbol or ""),
+        float_parser=lambda value, default=0.0: default if value is None else float(value),
+        exchange_position_open_checker=lambda position: bool(position),
+        paper_okx_provider=lambda: paper_okx,
+        exchange_protection_map_provider=protection_map,
+        position_protection_fallback_provider=fallback_protection,
+        local_position_snapshot_syncer=lambda _positions, **_kwargs: False,
+        datetime_from_ms_parser=lambda _timestamp_ms: datetime.now(UTC),
+        **_noop_reconcile_close_boundaries(),
+    )
+    service._remember_authoritative_position_snapshot("paper", paper_okx, [])
+
+    result = await service.reconcile_exchange_positions()
+
+    assert len(result) == 1
+    assert result[0]["kind"] == "position_snapshot_reused"
+    assert result[0]["degraded"] is True
+    assert result[0]["requires_attention"] is False
+    assert result[0]["error"] == "timeout"
 
 
 @pytest.mark.asyncio
@@ -11379,7 +11441,7 @@ async def test_local_open_positions_context_returns_db_positions_without_okx(
         yield FakeSession()
 
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
-    monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(sync_module, "get_read_session_ctx", fake_session_ctx)
 
     result = await OkxSyncService(
         symbol_normalizer=normalize_trading_symbol,
@@ -11446,12 +11508,42 @@ async def test_position_round_refreshes_open_positions_context_authoritatively()
         return [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
 
     service._get_open_positions_context = load_positions  # type: ignore[method-assign]
+    service._okx_authoritative_sync_context_is_usable_for_market_scan = lambda: False  # type: ignore[method-assign]
 
     result = await service._open_positions_context_for_round("position")
 
     assert result == [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
     assert calls == 1
     assert service._open_positions_context_cache["positions"] == result
+
+
+@pytest.mark.asyncio
+async def test_position_round_uses_local_context_after_fresh_authoritative_sync() -> None:
+    service = TradingService.__new__(TradingService)
+    service._open_positions_context_cache = {}
+    authoritative_calls = 0
+    local_calls = 0
+
+    async def load_authoritative():
+        nonlocal authoritative_calls
+        authoritative_calls += 1
+        return [{"symbol": "OLD/USDT", "side": "long", "is_open": True}]
+
+    async def load_local(*, strict: bool = False):
+        nonlocal local_calls
+        assert strict is True
+        local_calls += 1
+        return [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
+
+    service._get_open_positions_context = load_authoritative  # type: ignore[method-assign]
+    service._get_local_open_positions_context = load_local  # type: ignore[method-assign]
+    service._okx_authoritative_sync_context_is_usable_for_market_scan = lambda: True  # type: ignore[method-assign]
+
+    result = await service._open_positions_context_for_round("position")
+
+    assert result == [{"symbol": "ETH/USDT", "side": "short", "is_open": True}]
+    assert local_calls == 1
+    assert authoritative_calls == 0
 
 
 @pytest.mark.asyncio

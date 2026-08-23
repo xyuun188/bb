@@ -159,6 +159,7 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
 )
+from services.normal_paper_trade import normal_paper_trade_contract_reasons
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
@@ -169,7 +170,6 @@ from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
-from services.normal_paper_trade import normal_paper_trade_contract_reasons
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -6438,13 +6438,29 @@ class TradingService:
             contribution=model_contribution_perf,
             snapshot_version=int(performance_snapshot.get("version") or 0),
         )
-        account_equity = await self._bounded_strategy_context_value(
-            "account_equity",
-            self._strategy_context_account_equity(selected_mode),
-            0.0,
-            account_timeout,
-            context_fetch_timings,
-        )
+        # Market and position analysis deliberately use cached equity. This
+        # path performs no database/network read, so putting it behind the
+        # shared history-I/O semaphore only creates avoidable queue timeouts.
+        if _analysis_scope_context.get() in {"market", "position"}:
+            equity_started = asyncio.get_running_loop().time()
+            account_equity = await self._strategy_context_account_equity(selected_mode)
+            context_fetch_timings["account_equity"] = {
+                "duration_seconds": round(
+                    max(asyncio.get_running_loop().time() - equity_started, 0.0),
+                    6,
+                ),
+                "queue_wait_seconds": 0.0,
+                "timeout_seconds": round(float(account_timeout), 6),
+                "status": "cached_or_previous_context",
+            }
+        else:
+            account_equity = await self._bounded_strategy_context_value(
+                "account_equity",
+                self._strategy_context_account_equity(selected_mode),
+                0.0,
+                account_timeout,
+                context_fetch_timings,
+            )
         context = self._entry_strategy_mode_context_policy().build(
             market_regime=market_regime,
             daily_state=daily_state,
@@ -10569,9 +10585,17 @@ class TradingService:
             _analysis_round_id_context.reset(round_id_token)
         return results
 
-    @staticmethod
-    def _should_run_full_reconciliation_at_round_start(analysis_scope: str) -> bool:
-        return analysis_scope in {"full", "position"}
+    def _should_run_full_reconciliation_at_round_start(self, analysis_scope: str) -> bool:
+        if analysis_scope == "full":
+            return True
+        if analysis_scope != "position":
+            return False
+        # The independent authoritative-sync loop is the normal owner of OKX
+        # current-position reconciliation. Repeating the same private API pass
+        # at every position round caused overlapping position/protection calls
+        # and made both callers time out. A position round only takes over when
+        # the background fact is stale, degraded, or requires attention.
+        return not self._okx_authoritative_sync_context_is_usable_for_market_scan()
 
     @staticmethod
     def _should_refresh_position_prices_before_review(analysis_scope: str) -> bool:
@@ -13316,6 +13340,29 @@ class TradingService:
 
     async def _open_positions_context_for_round(self, analysis_scope: str) -> list[dict]:
         if analysis_scope != "market":
+            if self._okx_authoritative_sync_context_is_usable_for_market_scan():
+                try:
+                    positions = await asyncio.wait_for(
+                        self._get_local_open_positions_context(strict=True),
+                        timeout=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    positions = self._cached_open_positions_context(ignore_age=True) or []
+                    logger.warning(
+                        "local open positions context timed out after fresh authoritative sync; using cache",
+                        scope=analysis_scope,
+                        timeout_seconds=OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS,
+                        cached_count=len(positions),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "failed to load local positions after fresh authoritative sync; falling back to OKX",
+                        scope=analysis_scope,
+                        error=safe_error_text(exc),
+                    )
+                else:
+                    self._remember_open_positions_context(positions)
+                    return positions
             try:
                 positions = await asyncio.wait_for(
                     self._get_open_positions_context(),

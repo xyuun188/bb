@@ -24,7 +24,7 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from db.repositories.trade_repo import TradeRepository
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from executor.base_executor import OrderStatus
 from models.account import OkxAccountBill
 from models.decision import AIDecision
@@ -2827,8 +2827,28 @@ class OkxSyncService:
                 timeout=6.0,
             )
         except TimeoutError:
-            logger.warning("timed out fetching OKX positions for reconciliation")
-            return []
+            cached_positions = self._cached_authoritative_position_snapshot(
+                "paper",
+                paper_okx,
+                max_age_seconds=AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS,
+            )
+            if cached_positions is None:
+                logger.warning("timed out fetching OKX positions for reconciliation")
+                return []
+            exchange_positions = cached_positions
+            self._record_reconcile_degraded(
+                kind="position_snapshot_reused",
+                error="timeout",
+                note=(
+                    "OKX current-position request timed out; the most recent authoritative "
+                    "position snapshot (within the short reuse window) was used for this "
+                    "reconciliation round."
+                ),
+            )
+            logger.warning(
+                "timed out fetching OKX positions for reconciliation; using recent authoritative snapshot",
+                snapshot_count=len(exchange_positions),
+            )
         except Exception as e:
             logger.warning(
                 "failed to fetch OKX positions for reconciliation",
@@ -4165,7 +4185,7 @@ class OkxSyncService:
         local_positions: list[dict[str, Any]] = []
 
         try:
-            async with get_session_ctx() as session:
+            async with get_read_session_ctx() as session:
                 repo = TradeRepository(session)
                 db_positions = await repo.get_position_records(
                     execution_mode=mode_manager.mode.value,

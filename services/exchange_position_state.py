@@ -394,6 +394,37 @@ class ExchangeProtectionMapProvider:
         )
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
         self._cache: dict[str, _ProtectionCacheEntry] = {}
+        self._account_wide_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
+
+    def _start_account_wide_refresh(self, executor: Any) -> asyncio.Task[list[dict[str, Any]]]:
+        task = self._account_wide_refresh_task
+        if task is not None and not task.done():
+            return task
+
+        async def refresh() -> list[dict[str, Any]]:
+            orders = await asyncio.wait_for(
+                executor.get_position_protection_orders(None),
+                timeout=max(self.account_wide_timeout_seconds * 2.0, 10.0),
+            )
+            normalized_orders = list(orders or [])
+            if self.cache_ttl_seconds > 0:
+                self._cache[ALL_PROTECTION_ORDERS_CACHE_KEY] = _ProtectionCacheEntry(
+                    orders=normalized_orders,
+                    expires_at=time.monotonic() + self.cache_ttl_seconds,
+                )
+            return normalized_orders
+
+        task = asyncio.create_task(refresh())
+        self._account_wide_refresh_task = task
+
+        def consume_result(completed: asyncio.Task[list[dict[str, Any]]]) -> None:
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                return
+
+        task.add_done_callback(consume_result)
+        return task
 
     async def fetch(
         self,
@@ -476,31 +507,31 @@ class ExchangeProtectionMapProvider:
                 symbols,
             )
 
+        task = self._start_account_wide_refresh(executor)
+        if cached:
+            logger.info(
+                "refreshing account-wide OKX TP/SL protection orders in background; using cached inventory",
+                symbols=len(symbols),
+            )
+            return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
+                list(cached.orders),
+                symbols,
+            )
+
         try:
-            orders = await asyncio.wait_for(
-                executor.get_position_protection_orders(None),
+            normalized_orders = await asyncio.wait_for(
+                asyncio.shield(task),
                 timeout=self.account_wide_timeout_seconds,
             )
-            normalized_orders = list(orders or [])
-            if self.cache_ttl_seconds > 0:
-                self._cache[ALL_PROTECTION_ORDERS_CACHE_KEY] = _ProtectionCacheEntry(
-                    orders=normalized_orders,
-                    expires_at=now + self.cache_ttl_seconds,
-                )
             return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
-                normalized_orders,
+                list(normalized_orders),
                 symbols,
             )
         except TimeoutError:
             logger.warning(
-                "timed out fetching account-wide OKX TP/SL protection orders",
+                "timed out waiting for account-wide OKX TP/SL protection orders; background refresh continues",
                 symbols=len(symbols),
             )
-            if cached:
-                return ALL_PROTECTION_ORDERS_CACHE_KEY, self._filter_orders_for_symbols(
-                    list(cached.orders),
-                    symbols,
-                )
             raise
         except Exception as exc:
             logger.warning(
