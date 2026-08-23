@@ -1139,6 +1139,20 @@ async def test_native_facts_client_fetches_funding_bills_with_type_and_subtype_f
 
 
 @pytest.mark.asyncio
+async def test_native_facts_client_can_skip_archive_for_realtime_funding_mirror() -> None:
+    ccxt = _AccountBillsCcxt()
+    bills = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_account_bills(
+        since=datetime(2026, 6, 28, 0, 0, tzinfo=UTC),
+        limit=20,
+        funding_only=True,
+        include_archive=False,
+    )
+
+    assert [bill.bill_id for bill in bills] == ["funding-173", "funding-174"]
+    assert ccxt.archive_params == []
+
+
+@pytest.mark.asyncio
 async def test_native_facts_client_prioritizes_explicit_order_history_ids() -> None:
     timestamp = int(datetime.now(UTC).timestamp() * 1000)
     fills = group_okx_native_fill_rows(

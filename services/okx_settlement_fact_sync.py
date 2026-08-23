@@ -41,6 +41,12 @@ DEFAULT_SETTLEMENT_FACT_LIMIT = 100
 DEFAULT_SETTLEMENT_FACT_MAX_PAGES = 5
 DEFAULT_SETTLEMENT_FACT_TIMEOUT_SECONDS = 8.0
 PENDING_SETTLEMENT_INST_BATCH_SIZE = 3
+NON_FETCHABLE_SETTLEMENT_STATUSES = frozenset(
+    {
+        "settlement_quarantined",
+        "superseded_position_residual",
+    }
+)
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 ExecutorProvider = Callable[[str], Awaitable[OKXExecutor]]
@@ -142,7 +148,10 @@ class OkxSettlementFactSyncService:
         history_rows: list[dict[str, Any]] = []
         account_bills: list[OkxNativeAccountBill] = []
         contract_specs: dict[str, dict[str, Any]] = {}
+        fetched_contract_specs: dict[str, dict[str, Any]] = {}
+        stored_history_available = False
         targeted_inst_ids: tuple[str, ...] = ()
+        targeted_pos_ids: tuple[str, ...] = ()
         initialized = False
         private_pull_available = False
 
@@ -215,14 +224,21 @@ class OkxSettlementFactSyncService:
                 # Closed local positions awaiting authority are the highest
                 # priority: account-wide history and bills must not consume
                 # the entire round budget before their identity can be pulled.
-                targeted_inst_ids = await self._pending_settlement_inst_ids()
-                if targeted_inst_ids:
+                targeted_since = since - timedelta(hours=24)
+                targeted_rows_to_fetch = await self._pending_settlement_targets(
+                    since=targeted_since
+                )
+                targeted_inst_ids = tuple(
+                    dict.fromkeys(inst_id for inst_id, _pos_id in targeted_rows_to_fetch)
+                )
+                targeted_pos_ids = tuple(pos_id for _inst_id, pos_id in targeted_rows_to_fetch)
+                if targeted_pos_ids:
                     targeted_rows_result = await run_stage(
                         "position_history_targeted_pending_settlements",
                         lambda: native_facts.fetch_position_history_rows(
                             inst_ids=targeted_inst_ids,
-                            pos_ids=None,
-                            since=since - timedelta(hours=24),
+                            pos_ids=targeted_pos_ids,
+                            since=targeted_since,
                             limit=self.limit,
                             max_pages=self.max_pages,
                             strict=True,
@@ -257,6 +273,7 @@ class OkxSettlementFactSyncService:
                             limit=self.limit,
                             max_pages=self.max_pages,
                             funding_only=True,
+                            include_archive=False,
                             strict=True,
                         ),
                         cap_seconds=4.5,
@@ -281,15 +298,24 @@ class OkxSettlementFactSyncService:
                     for row in history_rows
                     if str(row.get("instId") or "").strip()
                 }
-                if not inst_ids:
-                    inst_ids = await self._stored_inst_ids()
                 if inst_ids:
-                    specs, _ = await run_stage(
-                        "contract_specs",
-                        lambda: native_facts.fetch_contract_specs(inst_ids=inst_ids),
-                        cap_seconds=1.5,
-                    )
-                    contract_specs = dict(specs or {})
+                    (
+                        contract_specs,
+                        stored_history_available,
+                    ) = await self._stored_history_context(inst_ids)
+                    missing_inst_ids = inst_ids.difference(contract_specs)
+                    if missing_inst_ids:
+                        specs, _ = await run_stage(
+                            "contract_specs",
+                            lambda: native_facts.fetch_contract_specs(
+                                inst_ids=missing_inst_ids
+                            ),
+                            cap_seconds=1.5,
+                        )
+                        fetched_contract_specs = dict(specs or {})
+                        contract_specs.update(fetched_contract_specs)
+                    else:
+                        completed_stages.append("contract_specs_reused")
         finally:
             if owns_executor:
                 try:
@@ -300,8 +326,11 @@ class OkxSettlementFactSyncService:
                         error=safe_error_text(exc, limit=120),
                     )
 
-        if contract_specs:
-            await self._persist_contract_specs(contract_specs, synced_at=started_at)
+        if fetched_contract_specs and stored_history_available:
+            await self._persist_contract_specs(
+                fetched_contract_specs,
+                synced_at=started_at,
+            )
         for row in history_rows:
             inst_id = str(row.get("instId") or "").strip().upper()
             if spec := contract_specs.get(inst_id):
@@ -369,25 +398,24 @@ class OkxSettlementFactSyncService:
             samples=tuple([*history_samples, *bill_samples][:10]),
         ).as_dict()
 
-    async def _stored_inst_ids(self) -> set[str]:
-        async with self.session_context_factory() as session:
-            result = await session.execute(
-                select(OkxPositionHistory.inst_id).where(OkxPositionHistory.mode == self.mode)
-            )
-            return {
-                str(value or "").strip().upper()
-                for value in result.scalars().all()
-                if str(value or "").strip()
-            }
-
-    async def _pending_settlement_inst_ids(self) -> tuple[str, ...]:
-        """Return instruments with local closed rows awaiting OKX authority."""
+    async def _pending_settlement_targets(
+        self,
+        *,
+        since: datetime,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return exact OKX lifecycle identities awaiting authority."""
 
         async with self.session_context_factory() as session:
             final_statuses = final_settlement_status_values()
+            open_pos_ids = select(Position.okx_pos_id).where(
+                Position.execution_mode == self.mode,
+                Position.is_open.is_(True),
+                Position.okx_pos_id.is_not(None),
+            )
             result = await session.execute(
                 select(
                     Position.okx_inst_id,
+                    Position.okx_pos_id,
                     Position.settlement_synced_at,
                     Position.closed_at,
                     Position.id,
@@ -400,6 +428,16 @@ class OkxSettlementFactSyncService:
                         Position.settlement_status.notin_(final_statuses),
                     ),
                     Position.okx_inst_id.is_not(None),
+                    Position.okx_pos_id.is_not(None),
+                    Position.okx_pos_id.notin_(open_pos_ids),
+                    Position.closed_at.is_not(None),
+                    Position.closed_at >= since,
+                    or_(
+                        Position.settlement_status.is_(None),
+                        Position.settlement_status.notin_(
+                            NON_FETCHABLE_SETTLEMENT_STATUSES
+                        ),
+                    ),
                 )
                 .order_by(
                     Position.settlement_synced_at.asc(),
@@ -407,17 +445,53 @@ class OkxSettlementFactSyncService:
                     Position.id.asc(),
                 )
             )
-            selected: list[str] = []
+            selected: list[tuple[str, str]] = []
             seen: set[str] = set()
             for row in result.all():
-                value = str(row[0] or "").strip().upper()
-                if not value or value in seen:
+                inst_id = str(row[0] or "").strip().upper()
+                pos_id = str(row[1] or "").strip()
+                if not inst_id or not pos_id or pos_id in seen:
                     continue
-                seen.add(value)
-                selected.append(value)
+                seen.add(pos_id)
+                selected.append((inst_id, pos_id))
                 if len(selected) >= PENDING_SETTLEMENT_INST_BATCH_SIZE:
                     break
             return tuple(selected)
+
+    async def _stored_history_context(
+        self,
+        inst_ids: set[str],
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        bool,
+    ]:
+        if not inst_ids:
+            return {}, False
+        async with self.session_context_factory() as session:
+            result = await session.execute(
+                select(
+                    OkxPositionHistory.inst_id,
+                    OkxPositionHistory.raw_row,
+                ).where(
+                    OkxPositionHistory.mode == self.mode,
+                    OkxPositionHistory.inst_id.in_(sorted(inst_ids)),
+                )
+            )
+            specs: dict[str, dict[str, Any]] = {}
+            records = list(result.all())
+            for inst_id_value, raw_value in records:
+                inst_id = str(inst_id_value or "").strip().upper()
+                raw = raw_value if isinstance(raw_value, dict) else {}
+                spec = raw.get("_bb_contract_spec")
+                if (
+                    inst_id
+                    and inst_id not in specs
+                    and isinstance(spec, dict)
+                    and raw.get("_bb_contract_spec_source") == "okx_public_instruments"
+                    and _positive_float(spec.get("ctVal")) > 0.0
+                ):
+                    specs[inst_id] = dict(spec)
+            return specs, bool(records)
 
     async def _persist_contract_specs(
         self,
@@ -599,6 +673,13 @@ def _row_u_time_ms(row: dict[str, Any] | None) -> float:
         return 0.0
     try:
         return float(str(row.get("uTime") or row.get("cTime") or 0).strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _positive_float(value: Any) -> float:
+    try:
+        return max(float(value or 0.0), 0.0)
     except (TypeError, ValueError):
         return 0.0
 

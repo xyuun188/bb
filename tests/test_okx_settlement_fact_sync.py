@@ -258,6 +258,7 @@ async def test_settlement_fact_sync_targeted_pull_covers_pending_local_instrumen
                 current_price=1.0,
                 is_open=False,
                 okx_inst_id="SUI-USDT-SWAP",
+                okx_pos_id="sui-pos-1",
                 settlement_status="pending_okx_authority",
                 closed_at=now - timedelta(hours=28),
             )
@@ -289,6 +290,7 @@ async def test_settlement_fact_sync_targeted_pull_covers_pending_local_instrumen
         assert report["targeted_pending_settlement_inst_count"] == 1
         assert "position_history_targeted_pending_settlements" in report["completed_stages"]
         assert ccxt.history_params[0].get("instId") == "SUI-USDT-SWAP"
+        assert ccxt.history_params[0].get("posId") == "sui-pos-1"
         assert all(
             params.get("instId") != "ADA-USDT-SWAP" for params in ccxt.history_params
         )
@@ -299,6 +301,123 @@ async def test_settlement_fact_sync_targeted_pull_covers_pending_local_instrumen
             stored = (await session.execute(select(OkxPositionHistory))).scalar_one()
         assert stored.inst_id == "SUI-USDT-SWAP"
         assert stored.pos_id == "sui-pos-1"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_pending_settlement_targets_skip_legacy_rows_without_exchange_identity(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "settlement-facts-pending-targets.db")
+    now = datetime.now(UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="OLD/USDT",
+                    side="short",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="OLD-USDT-SWAP",
+                    okx_pos_id=None,
+                    settlement_status="settling",
+                    closed_at=now - timedelta(days=30),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="STALE/USDT",
+                    side="short",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="STALE-USDT-SWAP",
+                    okx_pos_id="stale-pos-1",
+                    settlement_status="settling",
+                    closed_at=now - timedelta(days=7),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="NEW/USDT",
+                    side="long",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="NEW-USDT-SWAP",
+                    okx_pos_id="new-pos-1",
+                    settlement_status="settling",
+                    closed_at=now - timedelta(minutes=5),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="RESIDUAL/USDT",
+                    side="short",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="RESIDUAL-USDT-SWAP",
+                    okx_pos_id="residual-pos-1",
+                    settlement_status="superseded_position_residual",
+                    closed_at=now - timedelta(minutes=4),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="QUARANTINED/USDT",
+                    side="short",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="QUARANTINED-USDT-SWAP",
+                    okx_pos_id="quarantined-pos-1",
+                    settlement_status="settlement_quarantined",
+                    closed_at=now - timedelta(minutes=3),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="PARTIAL/USDT",
+                    side="long",
+                    quantity=4.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="PARTIAL-USDT-SWAP",
+                    okx_pos_id="partial-pos-1",
+                    settlement_status="settling",
+                    closed_at=now - timedelta(minutes=2),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="PARTIAL/USDT",
+                    side="long",
+                    quantity=6.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=True,
+                    okx_inst_id="PARTIAL-USDT-SWAP",
+                    okx_pos_id="partial-pos-1",
+                ),
+            ]
+        )
+    try:
+        targets = await OkxSettlementFactSyncService(mode="paper")._pending_settlement_targets(
+            since=now - timedelta(hours=96)
+        )
+        assert targets == (("NEW-USDT-SWAP", "new-pos-1"),)
     finally:
         await close_db()
 
@@ -380,6 +499,8 @@ async def test_settlement_fact_sync_bulk_loads_existing_rows_once(
             == 3
         )
         assert len(target_selects) == 3
+        assert sum("okx_position_history" in statement for statement in target_selects) == 2
+        assert sum("okx_account_bills" in statement for statement in target_selects) == 1
     finally:
         await close_db()
 

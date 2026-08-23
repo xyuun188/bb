@@ -1043,6 +1043,7 @@ class TradingService:
         self._okx_settlement_fact_sync_last_row: dict[str, Any] | None = None
         self._okx_settlement_fact_sync_last_error: str | None = None
         self._okx_settlement_fact_sync_success_count = 0
+        self._okx_settlement_fact_sync_deferred_count = 0
         self._okx_settlement_fact_sync_failure_count = 0
         self._okx_position_settlement_sync_task: asyncio.Task | None = None
         self._okx_position_settlement_sync_last_started_at: datetime | None = None
@@ -1810,6 +1811,9 @@ class TradingService:
             "last_error": getattr(self, "_okx_settlement_fact_sync_last_error", None),
             "last_row": last_row,
             "success_count": int(getattr(self, "_okx_settlement_fact_sync_success_count", 0) or 0),
+            "deferred_count": int(
+                getattr(self, "_okx_settlement_fact_sync_deferred_count", 0) or 0
+            ),
             "failure_count": int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0),
             "interval_seconds": round(interval_seconds, 3),
         }
@@ -2411,19 +2415,8 @@ class TradingService:
                 self._okx_settlement_fact_sync_last_row = row
                 error = safe_error_text(row.get("error"), limit=220) if row.get("error") else None
                 self._okx_settlement_fact_sync_last_error = error
-                if str(row.get("status") or "").lower() in {"degraded", "error", "critical"}:
-                    self._okx_settlement_fact_sync_failure_count = (
-                        int(
-                            getattr(
-                                self,
-                                "_okx_settlement_fact_sync_failure_count",
-                                0,
-                            )
-                            or 0
-                        )
-                        + 1
-                    )
-                else:
+                status = str(row.get("status") or "").lower()
+                if status == "ok":
                     self._okx_settlement_fact_sync_success_count = (
                         int(
                             getattr(
@@ -2435,6 +2428,31 @@ class TradingService:
                         )
                         + 1
                     )
+                elif status == "deferred":
+                    self._okx_settlement_fact_sync_deferred_count = (
+                        int(
+                            getattr(
+                                self,
+                                "_okx_settlement_fact_sync_deferred_count",
+                                0,
+                            )
+                            or 0
+                        )
+                        + 1
+                    )
+                else:
+                    self._okx_settlement_fact_sync_failure_count = (
+                        int(
+                            getattr(
+                                self,
+                                "_okx_settlement_fact_sync_failure_count",
+                                0,
+                            )
+                            or 0
+                        )
+                        + 1
+                    )
+                if status not in {"degraded", "error", "critical"}:
                     changed_count = int(row.get("position_history_inserted_count") or 0) + int(
                         row.get("position_history_updated_count") or 0
                     )

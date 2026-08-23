@@ -588,6 +588,48 @@ async def test_okx_authoritative_sync_loop_reconciles_current_positions(
 
 
 @pytest.mark.asyncio
+async def test_okx_settlement_fact_sync_loop_counts_deferred_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._okx_settlement_fact_sync_last_started_at = None
+    service._okx_settlement_fact_sync_last_finished_at = None
+    service._okx_settlement_fact_sync_last_row = None
+    service._okx_settlement_fact_sync_last_error = None
+    service._okx_settlement_fact_sync_success_count = 0
+    service._okx_settlement_fact_sync_deferred_count = 0
+    service._okx_settlement_fact_sync_failure_count = 0
+    service.okx_settlement_fact_sync_interval_seconds = lambda: 60.0  # type: ignore[method-assign]
+
+    class FakeSettlementFactSync:
+        async def sync_once(self) -> dict[str, Any]:
+            return {
+                "status": "deferred",
+                "position_history_inserted_count": 0,
+                "position_history_updated_count": 0,
+                "deferred_stages": ["account_bills"],
+            }
+
+    service.okx_settlement_fact_sync_factory = (
+        lambda **_kwargs: FakeSettlementFactSync()
+    )
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+
+    await service._okx_settlement_fact_sync_loop()
+
+    status = service._okx_settlement_fact_sync_status_payload()
+    assert status["status"] == "deferred"
+    assert status["success_count"] == 0
+    assert status["deferred_count"] == 1
+    assert status["failure_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

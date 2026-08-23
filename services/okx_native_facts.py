@@ -492,19 +492,19 @@ class OkxNativeFactsClient:
         limit: int = DEFAULT_FILL_LIMIT,
         max_pages: int = DEFAULT_MAX_FILL_PAGES,
         funding_only: bool = False,
+        include_archive: bool = True,
         strict: bool = False,
     ) -> list[OkxNativeAccountBill]:
         """Fetch OKX account bills used to reconcile per-position funding fees."""
 
         ccxt = await self.executor._get_ccxt()
-        fetch_bill_methods = [
-            method
-            for method in (
-                getattr(ccxt, "privateGetAccountBills", None),
-                getattr(ccxt, "privateGetAccountBillsArchive", None),
-            )
-            if callable(method)
-        ]
+        fetch_bill_methods = []
+        current_bills = getattr(ccxt, "privateGetAccountBills", None)
+        archive_bills = getattr(ccxt, "privateGetAccountBillsArchive", None)
+        if callable(current_bills):
+            fetch_bill_methods.append(current_bills)
+        if include_archive and callable(archive_bills):
+            fetch_bill_methods.append(archive_bills)
         if not fetch_bill_methods:
             if strict:
                 raise RuntimeError("OKX native account-bills API is unavailable")
