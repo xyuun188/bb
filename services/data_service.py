@@ -1171,11 +1171,10 @@ class DataService:
                     websocket_snapshot,
                     block_on_remote=True,
                 )
-                if ticker_consistency_issue:
-                    source_snapshots.append(websocket_snapshot)
-                else:
-                    selected = websocket_snapshot
-                    source_snapshots = [websocket_snapshot, rest_snapshot]
+                # A blocking refresh has an authoritative REST snapshot. Keep
+                # the fresh WebSocket observation only as a comparison source;
+                # it must never overwrite the REST fact after the refresh.
+                source_snapshots.append(websocket_snapshot)
 
             selected = dict(selected)
             selected["market_source_snapshots"] = [
@@ -2542,13 +2541,18 @@ class DataService:
                 data["derivatives_snapshot_stale"] = True
                 data["derivatives_refresh_suppressed"] = True
             return data
+        cached_data = dict((cached or {}).get("data") or {})
+        cached_has_required_facts = self._derivatives_cache_has_required_facts(
+            cached_data
+        )
         if cached:
             updated_at = cached.get("updated_at")
             if (
                 isinstance(updated_at, datetime)
                 and (now - updated_at).total_seconds() < self._derivatives_update_interval
+                and cached_has_required_facts
             ):
-                return dict(cached.get("data") or {})
+                return cached_data
             if (
                 isinstance(updated_at, datetime)
                 and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
@@ -2556,7 +2560,7 @@ class DataService:
             ):
                 if allow_background_refresh:
                     self._schedule_derivatives_background_refresh(normalized)
-                data = dict(cached.get("data") or {})
+                data = cached_data
                 if data:
                     data["derivatives_snapshot_stale"] = True
                     data["derivatives_refresh_in_background"] = True
@@ -2564,10 +2568,12 @@ class DataService:
             if not block_on_remote:
                 if allow_background_refresh:
                     self._schedule_derivatives_background_refresh(normalized)
-                data = dict(cached.get("data") or {})
+                data = cached_data
                 if data:
                     data["derivatives_snapshot_stale"] = True
                     data["derivatives_refresh_in_background"] = True
+                    if not cached_has_required_facts:
+                        data["derivatives_required_data_available"] = False
                     return data
 
         tasks = self._derivatives_refresh_task_map()
@@ -2581,9 +2587,10 @@ class DataService:
                     )
                     return dict(result or {})
                 except TimeoutError:
-                    cached_data = dict((cached or {}).get("data") or {})
                     if cached_data:
                         cached_data["derivatives_snapshot_stale"] = True
+                        if not cached_has_required_facts:
+                            cached_data["derivatives_required_data_available"] = False
                     cached_data["derivatives_refresh_in_background"] = True
                     cached_data["derivatives_refresh_timeout"] = True
                     return cached_data
@@ -2609,15 +2616,48 @@ class DataService:
             )
             return dict(result or {})
         except TimeoutError:
-            cached_data = dict((cached or {}).get("data") or {})
             if cached_data:
                 cached_data["derivatives_snapshot_stale"] = True
+                if not cached_has_required_facts:
+                    cached_data["derivatives_required_data_available"] = False
             cached_data["derivatives_refresh_in_background"] = True
             cached_data["derivatives_refresh_timeout"] = True
             return cached_data
         except Exception:
             failed_cache[normalized] = datetime.now(UTC)
             return {}
+
+    def _derivatives_cache_has_required_facts(self, data: dict[str, Any]) -> bool:
+        """Return whether a derivatives snapshot can be reused for execution.
+
+        Funding and open interest are optional enrichments. The reusable cache,
+        however, must contain an executable order book and a current mark-price
+        fact; a timestamp-only or partial snapshot must not masquerade as fresh.
+        """
+
+        if not isinstance(data, dict) or not data:
+            return False
+        if data.get("derivatives_required_data_available") is False:
+            return False
+        if not bool(data.get("orderbook_data_available")):
+            return False
+        if self._safe_float(data.get("orderbook_bid_depth"), 0.0) <= 0:
+            return False
+        if self._safe_float(data.get("orderbook_ask_depth"), 0.0) <= 0:
+            return False
+        if self._safe_float(data.get("mark_price"), 0.0) <= 0:
+            return False
+        mark_fact = data.get("mark_price_fact")
+        if not isinstance(mark_fact, dict):
+            return False
+        if self._safe_float(mark_fact.get("price"), 0.0) <= 0:
+            return False
+        try:
+            if int(mark_fact.get("source_timestamp_ms") or 0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _schedule_derivatives_background_refresh(self, symbol: str) -> None:
         try:
@@ -2656,7 +2696,6 @@ class DataService:
 
     async def _refresh_derivatives_snapshot(self, symbol: str) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
-        now = datetime.now(UTC)
         tasks = self._derivatives_refresh_task_map()
         failed_cache = getattr(self, "_derivatives_failed_at", None)
         if not isinstance(failed_cache, dict):
@@ -2690,8 +2729,11 @@ class DataService:
             failed_cache[normalized] = datetime.now(UTC)
 
         self._derivatives_cache[normalized] = {
-            "updated_at": now,
+            "updated_at": datetime.now(UTC),
             "data": dict(data or {}),
+            "required_facts_available": self._derivatives_cache_has_required_facts(
+                dict(data or {})
+            ),
         }
         return dict(data or {})
 

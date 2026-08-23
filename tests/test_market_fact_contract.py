@@ -132,6 +132,30 @@ def test_feature_vector_carries_one_native_market_fact_after_depth_enrichment() 
     assert vector.to_dict()["market_fact"]["fact_id"] == vector.market_fact["fact_id"]
 
 
+def test_optional_derivatives_staleness_does_not_quarantine_fresh_market_fact() -> None:
+    ticker = {
+        **_snapshot(0.0129, 1_783_990_800_000),
+        "contract_spec": _spec(),
+        "source": "websocket",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "tickers",
+    }
+    vector = build_feature_vector(
+        "ROBO/USDT",
+        ticker=ticker,
+        derivatives={
+            "orderbook_bid_depth": 25_000.0,
+            "orderbook_ask_depth": 24_000.0,
+            "derivatives_snapshot_stale": True,
+            "derivatives_refresh_in_background": True,
+        },
+    )
+
+    assert vector.derivatives_snapshot_stale is True
+    assert vector.market_fact["quality"]["status"] == "clean"
+    assert "stale_market_fact" not in vector.market_fact["quality"]["reasons"]
+
+
 def _source_consistency_auxiliary(timestamp: int, price: float) -> dict:
     return {
         "orderbook_fact": {

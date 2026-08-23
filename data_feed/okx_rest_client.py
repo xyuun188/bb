@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import deque
 from typing import Any
 
 import structlog
@@ -47,6 +48,31 @@ TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # route budget so a completed shared request is not lost as a timeout stub.
 TICKER_ROUTE_JOIN_TIMEOUT_SECONDS = 2.5
 TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
+# All public market routes share one SDK session.  Without a client-level
+# gate, a market round can create several requests per symbol (ticker,
+# orderbook, mark/index and the native 1m path) and overwhelm that session
+# even though the service-level feature gate is bounded.
+PUBLIC_MARKET_REQUEST_CONCURRENCY = 8
+PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
+
+PUBLIC_MARKET_METHODS = frozenset(
+    {
+        "fetch_ticker",
+        "fetch_order_book",
+        "fetch_ohlcv",
+        "fetch_funding_rate",
+        "fetch_open_interest",
+    }
+)
+PUBLIC_MARKET_PRIORITY_METHODS = frozenset(
+    {
+        "fetch_ticker",
+        "fetch_order_book",
+        "publicGetMarketTicker",
+        "publicGetPublicMarkPrice",
+        "publicGetMarketIndexTickers",
+    }
+)
 
 
 def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
@@ -54,6 +80,47 @@ def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
         task.result()
     except (asyncio.CancelledError, Exception):
         return
+
+
+class _PriorityRequestGate:
+    """Bound one SDK session while serving executable quotes before enrichments."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(int(limit), 1)
+        self._active = 0
+        self._priority_waiters: deque[asyncio.Future[None]] = deque()
+        self._normal_waiters: deque[asyncio.Future[None]] = deque()
+
+    async def acquire(self, *, priority: bool) -> None:
+        if (
+            self._active < self._limit
+            and not self._priority_waiters
+            and not self._normal_waiters
+        ):
+            self._active += 1
+            return
+        future = asyncio.get_running_loop().create_future()
+        waiters = self._priority_waiters if priority else self._normal_waiters
+        waiters.append(future)
+        try:
+            await future
+        except asyncio.CancelledError:
+            try:
+                waiters.remove(future)
+            except ValueError:
+                pass
+            raise
+
+    def release(self) -> None:
+        self._active = max(self._active - 1, 0)
+        waiters = self._priority_waiters or self._normal_waiters
+        while waiters:
+            future = waiters.popleft()
+            if future.done():
+                continue
+            self._active += 1
+            future.set_result(None)
+            return
 
 def _is_suspicious_contract_base(base: str | None) -> bool:
     value = str(base or "").upper()
@@ -70,9 +137,11 @@ class OKXRestClient:
         # SDK session is not initialized and used concurrently.
         self._exchange_init_lock = asyncio.Lock()
         self._instrument_spec_lock = asyncio.Lock()
+        self._public_market_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._reference_route_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._reference_price_failure_cache: dict[str, float] = {}
         self._ticker_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._ticker_retry_at: dict[str, float] = {}
@@ -132,13 +201,40 @@ class OKXRestClient:
             "NoneType" in message and "+:" in message and "str" in message
         )
 
+    def _public_market_gate(self) -> _PriorityRequestGate:
+        gate = self._public_market_request_gate
+        if not isinstance(gate, _PriorityRequestGate):
+            gate = _PriorityRequestGate(PUBLIC_MARKET_REQUEST_CONCURRENCY)
+            self._public_market_request_gate = gate
+        return gate
+
+    @staticmethod
+    def _is_public_market_method(method_name: str) -> bool:
+        return str(method_name or "").startswith("public") or str(
+            method_name or ""
+        ) in PUBLIC_MARKET_METHODS
+
     async def _ccxt_call(self, method_name: str, *args, **kwargs):
         for attempt in range(2):
             ex = await self._get_exchange()
             self._ensure_rest_url()
             method = getattr(ex, method_name)
+            gate = self._public_market_gate() if self._is_public_market_method(method_name) else None
+            if gate is not None:
+                await gate.acquire(
+                    priority=str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
+                )
             try:
-                return await method(*args, **kwargs)
+                call = method(*args, **kwargs)
+                if gate is not None:
+                    # Keep the shared single-flight task alive after a caller's
+                    # shorter route deadline, but bound the actual SDK call so
+                    # a dead public connection cannot occupy a slot forever.
+                    return await asyncio.wait_for(
+                        call,
+                        timeout=PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS,
+                    )
+                return await call
             except Exception as exc:
                 if attempt == 0 and self._is_broken_rest_url_error(exc):
                     logger.warning(
@@ -149,6 +245,9 @@ class OKXRestClient:
                     await self.reinitialize()
                     continue
                 raise
+            finally:
+                if gate is not None:
+                    gate.release()
 
     async def _load_usdt_swap_markets(self) -> None:
         """Load only live linear USDT perpetual swaps.
@@ -706,30 +805,36 @@ class OKXRestClient:
         inst_id = okx_inst_id_from_symbol(symbol)
         uly = str(normalized_spec.get("uly") or inst_id.removesuffix("-SWAP")).upper()
         route_tasks = {
-            "mark": asyncio.create_task(
-                self._ccxt_call(
+            "mark": self._reference_route_task(
+                inst_id,
+                "mark",
+                lambda: self._ccxt_call(
                     "publicGetPublicMarkPrice",
                     {"instType": "SWAP", "instId": inst_id},
-                )
+                ),
             ),
-            "index": asyncio.create_task(
-                self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly})
+            "index": self._reference_route_task(
+                inst_id,
+                "index",
+                lambda: self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly}),
             ),
         }
-        task_names = {task: name for name, task in route_tasks.items()}
-        done, pending = await asyncio.wait(
+        # Return a bounded snapshot to the current round, while leaving slow
+        # route tasks alive in the per-instrument single-flight map.  A later
+        # round can join the same request instead of creating another burst.
+        done, _pending = await asyncio.wait(
             set(route_tasks.values()),
             timeout=REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS,
         )
-        for task in pending:
-            task.cancel()
-            task.add_done_callback(_consume_cancelled_task)
         results: dict[str, Any] = {}
-        for task in done:
+        for name, task in route_tasks.items():
+            if task not in done:
+                continue
             try:
-                results[task_names[task]] = task.result()
+                result = task.result()
             except Exception:
-                results[task_names[task]] = {}
+                result = {}
+            results[name] = result if isinstance(result, dict) else {}
 
         mark_result = results.get("mark")
         index_result = results.get("index")
@@ -829,29 +934,46 @@ class OKXRestClient:
             self._reference_price_cache[inst_id] = (time.monotonic(), payload)
         return payload
 
+    def _reference_route_task(
+        self,
+        inst_id: str,
+        route: str,
+        fetcher: Any,
+    ) -> asyncio.Task[Any]:
+        key = (str(inst_id).upper(), str(route))
+        existing = self._reference_route_tasks.get(key)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(fetcher())
+        self._reference_route_tasks[key] = task
+
+        def cleanup(finished: asyncio.Task[Any]) -> None:
+            if self._reference_route_tasks.get(key) is finished:
+                self._reference_route_tasks.pop(key, None)
+            _consume_cancelled_task(finished)
+
+        task.add_done_callback(cleanup)
+        return task
+
     async def fetch_derivatives_snapshot(
         self,
         symbol: str,
         *,
         contract_spec: dict[str, Any] | None = None,
         timeout_seconds: float = DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS,
+        required_only: bool = False,
     ) -> dict[str, Any]:
-        """Fetch compact perpetual-swap features used by AI experts."""
-        route_tasks = {
-            "funding": asyncio.create_task(
-                self._cached_derivatives_route(
-                    "funding",
-                    symbol,
-                    lambda: self.fetch_funding_rate(symbol),
-                )
-            ),
-            "open_interest": asyncio.create_task(
-                self._cached_derivatives_route(
-                    "open_interest",
-                    symbol,
-                    lambda: self.fetch_open_interest(symbol),
-                )
-            ),
+        """Fetch compact perpetual-swap features used by AI experts.
+
+        The order book and reference prices are required to construct an
+        executable native market fact. Funding and open interest are useful
+        analytical enrichments, but a slow optional route must not hold those
+        required facts hostage for the whole snapshot deadline. Optional
+        single-flight refreshes are allowed to finish in the background and
+        populate their own route caches for the next round.
+        """
+        required_routes = {"orderbook", "reference_prices"}
+        route_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {
             "orderbook": asyncio.create_task(
                 self.fetch_order_book_metrics(symbol, contract_spec=contract_spec)
             ),
@@ -859,11 +981,40 @@ class OKXRestClient:
                 self.fetch_reference_prices(symbol, contract_spec=contract_spec)
             ),
         }
+        if not required_only:
+            route_tasks.update(
+                {
+                    "funding": asyncio.create_task(
+                        self._cached_derivatives_route(
+                            "funding",
+                            symbol,
+                            lambda: self.fetch_funding_rate(symbol),
+                        )
+                    ),
+                    "open_interest": asyncio.create_task(
+                        self._cached_derivatives_route(
+                            "open_interest",
+                            symbol,
+                            lambda: self.fetch_open_interest(symbol),
+                        )
+                    ),
+                }
+            )
         task_names = {task: name for name, task in route_tasks.items()}
-        done, pending = await asyncio.wait(
-            set(task_names),
+        required_tasks = {
+            task for task, name in task_names.items() if name in required_routes
+        }
+        optional_tasks = set(task_names) - required_tasks
+        done_required, pending_required = await asyncio.wait(
+            required_tasks,
             timeout=max(float(timeout_seconds or 0.0), 0.05),
         )
+        # Collect optional routes that completed while required routes were
+        # running, but do not wait for them. Their underlying route single-
+        # flight remains alive after the lightweight wrapper is cancelled.
+        done_optional = {task for task in optional_tasks if task.done()}
+        pending = set(pending_required) | (optional_tasks - done_optional)
+        done = set(done_required) | done_optional
         timed_out_routes = sorted(task_names[task] for task in pending)
         for task in pending:
             task.cancel()
@@ -896,6 +1047,16 @@ class OKXRestClient:
             "failed": sorted(failed_routes),
             "timed_out": timed_out_routes,
         }
+        merged["derivatives_required_routes"] = sorted(required_routes)
+        merged["derivatives_required_data_available"] = bool(
+            required_routes.issubset(set(completed_routes))
+        )
+        merged["derivatives_optional_refresh_in_background"] = bool(
+            not required_only and any(
+                name in {"funding", "open_interest"} for name in timed_out_routes
+            )
+        )
+        merged["derivatives_optional_routes_skipped"] = bool(required_only)
         merged["derivatives_snapshot_partial"] = bool(
             failed_routes
             or timed_out_routes

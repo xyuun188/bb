@@ -362,9 +362,12 @@ def build_feature_vector(
             "price_reconciliation_warning": fv.price_reconciliation_warning,
             "mark_price": fv.mark_price,
             "index_price": fv.index_price,
-            "stale": bool(
-                ticker_fact_input.get("stale") or fv.derivatives_snapshot_stale
-            ),
+            # Funding/open-interest are optional analytical enrichments. A
+            # delayed optional route must remain visible on the feature vector
+            # and can still block execution-cost completeness, but it must not
+            # quarantine an otherwise fresh executable ticker/orderbook/mark
+            # fact as stale.
+            "stale": bool(ticker_fact_input.get("stale")),
         }
     )
     fv.market_fact = build_market_fact(

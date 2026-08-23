@@ -1784,6 +1784,51 @@ async def test_ticker_snapshot_refreshes_fresh_but_inconsistent_ws_cache() -> No
     assert service.ws_client.latest_tickers["PROS/USDT"]["last_price"] == pytest.approx(0.5531)
 
 
+@pytest.mark.asyncio
+async def test_blocking_ticker_refresh_keeps_rest_as_primary_over_fresh_ws_cache() -> None:
+    service = _service()
+    fresh_timestamp_ms = int(time.time() * 1000)
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "high_24h": 0.4000,
+                "low_24h": 0.3800,
+                "timestamp": fresh_timestamp_ms,
+                "source": "websocket",
+            }
+        }
+
+    class FakeRestClient:
+        async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "last": 0.5666,
+                "bid": 0.5665,
+                "ask": 0.5667,
+                "high": 0.5700,
+                "low": 0.5500,
+                "baseVolume": 1234,
+                "timestamp": fresh_timestamp_ms + 1,
+                "info": {"instId": "PROS-USDT-SWAP"},
+            }
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+
+    snapshot = await service._get_ticker_snapshot("PROS/USDT")
+
+    assert snapshot["source"] == "rest"
+    assert snapshot["last_price"] == pytest.approx(0.5666)
+    assert [item["source"] for item in snapshot["market_source_snapshots"]] == [
+        "rest",
+        "websocket",
+    ]
+
+
 def test_last_trade_outside_current_book_is_not_cache_corruption() -> None:
     service = _service()
 
@@ -1840,6 +1885,42 @@ async def test_blocking_derivatives_read_refreshes_stale_cache() -> None:
     assert refresh_calls == ["PROS/USDT"]
     assert result == {"funding_rate": 0.002, "source": "fresh_rest"}
     assert "derivatives_snapshot_stale" not in result
+
+
+@pytest.mark.asyncio
+async def test_incomplete_derivatives_cache_is_not_reused_as_fresh() -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    service._derivatives_cache["PROS/USDT"] = {
+        "updated_at": datetime.now(UTC),
+        "data": {
+            "funding_rate": 0.001,
+            "derivatives_required_data_available": False,
+            "orderbook_data_available": False,
+        },
+    }
+    refresh_calls: list[str] = []
+
+    async def refresh(symbol: str) -> dict[str, Any]:
+        refresh_calls.append(symbol)
+        return {
+            "derivatives_required_data_available": True,
+            "orderbook_data_available": True,
+            "orderbook_bid_depth": 10.0,
+            "orderbook_ask_depth": 11.0,
+            "mark_price": 100.0,
+            "mark_price_fact": {
+                "price": 100.0,
+                "source_timestamp_ms": int(time.time() * 1000),
+            },
+        }
+
+    service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot("PROS/USDT", block_on_remote=True)
+
+    assert refresh_calls == ["PROS/USDT"]
+    assert result["derivatives_required_data_available"] is True
 
 
 @pytest.mark.asyncio
