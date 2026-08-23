@@ -762,6 +762,63 @@ async def test_derivatives_snapshot_does_not_wait_for_optional_routes(
 
 
 @pytest.mark.asyncio
+async def test_derivatives_snapshot_can_require_funding_for_final_analysis(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    funding_started = asyncio.Event()
+    release_funding = asyncio.Event()
+
+    async def funding(_symbol: str) -> dict:
+        funding_started.set()
+        await release_funding.wait()
+        return {
+            "funding_rate": 0.0001,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+            "next_funding_time": "2026-08-23T08:00:00+00:00",
+            "funding_rate_observed_at": "2026-08-23T00:00:00+00:00",
+        }
+
+    async def open_interest(_symbol: str) -> dict:
+        return {"open_interest_contracts": 123.0}
+
+    async def orderbook(_symbol: str, *, contract_spec=None) -> dict:
+        return {
+            "orderbook_bid_depth": 10.0,
+            "orderbook_ask_depth": 11.0,
+            "orderbook_data_available": True,
+        }
+
+    async def reference_prices(_symbol: str, *, contract_spec=None) -> dict:
+        return {"mark_price": 100.0, "index_price": 100.0}
+
+    monkeypatch.setattr(client, "fetch_funding_rate", funding)
+    monkeypatch.setattr(client, "fetch_open_interest", open_interest)
+    monkeypatch.setattr(client, "fetch_order_book_metrics", orderbook)
+    monkeypatch.setattr(client, "fetch_reference_prices", reference_prices)
+
+    pending = asyncio.create_task(
+        client.fetch_derivatives_snapshot(
+            "BTC/USDT",
+            timeout_seconds=0.5,
+            required_only=True,
+            require_funding=True,
+        )
+    )
+    await asyncio.wait_for(funding_started.wait(), timeout=0.2)
+    assert not pending.done()
+    release_funding.set()
+    result = await asyncio.wait_for(pending, timeout=0.5)
+
+    assert result["derivatives_funding_required"] is True
+    assert result["derivatives_funding_data_available"] is True
+    assert result["derivatives_required_data_available"] is True
+    assert "funding" in result["derivatives_route_status"]["completed"]
+    assert "open_interest" not in result["derivatives_route_status"]["completed"]
+
+
+@pytest.mark.asyncio
 async def test_derivatives_route_timeout_keeps_single_flight_and_populates_cache(
     monkeypatch,
 ) -> None:

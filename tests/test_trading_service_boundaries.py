@@ -1099,7 +1099,17 @@ def test_position_discovery_refreshes_derivatives_without_blocking_round() -> No
 async def test_final_market_candidate_refresh_prefers_fresh_complete_local_sources() -> None:
     service = TradingService.__new__(TradingService)
     received: dict[str, Any] = {}
-    vector = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
+    vector = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+    )
 
     async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
         received["symbol"] = symbol
@@ -1120,8 +1130,28 @@ async def test_final_market_candidate_refresh_prefers_fresh_complete_local_sourc
         "allow_cached_indicator_build": True,
         "allow_indicator_background_refresh": False,
         "allow_derivatives_background_refresh": False,
+        "require_funding": True,
         "prioritize_indicator_build": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_defers_without_funding_evidence() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    incomplete = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return incomplete
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
+
+    assert result is None
+    assert len(calls) == 2
+    assert all(call["require_funding"] is True for call in calls)
 
 
 @pytest.mark.asyncio
@@ -1129,7 +1159,17 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
     service = TradingService.__new__(TradingService)
     calls: list[dict[str, Any]] = []
     invalid = SimpleNamespace(current_price=0.0, close=0.0, bid=0.0, ask=0.0)
-    fresh = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
+    fresh = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+    )
 
     async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
         calls.append(kwargs)
@@ -1146,6 +1186,8 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
     assert calls[1]["block_on_remote_indicators"] is True
     assert calls[1]["block_on_remote_derivatives"] is True
     assert calls[1]["allow_cached_indicator_build"] is False
+    assert calls[0]["require_funding"] is True
+    assert calls[1]["require_funding"] is True
 
 
 @pytest.mark.asyncio
@@ -1167,6 +1209,11 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
         bid=99.9,
         ask=100.1,
         indicator_snapshot_available=True,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
     )
     stale_issue = SimpleNamespace(
         code="native_market_fact_invalid",
@@ -1198,6 +1245,8 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
     assert calls[1]["allow_cached_indicator_build"] is True
     assert calls[1]["allow_indicator_background_refresh"] is False
     assert calls[1]["allow_derivatives_background_refresh"] is False
+    assert calls[0]["require_funding"] is True
+    assert calls[1]["require_funding"] is True
     assert calls[1]["prioritize_native_market_data"] is True
 
 

@@ -824,6 +824,7 @@ class DataService:
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
+        require_funding: bool = False,
         prioritize_indicator_build: bool = False,
         prioritize_native_market_data: bool = False,
     ) -> FeatureVector:
@@ -918,6 +919,7 @@ class DataService:
                     symbol,
                     block_on_remote=block_on_remote_derivatives,
                     allow_background_refresh=allow_derivatives_background_refresh,
+                    require_funding=require_funding,
                 ),
                 uses_native_remote=block_on_remote_derivatives,
             )
@@ -1694,6 +1696,7 @@ class DataService:
         *,
         block_on_remote: bool = True,
         allow_background_refresh: bool = True,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
         getter = self._get_derivatives_snapshot
         try:
@@ -1701,9 +1704,29 @@ class DataService:
                 symbol,
                 block_on_remote=block_on_remote,
                 allow_background_refresh=allow_background_refresh,
+                require_funding=require_funding,
             )
         except TypeError as exc:
             error_text = safe_error_text(exc)
+            if "require_funding" in error_text:
+                try:
+                    return await getter(
+                        symbol,
+                        block_on_remote=block_on_remote,
+                        allow_background_refresh=allow_background_refresh,
+                    )
+                except TypeError as nested_exc:
+                    nested_text = safe_error_text(nested_exc)
+                    if "allow_background_refresh" in nested_text:
+                        try:
+                            return await getter(symbol, block_on_remote=block_on_remote)
+                        except TypeError as final_exc:
+                            if "block_on_remote" not in safe_error_text(final_exc):
+                                raise
+                            return await getter(symbol)
+                    if "block_on_remote" not in nested_text:
+                        raise
+                    return await getter(symbol)
             if "allow_background_refresh" in error_text:
                 return await getter(symbol, block_on_remote=block_on_remote)
             if "block_on_remote" not in error_text:
@@ -2586,6 +2609,7 @@ class DataService:
         *,
         block_on_remote: bool = True,
         allow_background_refresh: bool = True,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         normalized = self._normalize_symbols([symbol])[0]
@@ -2599,26 +2623,29 @@ class DataService:
             failed_cache = {}
             self._derivatives_failed_at = failed_cache
         failed_at = failed_cache.get(normalized)
+        cached_data = dict((cached or {}).get("data") or {})
         if (
             block_on_remote
             and failed_at is not None
             and (now - failed_at).total_seconds() < DERIVATIVES_FAILURE_CACHE_SECONDS
+            and not (require_funding and not self._derivatives_funding_ready(cached_data))
         ):
             data = dict((cached or {}).get("data") or {})
             if data:
                 data["derivatives_snapshot_stale"] = True
                 data["derivatives_refresh_suppressed"] = True
             return data
-        cached_data = dict((cached or {}).get("data") or {})
         cached_has_required_facts = self._derivatives_cache_has_required_facts(
             cached_data
         )
+        cached_funding_ready = self._derivatives_funding_ready(cached_data)
         if cached:
             updated_at = cached.get("updated_at")
             if (
                 isinstance(updated_at, datetime)
                 and (now - updated_at).total_seconds() < self._derivatives_update_interval
                 and cached_has_required_facts
+                and (not require_funding or cached_funding_ready)
             ):
                 return cached_data
             if (
@@ -2653,7 +2680,16 @@ class DataService:
                         asyncio.shield(existing_task),
                         timeout=DERIVATIVES_REFRESH_TIMEOUT_SECONDS,
                     )
-                    return dict(result or {})
+                    result = dict(result or {})
+                    if not require_funding or self._derivatives_funding_ready(result):
+                        return result
+                    # A background refresh may have completed the executable
+                    # routes while its optional funding request is still
+                    # warming the route cache.  Let this required caller run
+                    # one explicit funding-aware refresh instead of accepting
+                    # that partial result as an analysis snapshot.
+                    if tasks.get(normalized) is existing_task:
+                        tasks.pop(normalized, None)
                 except TimeoutError:
                     if cached_data:
                         cached_data["derivatives_snapshot_stale"] = True
@@ -2668,19 +2704,34 @@ class DataService:
                 self._schedule_derivatives_background_refresh(normalized)
                 return {"derivatives_refresh_in_background": True}
             return {}
-        # A synchronous market refresh only needs executable facts.  Funding and
-        # open-interest are analytical enrichments and must not compete with
-        # ticker/orderbook requests for the shared OKX public-request gate.
+        # A normal synchronous market refresh only needs executable facts.
+        # Final entry analysis opts into a funding-aware refresh explicitly;
+        # open interest remains optional in both modes.
         required_only = not allow_background_refresh
 
         async def refresh() -> dict[str, Any]:
             refresh_fn = self._refresh_derivatives_snapshot
             try:
-                return await refresh_fn(normalized, required_only=required_only)
+                return await refresh_fn(
+                    normalized,
+                    required_only=required_only,
+                    require_funding=require_funding,
+                )
             except TypeError as exc:
                 # Keep older test doubles and integrations source-compatible
                 # while the real implementation adopts the explicit contract.
-                if "required_only" not in safe_error_text(exc):
+                error_text = safe_error_text(exc)
+                if "require_funding" in error_text:
+                    try:
+                        return await refresh_fn(
+                            normalized,
+                            required_only=required_only,
+                        )
+                    except TypeError as nested_exc:
+                        if "required_only" not in safe_error_text(nested_exc):
+                            raise
+                        return await refresh_fn(normalized)
+                if "required_only" not in error_text:
                     raise
                 return await refresh_fn(normalized)
 
@@ -2710,6 +2761,24 @@ class DataService:
         except Exception:
             failed_cache[normalized] = datetime.now(UTC)
             return {}
+
+    @staticmethod
+    def _derivatives_funding_ready(data: dict[str, Any]) -> bool:
+        """Return whether a snapshot has all fields required for projection."""
+
+        if not isinstance(data, dict) or data.get("funding_data_available") is not True:
+            return False
+        if data.get("funding_rate") is None:
+            return False
+        try:
+            if float(data.get("funding_interval_minutes") or 0.0) <= 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            data.get("next_funding_time")
+            and data.get("funding_rate_observed_at")
+        )
 
     def _derivatives_cache_has_required_facts(self, data: dict[str, Any]) -> bool:
         """Return whether a derivatives snapshot can be reused for execution.
@@ -2789,6 +2858,7 @@ class DataService:
         symbol: str,
         *,
         required_only: bool = False,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         tasks = self._derivatives_refresh_task_map()
@@ -2815,11 +2885,25 @@ class DataService:
                     normalized,
                     contract_spec=contract_spec,
                     required_only=required_only,
+                    require_funding=require_funding,
                 )
             except TypeError as exc:
-                if "required_only" not in safe_error_text(exc):
+                error_text = safe_error_text(exc)
+                if "require_funding" in error_text:
+                    try:
+                        fetch_call = fetcher(
+                            normalized,
+                            contract_spec=contract_spec,
+                            required_only=required_only,
+                        )
+                    except TypeError as nested_exc:
+                        if "required_only" not in safe_error_text(nested_exc):
+                            raise
+                        fetch_call = fetcher(normalized, contract_spec=contract_spec)
+                elif "required_only" in error_text:
+                    fetch_call = fetcher(normalized, contract_spec=contract_spec)
+                else:
                     raise
-                fetch_call = fetcher(normalized, contract_spec=contract_spec)
             data = await asyncio.wait_for(
                 fetch_call,
                 timeout=max(float(DERIVATIVES_PROVIDER_TIMEOUT_SECONDS), 0.5),

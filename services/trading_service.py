@@ -5133,6 +5133,7 @@ class TradingService:
         allow_cached_indicator_build: bool = True,
         allow_indicator_background_refresh: bool = True,
         allow_derivatives_background_refresh: bool = True,
+        require_funding: bool = False,
         prioritize_indicator_build: bool = False,
         prioritize_native_market_data: bool = False,
     ) -> Any:
@@ -5161,6 +5162,9 @@ class TradingService:
             accepts_derivatives_background_refresh_option = (
                 "allow_derivatives_background_refresh" in parameters or accepts_var_kwargs
             )
+            accepts_funding_requirement_option = (
+                "require_funding" in parameters or accepts_var_kwargs
+            )
             accepts_indicator_priority_option = (
                 "prioritize_indicator_build" in parameters or accepts_var_kwargs
             )
@@ -5175,6 +5179,7 @@ class TradingService:
             accepts_cached_indicator_build_option = True
             accepts_indicator_background_refresh_option = True
             accepts_derivatives_background_refresh_option = True
+            accepts_funding_requirement_option = True
             accepts_indicator_priority_option = True
             accepts_native_market_priority_option = True
 
@@ -5193,6 +5198,8 @@ class TradingService:
             kwargs["allow_indicator_background_refresh"] = allow_indicator_background_refresh
         if accepts_derivatives_background_refresh_option:
             kwargs["allow_derivatives_background_refresh"] = allow_derivatives_background_refresh
+        if accepts_funding_requirement_option:
+            kwargs["require_funding"] = require_funding
         if accepts_indicator_priority_option:
             kwargs["prioritize_indicator_build"] = prioritize_indicator_build
         if accepts_native_market_priority_option and prioritize_native_market_data:
@@ -5522,6 +5529,23 @@ class TradingService:
         """
         _ = fallback
 
+        def funding_ready(candidate: Any) -> bool:
+            """Final market analysis may not proceed on an optional funding stub."""
+
+            if candidate is None or getattr(candidate, "funding_data_available", False) is not True:
+                return False
+            if getattr(candidate, "funding_rate", None) is None:
+                return False
+            try:
+                if float(getattr(candidate, "funding_interval_minutes", 0) or 0) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            return bool(
+                getattr(candidate, "next_funding_time", None)
+                and getattr(candidate, "funding_rate_observed_at", None)
+            )
+
         def validated(candidate: Any, *, source: str) -> tuple[Any | None, Any | None]:
             if not self._is_valid_feature_vector(candidate):
                 return None, None
@@ -5558,6 +5582,7 @@ class TradingService:
                     allow_cached_indicator_build=True,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
+                    require_funding=True,
                     prioritize_indicator_build=True,
                 ),
                 timeout=MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS,
@@ -5566,8 +5591,13 @@ class TradingService:
                 local_candidate,
                 source="fresh_local_market_cache",
             )
-            if cached is not None:
+            if cached is not None and funding_ready(cached):
                 return cached
+            if cached is not None:
+                logger.info(
+                    "fresh local feature cache lacks complete funding evidence; trying remote refresh",
+                    symbol=symbol,
+                )
         except TimeoutError:
             logger.info(
                 "fresh local feature cache timed out; trying remote refresh",
@@ -5601,14 +5631,20 @@ class TradingService:
                     allow_cached_indicator_build=refresh_native_market_only,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
+                    require_funding=True,
                     prioritize_indicator_build=True,
                     prioritize_native_market_data=True,
                 ),
                 timeout=MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS,
             )
             fresh, _fresh_quality_issue = validated(fresh, source=refresh_source)
-            if fresh is not None:
+            if fresh is not None and funding_ready(fresh):
                 return fresh
+            if fresh is not None:
+                logger.warning(
+                    "fresh feature vector lacks complete funding evidence; deferring symbol",
+                    symbol=symbol,
+                )
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
             logger.warning(

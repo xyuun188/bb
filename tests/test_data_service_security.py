@@ -2054,6 +2054,53 @@ async def test_market_derivatives_refresh_requests_required_routes_only() -> Non
 
 
 @pytest.mark.asyncio
+async def test_final_derivatives_refresh_requires_funding_route() -> None:
+    service = _service()
+    service._derivatives_failed_at = {}
+    service._derivatives_refresh_tasks = {}
+    service._get_instrument_spec = (  # type: ignore[method-assign]
+        lambda _symbol, **_kwargs: asyncio.sleep(0, result={"instId": "ETH-USDT-SWAP"})
+    )
+    calls: list[tuple[bool, bool]] = []
+
+    class FakeRestClient:
+        async def fetch_derivatives_snapshot(
+            self,
+            _symbol: str,
+            *,
+            contract_spec: dict,
+            required_only: bool = False,
+            require_funding: bool = False,
+        ) -> dict[str, Any]:
+            calls.append((required_only, require_funding))
+            return {
+                "orderbook_data_available": True,
+                "orderbook_bid_depth": 10.0,
+                "orderbook_ask_depth": 12.0,
+                "mark_price": 100.0,
+                "mark_price_fact": {"price": 100.0, "source_timestamp_ms": 1},
+                "funding_data_available": True,
+                "funding_rate": 0.0001,
+                "funding_interval_minutes": 480.0,
+                "next_funding_time": "2026-08-23T08:00:00+00:00",
+                "funding_rate_observed_at": "2026-08-23T00:00:00+00:00",
+                "derivatives_required_data_available": True,
+            }
+
+    service.rest_client = FakeRestClient()
+
+    result = await service._get_derivatives_snapshot(
+        "ETH/USDT",
+        block_on_remote=True,
+        allow_background_refresh=False,
+        require_funding=True,
+    )
+
+    assert calls == [(True, True)]
+    assert result["funding_data_available"] is True
+
+
+@pytest.mark.asyncio
 async def test_feature_market_fact_proves_rest_ws_book_reference_and_native_path() -> None:
     service = _service()
     timestamp = int(time.time() * 1000)

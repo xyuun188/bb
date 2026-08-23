@@ -1084,17 +1084,20 @@ class OKXRestClient:
         contract_spec: dict[str, Any] | None = None,
         timeout_seconds: float = DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS,
         required_only: bool = False,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
         """Fetch compact perpetual-swap features used by AI experts.
 
         The order book and reference prices are required to construct an
-        executable native market fact. Funding and open interest are useful
-        analytical enrichments, but a slow optional route must not hold those
-        required facts hostage for the whole snapshot deadline. Optional
-        single-flight refreshes are allowed to finish in the background and
-        populate their own route caches for the next round.
+        executable native market fact. Funding is normally an analytical
+        enrichment, but final entry analysis can explicitly require a complete
+        funding projection. Open interest remains optional in that mode.
+        Optional single-flight refreshes are allowed to finish in the
+        background and populate their own route caches for the next round.
         """
         required_routes = {"orderbook", "reference_prices"}
+        if require_funding:
+            required_routes.add("funding")
         route_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {
             "orderbook": asyncio.create_task(
                 self.fetch_order_book_metrics(symbol, contract_spec=contract_spec)
@@ -1103,24 +1106,21 @@ class OKXRestClient:
                 self.fetch_reference_prices(symbol, contract_spec=contract_spec)
             ),
         }
+        if not required_only or require_funding:
+            route_tasks["funding"] = asyncio.create_task(
+                self._cached_derivatives_route(
+                    "funding",
+                    symbol,
+                    lambda: self.fetch_funding_rate(symbol),
+                )
+            )
         if not required_only:
-            route_tasks.update(
-                {
-                    "funding": asyncio.create_task(
-                        self._cached_derivatives_route(
-                            "funding",
-                            symbol,
-                            lambda: self.fetch_funding_rate(symbol),
-                        )
-                    ),
-                    "open_interest": asyncio.create_task(
-                        self._cached_derivatives_route(
-                            "open_interest",
-                            symbol,
-                            lambda: self.fetch_open_interest(symbol),
-                        )
-                    ),
-                }
+            route_tasks["open_interest"] = asyncio.create_task(
+                self._cached_derivatives_route(
+                    "open_interest",
+                    symbol,
+                    lambda: self.fetch_open_interest(symbol),
+                )
             )
         task_names = {task: name for name, task in route_tasks.items()}
         required_tasks = {
@@ -1172,10 +1172,19 @@ class OKXRestClient:
         merged["derivatives_required_routes"] = sorted(required_routes)
         merged["derivatives_required_data_available"] = bool(
             required_routes.issubset(set(completed_routes))
+            and (
+                not require_funding
+                or merged.get("funding_data_available") is True
+            )
+        )
+        merged["derivatives_funding_required"] = bool(require_funding)
+        merged["derivatives_funding_data_available"] = bool(
+            merged.get("funding_data_available") is True
         )
         merged["derivatives_optional_refresh_in_background"] = bool(
             not required_only and any(
-                name in {"funding", "open_interest"} for name in timed_out_routes
+                name in ({"open_interest"} if require_funding else {"funding", "open_interest"})
+                for name in timed_out_routes
             )
         )
         merged["derivatives_optional_routes_skipped"] = bool(required_only)
@@ -1184,6 +1193,7 @@ class OKXRestClient:
             or timed_out_routes
             or merged.get("orderbook_data_available") is False
             or merged.get("reference_prices_fallback")
+            or (require_funding and merged.get("funding_data_available") is not True)
         )
         if timed_out_routes:
             logger.warning(
