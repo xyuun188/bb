@@ -1236,6 +1236,36 @@ async def test_market_candidate_prewarm_uses_bounded_priority_api() -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_indicator_prewarm_does_not_use_round_deadline() -> None:
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    received: dict[str, Any] = {}
+
+    async def prewarm(symbols: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        received["symbols"] = symbols
+        received["timeout_seconds"] = timeout_seconds
+        return {
+            "status": "ok",
+            "requested_count": len(symbols),
+            "available_count": len(symbols),
+            "unavailable_symbols": [],
+        }
+
+    service.data_service = SimpleNamespace(prewarm_indicator_snapshots=prewarm)
+
+    diagnostics = await service._prewarm_market_candidate_indicators(
+        ["BTC/USDT", "ETH/USDT"],
+        background=True,
+    )
+
+    assert received["timeout_seconds"] >= 15.0
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["is_entry_permission"] is False
+
+
+@pytest.mark.asyncio
 async def test_market_candidate_prewarm_runs_in_background_queue() -> None:
     service = TradingService.__new__(TradingService)
     service.entry_symbol_universe = SimpleNamespace(
@@ -1378,6 +1408,42 @@ async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -
     ]
     assert all(kwargs["block_on_remote_indicators"] is False for _symbol, kwargs in calls)
     assert all(kwargs["prioritize_indicator_build"] is True for _symbol, kwargs in calls)
+
+
+@pytest.mark.asyncio
+async def test_pending_indicator_snapshot_is_not_rebuilt_in_same_round() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[str] = []
+
+    async def feature_snapshot(symbol: str, **_kwargs: Any) -> Any:
+        calls.append(symbol)
+        return SimpleNamespace(
+            symbol=symbol,
+            current_price=100.0,
+            close=100.0,
+            indicator_snapshot_available=True,
+        )
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    hydrated, diagnostics = await service._hydrate_prewarmed_market_candidates(
+        {
+            "BTC/USDT": SimpleNamespace(
+                current_price=100.0,
+                indicator_snapshot_available=False,
+                indicator_snapshot_reason="indicator_snapshot_build_in_progress",
+            )
+        }
+    )
+
+    assert hydrated == {}
+    assert diagnostics["unavailable_symbols"] == [
+        {
+            "symbol": "BTC/USDT",
+            "reason": "indicator_snapshot_build_in_progress",
+        }
+    ]
+    assert calls == []
 
 
 @pytest.mark.asyncio

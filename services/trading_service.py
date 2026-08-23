@@ -5619,8 +5619,15 @@ class TradingService:
     async def _prewarm_market_candidate_indicators(
         self,
         symbols: list[str],
+        *,
+        background: bool = False,
     ) -> dict[str, Any]:
-        """Give the final shortlist priority access to complete indicator snapshots."""
+        """Give the final shortlist priority access to complete indicator snapshots.
+
+        Background work must not inherit the live-round deadline. Otherwise a
+        busy but healthy indicator build is reported as a round failure and
+        the same candidates are retried on every round.
+        """
 
         requested = self.entry_symbol_universe.dedupe_symbols(symbols)
         if not requested:
@@ -5642,6 +5649,13 @@ class TradingService:
         loop = asyncio.get_running_loop()
         started = loop.time()
         timeout_seconds = max(float(MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS), 0.5)
+        if background:
+            timeout_seconds = max(timeout_seconds, 15.0)
+        outer_timeout_seconds = (
+            max(timeout_seconds * max(len(requested), 1) + 5.0, 30.0)
+            if background
+            else timeout_seconds + 0.5
+        )
         try:
             try:
                 parameters = inspect.signature(warmer).parameters
@@ -5653,7 +5667,7 @@ class TradingService:
             kwargs = {"timeout_seconds": timeout_seconds} if accepts_timeout else {}
             result = await asyncio.wait_for(
                 warmer(requested, **kwargs),
-                timeout=timeout_seconds + 0.5,
+                timeout=outer_timeout_seconds,
             )
             diagnostics = self._safe_dict(result)
             diagnostics.setdefault("status", "ok")
@@ -5665,11 +5679,16 @@ class TradingService:
                 "available_count": 0,
                 "unavailable_symbols": requested,
                 "timeout_seconds": timeout_seconds,
+                "background": background,
             }
             logger.warning(
-                "market candidate indicator prewarm exceeded round budget",
+                (
+                    "background market candidate indicator prewarm exceeded retry budget"
+                    if background
+                    else "market candidate indicator prewarm exceeded round budget"
+                ),
                 symbol_count=len(requested),
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=outer_timeout_seconds,
             )
         except Exception as exc:
             diagnostics = {
@@ -5789,7 +5808,10 @@ class TradingService:
                     for symbol in self._market_indicator_prewarm_queue
                     if symbol not in selected
                 ]
-                diagnostics = await self._prewarm_market_candidate_indicators(batch)
+                diagnostics = await self._prewarm_market_candidate_indicators(
+                    batch,
+                    background=True,
+                )
                 diagnostics["background"] = True
                 diagnostics["remaining_queue_count"] = len(self._market_indicator_prewarm_queue)
                 unavailable_symbols = [
@@ -5874,6 +5896,27 @@ class TradingService:
 
         async def hydrate(symbol: str) -> tuple[str, Any | None, str, str]:
             existing = feature_vectors.get(symbol)
+
+            # The observation pool may contain vectors whose indicators are
+            # still being built by the background prewarm worker.  Re-running
+            # the full feature pipeline here for every such candidate just
+            # recreates the same 3-second timeout storm.  Leave those symbols
+            # explicitly pending so the worker can populate the cache and a
+            # later rotation can retry them; executable entry quality remains
+            # enforced by the final per-symbol refresh.
+            if (
+                existing is not None
+                and getattr(existing, "indicator_snapshot_available", None) is False
+            ):
+                return (
+                    symbol,
+                    None,
+                    str(
+                        getattr(existing, "indicator_snapshot_reason", "")
+                        or "background_indicator_prewarm_pending"
+                    ),
+                    "background_prewarm_pending",
+                )
 
             def existing_full_snapshot() -> Any | None:
                 if self._is_valid_feature_vector(existing) and bool(

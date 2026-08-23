@@ -1681,6 +1681,35 @@ async def test_ticker_snapshot_can_defer_rest_for_market_batch_scan() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_consistency_bars_are_singleflight_and_short_cached() -> None:
+    service = _service()
+    calls = 0
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self, _symbol: str, *, timeframe: str, limit: int
+        ) -> list[list[float]]:
+            nonlocal calls
+            assert timeframe == "1m"
+            assert limit >= 1
+            calls += 1
+            await asyncio.sleep(0.01)
+            return [[1_000.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    snapshots = [{"timestamp": int(time.time() * 1000)}]
+
+    first, second = await asyncio.gather(
+        service._fetch_native_consistency_bars("BTC/USDT", snapshots),
+        service._fetch_native_consistency_bars("BTC/USDT", snapshots),
+    )
+    third = await service._fetch_native_consistency_bars("BTC/USDT", snapshots)
+
+    assert first == second == third
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_feature_vector_can_defer_ticker_rest_for_market_batch_scan() -> None:
     service = _service()
     stale_timestamp_ms = int(

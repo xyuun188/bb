@@ -129,6 +129,12 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
     10.0,
     float(_MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds),
 )
+# Native 1m bars are used only to verify the relationship between an
+# executable ticker and the recent OKX price path.  Re-fetching them for every
+# ticker refresh creates a second public request per symbol and can starve the
+# actual quote route.  Keep a short single-flight cache; the market-fact
+# validator still rejects missing or stale paths.
+NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS = 30.0
 AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
 CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
     float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) + 2.0,
@@ -272,6 +278,8 @@ class DataService:
         self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
         self._instrument_spec_failed_at: dict[str, datetime] = {}
         self._ticker_persist_tasks: set[asyncio.Task] = set()
+        self._native_consistency_bars_cache: dict[str, tuple[float, list[Any]]] = {}
+        self._native_consistency_bars_tasks: dict[str, asyncio.Task[list[Any]]] = {}
         self._started = False
         self._stopping = False
 
@@ -1219,6 +1227,22 @@ class DataService:
         symbol: str,
         source_snapshots: list[dict[str, Any]],
     ) -> list[Any]:
+        normalized = self._normalize_symbols([symbol])[0]
+        now = asyncio.get_running_loop().time()
+        cache = getattr(self, "_native_consistency_bars_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._native_consistency_bars_cache = cache
+        tasks = getattr(self, "_native_consistency_bars_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._native_consistency_bars_tasks = tasks
+        cached = cache.get(normalized)
+        if cached is not None:
+            cached_at, cached_rows = cached
+            if now - cached_at <= NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS:
+                return list(cached_rows)
+
         timestamps = [
             self._ticker_timestamp_from_raw(snapshot)
             for snapshot in source_snapshots
@@ -1233,16 +1257,55 @@ class DataService:
         fetcher = getattr(self.rest_client, "fetch_ohlcv", None)
         if not callable(fetcher):
             return []
+
+        existing = tasks.get(normalized)
+        if existing is not None and not existing.done():
+            try:
+                return list(
+                    await asyncio.wait_for(
+                        asyncio.shield(existing),
+                        timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
+                    )
+                )
+            except TimeoutError:
+                return []
+
+        async def fetch() -> list[Any]:
+            try:
+                rows = await asyncio.wait_for(
+                    fetcher(normalized, timeframe="1m", limit=limit),
+                    timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "OKX native 1m consistency path unavailable",
+                    symbol=normalized,
+                    error=safe_error_text(exc),
+                )
+                return []
+            result = rows if isinstance(rows, list) else []
+            if result:
+                cache[normalized] = (asyncio.get_running_loop().time(), list(result))
+            return result
+
+        task = asyncio.create_task(fetch())
+        tasks[normalized] = task
+
+        def cleanup(finished: asyncio.Task[list[Any]]) -> None:
+            if tasks.get(normalized) is finished:
+                tasks.pop(normalized, None)
+            _consume_task_result(finished)
+
+        task.add_done_callback(cleanup)
         try:
-            rows = await fetcher(symbol, timeframe="1m", limit=limit)
-        except Exception as exc:
-            logger.warning(
-                "OKX native 1m consistency path unavailable",
-                symbol=symbol,
-                error=safe_error_text(exc),
+            return list(
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
+                )
             )
+        except TimeoutError:
             return []
-        return rows if isinstance(rows, list) else []
 
     async def _attach_native_market_fact(
         self,

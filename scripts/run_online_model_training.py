@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,10 +32,39 @@ _PERSISTED_TRAINING_RESULT_PREFIXES = {
     "local_ai_tools": LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
 }
 _PREFLIGHT_RESULT_PREFIX = "ONLINE_TRAINING_PREFLIGHT_RESULT "
+_REMOTE_TRAINING_PID_PREFIX = "/tmp/bb-online-training-"
 
 
 def _remote_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _remote_training_pid_file(run_token: str) -> str:
+    token = str(run_token or "").strip()
+    if not token or any(char not in "0123456789abcdef" for char in token.lower()):
+        raise ValueError("remote training run token must be hexadecimal")
+    return f"{_REMOTE_TRAINING_PID_PREFIX}{token}.pid"
+
+
+def _remote_cleanup_command(*, remote_app_dir: str, run_token: str) -> str:
+    """Terminate only the remote process tree owned by one training run."""
+
+    pid_file = _remote_training_pid_file(run_token)
+    expected_token = f"BB_ONLINE_TRAINING_TOKEN={run_token}"
+    return (
+        f"cd {_remote_quote(remote_app_dir)} && "
+        f"PID_FILE={_remote_quote(pid_file)}; "
+        f"EXPECTED_TOKEN={_remote_quote(expected_token)}; "
+        "if [ -s \"$PID_FILE\" ]; then "
+        "ROOT_PID=$(cat \"$PID_FILE\" 2>/dev/null || true); "
+        "if [ -n \"$ROOT_PID\" ] && [ -r \"/proc/$ROOT_PID/environ\" ] && "
+        "tr '\\0' '\\n' <\"/proc/$ROOT_PID/environ\" | /usr/bin/grep -Fxq \"$EXPECTED_TOKEN\"; then "
+        "kill_tree() { "
+        "for child in $(/usr/bin/pgrep -P \"$1\" 2>/dev/null || true); do kill_tree \"$child\"; done; "
+        "/bin/kill -TERM \"$1\" 2>/dev/null || true; "
+        "}; kill_tree \"$ROOT_PID\"; sleep 1; "
+        "fi; rm -f \"$PID_FILE\"; fi"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,7 +107,10 @@ def _remote_command(
     argv: list[str],
     execution_timeout_seconds: int,
     persist_artifact: bool = True,
+    run_token: str | None = None,
 ) -> str:
+    run_token = str(run_token or secrets.token_hex(16))
+    pid_file = _remote_training_pid_file(run_token)
     result_prefixes = tuple(_PERSISTED_TRAINING_RESULT_PREFIXES.values())
     remote_script = f"""
 import contextlib
@@ -168,6 +201,10 @@ print(result_prefix + json.dumps(compact_payload, ensure_ascii=False, sort_keys=
 """
     return (
         f"cd {_remote_quote(remote_app_dir)} && "
+        f"RUN_TOKEN={_remote_quote(run_token)}; export BB_ONLINE_TRAINING_TOKEN=\"$RUN_TOKEN\"; "
+        f"PID_FILE={_remote_quote(pid_file)}; echo \"$$\" > \"$PID_FILE\"; "
+        "cleanup_training_pid() { rm -f \"$PID_FILE\"; }; "
+        "trap cleanup_training_pid EXIT; trap 'exit 130' INT; trap 'exit 143' TERM HUP; "
         "PYBIN=python3; "
         "if [ -x .venv/bin/python ]; then PYBIN=.venv/bin/python; "
         "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "
@@ -175,6 +212,42 @@ print(result_prefix + json.dumps(compact_payload, ensure_ascii=False, sort_keys=
         f"{max(int(execution_timeout_seconds), 1)}s $PYBIN - <<'PY'\n"
         f"{remote_script}\nPY"
     )
+
+
+def _cleanup_remote_training(
+    ssh: Any,
+    *,
+    remote_app_dir: str,
+    run_token: str,
+) -> None:
+    """Best-effort cleanup after local timeout, cancellation, or parse failure."""
+
+    cleanup_command = _remote_cleanup_command(
+        remote_app_dir=remote_app_dir,
+        run_token=run_token,
+    )
+    try:
+        run_remote_text(ssh, cleanup_command, timeout=20, check=False, max_output_chars=2000)
+        return
+    except BaseException:
+        pass
+    # The original channel may have died with the long-running command. Reconnect
+    # once so a local Ctrl+C cannot leave a remote training process behind.
+    replacement = None
+    try:
+        replacement = connect_remote_ssh(ROOT, timeout=20)
+        run_remote_text(
+            replacement,
+            cleanup_command,
+            timeout=20,
+            check=False,
+            max_output_chars=2000,
+        )
+    except BaseException:
+        pass
+    finally:
+        if replacement is not None:
+            replacement.close()
 
 
 def _persisted_training_result(target: str, output: str) -> dict[str, Any]:
@@ -211,23 +284,33 @@ def main() -> None:
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
         for target in targets:
+            run_token = secrets.token_hex(16)
             script_path, argv = _target_argv(
                 target,
                 persist_artifact=bool(args.persist_artifact),
             )
-            output = run_remote_text(
-                ssh,
-                _remote_command(
+            try:
+                output = run_remote_text(
+                    ssh,
+                    _remote_command(
+                        remote_app_dir=args.remote_app_dir,
+                        script_path=script_path,
+                        argv=argv,
+                        execution_timeout_seconds=execution_timeout,
+                        persist_artifact=bool(args.persist_artifact),
+                        run_token=run_token,
+                    ),
+                    timeout=command_timeout,
+                    check=True,
+                    max_output_chars=MAX_REMOTE_OUTPUT_TEXT_LIMIT,
+                )
+            except BaseException:
+                _cleanup_remote_training(
+                    ssh,
                     remote_app_dir=args.remote_app_dir,
-                    script_path=script_path,
-                    argv=argv,
-                    execution_timeout_seconds=execution_timeout,
-                    persist_artifact=bool(args.persist_artifact),
-                ),
-                timeout=command_timeout,
-                check=True,
-                max_output_chars=MAX_REMOTE_OUTPUT_TEXT_LIMIT,
-            )
+                    run_token=run_token,
+                )
+                raise
             if args.persist_artifact:
                 _persisted_training_result(target, output)
             safe_print(f"[{target}]")

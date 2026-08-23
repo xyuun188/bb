@@ -6,7 +6,9 @@ import pytest
 from scripts.run_online_model_training import (
     MAX_REMOTE_OUTPUT_TEXT_LIMIT,
     _persisted_training_result,
+    _remote_cleanup_command,
     _remote_command,
+    _remote_training_pid_file,
     _target_argv,
 )
 from services.ml_training_contract import LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX
@@ -58,6 +60,35 @@ def test_online_preflight_does_not_require_persisted_result_frame() -> None:
     assert "expect_persisted_result = False" in command
     assert "preflight_completed" in command
     assert "persisted training result frame missing on remote host" in command
+
+
+def test_remote_training_command_has_scoped_pid_cleanup() -> None:
+    token = "a" * 32
+
+    command = _remote_command(
+        remote_app_dir="/data/bb/app",
+        script_path="scripts/train_ml_signal_model.py",
+        argv=["scripts/train_ml_signal_model.py"],
+        execution_timeout_seconds=7140,
+        persist_artifact=False,
+        run_token=token,
+    )
+    cleanup = _remote_cleanup_command(
+        remote_app_dir="/data/bb/app",
+        run_token=token,
+    )
+
+    assert _remote_training_pid_file(token) == f"/tmp/bb-online-training-{token}.pid"
+    assert "BB_ONLINE_TRAINING_TOKEN" in command
+    assert "trap cleanup_training_pid EXIT" in command
+    assert _remote_training_pid_file(token) in command
+    assert "kill_tree" in cleanup
+    assert token in cleanup
+
+
+def test_remote_training_pid_file_rejects_non_hex_tokens() -> None:
+    with pytest.raises(ValueError):
+        _remote_training_pid_file("not-safe")
 
 
 def test_online_training_requires_successful_structured_business_result() -> None:
