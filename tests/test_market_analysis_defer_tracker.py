@@ -97,6 +97,16 @@ def test_global_defer_reasons_never_enter_blocked_queue() -> None:
     assert tracker.candidates["BTC/USDT"].consecutive_defer_count == 12
 
 
+def test_indicator_hydration_failure_remains_retryable_not_permanently_blocked() -> None:
+    tracker = _tracker()
+    for _attempt in range(20):
+        tracker.defer("BTC/USDT", "indicator_hydration_unavailable")
+
+    assert "BTC/USDT" in tracker.candidates
+    assert "BTC/USDT" not in tracker.blocked_candidates
+    assert tracker.candidates["BTC/USDT"].consecutive_defer_count == 20
+
+
 def test_changed_reason_resets_consecutive_block_counter() -> None:
     tracker = _tracker()
     for _attempt in range(7):

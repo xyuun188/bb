@@ -91,6 +91,16 @@ class _MarketApi:
         self.calls.append(("get_index_tickers", dict(kwargs)))
         return {"code": "0", "data": [{"idxPx": "0.0129"}]}
 
+    def get_candlesticks(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_candlesticks", dict(kwargs)))
+        return {
+            "code": "0",
+            "data": [
+                ["1780000120000", "1.1", "1.2", "1.0", "1.15", "10"],
+                ["1780000060000", "1.0", "1.1", "0.9", "1.1", "9"],
+            ],
+        }
+
 
 class _TradeApi:
     def __init__(self) -> None:
@@ -268,6 +278,27 @@ async def test_sdk_adapter_serializes_calls_on_same_sync_client() -> None:
 
     assert {row["data"][0]["value"] for row in results} == {"first", "second"}
     assert api.max_active_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_candles_use_isolated_market_client() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    primary_api = _MarketApi()
+    native_api = _MarketApi()
+    exchange._market_api = primary_api
+    exchange._native_consistency_market_api = native_api
+
+    rows = await exchange.fetch_native_consistency_ohlcv("BTC/USDT", limit=2)
+
+    assert rows[0][0] == 1_780_000_060_000.0
+    assert rows[-1][0] == 1_780_000_120_000.0
+    assert primary_api.calls == []
+    assert native_api.calls == [
+        (
+            "get_candlesticks",
+            {"instId": "BTC-USDT-SWAP", "bar": "1m", "limit": "2"},
+        )
+    ]
 
 
 @pytest.mark.asyncio

@@ -1254,7 +1254,10 @@ class DataService:
             else 1
         )
         limit = min(elapsed_minutes + 2, 300)
-        fetcher = getattr(self.rest_client, "fetch_ohlcv", None)
+        fetcher = getattr(self.rest_client, "fetch_native_consistency_ohlcv", None)
+        use_native_fetcher = callable(fetcher)
+        if not use_native_fetcher:
+            fetcher = getattr(self.rest_client, "fetch_ohlcv", None)
         if not callable(fetcher):
             return []
 
@@ -1273,7 +1276,9 @@ class DataService:
         async def fetch() -> list[Any]:
             try:
                 rows = await asyncio.wait_for(
-                    fetcher(normalized, timeframe="1m", limit=limit),
+                    fetcher(normalized, limit=limit)
+                    if use_native_fetcher
+                    else fetcher(normalized, timeframe="1m", limit=limit),
                     timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
                 )
             except Exception as exc:

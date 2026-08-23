@@ -285,7 +285,13 @@ EXPERT_MEMORY_CONTEXT_CACHE_LIMIT = 128
 EXPERT_MEMORY_CONTEXT_REFRESH_CONCURRENCY = 2
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
-MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 8
+# Background indicator builds share the OKX public-request and indicator
+# compute gates with live analysis.  A large batch made the prewarm worker
+# compete with executable ticker/orderbook refreshes and caused otherwise
+# healthy symbols to hit the per-symbol timeout together.  Keep the worker
+# deliberately small; the queue provides fairness and retries without adding
+# latency to the live market round.
+MARKET_BACKGROUND_PREWARM_BATCH_SIZE = 2
 MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_BACKGROUND_PREWARM_INTER_BATCH_SECONDS = 0.75
 MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_BASE_SECONDS = 30.0

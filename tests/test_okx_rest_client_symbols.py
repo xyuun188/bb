@@ -29,6 +29,12 @@ def test_optional_derivatives_routes_use_a_separate_gate() -> None:
     assert client._public_market_gate() is not client._public_market_optional_gate()
 
 
+def test_native_consistency_route_uses_a_separate_gate() -> None:
+    client = OKXRestClient()
+    assert client._native_consistency_gate() is not client._public_market_gate()
+    assert client._native_consistency_gate() is not client._public_market_optional_gate()
+
+
 @pytest.mark.asyncio
 async def test_priority_market_gate_reserves_capacity_for_executable_routes() -> None:
     gate = _PriorityRequestGate(limit=4, normal_limit=2)

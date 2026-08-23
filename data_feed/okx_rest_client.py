@@ -67,6 +67,10 @@ PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
     PUBLIC_MARKET_REQUEST_CONCURRENCY // 2,
 )
 PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 2
+# Native one-minute candles are part of the executable-market-fact proof. They
+# must not queue behind the larger indicator K-line fan-out, while still being
+# bounded so a provider outage cannot consume all public-request capacity.
+PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 2
 PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
 
 PUBLIC_MARKET_METHODS = frozenset(
@@ -74,6 +78,7 @@ PUBLIC_MARKET_METHODS = frozenset(
         "fetch_ticker",
         "fetch_order_book",
         "fetch_ohlcv",
+        "fetch_native_consistency_ohlcv",
         "fetch_funding_rate",
         "fetch_open_interest",
     }
@@ -176,6 +181,7 @@ class OKXRestClient:
         self._instrument_spec_lock = asyncio.Lock()
         self._public_market_request_gate: _PriorityRequestGate | None = None
         self._public_market_optional_request_gate: _PriorityRequestGate | None = None
+        self._native_consistency_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -256,6 +262,13 @@ class OKXRestClient:
             self._public_market_optional_request_gate = gate
         return gate
 
+    def _native_consistency_gate(self) -> _PriorityRequestGate:
+        gate = self._native_consistency_request_gate
+        if not isinstance(gate, _PriorityRequestGate):
+            gate = _PriorityRequestGate(PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY)
+            self._native_consistency_request_gate = gate
+        return gate
+
     @staticmethod
     def _is_public_market_method(method_name: str) -> bool:
         return str(method_name or "").startswith("public") or str(
@@ -263,20 +276,26 @@ class OKXRestClient:
         ) in PUBLIC_MARKET_METHODS
 
     async def _ccxt_call(self, method_name: str, *args, **kwargs):
+        request_gate = kwargs.pop("_request_gate", None)
+        request_priority = kwargs.pop("_request_priority", None)
         for attempt in range(2):
             ex = await self._get_exchange()
             self._ensure_rest_url()
             method = getattr(ex, method_name)
             is_public_method = self._is_public_market_method(method_name)
             is_optional_method = method_name in PUBLIC_MARKET_OPTIONAL_METHODS
-            gate = (
+            gate = request_gate or (
                 self._public_market_optional_gate()
                 if is_public_method and is_optional_method
                 else self._public_market_gate()
                 if is_public_method
                 else None
             )
-            is_priority = str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
+            is_priority = (
+                bool(request_priority)
+                if request_priority is not None
+                else str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
+            )
             if gate is not None:
                 await gate.acquire(
                     priority=is_priority,
@@ -501,6 +520,18 @@ class OKXRestClient:
             self._to_swap_symbol(symbol),
             timeframe,
             limit=limit,
+        )
+
+    async def fetch_native_consistency_ohlcv(
+        self, symbol: str, limit: int = 5
+    ) -> list[list[float]]:
+        """Fetch the short 1m path on its own bounded request lane."""
+        return await self._ccxt_call(
+            "fetch_native_consistency_ohlcv",
+            self._to_swap_symbol(symbol),
+            limit=limit,
+            _request_gate=self._native_consistency_gate(),
+            _request_priority=False,
         )
 
     async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:

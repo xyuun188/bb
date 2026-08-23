@@ -385,6 +385,7 @@ class OkxPerpetualSdkExchange:
         self._account_api: Any | None = None
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
+        self._native_consistency_market_api: Any | None = None
         self._public_api: Any | None = None
         self._execution_market_api: Any | None = None
         self._execution_public_api: Any | None = None
@@ -419,6 +420,15 @@ class OkxPerpetualSdkExchange:
 
             self._market_api = MarketAPI(**self._public_kwargs())
         return self._market_api
+
+    @property
+    def native_consistency_market_api(self) -> Any:
+        """Return a public market client isolated from indicator K-line calls."""
+        if self._native_consistency_market_api is None:
+            from okx.MarketData import MarketAPI
+
+            self._native_consistency_market_api = MarketAPI(**self._public_kwargs())
+        return self._native_consistency_market_api
 
     @property
     def public_api(self) -> Any:
@@ -613,6 +623,7 @@ class OkxPerpetualSdkExchange:
             "_account_api",
             "_trade_api",
             "_market_api",
+            "_native_consistency_market_api",
             "_public_api",
             "_execution_market_api",
             "_execution_public_api",
@@ -677,6 +688,7 @@ class OkxPerpetualSdkExchange:
                 "_account_api",
                 "_trade_api",
                 "_market_api",
+                "_native_consistency_market_api",
                 "_public_api",
                 "_execution_market_api",
                 "_execution_public_api",
@@ -698,6 +710,7 @@ class OkxPerpetualSdkExchange:
                         self._account_api,
                         self._trade_api,
                         self._market_api,
+                        self._native_consistency_market_api,
                         self._public_api,
                         self._execution_market_api,
                         self._execution_public_api,
@@ -1325,6 +1338,10 @@ class OkxPerpetualSdkExchange:
             bar=bar,
             limit=str(max(1, int(limit or 100))),
         )
+        return self._parse_ohlcv_rows(response)
+
+    @staticmethod
+    def _parse_ohlcv_rows(response: Mapping[str, Any] | None) -> list[list[float]]:
         rows = response.get("data") if isinstance(response, Mapping) else []
         result: list[list[float]] = []
         for row in rows or []:
@@ -1341,6 +1358,22 @@ class OkxPerpetualSdkExchange:
                 ]
             )
         return list(reversed(result))
+
+    async def fetch_native_consistency_ohlcv(
+        self,
+        symbol: str,
+        limit: int = 5,
+    ) -> list[list[float]]:
+        """Fetch the executable-fact 1m path on an isolated public client."""
+        inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
+        response = await self._call_sdk(
+            lambda: self.native_consistency_market_api,
+            "get_candlesticks",
+            instId=inst_id,
+            bar="1m",
+            limit=str(max(1, int(limit or 5))),
+        )
+        return self._parse_ohlcv_rows(response)
 
     async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)

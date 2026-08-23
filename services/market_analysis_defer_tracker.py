@@ -15,7 +15,6 @@ BLOCKABLE_DEFER_REASONS = frozenset(
     {
         "feature_unavailable",
         "fresh_feature_unavailable",
-        "indicator_hydration_unavailable",
         "model_timeout",
         "decision_persistence_failed",
     }
