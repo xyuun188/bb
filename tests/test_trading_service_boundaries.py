@@ -6338,6 +6338,25 @@ async def test_auto_training_busy_retry_does_not_sleep_full_training_interval(
     assert delays == [trading_service.TRAINING_BUSY_RETRY_SECONDS]
 
 
+def test_deferred_training_schedulers_keep_heartbeats(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class StateStore:
+        def heartbeat(self, *, scheduler_id, model_ids, interval_seconds) -> None:
+            _ = interval_seconds
+            calls.append((scheduler_id, tuple(model_ids)))
+
+    monkeypatch.setattr(service, "_model_training_state", lambda: StateStore())
+
+    service._heartbeat_deferred_training_schedulers()
+
+    assert [scheduler_id for scheduler_id, _ in calls] == [
+        "local_ai_tools_auto_train",
+        "local_ml_auto_train",
+    ]
+
+
 def test_market_round_budget_reserves_full_analysis_time_per_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

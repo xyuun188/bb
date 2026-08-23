@@ -5,7 +5,49 @@ import asyncio
 import pytest
 
 from data_feed.feature_vector import build_feature_vector
-from data_feed.okx_rest_client import OKXRestClient
+from data_feed.okx_rest_client import (
+    PUBLIC_MARKET_OPTIONAL_METHODS,
+    PUBLIC_MARKET_PRIORITY_METHODS,
+    OKXRestClient,
+    _PriorityRequestGate,
+)
+
+
+def test_required_market_fact_routes_use_priority_lane() -> None:
+    assert {
+        "fetch_order_book",
+        "publicGetPublicMarkPrice",
+    }.issubset(PUBLIC_MARKET_PRIORITY_METHODS)
+    assert {"fetch_funding_rate", "fetch_open_interest"} == (
+        set(PUBLIC_MARKET_OPTIONAL_METHODS)
+    )
+
+
+def test_optional_derivatives_routes_use_a_separate_gate() -> None:
+    client = OKXRestClient()
+    assert client._public_market_gate() is not client._public_market_optional_gate()
+
+
+@pytest.mark.asyncio
+async def test_priority_market_gate_reserves_capacity_for_executable_routes() -> None:
+    gate = _PriorityRequestGate(limit=4, normal_limit=2)
+
+    await gate.acquire(priority=False)
+    await gate.acquire(priority=False)
+
+    waiting_normal = asyncio.create_task(gate.acquire(priority=False))
+    await asyncio.sleep(0)
+    assert waiting_normal.done() is False
+
+    # A third enrichment cannot consume the reserved slots, so an executable
+    # order-book/mark-price request is admitted immediately.
+    await gate.acquire(priority=True)
+    assert waiting_normal.done() is False
+
+    gate.release(priority=True)
+    gate.release(priority=False)
+    await asyncio.wait_for(waiting_normal, timeout=0.1)
+    gate.release(priority=False)
 
 
 class _AliasMarketExchange:

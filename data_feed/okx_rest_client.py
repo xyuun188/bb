@@ -53,6 +53,14 @@ TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # orderbook, mark/index and the native 1m path) and overwhelm that session
 # even though the service-level feature gate is bounded.
 PUBLIC_MARKET_REQUEST_CONCURRENCY = 8
+# Funding and open-interest are useful enrichments, but they must never be
+# able to consume every public-request slot while executable quotes are being
+# refreshed. Keep a fixed reserve for ticker/orderbook/mark/index routes.
+PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
+    1,
+    PUBLIC_MARKET_REQUEST_CONCURRENCY // 2,
+)
+PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 2
 PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
 
 PUBLIC_MARKET_METHODS = frozenset(
@@ -73,6 +81,12 @@ PUBLIC_MARKET_PRIORITY_METHODS = frozenset(
         "publicGetMarketIndexTickers",
     }
 )
+PUBLIC_MARKET_OPTIONAL_METHODS = frozenset(
+    {
+        "fetch_funding_rate",
+        "fetch_open_interest",
+    }
+)
 
 
 def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
@@ -85,19 +99,27 @@ def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
 class _PriorityRequestGate:
     """Bound one SDK session while serving executable quotes before enrichments."""
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, normal_limit: int | None = None) -> None:
         self._limit = max(int(limit), 1)
+        self._normal_limit = min(
+            self._limit,
+            max(int(normal_limit or self._limit), 1),
+        )
         self._active = 0
+        self._active_normal = 0
         self._priority_waiters: deque[asyncio.Future[None]] = deque()
         self._normal_waiters: deque[asyncio.Future[None]] = deque()
 
     async def acquire(self, *, priority: bool) -> None:
         if (
             self._active < self._limit
-            and not self._priority_waiters
-            and not self._normal_waiters
+            and (priority or self._active_normal < self._normal_limit)
+            and (priority or not self._priority_waiters)
+            and (priority or not self._normal_waiters)
         ):
             self._active += 1
+            if not priority:
+                self._active_normal += 1
             return
         future = asyncio.get_running_loop().create_future()
         waiters = self._priority_waiters if priority else self._normal_waiters
@@ -111,14 +133,23 @@ class _PriorityRequestGate:
                 pass
             raise
 
-    def release(self) -> None:
+    def release(self, *, priority: bool = False) -> None:
         self._active = max(self._active - 1, 0)
-        waiters = self._priority_waiters or self._normal_waiters
-        while waiters:
-            future = waiters.popleft()
+        if not priority:
+            self._active_normal = max(self._active_normal - 1, 0)
+        while self._priority_waiters:
+            future = self._priority_waiters.popleft()
             if future.done():
                 continue
             self._active += 1
+            future.set_result(None)
+            return
+        while self._normal_waiters and self._active_normal < self._normal_limit:
+            future = self._normal_waiters.popleft()
+            if future.done():
+                continue
+            self._active += 1
+            self._active_normal += 1
             future.set_result(None)
             return
 
@@ -138,6 +169,7 @@ class OKXRestClient:
         self._exchange_init_lock = asyncio.Lock()
         self._instrument_spec_lock = asyncio.Lock()
         self._public_market_request_gate: _PriorityRequestGate | None = None
+        self._public_market_optional_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -204,8 +236,18 @@ class OKXRestClient:
     def _public_market_gate(self) -> _PriorityRequestGate:
         gate = self._public_market_request_gate
         if not isinstance(gate, _PriorityRequestGate):
-            gate = _PriorityRequestGate(PUBLIC_MARKET_REQUEST_CONCURRENCY)
+            gate = _PriorityRequestGate(
+                PUBLIC_MARKET_REQUEST_CONCURRENCY,
+                normal_limit=PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY,
+            )
             self._public_market_request_gate = gate
+        return gate
+
+    def _public_market_optional_gate(self) -> _PriorityRequestGate:
+        gate = self._public_market_optional_request_gate
+        if not isinstance(gate, _PriorityRequestGate):
+            gate = _PriorityRequestGate(PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY)
+            self._public_market_optional_request_gate = gate
         return gate
 
     @staticmethod
@@ -219,10 +261,19 @@ class OKXRestClient:
             ex = await self._get_exchange()
             self._ensure_rest_url()
             method = getattr(ex, method_name)
-            gate = self._public_market_gate() if self._is_public_market_method(method_name) else None
+            is_public_method = self._is_public_market_method(method_name)
+            is_optional_method = method_name in PUBLIC_MARKET_OPTIONAL_METHODS
+            gate = (
+                self._public_market_optional_gate()
+                if is_public_method and is_optional_method
+                else self._public_market_gate()
+                if is_public_method
+                else None
+            )
+            is_priority = str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
             if gate is not None:
                 await gate.acquire(
-                    priority=str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
+                    priority=is_priority,
                 )
             try:
                 call = method(*args, **kwargs)
@@ -247,7 +298,7 @@ class OKXRestClient:
                 raise
             finally:
                 if gate is not None:
-                    gate.release()
+                    gate.release(priority=is_priority)
 
     async def _load_usdt_swap_markets(self) -> None:
         """Load only live linear USDT perpetual swaps.

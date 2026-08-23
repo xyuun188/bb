@@ -10612,6 +10612,27 @@ class TradingService:
                 )
             await asyncio.sleep(heartbeat_interval)
 
+    def _heartbeat_deferred_training_schedulers(self) -> None:
+        """Keep deferred child schedulers observable while trading stays busy."""
+
+        state_store = self._model_training_state()
+        for scheduler_id, model_ids in (
+            ("local_ai_tools_auto_train", LOCAL_AI_TOOL_MODEL_IDS),
+            ("local_ml_auto_train", LOCAL_ML_MODEL_IDS),
+        ):
+            try:
+                state_store.heartbeat(
+                    scheduler_id=scheduler_id,
+                    model_ids=model_ids,
+                    interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "deferred model training scheduler heartbeat write failed",
+                    scheduler_id=scheduler_id,
+                    error=safe_error_text(exc, limit=180),
+                )
+
     async def _ml_auto_train_loop(self) -> None:
         """Retrain local ML and server-side quant tools without blocking trading."""
         # A service restart commonly follows deployment or host maintenance.
@@ -10689,6 +10710,7 @@ class TradingService:
             # Both trainers read the same large history and use the same model
             # tunnel.  Serial execution prevents CPU, DB and 18001 contention.
             if self._auto_training_should_defer():
+                self._heartbeat_deferred_training_schedulers()
                 await asyncio.sleep(TRAINING_BUSY_RETRY_SECONDS)
                 continue
             ml_result = await run_ml_step()
