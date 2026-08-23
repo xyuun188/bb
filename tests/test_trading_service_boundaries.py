@@ -6786,6 +6786,7 @@ async def test_market_selection_history_projects_only_small_selection_fields(
     service = TradingService.__new__(TradingService)
     remembered: list[tuple[str, dict[str, Any], datetime]] = []
     selected_column_keys: list[str] = []
+    compiled_queries: list[str] = []
 
     class Policy:
         history_loaded = False
@@ -6822,6 +6823,9 @@ async def test_market_selection_history_projects_only_small_selection_fields(
             selected_column_keys.extend(
                 str(column.key) for column in statement.selected_columns
             )
+            compiled_queries.append(
+                str(statement.compile(compile_kwargs={"literal_binds": True}))
+            )
             return Result()
 
     class SessionContext:
@@ -6832,6 +6836,11 @@ async def test_market_selection_history_projects_only_small_selection_fields(
             return None
 
     monkeypatch.setattr(trading_service, "get_read_session_ctx", SessionContext)
+    monkeypatch.setattr(
+        trading_service,
+        "mode_manager",
+        SimpleNamespace(is_paper=True),
+    )
 
     await service._ensure_market_analysis_selection_history()
 
@@ -6840,6 +6849,7 @@ async def test_market_selection_history_projects_only_small_selection_fields(
     assert set(trading_service.MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS).issubset(
         selected_column_keys
     )
+    assert "ai_decisions.is_paper = true" in compiled_queries[0].lower()
     assert remembered == [
         (
             "BTC/USDT",
@@ -6854,6 +6864,94 @@ async def test_market_selection_history_projects_only_small_selection_fields(
         )
     ]
     assert policy.history_loaded is True
+    assert service._market_analysis_selection_history_mode == "paper"
+
+
+@pytest.mark.asyncio
+async def test_initialize_starts_and_awaits_market_history_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    prewarm_started = asyncio.Event()
+    release_prewarm = asyncio.Event()
+    prewarm_finished = asyncio.Event()
+    calls: list[str] = []
+
+    class Policy:
+        history_loaded = False
+
+    policy = Policy()
+
+    async def ensure_history(*, wait_until_ready: bool = False) -> None:
+        assert wait_until_ready is True
+        calls.append("prewarm_started")
+        prewarm_started.set()
+        await release_prewarm.wait()
+        policy.history_loaded = True
+        service._market_analysis_selection_history_mode = "paper"
+        calls.append("prewarm_finished")
+        prewarm_finished.set()
+
+    class Models:
+        async def initialize_all(self) -> None:
+            calls.append("models_started")
+            await asyncio.wait_for(prewarm_started.wait(), timeout=0.2)
+            release_prewarm.set()
+
+    class Executor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            calls.append("executor_initialized")
+
+    class CountResult:
+        def scalar(self) -> int:
+            return 0
+
+    class Session:
+        async def execute(self, _statement: Any) -> CountResult:
+            return CountResult()
+
+    class SessionContext:
+        async def __aenter__(self) -> Session:
+            return Session()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    class ExpertMemory:
+        async def backfill_trade_reflections(self, mode: str) -> None:
+            assert mode == "paper"
+            calls.append("expert_memory_backfill")
+
+    async def prime_strategy_context(mode: str) -> None:
+        assert mode == "paper"
+
+    subscribed: list[Any] = []
+    fake_mode_manager = SimpleNamespace(
+        mode=SimpleNamespace(value="paper"),
+        is_paper=True,
+        subscribe=lambda callback: subscribed.append(callback),
+    )
+    service.models = Models()
+    service._ensure_market_analysis_selection_history = ensure_history  # type: ignore[method-assign]
+    service._market_analysis_selector_policy = lambda: policy  # type: ignore[method-assign]
+    service._has_live_models = lambda: False  # type: ignore[method-assign]
+    service.expert_memory_service = ExpertMemory()
+    service._prime_strategy_context_performance_snapshot = prime_strategy_context  # type: ignore[method-assign]
+    service._on_mode_changed = object()  # type: ignore[method-assign]
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", Executor)
+    monkeypatch.setattr(trading_service, "get_session_ctx", SessionContext)
+    monkeypatch.setattr(trading_service, "mode_manager", fake_mode_manager)
+
+    await service.initialize()
+
+    assert prewarm_finished.is_set()
+    assert calls.index("prewarm_started") < calls.index("executor_initialized")
+    assert calls.index("prewarm_finished") < calls.index("expert_memory_backfill")
+    assert subscribed == [service._on_mode_changed]
 
 
 @pytest.mark.asyncio

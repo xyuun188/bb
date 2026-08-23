@@ -816,6 +816,8 @@ class TradingService:
             advantage_scorer=self._feature_opportunity_score,
             params=MARKET_ANALYSIS_SELECTION_PARAMS,
         )
+        self._market_analysis_selection_history_task: asyncio.Task | None = None
+        self._market_analysis_selection_history_mode: str | None = None
         self._last_market_analysis_selection_diagnostics: dict[str, Any] = {}
         self.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
             normalize_symbol=self._normalize_position_symbol,
@@ -7342,7 +7344,11 @@ class TradingService:
             return False
         return "模型分析超过独立时间上限" not in str(reasoning or "")
 
-    async def _ensure_market_analysis_selection_history(self) -> None:
+    async def _ensure_market_analysis_selection_history(
+        self,
+        *,
+        wait_until_ready: bool = False,
+    ) -> None:
         """Hydrate cooldown history before selecting any market symbol.
 
         Selection must not race the database read after a service restart.  A
@@ -7352,20 +7358,33 @@ class TradingService:
         """
 
         policy = self._market_analysis_selector_policy()
-        if policy.history_loaded:
+        wait_timeout_seconds = (
+            None
+            if wait_until_ready
+            else MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS
+        )
+        current_mode = "paper" if mode_manager.is_paper else "live"
+        loaded_mode = getattr(self, "_market_analysis_selection_history_mode", None)
+        if policy.history_loaded and loaded_mode == current_mode:
             return
+        if policy.history_loaded and loaded_mode != current_mode:
+            policy.clear()
+            self._market_analysis_selection_history_mode = None
         existing = getattr(self, "_market_analysis_selection_history_task", None)
         if isinstance(existing, asyncio.Task) and not existing.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(existing),
-                    timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "market analysis cooldown history is still loading; selection deferred",
-                    timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
-                )
+            if wait_timeout_seconds is None:
+                await asyncio.shield(existing)
+            else:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(existing),
+                        timeout=wait_timeout_seconds,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "market analysis cooldown history is still loading; selection deferred",
+                        timeout_seconds=wait_timeout_seconds,
+                    )
             return
         cutoff = datetime.now(UTC) - timedelta(
             seconds=max(
@@ -7395,6 +7414,7 @@ class TradingService:
                         .where(
                             AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                             AIDecision.analysis_type == "market",
+                            AIDecision.is_paper == (current_mode == "paper"),
                             AIDecision.created_at >= cutoff,
                         )
                         .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
@@ -7426,6 +7446,7 @@ class TradingService:
                         observed_at=row.created_at,
                     )
                 policy.history_loaded = True
+                self._market_analysis_selection_history_mode = current_mode
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -7441,14 +7462,17 @@ class TradingService:
         self._market_analysis_selection_history_task = task
         task.add_done_callback(_consume_task_result)
         try:
-            await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
-            )
+            if wait_timeout_seconds is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=wait_timeout_seconds,
+                )
         except TimeoutError:
             logger.warning(
                 "market analysis cooldown history load timed out; selection deferred",
-                timeout_seconds=MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS,
+                timeout_seconds=wait_timeout_seconds,
             )
 
     def _select_market_analysis_candidates(
@@ -8877,6 +8901,10 @@ class TradingService:
 
     async def initialize(self) -> None:
         """Initialize models, executors, and connections."""
+        cooldown_history_prewarm = asyncio.create_task(
+            self._ensure_market_analysis_selection_history(wait_until_ready=True)
+        )
+        cooldown_history_prewarm.add_done_callback(_consume_task_result)
         await self.models.initialize_all()
         self.paper_executor = None
 
@@ -8918,6 +8946,29 @@ class TradingService:
                 )
             )
             self._trade_count = trade_count.scalar() or 0
+
+        try:
+            await cooldown_history_prewarm
+            current_mode = mode_manager.mode.value
+            policy = self._market_analysis_selector_policy()
+            if (
+                policy.history_loaded
+                and self._market_analysis_selection_history_mode == current_mode
+            ):
+                logger.info(
+                    "market analysis cooldown history prewarmed",
+                    mode=current_mode,
+                )
+            else:
+                logger.warning(
+                    "market analysis cooldown history prewarm completed without ready history",
+                    mode=current_mode,
+                )
+        except Exception as exc:
+            logger.warning(
+                "market analysis cooldown history prewarm failed",
+                error=safe_error_text(exc),
+            )
 
         await self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value)
         await self._prime_strategy_context_performance_snapshot(mode_manager.mode.value)
