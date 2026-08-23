@@ -35,6 +35,12 @@ SUSPICIOUS_CONTRACT_BASE_TOKENS = ("TEST", "DEMO", "DUMMY", "MOCK", "SAMPLE")
 DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS = 6.0
 DERIVATIVES_ROUTE_TIMEOUT_SECONDS = 2.5
 DERIVATIVES_ROUTE_CACHE_TTL_SECONDS = 20.0
+# A funding snapshot remains useful between rounds as long as its own
+# observed-at timestamp is still within the funding-cost freshness contract.
+# Serve this bounded stale cache immediately while a single-flight refresh runs
+# in the background; otherwise the optional route is almost always cancelled
+# before it can populate the cache and every new symbol becomes ineligible.
+DERIVATIVES_ROUTE_STALE_CACHE_TTL_SECONDS = 10 * 60
 DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 1.5
 REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS = 0.35
@@ -575,32 +581,17 @@ class OKXRestClient:
         key = (str(route), inst_id)
         now = time.monotonic()
         cached = self._derivatives_route_cache.get(key)
-        if cached is not None and now - cached[0] <= DERIVATIVES_ROUTE_CACHE_TTL_SECONDS:
-            return {**cached[1], f"{route}_cached": True}
-        task = self._derivatives_route_tasks.get(key)
-        if task is not None and not task.done():
-            try:
-                return dict(
-                    await asyncio.wait_for(
-                        asyncio.shield(task),
-                        timeout=max(float(timeout_seconds or 0.0), 0.1),
-                    )
-                )
-            except TimeoutError:
-                return {
-                    **(cached[1] if cached is not None else {}),
-                    f"{route}_refresh_in_background": True,
-                    f"{route}_timeout": True,
-                }
-        retry_at = self._derivatives_route_retry_at.get(key, 0.0)
-        if retry_at > now:
-            return {
-                f"{route}_refresh_in_background": True,
-                f"{route}_retry_after_seconds": round(retry_at - now, 3),
-                **(cached[1] if cached is not None else {}),
-            }
 
-        if task is None or task.done():
+        def cached_is_usable(payload: dict[str, Any]) -> bool:
+            # Do not turn a previously failed funding response into apparently
+            # complete evidence.  Open interest has no entry-eligibility gate,
+            # so its last value can be used while it refreshes.
+            return route != "funding" or payload.get("funding_data_available") is True
+
+        def start_refresh() -> asyncio.Task[dict[str, Any]]:
+            existing = self._derivatives_route_tasks.get(key)
+            if existing is not None and not existing.done():
+                return existing
             task = asyncio.create_task(fetcher())
             self._derivatives_route_tasks[key] = task
 
@@ -623,6 +614,55 @@ class OKXRestClient:
                     )
 
             task.add_done_callback(cleanup)
+            return task
+
+        if cached is not None and now - cached[0] <= DERIVATIVES_ROUTE_CACHE_TTL_SECONDS:
+            return {**cached[1], f"{route}_cached": True}
+
+        cache_age = now - cached[0] if cached is not None else None
+        retry_at = self._derivatives_route_retry_at.get(key, 0.0)
+        if (
+            cached is not None
+            and cache_age is not None
+            and cache_age <= DERIVATIVES_ROUTE_STALE_CACHE_TTL_SECONDS
+            and cached_is_usable(cached[1])
+        ):
+            # This path is deliberately non-blocking.  Funding evidence keeps
+            # its original observed timestamp, so funding_cost_estimate still
+            # rejects it if the exchange snapshot itself is too old.
+            if retry_at <= now:
+                start_refresh()
+            return {
+                **cached[1],
+                f"{route}_cached": True,
+                f"{route}_refresh_in_background": True,
+                f"{route}_cache_age_seconds": round(max(cache_age, 0.0), 3),
+            }
+
+        task = self._derivatives_route_tasks.get(key)
+        if task is not None and not task.done():
+            try:
+                return dict(
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=max(float(timeout_seconds or 0.0), 0.1),
+                    )
+                )
+            except TimeoutError:
+                return {
+                    **(cached[1] if cached is not None else {}),
+                    f"{route}_refresh_in_background": True,
+                    f"{route}_timeout": True,
+                }
+        if retry_at > now:
+            return {
+                f"{route}_refresh_in_background": True,
+                f"{route}_retry_after_seconds": round(retry_at - now, 3),
+                **(cached[1] if cached is not None else {}),
+            }
+
+        if task is None or task.done():
+            task = start_refresh()
         try:
             return dict(
                 await asyncio.wait_for(

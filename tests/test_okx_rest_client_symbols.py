@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -801,6 +802,58 @@ async def test_derivatives_route_timeout_keeps_single_flight_and_populates_cache
     second_result = await second
     assert second_result["open_interest_contracts"] == pytest.approx(321.0)
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_funding_cache_is_served_while_refresh_runs_in_background(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    key = ("funding", "BTC-USDT-SWAP")
+    client._derivatives_route_cache[key] = (
+        time.monotonic() - 30.0,
+        {
+            "funding_rate": 0.0001,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+            "funding_time": "1783958400000",
+            "next_funding_time": "1783987200000",
+            "funding_rate_observed_at": "1783931769300",
+        },
+    )
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def slow_refresh(_symbol: str) -> dict:
+        refresh_started.set()
+        await release_refresh.wait()
+        return {
+            "funding_rate": 0.0002,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+            "funding_time": "1783958400000",
+            "next_funding_time": "1783987200000",
+            "funding_rate_observed_at": "1783931769300",
+        }
+
+    result = await asyncio.wait_for(
+        client._cached_derivatives_route(
+            "funding",
+            "BTC/USDT",
+            lambda: slow_refresh("BTC/USDT"),
+            timeout_seconds=0.01,
+        ),
+        timeout=0.1,
+    )
+
+    assert result["funding_rate"] == pytest.approx(0.0001)
+    assert result["funding_cached"] is True
+    assert result["funding_refresh_in_background"] is True
+    await asyncio.wait_for(refresh_started.wait(), timeout=0.1)
+    release_refresh.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert client._derivatives_route_cache[key][1]["funding_rate"] == pytest.approx(0.0002)
 
 
 @pytest.mark.asyncio

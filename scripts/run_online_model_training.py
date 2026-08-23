@@ -30,6 +30,7 @@ _PERSISTED_TRAINING_RESULT_PREFIXES = {
     "ml_signal": LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
     "local_ai_tools": LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
 }
+_PREFLIGHT_RESULT_PREFIX = "ONLINE_TRAINING_PREFLIGHT_RESULT "
 
 
 def _remote_quote(value: str) -> str:
@@ -75,6 +76,7 @@ def _remote_command(
     script_path: str,
     argv: list[str],
     execution_timeout_seconds: int,
+    persist_artifact: bool = True,
 ) -> str:
     result_prefixes = tuple(_PERSISTED_TRAINING_RESULT_PREFIXES.values())
     remote_script = f"""
@@ -103,6 +105,23 @@ training_output = captured_stdout.getvalue()
 if exit_code != 0:
     sys.stdout.write(training_output[-10000:])
     raise SystemExit(exit_code)
+
+expect_persisted_result = {bool(persist_artifact)!r}
+if not expect_persisted_result:
+    # The preflight script intentionally emits ordinary human-readable JSON
+    # and does not persist an artifact.  It must not be mistaken for a failed
+    # persisted training run merely because no lifecycle result prefix exists.
+    sys.stdout.write(training_output)
+    print({_PREFLIGHT_RESULT_PREFIX!r} + json.dumps(
+        {{
+            "trained": False,
+            "reason": "preflight_completed",
+            "artifact_persisted": False,
+        }},
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
+    raise SystemExit(0)
 
 prefixes = {result_prefixes!r}
 result_line = next(
@@ -203,6 +222,7 @@ def main() -> None:
                     script_path=script_path,
                     argv=argv,
                     execution_timeout_seconds=execution_timeout,
+                    persist_artifact=bool(args.persist_artifact),
                 ),
                 timeout=command_timeout,
                 check=True,

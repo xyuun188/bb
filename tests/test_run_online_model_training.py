@@ -46,6 +46,20 @@ def test_online_training_command_terminates_before_ssh_timeout() -> None:
     assert 'compact_payload["full_result_chars"]' in command
 
 
+def test_online_preflight_does_not_require_persisted_result_frame() -> None:
+    command = _remote_command(
+        remote_app_dir="/data/bb/app",
+        script_path="scripts/train_ml_signal_model.py",
+        argv=["scripts/train_ml_signal_model.py"],
+        execution_timeout_seconds=7140,
+        persist_artifact=False,
+    )
+
+    assert "expect_persisted_result = False" in command
+    assert "preflight_completed" in command
+    assert "persisted training result frame missing on remote host" in command
+
+
 def test_online_training_requires_successful_structured_business_result() -> None:
     output = (
         "training log\n"
