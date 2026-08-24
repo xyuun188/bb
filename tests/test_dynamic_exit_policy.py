@@ -1,10 +1,14 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.current_position_management import build_current_position_management_contract
-from services.dynamic_exit_policy import apply_dynamic_exit
+from services.dynamic_exit_policy import (
+    apply_dynamic_exit,
+    evaluate_dynamic_exit_execution_contract,
+)
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import PAPER_TRAINING_POSITION_LIFECYCLE_VERSION
 
@@ -87,6 +91,58 @@ def _position(**overrides: object) -> dict:
             }
         )
     return position
+
+
+def test_dynamic_exit_execution_contract_blocks_ordinary_exit_during_observation() -> None:
+    contract = evaluate_dynamic_exit_execution_contract(
+        SimpleNamespace(
+            eligible=True,
+            close_fraction=0.25,
+            hard_risk=False,
+            execution_cost_complete=True,
+            current_management_contract_complete=True,
+            position_age_evidence_complete=True,
+            position_age_minutes=2.0,
+            early_exit_observation_active=True,
+            economic_exit_evidence_complete=True,
+        )
+    )
+
+    assert contract["allowed"] is False
+    assert "minimum_position_observation_not_elapsed" in contract["block_reasons"]
+    assert "early_exit_observation_active" in contract["block_reasons"]
+
+
+def test_dynamic_exit_execution_contract_allows_explicit_planned_stop() -> None:
+    contract = evaluate_dynamic_exit_execution_contract(
+        SimpleNamespace(
+            eligible=True,
+            close_fraction=1.0,
+            hard_risk=True,
+            planned_stop_crossed=True,
+            funding_loss_budget_crossed=False,
+            projected_funding_budget_crossed=False,
+        )
+    )
+
+    assert contract["allowed"] is True
+    assert contract["explicit_hard_evidence"]["planned_stop_crossed"] is True
+
+
+def test_dynamic_exit_execution_contract_rejects_unexplained_hard_risk() -> None:
+    contract = evaluate_dynamic_exit_execution_contract(
+        SimpleNamespace(
+            eligible=True,
+            close_fraction=1.0,
+            hard_risk=True,
+            planned_stop_crossed=False,
+            funding_loss_budget_crossed=False,
+            projected_funding_budget_crossed=False,
+        )
+    )
+
+    assert contract["allowed"] is False
+    assert contract["block_reasons"] == ["hard_risk_evidence_missing"]
 
 
 def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size() -> None:

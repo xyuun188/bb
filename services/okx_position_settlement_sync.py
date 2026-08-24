@@ -58,9 +58,20 @@ SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
 SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
 DUPLICATE_CLOSED_POSITION_REASON = "duplicate_local_closed_position_for_same_okx_lifecycle"
+DUPLICATE_CLOSED_ORDER_POSITION_REASON = (
+    "duplicate_local_closed_position_for_same_okx_close_order"
+)
+DUPLICATE_EXACT_LIFECYCLE_PROJECTION_REASON = (
+    "duplicate_local_closed_position_for_same_okx_lifecycle_exact_projection"
+)
 DISTINCT_CLOSED_FRAGMENT_REACTIVATED_REASON = "distinct_partial_close_fragment_reactivated"
 SUPERSEDED_POSITION_REASONS = frozenset(
-    {SUPERSEDED_POSITION_REASON, DUPLICATE_CLOSED_POSITION_REASON}
+    {
+        SUPERSEDED_POSITION_REASON,
+        DUPLICATE_CLOSED_POSITION_REASON,
+        DUPLICATE_CLOSED_ORDER_POSITION_REASON,
+        DUPLICATE_EXACT_LIFECYCLE_PROJECTION_REASON,
+    }
 )
 SETTLEMENT_STATUS_QUARANTINED = "settlement_quarantined"
 SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"

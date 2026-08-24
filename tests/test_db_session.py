@@ -461,6 +461,7 @@ async def test_postgres_trade_fact_indexes_skip_existing_indexes(
             "idx_orders_filled_exchange_scan",
             "idx_orders_decision_side_scan",
             "idx_orders_exchange_order_id",
+            "uq_orders_execution_exchange_fact",
             "idx_orders_okx_inst_id",
             "idx_orders_okx_sync_status",
             "idx_ai_decisions_pending_entry_recent",
@@ -505,6 +506,40 @@ async def test_postgres_trade_fact_indexes_create_pending_entry_index(
         "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_training_completed" in statement
         for statement in fake_conn.statements
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_duplicate_exchange_fact_repair_selects_canonical_order_before_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+    fake_conn = _FakeConnection()
+
+    await session_module._repair_duplicate_exchange_order_facts(fake_conn)
+
+    assert len(fake_conn.statements) == 3
+    position_repair = fake_conn.statements[0]
+    assert "WITH canonical_orders AS" in position_repair
+    assert "SELECT DISTINCT ON (o.execution_mode, o.exchange_order_id)" in position_repair
+    assert "JOIN canonical_orders o" in position_repair
+    assert "o.canonical_contracts" in position_repair
+    assert "FIRST_VALUE(p.id)" in position_repair
+    assert "duplicate_local_closed_position_for_same_okx_close_order" in position_repair
+
+    exact_projection_repair = fake_conn.statements[1]
+    assert "WITH keyed AS" in exact_projection_repair
+    assert "string_to_array(COALESCE(p.close_exchange_order_id, ''), ',')" in exact_projection_repair
+    assert "PARTITION BY" in exact_projection_repair
+    assert "keyed.entry_order_ids" in exact_projection_repair
+    assert "duplicate_local_closed_position_for_same_okx_lifecycle_exact_projection" in exact_projection_repair
+
+    order_repair = fake_conn.statements[2]
+    assert "PARTITION BY o.execution_mode, o.exchange_order_id" in order_repair
+    assert "exchange_order_id = NULL" in order_repair
 
 
 @pytest.mark.asyncio

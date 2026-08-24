@@ -19,6 +19,8 @@ SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_REASONS = {
     "duplicate_local_open_position_for_same_okx_pos_id",
     "duplicate_local_closed_position_for_same_okx_lifecycle",
+    "duplicate_local_closed_position_for_same_okx_close_order",
+    "duplicate_local_closed_position_for_same_okx_lifecycle_exact_projection",
 }
 
 

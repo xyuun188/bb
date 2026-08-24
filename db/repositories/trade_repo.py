@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from core.symbols import trading_symbol_variants
 from db.repositories.base import BaseRepository
+from models.decision import AIDecision
 from models.trade import Order, Position
 
 
@@ -15,10 +16,112 @@ class TradeRepository(BaseRepository):
     model = Order
 
     async def create_order(self, data: dict) -> Order:
+        order, _created = await self.create_order_fact(data)
+        return order
+
+    async def create_order_fact(self, data: dict) -> tuple[Order, bool]:
+        """Create one exchange fact or reuse the row that already owns it."""
+
+        # An exchange order id is the authoritative execution identity.  The
+        # execution result and the recovery/sync path can both arrive for the
+        # same fill, so always reuse the existing fact before inserting a new
+        # projection.  The database migration adds a unique partial index; the
+        # locked lookup keeps this boundary idempotent while older databases
+        # are being repaired.
+        exchange_order_id = str(data.get("exchange_order_id") or "").strip()
+        execution_mode = str(data.get("execution_mode") or "").strip()
+        if exchange_order_id and execution_mode and exchange_order_id not in {
+            "hold",
+            "rejected",
+            "no_position",
+        }:
+            bind = self.session.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                lock_identity = f"order-fact:{execution_mode}:{exchange_order_id}"
+                await self.session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:identity, 0))"),
+                    {"identity": lock_identity},
+                )
+            result = await self.session.execute(
+                select(Order)
+                .where(
+                    Order.execution_mode == execution_mode,
+                    Order.exchange_order_id == exchange_order_id,
+                )
+                .order_by(Order.id.asc())
+                .with_for_update()
+                .limit(1)
+            )
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                self._merge_order_fact(existing, data)
+                await self._prefer_authoritative_decision(existing, data)
+                await self.session.flush()
+                return existing, False
         order = Order(**data)
         self.session.add(order)
         await self.session.flush()
-        return order
+        return order, True
+
+    @staticmethod
+    def _merge_order_fact(order: Order, data: dict) -> None:
+        """Merge richer recovery data without replacing the original identity."""
+
+        for field in (
+            "okx_inst_id",
+            "okx_trade_ids",
+            "okx_fill_contracts",
+            "okx_fill_pnl",
+            "okx_state",
+            "okx_sync_status",
+            "okx_synced_at",
+            "okx_last_error",
+            "okx_raw_fills",
+        ):
+            incoming = data.get(field)
+            if incoming is None or incoming == {}:
+                continue
+            current = getattr(order, field, None)
+            if current in (None, "", {}, []):
+                setattr(order, field, incoming)
+                continue
+            if field == "okx_raw_fills" and isinstance(current, dict) and isinstance(incoming, dict):
+                setattr(order, field, {**current, **incoming})
+        incoming_status = str(data.get("status") or "").lower()
+        current_status = str(getattr(order, "status", "") or "").lower()
+        status_rank = {"rejected": 0, "pending": 1, "open": 2, "partial": 3, "filled": 4}
+        if status_rank.get(incoming_status, -1) > status_rank.get(current_status, -1):
+            order.status = incoming_status
+        for field in ("quantity", "price", "fee", "filled_at"):
+            incoming = data.get(field)
+            current = getattr(order, field, None)
+            if incoming is not None and current in (None, 0, 0.0, ""):
+                setattr(order, field, incoming)
+
+    async def _prefer_authoritative_decision(self, order: Order, data: dict) -> None:
+        incoming_id = int(data.get("decision_id") or 0)
+        existing_id = int(getattr(order, "decision_id", 0) or 0)
+        if incoming_id <= 0 or incoming_id == existing_id:
+            return
+        if existing_id <= 0:
+            order.decision_id = incoming_id
+            return
+        existing = await self.session.get(AIDecision, existing_id)
+        incoming = await self.session.get(AIDecision, incoming_id)
+        if incoming is None:
+            return
+        existing_raw = (
+            existing.raw_llm_response
+            if existing is not None and isinstance(existing.raw_llm_response, dict)
+            else {}
+        )
+        incoming_raw = (
+            incoming.raw_llm_response if isinstance(incoming.raw_llm_response, dict) else {}
+        )
+        existing_is_sync = existing is None or existing_raw.get("system_sync") is True
+        incoming_is_sync = incoming_raw.get("system_sync") is True
+        if existing_is_sync and not incoming_is_sync:
+            order.decision_id = incoming_id
 
     async def update_order_status(
         self,

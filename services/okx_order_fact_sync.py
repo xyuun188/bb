@@ -26,6 +26,7 @@ from core.symbols import (
     okx_inst_id_from_symbol,
     symbol_from_okx_inst_id,
 )
+from db.repositories.trade_repo import TradeRepository
 from db.session import get_engine, get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
@@ -1982,6 +1983,7 @@ class OkxOrderFactSyncService:
             fill_order_ids | order_history_ids,
         )
         order_rows_by_id = _order_rows_by_id(order_rows)
+        trade_repo = TradeRepository(session)
         for fill in fills:
             if fill.order_id in existing_exchange_ids:
                 continue
@@ -2006,24 +2008,26 @@ class OkxOrderFactSyncService:
                 order_row=order_row,
                 decisions_by_id=decisions_by_id,
             )
-            order = Order(
-                model_name=(
+            order, created = await trade_repo.create_order_fact(
+                {
+                    "model_name": (
                     str(getattr(decision, "model_name", "") or "okx_authoritative_sync")
                     if decision is not None
                     else "okx_authoritative_sync"
-                ),
-                execution_mode=self.mode,
-                symbol=fill.symbol,
-                side=fill.side,
-                order_type=_fill_order_type(fill),
-                quantity=_fill_base_quantity(fill, contract_size),
-                price=fill.avg_price,
-                status="filled",
-                fee=fill.fee_abs,
-                decision_id=(int(decision.id) if decision is not None else None),
-                exchange_order_id=fill.order_id,
-                filled_at=fill.timestamp or now,
-                created_at=fill.timestamp or now,
+                    ),
+                    "execution_mode": self.mode,
+                    "symbol": fill.symbol,
+                    "side": fill.side,
+                    "order_type": _fill_order_type(fill),
+                    "quantity": _fill_base_quantity(fill, contract_size),
+                    "price": fill.avg_price,
+                    "status": "filled",
+                    "fee": fill.fee_abs,
+                    "decision_id": (int(decision.id) if decision is not None else None),
+                    "exchange_order_id": fill.order_id,
+                    "filled_at": fill.timestamp or now,
+                    "created_at": fill.timestamp or now,
+                }
             )
             self._apply_fill_to_order(
                 order,
@@ -2042,16 +2046,20 @@ class OkxOrderFactSyncService:
                     client_order_id=_fill_client_order_id(fill, order_row),
                     now=now,
                 )
-            session.add(order)
             existing_exchange_ids.add(fill.order_id)
-            backfilled += 1
+            if created:
+                backfilled += 1
             samples.append(
                 _sample(
                     order,
                     kind=(
                         "okx_only_backfilled_with_decision_identity"
-                        if decision is not None
-                        else "okx_only_backfilled"
+                        if created and decision is not None
+                        else (
+                            "okx_only_backfilled"
+                            if created
+                            else "okx_only_merged_into_existing_exchange_fact"
+                        )
                     ),
                 )
             )
@@ -2070,10 +2078,26 @@ class OkxOrderFactSyncService:
                 now=now,
                 contract_size=_contract_size_for_order_row(row, contract_sizes),
             )
-            session.add(order)
+            order, created = await trade_repo.create_order_fact(
+                {
+                    column.name: getattr(order, column.name)
+                    for column in Order.__table__.columns
+                    if column.name not in {"id", "updated_at"}
+                }
+            )
             existing_exchange_ids.add(order_id)
-            order_history_backfilled += 1
-            samples.append(_sample(order, kind="okx_order_history_backfilled"))
+            if created:
+                order_history_backfilled += 1
+            samples.append(
+                _sample(
+                    order,
+                    kind=(
+                        "okx_order_history_backfilled"
+                        if created
+                        else "okx_order_history_merged_into_existing_exchange_fact"
+                    ),
+                )
+            )
         return backfilled, order_history_backfilled, contract_size_deferred_count
 
     @staticmethod

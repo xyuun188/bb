@@ -34,6 +34,11 @@ class Order(Base, TimestampMixin):
     okx_last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     okx_raw_fills: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # ``exchange_order_id`` is unique within one execution mode in the
+    # authoritative-fact view.  The physical partial unique index is installed
+    # by the startup migration because historical rows need an audited cleanup
+    # before the constraint can be enforced.
+
 
 class Position(Base, TimestampMixin):
     __tablename__ = "positions"

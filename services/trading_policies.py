@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
-from services.dynamic_exit_policy import apply_dynamic_exit
+from services.dynamic_exit_policy import (
+    apply_dynamic_exit,
+    evaluate_dynamic_exit_execution_contract,
+)
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 from services.live_ml_profit_contract import apply_live_ml_profit_contract
 from services.normal_paper_trade import (
@@ -566,11 +569,22 @@ class ExitPolicy:
                 )
 
         dynamic_exit = apply_dynamic_exit(decision, exit_positions)
+        execution_contract = evaluate_dynamic_exit_execution_contract(dynamic_exit)
         if not dynamic_exit.eligible:
             return PolicyGateResult.block(
                 "dynamic_exit_policy",
                 dynamic_exit.reason,
                 {**gate_data(), "dynamic_exit_policy": dynamic_exit.to_dict()},
+            )
+        if not execution_contract["allowed"]:
+            return PolicyGateResult.block(
+                "dynamic_exit_execution_contract",
+                ",".join(execution_contract["block_reasons"]),
+                {
+                    **gate_data(),
+                    "dynamic_exit_policy": dynamic_exit.to_dict(),
+                    "dynamic_exit_execution_contract": execution_contract,
+                },
             )
 
         return PolicyGateResult.allow(
@@ -579,5 +593,6 @@ class ExitPolicy:
                 "target_side": "long" if decision.action == Action.CLOSE_LONG else "short",
                 "pipeline_context": context.public_data(),
                 "dynamic_exit_policy": dynamic_exit.to_dict(),
+                "dynamic_exit_execution_contract": execution_contract,
             }
         )

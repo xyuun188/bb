@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -39,6 +40,14 @@ class TradeOrderPersistenceError(RuntimeError):
     """An exchange-confirmed order could not be written to the local fact cache."""
 
 
+@dataclass(frozen=True, slots=True)
+class TradeOrderLogOutcome:
+    created: bool
+    local_order_id: int | None
+    decision_id: int | None
+    exchange_order_id: str | None
+
+
 class TradeOrderLogService:
     """Persist order rows without leaking repository details into orchestration."""
 
@@ -59,30 +68,52 @@ class TradeOrderLogService:
         model_name: str,
         decision: DecisionOutput,
         decision_id: int | None = None,
-    ) -> None:
+    ) -> TradeOrderLogOutcome | None:
         if self._should_skip_order_log(result):
-            return
+            return None
         try:
             async with self._session_context_factory() as session:
                 repo = self._trade_repo_factory(session)
                 symbol = self._result_symbol(result, decision)
                 payload = self._okx_execution_fact_payload(result)
-                await repo.create_order(
-                    {
-                        "model_name": model_name,
-                        "execution_mode": self._execution_mode_provider(model_name),
-                        "symbol": symbol,
-                        "side": result.side,
-                        "order_type": result.order_type,
-                        "quantity": result.quantity,
-                        "price": result.price,
-                        "status": result.status.value,
-                        "fee": result.fee,
-                        "decision_id": decision_id,
-                        "exchange_order_id": result.exchange_order_id,
-                        "filled_at": result.timestamp,
-                        **payload,
-                    }
+                order_payload = {
+                    "model_name": model_name,
+                    "execution_mode": self._execution_mode_provider(model_name),
+                    "symbol": symbol,
+                    "side": result.side,
+                    "order_type": result.order_type,
+                    "quantity": result.quantity,
+                    "price": result.price,
+                    "status": result.status.value,
+                    "fee": result.fee,
+                    "decision_id": decision_id,
+                    "exchange_order_id": result.exchange_order_id,
+                    "filled_at": result.timestamp,
+                    **payload,
+                }
+                create_fact = getattr(repo, "create_order_fact", None)
+                if callable(create_fact):
+                    order, created = await create_fact(order_payload)
+                else:
+                    order = await repo.create_order(order_payload)
+                    created = True
+                return TradeOrderLogOutcome(
+                    created=bool(created),
+                    local_order_id=(
+                        int(getattr(order, "id", 0) or 0)
+                        if getattr(order, "id", None) is not None
+                        else None
+                    ),
+                    decision_id=(
+                        int(getattr(order, "decision_id", 0) or 0)
+                        if getattr(order, "decision_id", None) is not None
+                        else decision_id
+                    ),
+                    exchange_order_id=(
+                        str(getattr(order, "exchange_order_id", "") or "").strip()
+                        or str(result.exchange_order_id or "").strip()
+                        or None
+                    ),
                 )
         except Exception as exc:
             error = safe_error_text(exc)

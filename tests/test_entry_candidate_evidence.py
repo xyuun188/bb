@@ -228,9 +228,42 @@ def test_no_positive_production_lcb_returns_neutral() -> None:
 
     evidence = _policy(ineligible_score).build(_Feature(), {}, {}, {}, {}, {})
 
-    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["preferred_side_by_evidence"] == "neutral"
     assert evidence["long"]["production_eligible"] is False
     assert evidence["short"]["production_eligible"] is False
+    assert (
+        evidence["policy_provenance"]["fallback_reason"]
+        == "no_positive_fee_after_execution_eligible_side"
+    )
+
+
+def test_positive_paper_side_can_be_preferred_without_production_promotion() -> None:
+    def paper_score(decision: DecisionOutput, _strategy: dict | None) -> float:
+        is_long = decision.action == Action.LONG
+        expected_net = 0.25 if is_long else -0.05
+        return_lcb = 0.12 if is_long else -0.15
+        raw = dict(decision.raw_response)
+        raw["opportunity_score"] = {
+            "score": return_lcb,
+            "expected_net_return_pct": expected_net,
+            "return_lcb_pct": return_lcb,
+            "execution_scope": "paper",
+            "decision_eligible": True,
+            "paper_eligible": True,
+            "production_eligible": False,
+            "policy_provenance": {"sample_count": 2},
+        }
+        decision.raw_response = raw
+        return return_lcb
+
+    evidence = _policy(paper_score).build(_Feature(), {}, {}, {}, {}, {})
+
+    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["long"]["decision_eligible"] is True
+    assert evidence["long"]["paper_eligible"] is True
+    assert evidence["long"]["production_eligible"] is False
+    assert evidence["long"]["positive_fee_after_return_edge"] is True
+    assert evidence["policy_provenance"]["fallback_reason"] == ""
 
 
 def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
@@ -264,7 +297,7 @@ def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
 
     evidence = _policy(near_threshold_score).build(_Feature(), {}, {}, {}, {}, {})
 
-    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["preferred_side_by_evidence"] == "neutral"
     assert "preferred_exploration_side" not in evidence
     assert "paper_exploration" not in evidence
     assert evidence["long"]["expected_net_return_pct"] == 0.3

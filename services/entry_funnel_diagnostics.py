@@ -66,6 +66,39 @@ def _reason_blob(raw: dict[str, Any], reason: Any) -> str:
     return " ".join([_text(reason), *_reason_fragments(raw)]).lower()
 
 
+def _shallow_reason_fragments(value: Any) -> list[str]:
+    fragments: list[str] = []
+    if not isinstance(value, dict):
+        return fragments
+    for key, item in value.items():
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in _REASON_FIELDS or item in (None, {}, [], ""):
+            continue
+        if isinstance(item, (list, tuple)):
+            fragments.extend(str(part) for part in item if not isinstance(part, (dict, list, tuple)))
+        elif not isinstance(item, dict):
+            fragments.append(str(item))
+    return fragments
+
+
+def _explicit_risk_reason_blob(payload: dict[str, Any], reason: Any) -> str:
+    """Read only decision/execution blockers, never expert narrative text."""
+
+    fragments = [_text(reason), *_shallow_reason_fragments(payload)]
+    for key in (
+        "decision_state_machine",
+        "decision_state",
+        "execution_trace",
+        "policy_gate",
+        "trade_gate",
+    ):
+        container = _dict(payload.get(key))
+        fragments.extend(_shallow_reason_fragments(container))
+        fragments.extend(_shallow_reason_fragments(_dict(container.get("summary"))))
+        fragments.extend(_shallow_reason_fragments(_dict(container.get("failed_step"))))
+    return " ".join(fragment for fragment in fragments if fragment).lower()
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         return float(value)
@@ -106,6 +139,7 @@ def classify_entry_funnel_reason(
         return None
     payload = _dict(raw)
     text = _reason_blob(payload, reason)
+    explicit_risk_text = _explicit_risk_reason_blob(payload, reason)
     action_text = _text(action).lower()
     quality = _dict(payload.get("analysis_quality_contract"))
     state = _dict(payload.get("decision_state_machine") or payload.get("decision_state"))
@@ -211,14 +245,18 @@ def classify_entry_funnel_reason(
         return "insufficient_evidence"
 
     if any(
-        token in text
+        token in explicit_risk_text
         for token in (
             "risk_blocked",
             "risk blocked",
-            "risk_check",
-            "风控",
-            "风险",
-            "熔断",
+            "risk_check_blocked",
+            "risk_check_failed",
+            "risk_limit_exceeded",
+            "risk budget exhausted",
+            "风控阻断",
+            "风险阻断",
+            "风险门禁",
+            "熔断触发",
             "余额不足",
             "保证金不足",
         )

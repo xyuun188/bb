@@ -13,6 +13,7 @@ from core.safe_output import safe_error_text
 from services.dynamic_exit_policy import (
     apply_dynamic_exit,
     attach_dynamic_exit_observation,
+    evaluate_dynamic_exit_execution_contract,
 )
 from services.entry_capacity import EntryCapacityPolicy
 from services.position_review_entry_guard import PositionReviewEntryGuardPolicy
@@ -292,6 +293,39 @@ class PositionReviewDecisionProcessor:
         results: dict[str, Any] | None,
     ) -> PositionReviewProcessResult:
         dynamic_exit = apply_dynamic_exit(executed, open_positions)
+        raw = dict(executed.raw_response or {})
+        executed.raw_response = raw
+        if not dynamic_exit.eligible:
+            await self.result_recorder.record_skip(
+                decision=executed,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                reason=dynamic_exit.reason,
+                decision_db_id=decision_db_id,
+                results=results,
+                risk_alert=risk_alert,
+                append_result=True,
+            )
+            return PositionReviewProcessResult(handled=True)
+
+        execution_contract = evaluate_dynamic_exit_execution_contract(dynamic_exit)
+        raw = dict(executed.raw_response or {})
+        raw["dynamic_exit_execution_contract"] = execution_contract
+        executed.raw_response = raw
+        if not execution_contract["allowed"]:
+            await self.result_recorder.record_skip(
+                decision=executed,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                reason=",".join(execution_contract["block_reasons"]),
+                decision_db_id=decision_db_id,
+                results=results,
+                risk_alert=risk_alert,
+                append_result=True,
+            )
+            return PositionReviewProcessResult(handled=True)
         conflict_gate = self._unresolved_exit_conflict_gate(executed, dynamic_exit)
         if conflict_gate:
             raw = dict(executed.raw_response or {})
@@ -303,19 +337,6 @@ class PositionReviewDecisionProcessor:
                 symbol=symbol,
                 model_mode=model_mode,
                 reason=conflict_gate["reason"],
-                decision_db_id=decision_db_id,
-                results=results,
-                risk_alert=risk_alert,
-                append_result=True,
-            )
-            return PositionReviewProcessResult(handled=True)
-        if not dynamic_exit.eligible:
-            await self.result_recorder.record_skip(
-                decision=executed,
-                model_name=model_name,
-                symbol=symbol,
-                model_mode=model_mode,
-                reason=dynamic_exit.reason,
                 decision_db_id=decision_db_id,
                 results=results,
                 risk_alert=risk_alert,

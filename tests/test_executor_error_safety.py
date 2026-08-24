@@ -1892,14 +1892,15 @@ async def test_okx_entry_instrument_prefilter_does_not_retry_transport_failure()
 
 
 @pytest.mark.asyncio
-async def test_okx_entry_instrument_prefilter_blocks_live_demo_contract_mismatch() -> None:
+async def test_okx_entry_instrument_prefilter_allows_demo_underlying_alias() -> None:
     exchange = _IncompatibleEntryEnvironmentCcxt()
     result = await _executor(exchange).entry_instrument_availability("BTC/USDT")
 
-    assert result["available"] is False
-    assert result["reason"] == "okx_entry_live_execution_environment_incompatible"
-    assert "uly_mismatch" in result["environment_compatibility"]["blockers"]
-    assert exchange.fetch_leverage_calls == []
+    assert result["available"] is True
+    assert result["environment_compatibility"]["compatible"] is True
+    assert result["environment_compatibility"]["blockers"] == []
+    assert result["environment_compatibility"]["warnings"] == ["uly_alias_mismatch"]
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
 
 
 @pytest.mark.asyncio

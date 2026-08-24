@@ -7,14 +7,17 @@ from math import isfinite
 from typing import Any
 
 ENTRY_ENVIRONMENT_PRICE_MAX_DRIFT_FRACTION = 0.01
+ENTRY_ENVIRONMENT_COMPATIBILITY_VERSION = (
+    "2026-08-24.okx-entry-environment-compatibility.v2"
+)
 
-_TEXT_FIELDS = (
+_HARD_TEXT_FIELDS = (
     "instId",
-    "uly",
     "ctValCcy",
     "settleCcy",
     "ctType",
 )
+_ALIAS_TEXT_FIELDS = ("uly",)
 _IDENTITY_NUMERIC_FIELDS = (
     "ctVal",
     "ctMult",
@@ -75,17 +78,23 @@ def assess_okx_entry_environment_compatibility(
     live = _row(live_instrument)
     execution = _row(execution_instrument)
     blockers: list[str] = []
+    warnings: list[str] = []
     if not live:
         blockers.append("live_instrument_missing")
     if not execution:
         blockers.append("execution_instrument_missing")
 
     if live and execution:
-        for field in _TEXT_FIELDS:
+        for field in _HARD_TEXT_FIELDS:
             left = _text(live.get(field))
             right = _text(execution.get(field))
             if left != right:
                 blockers.append(f"{field}_mismatch")
+        for field in _ALIAS_TEXT_FIELDS:
+            left = _text(live.get(field))
+            right = _text(execution.get(field))
+            if left != right:
+                warnings.append(f"{field}_alias_mismatch")
         for field in _IDENTITY_NUMERIC_FIELDS:
             # OKX omits ctMult for some linear contracts; the SDK treats it as 1.
             default = "1" if field == "ctMult" else "0"
@@ -117,7 +126,13 @@ def assess_okx_entry_environment_compatibility(
         for field in _EXECUTION_RULE_FIELDS
         if live and execution and _decimal(live.get(field)) != _decimal(execution.get(field))
     ]
+    alias_differences = [
+        f"{field}_alias_mismatch"
+        for field in _ALIAS_TEXT_FIELDS
+        if live and execution and _text(live.get(field)) != _text(execution.get(field))
+    ]
     return {
+        "contract_version": ENTRY_ENVIRONMENT_COMPATIBILITY_VERSION,
         "compatible": not deduped_blockers,
         "reason": (
             "live_analysis_and_execution_environment_compatible"
@@ -125,6 +140,7 @@ def assess_okx_entry_environment_compatibility(
             else "okx_live_execution_environment_incompatible"
         ),
         "blockers": deduped_blockers,
+        "warnings": list(dict.fromkeys(warnings)),
         "price_drift_fraction": price_drift,
         "max_price_drift_fraction": max(float(max_price_drift_fraction), 0.0),
         "live_price": live_price,
@@ -133,12 +149,18 @@ def assess_okx_entry_environment_compatibility(
         "execution_inst_id": _text(execution.get("instId")),
         "live_uly": _text(live.get("uly")),
         "execution_uly": _text(execution.get("uly")),
+        "identity_alias_differences": alias_differences,
         "operational_rule_differences": operational_differences,
         "spec_fields": {
             field: {
                 "live": live.get(field),
                 "execution": execution.get(field),
             }
-            for field in (*_TEXT_FIELDS, *_IDENTITY_NUMERIC_FIELDS, *_EXECUTION_RULE_FIELDS)
+            for field in (
+                *_HARD_TEXT_FIELDS,
+                *_ALIAS_TEXT_FIELDS,
+                *_IDENTITY_NUMERIC_FIELDS,
+                *_EXECUTION_RULE_FIELDS,
+            )
         },
     }

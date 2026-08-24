@@ -22,6 +22,7 @@ from services.paper_training import assess_paper_training_position_horizon
 EARLY_EXIT_OBSERVATION_MINUTES = 10.0
 MIN_AUTOMATED_EXIT_FRACTION = 0.05
 MIN_EARLY_MODEL_EXIT_PRESSURE = MIN_AUTOMATED_EXIT_FRACTION * 2.0
+DYNAMIC_EXIT_EXECUTION_CONTRACT_VERSION = "2026-08-24.dynamic-exit-execution-contract.v1"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -143,6 +144,86 @@ class DynamicExitAssessment:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def evaluate_dynamic_exit_execution_contract(assessment: Any) -> dict[str, Any]:
+    """Validate the evidence boundary immediately before any exit order.
+
+    The sizing calculation is intentionally separate from execution permission.
+    This contract prevents a stale or partially populated assessment from
+    reaching either the normal review executor or the fast risk path.
+    """
+
+    reasons: list[str] = []
+    if assessment is None:
+        reasons.append("dynamic_exit_assessment_missing")
+        return {
+            "version": DYNAMIC_EXIT_EXECUTION_CONTRACT_VERSION,
+            "allowed": False,
+            "hard_risk": False,
+            "close_fraction": 0.0,
+            "block_reasons": reasons,
+        }
+
+    eligible = getattr(assessment, "eligible", None) is True
+    close_fraction = _safe_float(getattr(assessment, "close_fraction", 0.0), 0.0)
+    hard_risk = bool(getattr(assessment, "hard_risk", False))
+    if not eligible:
+        reasons.append("dynamic_exit_policy_not_eligible")
+    if close_fraction <= 0.0:
+        reasons.append("dynamic_exit_close_fraction_not_positive")
+
+    explicit_hard_evidence = {
+        "planned_stop_crossed": bool(
+            getattr(assessment, "planned_stop_crossed", False)
+        ),
+        "funding_loss_budget_crossed": bool(
+            getattr(assessment, "funding_loss_budget_crossed", False)
+        ),
+        "projected_funding_budget_crossed": bool(
+            getattr(assessment, "projected_funding_budget_crossed", False)
+        ),
+    }
+    if hard_risk and not any(explicit_hard_evidence.values()):
+        reasons.append("hard_risk_evidence_missing")
+
+    if not hard_risk:
+        if getattr(assessment, "execution_cost_complete", None) is not True:
+            reasons.append("exit_execution_cost_incomplete")
+        if getattr(assessment, "current_management_contract_complete", None) is not True:
+            reasons.append("current_position_management_contract_incomplete")
+        if getattr(assessment, "position_age_evidence_complete", None) is not True:
+            reasons.append("position_age_evidence_missing")
+        age = getattr(assessment, "position_age_minutes", None)
+        if age is None or _safe_float(age, -1.0) < EARLY_EXIT_OBSERVATION_MINUTES:
+            reasons.append("minimum_position_observation_not_elapsed")
+        if getattr(assessment, "early_exit_observation_active", None) is True:
+            reasons.append("early_exit_observation_active")
+        if getattr(assessment, "economic_exit_evidence_complete", None) is not True:
+            reasons.append("economic_exit_evidence_incomplete")
+        if close_fraction + 1e-9 < MIN_AUTOMATED_EXIT_FRACTION:
+            reasons.append("dynamic_exit_fraction_below_execution_minimum")
+
+    # Preserve first occurrence order for deterministic dashboard diagnostics.
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "version": DYNAMIC_EXIT_EXECUTION_CONTRACT_VERSION,
+        "allowed": not reasons,
+        "hard_risk": hard_risk,
+        "close_fraction": round(close_fraction if not reasons else 0.0, 8),
+        "explicit_hard_evidence": explicit_hard_evidence,
+        "position_age_minutes": getattr(assessment, "position_age_minutes", None),
+        "position_age_evidence_complete": getattr(
+            assessment, "position_age_evidence_complete", None
+        ),
+        "current_management_contract_complete": getattr(
+            assessment, "current_management_contract_complete", None
+        ),
+        "economic_exit_evidence_complete": getattr(
+            assessment, "economic_exit_evidence_complete", None
+        ),
+        "block_reasons": reasons,
+    }
 
 
 def _matching_positions(
@@ -780,8 +861,10 @@ def apply_dynamic_exit(
     positions: list[dict[str, Any]],
 ) -> DynamicExitAssessment:
     assessment = assess_dynamic_exit(decision, positions)
+    execution_contract = evaluate_dynamic_exit_execution_contract(assessment)
     raw = _safe_dict(decision.raw_response)
     raw["dynamic_exit_policy"] = assessment.to_dict()
+    raw["dynamic_exit_execution_contract"] = execution_contract
     raw["close_fraction"] = assessment.close_fraction
     raw["action_plan"] = (
         "close"

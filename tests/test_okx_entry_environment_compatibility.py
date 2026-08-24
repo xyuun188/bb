@@ -37,16 +37,29 @@ def test_matching_live_and_execution_contract_is_compatible() -> None:
     assert result["price_drift_fraction"] < 0.01
 
 
-def test_same_inst_id_with_different_underlying_or_contract_value_is_blocked() -> None:
+def test_same_economic_contract_with_demo_underlying_alias_is_compatible() -> None:
     result = assess_okx_entry_environment_compatibility(
         live_instrument=_instrument(),
-        execution_instrument=_instrument(uly="TEST-USDT", ctVal="1"),
+        execution_instrument=_instrument(uly="BTC1-USDT"),
+        live_ticker=_ticker("60000"),
+        execution_ticker=_ticker("60000"),
+    )
+
+    assert result["compatible"] is True
+    assert result["blockers"] == []
+    assert result["warnings"] == ["uly_alias_mismatch"]
+    assert result["identity_alias_differences"] == ["uly_alias_mismatch"]
+
+
+def test_contract_value_mismatch_remains_an_identity_blocker() -> None:
+    result = assess_okx_entry_environment_compatibility(
+        live_instrument=_instrument(),
+        execution_instrument=_instrument(ctVal="1"),
         live_ticker=_ticker("60000"),
         execution_ticker=_ticker("60000"),
     )
 
     assert result["compatible"] is False
-    assert "uly_mismatch" in result["blockers"]
     assert "ctVal_mismatch" in result["blockers"]
 
 

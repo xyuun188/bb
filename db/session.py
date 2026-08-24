@@ -200,6 +200,7 @@ async def init_db(*, migrate_schema: bool = True) -> None:
         await _ensure_ai_decision_idempotency_column(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_runtime_data_retention_columns(conn)
+        await _repair_duplicate_exchange_order_facts(conn)
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
         await _ensure_okx_position_history_column_widths(conn)
@@ -491,6 +492,14 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
             "CREATE INDEX IF NOT EXISTS idx_orders_exchange_order_id ON orders (exchange_order_id)",
         ),
         (
+            "uq_orders_execution_exchange_fact",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_execution_exchange_fact "
+            "ON orders (execution_mode, exchange_order_id) "
+            "WHERE exchange_order_id IS NOT NULL "
+            "AND trim(exchange_order_id) <> '' "
+            "AND exchange_order_id NOT IN ('hold', 'rejected', 'no_position')",
+        ),
+        (
             "idx_ai_decisions_market_selection",
             "CREATE INDEX IF NOT EXISTS idx_ai_decisions_market_selection "
             "ON ai_decisions (model_name, analysis_type, symbol, created_at DESC, id DESC)",
@@ -533,7 +542,250 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
                 await conn.execute(text(ddl))
         return
     for _name, ddl in index_ddls:
+        # SQLite remains a local/test backend and may intentionally contain
+        # legacy duplicate fixtures; the PostgreSQL partial unique index is the
+        # production enforcement boundary.
+        if _name == "uq_orders_execution_exchange_fact":
+            continue
         await conn.execute(text(ddl))
+
+
+async def _repair_duplicate_exchange_order_facts(conn: Any) -> None:
+    """Retire historical duplicate projections before enforcing fact uniqueness.
+
+    An OKX order id is one exchange execution fact.  Older recovery and live
+    execution paths could both persist that fact, producing duplicate orders
+    and closed-position fragments.  This migration keeps the lowest-ranked
+    projection as the canonical row, records the retirement in the duplicate's
+    raw evidence, and clears its active exchange identity so it cannot enter
+    training, settlement, or dashboard authoritative views.
+    """
+
+    if "postgresql" not in settings.database_url:
+        return
+
+    await conn.execute(
+        text("""
+            WITH canonical_orders AS (
+                SELECT DISTINCT ON (o.execution_mode, o.exchange_order_id)
+                    o.execution_mode,
+                    o.exchange_order_id,
+                    o.id AS canonical_order_id,
+                    COALESCE(o.okx_fill_contracts, o.quantity, 0) AS canonical_contracts
+                FROM orders o
+                LEFT JOIN ai_decisions d ON d.id = o.decision_id
+                WHERE o.exchange_order_id IS NOT NULL
+                  AND btrim(o.exchange_order_id) <> ''
+                  AND o.exchange_order_id NOT IN ('hold', 'rejected', 'no_position')
+                ORDER BY
+                    o.execution_mode,
+                    o.exchange_order_id,
+                    CASE
+                        WHEN COALESCE(d.raw_llm_response::jsonb ->> 'system_sync', 'false') <> 'true'
+                        THEN 0 ELSE 1
+                    END,
+                    CASE WHEN o.okx_fill_contracts IS NOT NULL THEN 0 ELSE 1 END,
+                    o.id
+            ),
+            ranked AS (
+                SELECT
+                    p.id,
+                    p.execution_mode,
+                    p.close_exchange_order_id,
+                    FIRST_VALUE(p.id) OVER (
+                        PARTITION BY p.execution_mode, p.close_exchange_order_id
+                        ORDER BY
+                            ABS(
+                                COALESCE(p.quantity, 0) -
+                                o.canonical_contracts
+                            ),
+                            CASE WHEN p.settlement_status = 'settlement_quarantined' THEN 1 ELSE 0 END,
+                            p.closed_at NULLS LAST,
+                            p.id
+                    ) AS canonical_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.execution_mode, p.close_exchange_order_id
+                        ORDER BY
+                            ABS(
+                                COALESCE(p.quantity, 0) -
+                                o.canonical_contracts
+                            ),
+                            CASE WHEN p.settlement_status = 'settlement_quarantined' THEN 1 ELSE 0 END,
+                            p.closed_at NULLS LAST,
+                            p.id
+                    ) AS duplicate_rank
+                FROM positions p
+                JOIN canonical_orders o
+                  ON o.execution_mode = p.execution_mode
+                 AND o.exchange_order_id = p.close_exchange_order_id
+                WHERE p.is_open = FALSE
+                  AND p.close_exchange_order_id IS NOT NULL
+                  AND btrim(p.close_exchange_order_id) <> ''
+                  AND p.settlement_status IS DISTINCT FROM 'superseded_position_residual'
+            )
+            UPDATE positions p
+            SET
+                settlement_status = 'superseded_position_residual',
+                settlement_source = 'okx_exchange_order_fact_deduplication',
+                settlement_raw = COALESCE(p.settlement_raw::jsonb, '{}'::jsonb) || jsonb_build_object(
+                    'reason', 'duplicate_local_closed_position_for_same_okx_close_order',
+                    'canonical_position_id', ranked.canonical_id,
+                    'retired_position_id', p.id,
+                    'close_exchange_order_id', ranked.close_exchange_order_id,
+                    'retired_at', CURRENT_TIMESTAMP
+                )
+            FROM ranked
+            WHERE p.id = ranked.id
+              AND ranked.duplicate_rank > 1
+        """)
+    )
+
+    # Older settlement mirrors stored several exchange order ids as a comma
+    # separated lifecycle.  The single-order pass above cannot match those
+    # values to ``orders.exchange_order_id``.  Retire only exact duplicate
+    # projections (same official posId, entry set, close set and quantity),
+    # while leaving quantity-different partial fragments untouched.
+    await conn.execute(
+        text("""
+            WITH keyed AS (
+                SELECT
+                    p.id,
+                    p.execution_mode,
+                    btrim(p.okx_pos_id) AS okx_pos_id,
+                    lower(btrim(p.symbol)) AS symbol_key,
+                    lower(btrim(p.side)) AS side_key,
+                    round(COALESCE(p.quantity, 0)::numeric, 12) AS quantity_key,
+                    ARRAY(
+                        SELECT btrim(value)
+                        FROM unnest(string_to_array(COALESCE(p.entry_exchange_order_id, ''), ',')) value
+                        WHERE btrim(value) <> ''
+                        ORDER BY btrim(value)
+                    ) AS entry_order_ids,
+                    ARRAY(
+                        SELECT btrim(value)
+                        FROM unnest(string_to_array(COALESCE(p.close_exchange_order_id, ''), ',')) value
+                        WHERE btrim(value) <> ''
+                        ORDER BY btrim(value)
+                    ) AS close_order_ids,
+                    p.settlement_status,
+                    p.closed_at
+                FROM positions p
+                WHERE p.is_open = FALSE
+                  AND btrim(COALESCE(p.okx_pos_id, '')) <> ''
+                  AND btrim(COALESCE(p.entry_exchange_order_id, '')) <> ''
+                  AND btrim(COALESCE(p.close_exchange_order_id, '')) <> ''
+                  AND p.settlement_status IS DISTINCT FROM 'superseded_position_residual'
+            ),
+            ranked AS (
+                SELECT
+                    keyed.*,
+                    FIRST_VALUE(keyed.id) OVER (
+                        PARTITION BY
+                            keyed.execution_mode,
+                            keyed.okx_pos_id,
+                            keyed.symbol_key,
+                            keyed.side_key,
+                            keyed.quantity_key,
+                            keyed.entry_order_ids,
+                            keyed.close_order_ids
+                        ORDER BY
+                            CASE WHEN keyed.settlement_status = 'reconciled' THEN 0 ELSE 1 END,
+                            CASE WHEN keyed.settlement_status = 'okx_position_history' THEN 0 ELSE 1 END,
+                            keyed.closed_at NULLS LAST,
+                            keyed.id
+                    ) AS canonical_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            keyed.execution_mode,
+                            keyed.okx_pos_id,
+                            keyed.symbol_key,
+                            keyed.side_key,
+                            keyed.quantity_key,
+                            keyed.entry_order_ids,
+                            keyed.close_order_ids
+                        ORDER BY
+                            CASE WHEN keyed.settlement_status = 'reconciled' THEN 0 ELSE 1 END,
+                            CASE WHEN keyed.settlement_status = 'okx_position_history' THEN 0 ELSE 1 END,
+                            keyed.closed_at NULLS LAST,
+                            keyed.id
+                    ) AS duplicate_rank
+                FROM keyed
+                WHERE cardinality(keyed.entry_order_ids) > 0
+                  AND cardinality(keyed.close_order_ids) > 0
+            )
+            UPDATE positions p
+            SET
+                settlement_status = 'superseded_position_residual',
+                settlement_source = 'okx_exchange_order_fact_deduplication',
+                settlement_raw = COALESCE(p.settlement_raw::jsonb, '{}'::jsonb) || jsonb_build_object(
+                    'reason', 'duplicate_local_closed_position_for_same_okx_lifecycle_exact_projection',
+                    'canonical_position_id', ranked.canonical_id,
+                    'retired_position_id', p.id,
+                    'okx_pos_id', ranked.okx_pos_id,
+                    'retired_at', CURRENT_TIMESTAMP
+                )
+            FROM ranked
+            WHERE p.id = ranked.id
+              AND ranked.duplicate_rank > 1
+        """)
+    )
+
+    # Keep this update after the position pass: duplicate closed fragments use
+    # the order id as their join key when selecting the canonical fragment.
+    await conn.execute(
+        text("""
+            WITH ranked AS (
+                SELECT
+                    o.id,
+                    o.execution_mode,
+                    o.exchange_order_id,
+                    FIRST_VALUE(o.id) OVER (
+                        PARTITION BY o.execution_mode, o.exchange_order_id
+                        ORDER BY
+                            CASE
+                                WHEN COALESCE(d.raw_llm_response::jsonb ->> 'system_sync', 'false') <> 'true'
+                                THEN 0 ELSE 1
+                            END,
+                            CASE WHEN o.okx_fill_contracts IS NOT NULL THEN 0 ELSE 1 END,
+                            o.id
+                    ) AS canonical_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY o.execution_mode, o.exchange_order_id
+                        ORDER BY
+                            CASE
+                                WHEN COALESCE(d.raw_llm_response::jsonb ->> 'system_sync', 'false') <> 'true'
+                                THEN 0 ELSE 1
+                            END,
+                            CASE WHEN o.okx_fill_contracts IS NOT NULL THEN 0 ELSE 1 END,
+                            o.id
+                    ) AS duplicate_rank
+                FROM orders o
+                LEFT JOIN ai_decisions d ON d.id = o.decision_id
+                WHERE o.exchange_order_id IS NOT NULL
+                  AND btrim(o.exchange_order_id) <> ''
+                  AND o.exchange_order_id NOT IN ('hold', 'rejected', 'no_position')
+            )
+            UPDATE orders o
+            SET
+                status = 'superseded',
+                okx_state = 'superseded',
+                okx_sync_status = 'superseded_duplicate_exchange_order',
+                okx_raw_fills = COALESCE(o.okx_raw_fills::jsonb, '{}'::jsonb) || jsonb_build_object(
+                    'duplicate_exchange_order_retirement', jsonb_build_object(
+                        'version', '2026-08-24.exchange-order-fact-idempotency.v1',
+                        'reason', 'duplicate_local_order_for_same_okx_exchange_order',
+                        'canonical_order_id', ranked.canonical_id,
+                        'retired_order_id', o.id,
+                        'exchange_order_id', ranked.exchange_order_id,
+                        'retired_at', CURRENT_TIMESTAMP
+                    )
+                ),
+                exchange_order_id = NULL
+            FROM ranked
+            WHERE o.id = ranked.id
+              AND ranked.duplicate_rank > 1
+        """)
+    )
 
 
 async def _ensure_runtime_data_retention_columns(conn: Any) -> None:

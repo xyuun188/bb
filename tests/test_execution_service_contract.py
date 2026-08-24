@@ -21,6 +21,7 @@ from services.okx_execution_slippage import build_okx_fill_mark_slippage
 from services.okx_training_facts import build_okx_history_training_sample
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import validate_entry_execution_contract
+from services.trade_order_log_service import TradeOrderLogOutcome
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
 from tests.legacy_paper_contract_fixtures import (
@@ -46,9 +47,11 @@ def _test_execution_service(
     reasons: list[str | None] | None = None,
     stages: list[tuple[str, str, str]] | None = None,
     trade_logger=None,
+    trade_count_incrementer=None,
     position_execution_persister=None,
     position_protection_rebalancer=None,
     order_fact_recovery_trigger=None,
+    open_positions_execution_applier=None,
     decision_stage_recorder=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
@@ -98,11 +101,13 @@ def _test_execution_service(
         ),
         exit_progress_checker=lambda _result: False,
         no_exchange_position_result_checker=lambda _result: False,
-        trade_count_incrementer=lambda: None,
+        trade_count_incrementer=trade_count_incrementer or (lambda: None),
         position_execution_persister=position_execution_persister or _noop_async,
         position_protection_rebalancer=position_protection_rebalancer or _noop_async,
         order_fact_recovery_trigger=order_fact_recovery_trigger,
-        open_positions_execution_applier=lambda *_args: None,
+        open_positions_execution_applier=(
+            open_positions_execution_applier or (lambda *_args: None)
+        ),
         decision_executed_marker=_noop_async,
         account_update_persister=_noop_async,
         account_balance_provider=lambda _model: _noop_async(),
@@ -1198,6 +1203,88 @@ async def test_execution_service_requests_authoritative_facts_after_confirmed_wr
     assert result is not None
     assert result.status == OrderStatus.FILLED
     assert recovery_requests == ["paper"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_exchange_fact_callback_does_not_mutate_position_again() -> None:
+    persisted_positions: list[str] = []
+    applied_positions: list[str] = []
+    trade_counts: list[str] = []
+    recovery_requests: list[str] = []
+    raw_updates: list[dict[str, Any] | None] = []
+
+    class ReplayedFilledExecutor:
+        async def place_order(
+            self,
+            decision: DecisionOutput,
+            account_id: str | None = None,
+            override_balance: float | None = None,
+        ) -> ExecutionResult:
+            del account_id, override_balance
+            return ExecutionResult(
+                order_id="local-replayed-order",
+                exchange_order_id="okx-existing-order",
+                symbol=decision.symbol,
+                side="sell",
+                order_type="market",
+                quantity=2.0,
+                price=100.0,
+                status=OrderStatus.FILLED,
+                raw_response={"info": {"ordId": "okx-existing-order"}},
+            )
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return ReplayedFilledExecutor()
+
+    async def reused_trade_logger(*_args: Any, **_kwargs: Any) -> TradeOrderLogOutcome:
+        return TradeOrderLogOutcome(
+            created=False,
+            local_order_id=8059,
+            decision_id=388831,
+            exchange_order_id="okx-existing-order",
+        )
+
+    async def persist_position(*_args: Any, **_kwargs: Any) -> None:
+        persisted_positions.append("called")
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        trade_logger=reused_trade_logger,
+        trade_count_incrementer=lambda: trade_counts.append("called"),
+        position_execution_persister=persist_position,
+        open_positions_execution_applier=lambda *_args: applied_positions.append("called"),
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode),
+        raw_updates=raw_updates,
+    )
+    decision = _profit_first_ready_position_review_decision()
+
+    result = await service.execute_candidate(
+        "BTC/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        388833,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert persisted_positions == []
+    assert applied_positions == []
+    assert trade_counts == []
+    assert recovery_requests == ["paper", "paper"]
+    idempotency = decision.raw_response["exchange_order_fact_idempotency"]
+    assert idempotency == {
+        "version": "2026-08-24.exchange-order-fact-idempotency.v1",
+        "status": "reused_existing_fact",
+        "exchange_order_id": "okx-existing-order",
+        "local_order_id": 8059,
+        "authoritative_decision_id": 388831,
+        "incoming_decision_id": 388833,
+        "position_mutation_skipped": True,
+        "recovery_requested": True,
+    }
+    assert raw_updates[-1]["exchange_order_fact_idempotency"] == idempotency
 
 
 @pytest.mark.asyncio

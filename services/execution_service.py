@@ -1601,10 +1601,49 @@ class ExecutionService:
             )
             confirm_reason = execution_reason_from_result(execution_result)
             local_order_persisted = True
+            local_order_fact_created = True
+            local_order_fact_owner_decision_id = decision_db_id
             local_order_persistence_error: str | None = None
             recovery_requested = False
             try:
-                await log_trade(execution_result, model_name, decision, decision_db_id)
+                order_log_outcome = await log_trade(
+                    execution_result,
+                    model_name,
+                    decision,
+                    decision_db_id,
+                )
+                if order_log_outcome is not None and hasattr(
+                    order_log_outcome, "created"
+                ):
+                    local_order_fact_created = bool(order_log_outcome.created)
+                    local_order_fact_owner_decision_id = getattr(
+                        order_log_outcome,
+                        "decision_id",
+                        decision_db_id,
+                    )
+                if not local_order_fact_created:
+                    recovery_requested = self._trigger_order_fact_recovery(model_mode)
+                    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                    raw = dict(raw)
+                    raw["exchange_order_fact_idempotency"] = {
+                        "version": "2026-08-24.exchange-order-fact-idempotency.v1",
+                        "status": "reused_existing_fact",
+                        "exchange_order_id": getattr(
+                            order_log_outcome,
+                            "exchange_order_id",
+                            getattr(execution_result, "exchange_order_id", None),
+                        ),
+                        "local_order_id": getattr(
+                            order_log_outcome,
+                            "local_order_id",
+                            None,
+                        ),
+                        "authoritative_decision_id": local_order_fact_owner_decision_id,
+                        "incoming_decision_id": decision_db_id,
+                        "position_mutation_skipped": True,
+                        "recovery_requested": recovery_requested,
+                    }
+                    decision.raw_response = raw
             except Exception as exc:
                 local_order_persisted = False
                 local_order_persistence_error = safe_error_text(exc, limit=180)
@@ -1714,23 +1753,25 @@ class ExecutionService:
                 if open_positions is not None:
                     open_positions[:] = await get_open_positions_context()
             if exchange_confirmed or exit_progress:
-                increment_trade_count()
+                if local_order_fact_created:
+                    increment_trade_count()
                 if local_order_persisted:
-                    await persist_position_from_execution(
-                        model_name,
-                        decision,
-                        execution_result,
-                        model_mode,
-                    )
-                    if open_positions is not None:
-                        apply_execution_to_open_positions(
-                            open_positions,
+                    if local_order_fact_created:
+                        await persist_position_from_execution(
                             model_name,
                             decision,
                             execution_result,
+                            model_mode,
                         )
+                        if open_positions is not None:
+                            apply_execution_to_open_positions(
+                                open_positions,
+                                model_name,
+                                decision,
+                                execution_result,
+                            )
                     protection_rebalance: dict[str, Any] | None = None
-                    if decision.is_exit and exchange_confirmed:
+                    if decision.is_exit and exchange_confirmed and local_order_fact_created:
                         try:
                             protection_rebalance = await rebalance_position_protection(
                                 executor,
@@ -1764,10 +1805,18 @@ class ExecutionService:
                     await mark_stage(
                         DecisionStage.LOCAL_SYNC,
                         DecisionStageStatus.COMPLETED,
-                        "成交结果已写入本地订单/持仓记录。",
+                        (
+                            "成交结果已写入本地订单/持仓记录。"
+                            if local_order_fact_created
+                            else "该 OKX 成交事实已存在；本次重复回调仅合并证据，未重复改动持仓。"
+                        ),
                         {
                             "exit_progress": bool(exit_progress),
                             "exchange_confirmed": bool(exchange_confirmed),
+                            "order_fact_created": local_order_fact_created,
+                            "order_fact_owner_decision_id": (
+                                local_order_fact_owner_decision_id
+                            ),
                             "protection_rebalance_status": (
                                 protection_rebalance.get("status")
                                 if isinstance(protection_rebalance, dict)
@@ -1818,8 +1867,16 @@ class ExecutionService:
                 }
             )
             if exchange_confirmed:
-                record_trade_notional(execution_result.price * execution_result.quantity)
-            if decision_db_id is not None and exchange_confirmed:
+                if local_order_fact_created:
+                    record_trade_notional(execution_result.price * execution_result.quantity)
+            decision_owns_order_fact = bool(
+                local_order_fact_created
+                or (
+                    decision_db_id is not None
+                    and local_order_fact_owner_decision_id == decision_db_id
+                )
+            )
+            if decision_db_id is not None and exchange_confirmed and decision_owns_order_fact:
                 await mark_decision_executed(decision_db_id, execution_result.price)
                 await mark_decision_reason(decision_db_id, confirm_reason)
                 attach_execution_parameters("exchange_confirmed")
@@ -1832,7 +1889,14 @@ class ExecutionService:
             elif decision_db_id is not None:
                 await mark_decision_reason(
                     decision_db_id,
-                    execution_reason_from_result(execution_result),
+                    (
+                        execution_reason_from_result(execution_result)
+                        if local_order_fact_created
+                        else (
+                            "OKX 成交号已由另一条权威执行记录认领；"
+                            "本条重复回调未再次改动持仓。"
+                        )
+                    ),
                 )
                 attach_execution_parameters("exchange_not_confirmed")
                 attach_execution_result_snapshot(

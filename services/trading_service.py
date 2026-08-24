@@ -74,7 +74,10 @@ from services.decision_state import (
     decision_state_from_raw,
     is_decision_terminal_state,
 )
-from services.dynamic_exit_policy import apply_dynamic_exit
+from services.dynamic_exit_policy import (
+    apply_dynamic_exit,
+    evaluate_dynamic_exit_execution_contract,
+)
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
@@ -12735,7 +12738,8 @@ class TradingService:
                 ),
             )
             assessment = apply_dynamic_exit(close_decision, [position_snapshot])
-            if not assessment.eligible or assessment.close_fraction <= 0.0:
+            execution_contract = evaluate_dynamic_exit_execution_contract(assessment)
+            if not execution_contract["allowed"]:
                 continue
             # The fast path is reserved for exchange/fee hard protection and
             # explicit stop or target crossings. Ordinary dynamic pressure must
@@ -13230,9 +13234,10 @@ class TradingService:
 
     @staticmethod
     def _fast_dynamic_position_scan_is_allowed(assessment: Any) -> bool:
-        """Allow the evidence-free fast path only for hard protection."""
+        """Reserve the fast path for explicit, evidence-backed hard risk."""
 
-        return bool(getattr(assessment, "hard_risk", False))
+        contract = evaluate_dynamic_exit_execution_contract(assessment)
+        return bool(contract["allowed"] and contract["hard_risk"])
 
     def _position_review_batch_policy(self) -> PositionReviewBatchPolicy:
         policy = getattr(self, "position_review_batch", None)

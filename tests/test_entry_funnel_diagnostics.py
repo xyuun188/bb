@@ -143,6 +143,63 @@ def test_funnel_keeps_explicit_market_model_timeout_as_service_error() -> None:
     ) == "service_error"
 
 
+def test_funnel_does_not_treat_normal_risk_expert_reasoning_as_a_block() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "analysis_quality_contract": {
+                "analysis_complete": True,
+                "decision_eligible": True,
+            },
+            "risk_expert": {
+                "reason": "当前风险可控，但收益证据不足，建议继续观察。",
+            },
+            "production_trade_gate": {
+                "allowed": True,
+                "risk": {"blocked": False},
+            },
+        },
+        action="hold",
+        was_executed=False,
+        has_order=False,
+        reason="AI completed expert analysis",
+    ) == "insufficient_evidence"
+
+
+def test_funnel_classifies_explicit_structured_risk_block() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "analysis_quality_contract": {
+                "analysis_complete": True,
+                "decision_eligible": True,
+            },
+            "production_trade_gate": {
+                "allowed": False,
+                "risk": {"blocked": True},
+            },
+        },
+        action="short",
+        was_executed=False,
+        has_order=False,
+        reason="production gate rejected candidate",
+    ) == "risk_blocked"
+
+
+def test_funnel_classifies_environment_rejection_as_execution_blocked() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "analysis_quality_contract": {
+                "analysis_complete": True,
+                "decision_eligible": True,
+            },
+            "policy_blocker": "normal_paper_exchange_facts_ineligible",
+        },
+        action="short",
+        was_executed=False,
+        has_order=False,
+        reason="normal_paper_exchange_facts_ineligible",
+    ) == "execution_blocked"
+
+
 def test_funnel_classifies_reconciliation_before_execution() -> None:
     assert classify_entry_funnel_reason(
         raw={},

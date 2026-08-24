@@ -133,14 +133,25 @@ class EntryCandidateEvidencePolicy:
         long_evidence = self._build_side("long", symbol, feature_vector, strategy, base_raw)
         short_evidence = self._build_side("short", symbol, feature_vector, strategy, base_raw)
         feature_score = _safe_float(self.feature_opportunity_score(feature_vector), 0.0)
-        eligible_sides = [
+        # ``decision_eligible`` is scoped to the current execution mode:
+        # paper eligibility in paper mode and production eligibility in live
+        # mode. Require a positive fee-after mean and LCB as well so a merely
+        # less-bad side cannot leak a directional bias into later AI context.
+        execution_sides = [
             item
             for item in (long_evidence, short_evidence)
-            if item["decision_eligible"] and item["score"] is not None
+            if item["decision_eligible"] is True
+            and item["positive_fee_after_return_edge"] is True
+            and item["score"] is not None
+        ]
+        execution_candidates = [
+            item
+            for item in (long_evidence, short_evidence)
+            if item["decision_eligible"] is True and item["score"] is not None
         ]
         preferred = (
-            max(eligible_sides, key=lambda item: item["return_lcb_pct"])["side"]
-            if eligible_sides
+            max(execution_sides, key=lambda item: item["return_lcb_pct"])["side"]
+            if execution_sides
             else "neutral"
         )
         generated_at = datetime.now(UTC).isoformat()
@@ -162,9 +173,13 @@ class EntryCandidateEvidencePolicy:
                     for item in (long_evidence, short_evidence)
                 ),
                 "generated_at": generated_at,
-                "strategy_version": "2026-07-12.candidate-return-evidence.v1",
+                "strategy_version": "2026-08-24.candidate-return-evidence.v2",
                 "fallback_reason": (
-                    "" if eligible_sides else "execution_scoped_return_candidate_unavailable"
+                    ""
+                    if execution_sides
+                    else "no_positive_fee_after_execution_eligible_side"
+                    if execution_candidates
+                    else "execution_scoped_return_candidate_unavailable"
                 ),
             },
             "policy": (
