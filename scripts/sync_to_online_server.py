@@ -124,9 +124,18 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then exec .venv/bin/python scripts/run_dashboard.py; elif [ -x venv/bin/python ]; then exec venv/bin/python scripts/run_dashboard.py; else exec python3 scripts/run_dashboard.py; fi'
 Restart=always
 RestartSec=5
+MemoryAccounting=true
+MemoryHigh=3G
+MemoryMax=5G
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target
@@ -148,6 +157,11 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then exec .venv/bin/python scripts/start_online_model_tunnels.py; elif [ -x venv/bin/python ]; then exec venv/bin/python scripts/start_online_model_tunnels.py; else exec python3 scripts/start_online_model_tunnels.py; fi'
 Restart=always
 RestartSec=3
@@ -477,9 +491,18 @@ def _install_split_service_command(
     trading_dropin = f"""[Service]
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 ExecStartPre=/bin/bash -lc 'for spec in 18000:/v1/models 18001:/health/live 18002:/v1/models 18003:/v1/models; do port=${{spec%%:*}}; path=${{spec#*:}}; for i in $(seq 1 60); do curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 && break; sleep 1; done; curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 || exit 1; done'
 StandardOutput=journal
 StandardError=journal
+MemoryAccounting=true
+MemoryHigh=6G
+MemoryMax=8G
+TasksMax=512
 """
     cleanup_prefix = (
         f'trap "rm -f {_remote_quote(local_ai_tools_key_file)}" EXIT; '

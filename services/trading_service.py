@@ -270,6 +270,16 @@ MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
+# A definitive OKX capability rejection (51001 / unsupported execution
+# instrument) must not be rediscovered on every market round.  Keep this
+# separate from the executor's per-request cache so the ranked candidate pool
+# also remembers the negative result and stops wasting analysis slots.
+MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS = 6 * 60 * 60
+# Demo/live price divergence is retryable, but repeatedly reselecting the same
+# symbol every market round wastes the candidate budget. Keep a short cooling
+# window while allowing the instrument to be rechecked automatically.
+MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS = 10 * 60
+MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS = 60
 MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
 OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
 MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
@@ -349,6 +359,9 @@ def _training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str
     ):
         env[key] = worker_count
     env["BB_TRAINING_MAX_WORKERS"] = worker_count
+    # Limit glibc arena growth in long-lived training workers so completed
+    # fitting runs do not retain large transient allocations.
+    env["MALLOC_ARENA_MAX"] = "2"
     return env
 
 
@@ -1026,6 +1039,12 @@ class TradingService:
             "paper": set(),
             "live": set(),
         }
+        self._unavailable_entry_symbols_by_mode: dict[str, dict[str, dict[str, Any]]] = {
+            "paper": {},
+            "live": {},
+        }
+        self._entry_unavailable_cache_persist_enabled = True
+        self._load_unavailable_entry_symbol_cache()
         self._market_instrument_refresh_status_by_mode: dict[str, dict[str, Any]] = {}
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
@@ -7074,8 +7093,16 @@ class TradingService:
         selection = self._safe_dict(raw.get("paper_trade_selection"))
         permission = self._safe_dict(raw.get("entry_permission"))
         contract = self._safe_dict(raw.get("normal_paper_trade"))
+        try:
+            mode = self._get_model_execution_mode(getattr(decision, "model_name", ""))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            mode = "paper"
+        selected_mode = "live" if str(mode).lower() == "live" else "paper"
+        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
         return bool(
-            selection.get("selected") is True
+            symbol not in unavailable_by_mode
+            and selection.get("selected") is True
             and permission.get("granted") is True
             and not normal_paper_trade_contract_reasons(contract)
         )
@@ -7685,6 +7712,181 @@ class TradingService:
         self._market_analysis_only_symbols.update(analysis_only_symbols)
         return result.selected
 
+    @staticmethod
+    def _is_definitive_entry_unavailable(facts: Mapping[str, Any] | None) -> bool:
+        """Classify only durable capability failures as negative-cache entries."""
+
+        payload = facts if isinstance(facts, Mapping) else {}
+        error_code = str(payload.get("error_code") or "")
+        reason = str(payload.get("reason") or "")
+        if error_code == "51001" or reason == "okx_private_entry_instrument_unavailable":
+            return True
+        if reason != "okx_entry_live_execution_environment_incompatible":
+            return False
+        compatibility = payload.get("environment_compatibility")
+        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
+        blockers = {
+            str(item)
+            for item in compatibility.get("blockers", [])
+        }
+        # Price drift/missing ticker is transient and should be retried quickly;
+        # contract identity or missing execution instrument is durable enough to
+        # keep out of the candidate budget until the cache expires.
+        transient_blockers = {
+            "environment_price_drift_exceeded",
+            "environment_price_missing",
+        }
+        return bool(blockers - transient_blockers)
+
+    @staticmethod
+    def _entry_unavailable_cache_ttl(
+        facts: Mapping[str, Any] | None,
+    ) -> float | None:
+        """Return a bounded retry TTL for an execution capability failure."""
+
+        payload = facts if isinstance(facts, Mapping) else {}
+        error_code = str(payload.get("error_code") or "")
+        reason = str(payload.get("reason") or "")
+        if error_code == "51001" or reason == "okx_private_entry_instrument_unavailable":
+            return MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
+        if reason != "okx_entry_live_execution_environment_incompatible":
+            return None
+        compatibility = payload.get("environment_compatibility")
+        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
+        blockers = {str(item) for item in compatibility.get("blockers", [])}
+        if blockers - {"environment_price_drift_exceeded", "environment_price_missing"}:
+            return MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
+        if "environment_price_drift_exceeded" in blockers:
+            return MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
+        if "environment_price_missing" in blockers:
+            return MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS
+        return None
+
+    def _entry_unavailable_cache_path(self) -> Path:
+        return settings.data_dir / "entry_instrument_unavailable_cache.json"
+
+    def _load_unavailable_entry_symbol_cache(self) -> None:
+        """Restore durable negative capability results after a service restart."""
+
+        path = self._entry_unavailable_cache_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return
+        if not isinstance(payload, Mapping):
+            return
+        now = datetime.now(UTC)
+        restored: dict[str, dict[str, dict[str, Any]]] = {"paper": {}, "live": {}}
+        for mode in restored:
+            rows = payload.get(mode)
+            if not isinstance(rows, Mapping):
+                continue
+            for symbol, facts in rows.items():
+                if not isinstance(facts, Mapping):
+                    continue
+                expires_at = str(facts.get("expires_at") or "")
+                try:
+                    expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+                except (TypeError, ValueError):
+                    continue
+                if expires <= now:
+                    continue
+                normalized_symbol = self._normalize_position_symbol(str(symbol))
+                if not normalized_symbol:
+                    continue
+                restored[mode][normalized_symbol] = dict(facts)
+        self._unavailable_entry_symbols_by_mode = restored
+
+    def _persist_unavailable_entry_symbol_cache(self) -> None:
+        if getattr(self, "_entry_unavailable_cache_persist_enabled", False) is not True:
+            return
+        payload = getattr(self, "_unavailable_entry_symbols_by_mode", {})
+        if not isinstance(payload, Mapping):
+            return
+        path = self._entry_unavailable_cache_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError as exc:
+            logger.warning(
+                "persisting unavailable entry instrument cache failed",
+                error=safe_error_text(exc, limit=180),
+            )
+
+    def _entry_unavailable_cache_for_mode(self, mode: str) -> dict[str, dict[str, Any]]:
+        caches = getattr(self, "_unavailable_entry_symbols_by_mode", None)
+        if not isinstance(caches, dict):
+            caches = {"paper": {}, "live": {}}
+            self._unavailable_entry_symbols_by_mode = caches
+        key = "live" if str(mode).lower() == "live" else "paper"
+        rows = caches.setdefault(key, {})
+        if not isinstance(rows, dict):
+            rows = {}
+            caches[key] = rows
+        now = datetime.now(UTC)
+        expired = []
+        for symbol, facts in rows.items():
+            if not isinstance(facts, Mapping):
+                expired.append(symbol)
+                continue
+            try:
+                expires = datetime.fromisoformat(
+                    str(facts.get("expires_at") or "").replace("Z", "+00:00")
+                )
+                expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                expired.append(symbol)
+                continue
+            if expires <= now:
+                expired.append(symbol)
+        for symbol in expired:
+            rows.pop(symbol, None)
+        return rows
+
+    def _remember_unavailable_entry_symbol(
+        self,
+        mode: str,
+        symbol: str,
+        facts: Mapping[str, Any],
+        *,
+        persist: bool = True,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        normalized_symbol = self._normalize_position_symbol(symbol)
+        if not normalized_symbol:
+            return
+        rows = self._entry_unavailable_cache_for_mode(mode)
+        ttl = (
+            float(ttl_seconds)
+            if ttl_seconds is not None
+            else self._entry_unavailable_cache_ttl(facts)
+        )
+        if ttl is None or ttl <= 0:
+            return
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
+        payload = dict(facts)
+        payload.update(
+            {
+                "available": False,
+                "symbol": normalized_symbol,
+                "cache_hit": True,
+                "analysis_only": True,
+                "execution_verified": False,
+                "source": "trading_service_negative_entry_capability_cache",
+                "cached_at": datetime.now(UTC).isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }
+        )
+        rows[normalized_symbol] = payload
+        if persist:
+            self._persist_unavailable_entry_symbol_cache()
+
     async def _filter_entry_instrument_shortlist(
         self,
         feature_vectors: dict[str, Any],
@@ -7707,6 +7909,9 @@ class TradingService:
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
         verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
+        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        unavailable_symbols = set(unavailable_by_mode)
+        verified_symbols.difference_update(unavailable_symbols)
         # Private OKX capability checks are execution permissions, not market
         # observation data. Never wait for a batch of private probes inside
         # the market-analysis critical path; refresh them independently and
@@ -7752,19 +7957,34 @@ class TradingService:
             )
 
         selected = [symbol for symbol in feature_vectors if symbol in verified_symbols]
+        selected.extend(
+            symbol
+            for symbol in feature_vectors
+            if symbol not in selected and symbol not in unavailable_symbols
+        )
+        # Keep known-incompatible symbols as an observation fallback only when
+        # there are not enough unknown/verified instruments to fill the budget.
+        # They are marked execution-unavailable below and can never reach the
+        # order path.
         selected.extend(symbol for symbol in feature_vectors if symbol not in selected)
         selected = selected[:target]
         availability = {
             symbol: {
-                "available": True if symbol in verified_symbols else None,
-                "reason": (
-                    "cached_okx_private_account_instrument_verified"
-                    if symbol in verified_symbols
-                    else "okx_private_entry_instrument_probe_deferred"
+                **(
+                    dict(unavailable_by_mode[symbol])
+                    if symbol in unavailable_by_mode
+                    else {
+                        "available": True if symbol in verified_symbols else None,
+                        "reason": (
+                            "cached_okx_private_account_instrument_verified"
+                            if symbol in verified_symbols
+                            else "okx_private_entry_instrument_probe_deferred"
+                        ),
+                        "cache_hit": symbol in verified_symbols,
+                        "analysis_only": symbol not in verified_symbols,
+                        "execution_verified": symbol in verified_symbols,
+                    }
                 ),
-                "cache_hit": symbol in verified_symbols,
-                "analysis_only": symbol not in verified_symbols,
-                "execution_verified": symbol in verified_symbols,
             }
             for symbol in feature_vectors
         }
@@ -7832,11 +8052,28 @@ class TradingService:
             availability_facts = self._safe_dict(facts)
             if availability_facts.get("available") is True:
                 verified_symbols.add(str(symbol))
-            elif str(availability_facts.get("error_code") or "") == "51001":
+                unavailable_by_mode.pop(str(symbol), None)
+            else:
+                cache_ttl = self._entry_unavailable_cache_ttl(availability_facts)
+                if cache_ttl is None:
+                    continue
                 verified_symbols.discard(str(symbol))
+                self._remember_unavailable_entry_symbol(
+                    selected_mode,
+                    str(symbol),
+                    availability_facts,
+                    ttl_seconds=cache_ttl,
+                )
         verified_by_mode = dict(verified_by_mode)
         verified_by_mode[selected_mode] = verified_symbols
         self._verified_entry_symbols_by_mode = verified_by_mode
+        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        selected_unavailable_symbols = {
+            symbol
+            for symbol in selected_order
+            if candidate_state(symbol) == "execution_unavailable"
+        }
+        self._market_analysis_only_symbols.update(selected_unavailable_symbols)
         unavailable = [
             {
                 "symbol": symbol,
@@ -7875,6 +8112,10 @@ class TradingService:
             "available_count": sum(
                 self._safe_dict(facts).get("available") is True for facts in availability.values()
             ),
+            "known_unavailable_count": len(
+                unavailable_symbols.intersection(feature_vectors)
+            ),
+            "known_unavailable_selected_count": len(selected_unavailable_symbols),
             "execution_verified_selected_count": sum(
                 state == "execution_verified" for state in selected_states.values()
             ),
@@ -7987,19 +8228,39 @@ class TradingService:
                 if not isinstance(verified_by_mode, dict):
                     verified_by_mode = {}
                 merged = set(verified_by_mode.get(key, set()) or set())
+                unavailable_rows = self._entry_unavailable_cache_for_mode(key)
+                unavailable_changed = False
                 for symbol, facts in (availability or {}).items():
                     if not isinstance(facts, dict):
                         continue
-                    normalized_symbol = str(symbol)
+                    normalized_symbol = self._normalize_position_symbol(str(symbol))
                     if facts.get("available") is True:
                         merged.add(normalized_symbol)
-                    elif facts.get("available") is False:
-                        # A definitive OKX capability response revokes a
-                        # previously cached execution permission. Temporary
-                        # unverified responses do not revoke it.
+                        unavailable_changed = (
+                            unavailable_rows.pop(normalized_symbol, None) is not None
+                            or unavailable_changed
+                        )
+                    else:
+                        cache_ttl = self._entry_unavailable_cache_ttl(facts)
+                        if cache_ttl is None:
+                            continue
+                        # A capability response revokes a previously cached
+                        # execution permission. Durable failures use the long
+                        # negative cache; price drift uses only the short
+                        # retry-cooling window.
                         merged.discard(normalized_symbol)
+                        self._remember_unavailable_entry_symbol(
+                            key,
+                            normalized_symbol,
+                            facts,
+                            persist=False,
+                            ttl_seconds=cache_ttl,
+                        )
+                        unavailable_changed = True
                 verified_by_mode[key] = merged
                 self._verified_entry_symbols_by_mode = verified_by_mode
+                if unavailable_changed:
+                    self._persist_unavailable_entry_symbol_cache()
                 status.update(
                     {
                         "status": "ok",
@@ -8008,6 +8269,7 @@ class TradingService:
                         if isinstance(result, dict)
                         else 0,
                         "verified_count": len(verified),
+                        "known_unavailable_count": len(unavailable_rows),
                     }
                 )
                 logger.info(
@@ -8017,6 +8279,7 @@ class TradingService:
                     if isinstance(result, dict)
                     else 0,
                     verified_count=len(verified),
+                    known_unavailable_count=len(unavailable_rows),
                 )
             except asyncio.CancelledError:
                 raise

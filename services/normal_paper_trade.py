@@ -10,10 +10,14 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
+NORMAL_PAPER_TRADE_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
+LEGACY_NORMAL_PAPER_TRADE_V7_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
 LEGACY_NORMAL_PAPER_TRADE_V6_VERSION = "2026-08-19.normal-paper-strategy-trade.v6"
 LEGACY_NORMAL_PAPER_TRADE_V5_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v4"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-08-25.normal-paper-dynamic-risk.v5"
+LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION = (
+    "2026-07-28.normal-paper-dynamic-risk.v4"
+)
 NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 LEGACY_NORMAL_PAPER_TRADE_V4_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
@@ -34,6 +38,7 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION = 0.0001
+NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 # Keep paper training samples flowing while preventing a materially stressed
 # portfolio from continuing to stack one direction.
 NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION = 0.90
@@ -296,6 +301,7 @@ def select_normal_paper_trade_side(
 
     candidates.sort(
         key=lambda item: (
+            item["selection_reason"] == "strategy_edge_selected",
             float(item["expected_net_return_pct"])
             if item["expected_net_return_pct"] is not None
             else float("-inf"),
@@ -313,7 +319,10 @@ def select_normal_paper_trade_side(
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
         and item["objective_net_return_pct"] is not None
-        and float(item["objective_net_return_pct"]) > 0.0
+        and (
+            float(item["objective_net_return_pct"]) > 0.0
+            or item["selection_reason"] == "paper_quality_observation"
+        )
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -381,6 +390,7 @@ def build_normal_paper_trade_contract(
             if str(reason).strip()
         }
     )
+    loss_probability = _float(support.get("loss_probability"), None)
     if (
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
@@ -390,7 +400,10 @@ def build_normal_paper_trade_contract(
         or expected_net is None
         or expected_net <= 0.0
         or objective_net is None
-        or objective_net <= 0.0
+        or (
+            objective_net <= 0.0
+            and selection_reason != "paper_quality_observation"
+        )
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
@@ -404,6 +417,9 @@ def build_normal_paper_trade_contract(
             and (
                 not quality_observation_only
                 or not quality_observation_reasons
+                or loss_probability is None
+                or loss_probability
+                > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
             )
         )
     ):
@@ -425,7 +441,7 @@ def build_normal_paper_trade_contract(
         "valid_for_seconds": horizon * 60.0,
         "expected_net_return_pct": expected_net,
         "objective_net_return_pct": objective_net,
-        "loss_probability": _float(support.get("loss_probability"), None),
+        "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
         "single_trade_risk_fraction_cap": (
@@ -520,6 +536,7 @@ def _normal_strategy_trade_contract_reasons(
     expected_version: str,
     require_positive_objective: bool,
     require_quality_permission: bool = True,
+    allow_non_positive_objective_observation: bool = False,
 ) -> list[str]:
     contract = _dict(value)
     reasons: list[str] = []
@@ -551,10 +568,18 @@ def _normal_strategy_trade_contract_reasons(
     expected_net = _float(contract.get("expected_net_return_pct"), None)
     if expected_net is None or expected_net <= 0.0:
         reasons.append("normal_paper_trade_expected_net_not_positive")
+    observation_mode = selection_reason == "paper_quality_observation"
     objective_net = _float(contract.get("objective_net_return_pct"), None)
     if objective_net is None:
         reasons.append("normal_paper_trade_objective_net_missing")
-    elif require_positive_objective and objective_net <= 0.0:
+    elif (
+        require_positive_objective
+        and objective_net <= 0.0
+        and not (
+            observation_mode
+            and allow_non_positive_objective_observation
+        )
+    ):
         reasons.append("normal_paper_trade_objective_net_not_positive")
     if contract.get("uses_shared_order_pipeline") is not True:
         reasons.append("normal_paper_trade_order_pipeline_split")
@@ -564,13 +589,15 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_disabled")
     if contract.get("risk_override_permission") is not False:
         reasons.append("normal_paper_trade_risk_override_invalid")
-    observation_mode = selection_reason == "paper_quality_observation"
     observation_reasons = [
         str(reason)
         for reason in contract.get("quality_observation_reasons") or []
         if str(reason).strip()
     ]
-    if expected_version == NORMAL_PAPER_TRADE_VERSION:
+    if expected_version in {
+        NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
+    }:
         if contract.get("paper_quality_observation_only") is not observation_mode:
             reasons.append("normal_paper_trade_quality_mode_invalid")
         expected_quality_mode = "quality_observation" if observation_mode else "validated"
@@ -578,6 +605,19 @@ def _normal_strategy_trade_contract_reasons(
             reasons.append("normal_paper_trade_quality_mode_invalid")
         if observation_mode and not observation_reasons:
             reasons.append("normal_paper_trade_quality_observation_reason_missing")
+        loss_probability = _float(contract.get("loss_probability"), None)
+        if (
+            expected_version == NORMAL_PAPER_TRADE_VERSION
+            and observation_mode
+            and (
+            loss_probability is None
+            or loss_probability
+            > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+            )
+        ):
+            reasons.append(
+                "normal_paper_trade_quality_observation_loss_probability_too_high"
+            )
     if require_quality_permission:
         quality_permissions = _dict(contract.get("quant_quality_permissions"))
         if not quality_permissions:
@@ -623,6 +663,18 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     return _normal_strategy_trade_contract_reasons(
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+        require_quality_permission=True,
+        allow_non_positive_objective_observation=True,
+    )
+
+
+def legacy_normal_paper_v7_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v7 envelopes for settlement and recovery only."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
     )
@@ -829,6 +881,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION:
+        return legacy_normal_paper_v7_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION:
         return legacy_normal_paper_v6_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION:

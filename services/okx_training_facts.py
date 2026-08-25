@@ -11,14 +11,18 @@ from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_VERSION,
     historical_normal_paper_trade_contract_reasons,
     legacy_normal_paper_v2_trade_contract_reasons,
     legacy_normal_paper_v3_trade_contract_reasons,
     legacy_normal_paper_v4_trade_contract_reasons,
+    legacy_normal_paper_v5_trade_contract_reasons,
     legacy_normal_paper_v6_trade_contract_reasons,
+    legacy_normal_paper_v7_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_execution_slippage import (
@@ -1379,8 +1383,14 @@ def build_okx_history_training_sample(
     normal_paper = _dict(raw_llm_response.get("normal_paper_trade"))
     normal_paper_version = _text(normal_paper.get("version"))
     current_normal_paper = bool(normal_paper and normal_paper_version == NORMAL_PAPER_TRADE_VERSION)
+    legacy_v7_normal_paper = bool(
+        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
+    )
     legacy_v6_normal_paper = bool(
         normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION
+    )
+    legacy_v5_normal_paper = bool(
+        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
     )
     legacy_v4_normal_paper = bool(
         normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
@@ -1397,8 +1407,12 @@ def build_okx_history_training_sample(
     normal_paper_gaps = []
     if current_normal_paper:
         normal_paper_gaps = normal_paper_trade_contract_reasons(normal_paper)
+    elif legacy_v7_normal_paper:
+        normal_paper_gaps = legacy_normal_paper_v7_trade_contract_reasons(normal_paper)
     elif legacy_v6_normal_paper:
         normal_paper_gaps = legacy_normal_paper_v6_trade_contract_reasons(normal_paper)
+    elif legacy_v5_normal_paper:
+        normal_paper_gaps = legacy_normal_paper_v5_trade_contract_reasons(normal_paper)
     elif legacy_v4_normal_paper:
         normal_paper_gaps = legacy_normal_paper_v4_trade_contract_reasons(normal_paper)
     elif legacy_v3_normal_paper:
@@ -1423,7 +1437,9 @@ def build_okx_history_training_sample(
         paper_training_gaps.append("paper_training_conflicting_entry_contract")
     if (
         current_normal_paper
+        or legacy_v7_normal_paper
         or legacy_v6_normal_paper
+        or legacy_v5_normal_paper
         or legacy_v4_normal_paper
         or legacy_v3_normal_paper
         or legacy_v2_normal_paper
@@ -1613,7 +1629,9 @@ def build_okx_history_training_sample(
         "execution_actual_over_budget_loss_usdt": budget_facts["actual_over_budget_loss_usdt"],
         "strategy_entry_kind": "normal_strategy_trade",
         "historical_entry_contract_kind": (
-            "paper_training"
+            "normal_paper_v8"
+            if valid_normal_paper and current_normal_paper
+            else "paper_training"
             if valid_paper_training
             else "paper_exploration"
             if valid_paper_exploration
@@ -1625,6 +1643,12 @@ def build_okx_history_training_sample(
             if valid_normal_paper and legacy_v3_normal_paper
             else "normal_paper_v4"
             if valid_normal_paper and legacy_v4_normal_paper
+            else "normal_paper_v5"
+            if valid_normal_paper and legacy_v5_normal_paper
+            else "normal_paper_v6"
+            if valid_normal_paper and legacy_v6_normal_paper
+            else "normal_paper_v7"
+            if valid_normal_paper and legacy_v7_normal_paper
             else None
         ),
         "strategy_selection_reason": (
@@ -1632,6 +1656,9 @@ def build_okx_history_training_sample(
             if valid_normal_paper
             and (
                 current_normal_paper
+                or legacy_v7_normal_paper
+                or legacy_v6_normal_paper
+                or legacy_v5_normal_paper
                 or legacy_v4_normal_paper
                 or legacy_v3_normal_paper
                 or legacy_v2_normal_paper
@@ -1648,8 +1675,18 @@ def build_okx_history_training_sample(
             {
                 "version": normal_paper.get("version"),
                 "contract_generation": (
-                    "current_objective_v5"
+                    "current_quality_observation_v8"
                     if current_normal_paper
+                    and normal_paper.get("selection_reason")
+                    == "paper_quality_observation"
+                    else "current_validated_v8"
+                    if current_normal_paper
+                    else "historical_quality_v7"
+                    if legacy_v7_normal_paper
+                    else "historical_quality_v6"
+                    if legacy_v6_normal_paper
+                    else "historical_quality_v5"
+                    if legacy_v5_normal_paper
                     else "historical_expected_net_v4"
                     if legacy_v4_normal_paper
                     else "historical_dynamic_v3"

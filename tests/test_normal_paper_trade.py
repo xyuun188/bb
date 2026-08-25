@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    _contract_fingerprint_payload,
+    _fingerprint,
     attach_normal_paper_order_identity,
     build_normal_paper_trade_contract,
     ensure_normal_paper_trade_contract,
@@ -59,6 +62,35 @@ def _support(
         },
         "strong_expert_opposition": False,
     }
+
+
+def _quality_observation_support(
+    side: str,
+    *,
+    expected_net: float = 0.4,
+    objective_net: float = -0.2,
+    loss_probability: float = 0.4,
+) -> dict:
+    support = _support(
+        side,
+        expected_net=expected_net,
+        objective_net=objective_net,
+    )
+    permission = support["quant_quality_permissions"]["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "fee_after_return_lcb_not_positive",
+            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    support["loss_probability"] = loss_probability
+    support["paper_quality_observation_only"] = True
+    support["paper_quality_observation_reasons"] = [
+        "fee_after_return_lcb_not_positive"
+    ]
+    return support
 
 
 def _decision(raw: dict, *, action: Action = Action.LONG) -> DecisionOutput:
@@ -132,20 +164,7 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
 
 
 def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> None:
-    support = _support("short", expected_net=0.4)
-    permission = support["quant_quality_permissions"]["local_ml"]
-    permission.update(
-        {
-            "paper_execution_permission": False,
-            "paper_execution_reason": "fee_after_return_lcb_not_positive",
-            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
-            "paper_execution_evidence": {"sample_count": 0},
-        }
-    )
-    support["paper_quality_observation_only"] = True
-    support["paper_quality_observation_reasons"] = [
-        "fee_after_return_lcb_not_positive"
-    ]
+    support = _quality_observation_support("short")
 
     selection = select_normal_paper_trade_side({"short": support})
     contract = build_normal_paper_trade_contract(
@@ -163,6 +182,84 @@ def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> No
     assert contract["single_trade_risk_fraction_cap"] == (
         NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
     )
+
+
+def test_negative_lcb_quality_observation_can_authorize_only_paper_sampling() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.35,
+        objective_net=-3.2,
+    )
+
+    selection = select_normal_paper_trade_side({"long": support})
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side=selection["selected_side"],
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert contract["objective_net_return_pct"] == -3.2
+    assert contract["production_permission"] is False
+    assert normal_paper_trade_contract_reasons(contract) == []
+
+
+def test_legacy_v7_cannot_inherit_v8_negative_lcb_observation_semantics() -> None:
+    current = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support=_quality_observation_support(
+            "long",
+            expected_net=0.35,
+            objective_net=-3.2,
+        ),
+    )
+    legacy = dict(current)
+    legacy["version"] = LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
+    legacy["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(legacy)
+    )
+
+    assert normal_paper_trade_contract_reasons(legacy)
+    assert "normal_paper_trade_version_invalid" in normal_paper_trade_contract_reasons(
+        legacy
+    )
+    from services.normal_paper_trade import legacy_normal_paper_v7_trade_contract_reasons
+
+    assert "normal_paper_trade_objective_net_not_positive" in (
+        legacy_normal_paper_v7_trade_contract_reasons(legacy)
+    )
+
+
+def test_validated_strategy_candidate_precedes_quality_observation_candidate() -> None:
+    selection = select_normal_paper_trade_side(
+        {
+            "long": _support("long", expected_net=0.15, objective_net=0.05),
+            "short": _quality_observation_support(
+                "short",
+                expected_net=1.5,
+                objective_net=-0.1,
+            ),
+        }
+    )
+
+    assert selection["selected_side"] == "long"
+    assert selection["selection_reason"] == "strategy_edge_selected"
+
+
+def test_quality_observation_rejects_excessive_loss_probability() -> None:
+    support = _quality_observation_support("long", loss_probability=0.61)
+    selection = select_normal_paper_trade_side({"long": support})
+
+    assert selection["selected"] is True
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support=support,
+    ) == {}
 
 
 def test_positive_expected_net_with_non_positive_objective_cannot_authorize_order() -> None:

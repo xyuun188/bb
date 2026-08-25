@@ -9,11 +9,13 @@ from typing import Any
 import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.contract_math import persisted_product_isclose
 from core.symbols import normalize_trading_symbol
 from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
@@ -194,6 +196,14 @@ class RiskEngine:
                 reason = str(sizing.get("reason") or "normal_paper_risk_budget_ineligible")
                 return f"Normal paper risk budget is not eligible: {reason}."
             expected_single_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            quality_observation = (
+                normal_trade.get("selection_reason")
+                == "paper_quality_observation"
+            )
+            if quality_observation:
+                expected_single_cap = (
+                    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+                )
             if equity <= 0 or risk_budget > (
                 equity * expected_single_cap + 1e-8
             ):
@@ -207,6 +217,8 @@ class RiskEngine:
             )
             if leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
                 return "Normal paper leverage must be a positive exchange integer."
+            if quality_observation and not isclose(leverage, 1.0, abs_tol=1e-8):
+                return "Paper quality observation leverage must remain one x."
             if tier_max < 1.0 or leverage > tier_max + 1e-8:
                 return "Normal paper leverage exceeds the selected OKX tier."
             if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v5":
@@ -231,11 +243,10 @@ class RiskEngine:
             return "Dynamic entry exceeds the portfolio stressed-loss budget."
         if final_notional <= 0 or final_notional > target_notional + 1e-8:
             return "Dynamic final notional exceeds or is missing from its target."
-        if not isclose(
+        if not persisted_product_isclose(
             planned_loss,
-            final_notional * stress_stop,
-            rel_tol=1e-9,
-            abs_tol=1e-8,
+            final_notional,
+            stress_stop,
         ):
             return "Dynamic risk contract notional and stressed loss are inconsistent."
         if not isclose(

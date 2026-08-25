@@ -97,6 +97,11 @@ async def test_system_audit_subprocess_reloads_matching_snapshot(
     assert captured["args"][-3:] == ("--source", "test_refresh", "--no-record-history")
     assert captured["kwargs"]["cwd"] == str(system_audit.PROJECT_ROOT)
     assert captured["kwargs"]["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert captured["kwargs"]["env"]["MALLOC_ARENA_MAX"] == "2"
+    assert captured["kwargs"]["env"]["OMP_NUM_THREADS"] == "1"
+    assert captured["kwargs"]["env"]["OPENBLAS_NUM_THREADS"] == "1"
+    assert captured["kwargs"]["start_new_session"] is (system_audit.os.name != "nt")
+    assert "preexec_fn" not in captured["kwargs"]
     assert system_audit._cached_system_audit_status() == (
         datetime.fromisoformat(checked_at),
         payload,

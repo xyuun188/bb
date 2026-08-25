@@ -9,13 +9,16 @@ from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
+from core.contract_math import persisted_product_isclose
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
@@ -24,6 +27,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v4_trade_contract_reasons,
     legacy_normal_paper_v5_trade_contract_reasons,
     legacy_normal_paper_v6_trade_contract_reasons,
+    legacy_normal_paper_v7_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import (
@@ -369,6 +373,8 @@ def summarize_trade_execution_contract(
             "optimization_target": PROFIT_TRAINING_TARGET,
             "paper_entry_requires_model_promotion": False,
             "paper_entry_requires_positive_return_lcb": True,
+            "paper_quality_observation_requires_positive_expected_net_return": True,
+            "paper_quality_observation_allows_non_positive_return_lcb": True,
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
@@ -835,11 +841,10 @@ def validate_paper_canary_entry_contract(
         )
     ):
         reasons.append("paper_canary_risk_budget_invalid")
-    if stress_fraction <= 0 or not isclose(
+    if stress_fraction <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress_fraction,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress_fraction,
     ):
         reasons.append("paper_canary_stressed_loss_algebra_mismatch")
     if final_notional <= 0 or (
@@ -1127,6 +1132,9 @@ def validate_normal_paper_entry_contract(
     legacy_quality_v6 = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION
     )
+    legacy_quality_v7 = (
+        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_fixed_leverage
@@ -1138,6 +1146,8 @@ def validate_normal_paper_entry_contract(
         if allow_legacy_settlement and legacy_quality_v5
         else legacy_normal_paper_v6_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_quality_v6
+        else legacy_normal_paper_v7_trade_contract_reasons(normal_trade)
+        if allow_legacy_settlement and legacy_quality_v7
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 
@@ -1174,9 +1184,30 @@ def validate_normal_paper_entry_contract(
         if legacy_fixed_leverage
         else LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION
         if legacy_dynamic_v3
+        else LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION
+        if (
+            legacy_objective_v4
+            or legacy_quality_v5
+            or legacy_quality_v6
+            or legacy_quality_v7
+        )
         else NORMAL_PAPER_TRADE_SIZING_VERSION
     )
-    if sizing.get("contract_version") != expected_sizing_version:
+    accepted_sizing_versions = {expected_sizing_version}
+    # Settling a persisted legacy trade may pair its historical decision
+    # envelope with the current sizing envelope.  Keep this compatibility
+    # limited to settlement; the entry gate still rejects legacy trade
+    # versions before any new order can be submitted.
+    if allow_legacy_settlement and (
+        legacy_fixed_leverage
+        or legacy_dynamic_v3
+        or legacy_objective_v4
+        or legacy_quality_v5
+        or legacy_quality_v6
+        or legacy_quality_v7
+    ):
+        accepted_sizing_versions.add(NORMAL_PAPER_TRADE_SIZING_VERSION)
+    if sizing.get("contract_version") not in accepted_sizing_versions:
         reasons.append("normal_paper_sizing_version_invalid")
     if sizing.get("contract_lifecycle") != "normal_paper_trade":
         reasons.append("normal_paper_sizing_lifecycle_invalid")
@@ -1199,11 +1230,10 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_planned_loss_invalid")
     if single_cap <= 0.0 or risk_budget > equity * single_cap + 1e-8:
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
-    if stress <= 0.0 or not isclose(
+    if stress <= 0.0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress,
     ):
         reasons.append("normal_paper_stressed_loss_algebra_mismatch")
     if (
@@ -1227,6 +1257,9 @@ def validate_normal_paper_entry_contract(
         if not isclose(leverage, 1.0, abs_tol=1e-8):
             reasons.append("normal_paper_leverage_invalid")
     else:
+        quality_observation = (
+            normal_trade.get("selection_reason") == "paper_quality_observation"
+        )
         dynamic_leverage = _safe_dict(sizing.get("dynamic_leverage_decision"))
         model_requested_leverage = _safe_float(
             sizing.get("model_requested_leverage"),
@@ -1236,6 +1269,8 @@ def validate_normal_paper_entry_contract(
             reasons.append("normal_paper_leverage_invalid")
         if tier_max_leverage < 1.0 or leverage > tier_max_leverage + 1e-8:
             reasons.append("normal_paper_leverage_exceeds_okx_tier")
+        if quality_observation and not isclose(leverage, 1.0, abs_tol=1e-8):
+            reasons.append("paper_quality_observation_leverage_not_one_x")
         expected_dynamic_leverage_version = (
             "dynamic_leverage_allocator_v4"
             if legacy_dynamic_v3
@@ -1372,11 +1407,10 @@ def validate_paper_training_entry_contract(
     equity = _safe_float(sizing.get("account_equity_usdt"))
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"))
     portfolio_budget = _safe_float(sizing.get("portfolio_risk_budget_usdt"))
-    if stress <= 0 or not isclose(
+    if stress <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress,
     ):
         reasons.append("paper_training_stressed_loss_algebra_mismatch")
     if (
@@ -1513,11 +1547,10 @@ def validate_paper_exploration_entry_contract(
         or portfolio_budget > equity * portfolio_cap + 1e-8
     ):
         reasons.append("paper_exploration_portfolio_risk_cap_exceeded")
-    if stress <= 0 or not isclose(
+    if stress <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress,
     ):
         reasons.append("paper_exploration_stressed_loss_algebra_mismatch")
     if final_notional <= 0 or final_notional > target_notional + 1e-8:
@@ -1738,11 +1771,10 @@ def build_live_rules_canary_entry_contract(
         reasons.append("rules_canary_sizing_provenance_incomplete")
     if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("rules_canary_risk_budget_algebra_invalid")
-    if stress_fraction <= 0 or not isclose(
+    if stress_fraction <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress_fraction,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress_fraction,
     ):
         reasons.append("rules_canary_stressed_loss_algebra_invalid")
     if final_notional <= 0 or final_notional > target_notional + 1e-8:
@@ -1911,11 +1943,10 @@ def validate_production_entry_contract(
     final_notional = _safe_float(sizing.get("final_notional_usdt"))
     if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("dynamic_risk_budget_algebra_invalid")
-    if stress_fraction <= 0 or not isclose(
+    if stress_fraction <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress_fraction,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress_fraction,
     ):
         reasons.append("dynamic_stressed_loss_algebra_invalid")
     if final_notional <= 0 or final_notional > target_notional + 1e-8:

@@ -663,6 +663,77 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
     assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
 
 
+def test_quality_observation_contract_passes_entry_gate_only_at_one_x() -> None:
+    decision = _profit_first_ready_position_review_decision()
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "fee_after_return_lcb_not_positive",
+            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="short",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.35,
+            "objective_net_return_pct": -0.2,
+            "loss_probability": 0.3,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": [
+                "fee_after_return_lcb_not_positive"
+            ],
+            "strong_expert_opposition": False,
+        },
+    )
+    raw = decision.raw_response
+    raw["opportunity_score"]["execution_cost"].update(
+        {"order_notional_usdt": 8.0}
+    )
+    raw["profit_risk_sizing"].update(
+        {
+            "risk_budget_usdt": 0.1,
+            "planned_stressed_loss_usdt": 0.08,
+            "stressed_loss_fraction": 0.01,
+            "target_notional_usdt": 8.0,
+            "final_notional_usdt": 8.0,
+            "fill_notional_ceiling_usdt": 10.0,
+            "final_margin_usdt": 8.0,
+            "final_leverage": 1.0,
+            "model_requested_leverage": 1.0,
+        }
+    )
+    raw["execution_cost_sizing_pass"].update(
+        {
+            "impact_basis_notional_usdt": 8.0,
+            "final_notional_usdt": 8.0,
+        }
+    )
+
+    contract, reasons = validate_entry_execution_contract(raw)
+    assert reasons == []
+    assert contract["selection_reason"] == "paper_quality_observation"
+    assert _return_entry_contract_result(decision, "paper").passed is True
+
+    raw["profit_risk_sizing"].update(
+        {
+            "final_margin_usdt": 4.0,
+            "final_leverage": 2.0,
+            "model_requested_leverage": 2.0,
+        }
+    )
+    _contract, reasons = validate_entry_execution_contract(raw)
+    assert "paper_quality_observation_leverage_not_one_x" in reasons
+
+
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:
     decision = _paper_training_ready_decision()
     contract, reasons = validate_entry_execution_contract(decision.raw_response)
@@ -884,6 +955,26 @@ def test_dynamic_return_contract_ignores_legacy_probe_fields_and_fails_closed() 
     assert result.passed is False
     assert result.blocker == "dynamic_return_execution_contract_incomplete"
     assert "return_policy_provenance_incomplete" in result.data["block_reasons"]
+
+
+def test_dynamic_return_contract_accepts_persisted_eight_decimal_risk_algebra() -> None:
+    decision = _dynamic_return_ready_decision()
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing.update(
+        {
+            "planned_stressed_loss_usdt": 1.28138362,
+            "stressed_loss_fraction": 0.0278756,
+            "final_notional_usdt": 45.96792255,
+            "final_margin_usdt": 15.32264085,
+        }
+    )
+    decision.raw_response["opportunity_score"]["execution_cost"][
+        "order_notional_usdt"
+    ] = 45.96792255
+
+    result = _return_entry_contract_result(decision)
+
+    assert result.passed is True
 
 
 @pytest.mark.asyncio

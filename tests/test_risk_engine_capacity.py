@@ -132,3 +132,19 @@ def test_risk_engine_rejects_notional_loss_algebra_mismatch() -> None:
 
     assert result.approved is False
     assert "inconsistent" in result.rejection_reason
+
+
+def test_risk_engine_accepts_persisted_eight_decimal_risk_algebra() -> None:
+    decision = _decision("GMT/USDT")
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing.update(
+        {
+            "planned_stressed_loss_usdt": 1.28138362,
+            "stressed_loss_fraction": 0.0278756,
+            "final_notional_usdt": 45.96792255,
+        }
+    )
+
+    result = RiskEngine().assess(decision, [], 1000.0)
+
+    assert result.approved is True

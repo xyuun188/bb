@@ -154,6 +154,35 @@ class EntryCandidateEvidencePolicy:
             if execution_sides
             else "neutral"
         )
+        paper_observation_sides = [
+            item
+            for item in (long_evidence, short_evidence)
+            if item["decision_eligible"] is True
+            and item["paper_eligible"] is True
+            and item["expected_net_return_pct"] > 0.0
+            and item["return_lcb_pct"] <= 0.0
+            and item["loss_probability"] <= 0.60
+            and item["score"] is not None
+            and _safe_dict(item.get("execution_cost")).get("production_eligible")
+            is True
+            and _safe_float(
+                _safe_dict(item.get("execution_cost")).get("total_pct"),
+                0.0,
+            )
+            > 0.0
+        ]
+        preferred_paper_observation_side = (
+            max(
+                paper_observation_sides,
+                key=lambda item: (
+                    item["expected_net_return_pct"],
+                    item["return_lcb_pct"],
+                    -item["loss_probability"],
+                ),
+            )["side"]
+            if not execution_sides and paper_observation_sides
+            else "neutral"
+        )
         generated_at = datetime.now(UTC).isoformat()
         return {
             "enabled": True,
@@ -161,6 +190,7 @@ class EntryCandidateEvidencePolicy:
             "is_entry_gate": False,
             "symbol": symbol,
             "preferred_side_by_evidence": preferred,
+            "preferred_paper_observation_side": preferred_paper_observation_side,
             "feature_opportunity_score": round(feature_score, 8),
             "long": long_evidence,
             "short": short_evidence,
@@ -173,7 +203,7 @@ class EntryCandidateEvidencePolicy:
                     for item in (long_evidence, short_evidence)
                 ),
                 "generated_at": generated_at,
-                "strategy_version": "2026-08-24.candidate-return-evidence.v2",
+                "strategy_version": "2026-08-25.candidate-return-evidence.v3",
                 "fallback_reason": (
                     ""
                     if execution_sides
@@ -184,7 +214,8 @@ class EntryCandidateEvidencePolicy:
             },
             "policy": (
                 "Compare fee-after return LCB for long and short. This context cannot grant "
-                "execution, position size, or leverage."
+                "execution, position size, or leverage. A paper observation side is diagnostic "
+                "only and remains subject to the signed quality-observation contract."
             ),
         }
 

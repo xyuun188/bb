@@ -361,14 +361,30 @@ class OKXExecutor(AbstractExecutor):
         ccxt = await self._get_ccxt()
         if self._markets_loaded and getattr(ccxt, "markets", None):
             return
-        if not hasattr(ccxt, "publicGetPublicInstruments"):
+        # The SDK-backed adapter exposes both legacy public and execution
+        # transports, but lightweight adapters may expose only the execution
+        # transport.  Treat either callable as sufficient for lazy loading;
+        # otherwise a fresh executor incorrectly marks an empty market table
+        # as loaded and every new symbol fails with "market is not loaded".
+        if not any(
+            callable(getattr(ccxt, name, None))
+            for name in ("executionGetPublicInstruments", "publicGetPublicInstruments")
+        ):
             self._markets_loaded = True
             return
         await self._load_usdt_swap_markets()
 
     def _is_missing_market_symbol_error(self, error: Any) -> bool:
         text = str(error or "").lower()
-        return "does not have market symbol" in text or "bad symbol" in text
+        return any(
+            marker in text
+            for marker in (
+                "does not have market symbol",
+                "bad symbol",
+                "market is not loaded",
+                "market not loaded",
+            )
+        )
 
     def _position_matches_symbol(self, position: dict[str, Any], symbol: str) -> bool:
         info = position.get("info") or {}
@@ -5828,7 +5844,12 @@ class OKXExecutor(AbstractExecutor):
                     )
                 return str(market.get("symbol") or candidate)
             except Exception as exc:
-                if isinstance(exc, ExchangeAPIError):
+                # A newly listed or execution-only swap may be absent from
+                # the local CCXT market cache even though OKX native
+                # endpoints can address its instId. Preserve the strict
+                # behavior for real API failures, but let missing-cache
+                # errors continue through native instId resolution.
+                if isinstance(exc, ExchangeAPIError) and not self._is_missing_market_symbol_error(exc):
                     raise
                 logger.debug(
                     "OKX candidate CCXT symbol not found; trying native instId mapping",
@@ -5871,7 +5892,23 @@ class OKXExecutor(AbstractExecutor):
                     )
                     return native_inst_id
                 return str(market["symbol"])
-            positions = await self.get_positions_strict(symbol)
+            try:
+                positions = await self.get_positions_strict(symbol)
+            except ExchangeAPIError as exc:
+                error_text = safe_error_text(exc, limit=220)
+                error_code = self._exchange_error_code(exc, error_text)
+                if error_code != "51001" and "[51001]" not in error_text:
+                    raise
+                # A missing position for an otherwise addressable native
+                # instrument is expected.  It must not turn symbol resolution
+                # into a hard failure; the direct native instId candidate is
+                # still usable by OKX execution endpoints.
+                logger.debug(
+                    "OKX position snapshot has no instrument while resolving swap symbol",
+                    symbol=symbol,
+                    error=error_text,
+                )
+                positions = []
             for position in positions or []:
                 info = position.get("info") or {}
                 native_position_symbol = str(
@@ -6296,10 +6333,19 @@ class OKXExecutor(AbstractExecutor):
                     "cache_hit": False,
                 }
                 blockers = set(compatibility.get("blockers") or ())
+                # Contract identity/instrument absence is durable, while a
+                # missing or drifting ticker is transient. Keep the executor
+                # cache aligned with the candidate-pool retry policy so a
+                # temporary market-data outage cannot suppress entries for
+                # hours after the market recovers.
+                transient_blockers = {
+                    "environment_price_drift_exceeded",
+                    "environment_price_missing",
+                }
                 ttl = (
-                    OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
-                    if "environment_price_drift_exceeded" in blockers
-                    else OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
+                    OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
+                    if blockers - transient_blockers
+                    else OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
                 )
                 self._entry_instrument_availability_cache[inst_id] = (
                     dict(result),

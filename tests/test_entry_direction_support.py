@@ -376,3 +376,89 @@ def test_v7_single_aligned_family_still_requires_positive_objective_net() -> Non
     assert "direction_support_objective_net_not_positive" in support[
         "blocking_reasons"
     ]
+
+
+def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
+    long_row = _row("local_ml", raw=0.45, objective=-0.20)
+    long_row["paper_return_quality_governance"] = {
+        "paper_execution_permission": False,
+        "paper_execution_reason": "fee_after_return_lcb_not_positive",
+        "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+        "paper_execution_evidence_source": "trusted_settlement",
+        "paper_execution_evidence": {"sample_count": 0},
+        "break_even_contract": {"return_lcb_above_zero": False},
+    }
+    support = assess_paper_model_trade_support(
+        {
+            "selected_horizon_minutes": 30.0,
+            "horizon_cohort_selection": {"selected_horizon_minutes": 30.0},
+            "long": {"evidence": [long_row]},
+            "short": {
+                "evidence": [_row("local_ml", raw=-0.2, objective=-0.4)]
+            },
+        },
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["expected_net_return_pct"] == pytest.approx(0.35)
+    assert support["objective_net_return_pct"] == pytest.approx(-0.30)
+    assert support["paper_quality_observation_only"] is True
+    assert directional_entry_support_reasons(support, "long") == []
+
+
+def test_negative_lcb_quality_observation_does_not_leak_into_production_support() -> None:
+    long_row = _row("local_ml", raw=0.45, objective=-0.20)
+    long_row["paper_return_quality_governance"] = {
+        "paper_execution_permission": False,
+        "paper_execution_reason": "fee_after_return_lcb_not_positive",
+        "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+    }
+    support = assess_directional_entry_support(
+        {
+            "long": {"evidence": [long_row]},
+            "short": {"evidence": [_row("local_ml", raw=-0.2, objective=-0.4)]},
+        },
+        [
+            _opinion("trend", "long", source_group="llm:trend"),
+            _opinion("momentum", "long", source_group="llm:momentum"),
+            _opinion("risk", "hold", source_group="llm:risk"),
+        ],
+        "long",
+        support_scope="governed_return_candidate",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is False
+    assert support["quant_evidence_families"] == []
+    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
+    assert support["production_permission"] is False
+
+
+def test_quality_observation_still_rejects_high_loss_probability() -> None:
+    long_row = _row("local_ml", raw=0.45, objective=-0.20)
+    long_row["return_distribution_contract"] = {"tail_loss_probability": 0.61}
+    long_row["paper_return_quality_governance"] = {
+        "paper_execution_permission": False,
+        "paper_execution_reason": "fee_after_return_lcb_not_positive",
+        "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+    }
+    support = assess_paper_model_trade_support(
+        {
+            "long": {"evidence": [long_row]},
+            "short": {
+                "evidence": [_row("local_ml", raw=-0.2, objective=-0.4)]
+            },
+        },
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is False
+    assert (
+        "direction_support_quality_observation_loss_probability_too_high"
+        in support["blocking_reasons"]
+    )

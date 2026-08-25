@@ -3967,9 +3967,19 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
     assert diagnostics["execution_availability"]["mode"] == model_mode
     await asyncio.sleep(0)
     assert service._verified_entry_symbols_by_mode[model_mode] == {"BTC/USDT", "ETH/USDT"}
+    assert set(service._unavailable_entry_symbols_by_mode[model_mode]) == {
+        "PI/USDT",
+        "LUNA/USDT",
+    }
     pi = next(item for item in diagnostics["ranked_symbol_sample"] if item["symbol"] == "PI/USDT")
     assert pi["selected"] is True
     assert pi["analysis_only"] is True
+    selected_next_round = await service._filter_entry_instrument_shortlist(
+        features,
+        2,
+        model_mode,
+    )
+    assert list(selected_next_round) == ["BTC/USDT", "ETH/USDT"]
     assert not hasattr(TradingService, "_is_pending_execution_reason")
     assert not hasattr(TradingService, "_pending_execution_failed_reason")
     assert not hasattr(TradingService, "_action_label")
@@ -4103,6 +4113,78 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
     assert ranked["PI/USDT"]["selected"] is True
     assert ranked["PI/USDT"]["analysis_only"] is True
     assert service._market_analysis_only_symbols == set()
+    await asyncio.sleep(0)
+    assert "PI/USDT" in service._unavailable_entry_symbols_by_mode["paper"]
+    assert "BTC/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
+    assert "ETH/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
+
+
+def test_entry_unavailable_classification_keeps_transient_failures_retryable() -> None:
+    temporary_outage = {
+        "available": False,
+        "reason": "okx_private_entry_instrument_temporarily_unverified",
+        "error_code": "50001",
+    }
+    price_drift = {
+        "available": False,
+        "reason": "okx_entry_live_execution_environment_incompatible",
+        "environment_compatibility": {
+            "blockers": ["environment_price_drift_exceeded"]
+        },
+    }
+    durable_mismatch = {
+            "available": False,
+            "reason": "okx_entry_live_execution_environment_incompatible",
+            "environment_compatibility": {
+                "blockers": [
+                    "environment_price_drift_exceeded",
+                    "execution_instrument_missing",
+                ]
+            },
+    }
+
+    assert TradingService._is_definitive_entry_unavailable(temporary_outage) is False
+    assert TradingService._entry_unavailable_cache_ttl(temporary_outage) is None
+    assert TradingService._is_definitive_entry_unavailable(price_drift) is False
+    assert TradingService._entry_unavailable_cache_ttl(price_drift) == (
+        trading_service.MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
+    )
+    assert TradingService._is_definitive_entry_unavailable(durable_mismatch) is True
+    assert TradingService._entry_unavailable_cache_ttl(durable_mismatch) == (
+        trading_service.MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
+    )
+
+
+def test_entry_unavailable_cache_survives_restart_and_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    service = TradingService.__new__(TradingService)
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    service._entry_unavailable_cache_persist_enabled = True
+    service._remember_unavailable_entry_symbol(
+        "paper",
+        "PI/USDT",
+        {
+            "available": False,
+            "reason": "okx_private_entry_instrument_unavailable",
+            "error_code": "51001",
+        },
+    )
+
+    restored = TradingService.__new__(TradingService)
+    restored._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    restored._load_unavailable_entry_symbol_cache()
+
+    assert "PI/USDT" in restored._unavailable_entry_symbols_by_mode["paper"]
+    restored._unavailable_entry_symbols_by_mode["paper"]["PI/USDT"]["expires_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    assert restored._entry_unavailable_cache_for_mode("paper") == {}
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():
@@ -7180,6 +7262,7 @@ def test_training_subprocess_environment_bounds_native_thread_pools() -> None:
     assert env["OMP_NUM_THREADS"] == "1"
     assert env["MKL_NUM_THREADS"] == "1"
     assert env["TORCH_NUM_THREADS"] == "1"
+    assert env["MALLOC_ARENA_MAX"] == "2"
 
 
 @pytest.mark.asyncio

@@ -999,6 +999,10 @@ class EnsembleCoordinator:
             )
             if normal_contract:
                 action = Action.LONG if selected_side == "long" else Action.SHORT
+                quality_observation = (
+                    normal_contract.get("selection_reason")
+                    == "paper_quality_observation"
+                )
                 loss_probability = self._finite_or_none(
                     selected_support.get("loss_probability")
                 )
@@ -1008,7 +1012,11 @@ class EnsembleCoordinator:
                 ) if loss_probability is not None else 0.5
                 reason = self._reason(
                     (
-                        "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做多"
+                        "模型扣费后期望收益为正但稳健下界尚未转正，执行极小风险模拟盘质量观察做多"
+                        if quality_observation and action == Action.LONG
+                        else "模型扣费后期望收益为正但稳健下界尚未转正，执行极小风险模拟盘质量观察做空"
+                        if quality_observation
+                        else "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做多"
                         if action == Action.LONG
                         else "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做空"
                     ),

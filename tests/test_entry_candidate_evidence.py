@@ -298,10 +298,41 @@ def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
     evidence = _policy(near_threshold_score).build(_Feature(), {}, {}, {}, {}, {})
 
     assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["preferred_paper_observation_side"] == "neutral"
     assert "preferred_exploration_side" not in evidence
     assert "paper_exploration" not in evidence
     assert evidence["long"]["expected_net_return_pct"] == 0.3
     assert evidence["long"]["return_distribution_ready"] is True
+
+
+def test_paper_positive_mean_negative_lcb_exposes_diagnostic_observation_side() -> None:
+    def observation_score(decision: DecisionOutput, _strategy: dict | None) -> float:
+        is_long = decision.action == Action.LONG
+        expected_net = 0.30 if is_long else -0.10
+        return_lcb = -0.10 if is_long else -0.20
+        raw = dict(decision.raw_response)
+        raw["opportunity_score"] = {
+            "score": return_lcb,
+            "expected_net_return_pct": expected_net,
+            "return_lcb_pct": return_lcb,
+            "server_profit_loss_probability": 0.30,
+            "execution_scope": "paper",
+            "decision_eligible": True,
+            "paper_eligible": True,
+            "production_eligible": False,
+            "return_distribution_contract": {"horizon_minutes": 30.0},
+            "execution_cost": {"production_eligible": True, "total_pct": 0.08},
+            "policy_provenance": {"sample_count": 3},
+        }
+        decision.raw_response = raw
+        return return_lcb
+
+    evidence = _policy(observation_score).build(_Feature(), {}, {}, {}, {}, {})
+
+    assert evidence["preferred_side_by_evidence"] == "neutral"
+    assert evidence["preferred_paper_observation_side"] == "long"
+    assert evidence["long"]["positive_fee_after_return_edge"] is False
+    assert evidence["long"]["production_eligible"] is False
 
 
 def test_legacy_exploration_maturity_is_not_exposed_to_new_entry_context() -> None:

@@ -17,6 +17,7 @@ from typing import Any
 import structlog
 
 from ai_brain.base_model import DecisionOutput
+from core.contract_math import persisted_product_isclose
 from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult, OrderStatus
@@ -184,11 +185,10 @@ def _return_entry_contract_result(
         reasons.append("sizing_contract_fingerprint_missing")
     if risk_budget <= 0 or planned_loss <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("sizing_risk_budget_invalid")
-    if stress_fraction <= 0 or not math.isclose(
+    if stress_fraction <= 0 or not persisted_product_isclose(
         planned_loss,
-        final_notional * stress_fraction,
-        rel_tol=1e-9,
-        abs_tol=1e-8,
+        final_notional,
+        stress_fraction,
     ):
         reasons.append("sizing_stressed_loss_algebra_mismatch")
     if final_notional <= 0 or final_notional > target_notional + 1e-8:

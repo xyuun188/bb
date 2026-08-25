@@ -8,6 +8,7 @@ import copy
 import inspect
 import json
 import os
+import signal
 import sys
 import time
 from collections import Counter
@@ -105,8 +106,10 @@ OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
-SYSTEM_AUDIT_MAX_CONCURRENCY = 4
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 600.0
+SYSTEM_AUDIT_MAX_CONCURRENCY = 2
+# Audits are diagnostic work and must not retain a large object graph for ten
+# minutes while the trading process is live.
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
@@ -5771,10 +5774,17 @@ def _reload_system_audit_status_cache() -> tuple[datetime, dict[str, Any]] | Non
 
 async def _stop_system_audit_subprocess(process: Any) -> None:
     if process.returncode is None:
+        pid = getattr(process, "pid", None)
         try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+            if pid and os.name != "nt":
+                os.killpg(int(pid), signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
     try:
         await process.wait()
     except ProcessLookupError:
@@ -5817,12 +5827,26 @@ async def _run_system_audit_subprocess_once(
         command.append("--no-record-history")
     process_env = os.environ.copy()
     process_env["PYTHONIOENCODING"] = "utf-8"
+
+    # Keep diagnostic work in its own process group so a timeout can reap the
+    # complete child tree without ever signalling the dashboard process.
+    process_env.update(
+        {
+            "MALLOC_ARENA_MAX": "2",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
     process = await asyncio.create_subprocess_exec(  # noqa: S603
         *command,
         cwd=str(PROJECT_ROOT),
         env=process_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=(os.name != "nt"),
     )
     try:
         stdout, stderr = await asyncio.wait_for(

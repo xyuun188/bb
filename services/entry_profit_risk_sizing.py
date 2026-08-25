@@ -1362,6 +1362,10 @@ class EntryProfitRiskSizingPolicy:
         raw = _safe_dict(decision.raw_response)
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
         contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
+        quality_observation_mode = bool(
+            normal_trade.get("selection_reason") == "paper_quality_observation"
+            and normal_trade.get("paper_quality_observation_only") is True
+        )
         opportunity = _safe_dict(raw.get("opportunity_score"))
         distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         execution_cost = _safe_dict(opportunity.get("execution_cost"))
@@ -1420,6 +1424,9 @@ class EntryProfitRiskSizingPolicy:
             ),
             1.0,
         )
+        if quality_observation_mode:
+            model_requested_leverage = 1.0
+            model_leverage_is_explicit = True
         model_position_fraction = _clamp(
             _safe_float(
                 prior_sizing.get("model_requested_position_fraction")
@@ -1473,7 +1480,21 @@ class EntryProfitRiskSizingPolicy:
         declared_stop = _normalized_ratio(decision.stop_loss_pct)
         declared_take_profit = _normalized_ratio(decision.take_profit_pct)
         volatility = _normalized_ratio(snapshot.get("volatility_20"))
-        stress_fraction = max(declared_stop, volatility, 0.01)
+        contract_return_lcb_pct = _safe_float(
+            normal_trade.get("objective_net_return_pct"),
+            0.0,
+        )
+        negative_lcb_stress_fraction = (
+            max(-contract_return_lcb_pct / 100.0, 0.0)
+            if quality_observation_mode
+            else 0.0
+        )
+        stress_fraction = max(
+            declared_stop,
+            volatility,
+            negative_lcb_stress_fraction,
+            0.01,
+        )
         single_trade_risk_fraction = min(
             max(
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
@@ -1526,7 +1547,9 @@ class EntryProfitRiskSizingPolicy:
             0.0,
         )
         requested_leverage = (
-            min(model_requested_leverage, max_leverage)
+            1.0
+            if quality_observation_mode
+            else min(model_requested_leverage, max_leverage)
             if model_leverage_is_explicit and max_leverage >= 1.0
             else max(max_leverage, 1.0)
         )
@@ -1676,6 +1699,8 @@ class EntryProfitRiskSizingPolicy:
             reasons.extend(leverage_decision.reasons)
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
+        if quality_observation_mode and abs(final_leverage - 1.0) > 1e-8:
+            reasons.append("paper_quality_observation_leverage_not_one_x")
         if final_notional <= 0:
             reasons.append("normal_paper_notional_zero")
         if minimum_order_notional <= 0.0:
@@ -1706,6 +1731,10 @@ class EntryProfitRiskSizingPolicy:
             "model_requested_notional_cap_usdt": model_requested_notional_cap,
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
+            "paper_quality_observation_mode": quality_observation_mode,
+            "paper_quality_observation_leverage_cap": (
+                1.0 if quality_observation_mode else None
+            ),
             "target_notional_usdt": target_notional,
             "minimum_order_notional_usdt": minimum_order_notional,
             "minimum_order_supported": minimum_order_supported,
@@ -1715,6 +1744,7 @@ class EntryProfitRiskSizingPolicy:
             "contract_step_fill_reserve_fraction": contract_step_fill_reserve_fraction,
             "final_notional_usdt": final_notional,
             "stressed_loss_fraction": stress_fraction,
+            "negative_lcb_stress_fraction": negative_lcb_stress_fraction,
             "expected_net_return_pct": expected_net,
             "return_lcb_pct": return_lcb,
             "dynamic_take_profit_fraction": dynamic_take_profit,
@@ -1803,6 +1833,10 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
+            "paper_quality_observation_mode": quality_observation_mode,
+            "paper_quality_observation_leverage_cap": (
+                1.0 if quality_observation_mode else None
+            ),
             "dynamic_leverage_decision": leverage_decision.to_dict(),
             "existing_position_leverage": (
                 round(existing_position_leverage, 8)
@@ -1813,6 +1847,10 @@ class EntryProfitRiskSizingPolicy:
             "expected_profit_usdt": round(final_notional * expected_net / 100.0, 8),
             "declared_stop_loss_fraction": round(declared_stop, 8),
             "stressed_loss_fraction": round(stress_fraction, 8),
+            "negative_lcb_stress_fraction": round(
+                negative_lcb_stress_fraction,
+                8,
+            ),
             "declared_take_profit_fraction": round(
                 declared_take_profit,
                 8,

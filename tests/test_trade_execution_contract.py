@@ -14,6 +14,7 @@ from services.trade_execution_contract import (
     _decision_report_projection,
     _is_authoritative_filled_order,
     summarize_trade_execution_contract,
+    validate_production_entry_contract,
 )
 from tests.paper_canary_fixtures import (
     bounded_legacy_fill_drift_raw,
@@ -329,6 +330,22 @@ def test_projected_adverse_funding_cannot_exceed_planned_trade_loss() -> None:
     assert report["violation_reason_counts"][
         "projected_adverse_funding_exceeds_planned_stressed_loss"
     ] == 1
+
+
+def test_production_contract_accepts_persisted_eight_decimal_risk_algebra() -> None:
+    raw = _entry_raw()
+    raw["profit_risk_sizing"].update(
+        {
+            "planned_stressed_loss_usdt": 1.28138362,
+            "stressed_loss_fraction": 0.0278756,
+            "final_notional_usdt": 45.96792255,
+        }
+    )
+
+    contract, reasons = validate_production_entry_contract(raw)
+
+    assert contract["contract_complete"] is True
+    assert reasons == []
 
 
 def test_non_positive_fee_after_return_cannot_execute() -> None:

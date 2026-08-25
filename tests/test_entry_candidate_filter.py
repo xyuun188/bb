@@ -233,3 +233,72 @@ def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -
         "reason": "full_paper_entry_contract_passed",
         "original_reason": "ranker_analysis_only_fill",
     }
+
+
+def test_known_unavailable_market_candidate_cannot_be_promoted() -> None:
+    service = object.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+    service._unavailable_entry_symbols_by_mode = {
+        "paper": {
+            "BTC/USDT": {
+                "available": False,
+                "reason": "okx_private_entry_instrument_unavailable",
+                "error_code": "51001",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        },
+        "live": {},
+    }
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    decision = _decision("BTC/USDT")
+    support = {
+        "eligible": True,
+        "selected_side": "long",
+        "prediction_horizon_minutes": 30.0,
+        "expected_net_return_pct": 0.3,
+        "objective_net_return_pct": 0.15,
+        "loss_probability": 0.35,
+        "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": {
+            "local_ml": {
+                "paper_execution_permission": True,
+                "paper_execution_reason": "authoritative_quality_above_break_even",
+                "paper_execution_evidence_source": "test_authoritative_trade",
+                "paper_execution_evidence": {
+                    "sample_count": 20,
+                    "average_return": 0.2,
+                    "return_lcb": 0.1,
+                    "profit_factor": 1.5,
+                    "profit_factor_above_break_even": True,
+                },
+                "break_even_contract": {
+                    "average_return_above_zero": True,
+                    "return_lcb_above_zero": True,
+                    "profit_factor_above_one": True,
+                },
+            }
+        },
+        "strong_expert_opposition": False,
+    }
+    decision.raw_response = {
+        "paper_trade_selection": {"selected": True},
+        "entry_permission": {"granted": True},
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="long",
+            selection_reason="strategy_edge_selected",
+            direction_support=support,
+        ),
+    }
+
+    reason = service._entry_gate_reason_with_market_boundary(decision)
+
+    assert reason is not None
+    assert decision.raw_response["market_analysis_only_contract"]["entry_permission"] is False

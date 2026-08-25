@@ -74,6 +74,11 @@ def test_dashboard_stays_running_while_model_tunnels_recover() -> None:
     assert "After=" in unit and "bb-model-tunnels.service" in unit
     assert "Wants=network-online.target bb-model-tunnels.service" in unit
     assert "Requires=bb-model-tunnels.service" not in unit
+    assert "Environment=MALLOC_ARENA_MAX=2" in unit
+    assert "Environment=OMP_NUM_THREADS=1" in unit
+    assert "MemoryHigh=3G" in unit
+    assert "MemoryMax=5G" in unit
+    assert "TasksMax=256" in unit
 
 
 def test_split_service_deploy_stops_model_consumers_before_tunnel_restart() -> None:

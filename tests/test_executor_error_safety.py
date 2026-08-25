@@ -408,8 +408,61 @@ class _IncompatibleEntryEnvironmentCcxt(_EntryInstrumentAvailabilityCcxt):
     async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"data": [self._instrument("BTC-USDT")]}
 
-    async def executionGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+    async def executionGetPublicInstruments(
+        self,
+        _params: dict[str, Any],
+    ) -> dict[str, Any]:
         return {"data": [self._instrument("TEST-USDT")]}
+
+    async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"last": "60000"}]}
+
+    async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{"last": "60000"}]}
+
+
+class _MissingMarketCacheCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+    markets: dict[str, Any] = {}
+    markets_by_id: dict[str, Any] = {}
+
+    def market(self, _symbol: str) -> dict[str, Any]:
+        raise ExchangeAPIError("OKX SDK market is not loaded: NEW-USDT:USDT")
+
+    async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "instType": "SWAP",
+                "instCategory": "1",
+                "state": "live",
+                "settleCcy": "USDT",
+                "uly": "BTC-USDT",
+                "ctType": "linear",
+                "ctVal": "0.01",
+                "ctValCcy": "BTC",
+                "minSz": "1",
+                "lotSz": "1",
+                "tickSz": "0.1",
+            }
+        ]}
+
+    async def executionGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+        return await self.publicGetPublicInstruments(_params)
+
+    def parse_markets(self, _instruments: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "BTC/USDT:USDT": {
+                "symbol": "BTC/USDT:USDT",
+                "id": "BTC-USDT-SWAP",
+                "info": {"instId": "BTC-USDT-SWAP"},
+            }
+        }
+
+    def set_markets(self, markets: dict[str, Any]) -> None:
+        self.markets = markets
+        self.markets_by_id = {"BTC-USDT-SWAP": markets["BTC/USDT:USDT"]}
 
     async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"data": [{"last": "60000"}]}
@@ -1769,6 +1822,51 @@ async def test_okx_resolve_swap_symbol_rejects_ccxt_alias_to_different_inst_id()
 
 
 @pytest.mark.asyncio
+async def test_okx_resolve_swap_symbol_falls_back_to_native_id_when_market_cache_is_missing() -> None:
+    executor = _executor(_MissingMarketCacheCcxt())
+    executor._markets_loaded = True
+
+    resolved = await executor._resolve_swap_symbol("NEW/USDT")
+
+    assert resolved == "NEW/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_okx_resolve_swap_symbol_treats_51001_position_lookup_as_no_position() -> None:
+    executor = _executor(_MissingMarketCacheCcxt())
+    executor._markets_loaded = True
+
+    async def missing_position(_symbol: str) -> list[dict[str, Any]]:
+        raise ExchangeAPIError(
+            "OKX API error [51001]: Instrument ID doesn't exist.",
+            code="51001",
+        )
+
+    executor.get_positions_strict = missing_position  # type: ignore[method-assign]
+
+    resolved = await executor._resolve_swap_symbol("NEW/USDT")
+
+    assert resolved == "NEW/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_okx_resolve_swap_symbol_keeps_non_51001_position_errors_strict() -> None:
+    executor = _executor(_MissingMarketCacheCcxt())
+    executor._markets_loaded = True
+
+    async def failed_position_lookup(_symbol: str) -> list[dict[str, Any]]:
+        raise ExchangeAPIError(
+            "OKX API error [50001]: Service temporarily unavailable.",
+            code="50001",
+        )
+
+    executor.get_positions_strict = failed_position_lookup  # type: ignore[method-assign]
+
+    with pytest.raises(ExchangeAPIError, match="50001"):
+        await executor._resolve_swap_symbol("NEW/USDT")
+
+
+@pytest.mark.asyncio
 async def test_okx_resolve_swap_symbol_ignores_mismatched_markets_by_id_alias() -> None:
     executor = _executor(_MarketsByIdAliasMismatchCcxt())
     executor._markets_loaded = True
@@ -1901,6 +1999,27 @@ async def test_okx_entry_instrument_prefilter_allows_demo_underlying_alias() -> 
     assert result["environment_compatibility"]["blockers"] == []
     assert result["environment_compatibility"]["warnings"] == ["uly_alias_mismatch"]
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_instrument_price_missing_uses_transient_cache_ttl() -> None:
+    exchange = _EntryInstrumentAvailabilityCcxt()
+    executor = _executor(exchange)
+
+    result = await executor.entry_instrument_availability(
+        "BTC/USDT",
+        environment_compatibility={
+            "checked": True,
+            "compatible": False,
+            "blockers": ["environment_price_missing"],
+        },
+    )
+
+    assert result["available"] is False
+    inst_id = okx_module.okx_inst_id_from_symbol("BTC/USDT")
+    cached_result, _cached_at, ttl = executor._entry_instrument_availability_cache[inst_id]
+    assert cached_result["reason"] == "okx_entry_live_execution_environment_incompatible"
+    assert ttl == okx_module.OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
 
 
 @pytest.mark.asyncio
@@ -2330,19 +2449,38 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                     {
                         "instId": "BTC-USDT-SWAP",
                         "instType": "SWAP",
+                        "instCategory": "1",
+                        "state": "live",
+                        "settleCcy": "USDT",
+                        "uly": "BTC-USDT",
                         "ctVal": "0.01",
                         "ctMult": "1",
                         "ctValCcy": "BTC",
+                        "minSz": "1",
+                        "lotSz": "1",
+                        "tickSz": "0.1",
                     }
                 ]
             }
+
+        def parse_markets(self, instruments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            return {
+                "BTC/USDT:USDT": {
+                    "symbol": "BTC/USDT:USDT",
+                    "id": "BTC-USDT-SWAP",
+                    "info": dict(instruments[0]),
+                }
+            }
+
+        def set_markets(self, markets: dict[str, dict[str, Any]]) -> None:
+            self.markets = markets
+            self.markets_by_id = {"BTC-USDT-SWAP": markets["BTC/USDT:USDT"]}
 
         async def privateGetAccountFeeRates(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params == {"instType": "SWAP"}
             return {"data": [{"taker": "-0.0005", "ts": "1780000000002"}]}
 
     executor = _executor(_PreOrderFactsCcxt())
-    executor._markets_loaded = True
 
     facts = await executor.pre_order_execution_facts("BTC/USDT", "long")
 

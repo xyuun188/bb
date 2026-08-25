@@ -8,10 +8,11 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-21.paper-model-direction.v10"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-08-25.paper-model-direction.v11"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
+MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -347,6 +348,48 @@ def assess_directional_entry_support(
     prediction_horizon_minutes = _float(
         quantitative.get("prediction_horizon_minutes")
     )
+    selected_evidence = _dict(competition.get(side)).get("evidence")
+    selected_evidence = selected_evidence if isinstance(selected_evidence, list) else []
+    cohort_sources = {
+        str(source)
+        for item in family_summaries
+        for source in item.get("sources") or []
+        if str(source).strip()
+    }
+    quant_quality_permissions: dict[str, dict[str, Any]] = {}
+    for value in selected_evidence:
+        row = _dict(value)
+        source = str(row.get("source") or "")
+        governance = _dict(row.get("paper_return_quality_governance"))
+        if source in cohort_sources and governance:
+            quant_quality_permissions[source] = {
+                key: governance.get(key)
+                for key in (
+                    "paper_execution_permission",
+                    "paper_execution_reason",
+                    "paper_execution_blockers",
+                    "paper_execution_evidence_source",
+                    "paper_execution_evidence",
+                    "break_even_contract",
+                )
+            }
+    quality_observation_reasons = sorted(
+        {
+            str(reason)
+            for permission in quant_quality_permissions.values()
+            if permission.get("paper_execution_permission") is not True
+            for reason in (
+                permission.get("paper_execution_blockers")
+                or [permission.get("paper_execution_reason")]
+            )
+            if str(reason).strip()
+        }
+    )
+    quality_observation_only = bool(quant_quality_permissions) and any(
+        permission.get("paper_execution_permission") is not True
+        for permission in quant_quality_permissions.values()
+    )
+
     if paper_scope:
         opposite_rows = _dict(competition.get(opposite_side)).get("evidence")
         opposite_summaries = _quant_family_summaries(
@@ -382,13 +425,19 @@ def assess_directional_entry_support(
             item["direction_aligned"] = aligned
             item["opposite_raw_expected_return_pct"] = opposite_raw
             item["opposite_objective_expected_return_pct"] = opposite_objective
-            positive_net = bool(
+            positive_expected_net = bool(
                 (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
-                and (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
             )
-            if aligned and positive_net:
+            positive_objective_net = bool(
+                (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
+            )
+            current_contract_ready = bool(
+                positive_expected_net
+                and (positive_objective_net or quality_observation_only)
+            )
+            if aligned and current_contract_ready:
                 directional_families.append(item)
-            elif positive_net:
+            elif current_contract_ready:
                 conflicting_families.append(item)
     else:
         directional_families = [
@@ -406,25 +455,6 @@ def assess_directional_entry_support(
         }
     )
     quant_families = sorted(str(item["family"]) for item in directional_families)
-    selected_evidence = _dict(competition.get(side)).get("evidence")
-    selected_evidence = selected_evidence if isinstance(selected_evidence, list) else []
-    quant_quality_permissions: dict[str, dict[str, Any]] = {}
-    for value in selected_evidence:
-        row = _dict(value)
-        source = str(row.get("source") or "")
-        governance = _dict(row.get("paper_return_quality_governance"))
-        if source in quantitative_sources and governance:
-            quant_quality_permissions[source] = {
-                key: governance.get(key)
-                for key in (
-                    "paper_execution_permission",
-                    "paper_execution_reason",
-                    "paper_execution_blockers",
-                    "paper_execution_evidence_source",
-                    "paper_execution_evidence",
-                    "break_even_contract",
-                )
-            }
     expected_net_return_pct = _float(quantitative.get("expected_net_return_pct"))
     objective_net_return_pct = _float(quantitative.get("objective_net_return_pct"))
     loss_probability = _float(quantitative.get("loss_probability"))
@@ -460,23 +490,6 @@ def assess_directional_entry_support(
     strong_expert_opposition = bool(
         len(opposition_groups) >= 2 and len(opposition) > len(aligned)
     )
-    quality_observation_reasons = sorted(
-        {
-            str(reason)
-            for permission in quant_quality_permissions.values()
-            if permission.get("paper_execution_permission") is not True
-            for reason in (
-                permission.get("paper_execution_blockers")
-                or [permission.get("paper_execution_reason")]
-            )
-            if str(reason).strip()
-        }
-    )
-    quality_observation_only = bool(quant_quality_permissions) and any(
-        permission.get("paper_execution_permission") is not True
-        for permission in quant_quality_permissions.values()
-    )
-
     blockers: list[str] = []
     if side not in {"long", "short"}:
         blockers.append("direction_support_side_missing")
@@ -486,10 +499,25 @@ def assess_directional_entry_support(
         expected_net_return_pct is None or expected_net_return_pct <= 0.0
     ):
         blockers.append("direction_support_expected_net_not_positive")
-    if paper_scope and (
-        objective_net_return_pct is None or objective_net_return_pct <= 0.0
+    if paper_scope and objective_net_return_pct is None:
+        blockers.append("direction_support_objective_net_missing")
+    elif (
+        paper_scope
+        and objective_net_return_pct <= 0.0
+        and not quality_observation_only
     ):
         blockers.append("direction_support_objective_net_not_positive")
+    if (
+        paper_scope
+        and quality_observation_only
+        and (
+            loss_probability is None
+            or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
+        )
+    ):
+        blockers.append(
+            "direction_support_quality_observation_loss_probability_too_high"
+        )
     if not quant_families:
         blockers.append("direction_support_quant_evidence_missing")
     if paper_scope and conflicting_families:
@@ -603,7 +631,10 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         if expected_net is None or expected_net <= 0.0:
             reasons.append("direction_support_expected_net_not_positive")
         objective_net = _float(support.get("objective_net_return_pct"))
-        if objective_net is None or objective_net <= 0.0:
+        observation_only = support.get("paper_quality_observation_only") is True
+        if objective_net is None:
+            reasons.append("direction_support_objective_net_missing")
+        elif objective_net <= 0.0 and not observation_only:
             reasons.append("direction_support_objective_net_not_positive")
     if not support.get("quant_evidence_families"):
         reasons.append("direction_support_quant_evidence_missing")
@@ -615,7 +646,6 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             reasons.append("direction_support_quant_family_conflict")
         if support.get("strong_expert_opposition") is True:
             reasons.append("direction_support_strong_expert_opposition")
-        observation_only = support.get("paper_quality_observation_only") is True
         observation_reasons = [
             str(reason)
             for reason in support.get("paper_quality_observation_reasons") or []
@@ -623,6 +653,14 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         ]
         if observation_only and not observation_reasons:
             reasons.append("direction_support_quality_observation_reason_missing")
+        loss_probability = _float(support.get("loss_probability"))
+        if observation_only and (
+            loss_probability is None
+            or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
+        ):
+            reasons.append(
+                "direction_support_quality_observation_loss_probability_too_high"
+            )
     else:
         if int(support.get("aligned_expert_count") or 0) < (
             MIN_GOVERNED_ALIGNED_EXPERT_COUNT

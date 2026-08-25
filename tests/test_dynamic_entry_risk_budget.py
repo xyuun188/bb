@@ -140,6 +140,46 @@ def _decision() -> DecisionOutput:
     return decision
 
 
+def _quality_observation_decision(*, return_lcb_pct: float = -3.3) -> DecisionOutput:
+    decision = _decision()
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "fee_after_return_lcb_not_positive",
+            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.82,
+            "objective_net_return_pct": return_lcb_pct,
+            "loss_probability": 0.30,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": [
+                "fee_after_return_lcb_not_positive"
+            ],
+            "strong_expert_opposition": False,
+        },
+    )
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["return_lcb_pct"] = return_lcb_pct
+    opportunity["return_distribution_contract"][
+        "objective_expected_return_pct"
+    ] = return_lcb_pct
+    decision.suggested_leverage = 20.0
+    return decision
+
+
 async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
     return 1000.0
 
@@ -388,6 +428,26 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
     assert decision.raw_response["profit_risk_sizing"]["production_eligible"] is True
     assert decision.suggested_leverage > 1.0
+
+
+@pytest.mark.asyncio
+async def test_quality_observation_forces_one_x_and_prices_negative_lcb_risk() -> None:
+    decision = _quality_observation_decision(return_lcb_pct=-3.3)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["paper_quality_observation_mode"] is True
+    assert sizing["final_leverage"] == 1.0
+    assert decision.suggested_leverage == 1.0
+    assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.033)
+    assert sizing["stressed_loss_fraction"] >= 0.033
+    assert sizing["risk_budget_usdt"] <= 0.1 + 1e-8
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assessment = RiskEngine().assess(decision, [], _balance)
+    assert assessment.approved is True, assessment.rejection_reason
 
 
 @pytest.mark.asyncio

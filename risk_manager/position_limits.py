@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from math import isclose
 from typing import Any
 
+from core.contract_math import persisted_product_isclose
+
 
 def _within_limit(value: float, limit: float) -> bool:
     return value <= limit or isclose(
@@ -179,11 +181,10 @@ class PositionLimitChecker:
         margin_limit = current_margin + available_margin
         notional_limit = current_notional + proposed_notional_capacity
 
-        contract_algebra_valid = isclose(
+        contract_algebra_valid = persisted_product_isclose(
             proposed_stop_risk,
-            proposed_notional * stress_fraction,
-            rel_tol=1e-9,
-            abs_tol=1e-8,
+            proposed_notional,
+            stress_fraction,
         )
 
         return ContractExposureSnapshot(
