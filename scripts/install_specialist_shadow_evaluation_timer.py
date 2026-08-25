@@ -40,14 +40,23 @@ def render_service(*, hours: int = 168) -> str:
             WorkingDirectory={REMOTE_APP_DIR}
             EnvironmentFile=-{REMOTE_APP_DIR}/.env
             EnvironmentFile=-/etc/bb/bb-runtime.env
+            Environment=MALLOC_ARENA_MAX=2
+            Environment=OMP_NUM_THREADS=1
+            Environment=MKL_NUM_THREADS=1
+            Environment=OPENBLAS_NUM_THREADS=1
+            Environment=NUMEXPR_NUM_THREADS=1
             ExecStart={REMOTE_APP_DIR}/.venv/bin/python {REMOTE_APP_DIR}/scripts/run_specialist_shadow_evaluation.py --hours {int(hours)} --output-dir {REPORT_DIR}
+            MemoryAccounting=true
+            MemoryHigh=2G
+            MemoryMax=3G
+            TasksMax=128
             """
         ).strip()
         + "\n"
     )
 
 
-def render_timer(*, minutes: int = 30) -> str:
+def render_timer(*, minutes: int = 360) -> str:
     return (
         textwrap.dedent(
             f"""
@@ -55,7 +64,7 @@ def render_timer(*, minutes: int = 30) -> str:
             Description=Run BB Phase 3 Specialist Shadow Evaluation every {int(minutes)} minutes
 
             [Timer]
-            OnBootSec=5min
+            OnActiveSec={int(minutes)}min
             OnUnitActiveSec={int(minutes)}min
             AccuracySec=1min
             Persistent=true
@@ -83,11 +92,11 @@ def install_command(*, minutes: int, hours: int) -> str:
             f"install -m 0644 /tmp/{SERVICE_NAME} /etc/systemd/system/{SERVICE_NAME}",
             f"install -m 0644 /tmp/{TIMER_NAME} /etc/systemd/system/{TIMER_NAME}",
             "systemctl daemon-reload",
+            f"systemctl reset-failed {SERVICE_NAME} || true",
             f"systemctl enable --now {TIMER_NAME}",
-            f"systemctl start {SERVICE_NAME}",
             f"systemctl is-active {TIMER_NAME}",
             f"systemctl status {SERVICE_NAME} --no-pager -n 20 || true",
-            f"test -f {sh(REPORT_DIR + '/specialist_shadow_evaluation_latest.json')}",
+            f"test -d {sh(REPORT_DIR)}",
             "printf 'paper='; systemctl is-active bb-paper-trading.service || true",
         ]
     )
@@ -97,7 +106,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Install a read-only Phase 3 specialist shadow evaluation timer."
     )
-    parser.add_argument("--minutes", type=int, default=30)
+    parser.add_argument("--minutes", type=int, default=360)
     parser.add_argument("--hours", type=int, default=168)
     args = parser.parse_args()
 

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from config.settings import settings
 from core.symbols import normalize_trading_symbol, symbol_from_okx_inst_id
@@ -141,6 +141,7 @@ async def load_okx_position_history_records(
     session: Any,
     *,
     mode: str | None,
+    since: datetime | None = None,
     limit: int = 5000,
 ) -> list[OkxPositionHistory]:
     stmt = select(OkxPositionHistory).order_by(
@@ -150,6 +151,19 @@ async def load_okx_position_history_records(
     )
     if mode:
         stmt = stmt.where(OkxPositionHistory.mode == mode)
+    since_utc = _as_utc(since) if since is not None else None
+    if since_utc is not None:
+        # Keep the window restriction in SQL.  Shadow/evaluation jobs must not
+        # materialize the complete training epoch before applying ``since``.
+        stmt = stmt.where(
+            or_(
+                OkxPositionHistory.updated_at_okx >= since_utc,
+                (
+                    OkxPositionHistory.updated_at_okx.is_(None)
+                    & (OkxPositionHistory.opened_at >= since_utc)
+                ),
+            )
+        )
     safe_limit = max(1, int(limit or 1))
     result = await session.execute(stmt.limit(min(safe_limit * 4, 20000)))
     records: list[OkxPositionHistory] = []

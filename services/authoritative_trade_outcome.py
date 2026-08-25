@@ -162,6 +162,17 @@ def _filter_compact_outcomes(
     return list(rows)
 
 
+def _history_matches_since(history: Any, since: datetime | None) -> bool:
+    since_utc = _as_utc(since)
+    if since_utc is None:
+        return True
+    updated_at = _as_utc(getattr(history, "updated_at_okx", None))
+    if updated_at is not None:
+        return updated_at >= since_utc
+    opened_at = _as_utc(getattr(history, "opened_at", None))
+    return opened_at is not None and opened_at >= since_utc
+
+
 def _profit_label_contract(
     sample: dict[str, Any],
     *,
@@ -505,6 +516,7 @@ async def load_authoritative_trade_outcomes(
     limit: int | None = None,
     compact: bool = False,
     include_training_features: bool = False,
+    include_decision_evidence: bool = False,
     session_factory: Callable[[], AbstractAsyncContextManager[Any]] = get_read_session_ctx,
     _force_compact_refresh: bool = False,
 ) -> list[dict[str, Any]]:
@@ -518,6 +530,8 @@ async def load_authoritative_trade_outcomes(
     cache_enabled = bool(
         compact
         and not include_training_features
+        and not include_decision_evidence
+        and since is None
         and session_factory is get_read_session_ctx
         and str(settings.database_url or "").startswith("postgresql")
     )
@@ -558,6 +572,7 @@ async def load_authoritative_trade_outcomes(
         histories = await load_okx_position_history_records(
             session,
             mode=requested_mode,
+            since=requested_since,
             limit=requested_limit,
         )
         since_utc = _as_utc(requested_since)
@@ -565,8 +580,7 @@ async def load_authoritative_trade_outcomes(
             histories = [
                 history
                 for history in histories
-                if (_as_utc(history.updated_at_okx) or datetime.min.replace(tzinfo=UTC))
-                >= since_utc
+                if _history_matches_since(history, since_utc)
             ]
         if requested_result_limit is not None:
             histories = histories[:requested_limit]
@@ -789,7 +803,7 @@ async def load_authoritative_trade_outcomes(
             reflection=reflection,
             shadow_rows=shadows_by_decision_id.get(int(sample.get("decision_id") or 0), []),
         )
-        if compact:
+        if compact and not include_decision_evidence:
             outcome.pop("raw_llm_response", None)
         results.append(outcome)
     results.reverse()

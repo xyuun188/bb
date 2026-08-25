@@ -23,14 +23,25 @@ def test_specialist_shadow_evaluation_service_is_read_only_oneshot() -> None:
     assert "bb-paper-trading.service" not in service
     assert "systemctl start" not in service
     assert "live" not in service.lower()
+    assert "Environment=MALLOC_ARENA_MAX=2" in service
+    assert "Environment=OMP_NUM_THREADS=1" in service
+    assert "MemoryHigh=2G" in service
+    assert "MemoryMax=3G" in service
+    assert "TasksMax=128" in service
 
 
 def test_specialist_shadow_evaluation_timer_runs_periodically() -> None:
     timer = render_timer(minutes=15)
 
     assert f"Unit={SERVICE_NAME}" in timer
+    assert "OnActiveSec=15min" in timer
     assert "OnUnitActiveSec=15min" in timer
+    assert "OnBootSec" not in timer
     assert "Persistent=true" in timer
+
+
+def test_specialist_shadow_evaluation_timer_defaults_to_six_hours() -> None:
+    assert "OnUnitActiveSec=360min" in render_timer()
 
 
 def test_specialist_shadow_evaluation_install_command_keeps_paper_inactive_probe() -> None:
@@ -38,9 +49,12 @@ def test_specialist_shadow_evaluation_install_command_keeps_paper_inactive_probe
 
     assert SERVICE_NAME in command
     assert TIMER_NAME in command
+    assert "systemctl reset-failed bb-specialist-shadow-evaluation.service" in command
     assert "systemctl enable --now bb-specialist-shadow-evaluation.timer" in command
-    assert "systemctl start bb-specialist-shadow-evaluation.service" in command
+    assert "systemctl start bb-specialist-shadow-evaluation.service" not in command
     assert f"install -d -o 'bb' -g 'bb' -m 0775 '{REPORT_DIR}'" in command
+    assert f"test -d '{REPORT_DIR}'" in command
+    assert "specialist_shadow_evaluation_latest.json" not in command
     assert "systemctl is-active bb-paper-trading.service" in command
     assert "systemctl start bb-paper-trading.service" not in command
 

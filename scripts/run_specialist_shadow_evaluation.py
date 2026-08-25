@@ -6,7 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,15 +22,34 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
-from scripts.train_local_ai_tools_models import (  # noqa: E402
-    _load_trade_samples,
+from services.authoritative_trade_outcome import (  # noqa: E402
+    load_authoritative_trade_outcomes,
 )
 from services.specialist_shadow_evaluation import (  # noqa: E402
     DEFAULT_WINDOW_HOURS,
     SpecialistShadowEvaluationService,
 )
+from services.training_epoch import load_training_epoch_start  # noqa: E402
 
 DEFAULT_REPORT_DIR = "phase3"
+
+
+def _evaluation_since(*, hours: int, now: datetime | None = None) -> datetime:
+    capped_hours = max(1, min(int(hours or DEFAULT_WINDOW_HOURS), 24 * 90))
+    reference_time = now or datetime.now(UTC)
+    return max(reference_time - timedelta(hours=capped_hours), load_training_epoch_start())
+
+
+async def _load_evaluation_trade_samples(
+    *,
+    hours: int,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    return await load_authoritative_trade_outcomes(
+        since=_evaluation_since(hours=hours, now=now),
+        compact=True,
+        include_decision_evidence=True,
+    )
 
 
 def _safe_report_name(timestamp: str) -> str:
@@ -57,7 +76,7 @@ async def _main() -> None:
     parser.add_argument("--json-indent", type=int, default=2)
     args = parser.parse_args()
 
-    authoritative_trade_samples = await _load_trade_samples()
+    authoritative_trade_samples = await _load_evaluation_trade_samples(hours=args.hours)
     report = await SpecialistShadowEvaluationService().report(
         hours=args.hours,
         authoritative_trade_samples=authoritative_trade_samples,

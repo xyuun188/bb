@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +17,7 @@ from services.authoritative_trade_outcome import (
     load_authoritative_trade_outcomes,
 )
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+from services.okx_position_history_store import load_okx_position_history_records
 from services.training_data_quality import annotate_training_payload
 
 
@@ -334,5 +335,87 @@ async def test_authoritative_loader_deduplicates_legacy_and_canonical_history_ro
         assert outcomes[0]["lifecycle_key"] == (
             "paper|ICP-USDT-SWAP|dedupe-pos|short|1782579311213"
         )
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_history_loader_filters_evaluation_window_in_sql(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'history-window.db').as_posix()}",
+    )
+    await init_db()
+    cutoff = datetime(2026, 8, 18, 12, tzinfo=UTC)
+
+    def history(
+        *,
+        pos_id: str,
+        opened_at: datetime,
+        updated_at_okx: datetime | None,
+    ) -> OkxPositionHistory:
+        opened_ms = int(opened_at.timestamp() * 1000)
+        updated_ms = int(updated_at_okx.timestamp() * 1000) if updated_at_okx else 0
+        raw_row = {
+            "instId": "BTC-USDT-SWAP",
+            "posId": pos_id,
+            "posSide": "long",
+            "type": "2",
+            "cTime": str(opened_ms),
+            "uTime": str(updated_ms) if updated_ms else "",
+            "openMaxPos": "1",
+            "closeTotalPos": "1",
+        }
+        return OkxPositionHistory(
+            mode="paper",
+            row_identity=f"paper|BTC-USDT-SWAP|{pos_id}|long|{opened_ms}",
+            inst_id="BTC-USDT-SWAP",
+            symbol="BTC/USDT",
+            pos_id=pos_id,
+            pos_side="long",
+            side="long",
+            opened_at=opened_at,
+            updated_at_okx=updated_at_okx,
+            raw_row=raw_row,
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    history(
+                        pos_id="old",
+                        opened_at=cutoff - timedelta(days=20),
+                        updated_at_okx=cutoff - timedelta(days=10),
+                    ),
+                    history(
+                        pos_id="recent-update",
+                        opened_at=cutoff - timedelta(days=20),
+                        updated_at_okx=cutoff + timedelta(hours=1),
+                    ),
+                    history(
+                        pos_id="recent-open-no-update",
+                        opened_at=cutoff + timedelta(hours=2),
+                        updated_at_okx=None,
+                    ),
+                ]
+            )
+
+        async with get_session_ctx() as session:
+            records = await load_okx_position_history_records(
+                session,
+                mode="paper",
+                since=cutoff,
+            )
+
+        assert {record.pos_id for record in records} == {
+            "recent-update",
+            "recent-open-no-update",
+        }
     finally:
         await close_db()
