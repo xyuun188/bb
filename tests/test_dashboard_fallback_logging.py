@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -804,3 +805,43 @@ async def test_dashboard_okx_positions_stale_cache_returns_before_refresh(
 
     assert result == [{"symbol": "OLD/USDT:USDT", "side": "long", "contracts": 1}]
     assert refresh_calls == ["paper"]
+
+
+async def test_dashboard_okx_position_lock_timeout_returns_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = object()
+
+    class StableTradingService:
+        def okx_executor_for_dashboard(self, mode: str) -> object:
+            assert mode == "paper"
+            return executor
+
+    locked = asyncio.Lock()
+    await locked.acquire()
+    monkeypatch.setattr(dashboard, "_trading_service", StableTradingService())
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_cache",
+        {
+            "paper": (
+                datetime.now(UTC) - timedelta(minutes=10),
+                [{"symbol": "STALE/USDT:USDT", "side": "short", "contracts": 2}],
+                executor,
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_locks", {"paper": locked})
+    monkeypatch.setattr(dashboard, "_DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        result = await asyncio.wait_for(
+            dashboard._fetch_dashboard_okx_positions("paper"),
+            timeout=0.2,
+        )
+    finally:
+        locked.release()
+
+    assert result == [{"symbol": "STALE/USDT:USDT", "side": "short", "contracts": 2}]
+    assert "paper" in dashboard._dashboard_okx_position_error_cache

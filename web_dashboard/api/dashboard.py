@@ -118,6 +118,9 @@ _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 8.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS = 4.0
+_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 10.0
+_DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
@@ -296,6 +299,65 @@ def _consume_dashboard_refresh_task(
             )
 
     return _done
+
+
+def _consume_detached_dashboard_task(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:
+        return
+
+
+async def _await_dashboard_operation_bounded(
+    operation: Awaitable[Any],
+    *,
+    timeout_seconds: float,
+    label: str,
+) -> Any:
+    """Return or fail on deadline without waiting for cancellation cleanup."""
+
+    task = asyncio.create_task(operation)
+    done, _pending = await asyncio.wait({task}, timeout=max(float(timeout_seconds), 0.01))
+    if task in done:
+        return task.result()
+    task.cancel()
+    task.add_done_callback(_consume_detached_dashboard_task)
+    raise TimeoutError(f"{label} timed out after {timeout_seconds:g}s")
+
+
+async def _shutdown_dashboard_client_bounded(
+    operation: Awaitable[Any],
+    *,
+    label: str,
+    mode: str | None = None,
+) -> None:
+    try:
+        await _await_dashboard_operation_bounded(
+            operation,
+            timeout_seconds=_DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS,
+            label=label,
+        )
+    except Exception as exc:
+        _log_dashboard_fallback(f"{label} failed", exc, mode=mode)
+
+
+async def _acquire_dashboard_lock(
+    lock: asyncio.Lock,
+    *,
+    label: str,
+) -> None:
+    try:
+        await _await_dashboard_operation_bounded(
+            lock.acquire(),
+            timeout_seconds=_DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS,
+            label=f"{label} lock",
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"{label} lock timed out after {_DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS:g}s"
+        ) from exc
 
 
 async def _refresh_dashboard_okx_position_cache(selected_mode: str) -> None:
@@ -2749,7 +2811,8 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
             return audit
 
     lock = _dashboard_okx_protection_locks.setdefault(selected_mode, asyncio.Lock())
-    async with lock:
+    await _acquire_dashboard_lock(lock, label="dashboard OKX protection audit")
+    try:
         cached = _dashboard_okx_protection_cache.get(selected_mode)
         if cached is not None:
             cached_at, audit = cached
@@ -2813,14 +2876,13 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
             return audit
         finally:
             if owns_executor:
-                try:
-                    await executor.shutdown()
-                except Exception as exc:
-                    _log_dashboard_fallback(
-                        "dashboard okx protection fallback shutdown failed",
-                        exc,
-                        mode=selected_mode,
-                    )
+                await _shutdown_dashboard_client_bounded(
+                    executor.shutdown(),
+                    label="dashboard okx protection fallback shutdown",
+                    mode=selected_mode,
+                )
+    finally:
+        lock.release()
 
 
 async def _dashboard_open_position_protection_evidence(
@@ -2928,6 +2990,40 @@ async def _dashboard_open_position_protection_evidence(
     }
 
 
+async def _dashboard_open_position_evidence_bounded(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> tuple[Any, Any]:
+    operations = {
+        "risk": asyncio.create_task(
+            _dashboard_open_position_risk_evidence(positions, mode=mode)
+        ),
+        "protection": asyncio.create_task(
+            _dashboard_open_position_protection_evidence(positions, mode=mode)
+        ),
+    }
+    done, _pending = await asyncio.wait(
+        set(operations.values()),
+        timeout=_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS,
+    )
+    results: dict[str, Any] = {}
+    for label, task in operations.items():
+        if task not in done:
+            task.cancel()
+            task.add_done_callback(_consume_detached_dashboard_task)
+            results[label] = TimeoutError(
+                f"open position {label} evidence timed out after "
+                f"{_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS:g}s"
+            )
+            continue
+        try:
+            results[label] = task.result()
+        except BaseException as exc:
+            results[label] = exc
+    return results["risk"], results["protection"]
+
+
 async def _fetch_dashboard_okx_positions_uncached(
     selected_mode: str,
     executor: Any | None = None,
@@ -2986,7 +3082,18 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             raise RuntimeError(cached_text)
 
     lock = _dashboard_okx_position_locks.setdefault(selected_mode, asyncio.Lock())
-    async with lock:
+    try:
+        await _acquire_dashboard_lock(lock, label="dashboard OKX position cache")
+    except TimeoutError as exc:
+        _dashboard_okx_position_error_cache[selected_mode] = (
+            datetime.now(UTC),
+            _dashboard_okx_error_text(exc, resource="positions"),
+            executor_identity,
+        )
+        if cached:
+            return copy.deepcopy(cached[1])
+        raise
+    try:
         now = datetime.now(UTC)
         cached = _dashboard_okx_position_cache.get(selected_mode)
         if cached:
@@ -3038,6 +3145,8 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
         )
         _dashboard_okx_position_error_cache.pop(selected_mode, None)
         return normalized_positions
+    finally:
+        lock.release()
 
 
 async def _dashboard_okx_balance_snapshot_for_mode(mode: str) -> dict[str, Any] | None:
@@ -3098,7 +3207,14 @@ async def _dashboard_read_only_okx_executor(
     if lock is None or (lock_loop is not None and lock_loop is not current_loop):
         lock = asyncio.Lock()
         _dashboard_read_only_okx_executor_locks[selected_mode] = lock
-    async with lock:
+    try:
+        await _acquire_dashboard_lock(lock, label="dashboard read-only OKX executor")
+    except TimeoutError:
+        cached = _dashboard_read_only_okx_executors.get(selected_mode)
+        if cached is not None:
+            return cached
+        raise
+    try:
         cached = _dashboard_read_only_okx_executors.get(selected_mode)
         cached_loop = _dashboard_read_only_okx_executor_loops.get(selected_mode)
         if cached is not None and cached_loop is not None and cached_loop is not current_loop:
@@ -3112,14 +3228,11 @@ async def _dashboard_read_only_okx_executor(
         ):
             return cached
         if cached is not None:
-            try:
-                await cached.shutdown()
-            except Exception as exc:
-                _log_dashboard_fallback(
-                    "dashboard replaced read-only okx executor shutdown failed",
-                    exc,
-                    mode=selected_mode,
-                )
+            await _shutdown_dashboard_client_bounded(
+                cached.shutdown(),
+                label="dashboard replaced read-only okx executor shutdown",
+                mode=selected_mode,
+            )
             _dashboard_read_only_okx_executors.pop(selected_mode, None)
             _dashboard_read_only_okx_executor_factories.pop(selected_mode, None)
             _dashboard_read_only_okx_executor_loops.pop(selected_mode, None)
@@ -3133,19 +3246,18 @@ async def _dashboard_read_only_okx_executor(
                 ),
             )
         except Exception:
-            try:
-                await executor.shutdown()
-            except Exception as shutdown_exc:
-                _log_dashboard_fallback(
-                    "dashboard read-only okx executor shutdown failed",
-                    shutdown_exc,
-                    mode=selected_mode,
-                )
+            await _shutdown_dashboard_client_bounded(
+                executor.shutdown(),
+                label="dashboard read-only okx executor shutdown",
+                mode=selected_mode,
+            )
             raise
         _dashboard_read_only_okx_executors[selected_mode] = executor
         _dashboard_read_only_okx_executor_factories[selected_mode] = OKXExecutor
         _dashboard_read_only_okx_executor_loops[selected_mode] = current_loop
         return executor
+    finally:
+        lock.release()
 
 
 async def _dashboard_rest_client() -> Any:
@@ -3247,7 +3359,14 @@ async def shutdown_dashboard_read_clients() -> None:
     for task in tasks:
         task.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        done, pending = await asyncio.wait(
+            set(tasks),
+            timeout=_DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        for task in done:
+            _consume_detached_dashboard_task(task)
+        for task in pending:
+            task.add_done_callback(_consume_detached_dashboard_task)
     _dashboard_closed_ledger_refresh_tasks.clear()
     _dashboard_okx_protection_cache.clear()
     _dashboard_okx_protection_locks.clear()
@@ -3257,26 +3376,26 @@ async def shutdown_dashboard_read_clients() -> None:
     _dashboard_read_only_okx_executor_locks.clear()
     _dashboard_read_only_okx_executor_loops.clear()
     for executor in executors:
-        try:
-            await executor.shutdown()
-        except Exception as exc:
-            _log_dashboard_fallback("dashboard read-only okx executor shutdown failed", exc)
+        await _shutdown_dashboard_client_bounded(
+            executor.shutdown(),
+            label="dashboard read-only okx executor shutdown",
+        )
     rest_client = _dashboard_public_rest_client
     _dashboard_public_rest_client = None
     _dashboard_public_rest_client_factory = None
     _dashboard_public_rest_client_lock = None
     if rest_client is not None:
-        try:
-            await rest_client.close()
-        except Exception as exc:
-            _log_dashboard_fallback("dashboard public ticker client close failed", exc)
+        await _shutdown_dashboard_client_bounded(
+            rest_client.close(),
+            label="dashboard public ticker client close",
+        )
     local_ai_tools = _local_ai_tools_status_client
     _local_ai_tools_status_client = None
     if local_ai_tools is not None:
-        try:
-            await local_ai_tools.close()
-        except Exception as exc:
-            _log_dashboard_fallback("dashboard local AI tools client close failed", exc)
+        await _shutdown_dashboard_client_bounded(
+            local_ai_tools.close(),
+            label="dashboard local AI tools client close",
+        )
 
 
 def _dashboard_ml_signal_service() -> Any | None:
@@ -7659,10 +7778,9 @@ async def get_positions(
             exchange_mark_map,
             mode=mode,
         )
-        risk_result, protection_result = await asyncio.gather(
-            _dashboard_open_position_risk_evidence(positions, mode=mode),
-            _dashboard_open_position_protection_evidence(positions, mode=mode),
-            return_exceptions=True,
+        risk_result, protection_result = await _dashboard_open_position_evidence_bounded(
+            positions,
+            mode=mode,
         )
         if isinstance(risk_result, BaseException):
             _log_dashboard_fallback(

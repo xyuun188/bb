@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,38 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 HTML = (ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 STYLE = (ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_open_position_evidence_deadline_does_not_hang_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never_returns(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_open_position_risk_evidence",
+        never_returns,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_open_position_protection_evidence",
+        never_returns,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    risk_result, protection_result = await asyncio.wait_for(
+        dashboard._dashboard_open_position_evidence_bounded([], mode="paper"),
+        timeout=0.2,
+    )
+
+    assert isinstance(risk_result, TimeoutError)
+    assert isinstance(protection_result, TimeoutError)
 
 
 def test_market_direction_without_execution_permission_is_displayed_as_observation() -> None:
