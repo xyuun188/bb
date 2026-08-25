@@ -43,7 +43,7 @@ def test_specialist_shadow_evaluation_script_imports_online_runtime_bootstrap() 
     assert "from scripts.runtime_env_bootstrap import" in source
     assert "load_runtime_env_files(project_root=ROOT)" in source
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
-    assert "_load_trade_samples" in source
+    assert "_load_evaluation_trade_samples" in source
     assert "authoritative_trade_samples=authoritative_trade_samples" in source
 
 

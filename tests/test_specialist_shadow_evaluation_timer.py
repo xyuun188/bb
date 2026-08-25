@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts.install_specialist_shadow_evaluation_timer import (
+    DEFAULT_TIMER_MINUTES,
     REPORT_DIR,
     REPORT_OWNER,
     SERVICE_NAME,
@@ -40,8 +41,11 @@ def test_specialist_shadow_evaluation_timer_runs_periodically() -> None:
     assert "Persistent=true" in timer
 
 
-def test_specialist_shadow_evaluation_timer_defaults_to_six_hours() -> None:
-    assert "OnUnitActiveSec=360min" in render_timer()
+def test_specialist_shadow_evaluation_timer_default_stays_inside_report_freshness_window() -> None:
+    assert DEFAULT_TIMER_MINUTES == 90
+    timer = render_timer()
+    assert f"OnUnitActiveSec={DEFAULT_TIMER_MINUTES}min" in timer
+    assert DEFAULT_TIMER_MINUTES < 2 * 60
 
 
 def test_specialist_shadow_evaluation_install_command_keeps_paper_inactive_probe() -> None:

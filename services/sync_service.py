@@ -55,6 +55,7 @@ from services.position_settlement import (
     settlement_payload_fields,
 )
 from services.trade_fact_trust import TRUSTED_OKX_ORDER_SYNC_STATUSES
+from services.trade_execution_contract import validate_entry_contract_lineage
 
 logger = structlog.get_logger(__name__)
 
@@ -2498,6 +2499,50 @@ class OkxSyncService:
                 if str(order.exchange_order_id or "").strip()
             }
 
+        decision_ids = {
+            int(order.decision_id)
+            for order in orders_by_id.values()
+            if getattr(order, "decision_id", None)
+        }
+        decisions_by_id: dict[int, Any] = {}
+        if decision_ids:
+            decision_result = await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.was_executed,
+                    AIDecision.decision_learning_snapshot,
+                ).where(AIDecision.id.in_(decision_ids))
+            )
+            decisions_by_id = {
+                int(row.id): SimpleNamespace(
+                    id=row.id,
+                    symbol=row.symbol,
+                    action=row.action,
+                    was_executed=row.was_executed,
+                    raw_llm_response=dict(row.decision_learning_snapshot or {}),
+                )
+                for row in decision_result.all()
+                if row.id is not None
+            }
+            missing_snapshot_ids = {
+                decision_id
+                for decision_id, decision in decisions_by_id.items()
+                if not _dict_value(decision.raw_llm_response).get("profit_risk_sizing")
+            }
+            if missing_snapshot_ids:
+                legacy_result = await session.execute(
+                    select(
+                        AIDecision.id,
+                        AIDecision.raw_llm_response,
+                    ).where(AIDecision.id.in_(missing_snapshot_ids))
+                )
+                for row in legacy_result.all():
+                    decision = decisions_by_id.get(int(row.id or 0))
+                    if decision is not None:
+                        decision.raw_llm_response = dict(row.raw_llm_response or {})
+
         # Settlement sync owns the OKX private API. This refresh only reads its
         # local bill mirror so it cannot add latency or private-endpoint load.
         funding_bills_by_key: dict[tuple[str, str], list[OkxAccountBill]] = {}
@@ -2640,6 +2685,60 @@ class OkxSyncService:
                 }
             )
             entry_orders = [orders_by_id.get(order_id) for order_id in entry_order_ids]
+            original_entry_contract_gaps: list[str] = []
+            entry_orders_by_decision: dict[int, list[Order]] = {}
+            for order_id, order in zip(entry_order_ids, entry_orders, strict=True):
+                if order is None:
+                    original_entry_contract_gaps.append(
+                        f"entry_order_not_loaded:{order_id}"
+                    )
+                    continue
+                decision_id = int(getattr(order, "decision_id", 0) or 0)
+                if decision_id <= 0:
+                    original_entry_contract_gaps.append(
+                        f"entry_order_decision_missing:{order_id}"
+                    )
+                    continue
+                entry_orders_by_decision.setdefault(decision_id, []).append(order)
+            if not entry_order_ids:
+                original_entry_contract_gaps.append("entry_order_lineage_missing")
+            for decision_id, decision_orders in entry_orders_by_decision.items():
+                decision = decisions_by_id.get(decision_id)
+                if decision is None:
+                    original_entry_contract_gaps.append(
+                        f"entry_decision_not_loaded:{decision_id}"
+                    )
+                    continue
+                decision_symbol = symbol_normalizer(getattr(decision, "symbol", None))
+                action = str(getattr(decision, "action", "") or "").lower()
+                decision_side = (
+                    "long"
+                    if action in {"long", "open_long", "buy"}
+                    else "short"
+                    if action in {"short", "open_short", "sell"}
+                    else ""
+                )
+                if decision_symbol != key[0] or decision_side != key[1]:
+                    original_entry_contract_gaps.append(
+                        f"entry_decision_identity_mismatch:{decision_id}"
+                    )
+                    continue
+                _contract, reasons = validate_entry_contract_lineage(
+                    decision,
+                    decision_orders,
+                )
+                original_entry_contract_gaps.extend(
+                    f"entry_decision_contract:{decision_id}:{reason}"
+                    for reason in reasons
+                )
+            original_entry_contract_gaps = list(
+                dict.fromkeys(original_entry_contract_gaps)
+            )
+            original_entry_contract_complete = bool(
+                entry_order_ids
+                and entry_orders_by_decision
+                and not original_entry_contract_gaps
+            )
             entry_fee_evidence_complete = bool(
                 entry_orders
                 and all(
@@ -2735,8 +2834,8 @@ class OkxSyncService:
                     for order in entry_orders
                     if order is not None and order.decision_id
                 ],
-                "original_entry_contract_complete": False,
-                "original_entry_contract_gaps": ["historical_entry_contract_not_reconstructed"],
+                "original_entry_contract_complete": original_entry_contract_complete,
+                "original_entry_contract_gaps": original_entry_contract_gaps,
                 "position_fragment_ids": [position.id for position in fragments if position.id],
                 "position_fragment_count": len(fragments),
             }

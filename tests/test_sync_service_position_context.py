@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import services.sync_service as sync_module
 from core.symbols import normalize_trading_symbol
 from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
@@ -372,7 +373,9 @@ def test_okx_close_fill_order_payload_does_not_invent_contract_size_authority() 
 
 
 @pytest.mark.asyncio
-async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_position() -> None:
+async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     first = SimpleNamespace(
         id=1,
         is_open=True,
@@ -426,20 +429,45 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         ),
     ]
 
-    class Result:
-        class Scalars:
-            @staticmethod
-            def all():
-                return orders
+    decision_rows = [
+        SimpleNamespace(
+            id=11,
+            symbol="BTC/USDT",
+            action="open_long",
+            was_executed=True,
+            decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+        ),
+        SimpleNamespace(
+            id=12,
+            symbol="BTC/USDT",
+            action="open_long",
+            was_executed=True,
+            decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+        ),
+    ]
 
-        @staticmethod
-        def scalars():
-            return Result.Scalars()
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.rows
 
     class Session:
-        @staticmethod
-        async def execute(_statement):
-            return Result()
+        calls = 0
+
+        async def execute(self, _statement):
+            self.calls += 1
+            return Result(orders if self.calls == 1 else decision_rows)
+
+    monkeypatch.setattr(
+        sync_module,
+        "validate_entry_contract_lineage",
+        lambda _decision, _orders: ({"contract_complete": True}, []),
+    )
 
     async def balance(_mode):
         return {"equity": 1_000.0}
@@ -484,6 +512,8 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     assert second.current_management_contract == contract
     assert contract["position_scope"] == "exchange_net_position_group"
     assert contract["position_fragment_ids"] == [1, 2]
+    assert contract["original_entry_contract_status"] == "complete_at_entry"
+    assert contract["original_entry_contract_gaps"] == []
     assert contract["entry_fee_usdt"] == pytest.approx(0.3)
     assert first.entry_fee == pytest.approx(0.2)
     assert second.entry_fee == pytest.approx(0.1)
@@ -503,7 +533,9 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
 
 
 @pytest.mark.asyncio
-async def test_management_refresh_adds_only_matching_lifecycle_funding_bills() -> None:
+async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     opened_at = datetime(2026, 8, 15, 0, 0, tzinfo=UTC)
     position = SimpleNamespace(
         id=3,
@@ -557,6 +589,13 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills() -
             funding_fee=777.0,
         ),
     ]
+    decision = SimpleNamespace(
+        id=13,
+        symbol="BTC/USDT",
+        action="open_long",
+        was_executed=True,
+        decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+    )
 
     class Result:
         def __init__(self, rows):
@@ -573,7 +612,19 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills() -
 
         async def execute(self, _statement):
             self.execute_count += 1
-            return Result([order] if self.execute_count == 1 else bills)
+            return Result(
+                [order]
+                if self.execute_count == 1
+                else [decision]
+                if self.execute_count == 2
+                else bills
+            )
+
+    monkeypatch.setattr(
+        sync_module,
+        "validate_entry_contract_lineage",
+        lambda _decision, _orders: ({"contract_complete": True}, []),
+    )
 
     async def balance(_mode):
         return {"equity": 1_000.0}
@@ -618,7 +669,8 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills() -
 
     contract = position.current_management_contract
     assert refreshed == 1
-    assert session.execute_count == 2
+    assert session.execute_count == 3
+    assert contract["original_entry_contract_status"] == "complete_at_entry"
     assert contract["funding_fee_usdt"] == pytest.approx(12.5)
     assert contract["funding_bill_count"] == 1
     assert contract["funding_fee_source"] == "okx_account_bills"

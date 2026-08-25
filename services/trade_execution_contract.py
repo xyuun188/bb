@@ -470,6 +470,33 @@ def _entry_contract_row(
     return row, reasons
 
 
+def validate_entry_contract_lineage(
+    decision: Any,
+    orders: Sequence[Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate one persisted entry decision against its authoritative fills."""
+
+    raw = _safe_dict(_row_get(decision, "raw_llm_response"))
+    if not raw:
+        return (
+            {
+                "decision_id": _row_get(decision, "id"),
+                "symbol": _row_get(decision, "symbol"),
+                "action": _action(decision),
+                "executed": _was_executed(decision, list(orders)),
+                "contract_complete": False,
+                "reasons": ["entry_decision_risk_contract_missing"],
+            },
+            ["entry_decision_risk_contract_missing"],
+        )
+    return _entry_contract_row(
+        decision,
+        raw,
+        list(orders),
+        _was_executed(decision, list(orders)),
+    )
+
+
 def _okx_filled_order_notional_usdt(
     raw: dict[str, Any],
     orders: list[Any],

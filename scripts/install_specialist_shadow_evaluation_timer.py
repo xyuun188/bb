@@ -19,6 +19,7 @@ SERVICE_NAME = "bb-specialist-shadow-evaluation.service"
 TIMER_NAME = "bb-specialist-shadow-evaluation.timer"
 REPORT_DIR = "/data/bb/app/data/phase3"
 REPORT_OWNER = "bb:bb"
+DEFAULT_TIMER_MINUTES = 90
 
 
 def sh(value: str) -> str:
@@ -56,7 +57,7 @@ def render_service(*, hours: int = 168) -> str:
     )
 
 
-def render_timer(*, minutes: int = 360) -> str:
+def render_timer(*, minutes: int = DEFAULT_TIMER_MINUTES) -> str:
     return (
         textwrap.dedent(
             f"""
@@ -106,7 +107,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Install a read-only Phase 3 specialist shadow evaluation timer."
     )
-    parser.add_argument("--minutes", type=int, default=360)
+    parser.add_argument("--minutes", type=int, default=DEFAULT_TIMER_MINUTES)
     parser.add_argument("--hours", type=int, default=168)
     args = parser.parse_args()
 

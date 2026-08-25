@@ -9053,7 +9053,9 @@ async def test_current_position_management_refresh_allows_missing_protection() -
 
 
 @pytest.mark.asyncio
-async def test_current_position_management_refresh_bulk_loads_entry_orders_once() -> None:
+async def test_current_position_management_refresh_bulk_loads_entry_orders_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def account_equity(_mode: str) -> dict[str, float]:
         return {"equity": 1000.0}
 
@@ -9109,20 +9111,45 @@ async def test_current_position_management_refresh_bulk_loads_entry_orders_once(
             },
         ),
     ]
+    decisions = [
+        SimpleNamespace(
+            id=11,
+            symbol="BTC/USDT",
+            action="open_long",
+            was_executed=True,
+            decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+        ),
+        SimpleNamespace(
+            id=12,
+            symbol="ETH/USDT",
+            action="open_short",
+            was_executed=True,
+            decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+        ),
+    ]
 
     class FakeScalarResult:
+        def __init__(self, rows):
+            self.rows = rows
+
         def scalars(self):
             return self
 
         def all(self):
-            return orders
+            return self.rows
 
     class FakeSession:
         execute_count = 0
 
         async def execute(self, _statement):
             self.execute_count += 1
-            return FakeScalarResult()
+            return FakeScalarResult(orders if self.execute_count == 1 else decisions)
+
+    monkeypatch.setattr(
+        sync_module,
+        "validate_entry_contract_lineage",
+        lambda _decision, _orders: ({"contract_complete": True}, []),
+    )
 
     session = FakeSession()
     protection_by_key = {
@@ -9187,7 +9214,9 @@ async def test_current_position_management_refresh_bulk_loads_entry_orders_once(
     )
 
     assert refreshed == 2
-    assert session.execute_count == 1
+    assert session.execute_count == 2
+    assert positions[0].current_management_contract["original_entry_contract_status"] == "complete_at_entry"
+    assert positions[1].current_management_contract["original_entry_contract_status"] == "complete_at_entry"
     assert positions[0].current_management_contract["entry_fee_usdt"] == 0.2
     assert positions[1].current_management_contract["entry_fee_usdt"] == 0.3
 

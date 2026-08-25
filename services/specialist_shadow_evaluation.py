@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from math import sqrt
+from types import SimpleNamespace
 from typing import Any
 
 from services.execution_cost_model import execution_cost_estimate
@@ -1142,8 +1143,7 @@ class SpecialistShadowEvaluationService:
         authoritative_trade_samples: Sequence[Any] | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import select
-        from sqlalchemy.orm import load_only
+        from sqlalchemy import func, select
 
         from db.session import get_read_session_ctx
         from models.learning import ShadowBacktest
@@ -1165,32 +1165,77 @@ class SpecialistShadowEvaluationService:
             filters.append(ShadowBacktest.execution_mode == selected_mode)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
-            result = await session.execute(
-                select(ShadowBacktest)
-                .where(*filters)
-                .options(
-                    load_only(
-                        ShadowBacktest.id,
-                        ShadowBacktest.decision_id,
-                        ShadowBacktest.status,
-                        ShadowBacktest.symbol,
-                        ShadowBacktest.feature_snapshot,
-                        ShadowBacktest.long_return_pct,
-                        ShadowBacktest.short_return_pct,
-                        ShadowBacktest.best_action,
-                        ShadowBacktest.horizon_minutes,
-                        ShadowBacktest.due_at,
-                        ShadowBacktest.created_at,
-                        ShadowBacktest.updated_at,
+            feature_snapshot = ShadowBacktest.feature_snapshot
+            bind = getattr(session, "bind", None)
+            dialect_name = str(getattr(getattr(bind, "dialect", None), "name", ""))
+            projection_fields = (
+                "symbol",
+                "market_regime",
+                "regime",
+                "market_state",
+                "spread_pct",
+                "bid",
+                "ask",
+                "orderbook_bid_depth",
+                "orderbook_ask_depth",
+                "orderbook_imbalance",
+                "planned_order_notional_usdt",
+                "planned_order_side",
+                "contract_value_base",
+                "orderbook_asks",
+                "orderbook_bids",
+                "round_trip_fee_pct",
+                "entry_fee_rate",
+                "exit_fee_rate",
+                "taker_fee_rate",
+                "fee_rate",
+                "funding_rate",
+                "funding_interval_minutes",
+                "funding_interval_hours",
+                "local_ai_tools_shadow",
+            )
+            if dialect_name == "postgresql":
+                compact_feature_snapshot = func.jsonb_build_object(
+                    *sum(
+                        (
+                            [
+                                field,
+                                feature_snapshot[field],
+                            ]
+                            for field in projection_fields
+                        ),
+                        [],
                     )
+                ).label("feature_snapshot")
+            else:
+                # SQLite test databases do not expose jsonb_build_object.
+                compact_feature_snapshot = feature_snapshot.label("feature_snapshot")
+            result = await session.execute(
+                select(
+                    ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
+                    ShadowBacktest.status,
+                    ShadowBacktest.symbol,
+                    compact_feature_snapshot,
+                    ShadowBacktest.long_return_pct,
+                    ShadowBacktest.short_return_pct,
+                    ShadowBacktest.best_action,
+                    ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.due_at,
+                    ShadowBacktest.created_at,
+                    ShadowBacktest.updated_at,
                 )
+                .where(*filters)
                 .order_by(ShadowBacktest.id.desc())
             )
-            rows = list(result.scalars().all())
-        report = summarize_specialist_shadow_evaluation(
-            rows,
-            authoritative_trade_samples=authoritative_trade_samples,
-        )
+            rows = (
+                SimpleNamespace(**dict(row))
+                for row in result.mappings()
+            )
+            report = summarize_specialist_shadow_evaluation(
+                rows,
+                authoritative_trade_samples=authoritative_trade_samples,
+            )
         report["window_hours"] = capped_hours
         report["execution_mode"] = selected_mode or "all"
         report["mode_filter_applied"] = selected_mode is not None
@@ -1203,5 +1248,8 @@ class SpecialistShadowEvaluationService:
             "event_statistics_use_full_window": True,
             "event_evidence_rows_bounded": True,
             "row_limit": None,
+            "feature_snapshot_projection": dialect_name == "postgresql",
+            "feature_snapshot_projection_fields": list(projection_fields),
+            "streamed_rows": True,
         }
         return report
