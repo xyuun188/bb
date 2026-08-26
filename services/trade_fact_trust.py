@@ -13,6 +13,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_OKX_ONLY,
 )
+from services.position_settlement import is_final_settlement_status
 
 TRUSTED_OKX_ORDER_SYNC_STATUSES = {
     OKX_SYNC_CONFIRMED,
@@ -88,6 +89,12 @@ def closed_position_trade_fact_untrusted_reason(position: Any) -> str | None:
         and _text(settlement_raw.get("canonical_position_id"))
     ):
         return "superseded_position_residual"
+    if settlement_status and not is_final_settlement_status(settlement_status):
+        return (
+            "settlement_unresolved"
+            if settlement_status == "settlement_unresolved"
+            else "settlement_not_final"
+        )
     if not _text(getattr(position, "entry_exchange_order_id", None)):
         return "missing_entry_exchange_order_id"
     close_exchange_order_id = getattr(position, "close_exchange_order_id", None)

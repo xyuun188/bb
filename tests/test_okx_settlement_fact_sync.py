@@ -306,7 +306,7 @@ async def test_settlement_fact_sync_targeted_pull_covers_pending_local_instrumen
 
 
 @pytest.mark.asyncio
-async def test_pending_settlement_targets_skip_legacy_rows_without_exchange_identity(
+async def test_pending_settlement_targets_retry_quarantine_and_skip_terminal_rows(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -388,6 +388,20 @@ async def test_pending_settlement_targets_skip_legacy_rows_without_exchange_iden
                 Position(
                     model_name="ensemble_trader",
                     execution_mode="paper",
+                    symbol="TERMINAL/USDT",
+                    side="short",
+                    quantity=10.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    okx_inst_id="TERMINAL-USDT-SWAP",
+                    okx_pos_id="terminal-pos-1",
+                    settlement_status="settlement_unresolved",
+                    closed_at=now - timedelta(minutes=2),
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
                     symbol="PARTIAL/USDT",
                     side="long",
                     quantity=4.0,
@@ -417,7 +431,10 @@ async def test_pending_settlement_targets_skip_legacy_rows_without_exchange_iden
         targets = await OkxSettlementFactSyncService(mode="paper")._pending_settlement_targets(
             since=now - timedelta(hours=96)
         )
-        assert targets == (("NEW-USDT-SWAP", "new-pos-1"),)
+        assert targets == (
+            ("NEW-USDT-SWAP", "new-pos-1"),
+            ("QUARANTINED-USDT-SWAP", "quarantined-pos-1"),
+        )
     finally:
         await close_db()
 

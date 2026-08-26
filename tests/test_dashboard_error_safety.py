@@ -70,6 +70,43 @@ def test_trade_reflection_authority_status_distinguishes_pending_and_linkage_fai
     assert missing_link["label"] == "权威结果关联异常"
     assert quarantined["code"] == "authoritative_settlement_quarantined"
     assert quarantined["production_evidence_eligible"] is False
+    assert quarantined["retryable"] is True
+    lifecycle_quarantine = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="settlement_quarantined",
+            settlement_source="okx_position_history_identity_quarantine",
+            settlement_raw={"reason": "position_lifecycle_still_open"},
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    assert lifecycle_quarantine["code"] == "authoritative_lifecycle_still_open"
+    assert lifecycle_quarantine["retryable"] is True
+    evidence_quarantine = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="settlement_quarantined",
+            settlement_source="okx_position_history_identity_quarantine",
+            settlement_raw={
+                "reason": "position_lifecycle_still_open",
+                "last_error_code": "lifecycle_fragment_allocation_incomplete",
+                "quarantine_reason": "lifecycle_fragment_contract_conservation_unresolved",
+            },
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    assert evidence_quarantine["code"] == "authoritative_settlement_evidence_unresolved"
+    assert evidence_quarantine["retryable"] is True
+    superseded = dashboard._trade_reflection_authority_status(
+        position=SimpleNamespace(
+            settlement_status="superseded_position_residual",
+            settlement_source="okx_current_position_deduplication",
+        ),
+        reflection_source="okx_reconcile",
+        authoritative_outcome=None,
+    )
+    assert superseded["code"] == "authoritative_settlement_stopped"
+    assert superseded["retryable"] is False
     assert orphan["code"] == "non_authoritative_local_position_quarantined"
     assert orphan["label"] == "本地孤立仓位已隔离"
 

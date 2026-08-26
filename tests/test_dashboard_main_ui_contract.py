@@ -314,6 +314,8 @@ def test_position_history_separates_confirmed_close_from_official_settlement() -
 
     assert "function isOfficialClosedPositionSettlement" in script
     assert "function isPendingClosedPositionSettlement" in script
+    assert "['lifecycle_open', 'identity_unresolved', 'evidence_unresolved', 'pending_authority', 'stopped_waiting']" in script
+    assert "return Boolean(position?.settlement_display_state)" not in script
     assert "function closedPositionEvidenceLabel" in script
     assert "pending_settlement_count" in script
     assert "settlementPending || pnl === null" in script

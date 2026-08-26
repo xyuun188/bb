@@ -30,6 +30,7 @@ from services.okx_position_settlement_sync import (
     _prepare_lifecycle_allocations,
     _reactivate_distinct_superseded_fragment,
 )
+from services.position_settlement import SETTLEMENT_STATUS_UNRESOLVED
 
 
 @pytest.mark.asyncio
@@ -103,6 +104,57 @@ async def test_position_settlement_loads_history_mirror_once_per_batch(
     assert load_calls == 1
     assert seen_rows == [history_rows, history_rows]
     assert failure_batches == [[1, 2]]
+
+
+@pytest.mark.asyncio
+async def test_stale_settlement_sweep_skips_final_rows_and_terminalizes_unresolved_rows(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-stale-sweep.db")
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    old = now - timedelta(days=4)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="DONE/USDT",
+                    side="long",
+                    quantity=1.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    settlement_status="reconciled",
+                    closed_at=old,
+                ),
+                Position(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="WAIT/USDT",
+                    side="short",
+                    quantity=1.0,
+                    entry_price=1.0,
+                    current_price=1.0,
+                    is_open=False,
+                    settlement_status="settlement_quarantined",
+                    settlement_source="okx_position_history_identity_quarantine",
+                    settlement_raw={"quarantine_reason": "official_position_history_identity_unresolved"},
+                    closed_at=old,
+                ),
+            ]
+        )
+    service = OkxPositionSettlementSyncService(mode="paper")
+    try:
+        assert await service._expire_stale_settlements(now) == 1
+        async with get_session_ctx() as session:
+            rows = list((await session.execute(select(Position))).scalars().all())
+        by_symbol = {row.symbol: row for row in rows}
+        assert by_symbol["DONE/USDT"].settlement_status == "reconciled"
+        assert by_symbol["WAIT/USDT"].settlement_status == SETTLEMENT_STATUS_UNRESOLVED
+    finally:
+        await close_db()
 
 
 def _ms(value: datetime) -> str:

@@ -32,7 +32,10 @@ from services.okx_position_history_store import (
     publish_okx_position_history_watermark,
     upsert_okx_position_history_row,
 )
-from services.position_settlement import final_settlement_status_values
+from services.position_settlement import (
+    SETTLEMENT_STATUS_UNRESOLVED,
+    final_settlement_status_values,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -41,9 +44,12 @@ DEFAULT_SETTLEMENT_FACT_LIMIT = 100
 DEFAULT_SETTLEMENT_FACT_MAX_PAGES = 5
 DEFAULT_SETTLEMENT_FACT_TIMEOUT_SECONDS = 8.0
 PENDING_SETTLEMENT_INST_BATCH_SIZE = 3
+PENDING_SETTLEMENT_REPAIR_LOOKBACK_DAYS = 90
 NON_FETCHABLE_SETTLEMENT_STATUSES = frozenset(
     {
-        "settlement_quarantined",
+        # Quarantined rows are unresolved, not terminal: they must remain
+        # eligible for targeted OKX positions-history recovery.
+        SETTLEMENT_STATUS_UNRESOLVED,
         "superseded_position_residual",
     }
 )
@@ -224,7 +230,13 @@ class OkxSettlementFactSyncService:
                 # Closed local positions awaiting authority are the highest
                 # priority: account-wide history and bills must not consume
                 # the entire round budget before their identity can be pulled.
-                targeted_since = since - timedelta(hours=24)
+                # Targeted lifecycle repair may need to recover rows that
+                # outlived the regular 72-hour settlement window.  The exact
+                # posId batch stays capped at three per round, so this wider
+                # lookback does not turn into an unbounded private API pull.
+                targeted_since = started_at - timedelta(
+                    days=PENDING_SETTLEMENT_REPAIR_LOOKBACK_DAYS
+                )
                 targeted_rows_to_fetch = await self._pending_settlement_targets(
                     since=targeted_since
                 )
@@ -243,7 +255,10 @@ class OkxSettlementFactSyncService:
                             max_pages=self.max_pages,
                             strict=True,
                         ),
-                        cap_seconds=2.0,
+                        # Up to three exact posId reads may run sequentially.
+                        # Two seconds repeatedly cancelled the batch before
+                        # any recoverable quarantine row could be persisted.
+                        cap_seconds=4.0,
                     )
                     targeted_rows = list(targeted_rows_result[0] or [])
                 else:

@@ -8816,7 +8816,23 @@ function isPendingClosedPositionSettlement(position) {
         return true;
     }
     const status = String(position?.settlement_status || '').trim();
-    return status === 'settlement_quarantined' || status === 'settlement_pending';
+    const displayState = String(position?.settlement_display_state || '').trim();
+    return ['lifecycle_open', 'identity_unresolved', 'evidence_unresolved', 'pending_authority', 'stopped_waiting']
+        .includes(displayState)
+        || status === 'settlement_quarantined'
+        || status === 'settlement_pending'
+        || status === 'settlement_unresolved';
+}
+
+function closedPositionSettlementLabel(position) {
+    const displayLabel = String(position?.settlement_display_label || '').trim();
+    if (displayLabel) return displayLabel;
+    const state = String(position?.settlement_display_state || '').trim();
+    if (state === 'lifecycle_open') return 'OKX 仓位生命周期仍开放';
+    if (state === 'identity_unresolved') return 'OKX 权威仓位历史身份未确认';
+    if (state === 'evidence_unresolved') return '结算证据无法守恒';
+    if (state === 'stopped_waiting') return '权威结算未完成，已停止自动等待';
+    return '等待 OKX 权威结算';
 }
 
 function closedPositionEvidenceLabel(position) {
@@ -8858,7 +8874,7 @@ function renderClosedPositionsTable(positions, page = 1, totalPages = 1, totalIt
         positionLinkedOrdersByGroup.set(groupId, { position: p, fills: linkedFills });
         const linkedCount = Number(p.linked_order_count ?? linkedFills.length ?? 0);
         const evidenceBadge = settlementPending
-            ? '<div class="position-ledger-badge warn">\u5df2\u5e73\u4ed3 \u00b7 \u5f85\u7ed3\u7b97</div>'
+            ? `<div class="position-ledger-badge warn">${escHtml(closedPositionSettlementLabel(p))}</div>`
             : (isOfficialClosedPositionSettlement(p) || p.evidence_complete === true
                 ? '<div class="position-ledger-badge ok">OKX</div>'
                 : '<div class="position-ledger-badge warn">\u8ba2\u5355\u8865\u5168\u4e2d</div>');

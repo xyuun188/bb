@@ -3947,7 +3947,10 @@ async def _dashboard_pending_closed_position_rows(
         OKX_SYNC_OKX_ONLY,
     )
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
-    from services.position_settlement import final_settlement_status_values
+    from services.position_settlement import (
+        final_settlement_status_values,
+        settlement_display_state,
+    )
 
     final_statuses = final_settlement_status_values()
     position_stmt = select(Position).where(
@@ -4042,8 +4045,6 @@ async def _dashboard_pending_closed_position_rows(
         include_order_lifecycle_fragments=False,
     )
     for group in groups:
-        if not group.evidence_complete:
-            continue
         close_order_ids = set(group.close_order_ids)
         if not close_order_ids or not (close_order_ids & confirmed_order_ids):
             continue
@@ -4066,6 +4067,27 @@ async def _dashboard_pending_closed_position_rows(
                 if str(getattr(position, "settlement_source", "") or "").strip()
             }
         )
+        state_candidates = [
+            settlement_display_state(
+                getattr(position, "settlement_status", None),
+                getattr(position, "settlement_source", None),
+                getattr(position, "settlement_raw", None),
+            )
+            for position in source_positions
+        ]
+        state_priority = {
+            "lifecycle_open": 50,
+            "identity_unresolved": 40,
+            "evidence_unresolved": 30,
+            "stopped_waiting": 20,
+            "pending_authority": 10,
+            "settled": 0,
+        }
+        settlement_display = max(
+            state_candidates,
+            key=lambda item: state_priority.get(str(item.get("code") or ""), 5),
+            default=settlement_display_state(""),
+        )
         blockers = sorted(
             {
                 str(value).strip()
@@ -4078,6 +4100,7 @@ async def _dashboard_pending_closed_position_rows(
                 for value in (
                     raw.get("last_error_code"),
                     raw.get("quarantine_reason"),
+                    raw.get("terminal_reason"),
                 )
                 if str(value or "").strip()
             }
@@ -4106,8 +4129,25 @@ async def _dashboard_pending_closed_position_rows(
                 ),
                 "settlement_state": "pending",
                 "settlement_complete": False,
+                "settlement_display_state": settlement_display["code"],
+                "settlement_display_label": settlement_display["label"],
+                "settlement_retryable": settlement_display["retryable"],
+                "settlement_terminal": not settlement_display["retryable"],
+                "settlement_wait_minutes": (
+                    max(
+                        (
+                            datetime.now(UTC)
+                            - (_as_utc_datetime(group.closed_at) or datetime.now(UTC))
+                        ).total_seconds()
+                        / 60.0,
+                        0.0,
+                    )
+                    if group.closed_at
+                    else None
+                ),
                 "settlement_blockers": blockers,
-                "settlement_explanation": (
+                "settlement_explanation": settlement_display["explanation"],
+                "_legacy_settlement_explanation": (
                     "OKX平仓成交已确认，官方仓位历史身份尚未匹配；净盈亏暂不入账。"
                 ),
                 "order_evidence_complete": bool(group.evidence_complete),
@@ -9740,9 +9780,21 @@ def _trade_reflection_authority_status(
         }
     settlement_status = str(getattr(position, "settlement_status", "") or "").strip()
     settlement_source = str(getattr(position, "settlement_source", "") or "").strip()
+    from services.position_settlement import settlement_display_state
+
+    settlement_display = settlement_display_state(
+        settlement_status,
+        settlement_source,
+        getattr(position, "settlement_raw", None),
+    )
+    closed_at = _as_utc_datetime(getattr(position, "closed_at", None))
+    settlement_wait_minutes = (
+        max((datetime.now(UTC) - closed_at).total_seconds() / 60.0, 0.0)
+        if closed_at is not None
+        else None
+    )
     if (
-        settlement_status == "settlement_quarantined"
-        or settlement_source == "okx_position_history_identity_quarantine"
+        settlement_display["code"] == "identity_unresolved"
     ):
         return {
             "code": "authoritative_settlement_quarantined",
@@ -9751,6 +9803,9 @@ def _trade_reflection_authority_status(
             "production_evidence_eligible": False,
             "settlement_status": settlement_status,
             "settlement_source": settlement_source,
+            "settlement_display_state": settlement_display["code"],
+            "retryable": settlement_display["retryable"],
+            "settlement_wait_minutes": settlement_wait_minutes,
         }
     if settlement_status in {"reconciled", "settled", "okx_position_history"}:
         return {
@@ -9760,6 +9815,45 @@ def _trade_reflection_authority_status(
             "production_evidence_eligible": False,
             "settlement_status": settlement_status,
             "settlement_source": settlement_source,
+            "settlement_display_state": settlement_display["code"],
+            "retryable": False,
+            "settlement_wait_minutes": settlement_wait_minutes,
+        }
+    if settlement_display["code"] == "stopped_waiting":
+        return {
+            "code": "authoritative_settlement_stopped",
+            "label": settlement_display["label"],
+            "reason": settlement_display["explanation"],
+            "production_evidence_eligible": False,
+            "settlement_status": settlement_status,
+            "settlement_source": settlement_source,
+            "settlement_display_state": settlement_display["code"],
+            "retryable": False,
+            "settlement_wait_minutes": settlement_wait_minutes,
+        }
+    if settlement_display["code"] == "lifecycle_open":
+        return {
+            "code": "authoritative_lifecycle_still_open",
+            "label": settlement_display["label"],
+            "reason": settlement_display["explanation"],
+            "production_evidence_eligible": False,
+            "settlement_status": settlement_status,
+            "settlement_source": settlement_source,
+            "settlement_display_state": settlement_display["code"],
+            "retryable": True,
+            "settlement_wait_minutes": settlement_wait_minutes,
+        }
+    if settlement_display["code"] == "evidence_unresolved":
+        return {
+            "code": "authoritative_settlement_evidence_unresolved",
+            "label": settlement_display["label"],
+            "reason": settlement_display["explanation"],
+            "production_evidence_eligible": False,
+            "settlement_status": settlement_status,
+            "settlement_source": settlement_source,
+            "settlement_display_state": settlement_display["code"],
+            "retryable": True,
+            "settlement_wait_minutes": settlement_wait_minutes,
         }
     return {
         "code": "authoritative_settlement_pending",
@@ -9768,6 +9862,9 @@ def _trade_reflection_authority_status(
         "production_evidence_eligible": False,
         "settlement_status": settlement_status or "pending",
         "settlement_source": settlement_source,
+        "settlement_display_state": settlement_display["code"],
+        "retryable": settlement_display["retryable"],
+        "settlement_wait_minutes": settlement_wait_minutes,
     }
 
 

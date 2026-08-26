@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from core.symbols import (
     normalize_trading_symbol,
@@ -37,9 +37,12 @@ from services.okx_position_history_store import (
 from services.position_settlement import (
     SETTLEMENT_FORMULA,
     SETTLEMENT_STATUS_EXCEPTION,
+    SETTLEMENT_STATUS_UNRESOLVED,
     apply_position_settlement_snapshot,
     build_position_settlement_snapshot,
+    final_settlement_status_values,
     is_final_settlement_status,
+    is_terminal_settlement_status,
 )
 
 logger = structlog.get_logger(__name__)
@@ -54,6 +57,13 @@ POSITION_HISTORY_OPEN_MATCH_WINDOW_SECONDS = 24 * 60 * 60
 POSITION_HISTORY_MATCH_MAX_ATTEMPTS = 30
 POSITION_HISTORY_MATCH_MAX_AGE_HOURS = 6.0
 POSITION_HISTORY_QUARANTINE_RETRY_SECONDS = 15 * 60.0
+SETTLEMENT_TERMINAL_AGE_HOURS = 72.0
+SETTLEMENT_TERMINAL_SWEEP_INTERVAL_SECONDS = 60.0
+SETTLEMENT_TERMINAL_SWEEP_BATCH_SIZE = 200
+SETTLEMENT_REPAIR_LOOKBACK_DAYS = 90
+SETTLEMENT_STALE_REPAIR_BATCH_SIZE = 200
+SETTLEMENT_TERMINAL_SOURCE = "okx_settlement_terminal_unresolved"
+SETTLEMENT_TERMINAL_REASON = "authoritative_settlement_age_exceeded"
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
 SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
@@ -78,7 +88,7 @@ SETTLEMENT_QUARANTINE_SOURCE = "okx_position_history_identity_quarantine"
 SETTLEMENT_LIFECYCLE_OPEN_SOURCE = "okx_position_lifecycle_still_open"
 SETTLEMENT_LIFECYCLE_OPEN_REASON = "position_lifecycle_still_open"
 NON_RETRYABLE_SETTLEMENT_STATUSES = frozenset(
-    {SUPERSEDED_POSITION_STATUS}
+    {SUPERSEDED_POSITION_STATUS, SETTLEMENT_STATUS_UNRESOLVED}
 )
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
@@ -143,6 +153,7 @@ class OkxPositionSettlementSyncSummary:
     decision_outcome_count: int
     exception_count: int
     skipped_count: int
+    terminalized_count: int
     samples: tuple[dict[str, Any], ...]
     error: str | None = None
 
@@ -155,6 +166,7 @@ class OkxPositionSettlementSyncSummary:
             "decision_outcome_count": self.decision_outcome_count,
             "exception_count": self.exception_count,
             "skipped_count": self.skipped_count,
+            "terminalized_count": self.terminalized_count,
             "samples": list(self.samples),
             "error": self.error,
         }
@@ -179,12 +191,14 @@ class OkxPositionSettlementSyncService:
         self.limit = max(1, min(int(limit or DEFAULT_SETTLEMENT_LIMIT), 100))
         self.retry_seconds = max(1.0, float(retry_seconds or DEFAULT_SETTLEMENT_RETRY_SECONDS))
         self.session_context_factory = session_context_factory
+        self._last_terminal_sweep_at: datetime | None = None
 
     async def sync_once(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         decision_outcome_changes = await self._backfill_decision_outcomes(started_at)
         candidates = await self._load_candidates(started_at)
         if not candidates:
+            terminalized_count = await self._expire_stale_settlements(started_at)
             return OkxPositionSettlementSyncSummary(
                 status="ok",
                 mode=self.mode,
@@ -193,6 +207,7 @@ class OkxPositionSettlementSyncService:
                 decision_outcome_count=len(decision_outcome_changes),
                 exception_count=0,
                 skipped_count=0,
+                terminalized_count=terminalized_count,
                 samples=tuple(decision_outcome_changes[-10:]),
             ).as_dict()
 
@@ -293,6 +308,9 @@ class OkxPositionSettlementSyncService:
             )
             samples.append(sample)
 
+        # Historical rows are given one bounded repair pass before this sweep
+        # stops automatic waiting for records outside the normal lookback.
+        terminalized_count = await self._expire_stale_settlements(started_at)
         status = "warning" if exceptions else "ok"
         return OkxPositionSettlementSyncSummary(
             status=status,
@@ -302,6 +320,7 @@ class OkxPositionSettlementSyncService:
             decision_outcome_count=decision_outcome_count,
             exception_count=exceptions,
             skipped_count=skipped,
+            terminalized_count=terminalized_count,
             samples=tuple(samples[-10:]),
             error=None,
         ).as_dict()
@@ -331,8 +350,102 @@ class OkxPositionSettlementSyncService:
                 lookback_hours=self.lookback_hours,
             )
 
+    async def _expire_stale_settlements(self, now: datetime) -> int:
+        """Stop retrying old unresolved rows without changing their economics.
+
+        The normal settlement pass intentionally has a bounded lookback.  A
+        separate, throttled sweep prevents rows that fall outside that window
+        from remaining in ``settling`` forever.  A lifecycle that is still
+        represented by an open OKX ``posId`` is always left retryable.
+        """
+
+        last_sweep = self._last_terminal_sweep_at
+        if (
+            isinstance(last_sweep, datetime)
+            and (now - last_sweep).total_seconds() < SETTLEMENT_TERMINAL_SWEEP_INTERVAL_SECONDS
+        ):
+            return 0
+        self._last_terminal_sweep_at = now
+        cutoff = now - timedelta(hours=SETTLEMENT_TERMINAL_AGE_HOURS)
+        async with self.session_context_factory() as session:
+            open_result = await session.execute(
+                select(Position.okx_pos_id).where(
+                    Position.execution_mode == self.mode,
+                    Position.is_open.is_(True),
+                    Position.okx_pos_id.is_not(None),
+                )
+            )
+            open_pos_ids = {
+                str(value or "").strip()
+                for value in open_result.scalars().all()
+                if str(value or "").strip()
+            }
+            result = await session.execute(
+                select(Position)
+                .where(
+                    Position.execution_mode == self.mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at.is_not(None),
+                    Position.closed_at < _db_naive(cutoff),
+                    or_(
+                        Position.settlement_status.is_(None),
+                        Position.settlement_status.notin_(
+                            tuple(
+                                NON_RETRYABLE_SETTLEMENT_STATUSES
+                                | frozenset(final_settlement_status_values())
+                            )
+                        ),
+                    ),
+                )
+                .order_by(Position.closed_at.asc(), Position.id.asc())
+                .limit(SETTLEMENT_TERMINAL_SWEEP_BATCH_SIZE)
+            )
+            changed = 0
+            for position in result.scalars().all():
+                status = getattr(position, "settlement_status", None)
+                if is_final_settlement_status(status) or is_terminal_settlement_status(status):
+                    continue
+                if _is_non_retryable_settlement_status(position):
+                    continue
+                pos_id = str(getattr(position, "okx_pos_id", "") or "").strip()
+                if pos_id and pos_id in open_pos_ids:
+                    continue
+                raw = _safe_dict(getattr(position, "settlement_raw", None))
+                previous_source = str(
+                    getattr(position, "settlement_source", "") or ""
+                )
+                closed_at = _aware_utc(getattr(position, "closed_at", None))
+                age_hours = (
+                    max((now - closed_at).total_seconds() / 3600.0, 0.0)
+                    if closed_at is not None
+                    else None
+                )
+                position.settlement_status = SETTLEMENT_STATUS_UNRESOLVED
+                position.settlement_source = SETTLEMENT_TERMINAL_SOURCE
+                position.settlement_synced_at = now
+                position.settlement_raw = {
+                    **raw,
+                    "status": SETTLEMENT_STATUS_UNRESOLVED,
+                    "source": SETTLEMENT_TERMINAL_SOURCE,
+                    "terminal": True,
+                    "terminal_reason": SETTLEMENT_TERMINAL_REASON,
+                    "terminalized_at": now.isoformat(),
+                    "terminal_age_hours": age_hours,
+                    "previous_settlement_status": str(status or ""),
+                    "previous_settlement_source": previous_source,
+                    "retry_policy": (
+                        "automatic authority retry stopped after the bounded age policy; "
+                        "explicit repair may requeue this row"
+                    ),
+                }
+                position.updated_at = now
+                changed += 1
+            await session.flush()
+            return changed
+
     async def _load_candidates(self, now: datetime) -> list[SettlementCandidate]:
         since = now - timedelta(hours=self.lookback_hours)
+        stale_since = now - timedelta(days=SETTLEMENT_REPAIR_LOOKBACK_DAYS)
         async with self.session_context_factory() as session:
             open_pos_ids_result = await session.execute(
                 select(Position.okx_pos_id).where(
@@ -358,6 +471,35 @@ class OkxPositionSettlementSyncService:
                 .limit(max(self.limit * 25, MINIMUM_CLOSED_LIFECYCLE_SCAN_ROWS))
             )
             rows = list(result.scalars().all())
+            # The regular pass is intentionally recent and bounded, but old
+            # unresolved rows must receive a controlled authority-repair pass
+            # before they can be terminalized.  Keep this batch small so a
+            # historical backlog cannot recreate the memory pressure this
+            # service is designed to avoid.
+            stale_result = await session.execute(
+                select(Position)
+                .where(
+                    Position.execution_mode == self.mode,
+                    Position.is_open.is_(False),
+                    Position.closed_at.is_not(None),
+                    Position.closed_at >= _db_naive(stale_since),
+                    Position.closed_at < _db_naive(since),
+                    or_(
+                        Position.settlement_status.is_(None),
+                        Position.settlement_status.notin_(
+                            tuple(NON_RETRYABLE_SETTLEMENT_STATUSES)
+                        ),
+                    ),
+                )
+                .order_by(Position.closed_at.asc(), Position.id.asc())
+                .limit(SETTLEMENT_STALE_REPAIR_BATCH_SIZE)
+            )
+            seen_row_ids = {int(getattr(row, "id", 0) or 0) for row in rows}
+            rows.extend(
+                row
+                for row in stale_result.scalars().all()
+                if int(getattr(row, "id", 0) or 0) not in seen_row_ids
+            )
             rows, duplicate_rows = _deduplicate_closed_lifecycle_rows(rows, now=now)
             # Fill-level contract facts are the only acceptable basis for
             # splitting a shared official lifecycle.  Keep them on the
@@ -401,11 +543,16 @@ class OkxPositionSettlementSyncService:
                         }
             candidates: list[SettlementCandidate] = []
             restored_superseded = bool(duplicate_rows)
-            selected_lifecycle_keys: set[tuple[str, ...]] = set()
+            # A shared OKX posId is one settlement unit.  Select due lifecycle
+            # keys first, then include every local fragment in each selected
+            # lifecycle.  The previous row-by-row limit selected only the
+            # newest fragment, making contract conservation impossible whenever
+            # a lifecycle had multiple partial closes.
             pending_lifecycle_keys = {
                 _position_lifecycle_group_key(position)
                 for position in rows
                 if not is_final_settlement_status(getattr(position, "settlement_status", None))
+                and not is_terminal_settlement_status(getattr(position, "settlement_status", None))
                 and not _is_non_retryable_settlement_status(position)
             }
             pending_lifecycle_keys.update(
@@ -414,6 +561,25 @@ class OkxPositionSettlementSyncService:
                 if is_final_settlement_status(getattr(position, "settlement_status", None))
                 and _final_fragment_requires_settlement_repair(position)
             )
+            due_lifecycle_keys: list[tuple[str, ...]] = []
+            due_lifecycle_seen: set[tuple[str, ...]] = set()
+            for pending_row in rows:
+                pending_raw = _safe_dict(getattr(pending_row, "settlement_raw", None))
+                pending_key = _position_lifecycle_group_key(pending_row)
+                if pending_key not in pending_lifecycle_keys or pending_key in due_lifecycle_seen:
+                    continue
+                if _is_non_retryable_settlement_status(pending_row):
+                    continue
+                pending_pos_id = str(getattr(pending_row, "okx_pos_id", "") or "").strip()
+                if pending_pos_id and pending_pos_id in open_pos_ids:
+                    continue
+                if _retry_after(pending_raw, now):
+                    continue
+                due_lifecycle_seen.add(pending_key)
+                due_lifecycle_keys.append(pending_key)
+                if len(due_lifecycle_keys) >= self.limit:
+                    break
+            selected_lifecycle_keys = set(due_lifecycle_keys)
             for row in rows:
                 raw = getattr(row, "settlement_raw", None)
                 raw = raw if isinstance(raw, dict) else {}
@@ -438,11 +604,8 @@ class OkxPositionSettlementSyncService:
                     _mark_lifecycle_still_open(row, raw, now=now)
                     restored_superseded = True
                     continue
-                if _retry_after(raw, now):
+                if lifecycle_key not in selected_lifecycle_keys:
                     continue
-                if lifecycle_key not in selected_lifecycle_keys and len(selected_lifecycle_keys) >= self.limit:
-                    continue
-                selected_lifecycle_keys.add(lifecycle_key)
                 if lifecycle_key:
                     candidate = _candidate_from_position(row, raw)
                     entry_contracts = sum(
@@ -878,6 +1041,7 @@ class OkxPositionSettlementSyncService:
             **raw,
             "status": status,
             "source": source,
+            "reason": failure.code,
             "formula": SETTLEMENT_FORMULA,
             "funding_fee_status": "unknown_until_official_settlement",
             "last_error_code": failure.code,
