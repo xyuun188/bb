@@ -3,6 +3,7 @@
   const payloads = {};
   const requestErrors = {};
   let refreshSequence = 0;
+  let refreshInFlight = null;
   const requestTimeoutMs = Object.freeze({
     ml: 30_000, registry: 45_000, scheduler: 30_000,
     data: 45_000, strategy: 20_000, decisions: 30_000,
@@ -596,6 +597,8 @@
   }
 
   async function refresh() {
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = (async () => {
     const sequence = ++refreshSequence;
     setState('正在刷新');
     $('#error-text').hidden = true;
@@ -626,6 +629,12 @@
     } else {
       const ml = unwrap(payloads.ml);
       setState(ml.available === true ? (ml.live_ml_ready === true ? '模型已就绪' : '模型学习观察中') : '模型不可用', ml.available === true ? (ml.live_ml_ready === true ? 'ok' : 'warn') : 'error');
+    }
+    })();
+    try {
+      return await refreshInFlight;
+    } finally {
+      refreshInFlight = null;
     }
   }
 

@@ -109,6 +109,11 @@ async def main() -> None:
         host=settings.dashboard_host,
         port=settings.dashboard_port,
         log_level="info",
+        # A single dashboard worker must reject excess refreshes instead of
+        # buffering dozens of expensive JSON responses until the process hits
+        # its cgroup memory limit.
+        limit_concurrency=32,
+        timeout_keep_alive=15,
     )
     server = uvicorn.Server(config)
     try:

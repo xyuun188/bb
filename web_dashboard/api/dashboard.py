@@ -155,6 +155,8 @@ _dashboard_public_rest_client_lock: asyncio.Lock | None = None
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 _dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
+_DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS = 20.0
+_DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 
 
@@ -195,6 +197,114 @@ def _bounded_dashboard_payload(
             for item in list(value)[:max_items]
         ]
     return value
+
+
+def _compact_ml_status_for_dashboard(status: dict[str, Any]) -> dict[str, Any]:
+    """Keep the ML page useful without shipping full evaluation manifests.
+
+    Artifact manifests contain fold-level arrays and historical diagnostics that
+    are useful to offline audits but far too large for a one-minute browser poll.
+    The trading service still receives its complete in-process status; this
+    compaction applies only to the dashboard response.
+    """
+
+    payload = dict(status)
+
+    def compact_manifest(value: Any) -> dict[str, Any]:
+        raw = value if isinstance(value, dict) else {}
+        keep = {
+            key: raw[key]
+            for key in (
+                "artifact_version",
+                "artifact_registry_version",
+                "artifact_sha256",
+                "training_data_sha256",
+                "source_code_sha256",
+                "trained_at",
+                "training_mode",
+                "training_policy",
+                "model_stage",
+                "activation_stage",
+                "readiness_state",
+                "live_ml_ready",
+                "paper_canary_authorized",
+                "blocking_reasons",
+                "status",
+            )
+            if key in raw
+        }
+        for key in ("metrics", "quality_report", "return_evidence_report", "paper_canary_report"):
+            if isinstance(raw.get(key), dict):
+                keep[key] = _bounded_dashboard_payload(
+                    raw[key], max_depth=4, max_items=24, max_text=320
+                )
+        return keep
+
+    registry = payload.get("artifact_registry")
+    if isinstance(registry, dict):
+        compact_registry = {
+            key: registry[key]
+            for key in (
+                "available",
+                "model_id",
+                "registry_version",
+                "version",
+                "model_path",
+                "manifest_path",
+                "sha256",
+            )
+            if key in registry
+        }
+        pointers = registry.get("pointers")
+        if isinstance(pointers, dict):
+            compact_registry["pointers"] = {
+                str(role): {
+                    key: row[key]
+                    for key in (
+                        "available",
+                        "role",
+                        "version",
+                        "model_path",
+                        "manifest_path",
+                        "sha256",
+                    )
+                    if key in row
+                }
+                | ({"rejection_manifest": compact_manifest(row.get("rejection_manifest"))} if isinstance(row.get("rejection_manifest"), dict) else {})
+                | ({"manifest": compact_manifest(row.get("manifest"))} if isinstance(row.get("manifest"), dict) else {})
+                | ({"activation_manifest": compact_manifest(row.get("activation_manifest"))} if isinstance(row.get("activation_manifest"), dict) else {})
+                for role, row in pointers.items()
+                if isinstance(row, dict)
+            }
+        if isinstance(registry.get("manifest"), dict):
+            compact_registry["manifest"] = compact_manifest(registry["manifest"])
+        if isinstance(registry.get("activation_manifest"), dict):
+            compact_registry["activation_manifest"] = compact_manifest(registry["activation_manifest"])
+        payload["artifact_registry"] = compact_registry
+
+    for key in (
+        "artifact_activation_manifest",
+        "live_promotion_manifest",
+        "readiness",
+        "quality_report",
+        "walk_forward_report",
+        "leave_one_symbol_out_report",
+        "training_task_manifest",
+        "replay_weight_manifest",
+        "authoritative_trade_return_evidence",
+        "actual_trade_calibration",
+        "counterfactual_cost_holdout",
+        "oos_return_evaluation",
+        "strategy_replay_holdout",
+        "mixed_horizon_holdout_diagnostics",
+        "holdout_horizon_diagnostics",
+        "score_bucket_diagnostics",
+    ):
+        if isinstance(payload.get(key), dict):
+            payload[key] = _bounded_dashboard_payload(
+                payload[key], max_depth=5, max_items=32, max_text=480
+            )
+    return payload
 
 
 def _dashboard_heavy_cache_get(
@@ -7004,8 +7114,7 @@ async def get_status(mode: str | None = None):
     }
 
 
-@router.get("/ml-signal/status")
-async def get_ml_signal_status():
+async def _build_ml_signal_status() -> dict[str, Any]:
     try:
         ml_signal_service = _dashboard_ml_signal_service()
     except Exception as exc:
@@ -7058,7 +7167,20 @@ async def get_ml_signal_status():
             f"current_training_epoch_shadow_count_unavailable:{safe_error_text(exc, limit=120)}"
         )
 
-    return status
+    return _compact_ml_status_for_dashboard(status)
+
+
+@router.get("/ml-signal/status")
+async def get_ml_signal_status():
+    """Return a cached, bounded ML status snapshot for browser diagnostics."""
+
+    return sanitize_payload(
+        await _dashboard_heavy_cached(
+            ("ml-signal-status",),
+            _build_ml_signal_status,
+            ttl_seconds=_DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS,
+        )
+    )
 
 
 def _trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
@@ -7169,7 +7291,7 @@ async def get_model_training_registry_status() -> dict[str, Any]:
         try:
             value = await asyncio.wait_for(builder(), timeout=15.0)
             return value if isinstance(value, dict) else {"available": False, "status": f"{name}_invalid"}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {
                 "available": False,
                 "service_available": False,
@@ -7205,7 +7327,7 @@ async def get_model_training_registry_status() -> dict[str, Any]:
             ModelContributionPerformanceService().recent(mode_manager.mode.value),
             timeout=8.0,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Contribution attribution is diagnostic only. It must never hold the
         # registry page hostage or compete with the trading loop.
         contribution_performance = {}
@@ -7244,9 +7366,8 @@ async def get_server_monitor_status():
     return await get_server_monitor_status_async()
 
 
-@router.get("/dashboard/summary")
-async def get_dashboard_summary():
-    """Aggregate dashboard data."""
+async def _build_dashboard_summary() -> dict[str, Any]:
+    """Build the dashboard summary once per short cache window."""
     market_state = await _build_open_position_market_snapshot(mode_manager.mode.value)
 
     okx_account = await _get_dashboard_okx_account_snapshot(mode_manager.mode.value)
@@ -7276,6 +7397,17 @@ async def get_dashboard_summary():
         "today_decisions_total": today_decisions_total,
         "today_decisions_timezone": "Asia/Shanghai",
     }
+
+
+@router.get("/dashboard/summary")
+async def get_dashboard_summary():
+    """Aggregate dashboard data with single-flight protection."""
+
+    return await _dashboard_heavy_cached(
+        ("dashboard-summary", mode_manager.mode.value),
+        _build_dashboard_summary,
+        ttl_seconds=_DASHBOARD_SUMMARY_CACHE_TTL_SECONDS,
+    )
 
 
 @router.get("/dashboard/market")
@@ -9165,7 +9297,7 @@ async def get_strategy_learning(
             ),
             timeout=2.0,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         watermark = ("watermark_timeout",)
         timeout_payload = {
             "status": "timeout",
@@ -9217,7 +9349,7 @@ async def get_strategy_learning(
             ),
             timeout=12.0,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         payload = {
             "status": "timeout",
             "stale": False,
