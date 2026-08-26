@@ -4324,19 +4324,19 @@ function renderExpertMemories(data = {}) {
 
     if (memoryBody) {
         if (!memories.length) {
-            memoryBody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无专家记忆，平仓后会自动生成复盘经验。</td></tr>';
+            memoryBody.innerHTML = '<tr><td colspan="7" class="expert-memory-empty">暂无专家记忆，平仓完成权威结算后会自动生成。</td></tr>';
         } else {
             memoryBody.innerHTML = memories.map(m => {
+                const presentation = expertMemoryPresentation(m);
                 return `
                     <tr>
-                        <td>${escHtml(m.expert_label || m.expert_name || '-')}</td>
-                        <td>${escHtml(m.symbol || '通用')}</td>
-                        <td>${memoryTypeLabel(m.memory_type)}</td>
-                        <td style="max-width:180px;">${escHtml(m.market_pattern || '-')}</td>
-                        <td style="max-width:360px;">${escHtml(m.lesson || '-')}</td>
-                        <td>${memoryActionLabel(m.recommended_action)}</td>
-                        <td>${Number(m.evidence_count || 0)} / ${Number(m.hit_count || 0)}</td>
-                        <td style="color:var(--text-muted);white-space:nowrap;">仅观察</td>
+                        <td><strong class="expert-memory-expert">${escHtml(m.expert_label || m.expert_name || '-')}</strong></td>
+                        <td>${presentation.marketHtml}</td>
+                        <td>${presentation.sourceHtml}</td>
+                        <td>${presentation.outcomeHtml}</td>
+                        <td>${presentation.lessonHtml}</td>
+                        <td>${presentation.statsHtml}</td>
+                        <td>${presentation.usageHtml}</td>
                     </tr>
                 `;
             }).join('');
@@ -4544,9 +4544,10 @@ function memoryTypeLabel(type) {
         shadow_missed_opportunity: '影子复盘-错过机会',
         shadow_bad_signal: '影子复盘-错误信号',
         shadow_good_signal: '影子复盘-有效信号',
+        authoritative_trade_outcome: '权威成交结果',
         lesson: '经验',
     };
-    return map[type] || type || '-';
+    return map[type] || '其他记忆';
 }
 
 function memoryActionLabel(action) {
@@ -4554,8 +4555,115 @@ function memoryActionLabel(action) {
         reduce_risk: '降信心/降仓位',
         keep_with_filters: '保留但需过滤',
         wait_for_better_setup: '等待更好机会',
+        observation_only_revalidate_distribution: '观察并复核分布',
     };
-    return map[action] || action || '-';
+    return map[action] || '仅用于观察';
+}
+
+function expertMemoryPresentation(memory = {}) {
+    const patternParts = String(memory.market_pattern || '').split('|').map(item => item.trim());
+    const symbol = String(memory.symbol || patternParts[0] || '通用');
+    const side = String(memory.side || patternParts[1] || '').toLowerCase();
+    const sideText = side ? sideLabel(side) : '方向不限';
+    const sideClass = ['long', 'short'].includes(side) ? `badge-${side}` : 'badge-hold';
+    const typeText = memoryTypeLabel(memory.memory_type);
+    const isAuthoritative = memory.memory_type === 'authoritative_trade_outcome'
+        || memory.memory_source === 'authoritative_trade_outcome';
+    const outcome = expertMemoryOutcome(memory);
+    const actionText = memoryActionLabel(memory.recommended_action);
+    const evidenceCount = Math.max(0, Number(memory.evidence_count || 0));
+    const hitCount = Math.max(0, Number(memory.hit_count || 0));
+    const successCount = Math.max(0, Number(memory.success_count || 0));
+    const failureCount = Math.max(0, Number(memory.failure_count || 0));
+    const lessonText = isAuthoritative
+        ? authoritativeMemoryLesson(sideText, outcome)
+        : readableMemoryLesson(memory.lesson, typeText);
+    const sourceDetail = isAuthoritative ? 'OKX 完整持仓生命周期' : memorySourceDetail(memory.memory_type);
+    const productionEligible = memory.production_evidence_eligible === true;
+
+    const marketHtml = `<div class="expert-memory-market">
+        <strong>${escHtml(symbol)}</strong>
+        <span class="badge ${sideClass}">${escHtml(sideText)}</span>
+    </div>`;
+    const sourceHtml = `<div class="expert-memory-source">
+        <strong>${escHtml(typeText)}</strong>
+        <span>${escHtml(sourceDetail)}</span>
+    </div>`;
+    const outcomeHtml = outcome.available
+        ? `<div class="expert-memory-outcome ${outcome.tone}">
+            <strong>${escHtml(outcome.resultText)} · ${escHtml(outcome.returnText)}</strong>
+            <span>净盈亏 ${escHtml(outcome.pnlText)}</span>
+            ${outcome.id ? `<em title="${escHtml(outcome.id)}">结算 ID ${escHtml(compactIdentifier(outcome.id, 22))}</em>` : ''}
+        </div>`
+        : `<div class="expert-memory-outcome neutral">
+            <strong>${escHtml(memoryResultSummary(successCount, failureCount))}</strong>
+            <span>该类记忆未提供单笔结算金额</span>
+        </div>`;
+    const lessonHtml = `<div class="expert-memory-lesson">
+        <strong>${escHtml(lessonText)}</strong>
+        <span>${escHtml(actionText)}</span>
+    </div>`;
+    const statsHtml = `<div class="expert-memory-stats">
+        <span><b>${evidenceCount}</b> 条证据</span>
+        <span><b>${hitCount}</b> 次命中</span>
+    </div>`;
+    const usageHtml = `<div class="expert-memory-usage">
+        <strong>仅观察</strong>
+        <span>${productionEligible ? '可进入训练评估，不直接触发交易' : '不参与生产决策'}</span>
+    </div>`;
+    return { marketHtml, sourceHtml, outcomeHtml, lessonHtml, statsHtml, usageHtml };
+}
+
+function expertMemoryOutcome(memory = {}) {
+    let pnl = mlOptionalNumber(memory.realized_net_pnl_usdt);
+    let returnPct = mlOptionalNumber(memory.net_return_after_all_cost_pct);
+    let outcomeId = String(memory.outcome_id || '').trim();
+    if ((pnl === null || returnPct === null || !outcomeId) && memory.lesson) {
+        const match = String(memory.lesson).match(/^Authoritative fee-after outcome\s+(.+?):\s*symbol=[^,]+,\s*side=[^,]+,\s*result=([^,]+),\s*net_return_pct=([-+0-9.eE]+),\s*realized_net_pnl_usdt=([-+0-9.eE]+)\.?$/i);
+        if (match) {
+            outcomeId = outcomeId || match[1].trim();
+            returnPct = returnPct ?? mlOptionalNumber(match[3]);
+            pnl = pnl ?? mlOptionalNumber(match[4]);
+        }
+    }
+    if (pnl === null && returnPct === null) {
+        return { available: false, id: outcomeId };
+    }
+    const basis = pnl ?? returnPct ?? 0;
+    const resultText = basis > 0 ? '盈利' : basis < 0 ? '亏损' : '持平';
+    const tone = basis > 0 ? 'profit' : basis < 0 ? 'loss' : 'neutral';
+    return {
+        available: true,
+        id: outcomeId,
+        resultText,
+        tone,
+        returnText: returnPct === null ? '费后收益率待补充' : `${returnPct >= 0 ? '+' : ''}${returnPct.toFixed(4)}%`,
+        pnlText: pnl === null ? '待补充' : `${signedMoney(pnl)} USDT`,
+    };
+}
+
+function authoritativeMemoryLesson(sideText, outcome) {
+    if (!outcome.available) {
+        return `该笔${sideText}已完成权威结算，当前记录用于复核同类场景。`;
+    }
+    return `该笔${sideText}在计入资金费并扣除交易成本后${outcome.resultText}，用于校准同类场景的收益与风险分布。`;
+}
+
+function readableMemoryLesson(rawLesson, typeText) {
+    const text = String(rawLesson || '').trim();
+    if (!text) return `${typeText}尚未补充可读结论。`;
+    if (/^[\x00-\x7F]+$/.test(text)) return `${typeText}已记录，原始技术说明已收起。`;
+    return text;
+}
+
+function memorySourceDetail(type) {
+    if (String(type || '').startsWith('shadow_')) return '未成交机会的反事实复盘';
+    return '历史交易与复盘记录';
+}
+
+function memoryResultSummary(successCount, failureCount) {
+    if (successCount || failureCount) return `盈利 ${successCount} · 亏损 ${failureCount}`;
+    return '暂无结果统计';
 }
 
 // ========== Local ML Signal Dashboard ==========

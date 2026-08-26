@@ -9964,9 +9964,19 @@ async def get_expert_memories(
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "updated_at": m.updated_at.isoformat() if m.updated_at else None,
             "authority_level": _safe_dict(m.extra).get("authority_level"),
+            "memory_source": _safe_dict(m.extra).get("source"),
+            "source_position_id": m.source_position_id,
             "outcome_id": _safe_dict(m.extra).get("outcome_id"),
             "outcome_version": _safe_dict(m.extra).get("outcome_version"),
             "outcome_distribution": _safe_dict(m.extra).get("outcome_aggregation"),
+            "realized_net_pnl_usdt": _safe_dict(m.extra).get("realized_pnl"),
+            "net_return_after_all_cost_pct": _safe_dict(m.extra).get(
+                "net_return_after_all_cost_pct"
+            ),
+            "production_evidence_eligible": _safe_dict(m.extra).get(
+                "production_evidence_eligible"
+            ),
+            "hold_minutes": _safe_dict(m.extra).get("hold_minutes"),
         }
         for m in memories
     ]

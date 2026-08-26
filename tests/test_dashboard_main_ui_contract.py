@@ -122,7 +122,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.js?v=20260826-expert-memory-v2" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -159,6 +159,31 @@ def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence(
     assert ".trade-reflection-pnl" in style
     assert "min-width: 1660px;" in style
     assert "word-break: break-word;" in style
+
+
+def test_expert_memory_table_uses_readable_structured_outcomes() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+    source = (PROJECT_ROOT / "web_dashboard/api/dashboard.py").read_text(encoding="utf-8")
+
+    assert 'class="expert-memory-table"' in html
+    assert "<th>标的与方向</th>" in html
+    assert "<th>结算结果</th>" in html
+    assert "<th>经验结论</th>" in html
+    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "function expertMemoryPresentation(memory = {})" in script
+    assert "function expertMemoryOutcome(memory = {})" in script
+    assert "观察并复核分布" in script
+    assert "计入资金费并扣除交易成本" in script
+    assert "${escHtml(m.market_pattern || '-')}" not in script
+    assert "${escHtml(m.lesson || '-')}" not in script
+    assert '"realized_net_pnl_usdt"' in source
+    assert '"net_return_after_all_cost_pct"' in source
+    assert ".expert-memory-table" in style
+    assert "min-width: 980px;" in style
+    assert "@media (max-width: 1400px)" in style
+    assert "overflow-wrap: anywhere;" in style
 
 
 def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
@@ -684,7 +709,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.js?v=20260826-expert-memory-v2" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -823,8 +848,8 @@ def test_system_audit_nodes_use_state_aware_display_status() -> None:
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260826-reflection-layout-v1" in html
-    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.css?v=20260826-expert-memory-v2" in html
+    assert "dashboard.js?v=20260826-expert-memory-v2" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -991,8 +1016,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260826-reflection-layout-v1" in html
-    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.css?v=20260826-expert-memory-v2" in html
+    assert "dashboard.js?v=20260826-expert-memory-v2" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1246,7 +1271,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260826-reflection-layout-v1" in html
+    assert "/static/js/dashboard.js?v=20260826-expert-memory-v2" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:
