@@ -1284,6 +1284,16 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "dashboardReasonText(readiness.state || status.readiness_state || '证据缺失')" in script
 
 
+def test_dashboard_localizes_okx_settlement_reconciliation_gaps() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "close_fill_contracts_history_mismatch: 'OKX 平仓成交数量与仓位历史记录不一致" in script
+    assert "close_fill_contract_history_mismatch: 'OKX 平仓成交数量与仓位历史记录不一致" in script
+    assert "order_fee_total_mismatch: 'OKX 成交单手续费合计与仓位历史手续费不一致" in script
+    assert "证据未完整：" in script
+    assert "系统发现一项未确认的结算数据，已暂不纳入训练" in script
+
+
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 

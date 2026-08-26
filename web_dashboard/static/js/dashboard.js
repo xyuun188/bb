@@ -4364,7 +4364,7 @@ function renderExpertMemories(data = {}) {
                     ? `<div class="trade-outcome-cell ${authoritative.complete ? 'ready' : 'blocked'}">
                         <strong>${distributionPctLabel(authoritative.net_return_after_all_cost_pct)}</strong>
                         <span>${escHtml(authoritative.outcome_id ? `结算记录 ${compactIdentifier(authoritative.outcome_id, 22)}` : '结算记录编号缺失')}</span>
-                        <em>${authoritative.complete ? '交易所结算已确认' : `还缺少：${(authoritative.evidence_gaps || []).map(item => escHtml(dashboardReasonText(item))).join(' / ') || '完整持仓记录'}`}</em>
+                        <em>${authoritative.complete ? '交易所结算已确认' : `证据未完整：${[...new Set(authoritative.evidence_gaps || [])].map(item => escHtml(dashboardReasonText(item))).join('；') || '完整持仓记录'}`}</em>
                     </div>`
                     : `<div class="trade-outcome-cell blocked">
                         <strong>${escHtml(authorityStatus.label || '等待交易所结算')}</strong>
@@ -4883,6 +4883,17 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     okx_private_position_underlying_differs_from_public_instrument: 'OKX 私有仓位标的与公共合约规格不一致，已阻断正常持仓接管',
     current_position_notional_missing: 'OKX 当前仓位缺少可验证的权威名义价值，已阻断正常持仓接管',
     exchange_position_notional_mismatch: 'OKX 当前仓位名义价值与合约张数、合约面值和标记价不一致，已阻断正常持仓接管',
+    close_fill_contracts_history_mismatch: 'OKX 平仓成交数量与仓位历史记录不一致，无法确认完整平仓数量',
+    close_fill_contract_history_mismatch: 'OKX 平仓成交数量与仓位历史记录不一致，无法确认完整平仓数量',
+    entry_fill_contracts_history_mismatch: 'OKX 开仓成交数量与仓位历史记录不一致，无法确认完整开仓数量',
+    order_fee_total_mismatch: 'OKX 成交单手续费合计与仓位历史手续费不一致，无法确认最终手续费',
+    entry_fill_price_history_mismatch: 'OKX 开仓成交均价与仓位历史均价不一致',
+    close_fill_price_history_mismatch: 'OKX 平仓成交均价与仓位历史均价不一致',
+    entry_fill_contract_quantity_mismatch: 'OKX 开仓成交数量与合约面值换算结果不一致',
+    close_fill_contract_quantity_mismatch: 'OKX 平仓成交数量与合约面值换算结果不一致',
+    missing_authoritative_entry_fill_facts: '缺少 OKX 完整开仓成交明细',
+    missing_authoritative_close_fill_facts: '缺少 OKX 完整平仓成交明细',
+    settlement_algebra_mismatch: 'OKX 盈亏、手续费和资金费无法按同一公式对账',
     no_model: '本地 ML 尚未注册当前模型 Artifact',
     artifact_incompatible: '当前模型 Artifact 与运行时收益监督合同不兼容，已禁止加载',
     artifact_load_failed: '当前模型 Artifact 加载失败，已禁止用于运行时预测',
@@ -5096,7 +5107,7 @@ function dashboardReasonText(value) {
     if (/no trained local quant bundle/i.test(rawText)) return '本地量化模型产物尚未生成或尚未注册';
     if (rawText && /[\u3400-\u9fff]/.test(rawText)) return rawText;
     if (/^[a-z][a-z0-9_:-]*$/i.test(code)) {
-        return `未登记中文说明的系统原因，已按异常处理（诊断代码：${code}）`;
+        return `系统发现一项未确认的结算数据，已暂不纳入训练（诊断编号：${code}）`;
     }
     if (/[A-Za-z]{4}/.test(rawText)) return '系统返回了未中文化的异常说明，已按问题处理';
     return rawText || '原因尚未返回';
