@@ -432,11 +432,30 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
                 "px": "",
                 "reduceOnly": "false",
                 "tgtCcy": "",
-                "stpMode": "",
                 "attachAlgoOrds": None,
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_preserves_explicit_stp_mode() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    trade_api = _TradeApi()
+    exchange._trade_api = trade_api
+
+    await exchange.privatePostTradeOrder(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "buy",
+            "ordType": "market",
+            "sz": "1",
+            "stpMode": "cancel_maker",
+        }
+    )
+
+    assert trade_api.calls[0][1]["stpMode"] == "cancel_maker"
 
 
 @pytest.mark.asyncio

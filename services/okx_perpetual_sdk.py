@@ -1242,24 +1242,32 @@ class OkxPerpetualSdkExchange:
     async def privatePostTradeOrder(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = dict(params or {})
         inst_id = normalize_swap_inst_id(params.get("instId"), required=True)
+        sdk_kwargs: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": str(params.get("tdMode") or OKX_CROSS_MARGIN_MODE),
+            "side": str(params.get("side") or ""),
+            "ordType": str(params.get("ordType") or "market"),
+            "sz": str(params.get("sz") or ""),
+            "ccy": str(params.get("ccy") or ""),
+            "clOrdId": str(params.get("clOrdId") or ""),
+            "tag": str(params.get("tag") or ""),
+            "posSide": str(params.get("posSide") or params.get("positionSide") or ""),
+            "px": str(params.get("px") or ""),
+            "reduceOnly": _normalize_bool_text(params.get("reduceOnly")),
+            "tgtCcy": str(params.get("tgtCcy") or ""),
+            "attachAlgoOrds": params.get("attachAlgoOrds"),
+        }
+        # python-okx serializes every keyword it receives.  Sending the empty
+        # string used by its optional default for stpMode is rejected by OKX
+        # (51000); omitting it lets the account's configured default apply.
+        stp_mode = str(params.get("stpMode") or "").strip()
+        if stp_mode:
+            sdk_kwargs["stpMode"] = stp_mode
         return await self._call_sdk(
             lambda: self.trade_api,
             "place_order",
             check_data_code=True,
-            instId=inst_id,
-            tdMode=str(params.get("tdMode") or OKX_CROSS_MARGIN_MODE),
-            side=str(params.get("side") or ""),
-            ordType=str(params.get("ordType") or "market"),
-            sz=str(params.get("sz") or ""),
-            ccy=str(params.get("ccy") or ""),
-            clOrdId=str(params.get("clOrdId") or ""),
-            tag=str(params.get("tag") or ""),
-            posSide=str(params.get("posSide") or params.get("positionSide") or ""),
-            px=str(params.get("px") or ""),
-            reduceOnly=_normalize_bool_text(params.get("reduceOnly")),
-            tgtCcy=str(params.get("tgtCcy") or ""),
-            stpMode=str(params.get("stpMode") or ""),
-            attachAlgoOrds=params.get("attachAlgoOrds"),
+            **sdk_kwargs,
         )
 
     async def create_order(
