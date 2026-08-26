@@ -122,7 +122,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
+    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -147,12 +147,18 @@ def test_dashboard_refreshes_active_local_ml_status() -> None:
 
 def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert "const authorityStatus = r.authority_status || {};" in script
     assert "复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实" in script
     assert "authorityStatus.label || '等待权威结算'" in script
     assert "dashboardReasonText(item)" in script
     assert "权威成交 outcome 缺失" not in script
+    assert 'class="trade-reflection-pnl"' in script
+    assert 'style="color:${pnlColor};white-space:nowrap;"' not in script
+    assert ".trade-reflection-pnl" in style
+    assert "min-width: 1660px;" in style
+    assert "word-break: break-word;" in style
 
 
 def test_dashboard_static_assets_keep_utf8_chinese_text() -> None:
@@ -678,7 +684,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
+    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -817,8 +823,8 @@ def test_system_audit_nodes_use_state_aware_display_status() -> None:
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
+    assert "dashboard.css?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -985,8 +991,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260715-profit-evidence" in html
-    assert "dashboard.js?v=20260817-analysis-quality-v2" in html
+    assert "dashboard.css?v=20260826-reflection-layout-v1" in html
+    assert "dashboard.js?v=20260826-reflection-layout-v1" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1240,7 +1246,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260817-analysis-quality-v2" in html
+    assert "/static/js/dashboard.js?v=20260826-reflection-layout-v1" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:

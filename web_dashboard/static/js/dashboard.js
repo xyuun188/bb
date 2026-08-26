@@ -4383,7 +4383,7 @@ function renderExpertMemories(data = {}) {
                         <td class="trade-reflection-time" title="${escHtml(generatedTimeTitle)}">${generatedTime}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
-                        <td style="color:${pnlColor};white-space:nowrap;">${pnl === null ? escHtml(authorityStatus.label || '等待权威结算') : `${signedMoney(pnl)} USDT`}</td>
+                        <td class="trade-reflection-pnl" style="color:${pnlColor};">${pnl === null ? escHtml(authorityStatus.label || '等待权威结算') : `${signedMoney(pnl)} USDT`}</td>
                         <td>${mlOptionalNumber(r.hold_minutes) === null ? '证据缺失' : `${mlOptionalNumber(r.hold_minutes).toFixed(1)} 分钟`}</td>
                         <td>${actualHtml}</td>
                         <td>${shadowHtml}</td>

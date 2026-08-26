@@ -3016,35 +3016,60 @@ body {
     overflow: auto;
 }
 .trade-reflection-table {
-    min-width: 1480px;
+    min-width: 1660px;
     table-layout: fixed;
 }
 .trade-reflection-table th:nth-child(1),
-.trade-reflection-table td:nth-child(1) { width: 72px; }
+.trade-reflection-table td:nth-child(1) { width: 84px; }
 .trade-reflection-table th:nth-child(2),
-.trade-reflection-table td:nth-child(2) { width: 96px; }
+.trade-reflection-table td:nth-child(2) { width: 104px; }
 .trade-reflection-table th:nth-child(3),
 .trade-reflection-table td:nth-child(3) { width: 64px; }
 .trade-reflection-table th:nth-child(4),
-.trade-reflection-table td:nth-child(4) { width: 96px; }
+.trade-reflection-table td:nth-child(4) { width: 150px; }
 .trade-reflection-table th:nth-child(5),
-.trade-reflection-table td:nth-child(5) { width: 72px; }
+.trade-reflection-table td:nth-child(5) { width: 88px; }
 .trade-reflection-table th:nth-child(6),
-.trade-reflection-table td:nth-child(6) { width: 230px; }
+.trade-reflection-table td:nth-child(6) { width: 250px; }
 .trade-reflection-table th:nth-child(7),
-.trade-reflection-table td:nth-child(7) { width: 190px; }
+.trade-reflection-table td:nth-child(7) { width: 210px; }
 .trade-reflection-table th:nth-child(8),
 .trade-reflection-table td:nth-child(8),
 .trade-reflection-table th:nth-child(9),
-.trade-reflection-table td:nth-child(9) { width: 260px; }
+.trade-reflection-table td:nth-child(9) { width: 300px; }
+.trade-reflection-table th {
+    white-space: nowrap;
+}
 .trade-reflection-table td {
+    min-width: 0;
     vertical-align: top;
     line-height: 1.6;
+    white-space: normal;
     overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.trade-reflection-table td:nth-child(2),
+.trade-reflection-table td:nth-child(3),
+.trade-reflection-table td:nth-child(5) {
+    white-space: nowrap;
+}
+.trade-reflection-table td:nth-child(4) {
+    white-space: normal !important;
+}
+.trade-reflection-pnl {
+    font-variant-numeric: tabular-nums;
+    line-height: 1.45;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 .trade-reflection-text {
+    min-width: 0;
     color: var(--text-dim);
     line-height: 1.6;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 .trade-reflection-time {
     font-size: 10px;
@@ -4448,11 +4473,11 @@ select.form-input { cursor: pointer; }
 .trade-outcome-cell.ready { border-color: rgba(34,197,94,0.30); }
 .trade-outcome-cell.blocked { border-color: rgba(239,68,68,0.34); }
 .trade-outcome-cell strong,
-.trade-shadow-cell strong { color: var(--text); font-size: 11px; overflow-wrap: anywhere; }
+.trade-shadow-cell strong { color: var(--text); font-size: 11px; overflow-wrap: anywhere; word-break: break-word; }
 .trade-outcome-cell span,
-.trade-shadow-cell span { color: var(--text-dim); font-size: 9px; overflow-wrap: anywhere; }
+.trade-shadow-cell span { color: var(--text-dim); font-size: 9px; overflow-wrap: anywhere; word-break: break-word; }
 .trade-outcome-cell em,
-.trade-shadow-cell em { color: var(--text-muted); font-size: 9px; font-style: normal; overflow-wrap: anywhere; }
+.trade-shadow-cell em { color: var(--text-muted); font-size: 9px; font-style: normal; overflow-wrap: anywhere; word-break: break-word; }
 
 .position-action-stack {
     display: grid;
