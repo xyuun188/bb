@@ -10843,11 +10843,17 @@ function renderLocalAIToolsStatus() {
     const serviceAvailable = status.service_available !== false && (available || status.service_available === true);
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
-    const childAvailableCount = Object.values(childEndpoints).filter(item => item && item.available).length;
-    const childTotalCount = Object.keys(childEndpoints).length;
+    const childMetadataReadyFallback = Object.values(childEndpoints).filter(item => item && (item.metadata_ready || item.available)).length;
+    const childMetadataReadyCount = Number.isFinite(Number(status.child_metadata_ready_count))
+        ? Number(status.child_metadata_ready_count) : childMetadataReadyFallback;
+    const childLiveProbeOkCount = Number.isFinite(Number(status.child_live_probe_ok_count))
+        ? Number(status.child_live_probe_ok_count)
+        : Object.values(childEndpoints).filter(item => item && (item.live_probe_ok || item.actual_inference_probe)).length;
+    const childTotalCount = Object.keys(childEndpoints).length || 4;
+    const childContractStatus = status.child_contract_status || (childLiveProbeOkCount ? 'live_probe_ok' : childMetadataReadyCount ? 'metadata_ready' : 'unavailable');
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
-            ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口 ${childAvailableCount}/${childTotalCount || 4}`
+            ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口登记 ${childMetadataReadyCount}/${childTotalCount} · 实时探针 ${childLiveProbeOkCount}/${childTotalCount} · 状态 ${childContractStatus}`
             : '服务不可用';
     }
 
@@ -10859,10 +10865,10 @@ function renderLocalAIToolsStatus() {
             tone: serviceAvailable ? 'good' : 'bad',
         },
         {
-            label: '真实子接口',
-            value: `${childAvailableCount}/${childTotalCount || 4}`,
-            subtitle: childTotalCount ? '盈利预测、时序、情绪和平仓建议探针结果' : '等待后端返回子接口探针',
-            tone: childAvailableCount >= Math.max(childTotalCount, 1) ? 'good' : (childAvailableCount > 0 ? 'warn' : 'bad'),
+            label: '子接口状态',
+            value: `${childMetadataReadyCount}/${childTotalCount}`,
+            subtitle: `登记 ${childMetadataReadyCount}/${childTotalCount}；实时推理探针 ${childLiveProbeOkCount}/${childTotalCount}；状态 ${childContractStatus}`,
+            tone: childMetadataReadyCount >= childTotalCount && childLiveProbeOkCount >= childTotalCount ? 'good' : (childMetadataReadyCount > 0 ? 'warn' : 'bad'),
         },
         {
             label: '影子市场机会样本',
@@ -10895,7 +10901,6 @@ function renderLocalAIToolsStatus() {
             tone: mlOptionalNumber(status.text_sentiment_sample_count) !== null ? 'good' : 'warn',
         },
     ];
-
     container.innerHTML = `
         <div class="ml-overview-grid ml-overview-grid-compact">
             ${cards.map(item => mlMetricCard(item.label, item.value, item.subtitle, item.tone)).join('')}

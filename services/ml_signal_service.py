@@ -4830,9 +4830,19 @@ class MLSignalService:
 
     def _artifact_registry_status(self) -> dict[str, Any]:
         current = self._resolved_artifact
+        status_method = getattr(self.artifact_registry, "status", None)
+        registry_status = status_method() if callable(status_method) else {}
+        if not isinstance(registry_status, dict):
+            registry_status = {}
         if current is None:
-            return self.artifact_registry.status()
+            if registry_status:
+                return registry_status
+            return {"available": False, "error": "current_artifact_not_registered"}
+        # Keep the complete pointer map (candidate/challenger/current/rollback)
+        # alongside the resolved active artifact so the dashboard can show an
+        # auditable version chain without resolving files from the browser.
         return {
+            **registry_status,
             "available": True,
             "model_id": current.model_id,
             "registry_version": current.manifest.get("artifact_registry_version"),

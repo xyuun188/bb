@@ -1167,32 +1167,54 @@ def _local_ai_tools_child_endpoint_contracts(
         "exit_advice": "/exit/advise",
     }
     raw_contracts = status_metadata.get("child_endpoints")
-    if not isinstance(raw_contracts, dict):
+    if not isinstance(raw_contracts, dict) or not raw_contracts:
         raw_contracts = health_metadata.get("child_endpoints")
     raw_contracts = raw_contracts if isinstance(raw_contracts, dict) else {}
     rows: dict[str, dict[str, Any]] = {}
     for name, path in specs.items():
         raw = raw_contracts.get(name)
         raw = raw if isinstance(raw, dict) else {}
-        available = raw.get("available") is True
+        metadata_ready = bool(
+            raw.get("metadata_ready")
+            or raw.get("available") is True
+            or raw.get("status") == "metadata_ready"
+            or raw.get("status_category") == "metadata_contract"
+        )
+        live_probe_ok = bool(
+            raw.get("live_probe_ok")
+            or (raw.get("actual_inference_probe") is True and raw.get("ok") is True)
+            or raw.get("status") == "live_probe_ok"
+        )
+        state = (
+            "live_probe_ok"
+            if live_probe_ok
+            else "metadata_ready"
+            if metadata_ready
+            else "unavailable"
+            if raw
+            else "contract_missing"
+        )
         rows[name] = {
-            "available": available,
-            "ok": available,
+            "available": metadata_ready,
+            "ok": live_probe_ok or metadata_ready,
+            "metadata_ready": metadata_ready,
+            "live_probe_ok": live_probe_ok,
             "path": str(raw.get("path") or path),
             "status_code": None,
             "latency_ms": None,
-            "status_category": "metadata_contract" if raw else "contract_missing",
+            "status": state,
+            "status_category": state,
             "probe_mode": str(raw.get("probe_mode") or "metadata_contract"),
-            "actual_inference_probe": False,
+            "actual_inference_probe": live_probe_ok,
             "message": str(
                 raw.get("message")
                 or (
                     "状态契约已确认；实际推理由影子评估持续验证。"
-                    if available
+                    if metadata_ready
                     else "状态接口尚未返回该子接口的就绪契约。"
                 )
             ),
-            "error": "" if available else "child_endpoint_contract_missing_or_not_ready",
+            "error": "" if live_probe_ok else "inference_probe_not_run" if metadata_ready else "child_endpoint_contract_missing_or_not_ready",
         }
     return rows
 
@@ -1266,6 +1288,22 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         local_tools: dict[str, Any] = {
             "configured": bool(configured_local_base),
             "using_default_phase3_tunnel": not bool(configured_local_base),
+            "available": False,
+            "service_available": False,
+            "model_bundle_available": False,
+            "child_available": False,
+            "child_metadata_ready_count": 0,
+            "child_live_probe_ok_count": 0,
+            "child_degraded_count": 0,
+            "child_unavailable_count": 0,
+            "child_contract_status": "unavailable",
+            "transport_status": "unavailable",
+            "artifact_status": "unavailable",
+            "inference_probe_status": "unavailable",
+            "training_status": "unknown",
+            "evaluation_status": "unknown",
+            "permission_status": "shadow",
+            "child_endpoints": {},
         }
         if local_base:
             tunnel_contract = _platform_tunnel_contract(
@@ -1315,7 +1353,27 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 status_metadata,
             )
             child_available = any(
-                bool(item.get("available") or item.get("ok"))
+                bool(item.get("metadata_ready"))
+                for item in child_endpoints.values()
+                if isinstance(item, dict)
+            )
+            child_metadata_ready_count = sum(
+                bool(item.get("metadata_ready"))
+                for item in child_endpoints.values()
+                if isinstance(item, dict)
+            )
+            child_live_probe_ok_count = sum(
+                bool(item.get("live_probe_ok"))
+                for item in child_endpoints.values()
+                if isinstance(item, dict)
+            )
+            child_degraded_count = sum(
+                item.get("status") == "degraded"
+                for item in child_endpoints.values()
+                if isinstance(item, dict)
+            )
+            child_unavailable_count = sum(
+                item.get("status") in {"unavailable", "contract_missing"}
                 for item in child_endpoints.values()
                 if isinstance(item, dict)
             )
@@ -1333,6 +1391,44 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     "available": platform_call_available,
                     "service_available": service_available,
                     "child_available": child_available,
+                    "child_metadata_ready_count": child_metadata_ready_count,
+                    "child_live_probe_ok_count": child_live_probe_ok_count,
+                    "child_degraded_count": child_degraded_count,
+                    "child_unavailable_count": child_unavailable_count,
+                    "child_contract_status": (
+                        "live_probe_ok"
+                        if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
+                        else "metadata_ready"
+                        if child_metadata_ready_count
+                        else "unavailable"
+                    ),
+                    "transport_status": "ok" if service_available else "unavailable",
+                    "artifact_status": "ready" if model_bundle_available else "unavailable",
+                    "inference_probe_status": (
+                        "live_probe_ok"
+                        if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
+                        else "metadata_ready"
+                        if child_metadata_ready_count
+                        else "unavailable"
+                    ),
+                    "training_status": str(
+                        status_metadata.get("training_status")
+                        or status_metadata.get("training_state")
+                        or "unknown"
+                    ),
+                    "evaluation_status": str(
+                        status_metadata.get("evaluation_status")
+                        or status_metadata.get("promotion_status")
+                        or status_metadata.get("model_stage")
+                        or "unknown"
+                    ),
+                    "permission_status": (
+                        "live_candidate"
+                        if status_metadata.get("live_trading_permission") is True
+                        else "paper_canary"
+                        if status_metadata.get("paper_trading_permission") is True
+                        else "shadow"
+                    ),
                     "config_issue": (
                         "" if tunnel_contract.get("ok") else tunnel_contract.get("message", "")
                     ),

@@ -2034,7 +2034,11 @@ def _exit_contract_row(
     external_reconcile_contract = _external_okx_reconcile_exit_contract(raw, orders)
     if external_reconcile_contract is not None:
         reasons = list(external_reconcile_contract.pop("reasons"))
-        if executed and not _has_filled_order(orders):
+        if (
+            executed
+            and not _has_filled_order(orders)
+            and not external_reconcile_contract.get("external_fill_verified")
+        ):
             reasons.append("executed_exit_without_filled_order")
         row = {
             "decision_id": _row_get(decision, "id"),
@@ -2194,10 +2198,20 @@ def _external_okx_reconcile_exit_contract(
         if complete:
             authoritative_orders.append(order)
     reasons: list[str] = []
-    if len(authoritative_orders) != 1:
+    close_fill_fact = _external_close_fill_fact(close_fill)
+    if len(authoritative_orders) == 1:
+        authoritative = authoritative_orders[0]
+    elif close_fill_fact is not None:
+        # A reconciliation decision may be the only local row for an exchange
+        # close. The OKX fills-history identity is still authoritative when the
+        # decision carries a complete, uniquely identified close fill.
+        authoritative = None
+    else:
+        authoritative = None
         reasons.append("external_okx_close_fill_lifecycle_not_unique")
-    authoritative = authoritative_orders[0] if len(authoritative_orders) == 1 else None
     fact = _safe_dict(_row_get(authoritative, "okx_raw_fills")) if authoritative else {}
+    if close_fill_fact is not None:
+        fact = close_fill_fact
     return {
         "contract_kind": "okx_external_reconciliation",
         "close_fraction": _safe_float(_safe_dict(raw.get("close_fill")).get("close_fraction")),
@@ -2207,9 +2221,91 @@ def _external_okx_reconcile_exit_contract(
         "authoritative_close_order_id": (
             str(_row_get(authoritative, "exchange_order_id") or "")
             if authoritative is not None
-            else None
+            else close_fill_fact.get("order_id") if close_fill_fact else None
         ),
+        "authoritative_close_trade_ids": (
+            list(close_fill_fact.get("trade_ids") or []) if close_fill_fact else []
+        ),
+        "external_fill_verified": close_fill_fact is not None,
         "reasons": reasons,
+    }
+
+
+def _external_close_fill_fact(close_fill: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a complete OKX fill fact embedded in a reconciliation decision."""
+
+    info = _safe_dict(close_fill.get("order_info"))
+    order_id = str(
+        close_fill.get("order_id")
+        or close_fill.get("ordId")
+        or info.get("order_id")
+        or info.get("ordId")
+        or ""
+    ).strip()
+    inst_id = str(
+        close_fill.get("inst_id")
+        or close_fill.get("instId")
+        or info.get("instId")
+        or ""
+    ).strip().upper()
+    contracts = _safe_float(
+        close_fill.get("contracts")
+        or close_fill.get("fillSz")
+        or info.get("fillSz")
+        or info.get("accFillSz"),
+        0.0,
+    )
+    avg_price = _safe_float(
+        close_fill.get("avg_price")
+        or close_fill.get("price")
+        or info.get("fillPx")
+        or info.get("avgPx"),
+        0.0,
+    )
+    trade_ids = [
+        str(value).strip()
+        for value in (
+            *_safe_list(close_fill.get("trade_ids")),
+            close_fill.get("trade_id"),
+            close_fill.get("tradeId"),
+            info.get("tradeId"),
+        )
+        if str(value or "").strip()
+    ]
+    contract_size = _safe_float(close_fill.get("contract_size"), 0.0)
+    contract_size_source = str(close_fill.get("contract_size_source") or "").strip()
+    base_quantity = _safe_float(
+        close_fill.get("base_quantity")
+        or close_fill.get("quantity")
+        or (contracts * contract_size if contracts > 0 and contract_size > 0 else 0.0),
+        0.0,
+    )
+    fee = close_fill.get("fee_abs")
+    if fee is None:
+        fee = close_fill.get("fee") if close_fill.get("fee") is not None else info.get("fee")
+    complete = bool(
+        order_id
+        and inst_id.endswith("-SWAP")
+        and contracts > 0
+        and avg_price > 0
+        and trade_ids
+        and base_quantity > 0
+        and close_fill.get("contract_size_verified") is True
+        and contract_size_source == "okx_public_instruments"
+        and fee is not None
+    )
+    if not complete:
+        return None
+    return {
+        "source": "okx_fills_history",
+        "order_id": order_id,
+        "trade_ids": list(dict.fromkeys(trade_ids)),
+        "inst_id": inst_id,
+        "contracts": contracts,
+        "contract_size": contract_size,
+        "base_quantity": base_quantity,
+        "avg_price": avg_price,
+        "fee_abs": abs(_safe_float(fee)),
     }
 
 

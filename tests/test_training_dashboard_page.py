@@ -58,7 +58,7 @@ def test_training_page_static_bundle_uses_valid_chinese_and_cache_version() -> N
     training = (static_dir / "training.html").read_text(encoding="utf-8")
     script = (static_dir / "js" / "training.js").read_text(encoding="utf-8")
 
-    assert "training.js?v=20260727-paper-live-contract" in training
+    assert "training.js?v=20260826-training-evidence-v3" in training
     assert "当前 Artifact 与运行时收益监督合同不兼容" in script
     assert "模拟盘可用，实盘未晋升" in script
     assert "真实晋升阻断" in script

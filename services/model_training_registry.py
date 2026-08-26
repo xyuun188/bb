@@ -151,6 +151,7 @@ def _finquant_specialization_verified(
 
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
+    diagnostic_timeout = str(status.get("status") or "") == "timeout"
     live = status.get("live_ml_ready") is True
     readiness_report = _safe_dict(status.get("readiness"))
     readiness = str(
@@ -159,7 +160,9 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         or status.get("status")
         or "unknown"
     )
-    if live:
+    if diagnostic_timeout:
+        lifecycle = "diagnostic_timeout"
+    elif live:
         lifecycle = "live"
     elif available and readiness in {"degraded", "blocked", "promotion_blocked"}:
         lifecycle = "promotion_blocked"
@@ -183,8 +186,12 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
             status.get("training_shadow_sample_count") or status.get("sample_count")
         ),
         "live_ml_ready": live,
-        "quality_state": readiness,
-        "blocking_reasons": _reason_codes(readiness_report.get("blocking_reasons")),
+        "quality_state": "diagnostic_timeout" if diagnostic_timeout else readiness,
+        "blocking_reasons": (
+            ["status_query_timeout"]
+            if diagnostic_timeout
+            else _reason_codes(readiness_report.get("blocking_reasons"))
+        ),
         "identity_verified": available,
         "alias_only": False,
     }
@@ -236,6 +243,7 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
         status.get("model_bundle_available") or status.get("trained_models_available")
     )
     runtime_available = bool(status.get("service_available", status.get("available")))
+    diagnostic_timeout = str(status.get("status") or "") == "timeout"
     promotion = _safe_dict(status.get("promotion_recommendation"))
     live_ml_ready = promotion.get("live_ml_ready") is True
     canary_ready = bool(promotion.get("canary_ready"))
@@ -243,7 +251,9 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
     for model_id, display_name, model_key, task in _LOCAL_TOOL_MODELS:
         model_name = str(models.get(model_key) or "").strip()
         artifact_available = bool(bundle_available and model_name)
-        if artifact_available and live_ml_ready:
+        if diagnostic_timeout:
+            lifecycle = "diagnostic_timeout"
+        elif artifact_available and live_ml_ready:
             lifecycle = "active"
         elif artifact_available and canary_ready:
             lifecycle = "canary"
@@ -273,7 +283,11 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "live_ml_ready": live_ml_ready,
                 "quality_state": lifecycle,
-                "blocking_reasons": _safe_list(promotion.get("live_blocking_reasons")),
+                "blocking_reasons": (
+                    ["status_query_timeout"]
+                    if diagnostic_timeout
+                    else _safe_list(promotion.get("live_blocking_reasons"))
+                ),
                 "identity_verified": artifact_available,
                 "alias_only": False,
             }

@@ -12,7 +12,9 @@
     registry: '/api/model-training/registry',
     scheduler: '/api/model-training/scheduler',
     data: '/api/data-collection/status?include_feature_coverage=false',
-    strategy: '/api/strategy-learning',
+    // The strategy view is diagnostic only; a bounded recent window keeps it
+    // from competing with trading/analysis work during page refreshes.
+    strategy: '/api/strategy-learning?hours=24&limit=50&detail=summary',
     decisions: '/api/analysis-records?limit=12&page=1',
   };
   const endpointLabels = {
@@ -57,7 +59,7 @@
   });
   const lifecycleText = Object.freeze({
     active: '已激活', live: '已介入生产', canary: 'Paper Canary', trained: '已训练',
-    training: '训练中', promotion_blocked: '晋升阻断', shadow_evaluating: '影子评估',
+    training: '训练中', promotion_blocked: '晋升阻断', shadow_evaluating: '影子评估', diagnostic_timeout: '诊断查询超时',
     inference_only: '仅推理', not_trained: '未训练', not_evaluated: '未评估',
     service_unavailable: '服务不可用', unavailable: '不可用', running: '运行中',
     warning: '需要关注', error: '运行异常', ok: '正常',
@@ -179,10 +181,15 @@
     const totals = quality.totals || {};
     const trusted = number(governance.training_shadow_sample_count)
       ?? number(governance.local_ml_signal?.current_epoch_trainable_sample_count)
-      ?? number(localTools.training_shadow_sample_count) ?? number(totals.included);
+      ?? number(localTools.training_shadow_sample_count)
+      ?? number(ml.training_shadow_sample_count)
+      ?? number(ml.completed_shadow_sample_count)
+      ?? number(totals.included);
     const pending = number(ml.new_shadow_sample_count);
     const quarantined = number(governance.quarantined_shadow_sample_count)
-      ?? number(governance.local_ml_signal?.quarantined_sample_count) ?? number(totals.excluded);
+      ?? number(governance.local_ml_signal?.quarantined_sample_count)
+      ?? number(ml.quality_report?.totals?.excluded)
+      ?? number(totals.excluded);
     setText('[data-metric="training-status"]', visibleModelState(ml));
     setText('[data-detail="training-status"]', scheduler.status ? `调度：${lifecycleText[scheduler.status] || scheduler.status}` : '训练调度状态未提供');
     setText('[data-metric="trusted-samples"]', fmt(trusted));
@@ -194,6 +201,137 @@
     setText('[data-detail="model-influence"]', ml.live_ml_ready === true ? '实盘候选已就绪，逐笔生产门禁仍生效' : '实盘未授权；不阻断模拟盘分析和正常交易');
     setText('[data-metric="last-training"]', time(ml.trained_at));
     setText('[data-detail="last-training"]', ml.artifact_version ? `Artifact ${ml.artifact_version}` : 'Artifact 版本未提供');
+    renderTrainingEvidence();
+  }
+
+  function renderTrainingEvidence() {
+    const container = $('#training-evidence');
+    if (!container) return;
+    const ml = unwrap(payloads.ml);
+    const registry = unwrap(payloads.registry);
+    const scheduler = unwrap(payloads.scheduler);
+    const registryRoot = ml.artifact_registry || {};
+    const currentPointer = artifactPointer(registryRoot, 'current');
+    const challengerPointer = artifactPointer(registryRoot, 'challenger');
+    const currentManifest = artifactManifest(currentPointer);
+    const challengerManifest = artifactManifest(challengerPointer);
+    const activation = ml.artifact_activation_manifest || currentManifest.activation_manifest || ml.artifact_registry?.activation_manifest || {};
+    const latestTrainingVersion = challengerPointer?.version
+      || ml.artifact_version
+      || ml.version;
+    const challenger = ml.challenger_artifact_version
+      || ml.latest_challenger_version
+      || challengerPointer?.version
+      || activation.challenger_version;
+    const active = ml.active_artifact_version
+      || ml.active_version
+      || currentPointer?.version
+      || activation.active_version
+      || (ml.live_ml_ready ? ml.artifact_version : null);
+    const evaluated = ml.latest_evaluation_version
+      || ml.evaluation_artifact_version
+      || challengerPointer?.version
+      || ml.artifact_registry?.latest_evaluation_version
+      || (ml.evaluation_status ? ml.artifact_version : null);
+    const baseline = ml.no_model_baseline || ml.baseline || {};
+    const modelSummary = registry.summary || {};
+    const contributionStatus = registry.contribution_performance_status || {};
+    const schedulerState = scheduler.models || scheduler.schedulers || {};
+    const schedulerRows = Object.values(schedulerState).filter(item => item && typeof item === 'object');
+    const lastResult = schedulerRows.map(item => item.last_result || {}).find(item => Object.keys(item).length) || {};
+    const values = [
+      ['最新训练版本', latestTrainingVersion || '证据缺失'],
+      ['最新评估版本', evaluated || '尚未评估'],
+      ['当前 active', active || '未授权 active'],
+      ['候选 challenger', challenger || '暂无 challenger'],
+      ['无模型基线', baseline.version || baseline.name || '规则基线待提供'],
+      ['评估状态', ml.evaluation_status || ml.readiness?.state || '未提供'],
+      ['训练结果', lastResult.reason || lastResult.error || (lastResult.trained ? 'trained' : 'not_due / 未触发')],
+      ['下次检查', schedulerRows.map(item => item.next_check_at || item.next_run_at).find(Boolean) || '未提供'],
+      ['模型注册数', modelSummary.model_count ?? '未提供'],
+      ['贡献归因查询', contributionStatus.state === 'timeout' ? '已限时降级' : contributionStatus.state || '未提供'],
+      ['模拟盘权限', ml.paper_trading_permission === true ? '允许' : '未允许'],
+      ['实盘权限', ml.live_trading_permission === true ? '允许' : '未晋级'],
+      ['数据时间', ml.trained_at || ml.checked_at || '未提供'],
+    ];
+    container.innerHTML = values.map(([label, value]) => evidenceItem(label, value)).join('');
+    renderTrainingComparison(ml, registry);
+  }
+
+  function artifactPointer(registry, role) {
+    const pointers = registry?.pointers || registry?.artifact_registry?.pointers || {};
+    const pointer = pointers[role];
+    return pointer && typeof pointer === 'object' && pointer.available !== false ? pointer : null;
+  }
+
+  function artifactManifest(pointer) {
+    if (!pointer || typeof pointer !== 'object') return {};
+    const manifest = pointer.manifest;
+    return manifest && typeof manifest === 'object' ? manifest : {};
+  }
+
+  function artifactMetrics(pointer) {
+    const manifest = artifactManifest(pointer);
+    const source = manifest.metadata && typeof manifest.metadata === 'object'
+      ? manifest.metadata
+      : manifest;
+    const oos = source.oos_return_evaluation && typeof source.oos_return_evaluation === 'object'
+      ? source.oos_return_evaluation
+      : {};
+    const metrics = source.metrics && typeof source.metrics === 'object' ? source.metrics : {};
+    const side = (name) => {
+      const row = oos[name] && typeof oos[name] === 'object' ? oos[name] : {};
+      return {
+        avg_return_pct: row.avg_return_pct ?? metrics[`top_${name}_avg_return_pct`],
+        return_lcb_pct: row.return_lcb_pct ?? metrics[`top_${name}_return_lcb_pct`],
+        profit_factor: row.profit_factor ?? metrics[`top_${name}_profit_factor`],
+        cvar_10_pct: row.cvar_10_pct ?? metrics[`top_${name}_cvar_10_pct`],
+        max_drawdown_pct: row.max_drawdown_pct,
+        sample_count: row.sample_count,
+      };
+    };
+    return { long: side('long'), short: side('short'), version: pointer?.version || source.artifact_version || source.version };
+  }
+
+  function metricCell(metrics, key) {
+    const sideText = (side) => {
+      const value = metrics?.[side]?.[key];
+      if (!present(value)) return '未提供';
+      if (key === 'profit_factor') return Number(value).toFixed(2);
+      if (key === 'sample_count') return fmt(value);
+      return `${Number(value).toFixed(3)}%`;
+    };
+    return `多 ${sideText('long')} / 空 ${sideText('short')}`;
+  }
+
+  function renderTrainingComparison(ml, registry) {
+    const container = $('#training-comparison');
+    if (!container) return;
+    const registryRoot = ml.artifact_registry || registry?.artifact_registry || registry || {};
+    const activePointer = artifactPointer(registryRoot, 'current')
+      || artifactPointer(registryRoot, 'active');
+    const challengerPointer = artifactPointer(registryRoot, 'challenger');
+    const baselineSource = ml.no_model_baseline || ml.baseline
+      || registry.no_model_baseline || registry.baseline;
+    const baseline = baselineSource && typeof baselineSource === 'object' ? baselineSource : null;
+    const columns = [
+      ['当前 active', artifactMetrics(activePointer)],
+      ['候选 challenger', artifactMetrics(challengerPointer)],
+      ['无模型基线', baseline ? artifactMetrics({ manifest: baseline, version: baseline.version }) : null],
+    ];
+    const rows = [
+      ['费后平均收益', 'avg_return_pct'],
+      ['收益下置信界限', 'return_lcb_pct'],
+      ['Profit Factor', 'profit_factor'],
+      ['CVaR10', 'cvar_10_pct'],
+      ['最大回撤', 'max_drawdown_pct'],
+      ['样本数', 'sample_count'],
+    ];
+    const header = columns.map(([label, value]) => `<th>${esc(label)}<small>${esc(value?.version || '版本未提供')}</small></th>`).join('');
+    const body = rows.map(([label, key]) => `<tr><th>${esc(label)}</th>${columns.map(([, value]) => `<td>${esc(value ? metricCell(value, key) : '证据未提供')}</td>`).join('')}</tr>`).join('');
+    container.innerHTML = `
+      <div class="comparison-heading"><strong>样本外费后结果对照</strong><span>多空分开；缺失值不补零</span></div>
+      <div class="table-wrap"><table class="comparison-table"><thead><tr><th>指标</th>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   function renderQuality() {
@@ -350,6 +488,16 @@
 
   function renderStrategies() {
     const strategy = unwrap(payloads.strategy);
+    const container = $('#strategies');
+    if (strategy.status === 'timeout') {
+      container.classList.remove('empty');
+      container.innerHTML = [
+        row('当前状态', '查询已限时结束'),
+        row('原因', '策略学习数据库查询超过 12 秒，已停止本次查询'),
+        row('影响范围', '不影响模型、开仓、平仓或训练；页面不会重复发起'),
+      ].join('');
+      return;
+    }
     const schedule = strategy.schedule || {};
     const production = strategy.current_production_strategy || schedule.current_production_strategy || {};
     const champion = strategy.paper_strategy_champion || {};
@@ -362,7 +510,6 @@
       ['候选 / 通过治理 / 拒绝', `${fmt(schedule.candidate_count)} / ${fmt(schedule.governed_candidate_count)} / ${fmt(schedule.rejected_candidate_count)}`],
       ['调度原因', localizedReason(schedule.reason || '原因尚未返回')],
     ];
-    const container = $('#strategies');
     container.classList.remove('empty');
     container.innerHTML = values.map(([label, value]) => row(label, value)).join('');
   }
@@ -394,8 +541,10 @@
       if (payloads.registry) renderModels();
     } else if (key === 'registry') {
       renderModels();
+      renderTrainingEvidence();
     } else if (key === 'scheduler') {
       renderScheduler();
+      renderTrainingEvidence();
       if (payloads.ml) renderOverview();
     } else if (key === 'data') {
       renderQuality();

@@ -693,6 +693,98 @@ class LocalAIToolsClient:
             return {"ratio": round(ratio, 6), "status": "reported"}
         return {"ratio": None, "status": "not_reported"}
 
+    def _status_contract_payload(
+        self,
+        payload: Mapping[str, Any] | None,
+        *,
+        enabled_for_trading: bool,
+    ) -> dict[str, Any]:
+        """Return one stable status contract for fresh, cached, and early-error paths."""
+
+        status = dict(payload) if isinstance(payload, Mapping) else {}
+        health = status.get("health") if isinstance(status.get("health"), Mapping) else {}
+        child_endpoints = self._metadata_child_endpoints(status, health)
+        child_metadata_ready_count = sum(
+            bool(item.get("metadata_ready"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_live_probe_ok_count = sum(
+            bool(item.get("live_probe_ok"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_degraded_count = sum(
+            item.get("status") == "degraded"
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_unavailable_count = sum(
+            item.get("status") in {"unavailable", "contract_missing"}
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_available = child_metadata_ready_count > 0
+        service_available = bool(
+            status.get("service_available")
+            if "service_available" in status
+            else status.get("available") or status.get("health_available") or child_available
+        )
+        model_bundle_available = bool(
+            status.get("model_bundle_available")
+            if "model_bundle_available" in status
+            else status.get("trained_models_available")
+            or status.get("artifact_persisted")
+            or status.get("artifact_status") == "ready"
+        )
+        status.update(
+            {
+                "available": service_available,
+                "service_available": service_available,
+                "model_bundle_available": model_bundle_available,
+                "enabled_for_trading": bool(enabled_for_trading),
+                "child_endpoints": child_endpoints,
+                "child_available": child_available,
+                "child_metadata_ready_count": child_metadata_ready_count,
+                "child_live_probe_ok_count": child_live_probe_ok_count,
+                "child_degraded_count": child_degraded_count,
+                "child_unavailable_count": child_unavailable_count,
+                "child_contract_status": (
+                    "live_probe_ok"
+                    if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
+                    else "metadata_ready"
+                    if child_metadata_ready_count
+                    else "unavailable"
+                ),
+                "transport_status": "ok" if service_available else "unavailable",
+                "artifact_status": "ready" if model_bundle_available else "unavailable",
+            }
+        )
+        status.setdefault("inference_probe_status", status["child_contract_status"])
+        training_state = status.get("training_status") or status.get("training_state")
+        if not training_state:
+            last_training = status.get("auto_train_last_result")
+            training_state = (
+                last_training.get("reason")
+                if isinstance(last_training, Mapping) and last_training.get("reason")
+                else "unknown"
+            )
+        status["training_status"] = str(training_state)
+        status["evaluation_status"] = str(
+            status.get("evaluation_status")
+            or status.get("promotion_status")
+            or status.get("model_stage")
+            or "unknown"
+        )
+        status["permission_status"] = (
+            "live_candidate"
+            if status.get("live_trading_permission") is True
+            else "paper_canary"
+            if status.get("paper_trading_permission") is True
+            else "shadow"
+        )
+        return status
+
     def _to_float(self, value: Any, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -702,22 +794,15 @@ class LocalAIToolsClient:
     async def status(self, *, request_timeout: float | None = None) -> dict[str, Any]:
         enabled_for_trading = self.enabled()
         if not self.service_configured():
-            return {
-                "available": False,
-                "service_available": False,
-                "enabled_for_trading": False,
-                "status": "not_configured",
-            }
+            return self._status_contract_payload(
+                {"status": "not_configured"}, enabled_for_trading=False
+            )
         circuit_open = self._circuit_open_payload()
         if circuit_open:
-            return {
-                "available": False,
-                "enabled_for_trading": enabled_for_trading,
-                **circuit_open,
-            }
+            return self._status_contract_payload(circuit_open, enabled_for_trading=enabled_for_trading)
         cached = self._read_status_cache()
         if cached is not None:
-            return cached
+            return self._status_contract_payload(cached, enabled_for_trading=enabled_for_trading)
         timeout = (
             min(max(float(request_timeout), _MIN_REQUEST_TIMEOUT_SECONDS), _MAX_REQUEST_TIMEOUT_SECONDS)
             if request_timeout is not None
@@ -753,7 +838,27 @@ class LocalAIToolsClient:
 
         child_endpoints = self._metadata_child_endpoints(status, health)
         child_available = any(
-            bool(item.get("available") or item.get("ok"))
+            bool(item.get("metadata_ready"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_metadata_ready_count = sum(
+            bool(item.get("metadata_ready"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_live_probe_ok_count = sum(
+            bool(item.get("live_probe_ok"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_degraded_count = sum(
+            item.get("status") == "degraded"
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_unavailable_count = sum(
+            item.get("status") in {"unavailable", "contract_missing"}
             for item in child_endpoints.values()
             if isinstance(item, dict)
         )
@@ -766,6 +871,42 @@ class LocalAIToolsClient:
         status["enabled_for_trading"] = enabled_for_trading
         status["health"] = health
         status["child_endpoints"] = child_endpoints
+        status["child_metadata_ready_count"] = child_metadata_ready_count
+        status["child_live_probe_ok_count"] = child_live_probe_ok_count
+        status["child_degraded_count"] = child_degraded_count
+        status["child_unavailable_count"] = child_unavailable_count
+        status["child_contract_status"] = (
+            "live_probe_ok"
+            if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
+            else "metadata_ready"
+            if child_metadata_ready_count
+            else "unavailable"
+        )
+        status["transport_status"] = "ok" if service_available else "unavailable"
+        status["artifact_status"] = "ready" if model_bundle_available else "unavailable"
+        status["inference_probe_status"] = status["child_contract_status"]
+        training_state = status.get("training_status") or status.get("training_state")
+        if not training_state:
+            last_training = status.get("auto_train_last_result")
+            training_state = (
+                last_training.get("reason")
+                if isinstance(last_training, dict) and last_training.get("reason")
+                else "unknown"
+            )
+        status["training_status"] = str(training_state)
+        status["evaluation_status"] = str(
+            status.get("evaluation_status")
+            or status.get("promotion_status")
+            or status.get("model_stage")
+            or "unknown"
+        )
+        status["permission_status"] = (
+            "live_candidate"
+            if status.get("live_trading_permission") is True
+            else "paper_canary"
+            if status.get("paper_trading_permission") is True
+            else "shadow"
+        )
         # Phase 3 separates service reachability from persisted model-bundle readiness.
         # Reachability and persisted artifact readiness are separate states.
         status["available"] = bool(service_available)
@@ -835,17 +976,19 @@ class LocalAIToolsClient:
         error = status_error or "local AI tools service is unavailable"
         self._record_failure(error, open_circuit=False)
         return self._write_status_cache(
-            {
-                "available": False,
-                "status": "error",
-                "error": error,
-                "api_base": self._public_api_base(),
-                "model_bundle_available": False,
-                "service_available": False,
-                "enabled_for_trading": enabled_for_trading,
-                "child_endpoints": child_endpoints,
-                **self._breaker_fields(),
-            }
+            self._status_contract_payload(
+                {
+                    "available": False,
+                    "status": "error",
+                    "error": error,
+                    "api_base": self._public_api_base(),
+                    "model_bundle_available": False,
+                    "service_available": False,
+                    "child_endpoints": child_endpoints,
+                    **self._breaker_fields(),
+                },
+                enabled_for_trading=enabled_for_trading,
+            )
         )
 
     @staticmethod
@@ -853,17 +996,59 @@ class LocalAIToolsClient:
         status: Mapping[str, Any],
         health: Mapping[str, Any],
     ) -> dict[str, dict[str, Any]]:
-        """Read child readiness without executing expensive inference routes."""
+        """Normalize metadata readiness separately from real inference probes."""
 
         for source in (status, health):
             raw = source.get("child_endpoints")
             if not isinstance(raw, dict):
                 continue
-            return {
-                str(name): dict(item)
-                for name, item in raw.items()
-                if str(name).strip() and isinstance(item, dict)
-            }
+            rows: dict[str, dict[str, Any]] = {}
+            for name, item in raw.items():
+                if not str(name).strip() or not isinstance(item, dict):
+                    continue
+                metadata_ready = bool(
+                    item.get("metadata_ready")
+                    or item.get("available")
+                    or item.get("status") == "metadata_ready"
+                    or item.get("status_category") == "metadata_contract"
+                )
+                live_probe_ok = bool(
+                    item.get("live_probe_ok")
+                    or (item.get("actual_inference_probe") is True and item.get("ok") is True)
+                    or item.get("status") == "live_probe_ok"
+                )
+                if live_probe_ok:
+                    state = "live_probe_ok"
+                elif metadata_ready:
+                    state = "metadata_ready"
+                elif item:
+                    state = "unavailable"
+                else:
+                    state = "contract_missing"
+                normalized = dict(item)
+                normalized.update(
+                    {
+                        "metadata_ready": metadata_ready,
+                        "live_probe_ok": live_probe_ok,
+                        "status": state,
+                        "status_category": state,
+                        # Keep legacy consumers truthful: available means the route
+                        # contract is registered, not that a heavy inference probe ran.
+                        "available": metadata_ready,
+                        "ok": live_probe_ok or metadata_ready,
+                        "actual_inference_probe": live_probe_ok,
+                        "error": (
+                            ""
+                            if live_probe_ok
+                            else "inference_probe_not_run"
+                            if metadata_ready
+                            else "child_endpoint_contract_missing"
+                        ),
+                    }
+                )
+                rows[str(name)] = normalized
+            if rows:
+                return rows
         return {}
 
     async def train(

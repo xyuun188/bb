@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>模型训练与决策</title>
-  <link rel="stylesheet" href="/static/css/training.css?v=20260727-paper-live-contract">
+  <link rel="stylesheet" href="/static/css/training.css?v=20260826-training-evidence-v3">
 </head>
 <body>
   <main class="shell">
@@ -32,6 +32,11 @@
       <article class="metric"><span>交易权限</span><strong data-metric="model-influence">--</strong><small data-detail="model-influence">--</small></article>
       <article class="metric"><span>最近训练</span><strong data-metric="last-training">--</strong><small data-detail="last-training">--</small></article>
     </section>
+    <section class="panel">
+      <div class="panel-heading"><div><h2>训练事实链</h2><p>把 Artifact、评估、active、challenger、基线和权限分开显示。</p></div></div>
+      <div id="training-evidence" class="evidence-grid training-evidence-grid"><div class="empty-line">正在读取。</div></div>
+      <div id="training-comparison" class="comparison-wrap"><div class="empty-line">正在读取结果对照。</div></div>
+    </section>
     <section class="grid two-columns">
       <article class="panel"><div class="panel-heading"><div><h2>数据质量</h2><p>训练数据的可用性和证据完整度。</p></div></div><div id="data-quality" class="stack empty">正在读取。</div></article>
       <article class="panel"><div class="panel-heading"><div><h2>训练任务</h2><p>运行、结果和下一次计划。</p></div></div><div id="scheduler" class="stack empty">正在读取。</div></article>
@@ -50,6 +55,6 @@
     </section>
     <footer><span>只读页面，不改变主面板、实盘权限或风险限制。</span><span>数据来自训练、策略和分析记录。</span></footer>
   </main>
-  <script src="/static/js/training.js?v=20260727-paper-live-contract"></script>
+  <script src="/static/js/training.js?v=20260826-training-evidence-v3"></script>
 </body>
 </html>

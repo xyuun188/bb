@@ -1198,6 +1198,44 @@ async def test_local_ai_tools_status_failure_is_redacted(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_contract_is_stable_on_not_configured(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "local_ai_tools_api_base", "")
+    client = LocalAIToolsClient()
+
+    result = await client.status()
+
+    assert result["status"] == "not_configured"
+    assert result["available"] is False
+    assert result["transport_status"] == "unavailable"
+    assert result["artifact_status"] == "unavailable"
+    assert result["inference_probe_status"] == "unavailable"
+    assert result["training_status"] == "unknown"
+    assert result["evaluation_status"] == "unknown"
+    assert result["permission_status"] == "shadow"
+    assert result["child_metadata_ready_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_contract_is_stable_on_circuit_open(
+    local_tools_settings: None,
+) -> None:
+    client = LocalAIToolsClient()
+    client._circuit_open_until = datetime.now(UTC) + timedelta(seconds=30)
+
+    result = await client.status()
+
+    assert result["status"] == "circuit_open"
+    assert result["available"] is False
+    assert result["transport_status"] == "unavailable"
+    assert result["artifact_status"] == "unavailable"
+    assert result["inference_probe_status"] == "unavailable"
+    assert result["permission_status"] == "shadow"
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_missing(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

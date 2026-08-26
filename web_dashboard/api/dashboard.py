@@ -7165,8 +7165,32 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     if cached is not None:
         return sanitize_payload(cached)
 
-    local_ml_status = await get_ml_signal_status()
-    local_tools_status = await get_local_ai_tools_status()
+    async def _bounded_status(builder: Callable[[], Awaitable[dict[str, Any]]], name: str) -> dict[str, Any]:
+        try:
+            value = await asyncio.wait_for(builder(), timeout=15.0)
+            return value if isinstance(value, dict) else {"available": False, "status": f"{name}_invalid"}
+        except asyncio.TimeoutError:
+            return {
+                "available": False,
+                "service_available": False,
+                "status": "timeout",
+                "error": f"{name}_status_timeout",
+                "stale": False,
+            }
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} status fallback", exc)
+            return {
+                "available": False,
+                "service_available": False,
+                "status": "error",
+                "error": f"{name}_status_failed",
+                "stale": False,
+            }
+
+    local_ml_status, local_tools_status = await asyncio.gather(
+        _bounded_status(get_ml_signal_status, "ml_signal"),
+        _bounded_status(get_local_ai_tools_status, "local_ai_tools"),
+    )
     specialist_report = _load_model_training_report(
         "phase3/specialist_shadow_evaluation_latest.json"
     )
@@ -7175,9 +7199,29 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     )
     from services.model_contribution_performance import ModelContributionPerformanceService
 
-    contribution_performance = await ModelContributionPerformanceService().recent(
-        mode_manager.mode.value
-    )
+    contribution_status = {"state": "ready", "timeout_seconds": 8.0}
+    try:
+        contribution_performance = await asyncio.wait_for(
+            ModelContributionPerformanceService().recent(mode_manager.mode.value),
+            timeout=8.0,
+        )
+    except asyncio.TimeoutError:
+        # Contribution attribution is diagnostic only. It must never hold the
+        # registry page hostage or compete with the trading loop.
+        contribution_performance = {}
+        contribution_status = {
+            "state": "timeout",
+            "timeout_seconds": 8.0,
+            "reason": "model_contribution_query_timeout",
+        }
+    except Exception as exc:
+        _log_dashboard_fallback("model contribution performance fallback", exc)
+        contribution_performance = {}
+        contribution_status = {
+            "state": "error",
+            "timeout_seconds": 8.0,
+            "reason": "model_contribution_query_failed",
+        }
     registry = build_model_training_registry(
         local_ml_status=local_ml_status,
         local_tools_status=local_tools_status,
@@ -7185,6 +7229,7 @@ async def get_model_training_registry_status() -> dict[str, Any]:
         model_server_report=model_server_report,
         contribution_performance=contribution_performance,
     )
+    registry["contribution_performance_status"] = contribution_status
     registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
     return sanitize_payload(_dashboard_heavy_cache_set(cache_key, registry))
 
@@ -9112,13 +9157,36 @@ async def get_strategy_learning(
     if cached is not None:
         return sanitize_payload(cached)
 
-    cache_key = (
-        *request_cache_key,
-        await _strategy_learning_watermark_for_request(
-            selected_mode=selected_mode,
-            since=datetime.now(UTC) - timedelta(hours=capped_hours),
-        ),
-    )
+    try:
+        watermark = await asyncio.wait_for(
+            _strategy_learning_watermark_for_request(
+                selected_mode=selected_mode,
+                since=datetime.now(UTC) - timedelta(hours=capped_hours),
+            ),
+            timeout=2.0,
+        )
+    except asyncio.TimeoutError:
+        watermark = ("watermark_timeout",)
+        timeout_payload = {
+            "status": "timeout",
+            "stale": False,
+            "checked_at": datetime.now(UTC).isoformat(),
+            "mode": selected_mode,
+            "window_hours": capped_hours,
+            "sample_limit": capped_limit,
+            "schedule": {
+                "reason": "strategy_learning_watermark_timeout",
+                "scheduler_mode": "watermark_timeout",
+                "candidate_count": None,
+                "governed_candidate_count": None,
+                "rejected_candidate_count": None,
+                "candidates": [],
+            },
+            "current_production_strategy": {},
+        }
+        _dashboard_heavy_cache_set(request_cache_key, timeout_payload)
+        return sanitize_payload(timeout_payload)
+    cache_key = (*request_cache_key, watermark)
     cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
     if cached is not None:
         return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, cached))
@@ -9140,11 +9208,35 @@ async def get_strategy_learning(
             payload if selected_detail == "full" else _strategy_learning_dashboard_summary(payload)
         )
 
-    payload = await _dashboard_heavy_cached(
-        cache_key,
-        build_payload,
-        ttl_seconds=300.0,
-    )
+    try:
+        payload = await asyncio.wait_for(
+            _dashboard_heavy_cached(
+                cache_key,
+                build_payload,
+                ttl_seconds=300.0,
+            ),
+            timeout=12.0,
+        )
+    except asyncio.TimeoutError:
+        payload = {
+            "status": "timeout",
+            "stale": False,
+            "checked_at": datetime.now(UTC).isoformat(),
+            "mode": selected_mode,
+            "window_hours": capped_hours,
+            "sample_limit": capped_limit,
+            "schedule": {
+                "reason": "strategy_learning_query_timeout",
+                "scheduler_mode": "timeout",
+                "candidate_count": None,
+                "governed_candidate_count": None,
+                "rejected_candidate_count": None,
+                "candidates": [],
+            },
+            "current_production_strategy": {},
+        }
+        # The common cache write below keeps repeated refreshes bounded while
+        # the database is under pressure.
     _dashboard_heavy_cache_set(request_cache_key, payload)
     return sanitize_payload(payload)
 

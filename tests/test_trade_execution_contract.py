@@ -1000,6 +1000,37 @@ def test_external_okx_reconciliation_without_exact_fill_fact_fails_closed() -> N
     ] == 1
 
 
+def test_external_okx_reconciliation_accepts_complete_embedded_fill_without_local_order() -> None:
+    raw = {
+        "system_sync": True,
+        "source": "okx_position_reconcile",
+        "reconcile_origin": "external_okx_sync",
+        "close_fill": {
+            "reconcile_origin": "external_okx_sync",
+            "order_id": "okx-external-only-11",
+            "trade_ids": ["okx-external-trade-11"],
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": 2.0,
+            "contract_size": 0.01,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 0.02,
+            "avg_price": 100.0,
+            "fee_abs": 0.01,
+        },
+    }
+
+    decision = _decision(11, "close_short", raw)
+    decision.was_executed = True
+    report = summarize_trade_execution_contract([decision], orders=[])
+
+    assert report["summary"]["exit_contract_ready_count"] == 1
+    assert report["summary"]["contract_violation_count"] == 0
+    contract = report["exit_contracts"][0]
+    assert contract["external_fill_verified"] is True
+    assert contract["authoritative_close_order_id"] == "okx-external-only-11"
+
+
 def test_realized_pnl_summary_uses_closed_positions_only() -> None:
     report = summarize_trade_execution_contract(
         [],
