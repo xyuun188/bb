@@ -12,6 +12,7 @@ from models.trade import OkxPositionHistory, Position
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import (
     DISTINCT_CLOSED_FRAGMENT_REACTIVATED_REASON,
+    DUPLICATE_CLOSED_ORDER_POSITION_REASON,
     DUPLICATE_CLOSED_POSITION_REASON,
     POSITION_HISTORY_MATCH_MAX_ATTEMPTS,
     POSITION_HISTORY_QUARANTINE_RETRY_SECONDS,
@@ -24,6 +25,8 @@ from services.okx_position_settlement_sync import (
     SettlementCandidate,
     SettlementFailure,
     _claim_history_row_for_position,
+    _deduplicate_closed_lifecycle_rows,
+    _effective_official_lifecycle_contracts,
     _final_fragment_requires_quantity_repair,
     _group_candidates_by_lifecycle,
     _match_position_history_row,
@@ -804,6 +807,184 @@ def test_shared_official_lifecycle_allocates_pnl_only_by_close_contracts() -> No
     )
     assert [member.allocation_complete for member in group] == [True, True]
     assert [member.allocation_ratio for member in group] == pytest.approx([83 / 136, 53 / 136])
+
+
+def test_partial_close_history_uses_open_max_pos_when_pnl_is_lifecycle_total() -> None:
+    now = datetime.now(UTC)
+    first = SettlementCandidate(
+        position_id=401,
+        symbol="SLX/USDT",
+        side="short",
+        quantity=940.0,
+        entry_price=0.07268,
+        current_price=0.0726,
+        leverage=1.0,
+        entry_fee=0.0639584,
+        close_fee=0.034121,
+        okx_inst_id="SLX-USDT-SWAP",
+        okx_pos_id="partial-pos",
+        entry_exchange_order_id="entry-partial",
+        close_exchange_order_id="close-94",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now - timedelta(minutes=1),
+        settlement_status="settling",
+        settlement_raw={},
+        close_contracts=94.0,
+        entry_fee_authoritative=0.0639584,
+        close_fee_authoritative=0.034121,
+        close_fill_pnl_authoritative=0.0772,
+    )
+    second = replace(
+        first,
+        position_id=402,
+        quantity=820.0,
+        close_exchange_order_id="close-82",
+        close_contracts=82.0,
+        close_fee_authoritative=0.0,
+        close_fill_pnl_authoritative=0.3444,
+        closed_at=now,
+    )
+    group = next(iter(_group_candidates_by_lifecycle([first, second]).values()))
+    _prepare_lifecycle_allocations(
+        group,
+        [
+            {
+                "instId": "SLX-USDT-SWAP",
+                "posId": "partial-pos",
+                "posSide": "short",
+                "cTime": str(int((now - timedelta(minutes=20)).timestamp() * 1000)),
+                "uTime": str(int(now.timestamp() * 1000)),
+                "openMaxPos": "176",
+                "closeTotalPos": "82",
+                "realizedPnl": "0.3235206",
+                "_dashboard_position_ids": ["legacy-canonical-id"],
+            }
+        ],
+    )
+    assert _effective_official_lifecycle_contracts(
+        {"openMaxPos": "176", "closeTotalPos": "82"},
+        local_close_contracts=176.0,
+    ) == (176.0, "okx_open_max_pos_lifecycle_total")
+    assert [member.allocation_complete for member in group] == [True, True]
+    assert [member.allocation_ratio for member in group] == pytest.approx([94 / 176, 82 / 176])
+
+
+def test_preferred_history_identity_overrides_stale_position_link() -> None:
+    now = datetime.now(UTC)
+    candidate = SettlementCandidate(
+        position_id=410,
+        symbol="CRV/USDT",
+        side="short",
+        quantity=20.0,
+        entry_price=0.34,
+        current_price=0.35,
+        leverage=1.0,
+        entry_fee=0.01,
+        close_fee=0.01,
+        okx_inst_id="CRV-USDT-SWAP",
+        okx_pos_id="crv-pos",
+        entry_exchange_order_id="entry-crv",
+        close_exchange_order_id="close-crv",
+        created_at=now - timedelta(minutes=20),
+        closed_at=now,
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    row = {
+        "instId": "CRV-USDT-SWAP",
+        "posId": "crv-pos",
+        "posSide": "short",
+        "cTime": str(int((now - timedelta(minutes=20)).timestamp() * 1000)),
+        "uTime": str(int(now.timestamp() * 1000)),
+        "openMaxPos": "20",
+        "closeTotalPos": "20",
+        "realizedPnl": "1.0",
+        "_dashboard_history_row_identity": "paper|CRV-USDT-SWAP|crv-pos|net|identity",
+        "_dashboard_position_ids": ["legacy-canonical-id"],
+    }
+    matched = _match_position_history_row(
+        candidate,
+        [row],
+        inst_id="CRV-USDT-SWAP",
+        allowed_position_ids={410},
+        allow_shared_lifecycle=True,
+        preferred_row_identity=row["_dashboard_history_row_identity"],
+    )
+    assert not isinstance(matched, SettlementFailure)
+
+
+def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_exists() -> None:
+    now = datetime.now(UTC)
+    aggregate = Position(
+        id=501,
+        execution_mode="paper",
+        symbol="DOGE/USDT",
+        side="long",
+        quantity=50.0,
+        okx_inst_id="DOGE-USDT-SWAP",
+        okx_pos_id="doge-pos",
+        entry_exchange_order_id="entry-doge",
+        close_exchange_order_id=None,
+        settlement_status="reconciled",
+        settlement_raw={},
+    )
+    authoritative = Position(
+        id=502,
+        execution_mode="paper",
+        symbol="DOGE/USDT",
+        side="long",
+        quantity=50.0,
+        okx_inst_id="DOGE-USDT-SWAP",
+        okx_pos_id="doge-pos",
+        entry_exchange_order_id="entry-doge",
+        close_exchange_order_id="close-doge",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    retained, duplicates = _deduplicate_closed_lifecycle_rows(
+        [aggregate, authoritative], now=now
+    )
+    assert [item.id for item in retained] == [502]
+    assert [item.id for item in duplicates] == [501]
+    assert aggregate.settlement_status == SUPERSEDED_POSITION_STATUS
+    assert aggregate.settlement_raw["reason"] == DUPLICATE_CLOSED_ORDER_POSITION_REASON
+    assert aggregate.settlement_raw["canonical_position_id"] == 502
+
+
+def test_dedup_breaks_mutual_superseded_cycle_for_same_close_order() -> None:
+    now = datetime.now(UTC)
+    first = Position(
+        id=601,
+        execution_mode="paper",
+        symbol="CRV/USDT",
+        side="short",
+        quantity=20.0,
+        okx_inst_id="CRV-USDT-SWAP",
+        okx_pos_id="crv-pos",
+        entry_exchange_order_id="entry-crv",
+        close_exchange_order_id="close-crv",
+        settlement_status=SUPERSEDED_POSITION_STATUS,
+        settlement_raw={"reason": DUPLICATE_CLOSED_POSITION_REASON, "canonical_position_id": 602},
+    )
+    second = Position(
+        id=602,
+        execution_mode="paper",
+        symbol="CRV/USDT",
+        side="short",
+        quantity=20.0,
+        okx_inst_id="CRV-USDT-SWAP",
+        okx_pos_id="crv-pos",
+        entry_exchange_order_id="entry-crv",
+        close_exchange_order_id="close-crv",
+        settlement_status=SUPERSEDED_POSITION_STATUS,
+        settlement_raw={"reason": DUPLICATE_CLOSED_POSITION_REASON, "canonical_position_id": 601},
+    )
+    retained, duplicates = _deduplicate_closed_lifecycle_rows([first, second], now=now)
+    assert [item.id for item in retained] == [601]
+    assert [item.id for item in duplicates] == [602]
+    assert first.settlement_status == "settling"
+    assert second.settlement_status == SUPERSEDED_POSITION_STATUS
+    assert second.settlement_raw["canonical_position_id"] == 601
 
 
 def test_single_lifecycle_prefers_authoritative_order_economics() -> None:

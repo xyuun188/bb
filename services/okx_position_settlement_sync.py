@@ -29,6 +29,9 @@ from services.entry_decision_settlement import (
     backfill_settled_entry_decision_outcomes,
     sync_settled_entry_decision_outcome,
 )
+from services.okx_lifecycle_fragment_repair import (
+    repair_missing_okx_lifecycle_fragments,
+)
 from services.okx_position_history_store import (
     load_okx_position_history_records,
     okx_position_history_records_to_rows,
@@ -64,6 +67,7 @@ SETTLEMENT_REPAIR_LOOKBACK_DAYS = 90
 SETTLEMENT_STALE_REPAIR_BATCH_SIZE = 200
 SETTLEMENT_TERMINAL_SOURCE = "okx_settlement_terminal_unresolved"
 SETTLEMENT_TERMINAL_REASON = "authoritative_settlement_age_exceeded"
+LIFECYCLE_CONTRACT_TOLERANCE_RATIO = 1e-6
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_SOURCE = "okx_current_position_deduplication"
 SUPERSEDED_POSITION_REASON = "duplicate_local_open_position_for_same_okx_pos_id"
@@ -126,6 +130,8 @@ class SettlementCandidate:
     history_row_identity: str = ""
     history_record_id: int = 0
     allocation_error: str = ""
+    official_contracts: float = 0.0
+    official_contracts_source: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +202,11 @@ class OkxPositionSettlementSyncService:
     async def sync_once(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         decision_outcome_changes = await self._backfill_decision_outcomes(started_at)
+        position_history_rows = await self._load_position_history_rows()
+        fragment_repair = await self._repair_missing_lifecycle_fragments(
+            started_at,
+            position_history_rows,
+        )
         candidates = await self._load_candidates(started_at)
         if not candidates:
             terminalized_count = await self._expire_stale_settlements(started_at)
@@ -208,10 +219,10 @@ class OkxPositionSettlementSyncService:
                 exception_count=0,
                 skipped_count=0,
                 terminalized_count=terminalized_count,
-                samples=tuple(decision_outcome_changes[-10:]),
+                samples=tuple(
+                    [*decision_outcome_changes[-10:], *fragment_repair.get("samples", [])][-10:]
+                ),
             ).as_dict()
-
-        position_history_rows = await self._load_position_history_rows()
 
         samples: list[dict[str, Any]] = []
         checked = 0
@@ -221,6 +232,7 @@ class OkxPositionSettlementSyncService:
         skipped = 0
         failures: list[tuple[SettlementCandidate, SettlementFailure]] = []
         samples.extend(decision_outcome_changes[-10:])
+        samples.extend(fragment_repair.get("samples", []))
         # Match and allocate each official row at lifecycle scope.  An OKX
         # positions-history row is one lifecycle total; local partial-close
         # fragments may therefore share it, but may never each receive 100% of
@@ -324,6 +336,26 @@ class OkxPositionSettlementSyncService:
             samples=tuple(samples[-10:]),
             error=None,
         ).as_dict()
+
+    async def _repair_missing_lifecycle_fragments(
+        self,
+        now: datetime,
+        position_history_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Backfill only uniquely proven local fragments before allocation.
+
+        This runs once per bounded settlement pass.  The repair is idempotent,
+        and unresolved/ambiguous lifecycles remain under the existing evidence
+        gate instead of being marked complete.
+        """
+
+        async with self.session_context_factory() as session:
+            return await repair_missing_okx_lifecycle_fragments(
+                session,
+                mode=self.mode,
+                position_history_rows=position_history_rows,
+                now=now,
+            )
 
     async def _load_position_history_rows(self) -> list[dict[str, Any]]:
         """Load the shared OKX history mirror once for an entire sync batch."""
@@ -1104,6 +1136,42 @@ def _deduplicate_closed_lifecycle_rows(
     retained = list(retained_without_identity)
     duplicates: list[Position] = []
     for candidates in grouped.values():
+        close_projection_candidates = [
+            candidate
+            for candidate in candidates
+            if _split_exchange_order_ids(
+                getattr(candidate, "close_exchange_order_id", None)
+            )
+        ]
+        if close_projection_candidates:
+            # A legacy aggregate projection sometimes has the same entry,
+            # quantity and posId as an authoritative close-fill row but no
+            # close order link at all.  Keep it for audit history, yet retire
+            # it from settlement so the proven fill row owns the lifecycle.
+            for candidate in candidates:
+                if _split_exchange_order_ids(
+                    getattr(candidate, "close_exchange_order_id", None)
+                ):
+                    continue
+                canonical = min(
+                    close_projection_candidates,
+                    key=lambda item: (
+                        -len(
+                            _split_exchange_order_ids(
+                                getattr(item, "close_exchange_order_id", None)
+                            )
+                        ),
+                        int(getattr(item, "id", 0) or 0),
+                    ),
+                )
+                _mark_closed_position_superseded(
+                    candidate,
+                    canonical=canonical,
+                    reason=DUPLICATE_CLOSED_ORDER_POSITION_REASON,
+                    now=now,
+                )
+                duplicates.append(candidate)
+            candidates = close_projection_candidates
         # Distinct partial-close fills under one posId are valid fragments.  A
         # row is only retired when it projects the same close order set (or a
         # strict overlapping subset) as another row; disjoint close orders must
@@ -1159,23 +1227,21 @@ def _deduplicate_closed_lifecycle_rows(
                 int(getattr(item, "id", 0) or 0),
             ),
         )
+        _reactivate_selected_canonical_projection(
+            canonical,
+            candidates=candidates,
+            now=now,
+        )
         retained.append(canonical)
         for duplicate in candidates:
             if duplicate is canonical:
                 continue
-            raw = _safe_dict(getattr(duplicate, "settlement_raw", None))
-            duplicate.settlement_status = SUPERSEDED_POSITION_STATUS
-            duplicate.settlement_source = SUPERSEDED_POSITION_SOURCE
-            duplicate.settlement_synced_at = now
-            duplicate.settlement_raw = {
-                **raw,
-                "status": SUPERSEDED_POSITION_STATUS,
-                "source": SUPERSEDED_POSITION_SOURCE,
-                "reason": DUPLICATE_CLOSED_POSITION_REASON,
-                "canonical_position_id": int(getattr(canonical, "id", 0) or 0),
-                "duplicate_closed_lifecycle_retired_at": now.isoformat(),
-            }
-            duplicate.updated_at = now
+            _mark_closed_position_superseded(
+                duplicate,
+                canonical=canonical,
+                reason=DUPLICATE_CLOSED_POSITION_REASON,
+                now=now,
+            )
             duplicates.append(duplicate)
     retained.sort(
         key=lambda item: (
@@ -1186,6 +1252,72 @@ def _deduplicate_closed_lifecycle_rows(
         reverse=True,
     )
     return retained, duplicates
+
+
+def _mark_closed_position_superseded(
+    position: Position,
+    *,
+    canonical: Position,
+    reason: str,
+    now: datetime,
+) -> None:
+    raw = _safe_dict(getattr(position, "settlement_raw", None))
+    position.settlement_status = SUPERSEDED_POSITION_STATUS
+    position.settlement_source = SUPERSEDED_POSITION_SOURCE
+    position.settlement_synced_at = now
+    position.settlement_raw = {
+        **raw,
+        "status": SUPERSEDED_POSITION_STATUS,
+        "source": SUPERSEDED_POSITION_SOURCE,
+        "reason": reason,
+        "canonical_position_id": int(getattr(canonical, "id", 0) or 0),
+        "duplicate_closed_lifecycle_retired_at": now.isoformat(),
+    }
+    position.updated_at = now
+
+
+def _reactivate_selected_canonical_projection(
+    canonical: Position,
+    *,
+    candidates: list[Position],
+    now: datetime,
+) -> None:
+    """Break stale mutual-superseded cycles for the selected projection."""
+
+    if str(getattr(canonical, "settlement_status", "") or "") != SUPERSEDED_POSITION_STATUS:
+        return
+    raw = _safe_dict(getattr(canonical, "settlement_raw", None))
+    referenced_id = _safe_int(raw.get("canonical_position_id"), 0)
+    if referenced_id <= 0 or referenced_id == int(getattr(canonical, "id", 0) or 0):
+        return
+    referenced = next(
+        (item for item in candidates if int(getattr(item, "id", 0) or 0) == referenced_id),
+        None,
+    )
+    if referenced is None:
+        return
+    close_ids = _split_exchange_order_ids(
+        getattr(canonical, "close_exchange_order_id", None)
+    )
+    referenced_close_ids = _split_exchange_order_ids(
+        getattr(referenced, "close_exchange_order_id", None)
+    )
+    if not close_ids or not referenced_close_ids or not close_ids.intersection(referenced_close_ids):
+        return
+    canonical.settlement_status = "settling"
+    canonical.settlement_source = "okx_lifecycle_canonical_recovery"
+    canonical.settlement_synced_at = now
+    canonical.settlement_raw = {
+        **raw,
+        "status": "settling",
+        "source": "okx_lifecycle_canonical_recovery",
+        "reason": "mutual_superseded_projection_reactivated",
+        "legacy_superseded_reason": str(raw.get("reason") or ""),
+        "legacy_canonical_position_id": referenced_id,
+        "reactivated_at": now.isoformat(),
+        "next_settlement_retry_at": now.isoformat(),
+    }
+    canonical.updated_at = now
 
 
 def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
@@ -1275,6 +1407,30 @@ def _official_lifecycle_contracts(row: dict[str, Any]) -> float:
     return value if key and value > 0 else 0.0
 
 
+def _effective_official_lifecycle_contracts(
+    row: dict[str, Any],
+    *,
+    local_close_contracts: float,
+) -> tuple[float, str]:
+    """Choose the quantity that matches OKX's lifecycle-level PnL semantics.
+
+    For partial closes OKX can report ``closeTotalPos`` as the final close
+    slice while ``realizedPnl``/fees cover the complete lifecycle.  When the
+    authoritative local fills prove that their total equals ``openMaxPos``,
+    use that lifecycle total.  Otherwise retain ``closeTotalPos`` and fail
+    closed rather than guessing.
+    """
+
+    close_total = _official_lifecycle_contracts(row)
+    open_max = _safe_float(row.get("openMaxPos") or row.get("open_max_pos"), 0.0)
+    local_total = max(float(local_close_contracts or 0.0), 0.0)
+    if open_max > 0 and close_total > 0 and open_max > close_total:
+        tolerance = max(open_max * LIFECYCLE_CONTRACT_TOLERANCE_RATIO, 1e-8)
+        if abs(local_total - open_max) <= tolerance:
+            return open_max, "okx_open_max_pos_lifecycle_total"
+    return close_total, "okx_close_total_pos"
+
+
 def _prepare_lifecycle_allocations(
     members: list[SettlementCandidate],
     history_rows: list[dict[str, Any]],
@@ -1300,10 +1456,29 @@ def _prepare_lifecycle_allocations(
         allowed_position_ids=set(ids),
         allow_shared_lifecycle=True,
     )
-    official_contracts = (
-        _official_lifecycle_contracts(matched[0])
+    if isinstance(matched, SettlementFailure) and matched.code == "positions_history_no_matching_row":
+        # A prior deduplication pass may have linked the official row to a
+        # retired local canonical ID.  Re-match only with the strict exchange
+        # lifecycle identity (posId/instId/side/entry/time); economics and
+        # contract conservation below remain mandatory before settlement.
+        fallback = _match_position_history_row(
+            first,
+            history_rows,
+            inst_id=first.okx_inst_id or okx_inst_id_from_symbol(first.symbol),
+            allowed_position_ids=None,
+            allow_shared_lifecycle=True,
+        )
+        if not isinstance(fallback, SettlementFailure):
+            matched = fallback
+    close_contracts = [max(float(item.close_contracts or 0.0), 0.0) for item in members]
+    total_close_contracts = sum(close_contracts)
+    official_contracts, official_contracts_source = (
+        _effective_official_lifecycle_contracts(
+            matched[0],
+            local_close_contracts=total_close_contracts,
+        )
         if not isinstance(matched, SettlementFailure)
-        else 0.0
+        else (0.0, "")
     )
     if not isinstance(matched, SettlementFailure):
         matched_row = matched[0]
@@ -1312,8 +1487,6 @@ def _prepare_lifecycle_allocations(
         for member in members:
             object.__setattr__(member, "history_row_identity", identity)
             object.__setattr__(member, "history_record_id", record_id)
-    close_contracts = [max(float(item.close_contracts or 0.0), 0.0) for item in members]
-    total_close_contracts = sum(close_contracts)
     contract_allocation_complete = bool(
         not isinstance(matched, SettlementFailure)
         and official_contracts > 0
@@ -1383,6 +1556,8 @@ def _prepare_lifecycle_allocations(
             else 1.0
         )
         object.__setattr__(member, "allocation_ratio", ratio)
+        object.__setattr__(member, "official_contracts", official_contracts)
+        object.__setattr__(member, "official_contracts_source", official_contracts_source)
         object.__setattr__(
             member,
             "allocation_basis",
@@ -1461,6 +1636,8 @@ def _scale_settlement_success(
                 "entry_fee_authoritative": candidate.entry_fee_authoritative,
                 "close_fee_authoritative": candidate.close_fee_authoritative,
                 "close_fill_pnl_authoritative": candidate.close_fill_pnl_authoritative,
+                "official_contracts": candidate.official_contracts,
+                "official_contracts_source": candidate.official_contracts_source,
             },
         },
     )
@@ -1539,14 +1716,19 @@ def _match_position_history_row(
             continue
         row_pos_id = _position_history_pos_id(row)
         linked_position_ids = _history_row_position_ids(row)
+        preferred_row_match = bool(
+            (preferred_row_identity and row_identity == preferred_row_identity)
+            or (preferred_record_id > 0 and row_record_id == preferred_record_id)
+        )
         if linked_position_ids and not allow_shared_lifecycle:
-            if str(candidate.position_id) not in linked_position_ids:
+            if str(candidate.position_id) not in linked_position_ids and not preferred_row_match:
                 continue
         if (
             allow_shared_lifecycle
             and allowed_position_ids
             and linked_position_ids
             and not linked_position_ids.intersection({str(value) for value in allowed_position_ids})
+            and not preferred_row_match
         ):
             continue
         row_side = _position_history_side(row)
@@ -1559,10 +1741,7 @@ def _match_position_history_row(
             candidate.closed_at,
             row_closed_at,
         )
-        preferred_identity_match = bool(
-            (preferred_row_identity and row_identity == preferred_row_identity)
-            or (preferred_record_id > 0 and row_record_id == preferred_record_id)
-        )
+        preferred_identity_match = preferred_row_match
         if not preferred_identity_match and signed_close_delta is not None and (
             signed_close_delta < -POSITION_HISTORY_CLOSE_EARLY_TOLERANCE_SECONDS
             or signed_close_delta > POSITION_HISTORY_CLOSE_MATCH_WINDOW_SECONDS
