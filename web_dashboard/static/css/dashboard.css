@@ -3071,6 +3071,27 @@ body {
     overflow-wrap: anywhere;
     word-break: break-word;
 }
+.trade-reflection-copy {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+}
+.trade-reflection-copy strong {
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.45;
+}
+.trade-reflection-copy span {
+    color: var(--text-dim);
+    font-size: 11px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.trade-reflection-copy.profit strong { color: var(--green); }
+.trade-reflection-copy.loss strong { color: var(--red); }
+.trade-reflection-copy.neutral strong { color: var(--text-muted); }
 .trade-reflection-time {
     font-size: 10px;
     line-height: 1.2;

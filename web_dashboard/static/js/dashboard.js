@@ -4317,8 +4317,8 @@ function renderExpertMemories(data = {}) {
         const complete = mlOptionalNumber(authority.complete_count);
         authorityEl.className = `trade-reflection-authority ${authority.actual_outcome_overrides_shadow === true ? 'ready' : 'blocked'}`;
         authorityEl.innerHTML = authority.actual_outcome_overrides_shadow === true
-            ? `<strong>权威成交结果优先</strong><span>已加载 ${mlSampleCountLabel(loaded)} 个 OKX outcome，完整 ${mlSampleCountLabel(complete)} 个；影子反事实生产权重 ${mlEvidenceValue(authority.shadow_production_weight)}。</span><em>${escHtml(authority.version || '合同版本缺失')}</em>`
-            : '<strong>Outcome 优先级证据缺失</strong><span>不能确认影子结果是否会覆盖真实成交结果。</span>';
+            ? `<strong>交易所结算结果优先</strong><span>已读取 ${mlSampleCountLabel(loaded)} 条 OKX 结算记录，其中 ${mlSampleCountLabel(complete)} 条完整；未成交对照权重 ${mlEvidenceValue(authority.shadow_production_weight)}。</span><em>${escHtml(authority.version || '结算规则版本缺失')}</em>`
+            : '<strong>交易所结算结果暂不可用</strong><span>当前不能确认未成交对照是否应被真实成交结果覆盖。</span>';
     }
     setExpertMemoryView(state.expertMemoryView || 'memories');
 
@@ -4363,32 +4363,39 @@ function renderExpertMemories(data = {}) {
                 const actualHtml = authoritative
                     ? `<div class="trade-outcome-cell ${authoritative.complete ? 'ready' : 'blocked'}">
                         <strong>${distributionPctLabel(authoritative.net_return_after_all_cost_pct)}</strong>
-                        <span>${escHtml(authoritative.outcome_id || 'Outcome ID 缺失')}</span>
-                        <em>${authoritative.complete ? '权威证据完整' : `缺口：${(authoritative.evidence_gaps || []).map(item => escHtml(dashboardReasonText(item))).join(' / ') || '未说明'}`}</em>
+                        <span>${escHtml(authoritative.outcome_id ? `结算记录 ${compactIdentifier(authoritative.outcome_id, 22)}` : '结算记录编号缺失')}</span>
+                        <em>${authoritative.complete ? '交易所结算已确认' : `还缺少：${(authoritative.evidence_gaps || []).map(item => escHtml(dashboardReasonText(item))).join(' / ') || '完整持仓记录'}`}</em>
                     </div>`
                     : `<div class="trade-outcome-cell blocked">
-                        <strong>${escHtml(authorityStatus.label || '等待权威结算')}</strong>
-                        <span>${escHtml(authorityStatus.reason || 'OKX 完整仓位生命周期尚未返回')}</span>
-                        <em>${fallbackPnl === null ? '复盘暂存盈亏也不可用' : `复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实`}</em>
+                        <strong>${escHtml(authorityStatus.label || '等待交易所结算')}</strong>
+                        <span>${escHtml(authorityStatus.reason || '还没有拿到完整的开仓、持仓、平仓和资金费记录')}</span>
+                        <em>${fallbackPnl === null ? '暂时没有可确认的盈亏' : `本地暂存 ${signedMoney(fallbackPnl)} USDT，不能代替交易所结果`}</em>
                     </div>`;
                 const shadowHtml = authoritative
                     ? `<div class="trade-shadow-cell">
                         <strong>${shadowRows.length} 条路径</strong>
                         <span>生产权重 ${mlEvidenceValue(authoritative.counterfactual_production_weight)}</span>
-                        <em>只作反事实对照，不能覆盖真实盈亏</em>
+                        <em>仅作未成交情况下的对比，不代表真实盈亏</em>
                     </div>`
-                    : '<div class="trade-shadow-cell"><strong>等待结算</strong><span>尚无权威结果上下文</span><em>影子结果不得替代真实成交</em></div>';
+                    : '<div class="trade-shadow-cell"><strong>等待交易所结算</strong><span>暂时没有完整结果</span><em>未成交对照不能代替真实成交</em></div>';
+                const reflectionCopy = reflectionTextPresentation(
+                    r,
+                    authoritative,
+                    authorityStatus,
+                    pnl,
+                    fallbackPnl,
+                );
                 return `
                     <tr>
                         <td class="trade-reflection-time" title="${escHtml(generatedTimeTitle)}">${generatedTime}</td>
                         <td>${escHtml(r.symbol || '-')}</td>
                         <td>${sideLabel(r.side)}</td>
-                        <td class="trade-reflection-pnl" style="color:${pnlColor};">${pnl === null ? escHtml(authorityStatus.label || '等待权威结算') : `${signedMoney(pnl)} USDT`}</td>
+                        <td class="trade-reflection-pnl" style="color:${pnlColor};">${pnl === null ? escHtml(authorityStatus.label || '等待交易所结算') : `${signedMoney(pnl)} USDT`}</td>
                         <td>${mlOptionalNumber(r.hold_minutes) === null ? '证据缺失' : `${mlOptionalNumber(r.hold_minutes).toFixed(1)} 分钟`}</td>
                         <td>${actualHtml}</td>
                         <td>${shadowHtml}</td>
-                        <td><div class="trade-reflection-text">${escHtml(r.mistake_summary || '-')}</div></td>
-                        <td><div class="trade-reflection-text">${escHtml(r.improvement_summary || '-')}</div></td>
+                        <td><div class="trade-reflection-text">${reflectionCopy.conclusionHtml}</div></td>
+                        <td><div class="trade-reflection-text">${reflectionCopy.improvementHtml}</div></td>
                     </tr>
                 `;
             }).join('');
@@ -4548,6 +4555,74 @@ function memoryTypeLabel(type) {
         lesson: '经验',
     };
     return map[type] || '其他记忆';
+}
+
+function reflectionTextPresentation(row = {}, authoritative = null, authorityStatus = {}, pnl = null, fallbackPnl = null) {
+    const symbol = String(row.symbol || '该标的');
+    const side = sideLabel(row.side);
+    const authoritativeComplete = authoritative?.complete === true;
+    const authoritativePresent = Boolean(authoritative);
+    const authorityGapText = Array.isArray(authoritative?.evidence_gaps)
+        ? authoritative.evidence_gaps.map(item => dashboardReasonText(item)).filter(Boolean).join('；')
+        : '';
+    const returnPct = authoritativeComplete
+        ? mlOptionalNumber(authoritative.net_return_after_all_cost_pct)
+        : null;
+    const authoritativePnl = authoritativeComplete
+        ? mlOptionalNumber(authoritative.realized_pnl)
+        : null;
+    const confirmedPnl = authoritativePnl ?? pnl;
+    const confirmedBasis = confirmedPnl ?? returnPct;
+    const confirmedResult = confirmedBasis === null
+        ? '结果待确认'
+        : confirmedBasis > 0 ? '盈利' : confirmedBasis < 0 ? '亏损' : '持平';
+    const confirmedResultTone = confirmedBasis === null
+        ? 'neutral'
+        : confirmedBasis > 0 ? 'profit' : confirmedBasis < 0 ? 'loss' : 'neutral';
+    const returnText = returnPct === null
+        ? ''
+        : `，费后收益率 ${returnPct >= 0 ? '+' : ''}${returnPct.toFixed(4)}%`;
+
+    if (authoritativeComplete) {
+        return {
+            conclusionHtml: `<div class="trade-reflection-copy ${confirmedResultTone}">
+                <strong>交易所已确认：${escHtml(confirmedResult)}</strong>
+                <span>${escHtml(symbol)} ${escHtml(side)} 扣除手续费、计入资金费后，结果为${escHtml(confirmedResult)}${confirmedPnl === null ? '' : `，金额 ${signedMoney(confirmedPnl)} USDT`}${returnText}。</span>
+            </div>`,
+            improvementHtml: `<div class="trade-reflection-copy">
+                <strong>系统下一步</strong>
+                <span>把这笔结果加入训练对比，重新检查${escHtml(side)}信号是否稳定；不会只凭这一笔交易决定以后只做多或只做空。</span>
+            </div>`,
+        };
+    }
+
+    if (authoritativePresent) {
+        return {
+            conclusionHtml: `<div class="trade-reflection-copy neutral">
+                <strong>交易所结算还没完成</strong>
+                <span>${escHtml(symbol)} ${escHtml(side)} 当前不能确认真实盈亏${authorityGapText ? `；${escHtml(authorityGapText)}` : ''}。</span>
+            </div>`,
+            improvementHtml: `<div class="trade-reflection-copy">
+                <strong>系统下一步</strong>
+                <span>等 OKX 返回完整的开仓、持仓、平仓和资金费记录，再确认真实结果；确认前不用于训练或升级模型。</span>
+            </div>`,
+        };
+    }
+
+    const localResult = fallbackPnl === null
+        ? '暂时没有可用盈亏'
+        : fallbackPnl > 0 ? '暂时盈利' : fallbackPnl < 0 ? '暂时亏损' : '暂时持平';
+    const localPnlText = fallbackPnl === null ? '' : `，暂存盈亏 ${signedMoney(fallbackPnl)} USDT`;
+    return {
+        conclusionHtml: `<div class="trade-reflection-copy neutral">
+            <strong>等待交易所结算</strong>
+            <span>${escHtml(symbol)} ${escHtml(side)}${localResult ? `：${escHtml(localResult)}` : ''}${localPnlText}，当前只是本地暂存结果。</span>
+        </div>`,
+        improvementHtml: `<div class="trade-reflection-copy">
+            <strong>系统下一步</strong>
+            <span>${escHtml(authorityStatus.label || '等待 OKX 交易所结算')}；确认前不把这条记录当作训练事实或升级模型的依据。</span>
+        </div>`,
+    };
 }
 
 function memoryActionLabel(action) {

@@ -122,7 +122,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "dashboard.js?v=20260826-expert-memory-v3" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -150,8 +150,8 @@ def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence(
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert "const authorityStatus = r.authority_status || {};" in script
-    assert "复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实" in script
-    assert "authorityStatus.label || '等待权威结算'" in script
+    assert "本地暂存 ${signedMoney(fallbackPnl)} USDT，不能代替交易所结果" in script
+    assert "authorityStatus.label || '等待交易所结算'" in script
     assert "dashboardReasonText(item)" in script
     assert "权威成交 outcome 缺失" not in script
     assert 'class="trade-reflection-pnl"' in script
@@ -159,6 +159,22 @@ def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence(
     assert ".trade-reflection-pnl" in style
     assert "min-width: 1660px;" in style
     assert "word-break: break-word;" in style
+
+
+def test_trade_reflection_copy_is_localized_for_humans() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    assert "function reflectionTextPresentation(" in script
+    assert "交易所已确认" in script
+    assert "扣除手续费、计入资金费后" in script
+    assert "把这笔结果加入训练对比" in script
+    assert "不会只凭这一笔交易决定以后只做多或只做空" in script
+    assert "等 OKX 返回完整的开仓、持仓、平仓和资金费记录" in script
+    assert "${escHtml(r.mistake_summary || '-')}" not in script
+    assert "${escHtml(r.improvement_summary || '-')}" not in script
+    assert ".trade-reflection-copy" in style
+    assert "overflow-wrap: anywhere;" in style
 
 
 def test_expert_memory_table_uses_readable_structured_outcomes() -> None:
@@ -171,7 +187,7 @@ def test_expert_memory_table_uses_readable_structured_outcomes() -> None:
     assert "<th>标的与方向</th>" in html
     assert "<th>结算结果</th>" in html
     assert "<th>经验结论</th>" in html
-    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "dashboard.js?v=20260826-expert-memory-v3" in html
     assert "function expertMemoryPresentation(memory = {})" in script
     assert "function expertMemoryOutcome(memory = {})" in script
     assert "观察并复核分布" in script
@@ -709,7 +725,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "dashboard.js?v=20260826-expert-memory-v3" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -848,8 +864,8 @@ def test_system_audit_nodes_use_state_aware_display_status() -> None:
 def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "dashboard.css?v=20260826-expert-memory-v2" in html
-    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "dashboard.css?v=20260826-expert-memory-v3" in html
+    assert "dashboard.js?v=20260826-expert-memory-v3" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -1016,8 +1032,8 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-line" in style
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
-    assert "dashboard.css?v=20260826-expert-memory-v2" in html
-    assert "dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "dashboard.css?v=20260826-expert-memory-v3" in html
+    assert "dashboard.js?v=20260826-expert-memory-v3" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1271,7 +1287,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260826-expert-memory-v2" in html
+    assert "/static/js/dashboard.js?v=20260826-expert-memory-v3" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:
