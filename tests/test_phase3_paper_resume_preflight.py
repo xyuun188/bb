@@ -279,6 +279,50 @@ def test_phase3_paper_resume_preflight_allows_platform_model_endpoints_when_remo
     assert "phase3_model_server_platform_endpoints_ready" in report["passed_checks"]
 
 
+def test_phase3_paper_resume_preflight_accepts_healthy_external_decision_route() -> None:
+    runtime = _platform_runtime_ready()
+    runtime["ai_models"] = [
+        {
+            "name": "trend_expert",
+            "model": "BB-FinQuant-Expert-14B",
+            "available": True,
+            "models": ["BB-FinQuant-Expert-14B"],
+        },
+        {
+            "name": "decision_maker",
+            "model": "deepseek-v4-pro",
+            "available": True,
+            "models": ["deepseek-v4-pro"],
+        },
+        {
+            "name": "high_risk_review",
+            "model": "deepseek-r1-14b-risk",
+            "available": True,
+            "models": ["deepseek-r1-14b-risk"],
+        },
+    ]
+    model_server = {
+        "status": "unverified",
+        "runtime_ready": False,
+        "artifact_ready": False,
+        "phase3_model_service_go_live_blocked": True,
+        "blockers": [{"code": "model_server_probe_unavailable"}],
+    }
+
+    report = evaluate_phase3_paper_resume_preflight_inputs(
+        **_ready_inputs(
+            model_server_readiness=model_server,
+            platform_runtime=runtime,
+        )
+    )
+
+    assert report["status"] == "ready_with_warnings"
+    assert report["can_resume_paper"] is True
+    assert "phase3_model_server_remote_audit_unverified" in {
+        item["code"] for item in report["warnings"]
+    }
+
+
 def test_phase3_paper_resume_preflight_blocks_stale_specialist_report() -> None:
     specialist = _specialist_ready()
     specialist["generated_at"] = "2026-06-27T00:00:00+00:00"

@@ -101,17 +101,29 @@ def _platform_model_runtime_ready(runtime: dict[str, Any]) -> bool:
     ]
     required = PHASE3_REQUIRED_LLM_MODEL_IDS
     available: set[str] = set()
+    decision_route_available = False
     for row in rows:
         if not bool(row.get("available")):
             continue
         model = str(row.get("model") or "").strip().lower()
         if model:
             available.add(model)
+        if str(row.get("name") or "").strip().lower() == "decision_maker":
+            decision_route_available = True
         for served in _safe_list(row.get("models")):
             served_text = str(served or "").strip().lower()
             if served_text:
                 available.add(served_text)
-    return required.issubset(available)
+    if required.issubset(available):
+        return True
+
+    # The decision role may intentionally use an approved external route. In
+    # that case the canonical local Qwen model is not present in the probe,
+    # even though the active decision endpoint is healthy.
+    decision_model = PHASE3_REQUIRED_LLM_MODEL_IDS - {
+        "qwen3-14b-trade",
+    }
+    return decision_route_available and decision_model.issubset(available)
 
 
 def _account_equity_value(snapshot: dict[str, Any]) -> float:
