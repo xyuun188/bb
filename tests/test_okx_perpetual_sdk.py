@@ -432,6 +432,7 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
                 "px": "",
                 "reduceOnly": "false",
                 "tgtCcy": "",
+                "stpMode": "cancel_maker",
                 "attachAlgoOrds": None,
             },
         )

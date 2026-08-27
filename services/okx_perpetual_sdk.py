@@ -1283,12 +1283,11 @@ class OkxPerpetualSdkExchange:
             "tgtCcy": str(params.get("tgtCcy") or ""),
             "attachAlgoOrds": params.get("attachAlgoOrds"),
         }
-        # python-okx serializes every keyword it receives.  Sending the empty
-        # string used by its optional default for stpMode is rejected by OKX
-        # (51000); omitting it lets the account's configured default apply.
-        stp_mode = str(params.get("stpMode") or "").strip()
-        if stp_mode:
-            sdk_kwargs["stpMode"] = stp_mode
+        # python-okx 0.4.x serializes its optional stpMode keyword even when
+        # it is empty.  OKX rejects that empty value with 51000, so use the
+        # documented cancel-maker mode unless a caller supplied another mode.
+        stp_mode = str(params.get("stpMode") or "cancel_maker").strip()
+        sdk_kwargs["stpMode"] = stp_mode
         return await self._call_sdk(
             lambda: self.trade_api,
             "place_order",
