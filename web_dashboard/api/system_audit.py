@@ -107,9 +107,18 @@ OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
 SYSTEM_AUDIT_MAX_CONCURRENCY = 2
+# Database-backed cards use independent read-only sessions, but they still
+# share the trading service's database pool and PostgreSQL resources. Keep the
+# audit wave small enough that a long snapshot cannot starve its peers.
+SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
+# Keep one audit snapshot comfortably inside the isolated runner deadline.
+# The remaining time is reserved for serialization, process teardown, and
+# snapshot persistence; sections that cannot start in time are reported as
+# deferred instead of allowing the whole runner to hit its hard timeout.
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 220.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 260.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
@@ -134,7 +143,7 @@ TRADE_EXECUTION_CONTRACT_CACHE_TTL_SECONDS = 30.0
 TRADE_EXECUTION_CONTRACT_FAILURE_CACHE_TTL_SECONDS = 5.0
 OKX_TRADE_FACT_INTEGRITY_AUDIT_HOURS = 72
 OKX_TRADE_FACT_INTEGRITY_AUDIT_LIMIT = 500
-OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 40.0
+OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS = 90.0
 OKX_AUTHORITATIVE_SYNC_AUDIT_HOURS = 24
 OKX_AUTHORITATIVE_SYNC_AUDIT_LIMIT = 500
 OKX_AUTHORITATIVE_SYNC_TIMEOUT_SECONDS = 5.0
@@ -165,10 +174,20 @@ SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     "strategy_closed_loop": 60.0,
     "strategy_signal_root_cause": 60.0,
     "model_training": 180.0,
-    "position_capacity_release": 60.0,
+    "position_capacity_release": 100.0,
     "okx_trade_fact_integrity": OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS + 5.0,
+    "production_source_health": 45.0,
+    "crypto_feature_coverage": 45.0,
+    "visible_text_encoding": 60.0,
+    "runtime_text_integrity": 60.0,
 }
-PRIORITY_AUDIT_KEYS = ("okx_reconciliation", "trade_execution_contract")
+PRIORITY_AUDIT_KEYS = (
+    "okx_reconciliation",
+    "trade_execution_contract",
+    "production_source_health",
+    "okx_trade_fact_integrity",
+    "position_capacity_release",
+)
 DB_AUDIT_KEYS = (
     "trade_loop",
     "okx_trade_fact_integrity",
@@ -1068,6 +1087,7 @@ async def _run_audit_specs(
     *,
     max_concurrency: int = SYSTEM_AUDIT_MAX_CONCURRENCY,
     timings: dict[str, float] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, dict[str, Any] | Exception]:
     if not specs:
         return {}
@@ -1077,9 +1097,18 @@ async def _run_audit_specs(
         for key, factory in specs:
             started = time.perf_counter()
             try:
+                section_timeout = _system_audit_section_timeout_seconds(key)
+                if deadline is not None:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "system audit collection budget exhausted before "
+                            f"section {key} started"
+                        )
+                    section_timeout = min(section_timeout, remaining)
                 results[key] = await _audit_maybe_async(
                     factory,
-                    timeout_seconds=_system_audit_section_timeout_seconds(key),
+                    timeout_seconds=section_timeout,
                 )
             except Exception as exc:
                 results[key] = exc
@@ -1094,9 +1123,18 @@ async def _run_audit_specs(
         async with semaphore:
             started = time.perf_counter()
             try:
+                section_timeout = _system_audit_section_timeout_seconds(key)
+                if deadline is not None:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "system audit collection budget exhausted before "
+                            f"section {key} started"
+                        )
+                    section_timeout = min(section_timeout, remaining)
                 return key, await _audit_maybe_async(
                     factory,
-                    timeout_seconds=_system_audit_section_timeout_seconds(key),
+                    timeout_seconds=section_timeout,
                 )
             except Exception as exc:
                 return key, exc
@@ -3823,21 +3861,22 @@ async def _audit_platform_runtime_status(
 
 
 async def _data_collection_status_for_audit() -> dict[str, Any]:
-    """Request a real cold-start snapshot when the provider supports it."""
+    """Read the current snapshot without blocking the audit on cold refresh.
+
+    A first request may legitimately return ``warming`` while the background
+    refresh builds the production snapshot.  The next scheduled audit will use
+    that cached result; blocking here for the full initial-refresh timeout made
+    every cold audit consume most of the global 120-second budget.
+    """
 
     getter = data_collection_api.get_data_collection_status
     kwargs: dict[str, Any] = {"include_feature_coverage": False}
     try:
-        parameters = inspect.signature(getter).parameters.values()
-        supports_wait = any(
-            parameter.name == "wait_for_initial_refresh"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
+        parameters = inspect.signature(getter).parameters
     except (TypeError, ValueError):
-        supports_wait = False
-    if supports_wait:
-        kwargs["wait_for_initial_refresh"] = True
+        parameters = {}
+    if "start_background_refresh" in parameters:
+        kwargs["start_background_refresh"] = False
     return await getter(**kwargs)
 
 
@@ -4053,6 +4092,7 @@ async def _model_training_audit() -> dict[str, Any]:
         bool(local_tools.get("available"))
         or local_tools_status_probe_slow
         or clean_training_view_available
+        or data_collection_warming
     )
     runtime_probe_hard_failure = runtime_probe.get("status") == "warning" and not (
         runtime_probe_timeout_is_observing
@@ -5994,6 +6034,7 @@ async def _collect_system_audit_status_unlocked(
     *, record_history: bool = True, source: str = "api"
 ) -> dict[str, Any]:
     collection_started = time.perf_counter()
+    collection_deadline = collection_started + SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS
     audit_specs = [
         ("trade_loop", _trade_loop_audit),
         ("okx_reconciliation", _okx_reconciliation_audit),
@@ -6049,27 +6090,34 @@ async def _collect_system_audit_status_unlocked(
             priority_specs,
             max_concurrency=1,
             timings=section_timings,
+            deadline=collection_deadline,
         )
     )
-    result_by_key.update(
-        await _run_audit_specs(
+    # Database and regular diagnostics are read-only and have independent
+    # concurrency caps. Run the groups together so a slow database wave does
+    # not leave the entire audit idle before regular checks can start.
+    db_result, regular_result = await asyncio.gather(
+        _run_audit_specs(
             db_specs,
-            max_concurrency=1,
+            max_concurrency=SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
             timings=section_timings,
-        )
-    )
-    result_by_key.update(
-        await _run_audit_specs(
+            deadline=collection_deadline,
+        ),
+        _run_audit_specs(
             regular_specs,
             max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
             timings=section_timings,
-        )
+            deadline=collection_deadline,
+        ),
     )
+    result_by_key.update(db_result)
+    result_by_key.update(regular_result)
     result_by_key.update(
         await _run_audit_specs(
             heavy_specs,
             max_concurrency=1,
             timings=section_timings,
+            deadline=collection_deadline,
         )
     )
     cards: list[dict[str, Any]] = []
@@ -6138,12 +6186,13 @@ async def _collect_system_audit_status_unlocked(
             },
             "performance": {
                 "total_seconds": round(time.perf_counter() - collection_started, 4),
+                "collection_budget_seconds": SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS,
                 "section_seconds": dict(
                     sorted(section_timings.items(), key=lambda item: item[1], reverse=True)
                 ),
                 "group_concurrency": {
                     "priority": 1,
-                    "database": 1,
+                    "database": SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
                     "regular": SYSTEM_AUDIT_MAX_CONCURRENCY,
                     "heavy": 1,
                 },
