@@ -6136,6 +6136,10 @@ class OKXExecutor(AbstractExecutor):
             return await self._with_retry(
                 ccxt.privateGetAccountBalance,
                 {"ccy": asset},
+                # Balance is polled frequently and is already guarded by the
+                # dashboard/service deadline. Retrying here multiplies a slow
+                # private request into a 30s+ refresh storm.
+                _max_attempts=1,
             )
         if hasattr(ccxt, "fetch_balance"):
             markets_before = getattr(ccxt, "markets", None)
@@ -6148,7 +6152,7 @@ class OKXExecutor(AbstractExecutor):
                         error=safe_error_text(exc),
                     )
             try:
-                return await self._with_retry(ccxt.fetch_balance)
+                return await self._with_retry(ccxt.fetch_balance, _max_attempts=1)
             finally:
                 if markets_before is None:
                     try:

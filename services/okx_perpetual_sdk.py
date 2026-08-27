@@ -35,6 +35,10 @@ OKX_SWAP_SETTLE_CCY = "USDT"
 OKX_CROSS_MARGIN_MODE = "cross"
 OKX_SERVER_TIME_PATH = "/api/v5/public/time"
 OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
+# Keep the synchronous python-okx transport bounded as well as the async
+# caller.  Without this, cancelling an outer wait leaves a requests worker
+# blocked on the OS socket timeout and every balance refresh piles up behind it.
+OKX_SDK_HTTP_TIMEOUT_SECONDS = 8.0
 OKX_WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
 OKX_WS_TICKER_EMIT_INTERVAL_SECONDS = 5.0
 OKX_WS_TICKER_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"tickers"')
@@ -402,7 +406,9 @@ class OkxPerpetualSdkExchange:
         if self._account_api is None:
             from okx.Account import AccountAPI
 
-            self._account_api = self._configure_private_api(AccountAPI(**self._private_kwargs()))
+            self._account_api = self._configure_private_api(
+                self._configure_api_timeout(AccountAPI(**self._private_kwargs()))
+            )
         return self._account_api
 
     @property
@@ -410,7 +416,9 @@ class OkxPerpetualSdkExchange:
         if self._trade_api is None:
             from okx.Trade import TradeAPI
 
-            self._trade_api = self._configure_private_api(TradeAPI(**self._private_kwargs()))
+            self._trade_api = self._configure_private_api(
+                self._configure_api_timeout(TradeAPI(**self._private_kwargs()))
+            )
         return self._trade_api
 
     @property
@@ -418,7 +426,7 @@ class OkxPerpetualSdkExchange:
         if self._market_api is None:
             from okx.MarketData import MarketAPI
 
-            self._market_api = MarketAPI(**self._public_kwargs())
+            self._market_api = self._configure_api_timeout(MarketAPI(**self._public_kwargs()))
         return self._market_api
 
     @property
@@ -427,7 +435,9 @@ class OkxPerpetualSdkExchange:
         if self._native_consistency_market_api is None:
             from okx.MarketData import MarketAPI
 
-            self._native_consistency_market_api = MarketAPI(**self._public_kwargs())
+            self._native_consistency_market_api = self._configure_api_timeout(
+                MarketAPI(**self._public_kwargs())
+            )
         return self._native_consistency_market_api
 
     @property
@@ -435,7 +445,7 @@ class OkxPerpetualSdkExchange:
         if self._public_api is None:
             from okx.PublicData import PublicAPI
 
-            self._public_api = PublicAPI(**self._public_kwargs())
+            self._public_api = self._configure_api_timeout(PublicAPI(**self._public_kwargs()))
         return self._public_api
 
     @property
@@ -445,7 +455,9 @@ class OkxPerpetualSdkExchange:
         if self._execution_market_api is None:
             from okx.MarketData import MarketAPI
 
-            self._execution_market_api = MarketAPI(**self._execution_public_kwargs())
+            self._execution_market_api = self._configure_api_timeout(
+                MarketAPI(**self._execution_public_kwargs())
+            )
         return self._execution_market_api
 
     @property
@@ -455,7 +467,9 @@ class OkxPerpetualSdkExchange:
         if self._execution_public_api is None:
             from okx.PublicData import PublicAPI
 
-            self._execution_public_api = PublicAPI(**self._execution_public_kwargs())
+            self._execution_public_api = self._configure_api_timeout(
+                PublicAPI(**self._execution_public_kwargs())
+            )
         return self._execution_public_api
 
     def _public_kwargs(self) -> dict[str, Any]:
@@ -503,6 +517,18 @@ class OkxPerpetualSdkExchange:
         # signed calls are not invalidated by host clock drift.
         api.use_server_time = True
         api._get_timestamp = lambda: self._server_timestamp(api)
+        return api
+
+    @staticmethod
+    def _configure_api_timeout(api: Any) -> Any:
+        """Apply a finite timeout to python-okx's underlying httpx client."""
+
+        try:
+            import httpx
+
+            api._timeout = httpx.Timeout(OKX_SDK_HTTP_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.debug("failed to configure OKX SDK HTTP timeout", error=safe_error_text(exc))
         return api
 
     def _server_timestamp(self, api: Any) -> str:

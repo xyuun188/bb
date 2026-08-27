@@ -110,7 +110,7 @@ _EXCHANGE_OPEN_SYMBOL_CACHE_TTL_SECONDS = 15.0
 _PUBLIC_TICKER_CACHE_TTL_SECONDS = 10.0
 _DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 3.0
 _DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 3.0
-_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 5.0
+_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
@@ -6355,11 +6355,15 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             stale_cached["refresh_in_progress"] = True
             _start_dashboard_okx_balance_refresh(selected_mode)
             return stale_cached
-        _start_dashboard_okx_balance_refresh(selected_mode)
-        return _dashboard_okx_balance_refreshing_snapshot(selected_mode)
 
         try:
-            snapshot = await _fetch_dashboard_okx_balance_uncached(selected_mode)
+            # A cold cache must perform one bounded foreground read.  Returning
+            # ``refresh_pending`` here used to skip the real read entirely,
+            # leaving the dashboard without an authoritative balance until a
+            # later background poll happened to succeed.
+            snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(
+                selected_mode
+            )
             _dashboard_okx_balance_cache[selected_mode] = (
                 datetime.now(UTC),
                 copy.deepcopy(snapshot),
