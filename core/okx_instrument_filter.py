@@ -36,7 +36,18 @@ def is_crypto_swap_instrument(instrument: Mapping[str, Any]) -> bool:
     """Return whether the OKX instrument is categorized as a crypto contract."""
 
     inst_category = str(instrument.get("instCategory") or "").strip()
-    return inst_category == OKX_CRYPTO_INSTRUMENT_CATEGORY
+    if inst_category == OKX_CRYPTO_INSTRUMENT_CATEGORY:
+        return True
+
+    # OKX currently labels some established crypto swaps (for example XRP and
+    # BCH) with ``instCategory=3`` in the SWAP payload. Their product category
+    # remains crypto (``category=1``) and they use fixed-price contracts.
+    # Stock and commodity swaps expose ``pre_quote`` contracts; keep those out.
+    return (
+        inst_category == "3"
+        and str(instrument.get("category") or "").strip() == "1"
+        and str(instrument.get("openType") or "").strip() == "fix_price"
+    )
 
 
 def supported_usdt_swap_instruments(

@@ -50,6 +50,12 @@ def test_okx_instrument_filter_keeps_only_crypto_usdt_swaps() -> None:
         )
         is False
     )
+    xrp = _instrument("XRP-USDT-SWAP", open_type="fix_price", inst_category="3")
+    xrp["category"] = "1"
+    assert is_supported_usdt_swap_instrument(xrp) is True
+    stock = _instrument("PLTR-USDT-SWAP", open_type="pre_quote", inst_category="3")
+    stock["category"] = "1"
+    assert is_supported_usdt_swap_instrument(stock) is False
     assert (
         is_supported_usdt_swap_instrument(
             _instrument("XAU-USDT-SWAP", open_type="fix_price", inst_category="4")
