@@ -900,6 +900,7 @@
                     <div class="trade-tabs" id="expert-memory-tabs">
                         <button class="trade-tab active" data-expert-memory-view="memories" onclick="setExpertMemoryView('memories')">专家长期记忆 <span id="expert-memory-count">0 条</span></button>
                         <button class="trade-tab" data-expert-memory-view="reflections" onclick="setExpertMemoryView('reflections')">交易复盘 <span id="trade-reflection-count">0 条</span></button>
+                        <button class="trade-tab" data-expert-memory-view="training-effectiveness" onclick="setExpertMemoryView('training-effectiveness')">训练效果</button>
                     </div>
                 </div>
                 <div class="tab-panel active" id="expert-memory-panel-memories">
@@ -948,6 +949,22 @@
                     </table>
                 </div>
                 <div class="pagination" id="trade-reflection-pagination" style="display:none;"></div>
+                </div>
+                <div class="tab-panel" id="expert-memory-panel-training-effectiveness">
+                    <div class="training-effectiveness-toolbar">
+                        <select id="training-effectiveness-mode"><option value="all">全部模式</option><option value="paper">模拟盘</option><option value="live">实盘</option></select>
+                        <select id="training-effectiveness-side"><option value="all">多空方向</option><option value="long">做多</option><option value="short">做空</option></select>
+                        <input id="training-effectiveness-symbol" placeholder="币种（可选）" autocomplete="off">
+                        <button class="btn btn-sm" onclick="fetchTrainingEffectivenessReport()">刷新</button>
+                    </div>
+                    <div id="training-effectiveness-freshness" class="training-effectiveness-status"></div>
+                    <div id="training-effectiveness-version-comparison"></div>
+                    <div id="training-effectiveness-metrics"></div>
+                    <div id="training-effectiveness-cost-attribution"></div>
+                    <div id="training-effectiveness-expert-contributions"></div>
+                    <div id="training-effectiveness-execution-funnel"></div>
+                    <div id="training-effectiveness-sample-quality"></div>
+                    <div id="training-effectiveness-conclusion"></div>
                 </div>
             </div>
         </div>

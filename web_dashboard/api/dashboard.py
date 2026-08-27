@@ -83,6 +83,10 @@ from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import load_training_epoch_start
+from services.training_effectiveness_report import (
+    apply_report_filters,
+    load_cached_training_effectiveness_report,
+)
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -10094,6 +10098,27 @@ def _trade_reflection_authority_status(
         "retryable": settlement_display["retryable"],
         "settlement_wait_minutes": settlement_wait_minutes,
     }
+
+
+@router.get("/training-effectiveness/report")
+async def get_training_effectiveness_report(
+    mode: str = "all",
+    side: str = "all",
+    symbol: str | None = None,
+    market_state: str | None = None,
+    report_id: str | None = None,
+) -> dict[str, Any]:
+    """Read a cached training-effectiveness report; never start a job."""
+
+    report = load_cached_training_effectiveness_report(report_id=report_id)
+    filtered = apply_report_filters(
+        report,
+        mode=mode,
+        side=side,
+        symbol=symbol or "all",
+        market_state=market_state or "all",
+    )
+    return sanitize_payload(filtered)
 
 
 @router.get("/expert-memories")

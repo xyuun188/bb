@@ -57,6 +57,8 @@ const state = {
     tradeReflectionPage: 1,
     tradeReflectionTotal: 0,
     expertMemoryView: 'memories',
+    trainingEffectivenessReport: null,
+    trainingEffectivenessFilters: { mode: 'all', side: 'all', symbol: '' },
     shadowBacktests: [],
     shadowBacktestPage: 1,
     shadowBacktestTotal: 0,
@@ -1860,7 +1862,10 @@ function loadPageData(page) {
     if (page === 'strategy-learning') fetchStrategyLearning();
     if (page === 'analysis') fetchAnalysisRecords();
     if (page === 'alerts') fetchRiskEvents();
-    if (page === 'expert-memory') fetchExpertMemories();
+    if (page === 'expert-memory') {
+        fetchExpertMemories();
+        fetchTrainingEffectivenessReport();
+    }
     if (page === 'shadow-backtest') fetchShadowBacktests();
     if (page === 'ml-signal') fetchMLSignalDashboard();
     if (page === 'data-collection') fetchDataCollectionStatus();
@@ -1962,7 +1967,10 @@ function initModeButtons() {
             if (isPageActive('opening-funnel')) fetchOpeningFunnel();
             if (isPageActive('profit-attribution')) fetchProfitAttribution();
             if (isPageActive('strategy-learning')) fetchStrategyLearning();
-            if (isPageActive('expert-memory')) fetchExpertMemories();
+            if (isPageActive('expert-memory')) {
+                fetchExpertMemories();
+                fetchTrainingEffectivenessReport();
+            }
             fetchPositions();
             fetchPositionHistory();
             if (isPageActive('daily-pnl')) fetchDailyPnlRecords();
@@ -4415,13 +4423,133 @@ function changeTradeReflectionPage(page) {
 }
 
 function setExpertMemoryView(view) {
-    const selected = view === 'reflections' ? 'reflections' : 'memories';
+    const selected = ['memories', 'reflections', 'training-effectiveness'].includes(view) ? view : 'memories';
     state.expertMemoryView = selected;
     document.querySelectorAll('#expert-memory-tabs .trade-tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.expertMemoryView === selected);
     });
     document.getElementById('expert-memory-panel-memories')?.classList.toggle('active', selected === 'memories');
     document.getElementById('expert-memory-panel-reflections')?.classList.toggle('active', selected === 'reflections');
+    document.getElementById('expert-memory-panel-training-effectiveness')?.classList.toggle('active', selected === 'training-effectiveness');
+}
+
+function trainingEffectivenessFilters() {
+    const filters = {
+        mode: document.getElementById('training-effectiveness-mode')?.value || 'all',
+        side: document.getElementById('training-effectiveness-side')?.value || 'all',
+        symbol: document.getElementById('training-effectiveness-symbol')?.value?.trim() || '',
+    };
+    state.trainingEffectivenessFilters = filters;
+    return filters;
+}
+
+async function fetchTrainingEffectivenessReport() {
+    const query = new URLSearchParams(trainingEffectivenessFilters());
+    const report = await fetchLatestPageJSON(
+        'training-effectiveness',
+        `/api/training-effectiveness/report?${query.toString()}`,
+    );
+    if (!report) return;
+    state.trainingEffectivenessReport = report;
+    renderTrainingEffectiveness(report);
+}
+
+function trainingEffectivenessAvailable(report) {
+    return report?.status === 'complete'
+        && report?.freshness?.is_stale !== true
+        && Number(report?.sample_quality?.valid_sample_count || 0) > 0;
+}
+
+function trainingEffectivenessNumber(value, digits = 4) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(digits) : '不可用';
+}
+
+function trainingEffectivenessPanel(title, content, className = '') {
+    return `<section class="training-effectiveness-section ${className}"><h3>${escHtml(title)}</h3>${content}</section>`;
+}
+
+function renderTrainingEffectivenessFreshness(report) {
+    const element = document.getElementById('training-effectiveness-freshness');
+    if (!element) return;
+    const available = trainingEffectivenessAvailable(report);
+    element.className = `training-effectiveness-status ${available ? 'complete' : (report.status || 'missing')}`;
+    element.innerHTML = `<strong>${available ? '报告完整' : '结论不可用'}</strong><span>生成 ${escHtml(report.generated_at || '未生成')} · 截止 ${escHtml(report.data_cutoff_at || '无数据')} · 指纹 ${escHtml(report.input_fingerprint || '缺失')}</span>`;
+}
+
+function renderTrainingEffectivenessVersions(report) {
+    const element = document.getElementById('training-effectiveness-version-comparison');
+    if (!element) return;
+    const versions = report.versions || {};
+    const cards = ['active', 'challenger', 'baseline'].map(key => {
+        const row = versions[key] || {};
+        return `<div><span>${escHtml(key)}</span><strong>${escHtml(row.model_id || row.version || '缺失')}</strong><em>${escHtml(row.lifecycle || row.status || '不可用')}</em></div>`;
+    }).join('');
+    element.innerHTML = trainingEffectivenessPanel('版本对照', `<div class="training-effectiveness-summary">${cards}</div>`);
+}
+
+function renderTrainingEffectivenessMetrics(report) {
+    const element = document.getElementById('training-effectiveness-metrics');
+    if (!element) return;
+    const available = trainingEffectivenessAvailable(report);
+    const metrics = report.metrics || {};
+    const rows = ['active', 'challenger', 'baseline'].map(key => {
+        const row = metrics[key] || {};
+        return `<div><span>${escHtml(key)}</span><strong>${available ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '结论不可用'}</strong><em>Profit Factor ${trainingEffectivenessNumber(row.profit_factor)} · 下界 ${trainingEffectivenessNumber(row.return_lower_bound)} · 回撤 ${trainingEffectivenessNumber(row.max_drawdown)} · 胜率 ${trainingEffectivenessNumber(row.win_rate, 2)} · 样本 ${Number(row.sample_count || 0)}</em></div>`;
+    }).join('');
+    element.innerHTML = trainingEffectivenessPanel('训练前后效果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
+}
+
+function renderTrainingEffectivenessCostAttribution(report) {
+    const element = document.getElementById('training-effectiveness-cost-attribution');
+    if (!element) return;
+    const costs = report.cost_attribution || {};
+    element.innerHTML = trainingEffectivenessPanel('收益组成', `<div class="training-effectiveness-cost-equation"><span>毛盈亏 ${trainingEffectivenessNumber(costs.gross_pnl)}</span><b>-</b><span>手续费 ${trainingEffectivenessNumber(costs.fee)}</span><b>-</b><span>滑点 ${trainingEffectivenessNumber(costs.slippage)}</span><b>+</b><span>资金费 ${trainingEffectivenessNumber(costs.funding_fee)}</span><b>=</b><strong>费后净收益 ${trainingEffectivenessNumber(costs.fee_after_net_pnl)}</strong></div><p>资金费贡献不能直接等同于模型预测能力。</p>`);
+}
+
+function renderTrainingEffectivenessExperts(report) {
+    const element = document.getElementById('training-effectiveness-expert-contributions');
+    if (!element) return;
+    const rows = Array.isArray(report.expert_contributions) ? report.expert_contributions : [];
+    const content = rows.length ? rows.map(row => `<div><strong>${escHtml(row.expert_label || row.expert_name || '专家')}</strong><span>费后影响 ${trainingEffectivenessNumber(row.net_pnl_delta)} · 回撤影响 ${trainingEffectivenessNumber(row.drawdown_delta)} · 错误开仓 ${trainingEffectivenessNumber(row.false_entry_delta)} · 多空平衡 ${trainingEffectivenessNumber(row.side_balance_delta)}</span></div>`).join('') : '<div class="training-effectiveness-empty">专家消融证据缺失</div>';
+    element.innerHTML = trainingEffectivenessPanel('专家贡献', `<div class="training-effectiveness-list">${content}</div>`);
+}
+
+function renderTrainingEffectivenessFunnel(report) {
+    const element = document.getElementById('training-effectiveness-execution-funnel');
+    if (!element) return;
+    const funnel = report.execution_funnel || {};
+    const labels = [['signals', '产生信号'], ['evidence_passed', '证据门禁'], ['risk_passed', '风险检查'], ['orders_submitted', '提交订单'], ['filled', '成交'], ['positions_opened', '建立持仓'], ['closed', '平仓'], ['settled', '结算']];
+    const rows = labels.map(([key, label]) => `<div><span>${escHtml(label)}</span><strong>${Number(funnel[key] || 0)}</strong><em>损失率 ${trainingEffectivenessNumber(funnel[`${key}_loss_rate`], 2)}</em></div>`).join('');
+    element.innerHTML = trainingEffectivenessPanel('交易链路漏斗', `<div class="training-effectiveness-funnel">${rows}</div>`);
+}
+
+function renderTrainingEffectivenessSamples(report) {
+    const element = document.getElementById('training-effectiveness-sample-quality');
+    if (!element) return;
+    const quality = report.sample_quality || {};
+    const counts = quality.authority_counts || {};
+    element.innerHTML = trainingEffectivenessPanel('样本可信度', `<div class="training-effectiveness-metric-grid"><div><span>OKX 实际成交/结算</span><strong>${Number(counts.okx_realized || 0)}</strong></div><div><span>影子市场机会（非真实盈利）</span><strong>${Number(counts.shadow_opportunity || 0)}</strong></div><div><span>反事实成本</span><strong>${Number(counts.counterfactual_cost || 0)}</strong></div><div><span>排除异常</span><strong>${Number(counts.excluded || 0)}</strong></div></div>`);
+}
+
+function renderTrainingEffectivenessConclusion(report) {
+    const element = document.getElementById('training-effectiveness-conclusion');
+    if (!element) return;
+    const available = trainingEffectivenessAvailable(report);
+    const conclusion = report.conclusion || {};
+    const blockers = Array.isArray(conclusion.blocking_reasons) ? conclusion.blocking_reasons : [];
+    element.innerHTML = trainingEffectivenessPanel('审计结论', `<div class="training-effectiveness-conclusion ${available && conclusion.promotion_eligible === true ? 'complete' : 'blocked'}"><strong>${available ? (conclusion.promotion_eligible === true ? '满足晋级证据条件' : '不满足晋级条件') : '结论不可用'}</strong><span>${blockers.length ? blockers.map(reason => escHtml(reason)).join('；') : (available ? '没有记录阻断原因' : '报告缺失、过期、不完整或有效样本为 0')}</span></div>`);
+}
+
+function renderTrainingEffectiveness(report = {}) {
+    renderTrainingEffectivenessFreshness(report);
+    renderTrainingEffectivenessVersions(report);
+    renderTrainingEffectivenessMetrics(report);
+    renderTrainingEffectivenessCostAttribution(report);
+    renderTrainingEffectivenessExperts(report);
+    renderTrainingEffectivenessFunnel(report);
+    renderTrainingEffectivenessSamples(report);
+    renderTrainingEffectivenessConclusion(report);
 }
 
 // ========== Shadow Backtest ==========

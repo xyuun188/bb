@@ -3722,6 +3722,117 @@ select.form-input { cursor: pointer; }
 #page-expert-memory .tab-panel .pagination {
     padding: 0 12px 12px;
 }
+.training-effectiveness-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+}
+.training-effectiveness-toolbar select,
+.training-effectiveness-toolbar input {
+    min-width: 132px;
+    height: 32px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-input);
+    color: var(--text);
+    font: inherit;
+}
+.training-effectiveness-status {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    overflow-wrap: anywhere;
+}
+.training-effectiveness-status span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-status.complete strong { color: var(--green); }
+.training-effectiveness-status.partial strong,
+.training-effectiveness-status.missing strong { color: var(--yellow); }
+.training-effectiveness-status.invalid strong { color: var(--red); }
+.training-effectiveness-section {
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.training-effectiveness-section h3 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--text);
+}
+.training-effectiveness-summary,
+.training-effectiveness-metric-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}
+.training-effectiveness-summary > div,
+.training-effectiveness-metric-grid > div,
+.training-effectiveness-funnel > div,
+.training-effectiveness-list > div {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-input);
+    overflow-wrap: anywhere;
+}
+.training-effectiveness-summary span,
+.training-effectiveness-metric-grid span,
+.training-effectiveness-funnel span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-summary strong,
+.training-effectiveness-metric-grid strong { color: var(--text); }
+.training-effectiveness-summary em,
+.training-effectiveness-metric-grid em,
+.training-effectiveness-funnel em { color: var(--text-dim); font-size: 11px; font-style: normal; }
+.training-effectiveness-cost-equation {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-input);
+}
+.training-effectiveness-cost-equation b { color: var(--text-muted); }
+.training-effectiveness-section p { margin: 8px 0 0; color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-list { display: grid; gap: 8px; }
+.training-effectiveness-list span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-funnel {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+}
+.training-effectiveness-conclusion {
+    display: grid;
+    gap: 5px;
+    padding: 10px;
+    border-left: 3px solid var(--yellow);
+    background: var(--bg-input);
+    overflow-wrap: anywhere;
+}
+.training-effectiveness-conclusion.complete { border-left-color: var(--green); }
+.training-effectiveness-conclusion span,
+.training-effectiveness-empty { color: var(--text-muted); font-size: 11px; }
+@media (max-width: 900px) {
+    .training-effectiveness-summary,
+    .training-effectiveness-metric-grid,
+    .training-effectiveness-funnel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .training-effectiveness-status { display: grid; }
+}
+@media (max-width: 560px) {
+    .training-effectiveness-summary,
+    .training-effectiveness-metric-grid,
+    .training-effectiveness-funnel { grid-template-columns: minmax(0, 1fr); }
+    .training-effectiveness-toolbar > * { width: 100%; }
+}
 .expert-memory-table-wrap {
     max-width: 100%;
     overflow-x: auto;
