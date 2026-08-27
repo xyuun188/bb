@@ -19,7 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import settings
 from services.training_effectiveness_report import (
-    TRAINING_EFFECTIVENESS_REPORT_DIRNAME,
     TrainingEffectivenessReportService,
     build_input_fingerprint,
     load_cached_training_effectiveness_report,

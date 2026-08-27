@@ -7,6 +7,7 @@ fixed fixtures before connecting it to production read models.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -17,8 +18,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from config.settings import settings
-from services.model_training_registry import build_model_training_registry
-
 TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-08-25.v1"
 TRAINING_EFFECTIVENESS_REPORT_DIRNAME = "training_effectiveness_reports"
 TRAINING_EFFECTIVENESS_REPORT_STATUSES = {"complete", "partial", "invalid", "missing"}
@@ -375,6 +374,18 @@ async def _load_authoritative_samples(*, filters: dict[str, Any]) -> list[dict[s
     return samples
 
 
+async def _load_registry_snapshot() -> dict[str, Any]:
+    """Read the dashboard's existing lifecycle snapshot without mutating it."""
+
+    try:
+        from web_dashboard.api.dashboard import get_model_training_registry_status
+
+        result = await asyncio.wait_for(get_model_training_registry_status(), timeout=15.0)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
 class TrainingEffectivenessReportService:
     """Read-only report assembler with replaceable data providers."""
 
@@ -386,7 +397,7 @@ class TrainingEffectivenessReportService:
         execution_provider: Callable[..., Any] | None = None,
         expert_provider: Callable[..., Any] | None = None,
     ) -> None:
-        self._registry_provider = registry_provider or build_model_training_registry
+        self._registry_provider = registry_provider or _load_registry_snapshot
         self._samples_provider = samples_provider or _load_authoritative_samples
         self._execution_provider = execution_provider or (lambda **_: {})
         self._expert_provider = expert_provider or (lambda **_: [])
