@@ -2508,6 +2508,50 @@ def _status_child_endpoint_contracts(model_bundle_available: bool) -> dict[str, 
     }
 
 
+def _lightweight_model_bundle_available() -> bool:
+    """Check bundle file presence for the cheap liveness contract.
+
+    Full pointer/hash verification remains owned by ``/models/status`` and
+    ``/health``.  Liveness must not perform that expensive verification because
+    a transient status probe timeout would otherwise make the platform lose the
+    child-endpoint contract.
+    """
+
+    try:
+        pointer = read_json_object(CURRENT_POINTER_PATH)
+        if (
+            pointer.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or pointer.get("pointer_role") != "current"
+            or pointer.get("model_id") != ARTIFACT_MODEL_ID
+        ):
+            return False
+        version = str(pointer.get("version") or "").strip()
+        manifest_relative = str(pointer.get("manifest_path") or "").strip()
+        if not version or not manifest_relative:
+            return False
+        version_root = (VERSIONS_ROOT / version).resolve()
+        manifest_path = (MODEL_DIR / manifest_relative).resolve()
+        manifest_path.relative_to(version_root)
+        manifest = read_json_object(manifest_path)
+        if (
+            manifest.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or manifest.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or manifest.get("artifact_version") != version
+        ):
+            return False
+        model_relative = str(manifest.get("model_relative_path") or "").strip()
+        metadata_relative = str(manifest.get("metadata_relative_path") or "").strip()
+        if not model_relative or not metadata_relative:
+            return False
+        model_path = (version_root / model_relative).resolve()
+        metadata_path = (version_root / metadata_relative).resolve()
+        model_path.relative_to(version_root)
+        metadata_path.relative_to(version_root)
+        return model_path.is_file() and metadata_path.is_file()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def _model_artifact_status() -> dict[str, Any]:
     pointer_rows = {}
     resolved_rows = {}
@@ -4684,12 +4728,22 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/health/live")
 async def liveness() -> dict[str, Any]:
-    """Return event-loop liveness without reading or serializing model metadata."""
+    """Return a cheap liveness plus child-contract snapshot.
 
+    The platform uses this endpoint when the full metadata endpoint is busy.
+    Keeping the route contracts here prevents a transient metadata timeout from
+    being misreported as four missing quant endpoints.
+    """
+
+    model_bundle_available = _lightweight_model_bundle_available()
     return {
         "ok": True,
         "service": "phase3_quant_api",
         "port": PHASE3_API_PORT,
+        "model_bundle_available": model_bundle_available,
+        "status": "ready" if model_bundle_available else "artifact_unavailable",
+        "status_endpoint_uses_metadata_only": True,
+        "child_endpoints": _status_child_endpoint_contracts(model_bundle_available),
     }
 
 

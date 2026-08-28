@@ -421,7 +421,7 @@ async def test_public_ticker_map_works_without_data_service(
     assert result["BTC/USDT"]["volume_24h"] == 1234.0
 
 
-async def test_dashboard_okx_balance_cold_cache_returns_refresh_pending(
+async def test_dashboard_okx_balance_cold_cache_performs_bounded_read(
     monkeypatch: pytest.MonkeyPatch,
     dashboard_fallback_events: list[dict[str, Any]],
 ) -> None:
@@ -439,10 +439,11 @@ async def test_dashboard_okx_balance_cold_cache_returns_refresh_pending(
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
 
-    assert result["refresh_in_progress"] is True
-    assert result["balance_status"] == "refresh_pending"
-    assert result["source"] == "background_refresh"
-    assert refresh_calls == ["paper"]
+    assert result["equity"] == 7.0
+    assert result.get("balance_status") != "refresh_pending"
+    assert result.get("source") != "background_refresh"
+    assert refresh_calls == []
+    assert dashboard._dashboard_okx_balance_cache["paper"][1]["equity"] == 7.0
     assert dashboard_fallback_events == []
 
 

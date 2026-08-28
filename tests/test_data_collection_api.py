@@ -1381,5 +1381,23 @@ async def test_data_collection_status_can_wait_for_first_real_snapshot(
     assert body["cache"]["cold_start"] is False
 
 
+@pytest.mark.asyncio
+async def test_data_collection_status_audit_read_does_not_start_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    monkeypatch.setattr(data_collection_module, "_status_cache", {})
+    monkeypatch.setattr(data_collection_module, "_status_refresh_tasks", {})
+    monkeypatch.setattr(data_collection_module, "_start_data_collection_status_refresh", lambda _include: pytest.fail("audit read must not start refresh"))
+
+    body = await data_collection_module.get_data_collection_status(
+        include_feature_coverage=False,
+        start_background_refresh=False,
+    )
+
+    assert body["status"] == "warming"
+    assert body["cache"]["cold_start"] is True
+
+
 async def _async_value(value: Any) -> Any:
     return value

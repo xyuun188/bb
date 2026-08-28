@@ -862,7 +862,15 @@ class LocalAIToolsClient:
             for item in child_endpoints.values()
             if isinstance(item, dict)
         )
-        model_bundle_available = bool(status.get("available"))
+        # A successful `/models/status` response normally carries `available`,
+        # but the liveness response also carries the explicit bundle state. Use
+        # both so status-endpoint timeouts do not erase known artifact readiness.
+        model_bundle_available = bool(
+            status.get("model_bundle_available")
+            or status.get("available")
+            or health.get("model_bundle_available")
+            or health.get("trained_models_available")
+        )
         service_available = bool(status_ok or health_ok or child_available)
 
         status["model_bundle_available"] = model_bundle_available

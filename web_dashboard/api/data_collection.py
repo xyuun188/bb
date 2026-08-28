@@ -1346,6 +1346,7 @@ async def get_data_collection_status(
     include_feature_coverage: bool = True,
     *,
     wait_for_initial_refresh: bool = False,
+    start_background_refresh: bool = True,
 ) -> dict[str, Any]:
     cache_enabled = str(settings.database_url or "").startswith("postgresql")
     if not cache_enabled:
@@ -1363,6 +1364,12 @@ async def get_data_collection_status(
             "refresh_in_progress": age_seconds > STATUS_CACHE_TTL_SECONDS,
         }
         return result
+    if not start_background_refresh:
+        # Read-only audit callers must not start a second DB-heavy refresh while
+        # the system-audit process is already checking database-backed cards.
+        # The regular dashboard/background loop remains responsible for warming
+        # this cache.
+        return _warming_data_collection_status(include_feature_coverage)
     refresh_task = _start_data_collection_status_refresh(include_feature_coverage)
     if wait_for_initial_refresh:
         # The dashboard can render a warming placeholder, but system audit must

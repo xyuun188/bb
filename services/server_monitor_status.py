@@ -1327,6 +1327,10 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     "probe_mode": "models_status_reachability",
                 }
             else:
+                # Keep the fallback cheap and contract-complete.  The liveness
+                # endpoint intentionally carries the lightweight child-route
+                # contract so a busy metadata probe cannot turn into a false
+                # "all child endpoints missing" audit blocker.
                 health = await _probe_platform_json(
                     client,
                     f"{local_base}/health/live",
@@ -1345,8 +1349,15 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     or (health.get("ok") and is_phase3_quant_api)
                 )
             )
+            # `/health/live` is the authoritative fallback when the heavier
+            # `/models/status` probe is busy. Preserve the explicit artifact
+            # readiness field so a healthy quant service is not shown as
+            # "model unavailable" merely because metadata timed out.
             model_bundle_available = bool(
-                status_metadata.get("available") or metadata.get("trained_models_available")
+                status_metadata.get("model_bundle_available")
+                or status_metadata.get("available")
+                or metadata.get("model_bundle_available")
+                or metadata.get("trained_models_available")
             )
             child_endpoints = _local_ai_tools_child_endpoint_contracts(
                 metadata,

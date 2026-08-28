@@ -21,6 +21,8 @@ from services.server_monitor_status import get_cached_platform_runtime_status
 DEFAULT_OKX_LOOKBACK_HOURS = 24
 DEFAULT_OKX_LIMIT = 120
 DEFAULT_OKX_TIMEOUT_SECONDS = 5.0
+DEFAULT_ACCOUNT_EQUITY_ATTEMPTS = 2
+ACCOUNT_EQUITY_RETRY_DELAY_SECONDS = 0.5
 DEFAULT_SPECIALIST_REPORT_MAX_AGE_SECONDS = 2 * 3600
 
 ReportProvider = Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]
@@ -675,30 +677,39 @@ class Phase3PaperResumePreflightService:
         }
 
     async def _default_account_equity(self) -> dict[str, Any]:
-        executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
-        try:
-            await executor.initialize()
-            snapshot = await executor.get_balance_snapshot("USDT")
-        finally:
+        last_error = ""
+        for attempt in range(1, DEFAULT_ACCOUNT_EQUITY_ATTEMPTS + 1):
+            executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+            snapshot: Any = None
             try:
-                await executor.shutdown()
+                await executor.initialize()
+                snapshot = await executor.get_balance_snapshot("USDT")
             except Exception as exc:
-                snapshot = {
-                    "error": f"executor shutdown failed: {safe_error_text(exc)}"
-                }
-        if not isinstance(snapshot, dict):
-            return {
-                "available": False,
-                "status": "unavailable",
-                "read_only": True,
-                "audit_only": True,
-                "source": "okx_snapshot",
-                "error": f"balance snapshot returned {type(snapshot).__name__}",
-            }
-        result = dict(snapshot)
-        result["available"] = not bool(result.get("error")) and _account_equity_value(result) > 0
-        result["status"] = "ok" if result["available"] else "unavailable"
-        result["read_only"] = True
-        result["audit_only"] = True
-        result["source"] = "okx_snapshot"
-        return result
+                last_error = safe_error_text(exc, limit=180)
+            finally:
+                try:
+                    await executor.shutdown()
+                except Exception as exc:
+                    shutdown_error = safe_error_text(exc, limit=120)
+                    if not last_error:
+                        last_error = shutdown_error
+            if isinstance(snapshot, dict):
+                result = dict(snapshot)
+                result["available"] = not bool(result.get("error")) and _account_equity_value(result) > 0
+                result["status"] = "ok" if result["available"] else "unavailable"
+                result["read_only"] = True
+                result["audit_only"] = True
+                result["source"] = "okx_snapshot"
+                if result["available"]:
+                    return result
+                last_error = str(result.get("error") or last_error or "balance snapshot unavailable")
+            if attempt < DEFAULT_ACCOUNT_EQUITY_ATTEMPTS:
+                await asyncio.sleep(ACCOUNT_EQUITY_RETRY_DELAY_SECONDS)
+        return {
+            "available": False,
+            "status": "unavailable",
+            "read_only": True,
+            "audit_only": True,
+            "source": "okx_snapshot",
+            "error": last_error or "balance snapshot unavailable",
+        }

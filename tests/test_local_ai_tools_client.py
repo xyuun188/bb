@@ -1444,6 +1444,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
             return {
                 "ok": True,
                 "service": "phase3_quant_api",
+                "model_bundle_available": True,
                 "child_endpoints": {
                     "profit_prediction": {
                         "available": True,
@@ -1471,8 +1472,8 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
 
     assert result["available"] is True
     assert result["service_available"] is True
-    assert result["model_bundle_available"] is False
-    assert result["status"] == "artifact_unavailable"
+    assert result["model_bundle_available"] is True
+    assert result["status"] == "ready"
     assert result["status_error"] == "models status endpoint unavailable"
     assert result["health_available"] is True
     assert result["child_endpoints"]["profit_prediction"]["available"] is True

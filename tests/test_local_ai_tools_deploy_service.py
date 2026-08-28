@@ -644,11 +644,23 @@ async def test_local_ai_tools_liveness_does_not_read_artifact_metadata(monkeypat
         raise AssertionError("liveness must not read artifact metadata")
 
     monkeypatch.setattr(module, "_model_artifact_status", fail_artifact_status)
+    monkeypatch.setattr(module, "_lightweight_model_bundle_available", lambda: True)
 
-    assert await module.liveness() == {
-        "ok": True,
-        "service": "phase3_quant_api",
-        "port": 8101,
+    liveness = await module.liveness()
+    assert liveness["ok"] is True
+    assert liveness["service"] == "phase3_quant_api"
+    assert liveness["port"] == 8101
+    assert liveness["model_bundle_available"] is True
+    assert liveness["status"] == "ready"
+    assert liveness["status_endpoint_uses_metadata_only"] is True
+    assert {
+        name: row["available"]
+        for name, row in liveness["child_endpoints"].items()
+    } == {
+        "profit_prediction": True,
+        "time_series_prediction": True,
+        "sentiment_analysis": True,
+        "exit_advice": True,
     }
 
     payload = module.with_model_metadata(

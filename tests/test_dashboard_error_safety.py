@@ -2623,7 +2623,14 @@ async def test_collect_platform_runtime_status_falls_back_to_liveness_when_statu
             if url.endswith("/health/live"):
                 return httpx.Response(
                     200,
-                    json={"ok": True, "service": "phase3_quant_api"},
+                    json={
+                        "ok": True,
+                        "service": "phase3_quant_api",
+                        "model_bundle_available": True,
+                        "child_endpoints": {
+                            "profit_prediction": {"available": True, "path": "/profit/predict"},
+                        },
+                    },
                     request=request,
                 )
             raise AssertionError(f"unexpected request: {url}")
@@ -2639,7 +2646,7 @@ async def test_collect_platform_runtime_status_falls_back_to_liveness_when_statu
     ]
     assert tools["available"] is True
     assert tools["service_available"] is True
-    assert tools["model_bundle_available"] is False
+    assert tools["model_bundle_available"] is True
     assert tools["health"]["probe_mode"] == "liveness_fallback"
 
 
