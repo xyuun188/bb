@@ -9477,6 +9477,66 @@ class TradingService:
                 feature_fetch_budget_diagnostics = self._safe_dict(
                     getattr(self, "_last_auto_feature_fetch_budget_diagnostics", None)
                 )
+                # The discovery pool is intentionally broad, but complete
+                # feature snapshots are expensive (klines, indicators,
+                # derivatives and native consistency checks).  Keep the
+                # runtime fetch set bounded independently from the discovery
+                # diagnostics so a stale/default pool cannot fan out into
+                # dozens of concurrent snapshots and exhaust the paper
+                # trading process.  Open-position symbols always win this
+                # budget because position review is a separate safety path.
+                configured_market_limit = max(1, int(settings.auto_scan_symbol_limit))
+                runtime_market_fetch_limit = configured_market_limit
+                position_keys = {
+                    self._normalize_position_symbol(symbol)
+                    for symbol in position_scan_symbols
+                    if self._normalize_position_symbol(symbol)
+                }
+                position_fetch_symbols = [
+                    symbol
+                    for symbol in fetch_symbols
+                    if self._normalize_position_symbol(symbol) in position_keys
+                ]
+                market_fetch_symbols = [
+                    symbol
+                    for symbol in fetch_symbols
+                    if self._normalize_position_symbol(symbol) not in position_keys
+                ]
+                if len(market_fetch_symbols) > runtime_market_fetch_limit:
+                    fetch_symbols = self.entry_symbol_universe.dedupe_symbols(
+                        [
+                            *position_fetch_symbols,
+                            *market_fetch_symbols[:runtime_market_fetch_limit],
+                        ]
+                    )
+                    feature_fetch_budget_diagnostics.update(
+                        {
+                            "runtime_fetch_cap_applied": True,
+                            "runtime_market_fetch_limit": int(runtime_market_fetch_limit),
+                            "runtime_market_fetch_omitted_count": max(
+                                len(market_fetch_symbols) - runtime_market_fetch_limit,
+                                0,
+                            ),
+                            "runtime_cap_reason": (
+                                "bounded complete feature snapshots before analysis; "
+                                "deferred market symbols remain in the rotating discovery pool"
+                            ),
+                            "selected_market_feature_fetch_count": int(
+                                runtime_market_fetch_limit
+                            ),
+                            "selected_total_feature_fetch_count": len(fetch_symbols),
+                        }
+                    )
+                    self._last_auto_feature_fetch_budget_diagnostics = dict(
+                        feature_fetch_budget_diagnostics
+                    )
+                    logger.info(
+                        "auto scan runtime feature fetch cap applied",
+                        configured_market_limit=configured_market_limit,
+                        selected_market=len(market_fetch_symbols[:runtime_market_fetch_limit]),
+                        omitted_market=len(market_fetch_symbols) - runtime_market_fetch_limit,
+                        selected_total=len(fetch_symbols),
+                    )
             unclaimed_filter_for_funnel = unclaimed_filter if run_market_analysis else None
             if not fetch_symbols:
                 diagnostics = {

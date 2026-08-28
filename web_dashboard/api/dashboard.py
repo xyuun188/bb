@@ -3429,23 +3429,16 @@ async def warm_dashboard_read_caches(mode: str | None = None) -> None:
                 result,
                 mode=selected_mode,
             )
-    second_stage_results = await asyncio.gather(
-        _warm_dashboard_strategy_learning_cache(selected_mode),
-        get_model_training_registry_status(),
-        _warm_dashboard_data_collection_cache(),
-        return_exceptions=True,
-    )
-    for label, result in zip(
-        ("strategy_learning", "model_registry", "data_collection"),
-        second_stage_results,
-        strict=True,
-    ):
-        if isinstance(result, BaseException):
-            _log_dashboard_fallback(
-                f"dashboard {label} cache warmup failed",
-                result,
-                mode=selected_mode,
-            )
+    # Strategy-learning and data-collection snapshots can scan large history
+    # tables. Fetch them on demand with their own time budgets; running them
+    # during process startup made health checks compete for memory.
+    registry_result = await get_model_training_registry_status()
+    if isinstance(registry_result, BaseException):
+        _log_dashboard_fallback(
+            "dashboard model_registry cache warmup failed",
+            registry_result,
+            mode=selected_mode,
+        )
 
 
 async def _warm_dashboard_strategy_learning_cache(mode: str) -> None:
@@ -9242,8 +9235,24 @@ def _strategy_learning_candidate_summary(value: Any) -> dict[str, Any]:
 
 
 def _strategy_learning_dashboard_summary(payload: Any) -> dict[str, Any]:
-    result = _safe_dict(payload)
-    schedule = _safe_dict(result.get("schedule"))
+    raw = _safe_dict(payload)
+    # Keep the cache bounded: the strategy engine may attach large diagnostic
+    # arrays to its payload even when the dashboard asks for summary detail.
+    result = {
+        key: raw[key]
+        for key in (
+            "mode",
+            "window_hours",
+            "sample_limit",
+            "optimization_target",
+            "production_permission",
+            "current_production_strategy",
+            "paper_strategy_champion",
+            "feedback",
+        )
+        if key in raw
+    }
+    schedule = _safe_dict(raw.get("schedule"))
     runtime = _safe_dict(schedule.get("runtime"))
     candidates = [
         _strategy_learning_candidate_summary(candidate)

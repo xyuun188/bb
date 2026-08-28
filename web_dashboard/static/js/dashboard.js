@@ -4891,7 +4891,7 @@ async function fetchMLSignalDashboard() {
             summary: {},
             error: err?.message || '模型训练注册表请求失败',
         })),
-        fetchJSON(`/api/analysis-records?limit=120&include_ml_summary=true&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
+        fetchJSON(`/api/analysis-records?limit=20&include_ml_summary=true&is_paper=${state.mode === 'paper' ? 'true' : 'false'}`).catch(() => ({ records: [] })),
         fetchJSON(`/api/model-contribution/stats?mode=${state.mode === 'live' ? 'live' : 'paper'}&days=7`).catch(() => null),
     ]);
     state.mlSignalStatus = status || null;
