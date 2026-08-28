@@ -132,6 +132,16 @@ async def _main() -> dict[str, object]:
 
 
 def main() -> int:
+    gate = getattr(MODEL_TRAINING_STATE_STORE, "training_gate", None)
+    if callable(gate):
+        gate_result = gate(
+            scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+            model_ids=LOCAL_ML_MODEL_IDS,
+            force=True,
+        )
+        if not bool(gate_result.get("allowed")):
+            print(json.dumps({"trained": False, **gate_result}, ensure_ascii=False))
+            return 4
     lease_attempt = MODEL_TRAINING_STATE_STORE.try_acquire_lease(
         scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
         stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,

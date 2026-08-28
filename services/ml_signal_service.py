@@ -3238,6 +3238,20 @@ class MLSignalService:
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
         """Run one cross-process single-flight training check."""
 
+        gate = getattr(self.training_state_store, "training_gate", None)
+        if callable(gate):
+            gate_result = gate(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                force=force,
+            )
+            if not bool(gate_result.get("allowed")):
+                return {
+                    "trained": False,
+                    "reason": gate_result.get("reason") or "training_gate_blocked",
+                    "training_gate": gate_result,
+                }
+
         lease_attempt = self.training_state_store.try_acquire_lease(
             scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
             stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,

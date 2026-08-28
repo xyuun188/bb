@@ -1479,6 +1479,7 @@ class StrategyLearningService:
                                 StrategyLearningEvent.position_id.in_(position_ids),
                             )
                             .order_by(StrategyLearningEvent.created_at.desc())
+                            .limit(max(effective_limit * 4, 100))
                         )
                     )
                     .scalars()

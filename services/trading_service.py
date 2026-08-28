@@ -11413,6 +11413,19 @@ class TradingService:
 
     async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
         state_store = self._model_training_state()
+        gate = getattr(state_store, "training_gate", None)
+        if callable(gate):
+            gate_result = gate(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                force=force,
+            )
+            if not bool(gate_result.get("allowed")):
+                return {
+                    "trained": False,
+                    "reason": gate_result.get("reason") or "training_gate_blocked",
+                    "training_gate": gate_result,
+                }
         lease_attempt = state_store.try_acquire_lease(
             scheduler_id="local_ai_tools_auto_train",
             stale_after_seconds=AUTO_TRAIN_LEASE_STALE_SECONDS,

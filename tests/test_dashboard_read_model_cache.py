@@ -232,6 +232,60 @@ async def test_strategy_learning_request_snapshot_skips_repeated_watermark_query
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dashboard._clear_dashboard_heavy_cache("strategy-learning")
+
+
+@pytest.mark.asyncio
+async def test_strategy_learning_timeout_returns_persisted_stale_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("strategy-learning")
+    monkeypatch.setattr(dashboard, "_STRATEGY_LEARNING_SNAPSHOT_DIR", tmp_path)
+
+    async def watermark(**_kwargs: Any) -> tuple[str]:
+        return ("v1",)
+
+    class HealthyStrategyLearningStub:
+        async def dashboard_payload(self, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "mode": "paper",
+                "schedule": {
+                    "scheduler_mode": "shadow_validation",
+                    "reason": "healthy_snapshot",
+                    "candidates": [],
+                },
+            }
+
+    monkeypatch.setattr(dashboard, "_strategy_learning_watermark_for_request", watermark)
+    monkeypatch.setattr(
+        dashboard,
+        "_trading_service",
+        SimpleNamespace(strategy_learning_service=HealthyStrategyLearningStub()),
+    )
+    fresh = await dashboard.get_strategy_learning(mode="paper")
+    assert fresh["status"] == "ok"
+    dashboard._clear_dashboard_heavy_cache("strategy-learning")
+
+    async def failing_watermark(**_kwargs: Any) -> tuple[str]:
+        return ("v2",)
+
+    class TimeoutStrategyLearningStub:
+        async def dashboard_payload(self, **_kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("slow strategy query")
+
+    monkeypatch.setattr(dashboard, "_strategy_learning_watermark_for_request", failing_watermark)
+    monkeypatch.setattr(
+        dashboard,
+        "_trading_service",
+        SimpleNamespace(strategy_learning_service=TimeoutStrategyLearningStub()),
+    )
+    stale = await dashboard.get_strategy_learning(mode="paper")
+    assert stale["status"] == "stale"
+    assert stale["stale"] is True
+    assert stale["fallback_source"] == "persisted_last_success"
+    assert stale["schedule"]["scheduler_mode"] == "stale_snapshot"
+    assert stale["schedule"]["reason"] == "strategy_learning_query_timeout"
+    dashboard._clear_dashboard_heavy_cache("strategy-learning")
     watermark_calls = 0
     payload_calls = 0
 

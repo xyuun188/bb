@@ -166,6 +166,9 @@ _dashboard_public_rest_client_factory: Any | None = None
 _dashboard_public_rest_client_lock: asyncio.Lock | None = None
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
+_STRATEGY_LEARNING_SNAPSHOT_VERSION = 1
+_STRATEGY_LEARNING_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_STRATEGY_LEARNING_SNAPSHOT_DIR = settings.data_dir / "dashboard_strategy_learning"
 _dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS = 20.0
 _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
@@ -335,6 +338,102 @@ def _dashboard_heavy_cache_get(
 def _dashboard_heavy_cache_set(key: tuple[Any, ...], payload: Any) -> Any:
     _dashboard_heavy_cache[key] = (datetime.now(UTC), copy.deepcopy(payload))
     return payload
+
+
+def _strategy_learning_snapshot_path(*, mode: str, detail: str) -> Path:
+    safe_mode = "live" if mode == "live" else "paper"
+    safe_detail = "full" if detail == "full" else "summary"
+    return _STRATEGY_LEARNING_SNAPSHOT_DIR / f"{safe_mode}-{safe_detail}.json"
+
+
+def _load_strategy_learning_snapshot(*, mode: str, detail: str) -> dict[str, Any] | None:
+    path = _strategy_learning_snapshot_path(mode=mode, detail=detail)
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("version") != _STRATEGY_LEARNING_SNAPSHOT_VERSION:
+        return None
+    payload = envelope.get("payload")
+    saved_at = envelope.get("saved_at")
+    try:
+        saved = datetime.fromisoformat(str(saved_at).replace("Z", "+00:00"))
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=UTC)
+        age = max((datetime.now(UTC) - saved.astimezone(UTC)).total_seconds(), 0.0)
+    except (TypeError, ValueError):
+        return None
+    if age > _STRATEGY_LEARNING_SNAPSHOT_MAX_AGE_SECONDS or not isinstance(payload, dict):
+        return None
+    return {
+        **copy.deepcopy(payload),
+        "snapshot_saved_at": saved.astimezone(UTC).isoformat(),
+        "snapshot_age_seconds": round(age, 3),
+    }
+
+
+def _persist_strategy_learning_snapshot(
+    *,
+    mode: str,
+    detail: str,
+    payload: dict[str, Any],
+) -> None:
+    path = _strategy_learning_snapshot_path(mode=mode, detail=detail)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    envelope = {
+        "version": _STRATEGY_LEARNING_SNAPSHOT_VERSION,
+        "saved_at": datetime.now(UTC).isoformat(),
+        "payload": _bounded_dashboard_payload(
+            payload,
+            max_depth=6,
+            max_items=80,
+            max_text=1600,
+        ),
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError as exc:
+        _log_dashboard_fallback("strategy learning snapshot persist failed", exc, mode=mode)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _strategy_learning_stale_fallback(
+    *,
+    mode: str,
+    detail: str,
+    reason: str,
+    checked_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    snapshot = _load_strategy_learning_snapshot(mode=mode, detail=detail)
+    if snapshot is None:
+        return None
+    now = checked_at or datetime.now(UTC)
+    fallback = {
+        **snapshot,
+        "status": "stale",
+        "stale": True,
+        "checked_at": now.isoformat(),
+        "stale_at": now.isoformat(),
+        "stale_reason": reason,
+        "fallback_source": "persisted_last_success",
+    }
+    schedule = _safe_dict(fallback.get("schedule"))
+    schedule.update(
+        {
+            "scheduler_mode": "stale_snapshot",
+            "reason": reason,
+        }
+    )
+    fallback["schedule"] = schedule
+    return fallback
 
 
 async def _dashboard_heavy_cached(
@@ -9270,6 +9369,14 @@ def _strategy_learning_dashboard_summary(payload: Any) -> dict[str, Any]:
     result = {
         key: raw[key]
         for key in (
+            "status",
+            "stale",
+            "checked_at",
+            "stale_at",
+            "stale_reason",
+            "fallback_source",
+            "snapshot_saved_at",
+            "snapshot_age_seconds",
             "mode",
             "window_hours",
             "sample_limit",
@@ -9373,7 +9480,13 @@ async def get_strategy_learning(
         )
     except TimeoutError:
         watermark = ("watermark_timeout",)
-        timeout_payload = {
+        timeout_reason = "strategy_learning_watermark_timeout"
+        stale_payload = _strategy_learning_stale_fallback(
+            mode=selected_mode,
+            detail=selected_detail,
+            reason=timeout_reason,
+        )
+        timeout_payload = stale_payload or {
             "status": "timeout",
             "stale": False,
             "checked_at": datetime.now(UTC).isoformat(),
@@ -9381,7 +9494,7 @@ async def get_strategy_learning(
             "window_hours": capped_hours,
             "sample_limit": capped_limit,
             "schedule": {
-                "reason": "strategy_learning_watermark_timeout",
+                "reason": timeout_reason,
                 "scheduler_mode": "watermark_timeout",
                 "candidate_count": None,
                 "governed_candidate_count": None,
@@ -9424,7 +9537,12 @@ async def get_strategy_learning(
             timeout=12.0,
         )
     except TimeoutError:
-        payload = {
+        timeout_reason = "strategy_learning_query_timeout"
+        payload = _strategy_learning_stale_fallback(
+            mode=selected_mode,
+            detail=selected_detail,
+            reason=timeout_reason,
+        ) or {
             "status": "timeout",
             "stale": False,
             "checked_at": datetime.now(UTC).isoformat(),
@@ -9432,7 +9550,7 @@ async def get_strategy_learning(
             "window_hours": capped_hours,
             "sample_limit": capped_limit,
             "schedule": {
-                "reason": "strategy_learning_query_timeout",
+                "reason": timeout_reason,
                 "scheduler_mode": "timeout",
                 "candidate_count": None,
                 "governed_candidate_count": None,
@@ -9441,8 +9559,23 @@ async def get_strategy_learning(
             },
             "current_production_strategy": {},
         }
-        # The common cache write below keeps repeated refreshes bounded while
-        # the database is under pressure.
+    else:
+        payload = dict(payload)
+        checked_at = datetime.now(UTC).isoformat()
+        payload.update(
+            {
+                "status": "ok",
+                "stale": False,
+                "checked_at": checked_at,
+                "snapshot_saved_at": checked_at,
+                "fallback_source": "live_query",
+            }
+        )
+        _persist_strategy_learning_snapshot(
+            mode=selected_mode,
+            detail=selected_detail,
+            payload=payload,
+        )
     _dashboard_heavy_cache_set(request_cache_key, payload)
     return sanitize_payload(payload)
 

@@ -88,6 +88,81 @@ def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
         assert [event["event"] for event in row["history"]] == ["started", "succeeded"]
 
 
+def test_resource_failures_backoff_and_open_circuit_until_input_changes(tmp_path) -> None:
+    now = [datetime(2026, 8, 28, 1, 0, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+
+    def failed_run() -> None:
+        attempt = store.try_acquire_lease(
+            scheduler_id="local_ai_tools_auto_train",
+            stale_after_seconds=3600,
+        )
+        assert attempt.lease is not None
+        run_id = attempt.lease.run_id
+        store.record_check(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=run_id,
+            force=False,
+        )
+        store.start_run(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=run_id,
+            trigger_reason="training_due",
+        )
+        store.finish_check(
+            scheduler_id="local_ai_tools_auto_train",
+            model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+            run_id=run_id,
+            result={
+                "trained": False,
+                "reason": "error",
+                "error": "MemoryError: unable to allocate tensor",
+                "training_input_fingerprint": "same-input",
+            },
+            next_check_at=now[0] + timedelta(seconds=5),
+        )
+        attempt.lease.release()
+
+    failed_run()
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    assert row["resource_failure_count"] == 1
+    assert row["resource_error_class"] == "resource"
+    assert row["next_check_at"] == "2026-08-28T01:05:00+00:00"
+    assert store.training_gate(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+    )["reason"] == "retry_backoff_active"
+
+    now[0] += timedelta(minutes=5)
+    failed_run()
+    now[0] += timedelta(minutes=15)
+    failed_run()
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    assert row["state"] == "resource_blocked"
+    assert row["resource_failure_count"] == 3
+    blocked = store.training_gate(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        force=True,
+        input_fingerprint="same-input",
+    )
+    assert blocked["allowed"] is False
+    assert blocked["reason"] == "resource_blocked"
+    reopened = store.training_gate(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        force=True,
+        input_fingerprint="new-input",
+    )
+    assert reopened["allowed"] is True
+    assert reopened["reason"] == "resource_circuit_reset_new_input"
+
+
 def test_skipped_check_does_not_advance_last_successful_training_cursor(tmp_path) -> None:
     now = [datetime(2026, 7, 27, 1, 0, tzinfo=UTC)]
     store = ModelTrainingStateStore(

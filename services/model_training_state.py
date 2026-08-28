@@ -28,6 +28,66 @@ MAX_HISTORY_EVENTS = 30
 WRITE_LOCK_STALE_SECONDS = 30.0
 WRITE_LOCK_WAIT_SECONDS = 3.0
 INTERRUPTED_RETRY_INTERVAL_SECONDS = 5 * 60
+RESOURCE_ERROR_RETRY_DELAYS_SECONDS = (5 * 60, 15 * 60, 60 * 60, 3 * 60 * 60, 6 * 60 * 60)
+RESOURCE_ERROR_CIRCUIT_THRESHOLD = 3
+RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS = 6 * 60 * 60
+_RESOURCE_ERROR_MARKERS = (
+    "memoryerror",
+    "out of memory",
+    "oom",
+    "cannot allocate memory",
+    "resource exhausted",
+    "training_process_interrupted",
+    "training process interrupted",
+)
+
+
+def classify_training_failure(
+    result: dict[str, Any] | None = None,
+    *,
+    error: str | None = None,
+) -> str:
+    """Classify failures that should consume the resource circuit budget."""
+
+    payload = result if isinstance(result, dict) else {}
+    reason = str(payload.get("reason") or "").lower()
+    text = " ".join(
+        str(value or "")
+        for value in (
+            reason,
+            payload.get("error"),
+            payload.get("message"),
+            error,
+        )
+    ).lower()
+    if any(marker in text for marker in _RESOURCE_ERROR_MARKERS):
+        return "resource"
+    return "functional"
+
+
+def _resource_retry_delay(failure_count: int) -> float:
+    index = max(int(failure_count or 1), 1) - 1
+    return float(
+        RESOURCE_ERROR_RETRY_DELAYS_SECONDS[
+            min(index, len(RESOURCE_ERROR_RETRY_DELAYS_SECONDS) - 1)
+        ]
+    )
+
+
+def _row_resource_failure_count(row: dict[str, Any]) -> int:
+    """Read resource failure history from both current and legacy state rows."""
+
+    persisted = max(int(row.get("resource_failure_count") or 0), 0)
+    if persisted:
+        return persisted
+    legacy_result = row.get("last_result")
+    legacy_error = row.get("last_error")
+    if classify_training_failure(
+        legacy_result if isinstance(legacy_result, dict) else None,
+        error=str(legacy_error or ""),
+    ) != "resource":
+        return 0
+    return max(int(row.get("retry_count") or 0), 0)
 
 
 def _utc_now() -> datetime:
@@ -128,6 +188,10 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "artifact_persisted",
         "readiness_state",
         "live_ml_ready",
+        "training_input_fingerprint",
+        "input_fingerprint",
+        "data_fingerprint",
+        "resource_error_class",
     )
     summary: dict[str, Any] = {}
     for key in keys:
@@ -498,7 +562,29 @@ class ModelTrainingStateStore:
         reason = str(summary.get("reason") or "unknown")
         trained = bool(summary.get("trained"))
         error = str(summary.get("error") or "")
-        failed = bool(error or reason in {"error", "load_samples_error", "timeout"})
+        failed = bool(
+            error
+            or reason
+            in {
+                "error",
+                "load_samples_error",
+                "timeout",
+                "resource_blocked",
+            }
+        )
+        failure_class = classify_training_failure(summary)
+        input_fingerprint = next(
+            (
+                str(summary.get(key)).strip()
+                for key in (
+                    "training_input_fingerprint",
+                    "input_fingerprint",
+                    "data_fingerprint",
+                )
+                if str(summary.get(key) or "").strip()
+            ),
+            None,
+        )
         state = "succeeded" if trained else "failed" if failed else "skipped"
 
         def mutate(payload: dict[str, Any], now: datetime) -> None:
@@ -506,10 +592,39 @@ class ModelTrainingStateStore:
                 row = self._model_row(payload, model_id)
                 started = row.get("state") == "running" and row.get("active_run_id") == run_id
                 retry_count = int(row.get("retry_count") or 0)
+                effective_state = state
+                resource_failure_count = int(row.get("resource_failure_count") or 0)
+                previous_fingerprint = str(
+                    row.get("resource_failure_fingerprint") or ""
+                ).strip()
+                if failed and failure_class == "resource":
+                    previous_circuit_until = _parse_datetime(
+                        row.get("resource_circuit_open_until")
+                    )
+                    if previous_circuit_until is not None and previous_circuit_until <= now:
+                        resource_failure_count = 0
+                    if (
+                        input_fingerprint
+                        and previous_fingerprint
+                        and input_fingerprint != previous_fingerprint
+                    ):
+                        resource_failure_count = 0
+                    resource_failure_count += 1
+                    effective_next_check_at = now + timedelta(
+                        seconds=_resource_retry_delay(resource_failure_count)
+                    )
+                    if resource_failure_count >= RESOURCE_ERROR_CIRCUIT_THRESHOLD:
+                        effective_state = "resource_blocked"
+                        effective_next_check_at = now + timedelta(
+                            seconds=RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS
+                        )
+                else:
+                    resource_failure_count = 0
+                    effective_next_check_at = next_check_at
                 row.update(
                     {
                         "scheduler_id": scheduler_id,
-                        "state": state,
+                        "state": effective_state,
                         "triggered": bool(started or trained),
                         "trigger_reason": row.get("trigger_reason") if started else reason,
                         "last_finished_at": _iso(now)
@@ -517,10 +632,19 @@ class ModelTrainingStateStore:
                         else row.get("last_finished_at"),
                         "last_result": summary,
                         "last_error": error or None,
-                        "next_check_at": _iso(next_check_at),
+                        "next_check_at": _iso(effective_next_check_at),
                         "active_run_id": None,
                         "active_sample_cursor": None,
                         "retry_count": retry_count + 1 if failed else 0,
+                        "resource_error_class": failure_class if failed else None,
+                        "resource_failure_count": resource_failure_count,
+                        "resource_failure_fingerprint": input_fingerprint
+                        or previous_fingerprint
+                        if failed and failure_class == "resource"
+                        else None,
+                        "resource_circuit_open_until": _iso(effective_next_check_at)
+                        if effective_state == "resource_blocked"
+                        else None,
                     }
                 )
                 if trained:
@@ -544,7 +668,7 @@ class ModelTrainingStateStore:
                     row,
                     {
                         "at": _iso(now),
-                        "event": state,
+                        "event": effective_state,
                         "run_id": run_id,
                         "reason": reason,
                         "error": error or None,
@@ -593,6 +717,179 @@ class ModelTrainingStateStore:
             next_check_at=next_check_at,
         )
 
+    def training_gate(
+        self,
+        *,
+        scheduler_id: str,
+        model_ids: Iterable[str],
+        force: bool = False,
+        input_fingerprint: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return the persisted run gate before a trainer acquires a lease."""
+
+        checked_at = now or self.now_provider()
+        model_set = {str(model_id) for model_id in model_ids if str(model_id)}
+        payload = self.read()
+        models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
+        rows = [
+            row
+            for model_id, row in models.items()
+            if str(model_id) in model_set and isinstance(row, dict)
+        ]
+        if not rows:
+            return {
+                "allowed": True,
+                "reason": "training_gate_open",
+                "scheduler_id": scheduler_id,
+                "model_ids": sorted(model_set),
+            }
+
+        active = [row for row in rows if row.get("state") in {"checking", "running"}]
+        if active:
+            return {
+                "allowed": False,
+                "reason": "training_in_progress",
+                "scheduler_id": scheduler_id,
+                "active_run_ids": sorted(
+                    {
+                        str(row.get("active_run_id"))
+                        for row in active
+                        if row.get("active_run_id")
+                    }
+                ),
+            }
+
+        now_ts = checked_at
+        circuit_rows = [
+            row
+            for row in rows
+            if _row_resource_failure_count(row) >= RESOURCE_ERROR_CIRCUIT_THRESHOLD
+            or row.get("state") == "resource_blocked"
+        ]
+        legacy_rows = [
+            row
+            for row in circuit_rows
+            if not int(row.get("resource_failure_count") or 0)
+            and row.get("state") != "resource_blocked"
+        ]
+        if legacy_rows:
+            circuit_until = checked_at + timedelta(seconds=RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS)
+
+            def migrate(payload_to_update: dict[str, Any], _mutate_now: datetime) -> None:
+                models_to_update = payload_to_update.get("models")
+                if not isinstance(models_to_update, dict):
+                    return
+                for model_id in model_set:
+                    row_to_update = models_to_update.get(model_id)
+                    if not isinstance(row_to_update, dict):
+                        continue
+                    if int(row_to_update.get("resource_failure_count") or 0):
+                        continue
+                    count = _row_resource_failure_count(row_to_update)
+                    if count < RESOURCE_ERROR_CIRCUIT_THRESHOLD:
+                        continue
+                    row_to_update.update(
+                        {
+                            "state": "resource_blocked",
+                            "resource_error_class": "resource",
+                            "resource_failure_count": count,
+                            "resource_circuit_open_until": _iso(circuit_until),
+                            "next_check_at": _iso(circuit_until),
+                            "resource_failure_fingerprint": str(
+                                _result_summary(row_to_update.get("last_result")).get(
+                                    "training_input_fingerprint"
+                                )
+                                or _result_summary(row_to_update.get("last_result")).get(
+                                    "input_fingerprint"
+                                )
+                                or ""
+                            ).strip()
+                            or None,
+                        }
+                    )
+                    self._append_history(
+                        row_to_update,
+                        {
+                            "at": _iso(_mutate_now),
+                            "event": "resource_blocked",
+                            "reason": "legacy_resource_failure_migrated",
+                            "scheduler_id": scheduler_id,
+                        },
+                    )
+
+            self._mutate(migrate)
+        candidate_fingerprint = str(input_fingerprint or "").strip()
+        if circuit_rows:
+            stored_fingerprints = {
+                str(row.get("resource_failure_fingerprint") or "").strip()
+                for row in circuit_rows
+                if str(row.get("resource_failure_fingerprint") or "").strip()
+            }
+            until_values = [
+                _parse_datetime(row.get("resource_circuit_open_until"))
+                for row in circuit_rows
+            ]
+            until = max((value for value in until_values if value), default=None)
+            if until is not None and until <= now_ts:
+                return {
+                    "allowed": True,
+                    "reason": "resource_circuit_half_open",
+                    "state": "circuit_half_open",
+                    "scheduler_id": scheduler_id,
+                    "input_fingerprint": candidate_fingerprint or None,
+                    "circuit_open_until": _iso(until),
+                }
+            # A force flag alone is intentionally insufficient to reopen a
+            # resource circuit. The input must change and be explicitly named.
+            if not candidate_fingerprint or candidate_fingerprint in stored_fingerprints:
+                return {
+                    "allowed": False,
+                    "reason": "resource_blocked",
+                    "state": "circuit_open",
+                    "scheduler_id": scheduler_id,
+                    "circuit_open_until": _iso(until) if until else None,
+                    "resource_failure_count": max(
+                        _row_resource_failure_count(row) for row in circuit_rows
+                    ),
+                    "legacy_state_compatibility": any(
+                        not int(row.get("resource_failure_count") or 0)
+                        and _row_resource_failure_count(row) > 0
+                        for row in circuit_rows
+                    ),
+                    "force_ignored": bool(force),
+                }
+            return {
+                "allowed": True,
+                "reason": "resource_circuit_reset_new_input",
+                "state": "circuit_half_open",
+                "scheduler_id": scheduler_id,
+                "input_fingerprint": candidate_fingerprint,
+                "force": bool(force),
+            }
+
+        future_checks = [
+            parsed
+            for parsed in (_parse_datetime(row.get("next_check_at")) for row in rows)
+            if parsed is not None and parsed > now_ts
+        ]
+        if future_checks and not force:
+            next_check = max(future_checks)
+            return {
+                "allowed": False,
+                "reason": "retry_backoff_active",
+                "state": "cooldown",
+                "scheduler_id": scheduler_id,
+                "next_check_at": _iso(next_check),
+                "remaining_seconds": round(max((next_check - now_ts).total_seconds(), 0.0), 3),
+            }
+        return {
+            "allowed": True,
+            "reason": "manual_force_override" if force and future_checks else "training_gate_open",
+            "scheduler_id": scheduler_id,
+            "force": bool(force),
+        }
+
     def recover_interrupted_runs(
         self,
         *,
@@ -619,8 +916,17 @@ class ModelTrainingStateStore:
                 state = row.get("state")
                 if state == "interrupted" and not row.get("next_check_at"):
                     recovered.append(str(model_id))
+                    resource_failure_count = int(row.get("resource_failure_count") or 0) + 1
                     next_check_at = now + timedelta(seconds=retry_delay)
+                    if resource_failure_count >= RESOURCE_ERROR_CIRCUIT_THRESHOLD:
+                        row["state"] = "resource_blocked"
+                        next_check_at = now + timedelta(seconds=RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS)
                     row["next_check_at"] = _iso(next_check_at)
+                    row["resource_failure_count"] = resource_failure_count
+                    row["resource_error_class"] = "resource"
+                    row["resource_circuit_open_until"] = (
+                        _iso(next_check_at) if row.get("state") == "resource_blocked" else None
+                    )
                     self._append_history(
                         row,
                         {
@@ -639,15 +945,25 @@ class ModelTrainingStateStore:
                     continue
                 recovered.append(str(model_id))
                 run_id = str(row.get("active_run_id") or "unknown")
+                resource_failure_count = int(row.get("resource_failure_count") or 0) + 1
+                next_check_at = now + timedelta(seconds=_resource_retry_delay(resource_failure_count))
+                state = "resource_blocked" if resource_failure_count >= RESOURCE_ERROR_CIRCUIT_THRESHOLD else "interrupted"
+                if state == "resource_blocked":
+                    next_check_at = now + timedelta(seconds=RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS)
                 row.update(
                     {
-                        "state": "interrupted",
+                        "state": state,
                         "last_finished_at": _iso(now),
                         "last_error": "training_process_interrupted",
                         "active_run_id": None,
                         "active_sample_cursor": None,
-                        "next_check_at": _iso(now + timedelta(seconds=retry_delay)),
+                        "next_check_at": _iso(next_check_at),
                         "retry_count": int(row.get("retry_count") or 0) + 1,
+                        "resource_error_class": "resource",
+                        "resource_failure_count": resource_failure_count,
+                        "resource_circuit_open_until": (
+                            _iso(next_check_at) if state == "resource_blocked" else None
+                        ),
                     }
                 )
                 self._append_history(
