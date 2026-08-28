@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,42 @@ from core.model_runtime import HIGH_RISK_REVIEW_TOKEN_CAP, HIGH_RISK_REVIEW_TOKE
 from web_dashboard.api import settings_api as settings_api_module
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.app import create_app
+
+
+@pytest.mark.asyncio
+async def test_api_saturation_keeps_liveness_probe_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "dashboard_auth_enabled", False)
+    app = create_app()
+    app.state.dashboard_api_concurrency_limit = 1
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @app.get("/api/test/hold")
+    async def hold_api_request() -> dict[str, bool]:
+        started.set()
+        await release.wait()
+        return {"ok": True}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        held_request = asyncio.create_task(client.get("/api/test/hold"))
+        await started.wait()
+        try:
+            saturated = await client.get("/api/test/hold")
+            liveness = await client.get("/health/live")
+        finally:
+            release.set()
+        held_response = await held_request
+
+    assert saturated.status_code == 503
+    assert saturated.headers["retry-after"] == "2"
+    assert liveness.status_code == 200
+    assert liveness.json() == {"status": "ok"}
+    assert held_response.status_code == 200
+    assert app.state.dashboard_api_inflight == 0
 
 
 class _FakeHumanMessage:

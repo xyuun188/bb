@@ -28,6 +28,36 @@ def test_system_audit_runner_bootstraps_online_runtime_before_settings_imports()
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
 
 
+@pytest.mark.asyncio
+async def test_cold_system_audit_returns_warming_payload_and_schedules_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = False
+
+    def fake_schedule() -> None:
+        nonlocal scheduled
+        scheduled = True
+
+    async def unexpected_blocking_refresh(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("cold API request must not await the full audit")
+
+    monkeypatch.setattr(system_audit, "_cached_system_audit_status", lambda: None)
+    monkeypatch.setattr(system_audit, "_schedule_system_audit_refresh", fake_schedule)
+    monkeypatch.setattr(
+        system_audit,
+        "refresh_system_audit_snapshot",
+        unexpected_blocking_refresh,
+    )
+
+    payload = await system_audit.system_audit_status()
+
+    assert scheduled is True
+    assert payload["status"] == "warming"
+    assert payload["cards"] == []
+    assert payload["cache"]["hit"] is False
+    assert payload["cache"]["refresh_in_background"] is True
+
+
 class _CompletedProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
         self.returncode: int | None = 0

@@ -39,6 +39,7 @@ PUBLIC_AUTH_PATHS = {
     "/api/auth/status",
     "/api/auth/logout",
 }
+DASHBOARD_API_CONCURRENCY_LIMIT = 24
 
 # Global WebSocket manager
 ws_manager = WebSocketManager()
@@ -92,6 +93,19 @@ async def lifespan(app: FastAPI):
         await ws_manager.close_all()
 
 
+async def _try_acquire_dashboard_api_slot(app: FastAPI) -> bool:
+    async with app.state.dashboard_api_concurrency_lock:
+        if app.state.dashboard_api_inflight >= app.state.dashboard_api_concurrency_limit:
+            return False
+        app.state.dashboard_api_inflight += 1
+        return True
+
+
+async def _release_dashboard_api_slot(app: FastAPI) -> None:
+    async with app.state.dashboard_api_concurrency_lock:
+        app.state.dashboard_api_inflight = max(app.state.dashboard_api_inflight - 1, 0)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI Crypto Trading System",
@@ -99,6 +113,9 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.state.dashboard_api_concurrency_limit = DASHBOARD_API_CONCURRENCY_LIMIT
+    app.state.dashboard_api_inflight = 0
+    app.state.dashboard_api_concurrency_lock = asyncio.Lock()
 
     app.add_middleware(
         CORSMiddleware,
@@ -134,38 +151,52 @@ def create_app() -> FastAPI:
                         headers=getattr(exc, "headers", None),
                     )
 
-        response = await call_next(request)
-        content_type = response.headers.get("content-type", "")
-        if not request.url.path.startswith("/api") or "application/json" not in content_type:
-            return response
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk
-        if not body:
-            return response
+        api_slot_acquired = False
+        if _request_uses_dashboard_api_slot(request.url.path):
+            api_slot_acquired = await _try_acquire_dashboard_api_slot(request.app)
+            if not api_slot_acquired:
+                return JSONResponse(
+                    content={"detail": "Dashboard is busy; retry shortly."},
+                    status_code=503,
+                    headers={"Retry-After": "2"},
+                )
+
         try:
-            payload = json.loads(body)
-        except Exception as exc:
-            logger.debug(
-                "dashboard JSON sanitize skipped invalid payload",
-                path=request.url.path,
-                status_code=response.status_code,
-                error=type(exc).__name__,
-            )
+            response = await call_next(request)
+            content_type = response.headers.get("content-type", "")
+            if not request.url.path.startswith("/api") or "application/json" not in content_type:
+                return response
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
+            if not body:
+                return response
+            try:
+                payload = json.loads(body)
+            except Exception as exc:
+                logger.debug(
+                    "dashboard JSON sanitize skipped invalid payload",
+                    path=request.url.path,
+                    status_code=response.status_code,
+                    error=type(exc).__name__,
+                )
+                return JSONResponse(
+                    content=body.decode("utf-8", errors="replace"),
+                    status_code=response.status_code,
+                )
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() not in {"content-length", "content-type"}
+            }
             return JSONResponse(
-                content=body.decode("utf-8", errors="replace"),
+                content=sanitize_payload(payload),
                 status_code=response.status_code,
+                headers=headers,
             )
-        headers = {
-            key: value
-            for key, value in response.headers.items()
-            if key.lower() not in {"content-length", "content-type"}
-        }
-        return JSONResponse(
-            content=sanitize_payload(payload),
-            status_code=response.status_code,
-            headers=headers,
-        )
+        finally:
+            if api_slot_acquired:
+                await _release_dashboard_api_slot(request.app)
 
     app.include_router(api_router, prefix="/api")
 
@@ -176,6 +207,10 @@ def create_app() -> FastAPI:
     @app.get("/login", response_class=HTMLResponse)
     async def login_page():
         return HTMLResponse(content=dashboard_login_page_html())
+
+    @app.get("/health/live", include_in_schema=False)
+    async def health_live() -> dict[str, str]:
+        return {"status": "ok"}
 
     @app.get("/", response_class=HTMLResponse)
     async def root(request: Request):
@@ -243,6 +278,10 @@ def _request_needs_dashboard_session(request: Request) -> bool:
 
 def _is_public_auth_path(path: str) -> bool:
     return path in PUBLIC_AUTH_PATHS
+
+
+def _request_uses_dashboard_api_slot(path: str) -> bool:
+    return path.startswith("/api/") and not _is_public_auth_path(path)
 
 
 def _ensure_dashboard_http_access(request: Request) -> None:

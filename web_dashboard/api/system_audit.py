@@ -115,10 +115,10 @@ SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
 # The remaining time is reserved for serialization, process teardown, and
 # snapshot persistence; sections that cannot start in time are reported as
 # deferred instead of allowing the whole runner to hit its hard timeout.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 220.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 260.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
@@ -6216,11 +6216,23 @@ async def _collect_system_audit_status_unlocked(
 async def system_audit_status() -> dict[str, Any]:
     cached = _cached_system_audit_status()
     if cached is None:
-        payload = await refresh_system_audit_snapshot(
-            record_history=True,
-            source="api_cold_start",
-        )
-        return _dashboard_system_audit_payload(payload)
+        _schedule_system_audit_refresh()
+        refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
+        return {
+            "checked_at": _now().isoformat(),
+            "status": "warming",
+            "status_label": "正在生成首次系统审计",
+            "summary": {},
+            "cards": [],
+            "root_causes": [],
+            "cache": {
+                "hit": False,
+                "cold_start": True,
+                "age_seconds": 0.0,
+                "refresh_after_seconds": round(refresh_after, 3),
+                "refresh_in_background": True,
+            },
+        }
     checked_at, payload = cached
     age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
     refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
