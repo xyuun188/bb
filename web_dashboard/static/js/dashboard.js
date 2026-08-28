@@ -10791,6 +10791,7 @@ function mlLocalEvidenceHtml(status) {
     const readiness = status.readiness || {};
     const blockers = Array.isArray(readiness.blocking_reasons)
         ? readiness.blocking_reasons : [];
+    const blockerSource = status._promotion_source || 'ml_signal';
     const authoritative = status.authoritative_trade_return_evidence || {};
     const tasks = status.training_task_manifest || {};
     const replay = status.replay_weight_manifest || {};
@@ -10848,7 +10849,7 @@ function mlLocalEvidenceHtml(status) {
             ${mlEvidenceRow('权威成交指纹', evidenceValue(authoritative.data_fingerprint))}
         </section>`,
         `<section class="ml-evidence-panel ${blockers.length ? 'bad' : ''}">
-            <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>
+            <div class="ml-evidence-head"><strong>当前晋升阻断</strong><span>${blockerSource === 'local_ai_tools' ? 'local_ai_tools · ' : ''}${blockers.length ? `${blockers.length} 项` : '无阻断'}</span></div>
             <div class="ml-evidence-list">${blockers.length
                 ? blockers.slice(0, 10).map(item => mlEvidenceRow('阻断原因', dashboardReasonText(item), 'bad')).join('')
                 : mlEvidenceRow('就绪判断', dashboardReasonText(readiness.state || status.readiness_state || '证据缺失'))}</div>
@@ -10862,6 +10863,29 @@ function renderMLSignalOverview() {
     const updatedEl = document.getElementById('ml-signal-updated');
     if (!container) return;
     const status = state.mlSignalStatus || {};
+    const localStatus = state.localAIToolsStatus || {};
+    const localPromotion = localStatus.promotion_recommendation
+        || localStatus.activation_manifest?.promotion_recommendation
+        || localStatus.artifact_activation_manifest?.promotion_recommendation;
+    const localBlockers = localPromotion
+        ? (localPromotion.live_blocking_reasons || localPromotion.active_blocking_reasons || localPromotion.blocking_reasons || [])
+        : [];
+    const evidenceStatus = localPromotion
+        ? {
+            ...status,
+            ...localStatus,
+            _promotion_source: 'local_ai_tools',
+            _promotion_recommendation: localPromotion,
+            readiness: {
+                ...(status.readiness || {}),
+                blocking_reasons: localBlockers,
+                state: localStatus.artifact_lifecycle || localStatus.status || status.readiness?.state,
+            },
+            artifact_activation_manifest: localStatus.activation_manifest
+                || localStatus.artifact_activation_manifest
+                || status.artifact_activation_manifest,
+        }
+        : status;
     const records = state.mlSignalRecords || [];
     const latestRecord = records[0] || null;
     const latestSignal = latestRecord?.ml_signal || null;
@@ -10957,7 +10981,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || status.quality_report?.data_quality_version || '证据缺失', `要求 ${readinessMetrics.required_training_data_version || '证据缺失'}`, readinessMetrics.training_data_version && readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
             ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}
         </div>
-        ${mlLocalEvidenceHtml(status)}`;
+        ${mlLocalEvidenceHtml(evidenceStatus)}`;
 }
 
 function renderLocalAIToolsStatus() {
