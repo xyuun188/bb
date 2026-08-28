@@ -4515,10 +4515,10 @@ function trainingEffectivenessSampleEvidence(report, key) {
     const trainingCount = Number(version.sample_count || 0);
     const effectCount = Number(metric.sample_count || 0);
     if (trainingCount > 0 && key !== 'baseline') {
-        parts.push(`训练周期 ${trainingCount.toLocaleString()}`);
+        parts.push(`训练窗口 ${trainingCount.toLocaleString()}`);
     }
-    parts.push(`效果样本 ${effectCount.toLocaleString()}`);
-    if (version.artifact_available === true) parts.push('产物已生成');
+    parts.push(`样本 ${effectCount.toLocaleString()}`);
+    if (version.artifact_available === true) parts.push('已生成');
     return parts.join(' · ');
 }
 
@@ -4528,7 +4528,10 @@ function renderTrainingEffectivenessFreshness(report) {
     const available = trainingEffectivenessAvailable(report);
     const generating = report.refresh_state === 'running';
     element.className = `training-effectiveness-status ${available ? 'complete' : (report.status || 'missing')}`;
-    element.innerHTML = `<strong>${available ? '报告完整' : (generating ? '正在生成报告' : '暂无完整报告')}</strong><span>生成 ${escHtml(report.generated_at || '未生成')} · 截止 ${escHtml(report.data_cutoff_at || '无数据')} · ${generating ? '后台读取权威成交与模型贡献，完成后自动刷新' : `指纹 ${escHtml(report.input_fingerprint || '缺失')}`}</span>`;
+    const statusDetail = generating
+        ? '正在读取成交数据，完成后自动刷新'
+        : `更新 ${escHtml(report.generated_at || '未生成')} · 数据截止 ${escHtml(report.data_cutoff_at || '无数据')}`;
+    element.innerHTML = `<strong>${available ? '报告完整' : (generating ? '正在生成报告' : '暂无完整报告')}</strong><span>${statusDetail}</span>`;
 }
 
 function renderTrainingEffectivenessVersions(report) {
@@ -4540,7 +4543,7 @@ function renderTrainingEffectivenessVersions(report) {
         const status = row.lifecycle || row.status || 'missing';
         return `<div class="training-effectiveness-version-card ${escHtml(String(status))}"><span>${trainingEffectivenessVersionLabel(key)}</span><strong title="${escHtml(row.model_id || row.version || '未登记')}">${escHtml(row.display_name || row.model_id || row.version || '未登记')}</strong><em>${escHtml(trainingEffectivenessLifecycleLabel(status))}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
     }).join('');
-    element.innerHTML = trainingEffectivenessPanel('版本对照', `<div class="training-effectiveness-summary">${cards}</div><p class="training-effectiveness-source-note">训练周期数据表示模型读过的训练窗口；效果样本只统计已结算且能归因到该模型的成交。</p>`);
+    element.innerHTML = trainingEffectivenessPanel('模型版本', `<div class="training-effectiveness-summary">${cards}</div><p class="training-effectiveness-source-note">训练窗口 = 模型读过的范围；样本 = 已结算成交。</p>`);
 }
 
 function renderTrainingEffectivenessMetrics(report) {
@@ -4551,22 +4554,27 @@ function renderTrainingEffectivenessMetrics(report) {
         const row = metrics[key] || {};
         const label = key === 'observed' ? '已观测权威样本' : trainingEffectivenessVersionLabel(key);
         const tone = Number(row.sample_count || 0) > 0 ? 'has-data' : 'no-data';
-        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无效果样本'}</strong><em><b>Profit Factor</b> ${trainingEffectivenessNumber(row.profit_factor)}<b>收益下界</b> ${trainingEffectivenessNumber(row.return_lower_bound)}<b>最大回撤</b> ${trainingEffectivenessNumber(row.max_drawdown)}<b>胜率</b> ${trainingEffectivenessPercent(row.win_rate)}<b>效果样本</b> ${Number(row.sample_count || 0).toLocaleString()}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
+        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无数据'}</strong><em><b>收益倍数</b> ${trainingEffectivenessNumber(row.profit_factor)}<b>收益下限</b> ${trainingEffectivenessNumber(row.return_lower_bound)}<b>最大回撤</b> ${trainingEffectivenessNumber(row.max_drawdown)}<b>胜率</b> ${trainingEffectivenessPercent(row.win_rate)}<b>样本数</b> ${Number(row.sample_count || 0).toLocaleString()}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
     }).join('');
-    element.innerHTML = trainingEffectivenessPanel('训练前后效果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
+    element.innerHTML = trainingEffectivenessPanel('模型结果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
 }
 
 function renderTrainingEffectivenessChart(report) {
     const element = document.getElementById('training-effectiveness-chart');
     if (!element) return;
+    const grid = element.closest('.training-effectiveness-primary-grid');
     const metrics = report.metrics || {};
     const rows = ['active', 'challenger', 'baseline', 'observed']
         .map(key => ({ key, value: Number(metrics[key]?.fee_after_net_pnl), sampleCount: Number(metrics[key]?.sample_count || 0) }))
         .filter(row => Number.isFinite(row.value) && row.sampleCount > 0);
     if (!rows.length) {
         element.innerHTML = '';
+        element.hidden = true;
+        grid?.classList.add('chart-empty');
         return;
     }
+    element.hidden = false;
+    grid?.classList.remove('chart-empty');
     const max = Math.max(...rows.map(row => Math.abs(row.value)), 1);
     const labels = { active: '当前模型', challenger: '候选模型', baseline: '基准模型', observed: '已观测样本' };
     const bars = rows.map(row => {
@@ -4588,7 +4596,7 @@ function renderTrainingEffectivenessCostAttribution(report) {
         ['资金费', costs.funding_fee, 'funding'],
     ];
     const parts = items.map(([label, value, tone]) => `<div class="training-effectiveness-cost-item ${tone}"><span>${label}</span><strong>${trainingEffectivenessNumber(value)}</strong><em>USDT</em></div>`).join('');
-    element.innerHTML = trainingEffectivenessPanel('收益组成', `<div class="training-effectiveness-cost-breakdown">${parts}</div><div class="training-effectiveness-cost-total"><span>费后净收益</span><strong>${trainingEffectivenessNumber(costs.fee_after_net_pnl)} USDT</strong></div><p>计算口径：毛盈亏 − 手续费 − 滑点 + 资金费。资金费只用于完整核算；资金费贡献不能直接等同于模型预测能力。</p>`);
+    element.innerHTML = trainingEffectivenessPanel('收益拆分', `<div class="training-effectiveness-cost-breakdown">${parts}</div><div class="training-effectiveness-cost-total"><span>费后净收益</span><strong>${trainingEffectivenessNumber(costs.fee_after_net_pnl)} USDT</strong></div><p title="资金费贡献不能直接等同于模型预测能力">净收益 = 毛盈亏 − 手续费 − 滑点 + 资金费。</p>`);
 }
 
 function renderTrainingEffectivenessExperts(report) {
@@ -4596,7 +4604,7 @@ function renderTrainingEffectivenessExperts(report) {
     if (!element) return;
     const rows = Array.isArray(report.expert_contributions) ? report.expert_contributions : [];
     const content = rows.length ? rows.map(row => `<div><strong>${escHtml(row.expert_label || row.expert_name || '专家')}</strong><span>费后影响 <b>${trainingEffectivenessNumber(row.net_pnl_delta)}</b> · 回撤影响 <b>${trainingEffectivenessNumber(row.drawdown_delta)}</b> · 错误开仓 <b>${trainingEffectivenessNumber(row.false_entry_delta)}</b> · 多空平衡 <b>${trainingEffectivenessNumber(row.side_balance_delta)}</b> · 样本 <b>${Number(row.sample_count || 0)}</b></span></div>`).join('') : '<div class="training-effectiveness-empty">暂时没有专家消融样本</div>';
-    element.innerHTML = trainingEffectivenessPanel('专家贡献', `<div class="training-effectiveness-list">${content}</div>`);
+    element.innerHTML = trainingEffectivenessPanel('专家影响', `<div class="training-effectiveness-list">${content}</div>`);
 }
 
 function renderTrainingEffectivenessFunnel(report) {
@@ -4606,7 +4614,7 @@ function renderTrainingEffectivenessFunnel(report) {
     const labels = [['signals', '产生信号'], ['evidence_passed', '证据门禁'], ['risk_passed', '风险检查'], ['orders_submitted', '提交订单'], ['filled', '成交'], ['positions_opened', '建立持仓'], ['closed', '平仓'], ['settled', '结算']];
     const rows = labels.map(([key, label]) => `<div><span>${escHtml(label)}</span><strong>${Number(funnel[key] || 0).toLocaleString()}</strong><em>损失率 ${trainingEffectivenessPercent(funnel[`${key}_loss_rate`])}</em></div>`).join('');
     const scope = funnel.scope ? `<p class="training-effectiveness-source-note">${escHtml(funnel.scope)}</p>` : '';
-    element.innerHTML = trainingEffectivenessPanel('交易链路漏斗', `<div class="training-effectiveness-funnel">${rows}</div>${scope}`);
+    element.innerHTML = trainingEffectivenessPanel('交易流程', `<div class="training-effectiveness-funnel">${rows}</div>${scope}`);
 }
 
 function renderTrainingEffectivenessSamples(report) {
@@ -4614,7 +4622,7 @@ function renderTrainingEffectivenessSamples(report) {
     if (!element) return;
     const quality = report.sample_quality || {};
     const counts = quality.authority_counts || {};
-    element.innerHTML = trainingEffectivenessPanel('样本可信度', `<div class="training-effectiveness-metric-grid"><div><span>OKX 实际成交/结算</span><strong>${Number(counts.okx_realized || 0)}</strong></div><div><span>影子市场机会（非真实盈利）</span><strong>${Number(counts.shadow_opportunity || 0)}</strong></div><div><span>反事实成本</span><strong>${Number(counts.counterfactual_cost || 0)}</strong></div><div><span>排除异常</span><strong>${Number(counts.excluded || 0)}</strong></div></div>`);
+    element.innerHTML = trainingEffectivenessPanel('样本来源', `<div class="training-effectiveness-metric-grid"><div><span>OKX 实际成交/结算</span><strong>${Number(counts.okx_realized || 0)}</strong></div><div><span>影子市场机会（非真实盈利）</span><strong>${Number(counts.shadow_opportunity || 0)}</strong></div><div><span>假设成本</span><strong>${Number(counts.counterfactual_cost || 0)}</strong></div><div><span>排除异常</span><strong>${Number(counts.excluded || 0)}</strong></div></div>`);
 }
 
 function renderTrainingEffectivenessConclusion(report) {

@@ -3724,10 +3724,10 @@ select.form-input { cursor: pointer; }
 }
 .training-effectiveness-toolbar {
     display: grid;
-    grid-template-columns: minmax(220px, 1fr) repeat(3, minmax(132px, auto));
+    grid-template-columns: minmax(240px, 1fr) repeat(3, minmax(132px, 180px)) auto;
     align-items: center;
-    gap: 10px;
-    padding: 14px 16px;
+    gap: 8px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-input);
 }
@@ -3748,7 +3748,7 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-toolbar select,
 .training-effectiveness-toolbar input {
     width: 100%;
-    height: 32px;
+    height: 30px;
     padding: 0 9px;
     border: 1px solid var(--border);
     border-radius: 5px;
@@ -3756,12 +3756,16 @@ select.form-input { cursor: pointer; }
     color: var(--text);
     font: inherit;
 }
+.training-effectiveness-toolbar .btn {
+    justify-self: end;
+    white-space: nowrap;
+}
 .training-effectiveness-status {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
     gap: 14px;
     align-items: center;
-    padding: 12px 14px;
+    padding: 9px 12px;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-input);
@@ -3775,27 +3779,49 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-status.invalid strong { color: var(--red); }
 .training-effectiveness-layout {
     display: grid;
-    gap: 14px;
-    padding: 16px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    padding: 12px;
+}
+#training-effectiveness-freshness,
+#training-effectiveness-conclusion {
+    grid-column: span 1;
+    align-self: start;
+}
+.training-effectiveness-primary-grid,
+#training-effectiveness-version-comparison,
+.training-effectiveness-secondary-grid,
+#training-effectiveness-execution-funnel,
+#training-effectiveness-expert-contributions {
+    grid-column: 1 / -1;
 }
 .training-effectiveness-primary-grid,
 .training-effectiveness-secondary-grid {
     display: grid;
     grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-    gap: 14px;
+    gap: 10px;
     align-items: start;
+}
+.training-effectiveness-primary-grid > div,
+.training-effectiveness-secondary-grid > div {
+    min-height: 0;
+    height: max-content;
+    align-self: start;
+}
+.training-effectiveness-primary-grid.chart-empty #training-effectiveness-metrics {
+    grid-column: 1 / -1;
 }
 .training-effectiveness-section {
     min-width: 0;
     padding: 0;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 6px;
     background: var(--bg-input);
     overflow: hidden;
 }
 .training-effectiveness-section h3 {
     margin: 0;
-    padding: 12px 14px;
+    padding: 9px 12px;
     border-bottom: 1px solid var(--border);
     font-size: 13px;
     color: var(--text);
@@ -3805,7 +3831,7 @@ select.form-input { cursor: pointer; }
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
-    padding: 12px;
+    padding: 10px;
 }
 .training-effectiveness-summary > div,
 .training-effectiveness-metric-grid > div,
@@ -3814,7 +3840,7 @@ select.form-input { cursor: pointer; }
     display: grid;
     gap: 4px;
     min-width: 0;
-    padding: 10px;
+    padding: 9px;
     border: 1px solid var(--border);
     border-radius: 5px;
     background: var(--bg-panel, var(--bg-card));
@@ -3909,7 +3935,11 @@ select.form-input { cursor: pointer; }
     gap: 8px;
     padding: 12px;
 }
-.training-effectiveness-bars { display: grid; gap: 9px; }
+.training-effectiveness-bars {
+    display: grid;
+    gap: 8px;
+    padding: 10px 12px 12px;
+}
 .training-effectiveness-bar-row {
     display: grid;
     grid-template-columns: 92px minmax(120px, 1fr) 118px;
@@ -3926,7 +3956,7 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-conclusion {
     display: grid;
     gap: 5px;
-    padding: 12px 14px;
+    padding: 9px 12px;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-input);
@@ -3940,6 +3970,14 @@ select.form-input { cursor: pointer; }
 @media (max-width: 900px) {
     .training-effectiveness-toolbar { grid-template-columns: 1fr 1fr; }
     .training-effectiveness-toolbar-title { grid-column: 1 / -1; }
+    .training-effectiveness-layout { grid-template-columns: minmax(0, 1fr); }
+    #training-effectiveness-freshness,
+    #training-effectiveness-conclusion,
+    .training-effectiveness-primary-grid,
+    #training-effectiveness-version-comparison,
+    .training-effectiveness-secondary-grid,
+    #training-effectiveness-execution-funnel,
+    #training-effectiveness-expert-contributions { grid-column: 1; }
     .training-effectiveness-primary-grid,
     .training-effectiveness-secondary-grid { grid-template-columns: minmax(0, 1fr); }
     .training-effectiveness-summary,
