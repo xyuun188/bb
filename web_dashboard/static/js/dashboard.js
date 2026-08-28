@@ -4479,6 +4479,75 @@ function trainingEffectivenessPanel(title, content, className = '') {
     return `<section class="training-effectiveness-section ${className}"><h3>${escHtml(title)}</h3>${content}</section>`;
 }
 
+function trainingEffectivenessMoney(value) {
+    const number = Number(value);
+    return Number.isFinite(number)
+        ? `${number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`
+        : '暂无数据';
+}
+
+function renderTrainingEffectivenessOverview(report) {
+    const element = document.getElementById('training-effectiveness-overview');
+    if (!element) return;
+    const metrics = report.metrics || {};
+    const active = metrics.active || {};
+    const observed = metrics.observed || {};
+    const activePnl = Number(active.fee_after_net_pnl);
+    const observedPnl = Number(observed.fee_after_net_pnl);
+    const activeSamples = Number(active.sample_count || 0);
+    const hasActiveResult = activeSamples > 0 && Number.isFinite(activePnl);
+    const hasObservedResult = Number.isFinite(observedPnl) && Number(observed.sample_count || 0) > 0;
+    const eligible = trainingEffectivenessAvailable(report) && report.conclusion?.promotion_eligible === true;
+
+    let tone = 'neutral';
+    let verdict = '暂时无法判断';
+    let description = '先积累更多已结算成交，系统才能判断训练效果。';
+    let deltaText = '暂无数据';
+    if (hasActiveResult && hasObservedResult) {
+        const delta = activePnl - observedPnl;
+        const gapRatio = Math.abs(delta) / Math.max(Math.abs(observedPnl), 1);
+        deltaText = `${signedMoney(delta)} USDT`;
+        if (gapRatio <= 0.02) {
+            tone = 'good';
+            verdict = '结果基本一致';
+            description = `模型结果 ${trainingEffectivenessMoney(activePnl)}，实际成交 ${trainingEffectivenessMoney(observedPnl)}，两者相差不大。`;
+        } else if (delta > 0) {
+            tone = 'good';
+            verdict = '模型结果更好';
+            description = `模型结果 ${trainingEffectivenessMoney(activePnl)}，比实际成交高 ${trainingEffectivenessMoney(delta)}。`;
+        } else {
+            tone = 'warn';
+            verdict = '模型结果偏弱';
+            description = `模型结果 ${trainingEffectivenessMoney(activePnl)}，比实际成交低 ${trainingEffectivenessMoney(Math.abs(delta))}。`;
+        }
+    } else if (hasActiveResult) {
+        tone = activePnl >= 0 ? 'good' : 'warn';
+        verdict = activePnl >= 0 ? '已有正向结果' : '当前结果为负';
+        description = `当前模型费后净收益 ${trainingEffectivenessMoney(activePnl)}，共 ${activeSamples.toLocaleString()} 个已结算样本。`;
+    }
+
+    const decisionText = eligible ? '可以继续晋级评估' : '暂不建议晋级';
+    const decisionTone = eligible ? 'good' : 'warn';
+    const metricCards = [
+        ['当前模型收益', hasActiveResult ? trainingEffectivenessMoney(activePnl) : '暂无数据', activePnl >= 0 ? 'good' : 'warn'],
+        ['实际成交收益', hasObservedResult ? trainingEffectivenessMoney(observedPnl) : '暂无数据', observedPnl >= 0 ? 'good' : 'warn'],
+        ['模型与实际差额', deltaText, Number.isFinite(activePnl - observedPnl) && activePnl - observedPnl >= 0 ? 'good' : 'warn'],
+        ['已结算样本', activeSamples > 0 ? `${activeSamples.toLocaleString()} 笔` : '暂无数据', ''],
+    ].map(([label, value, metricTone]) => `<div class="training-effectiveness-overview-metric ${metricTone}"><span>${label}</span><strong>${escHtml(value)}</strong></div>`).join('');
+
+    element.innerHTML = `<section class="training-effectiveness-overview-card ${tone}">
+        <div class="training-effectiveness-overview-head">
+            <div class="training-effectiveness-overview-copy">
+                <span class="training-effectiveness-overview-eyebrow">训练效果一眼看懂</span>
+                <strong class="training-effectiveness-overview-verdict">${verdict}</strong>
+                <p class="training-effectiveness-overview-description">${escHtml(description)}</p>
+            </div>
+            <span class="training-effectiveness-overview-decision ${decisionTone}">${decisionText}</span>
+        </div>
+        <div class="training-effectiveness-overview-metrics">${metricCards}</div>
+    </section>`;
+}
+
 const TRAINING_EFFECTIVENESS_VERSION_LABELS = {
     active: '当前模型',
     challenger: '候选模型',
@@ -4491,12 +4560,12 @@ const TRAINING_EFFECTIVENESS_LIFECYCLE_LABELS = {
     live: '实盘可用',
     trained: '已训练',
     canary: '灰度中',
-    promotion_blocked: '晋级受阻',
-    inferred: '由成交样本推断',
-    inferred_from_authoritative_samples: '由权威成交样本推断',
-    defined: '已定义',
+    promotion_blocked: '暂不能晋级',
+    inferred: '根据成交记录推算',
+    inferred_from_authoritative_samples: '根据实际成交推算',
+    defined: '已准备',
     missing: '未登记',
-    service_unavailable: '服务不可用',
+    service_unavailable: '暂不可用',
 };
 
 function trainingEffectivenessVersionLabel(key) {
@@ -4552,9 +4621,21 @@ function renderTrainingEffectivenessMetrics(report) {
     const metrics = report.metrics || {};
     const rows = ['active', 'challenger', 'baseline', 'observed'].map(key => {
         const row = metrics[key] || {};
-        const label = key === 'observed' ? '已观测权威样本' : trainingEffectivenessVersionLabel(key);
+        const label = key === 'observed' ? '实际成交结果' : trainingEffectivenessVersionLabel(key);
         const tone = Number(row.sample_count || 0) > 0 ? 'has-data' : 'no-data';
-        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无数据'}</strong><em><b>收益倍数</b> ${trainingEffectivenessNumber(row.profit_factor)}<b>收益下限</b> ${trainingEffectivenessNumber(row.return_lower_bound)}<b>最大回撤</b> ${trainingEffectivenessNumber(row.max_drawdown)}<b>胜率</b> ${trainingEffectivenessPercent(row.win_rate)}<b>样本数</b> ${Number(row.sample_count || 0).toLocaleString()}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
+        const sampleCount = Number(row.sample_count || 0);
+        const pnl = Number(row.fee_after_net_pnl);
+        const pnlText = sampleCount > 0 && Number.isFinite(pnl)
+            ? `费后${pnl >= 0 ? '赚' : '亏'} ${trainingEffectivenessNumber(Math.abs(pnl), 2)} USDT`
+            : '暂无数据';
+        const factor = Number(row.profit_factor);
+        const factorText = sampleCount > 0 && Number.isFinite(factor)
+            ? `每亏 1 USDT，赚回 ${trainingEffectivenessNumber(factor, 2)} USDT`
+            : '收益倍数暂无数据';
+        const detail = sampleCount > 0
+            ? `<div class="training-effectiveness-metric-details"><span>${factorText}</span><span>保守估计 <b>${trainingEffectivenessNumber(row.return_lower_bound, 2)} USDT</b></span><span>最大回撤 <b>${trainingEffectivenessNumber(row.max_drawdown, 2)} USDT</b></span><span>胜率 <b>${trainingEffectivenessPercent(row.win_rate)}</b></span></div>`
+            : '<div class="training-effectiveness-metric-details"><span>还没有足够的已结算成交</span></div>';
+        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${pnlText}</strong>${detail}<small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
     }).join('');
     element.innerHTML = trainingEffectivenessPanel('模型结果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
 }
@@ -4632,22 +4713,27 @@ function renderTrainingEffectivenessConclusion(report) {
     const conclusion = report.conclusion || {};
     const blockers = Array.isArray(conclusion.blocking_reasons) ? conclusion.blocking_reasons : [];
     const blockerLabels = {
-        no_okx_realized_samples: '暂无 OKX 权威成交/结算样本',
-        active_version_missing: '当前 active 模型版本缺失',
-        active_version_inferred: 'active 模型来自权威成交样本推断，尚未在 registry 正式登记',
-        challenger_version_missing: '当前 challenger 模型版本缺失',
-        insufficient_effectiveness_samples: '有效训练效果样本不足',
-        report_version_mismatch: '报告版本不匹配',
-        invalid: '报告结构校验失败',
+        no_okx_realized_samples: '还没有足够的实际成交记录',
+        active_version_missing: '当前模型还没有正式登记',
+        active_version_inferred: '当前模型根据实际成交推算，还没有完成正式登记',
+        challenger_version_missing: '还没有可对比的候选模型',
+        insufficient_effectiveness_samples: '可用样本还不够',
+        report_version_mismatch: '报告版本不一致',
+        invalid: '报告校验失败',
     };
     const visibleBlockers = blockers.map(reason => blockerLabels[reason] || reason);
     const message = visibleBlockers.length
         ? visibleBlockers.map(reason => escHtml(reason)).join('；')
-        : (available ? '没有记录阻断原因' : '报告缺失、过期、不完整或有效样本为 0');
-    element.innerHTML = trainingEffectivenessPanel('审计结论', `<div class="training-effectiveness-conclusion ${available && conclusion.promotion_eligible === true ? 'complete' : 'blocked'}"><strong>${available ? (conclusion.promotion_eligible === true ? '满足晋级证据条件' : '不满足晋级条件') : '结论不可用'}</strong><span>${message}</span></div>`);
+        : (available ? '目前没有发现阻碍' : '报告还不完整，或暂时没有有效样本');
+    const conclusionLabel = available
+        ? (conclusion.promotion_eligible === true ? '可以进入下一步' : '暂不晋级')
+        : '暂时无法判断';
+    const conclusionTitle = available ? '' : '结论不可用';
+    element.innerHTML = trainingEffectivenessPanel('结论', `<div class="training-effectiveness-conclusion ${available && conclusion.promotion_eligible === true ? 'complete' : 'blocked'}"><strong title="${conclusionTitle}">${conclusionLabel}</strong><span>${message}</span></div>`);
 }
 
 function renderTrainingEffectiveness(report = {}) {
+    renderTrainingEffectivenessOverview(report);
     renderTrainingEffectivenessFreshness(report);
     renderTrainingEffectivenessVersions(report);
     renderTrainingEffectivenessChart(report);
