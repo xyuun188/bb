@@ -4033,6 +4033,10 @@ select.form-input { cursor: pointer; }
 }
 .training-effectiveness-list span { color: var(--text-muted); font-size: 11px; }
 .training-effectiveness-list span b { color: var(--text); font-weight: 600; }
+.training-effectiveness-expert-role {
+    color: var(--text-dim);
+    font-size: 10px;
+}
 .training-effectiveness-funnel {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));

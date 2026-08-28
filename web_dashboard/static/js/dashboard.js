@@ -4683,7 +4683,19 @@ function renderTrainingEffectivenessExperts(report) {
     const element = document.getElementById('training-effectiveness-expert-contributions');
     if (!element) return;
     const rows = Array.isArray(report.expert_contributions) ? report.expert_contributions : [];
-    const content = rows.length ? rows.map(row => `<div><strong>${escHtml(row.expert_label || row.expert_name || '专家')}</strong><span>费后影响 <b>${trainingEffectivenessNumber(row.net_pnl_delta)}</b> · 回撤影响 <b>${trainingEffectivenessNumber(row.drawdown_delta)}</b> · 错误开仓 <b>${trainingEffectivenessNumber(row.false_entry_delta)}</b> · 多空平衡 <b>${trainingEffectivenessNumber(row.side_balance_delta)}</b> · 样本 <b>${Number(row.sample_count || 0)}</b></span></div>`).join('') : '<div class="training-effectiveness-empty">暂时没有专家消融样本</div>';
+    const roleSummaries = {
+        trend_expert: '判断涨跌方向',
+        momentum_expert: '判断收益质量',
+        sentiment_expert: '判断短线走势',
+        position_expert: '决定继续持有或退出',
+        risk_expert: '检查风险与异常',
+    };
+    const content = rows.length ? rows.map(row => {
+        const rawName = row.expert_name || row.expert_label || '专家';
+        const label = analysisExpertDisplayName(rawName);
+        const summary = roleSummaries[rawName] || '';
+        return `<div><strong title="${escHtml(rawName)}">${escHtml(label)}</strong>${summary ? `<small class="training-effectiveness-expert-role">${summary}</small>` : ''}<span>费后影响 <b>${trainingEffectivenessNumber(row.net_pnl_delta)}</b> · 回撤影响 <b>${trainingEffectivenessNumber(row.drawdown_delta)}</b> · 错误开仓 <b>${trainingEffectivenessNumber(row.false_entry_delta)}</b> · 多空平衡 <b>${trainingEffectivenessNumber(row.side_balance_delta)}</b> · 样本 <b>${Number(row.sample_count || 0)}</b></span></div>`;
+    }).join('') : '<div class="training-effectiveness-empty">暂时没有专家消融样本</div>';
     element.innerHTML = trainingEffectivenessPanel('专家影响', `<div class="training-effectiveness-list">${content}</div>`);
 }
 
