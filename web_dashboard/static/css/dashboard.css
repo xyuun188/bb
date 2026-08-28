@@ -4037,6 +4037,10 @@ select.form-input { cursor: pointer; }
     color: var(--text-dim);
     font-size: 10px;
 }
+.training-effectiveness-expert-empty {
+    color: var(--text-dim) !important;
+    font-size: 10px !important;
+}
 .training-effectiveness-funnel {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));

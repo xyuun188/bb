@@ -4694,7 +4694,11 @@ function renderTrainingEffectivenessExperts(report) {
         const rawName = row.expert_name || row.expert_label || '专家';
         const label = analysisExpertDisplayName(rawName);
         const summary = roleSummaries[rawName] || '';
-        return `<div><strong title="${escHtml(rawName)}">${escHtml(label)}</strong>${summary ? `<small class="training-effectiveness-expert-role">${summary}</small>` : ''}<span>费后影响 <b>${trainingEffectivenessNumber(row.net_pnl_delta)}</b> · 回撤影响 <b>${trainingEffectivenessNumber(row.drawdown_delta)}</b> · 错误开仓 <b>${trainingEffectivenessNumber(row.false_entry_delta)}</b> · 多空平衡 <b>${trainingEffectivenessNumber(row.side_balance_delta)}</b> · 样本 <b>${Number(row.sample_count || 0)}</b></span></div>`;
+        const sampleCount = Number(row.sample_count || 0);
+        const metrics = sampleCount > 0
+            ? `<span>费后影响 <b>${trainingEffectivenessNumber(row.net_pnl_delta)}</b> · 回撤影响 <b>${trainingEffectivenessNumber(row.drawdown_delta)}</b> · 错误开仓 <b>${trainingEffectivenessNumber(row.false_entry_delta)}</b> · 多空平衡 <b>${trainingEffectivenessNumber(row.side_balance_delta)}</b> · 样本 <b>${sampleCount}</b></span>`
+            : '<span class="training-effectiveness-expert-empty">暂无可归因成交（不代表专家未运行）</span>';
+        return `<div><strong title="${escHtml(rawName)}">${escHtml(label)}</strong>${summary ? `<small class="training-effectiveness-expert-role">${summary}</small>` : ''}${metrics}</div>`;
     }).join('') : '<div class="training-effectiveness-empty">暂时没有专家消融样本</div>';
     element.innerHTML = trainingEffectivenessPanel('专家影响', `<div class="training-effectiveness-list">${content}</div>`);
 }
