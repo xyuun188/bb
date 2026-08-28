@@ -4538,7 +4538,6 @@ function renderTrainingEffectivenessOverview(report) {
     element.innerHTML = `<section class="training-effectiveness-overview-card ${tone}">
         <div class="training-effectiveness-overview-head">
             <div class="training-effectiveness-overview-copy">
-                <span class="training-effectiveness-overview-eyebrow">训练效果一眼看懂</span>
                 <strong class="training-effectiveness-overview-verdict">${verdict}</strong>
                 <p class="training-effectiveness-overview-description">${escHtml(description)}</p>
             </div>

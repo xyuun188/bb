@@ -3807,12 +3807,6 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-overview-copy {
     min-width: 0;
 }
-.training-effectiveness-overview-eyebrow {
-    display: block;
-    color: var(--text-muted);
-    font-size: 11px;
-    margin-bottom: 3px;
-}
 .training-effectiveness-overview-verdict {
     display: block;
     color: var(--text);
