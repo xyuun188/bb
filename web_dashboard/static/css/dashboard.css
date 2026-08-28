@@ -3723,16 +3723,31 @@ select.form-input { cursor: pointer; }
     padding: 0 12px 12px;
 }
 .training-effectiveness-toolbar {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) repeat(3, minmax(132px, auto));
     align-items: center;
-    gap: 8px;
-    padding: 12px;
+    gap: 10px;
+    padding: 14px 16px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg-input);
+}
+.training-effectiveness-toolbar-title {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+.training-effectiveness-toolbar-title strong {
+    color: var(--text);
+    font-size: 14px;
+}
+.training-effectiveness-toolbar-title span {
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
 }
 .training-effectiveness-toolbar select,
 .training-effectiveness-toolbar input {
-    min-width: 132px;
+    width: 100%;
     height: 32px;
     padding: 0 9px;
     border: 1px solid var(--border);
@@ -3742,33 +3757,55 @@ select.form-input { cursor: pointer; }
     font: inherit;
 }
 .training-effectiveness-status {
-    display: flex;
-    gap: 12px;
-    align-items: flex-start;
-    justify-content: space-between;
-    padding: 12px;
-    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 14px;
+    align-items: center;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
     overflow-wrap: anywhere;
 }
-.training-effectiveness-status span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-status strong { font-size: 13px; white-space: nowrap; }
+.training-effectiveness-status span { color: var(--text-muted); font-size: 11px; text-align: right; }
 .training-effectiveness-status.complete strong { color: var(--green); }
 .training-effectiveness-status.partial strong,
 .training-effectiveness-status.missing strong { color: var(--yellow); }
 .training-effectiveness-status.invalid strong { color: var(--red); }
+.training-effectiveness-layout {
+    display: grid;
+    gap: 14px;
+    padding: 16px;
+}
+.training-effectiveness-primary-grid,
+.training-effectiveness-secondary-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: 14px;
+    align-items: start;
+}
 .training-effectiveness-section {
-    padding: 14px 12px;
-    border-bottom: 1px solid var(--border);
+    min-width: 0;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    overflow: hidden;
 }
 .training-effectiveness-section h3 {
-    margin: 0 0 10px;
+    margin: 0;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
     font-size: 13px;
     color: var(--text);
 }
 .training-effectiveness-summary,
 .training-effectiveness-metric-grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
+    padding: 12px;
 }
 .training-effectiveness-summary > div,
 .training-effectiveness-metric-grid > div,
@@ -3779,10 +3816,15 @@ select.form-input { cursor: pointer; }
     min-width: 0;
     padding: 10px;
     border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg-input);
+    border-radius: 5px;
+    background: var(--bg-panel, var(--bg-card));
     overflow-wrap: anywhere;
 }
+.training-effectiveness-version-card strong,
+.training-effectiveness-metric-card strong { font-size: 14px; }
+.training-effectiveness-version-card em { color: var(--text-muted); font-style: normal; font-size: 11px; }
+.training-effectiveness-version-card.promotion_blocked em { color: var(--yellow); }
+.training-effectiveness-version-card.missing em { color: var(--red); }
 .training-effectiveness-summary span,
 .training-effectiveness-metric-grid span,
 .training-effectiveness-funnel span { color: var(--text-muted); font-size: 11px; }
@@ -3791,6 +3833,21 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-summary em,
 .training-effectiveness-metric-grid em,
 .training-effectiveness-funnel em { color: var(--text-dim); font-size: 11px; font-style: normal; }
+.training-effectiveness-metric-card em {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 6px;
+    row-gap: 3px;
+    line-height: 1.35;
+}
+.training-effectiveness-metric-card em b {
+    color: var(--text-muted);
+    font-weight: 500;
+}
+.training-effectiveness-metric-card.no-data { opacity: .72; }
+.training-effectiveness-metric-card.has-data strong { color: var(--text); }
+.training-effectiveness-metric-card.has-data:first-child strong,
+.training-effectiveness-metric-card.has-data:last-child strong { color: var(--green); }
 .training-effectiveness-cost-equation {
     display: flex;
     flex-wrap: wrap;
@@ -3802,13 +3859,53 @@ select.form-input { cursor: pointer; }
     background: var(--bg-input);
 }
 .training-effectiveness-cost-equation b { color: var(--text-muted); }
-.training-effectiveness-section p { margin: 8px 0 0; color: var(--text-muted); font-size: 11px; }
-.training-effectiveness-list { display: grid; gap: 8px; }
+.training-effectiveness-cost-breakdown {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+    padding: 12px;
+}
+.training-effectiveness-cost-item {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+    padding: 9px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-panel, var(--bg-card));
+}
+.training-effectiveness-cost-item span,
+.training-effectiveness-cost-item em { color: var(--text-muted); font-size: 11px; font-style: normal; }
+.training-effectiveness-cost-item strong { font-size: 14px; overflow-wrap: anywhere; }
+.training-effectiveness-cost-item.gross strong { color: var(--green); }
+.training-effectiveness-cost-item.fee strong,
+.training-effectiveness-cost-item.slippage strong { color: var(--yellow); }
+.training-effectiveness-cost-item.funding strong { color: var(--text); }
+.training-effectiveness-cost-total {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 0 12px 10px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+}
+.training-effectiveness-cost-total span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-cost-total strong { color: var(--green); font-size: 16px; }
+.training-effectiveness-section p { margin: 0; padding: 0 12px 12px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.training-effectiveness-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    padding: 12px;
+}
 .training-effectiveness-list span { color: var(--text-muted); font-size: 11px; }
+.training-effectiveness-list span b { color: var(--text); font-weight: 600; }
 .training-effectiveness-funnel {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 8px;
+    padding: 12px;
 }
 .training-effectiveness-bars { display: grid; gap: 9px; }
 .training-effectiveness-bar-row {
@@ -3827,25 +3924,37 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-conclusion {
     display: grid;
     gap: 5px;
-    padding: 10px;
-    border-left: 3px solid var(--yellow);
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
     background: var(--bg-input);
     overflow-wrap: anywhere;
 }
-.training-effectiveness-conclusion.complete { border-left-color: var(--green); }
+.training-effectiveness-conclusion { box-shadow: inset 0 2px 0 var(--yellow); }
+.training-effectiveness-conclusion.complete { box-shadow: inset 0 2px 0 var(--green); }
+.training-effectiveness-conclusion strong { font-size: 15px; }
 .training-effectiveness-conclusion span,
 .training-effectiveness-empty { color: var(--text-muted); font-size: 11px; }
 @media (max-width: 900px) {
+    .training-effectiveness-toolbar { grid-template-columns: 1fr 1fr; }
+    .training-effectiveness-toolbar-title { grid-column: 1 / -1; }
+    .training-effectiveness-primary-grid,
+    .training-effectiveness-secondary-grid { grid-template-columns: minmax(0, 1fr); }
     .training-effectiveness-summary,
     .training-effectiveness-metric-grid,
     .training-effectiveness-funnel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .training-effectiveness-status { display: grid; }
+    .training-effectiveness-status { grid-template-columns: minmax(0, 1fr); }
+    .training-effectiveness-status span { text-align: left; }
 }
 @media (max-width: 560px) {
+    .training-effectiveness-toolbar { grid-template-columns: minmax(0, 1fr); }
+    .training-effectiveness-toolbar-title { grid-column: auto; }
+    .training-effectiveness-layout { padding: 12px; gap: 10px; }
     .training-effectiveness-summary,
     .training-effectiveness-metric-grid,
-    .training-effectiveness-funnel { grid-template-columns: minmax(0, 1fr); }
-    .training-effectiveness-toolbar > * { width: 100%; }
+    .training-effectiveness-funnel,
+    .training-effectiveness-list,
+    .training-effectiveness-cost-breakdown { grid-template-columns: minmax(0, 1fr); }
     .training-effectiveness-bar-row { grid-template-columns: 78px minmax(80px, 1fr); }
     .training-effectiveness-bar-row > strong { grid-column: 2; text-align: left; }
 }

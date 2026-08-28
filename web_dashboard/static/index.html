@@ -952,20 +952,30 @@
                 </div>
                 <div class="tab-panel" id="expert-memory-panel-training-effectiveness">
                     <div class="training-effectiveness-toolbar">
+                        <div class="training-effectiveness-toolbar-title">
+                            <strong>训练效果审计</strong>
+                            <span>只读展示权威成交结果，不会触发训练或下单</span>
+                        </div>
                         <select id="training-effectiveness-mode"><option value="all">全部模式</option><option value="paper">模拟盘</option><option value="live">实盘</option></select>
                         <select id="training-effectiveness-side"><option value="all">多空方向</option><option value="long">做多</option><option value="short">做空</option></select>
                         <input id="training-effectiveness-symbol" placeholder="币种（可选）" autocomplete="off">
                         <button class="btn btn-sm" onclick="fetchTrainingEffectivenessReport()">刷新</button>
                     </div>
-                    <div id="training-effectiveness-freshness" class="training-effectiveness-status"></div>
-                    <div id="training-effectiveness-version-comparison"></div>
-                    <div id="training-effectiveness-chart"></div>
-                    <div id="training-effectiveness-metrics"></div>
-                    <div id="training-effectiveness-cost-attribution"></div>
-                    <div id="training-effectiveness-expert-contributions"></div>
-                    <div id="training-effectiveness-execution-funnel"></div>
-                    <div id="training-effectiveness-sample-quality"></div>
-                    <div id="training-effectiveness-conclusion"></div>
+                    <div class="training-effectiveness-layout">
+                        <div id="training-effectiveness-freshness" class="training-effectiveness-status"></div>
+                        <div id="training-effectiveness-conclusion"></div>
+                        <div class="training-effectiveness-primary-grid">
+                            <div id="training-effectiveness-chart"></div>
+                            <div id="training-effectiveness-metrics"></div>
+                        </div>
+                        <div id="training-effectiveness-version-comparison"></div>
+                        <div class="training-effectiveness-secondary-grid">
+                            <div id="training-effectiveness-cost-attribution"></div>
+                            <div id="training-effectiveness-sample-quality"></div>
+                        </div>
+                        <div id="training-effectiveness-execution-funnel"></div>
+                        <div id="training-effectiveness-expert-contributions"></div>
+                    </div>
                 </div>
             </div>
         </div>
