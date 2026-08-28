@@ -13,11 +13,13 @@ import inspect
 import json
 import math
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from config.settings import settings
+
 TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-08-28.v2"
 TRAINING_EFFECTIVENESS_REPORT_DIRNAME = "training_effectiveness_reports"
 TRAINING_EFFECTIVENESS_REPORT_STATUSES = {"complete", "partial", "invalid", "missing"}

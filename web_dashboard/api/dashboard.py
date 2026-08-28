@@ -83,13 +83,13 @@ from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.server_monitor_status import get_server_monitor_status_async
 from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.training_epoch import load_training_epoch_start
 from services.training_effectiveness_report import (
+    TrainingEffectivenessReportService,
     apply_report_filters,
     load_cached_training_effectiveness_report,
     report_directory,
-    TrainingEffectivenessReportService,
 )
+from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -7179,13 +7179,36 @@ async def _build_ml_signal_status() -> dict[str, Any]:
     return _compact_ml_status_for_dashboard(status)
 
 
+def _ml_signal_status_cache_key() -> tuple[Any, ...]:
+    """Keep ML status snapshots isolated across service and database changes.
+
+    The dashboard process can swap between an in-process trading service and a
+    split local-AI client, while tests and maintenance jobs may temporarily
+    point at another database.  A fixed cache key can then return a previous
+    sample cursor for the wrong source.  Include the source identities and the
+    current counter function so a source/config change starts a fresh snapshot.
+    """
+
+    try:
+        service = _dashboard_ml_signal_service()
+    except Exception:
+        service = None
+    return (
+        "ml-signal-status",
+        str(settings.database_url),
+        id(_trading_service),
+        id(service),
+        id(_completed_ml_shadow_sample_count),
+    )
+
+
 @router.get("/ml-signal/status")
 async def get_ml_signal_status():
     """Return a cached, bounded ML status snapshot for browser diagnostics."""
 
     return sanitize_payload(
         await _dashboard_heavy_cached(
-            ("ml-signal-status",),
+            _ml_signal_status_cache_key(),
             _build_ml_signal_status,
             ttl_seconds=_DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS,
         )
@@ -10213,7 +10236,7 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
                 json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.write("\n")
                 temporary = Path(handle.name)
-            temporary.replace(path)
+            await asyncio.to_thread(temporary.replace, path)
     except Exception as exc:
         logger.warning("training effectiveness report generation failed", error=safe_error_text(exc))
 

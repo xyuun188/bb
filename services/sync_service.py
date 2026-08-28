@@ -54,8 +54,8 @@ from services.position_settlement import (
     proportional_signed_value,
     settlement_payload_fields,
 )
-from services.trade_fact_trust import TRUSTED_OKX_ORDER_SYNC_STATUSES
 from services.trade_execution_contract import validate_entry_contract_lineage
+from services.trade_fact_trust import TRUSTED_OKX_ORDER_SYNC_STATUSES
 
 logger = structlog.get_logger(__name__)
 

@@ -96,4 +96,5 @@ def test_strategy_learning_cache_is_invalidated_by_all_scheduler_evidence() -> N
     assert "func.max(ShadowBacktest.updated_at)" in API
     assert "func.max(StrategyLearningEvent.updated_at)" in API
     assert "func.max(AIDecision.updated_at)" in API
-    assert "await _strategy_learning_watermark_for_request(" in API
+    assert "watermark = await asyncio.wait_for(" in API
+    assert "_strategy_learning_watermark_for_request(" in API

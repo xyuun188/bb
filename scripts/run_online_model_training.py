@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import secrets
 import sys
 from pathlib import Path
@@ -27,12 +28,14 @@ from services.ml_training_contract import (  # noqa: E402
     LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
 )
 
+logger = logging.getLogger(__name__)
+
 _PERSISTED_TRAINING_RESULT_PREFIXES = {
     "ml_signal": LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX,
     "local_ai_tools": LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
 }
 _PREFLIGHT_RESULT_PREFIX = "ONLINE_TRAINING_PREFLIGHT_RESULT "
-_REMOTE_TRAINING_PID_PREFIX = "/tmp/bb-online-training-"
+_REMOTE_TRAINING_PID_PREFIX = "/tmp/bb-online-training-"  # noqa: S108
 
 
 def _remote_quote(value: str) -> str:
@@ -230,7 +233,7 @@ def _cleanup_remote_training(
         run_remote_text(ssh, cleanup_command, timeout=20, check=False, max_output_chars=2000)
         return
     except BaseException:
-        pass
+        logger.debug("remote training cleanup on the original channel failed", exc_info=True)
     # The original channel may have died with the long-running command. Reconnect
     # once so a local Ctrl+C cannot leave a remote training process behind.
     replacement = None
@@ -244,7 +247,7 @@ def _cleanup_remote_training(
             max_output_chars=2000,
         )
     except BaseException:
-        pass
+        logger.debug("remote training cleanup reconnect failed", exc_info=True)
     finally:
         if replacement is not None:
             replacement.close()

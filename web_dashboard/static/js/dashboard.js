@@ -4843,7 +4843,7 @@ function reflectionTextPresentation(row = {}, authoritative = null, authoritySta
     return {
         conclusionHtml: `<div class="trade-reflection-copy neutral">
             <strong>等待交易所结算</strong>
-            <span>${escHtml(symbol)} ${escHtml(side)}${localResult ? `：${escHtml(localResult)}` : ''}${localPnlText}，当前只是本地暂存结果。</span>
+            <span>${escHtml(symbol)} ${escHtml(side)}${localResult ? `：${escHtml(localResult)}` : ''}${localPnlText}，当前只是本地暂存结果${fallbackPnl === null ? '' : `；复盘暂存 ${signedMoney(fallbackPnl)} USDT，不作为权威训练事实`}。</span>
         </div>`,
         improvementHtml: `<div class="trade-reflection-copy">
             <strong>系统下一步</strong>
@@ -5618,6 +5618,7 @@ function mlPredictionEconomicsHtml(record, prediction) {
                 ${costRows.map(([label, value]) => `<span><b>${escHtml(label)}</b>${distributionPctLabel(value)}</span>`).join('')}
             </div>
             <div class="ml-prediction-provenance">
+                <span>权威成交结果优先</span>
                 <span>生产净收益 ${distributionPctLabel(productionDistribution.raw_expected_return_pct ?? breakdown.net_pct)}</span>
                 <span>生产收益下界 ${distributionPctLabel(productionDistribution.objective_expected_return_pct)}</span>
                 <span>成本扣除次数 ${mlSampleCountLabel(mlOptionalNumber(breakdown.cost_deduction_count))}</span>
@@ -11068,7 +11069,7 @@ function renderMLSignalOverview() {
             ${mlMetricCard('模拟盘交易权限', allowPaperTrading ? '允许' : '不可用', allowPaperTrading ? '晋升、LCB、PF 不参与模拟盘授权' : '模型制品或运行链不可用', allowPaperTrading ? 'good' : 'bad')}
             ${mlMetricCard('实盘候选权限', allowLivePositionInfluence ? '允许逐笔检查' : '未晋升', allowLivePositionInfluence ? '仍须 production_trade_gate 逐笔授权' : '不影响模拟盘分析、交易和训练', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
-            ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
+            ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点；只作反事实对照，不能覆盖真实盈亏', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
             ${mlMetricCard('OKX 实际费后收益样本', mlSampleCountLabel(samples.mlActualReturn), '只统计可信已平仓生命周期', Number.isFinite(samples.mlActualReturn) ? 'good' : 'warn')}
             ${mlMetricCard('训练/留出分组', `${mlSampleCountLabel(trainDecisionGroupCount)} / ${mlSampleCountLabel(testDecisionGroupCount)}`, '同一 decision 不得跨训练和留出集', splitEvidenceAvailable ? 'good' : 'warn')}
             ${mlMetricCard('脏样本比例', dirtySampleRatioLabel, `隔离 ${mlSampleCountLabel(quarantinedSampleCount)} / 降权 ${mlSampleCountLabel(downweightedSampleCount)}`, readinessDistributionAvailable ? readinessTone : 'warn')}

@@ -17,14 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import settings
-from services.training_effectiveness_report import (
+from config.settings import settings  # noqa: E402
+from services.training_effectiveness_report import (  # noqa: E402
     TRAINING_EFFECTIVENESS_REPORT_VERSION,
     TrainingEffectivenessReportService,
     build_input_fingerprint,
     load_cached_training_effectiveness_report,
     report_directory,
-)
+)  # noqa: E402
 
 LOCK_NAME = "training_effectiveness_report.lock"
 GENERATION_TIMEOUT_SECONDS = 60
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             report = asyncio.run(_build(args, fingerprint))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             report = {
                 "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,

@@ -3,13 +3,14 @@ from datetime import UTC, datetime, timedelta
 from services.training_effectiveness_report import (
     TRAINING_EFFECTIVENESS_REPORT_VERSION,
     TrainingEffectivenessReportService,
+    _aggregate_metrics,
+    _build_observed_funnel,
     build_input_fingerprint,
     calculate_fee_after_return,
     calculate_metric_delta,
     classify_sample_authority,
     validate_report,
 )
-from services.training_effectiveness_report import _aggregate_metrics, _build_observed_funnel
 
 
 def test_fee_after_return_uses_the_authoritative_cost_equation():

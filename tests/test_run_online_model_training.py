@@ -78,7 +78,7 @@ def test_remote_training_command_has_scoped_pid_cleanup() -> None:
         run_token=token,
     )
 
-    assert _remote_training_pid_file(token) == f"/tmp/bb-online-training-{token}.pid"
+    assert _remote_training_pid_file(token) == f"/tmp/bb-online-training-{token}.pid"  # noqa: S108
     assert "BB_ONLINE_TRAINING_TOKEN" in command
     assert "trap cleanup_training_pid EXIT" in command
     assert _remote_training_pid_file(token) in command

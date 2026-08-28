@@ -222,13 +222,9 @@ async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
 
     await dashboard.warm_dashboard_read_caches("paper")
 
-    assert sorted(calls) == [
-        "balance",
-        "data_collection",
-        "model_registry",
-        "positions",
-        "strategy_learning",
-    ]
+    assert sorted(calls) == ["balance", "model_registry", "positions"]
+    assert "strategy_learning" not in calls
+    assert "data_collection" not in calls
 
 
 @pytest.mark.asyncio

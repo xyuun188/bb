@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from scripts import run_local_ai_tools_training_cursors as script
 from services.local_ai_training_contract import (
