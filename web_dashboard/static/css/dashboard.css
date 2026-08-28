@@ -3823,6 +3823,8 @@ select.form-input { cursor: pointer; }
 .training-effectiveness-version-card strong,
 .training-effectiveness-metric-card strong { font-size: 14px; }
 .training-effectiveness-version-card em { color: var(--text-muted); font-style: normal; font-size: 11px; }
+.training-effectiveness-version-card small,
+.training-effectiveness-metric-card small { color: var(--text-dim); font-size: 10px; line-height: 1.35; }
 .training-effectiveness-version-card.promotion_blocked em { color: var(--yellow); }
 .training-effectiveness-version-card.missing em { color: var(--red); }
 .training-effectiveness-summary span,

@@ -4508,6 +4508,20 @@ function trainingEffectivenessLifecycleLabel(value) {
     return TRAINING_EFFECTIVENESS_LIFECYCLE_LABELS[key] || value || '未说明';
 }
 
+function trainingEffectivenessSampleEvidence(report, key) {
+    const version = report.versions?.[key] || {};
+    const metric = report.metrics?.[key] || {};
+    const parts = [];
+    const trainingCount = Number(version.sample_count || 0);
+    const effectCount = Number(metric.sample_count || 0);
+    if (trainingCount > 0 && key !== 'baseline') {
+        parts.push(`训练周期 ${trainingCount.toLocaleString()}`);
+    }
+    parts.push(`效果样本 ${effectCount.toLocaleString()}`);
+    if (version.artifact_available === true) parts.push('产物已生成');
+    return parts.join(' · ');
+}
+
 function renderTrainingEffectivenessFreshness(report) {
     const element = document.getElementById('training-effectiveness-freshness');
     if (!element) return;
@@ -4524,9 +4538,9 @@ function renderTrainingEffectivenessVersions(report) {
     const cards = ['active', 'challenger', 'baseline'].map(key => {
         const row = versions[key] || {};
         const status = row.lifecycle || row.status || 'missing';
-        return `<div class="training-effectiveness-version-card ${escHtml(String(status))}"><span>${trainingEffectivenessVersionLabel(key)}</span><strong title="${escHtml(row.model_id || row.version || '未登记')}">${escHtml(row.display_name || row.model_id || row.version || '未登记')}</strong><em>${escHtml(trainingEffectivenessLifecycleLabel(status))}</em></div>`;
+        return `<div class="training-effectiveness-version-card ${escHtml(String(status))}"><span>${trainingEffectivenessVersionLabel(key)}</span><strong title="${escHtml(row.model_id || row.version || '未登记')}">${escHtml(row.display_name || row.model_id || row.version || '未登记')}</strong><em>${escHtml(trainingEffectivenessLifecycleLabel(status))}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
     }).join('');
-    element.innerHTML = trainingEffectivenessPanel('版本对照', `<div class="training-effectiveness-summary">${cards}</div>`);
+    element.innerHTML = trainingEffectivenessPanel('版本对照', `<div class="training-effectiveness-summary">${cards}</div><p class="training-effectiveness-source-note">训练周期数据表示模型读过的训练窗口；效果样本只统计已结算且能归因到该模型的成交。</p>`);
 }
 
 function renderTrainingEffectivenessMetrics(report) {
@@ -4537,7 +4551,7 @@ function renderTrainingEffectivenessMetrics(report) {
         const row = metrics[key] || {};
         const label = key === 'observed' ? '已观测权威样本' : trainingEffectivenessVersionLabel(key);
         const tone = Number(row.sample_count || 0) > 0 ? 'has-data' : 'no-data';
-        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无样本'}</strong><em><b>Profit Factor</b> ${trainingEffectivenessNumber(row.profit_factor)}<b>收益下界</b> ${trainingEffectivenessNumber(row.return_lower_bound)}<b>最大回撤</b> ${trainingEffectivenessNumber(row.max_drawdown)}<b>胜率</b> ${trainingEffectivenessPercent(row.win_rate)}<b>样本</b> ${Number(row.sample_count || 0)}</em></div>`;
+        return `<div class="training-effectiveness-metric-card ${tone}"><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无效果样本'}</strong><em><b>Profit Factor</b> ${trainingEffectivenessNumber(row.profit_factor)}<b>收益下界</b> ${trainingEffectivenessNumber(row.return_lower_bound)}<b>最大回撤</b> ${trainingEffectivenessNumber(row.max_drawdown)}<b>胜率</b> ${trainingEffectivenessPercent(row.win_rate)}<b>效果样本</b> ${Number(row.sample_count || 0).toLocaleString()}</em><small>${escHtml(trainingEffectivenessSampleEvidence(report, key))}</small></div>`;
     }).join('');
     element.innerHTML = trainingEffectivenessPanel('训练前后效果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
 }
