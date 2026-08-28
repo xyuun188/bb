@@ -6,11 +6,32 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import sys
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+
+def _limit_cursor_process_memory() -> None:
+    """Keep the diagnostic cursor from reclaiming memory needed by trading."""
+
+    if os.name == "nt":
+        return
+    try:
+        import resource
+
+        configured = int(os.environ.get("LOCAL_AI_CURSOR_MEMORY_LIMIT_BYTES", "1610612736"))
+        limit = max(configured, 512 * 1024 * 1024)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ImportError, OSError, ValueError):
+        # The cursor is diagnostic; inability to install a platform limit must
+        # not prevent the normal training process from starting.
+        return
+
+
+_limit_cursor_process_memory()
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

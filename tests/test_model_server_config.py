@@ -331,6 +331,49 @@ async def test_local_ai_tools_status_uses_client_when_dashboard_is_split(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_keeps_service_state_when_cursor_query_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict:
+            return {
+                "available": True,
+                "service_available": True,
+                "model_bundle_available": True,
+                "status": "canary",
+            }
+
+    async def slow_count() -> int:
+        await asyncio.sleep(0.05)
+        return 1
+
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    monkeypatch.setattr(dashboard, "_local_ai_tools_status_client", FakeLocalAIToolsClient())
+    monkeypatch.setattr(dashboard, "_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._completed_shadow_sample_count",
+        slow_count,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models._completed_trade_sample_count",
+        slow_count,
+    )
+
+    try:
+        result = await dashboard.get_local_ai_tools_status()
+    finally:
+        await close_db()
+
+    assert result["available"] is True
+    assert result["service_available"] is True
+    assert result["model_bundle_available"] is True
+    assert result.get("training_cursor_status") in {None, "timeout"}
+
+
+@pytest.mark.asyncio
 async def test_ml_signal_status_uses_current_epoch_count_when_dashboard_is_split(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

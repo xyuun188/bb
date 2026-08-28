@@ -125,6 +125,8 @@ _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS = 4.0
 _DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 10.0
 _DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 18.0
+_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
@@ -7222,7 +7224,21 @@ async def get_local_ai_tools_status():
     if not local_ai_tools:
         return {"available": False, "status": "service_not_ready"}
     try:
-        status = await local_ai_tools.status()
+        # The model service status is a page diagnostic. Keep its transport
+        # budget independent from training-data counters so a stalled probe
+        # cannot make the whole dashboard endpoint hang indefinitely.
+        status = await asyncio.wait_for(
+            local_ai_tools.status(),
+            timeout=_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return {
+            "available": False,
+            "service_available": False,
+            "status": "status_timeout",
+            "error": "local_ai_tools_status_timeout",
+            "message": "本地量化工具状态读取超时；训练统计不会阻塞页面。",
+        }
     except Exception as exc:
         _log_dashboard_fallback("local ai tools status fallback", exc)
         return {
@@ -7238,9 +7254,12 @@ async def get_local_ai_tools_status():
                 _completed_trade_sample_count,
             )
 
-            completed_shadow_count, completed_trade_count = await asyncio.gather(
-                _completed_shadow_sample_count(),
-                _completed_trade_sample_count(),
+            completed_shadow_count, completed_trade_count = await asyncio.wait_for(
+                asyncio.gather(
+                    _completed_shadow_sample_count(),
+                    _completed_trade_sample_count(),
+                ),
+                timeout=_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS,
             )
             artifact_shadow_count = _safe_int_value(
                 status.get("shadow_sample_count") or status.get("training_shadow_sample_count"),
@@ -7263,6 +7282,15 @@ async def get_local_ai_tools_status():
                     "artifact_training_trade_sample_count": artifact_trade_count,
                     "training_sample_source": "current_training_epoch",
                     "training_window_policy": "all_current_epoch_cost_complete_samples",
+                }
+            )
+        except TimeoutError:
+            # Cursor counts are supplemental diagnostics. Preserve the remote
+            # service/artifact status when a large historical query is slow.
+            status.update(
+                {
+                    "training_cursor_status": "timeout",
+                    "training_cursor_error": "local_ai_training_cursor_timeout",
                 }
             )
         except Exception as exc:

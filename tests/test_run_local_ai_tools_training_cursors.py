@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from scripts import run_local_ai_tools_training_cursors as script
 from services.local_ai_training_contract import (
@@ -12,6 +13,14 @@ from services.profit_supervision import (
     MARKET_OPPORTUNITY_TASK,
     PROFIT_SUPERVISION_VERSION,
 )
+
+
+def test_cursor_process_installs_memory_guard_before_project_imports() -> None:
+    source = script.__file__
+    assert source is not None
+    text = Path(source).read_text(encoding="utf-8")
+    assert "LOCAL_AI_CURSOR_MEMORY_LIMIT_BYTES" in text
+    assert "resource.RLIMIT_AS" in text
 
 
 def _shadow_sample(sample_id: int, group: str) -> dict:
