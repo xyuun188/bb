@@ -11,6 +11,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 from typing import Any, overload
 
@@ -86,6 +87,8 @@ from services.training_epoch import load_training_epoch_start
 from services.training_effectiveness_report import (
     apply_report_filters,
     load_cached_training_effectiveness_report,
+    report_directory,
+    TrainingEffectivenessReportService,
 )
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
@@ -98,6 +101,9 @@ _NATIVE_DATETIME_TYPE = datetime
 OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 EXECUTION_LEDGER_MODEL_NAMES = (ENSEMBLE_TRADER_NAME, OKX_AUTHORITATIVE_LEDGER_MODEL)
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+_training_effectiveness_generation_tasks: dict[str, asyncio.Task[Any]] = {}
+_training_effectiveness_generation_started_at: dict[str, float] = {}
+_TRAINING_EFFECTIVENESS_REFRESH_COOLDOWN_SECONDS = 60.0
 STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
 MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     settings.data_dir / "model_training_scheduler_state.json"
@@ -10144,10 +10150,33 @@ async def get_training_effectiveness_report(
     symbol: str | None = None,
     market_state: str | None = None,
     report_id: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Read a cached training-effectiveness report; never start a job."""
+    """Read the cached report and optionally start one bounded background refresh."""
 
-    report = load_cached_training_effectiveness_report(report_id=report_id)
+    selected_mode = mode if mode in {"paper", "live"} else "all"
+    cache_id = report_id or (None if selected_mode == "all" else f"latest-{selected_mode}")
+    report = load_cached_training_effectiveness_report(report_id=cache_id)
+    refresh_state = "idle"
+    if refresh and report_id is None and (
+        report.get("status") in {"missing", "partial", "invalid"}
+        or report.get("freshness", {}).get("is_stale") is True
+    ):
+        global _training_effectiveness_generation_tasks
+        task = _training_effectiveness_generation_tasks.get(selected_mode)
+        now = asyncio.get_running_loop().time()
+        started_at = _training_effectiveness_generation_started_at.get(selected_mode, 0.0)
+        if task is None or task.done():
+            if now - started_at >= _TRAINING_EFFECTIVENESS_REFRESH_COOLDOWN_SECONDS:
+                _training_effectiveness_generation_started_at[selected_mode] = now
+                task = asyncio.create_task(
+                    _generate_training_effectiveness_report(mode=selected_mode)
+                )
+                _training_effectiveness_generation_tasks[selected_mode] = task
+        if task is not None and not task.done():
+            refresh_state = "running"
+    elif any(not task.done() for task in _training_effectiveness_generation_tasks.values()):
+        refresh_state = "running"
     filtered = apply_report_filters(
         report,
         mode=mode,
@@ -10155,7 +10184,38 @@ async def get_training_effectiveness_report(
         symbol=symbol or "all",
         market_state=market_state or "all",
     )
+    filtered["refresh_state"] = refresh_state
     return sanitize_payload(filtered)
+
+
+async def _generate_training_effectiveness_report(*, mode: str) -> None:
+    """Build and atomically publish a report without blocking API requests."""
+
+    selected_mode = mode if mode in {"paper", "live"} else "all"
+    filters = {"mode": selected_mode, "from": None, "to": None}
+    try:
+        report = await asyncio.wait_for(
+            TrainingEffectivenessReportService().build(
+                filters=filters,
+            ),
+            timeout=60.0,
+        )
+        root = report_directory(settings.data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        report_path = root / f"{report['report_id']}.json"
+        latest_path = (
+            root / "latest.json"
+            if selected_mode == "all"
+            else root / f"latest-{selected_mode}.json"
+        )
+        for path in (report_path, latest_path):
+            with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                temporary = Path(handle.name)
+            temporary.replace(path)
+    except Exception as exc:
+        logger.warning("training effectiveness report generation failed", error=safe_error_text(exc))
 
 
 @router.get("/expert-memories")

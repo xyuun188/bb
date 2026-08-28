@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import settings
 from services.training_effectiveness_report import (
+    TRAINING_EFFECTIVENESS_REPORT_VERSION,
     TrainingEffectivenessReportService,
     build_input_fingerprint,
     load_cached_training_effectiveness_report,
@@ -66,7 +67,7 @@ def _release_lock(path: Path, descriptor: int | None) -> None:
 
 def _freshness_inputs(args: argparse.Namespace) -> dict:
     return {
-        "report_version": "2026-08-25.v1",
+        "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
         "stage": args.stage,
         "from": args.start,
         "to": args.end,
@@ -107,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         except asyncio.TimeoutError:
             now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             report = {
-                "report_version": "2026-08-25.v1",
+                "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
                 "report_id": f"te-{fingerprint[7:19]}",
                 "generated_at": now,
                 "data_cutoff_at": args.end or now,

@@ -4445,6 +4445,7 @@ function trainingEffectivenessFilters() {
 
 async function fetchTrainingEffectivenessReport() {
     const query = new URLSearchParams(trainingEffectivenessFilters());
+    query.set('refresh', '1');
     const report = await fetchLatestPageJSON(
         'training-effectiveness',
         `/api/training-effectiveness/report?${query.toString()}`,
@@ -4452,6 +4453,10 @@ async function fetchTrainingEffectivenessReport() {
     if (!report) return;
     state.trainingEffectivenessReport = report;
     renderTrainingEffectiveness(report);
+    if (report.refresh_state === 'running') {
+        window.clearTimeout(state.trainingEffectivenessRefreshTimer);
+        state.trainingEffectivenessRefreshTimer = window.setTimeout(fetchTrainingEffectivenessReport, 2500);
+    }
 }
 
 function trainingEffectivenessAvailable(report) {
@@ -4465,6 +4470,11 @@ function trainingEffectivenessNumber(value, digits = 4) {
     return Number.isFinite(number) ? number.toFixed(digits) : '不可用';
 }
 
+function trainingEffectivenessPercent(value, digits = 2) {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${(number * 100).toFixed(digits)}%` : '不可用';
+}
+
 function trainingEffectivenessPanel(title, content, className = '') {
     return `<section class="training-effectiveness-section ${className}"><h3>${escHtml(title)}</h3>${content}</section>`;
 }
@@ -4473,8 +4483,9 @@ function renderTrainingEffectivenessFreshness(report) {
     const element = document.getElementById('training-effectiveness-freshness');
     if (!element) return;
     const available = trainingEffectivenessAvailable(report);
+    const generating = report.refresh_state === 'running';
     element.className = `training-effectiveness-status ${available ? 'complete' : (report.status || 'missing')}`;
-    element.innerHTML = `<strong>${available ? '报告完整' : '结论不可用'}</strong><span>生成 ${escHtml(report.generated_at || '未生成')} · 截止 ${escHtml(report.data_cutoff_at || '无数据')} · 指纹 ${escHtml(report.input_fingerprint || '缺失')}</span>`;
+    element.innerHTML = `<strong>${available ? '报告完整' : (generating ? '正在生成报告' : '暂无完整报告')}</strong><span>生成 ${escHtml(report.generated_at || '未生成')} · 截止 ${escHtml(report.data_cutoff_at || '无数据')} · ${generating ? '后台读取权威成交与模型贡献，完成后自动刷新' : `指纹 ${escHtml(report.input_fingerprint || '缺失')}`}</span>`;
 }
 
 function renderTrainingEffectivenessVersions(report) {
@@ -4491,13 +4502,34 @@ function renderTrainingEffectivenessVersions(report) {
 function renderTrainingEffectivenessMetrics(report) {
     const element = document.getElementById('training-effectiveness-metrics');
     if (!element) return;
-    const available = trainingEffectivenessAvailable(report);
     const metrics = report.metrics || {};
-    const rows = ['active', 'challenger', 'baseline'].map(key => {
+    const rows = ['active', 'challenger', 'baseline', 'observed'].map(key => {
         const row = metrics[key] || {};
-        return `<div><span>${escHtml(key)}</span><strong>${available ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '结论不可用'}</strong><em>Profit Factor ${trainingEffectivenessNumber(row.profit_factor)} · 下界 ${trainingEffectivenessNumber(row.return_lower_bound)} · 回撤 ${trainingEffectivenessNumber(row.max_drawdown)} · 胜率 ${trainingEffectivenessNumber(row.win_rate, 2)} · 样本 ${Number(row.sample_count || 0)}</em></div>`;
+        const label = key === 'observed' ? '已观测权威样本' : key;
+        return `<div><span>${escHtml(label)}</span><strong>${row.sample_count ? `${trainingEffectivenessNumber(row.fee_after_net_pnl)} USDT` : '暂无样本'}</strong><em>Profit Factor ${trainingEffectivenessNumber(row.profit_factor)} · 收益下界 ${trainingEffectivenessNumber(row.return_lower_bound)} · 最大回撤 ${trainingEffectivenessNumber(row.max_drawdown)} · 胜率 ${trainingEffectivenessPercent(row.win_rate)} · 样本 ${Number(row.sample_count || 0)}</em></div>`;
     }).join('');
     element.innerHTML = trainingEffectivenessPanel('训练前后效果', `<div class="training-effectiveness-metric-grid">${rows}</div>`);
+}
+
+function renderTrainingEffectivenessChart(report) {
+    const element = document.getElementById('training-effectiveness-chart');
+    if (!element) return;
+    const metrics = report.metrics || {};
+    const rows = ['active', 'challenger', 'baseline', 'observed']
+        .map(key => ({ key, value: Number(metrics[key]?.fee_after_net_pnl), sampleCount: Number(metrics[key]?.sample_count || 0) }))
+        .filter(row => Number.isFinite(row.value) && row.sampleCount > 0);
+    if (!rows.length) {
+        element.innerHTML = '';
+        return;
+    }
+    const max = Math.max(...rows.map(row => Math.abs(row.value)), 1);
+    const labels = { active: 'active', challenger: 'challenger', baseline: 'baseline', observed: '已观测' };
+    const bars = rows.map(row => {
+        const width = Math.max(3, Math.round(Math.abs(row.value) / max * 100));
+        const sign = row.value >= 0 ? 'positive' : 'negative';
+        return `<div class="training-effectiveness-bar-row"><span>${labels[row.key]}</span><div><i class="${sign}" style="width:${width}%"></i></div><strong>${trainingEffectivenessNumber(row.value)} USDT</strong></div>`;
+    }).join('');
+    element.innerHTML = trainingEffectivenessPanel('费后净收益对照', `<div class="training-effectiveness-bars">${bars}</div>`);
 }
 
 function renderTrainingEffectivenessCostAttribution(report) {
@@ -4538,12 +4570,26 @@ function renderTrainingEffectivenessConclusion(report) {
     const available = trainingEffectivenessAvailable(report);
     const conclusion = report.conclusion || {};
     const blockers = Array.isArray(conclusion.blocking_reasons) ? conclusion.blocking_reasons : [];
-    element.innerHTML = trainingEffectivenessPanel('审计结论', `<div class="training-effectiveness-conclusion ${available && conclusion.promotion_eligible === true ? 'complete' : 'blocked'}"><strong>${available ? (conclusion.promotion_eligible === true ? '满足晋级证据条件' : '不满足晋级条件') : '结论不可用'}</strong><span>${blockers.length ? blockers.map(reason => escHtml(reason)).join('；') : (available ? '没有记录阻断原因' : '报告缺失、过期、不完整或有效样本为 0')}</span></div>`);
+    const blockerLabels = {
+        no_okx_realized_samples: '暂无 OKX 权威成交/结算样本',
+        active_version_missing: '当前 active 模型版本缺失',
+        active_version_inferred: 'active 模型来自权威成交样本推断，尚未在 registry 正式登记',
+        challenger_version_missing: '当前 challenger 模型版本缺失',
+        insufficient_effectiveness_samples: '有效训练效果样本不足',
+        report_version_mismatch: '报告版本不匹配',
+        invalid: '报告结构校验失败',
+    };
+    const visibleBlockers = blockers.map(reason => blockerLabels[reason] || reason);
+    const message = visibleBlockers.length
+        ? visibleBlockers.map(reason => escHtml(reason)).join('；')
+        : (available ? '没有记录阻断原因' : '报告缺失、过期、不完整或有效样本为 0');
+    element.innerHTML = trainingEffectivenessPanel('审计结论', `<div class="training-effectiveness-conclusion ${available && conclusion.promotion_eligible === true ? 'complete' : 'blocked'}"><strong>${available ? (conclusion.promotion_eligible === true ? '满足晋级证据条件' : '不满足晋级条件') : '结论不可用'}</strong><span>${message}</span></div>`);
 }
 
 function renderTrainingEffectiveness(report = {}) {
     renderTrainingEffectivenessFreshness(report);
     renderTrainingEffectivenessVersions(report);
+    renderTrainingEffectivenessChart(report);
     renderTrainingEffectivenessMetrics(report);
     renderTrainingEffectivenessCostAttribution(report);
     renderTrainingEffectivenessExperts(report);

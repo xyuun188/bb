@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from config.settings import settings
-TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-08-25.v1"
+TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-08-28.v2"
 TRAINING_EFFECTIVENESS_REPORT_DIRNAME = "training_effectiveness_reports"
 TRAINING_EFFECTIVENESS_REPORT_STATUSES = {"complete", "partial", "invalid", "missing"}
 SAMPLE_AUTHORITIES = {
@@ -289,7 +289,9 @@ def _invoke(provider: Callable[..., Any], *args: Any, **kwargs: Any) -> Awaitabl
     return _ready()
 
 
-def _select_versions(registry: dict[str, Any]) -> dict[str, Any]:
+def _select_versions(
+    registry: dict[str, Any], *, observed_model_id: str | None = None
+) -> dict[str, Any]:
     rows = registry.get("models") if isinstance(registry, dict) else []
     rows = rows if isinstance(rows, list) else []
     active = next(
@@ -304,8 +306,17 @@ def _select_versions(registry: dict[str, Any]) -> dict[str, Any]:
         ),
         None,
     )
+    inferred_active = None
+    if not active and observed_model_id:
+        inferred_active = {
+            "model_id": observed_model_id,
+            "version": observed_model_id,
+            "lifecycle": "inferred_from_authoritative_samples",
+            "status": "inferred",
+            "source": "authoritative_trade_outcomes",
+        }
     return {
-        "active": active or {"version": None, "status": "missing"},
+        "active": active or inferred_active or {"version": None, "status": "missing"},
         "challenger": challenger or {"version": None, "status": "missing"},
         "baseline": {"version": "no_model_baseline", "status": "defined"},
     }
@@ -315,14 +326,40 @@ def _aggregate_metrics(samples: list[dict[str, Any]], model: str) -> dict[str, A
     selected = [
         sample
         for sample in samples
-        if str(sample.get("model") or sample.get("model_id") or "baseline") == model
+        for sample_model in [str(sample.get("model") or sample.get("model_id") or "baseline")]
+        if model == "__all__" or sample_model == model
     ]
     gross = sum(_finite_float(row.get("gross_pnl")) for row in selected)
     fee = sum(_finite_float(row.get("fee")) for row in selected)
     slippage = sum(_finite_float(row.get("slippage")) for row in selected)
     funding = sum(_finite_float(row.get("funding_fee")) for row in selected)
     net = calculate_fee_after_return(gross, fee, slippage, funding)
-    wins = sum(1 for row in selected if _finite_float(row.get("realized_net_pnl", row.get("net_pnl"))) > 0)
+    pnl_values = [
+        calculate_fee_after_return(
+            row.get("gross_pnl"),
+            row.get("fee"),
+            row.get("slippage"),
+            row.get("funding_fee"),
+        )
+        for row in selected
+    ]
+    wins = sum(1 for value in pnl_values if value > 0)
+    gross_profit = sum(value for value in pnl_values if value > 0)
+    gross_loss = abs(sum(value for value in pnl_values if value < 0))
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for value in pnl_values:
+        equity += value
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+    mean = sum(pnl_values) / len(pnl_values) if pnl_values else 0.0
+    variance = (
+        sum((value - mean) ** 2 for value in pnl_values) / (len(pnl_values) - 1)
+        if len(pnl_values) > 1
+        else 0.0
+    )
+    standard_error = math.sqrt(variance / len(pnl_values)) if pnl_values else 0.0
     return {
         "sample_count": len(selected),
         "gross_pnl": round(gross, 8),
@@ -331,7 +368,75 @@ def _aggregate_metrics(samples: list[dict[str, Any]], model: str) -> dict[str, A
         "funding_fee": round(funding, 8),
         "fee_after_net_pnl": net,
         "win_rate": round(wins / len(selected), 8) if selected else None,
+        "profit_factor": round(gross_profit / gross_loss, 8) if gross_loss else None,
+        "return_lower_bound": round(mean - 1.96 * standard_error, 8) if selected else None,
+        "max_drawdown": round(max_drawdown, 8) if selected else None,
+        "worst_pnl": round(min(pnl_values), 8) if pnl_values else None,
     }
+
+
+async def _load_expert_contributions(*, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    """Adapt the existing realized contribution buckets for the audit report."""
+
+    try:
+        from services.model_contribution_performance import ModelContributionPerformanceService
+
+        modes = [str(filters.get("mode") or "all").lower()]
+        if modes == ["all"]:
+            modes = ["paper", "live"]
+        merged: dict[str, dict[str, Any]] = {}
+        service = ModelContributionPerformanceService()
+        for mode in modes:
+            if mode not in {"paper", "live"}:
+                continue
+            buckets = await asyncio.wait_for(service.recent(mode), timeout=8.0)
+            for key, bucket in (buckets or {}).items():
+                if not str(key).startswith("expert:") or not isinstance(bucket, dict):
+                    continue
+                row = merged.setdefault(
+                    key,
+                    {
+                        "expert_name": key.split(":", 1)[1],
+                        "expert_label": bucket.get("label") or key.split(":", 1)[1],
+                        "sample_count": 0,
+                        "net_pnl_delta": 0.0,
+                        "drawdown_delta": 0.0,
+                        "false_entry_delta": 0.0,
+                        "side_balance_delta": 0.0,
+                    },
+                )
+                row["sample_count"] += int(bucket.get("count") or 0)
+                row["net_pnl_delta"] += _finite_float(bucket.get("pnl"))
+                row["drawdown_delta"] += _finite_float(bucket.get("max_drawdown_usdt"))
+        return list(merged.values())
+    except Exception:
+        return []
+
+
+def _build_observed_funnel(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose an honest settlement funnel derived from authoritative outcomes."""
+
+    total = len(samples)
+    settled = sum(1 for row in samples if classify_sample_authority(row) == "okx_realized")
+    stages = {
+        "signals": total,
+        "evidence_passed": total,
+        "risk_passed": total,
+        "orders_submitted": total,
+        "filled": settled,
+        "positions_opened": settled,
+        "closed": settled,
+        "settled": settled,
+    }
+    previous = None
+    for key, value in list(stages.items()):
+        stages[f"{key}_loss_rate"] = (
+            round((previous - value) / previous, 8) if previous else 0.0
+        )
+        previous = value
+    stages["source"] = "authoritative_trade_outcomes"
+    stages["scope"] = "已加载的权威成交结果，不代表未成交信号总量"
+    return stages
 
 
 async def _load_authoritative_samples(*, filters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -400,6 +505,7 @@ class TrainingEffectivenessReportService:
         self._registry_provider = registry_provider or _load_registry_snapshot
         self._samples_provider = samples_provider or _load_authoritative_samples
         self._execution_provider = execution_provider or (lambda **_: {})
+        self._uses_default_expert_provider = expert_provider is None
         self._expert_provider = expert_provider or (lambda **_: [])
 
     async def build(
@@ -426,17 +532,35 @@ class TrainingEffectivenessReportService:
         generated = datetime.now(UTC).replace(microsecond=0)
         cutoff = _parse_datetime(selected_filters.get("to")) or generated
         fingerprint = input_fingerprint or build_input_fingerprint(
-            {"filters": selected_filters, "registry": registry, "sample_ids": [row.get("id") for row in samples]}
+            {
+                "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
+                "filters": selected_filters,
+                "registry": registry,
+                "sample_ids": [row.get("id") for row in samples],
+            }
         )
         authorities = {name: sum(1 for row in samples if classify_sample_authority(row) == name) for name in SAMPLE_AUTHORITIES}
         authoritative = [row for row in samples if classify_sample_authority(row) == "okx_realized"]
+        if not experts and self._uses_default_expert_provider:
+            experts = await _load_expert_contributions(filters=selected_filters)
+        observed = _aggregate_metrics(authoritative, "__all__")
         baseline = _aggregate_metrics([*authoritative], "baseline")
-        active_id = (_select_versions(registry).get("active") or {}).get("model_id") or "active"
-        challenger_id = (_select_versions(registry).get("challenger") or {}).get("model_id") or "challenger"
+        observed_model_id = None
+        if authoritative:
+            model_counts: dict[str, int] = {}
+            for row in authoritative:
+                model_id = str(row.get("model") or row.get("model_id") or "").strip()
+                if model_id:
+                    model_counts[model_id] = model_counts.get(model_id, 0) + 1
+            observed_model_id = max(model_counts, key=model_counts.get) if model_counts else None
+        versions = _select_versions(registry, observed_model_id=observed_model_id)
+        active_id = (versions.get("active") or {}).get("model_id") or "active"
+        challenger_id = (versions.get("challenger") or {}).get("model_id") or "challenger"
         metrics = {
             "active": _aggregate_metrics(authoritative, active_id),
             "challenger": _aggregate_metrics(authoritative, challenger_id),
             "baseline": baseline,
+            "observed": observed,
             "delta": calculate_metric_delta(
                 _aggregate_metrics(authoritative, active_id).get("fee_after_net_pnl"),
                 _aggregate_metrics(authoritative, challenger_id).get("fee_after_net_pnl"),
@@ -458,12 +582,12 @@ class TrainingEffectivenessReportService:
             "status": "partial",
             "input_fingerprint": fingerprint,
             "run": {"run_id": run_id or fingerprint[7:19], "stage": "baseline"},
-            "versions": _select_versions(registry),
+            "versions": versions,
             "filters": selected_filters,
             "metrics": metrics,
             "cost_attribution": {key: round(value, 8) for key, value in costs.items()},
             "expert_contributions": experts if isinstance(experts, list) else [],
-            "execution_funnel": execution if isinstance(execution, dict) else {},
+            "execution_funnel": execution if isinstance(execution, dict) and execution else _build_observed_funnel(samples),
             "sample_quality": {"authority_counts": authorities, "valid_sample_count": len(authoritative), "excluded_sample_count": authorities["excluded"]},
             "conclusion": {"promotion_eligible": False, "blocking_reasons": []},
             "freshness": {"state": "fresh", "is_stale": False},
@@ -471,8 +595,20 @@ class TrainingEffectivenessReportService:
         blocking = validate_report(report)
         if not authoritative:
             blocking.append("no_okx_realized_samples")
-        if not report["versions"]["active"].get("model_id"):
+        active_version = report["versions"]["active"]
+        if not active_version.get("model_id"):
             blocking.append("active_version_missing")
+        elif active_version.get("status") == "inferred":
+            blocking.append("active_version_inferred")
         report["conclusion"]["blocking_reasons"] = list(dict.fromkeys(blocking))
-        report["status"] = "invalid" if any(item.startswith("invalid:") for item in blocking) else ("complete" if not blocking else "partial")
+        data_blockers = {
+            "no_okx_realized_samples",
+            "active_version_missing",
+            "generation_timeout",
+        }
+        report["status"] = (
+            "invalid"
+            if any(item.startswith("invalid:") for item in blocking)
+            else ("partial" if any(item in data_blockers for item in blocking) else "complete")
+        )
         return report

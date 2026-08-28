@@ -3810,6 +3810,20 @@ select.form-input { cursor: pointer; }
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 8px;
 }
+.training-effectiveness-bars { display: grid; gap: 9px; }
+.training-effectiveness-bar-row {
+    display: grid;
+    grid-template-columns: 92px minmax(120px, 1fr) 118px;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+.training-effectiveness-bar-row > span,
+.training-effectiveness-bar-row > strong { font-size: 11px; color: var(--text-muted); }
+.training-effectiveness-bar-row > strong { text-align: right; color: var(--text); }
+.training-effectiveness-bar-row > div { height: 10px; border-radius: 3px; background: var(--bg-input); overflow: hidden; }
+.training-effectiveness-bar-row i { display: block; height: 100%; border-radius: 3px; background: var(--green); }
+.training-effectiveness-bar-row i.negative { background: var(--red); }
 .training-effectiveness-conclusion {
     display: grid;
     gap: 5px;
@@ -3832,6 +3846,8 @@ select.form-input { cursor: pointer; }
     .training-effectiveness-metric-grid,
     .training-effectiveness-funnel { grid-template-columns: minmax(0, 1fr); }
     .training-effectiveness-toolbar > * { width: 100%; }
+    .training-effectiveness-bar-row { grid-template-columns: 78px minmax(80px, 1fr); }
+    .training-effectiveness-bar-row > strong { grid-column: 2; text-align: left; }
 }
 .expert-memory-table-wrap {
     max-width: 100%;
