@@ -75,6 +75,17 @@ tmp_*_check.py
 /1
 /=
 
+# Root-level diagnostic output and temporary probes
+/inspect_*.json
+/online_health_*.json
+/test_full_latest.out
+/inspect.out
+/_tmp_*.py
+*.bak-codex-*
+*.bak_codex_*
+*.bak-*
+.env*.bak.*
+
 # Docker
 .docker/
 

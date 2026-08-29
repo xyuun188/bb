@@ -4,6 +4,8 @@ import stat
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 MODEL_SERVER_SCRIPTS = [
@@ -391,6 +393,35 @@ def test_sync_to_online_server_only_filter_limits_upload_scope() -> None:
         "services/profit_first_trade_plan.py",
         "web_dashboard/api/system_audit.py",
     ]
+
+
+def test_sync_to_online_server_uses_git_index_only_for_uploads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    services_dir = tmp_path / "services"
+    services_dir.mkdir()
+    tracked = services_dir / "tracked.py"
+    scratch = services_dir / "scratch.py"
+    tracked.write_text("print('tracked')\n", encoding="utf-8")
+    scratch.write_text("print('scratch')\n", encoding="utf-8")
+    monkeypatch.setattr(sync, "ROOT", tmp_path)
+
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(stdout=b"services/tracked.py\0")
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    files = sync.iter_upload_files(include_tests=False)
+
+    assert calls == [["git", "ls-files", "--cached", "-z"]]
+    assert files == [tracked]
+    assert scratch not in files
 
 
 def test_sync_to_online_server_only_filter_rejects_unsafe_paths() -> None:

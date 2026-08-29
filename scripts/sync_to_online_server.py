@@ -545,8 +545,14 @@ def should_upload(path: Path) -> bool:
 
 
 def iter_upload_files(include_tests: bool) -> list[Path]:
+    """Return source files already tracked by Git.
+
+    Deployment must not pick up untracked scratch files or half-finished local
+    modules. Newly created production files are uploaded after they are added
+    to the Git index, which keeps the sync set reviewable and reproducible.
+    """
     result = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        ["git", "ls-files", "--cached", "-z"],
         cwd=ROOT,
         check=True,
         capture_output=True,
