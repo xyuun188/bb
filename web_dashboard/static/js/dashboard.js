@@ -7,6 +7,7 @@
 const state = {
     mode: 'paper',
     paused: false,
+    activePage: 'dashboard',
     models: [],
     tickers: {},
     decisions: [],
@@ -84,6 +85,7 @@ const state = {
     runtimeStartedAt: null,
     lastStatsSource: '',
     lastStatsAt: 0,
+    lastModeCountsAt: 0,
 };
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
@@ -208,11 +210,6 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchMLSignalDashboard();
         }
     }, 60000);
-    fetchDashboardAccountSettings();
-    fetchModelServerSettings();
-    fetchOKXSettings();
-    fetchExecutionAccountSettings();
-    fetchAIModels();
 });
 
 // --- WebSocket ---
@@ -703,6 +700,8 @@ async function fetchRecentExecutions() {
 }
 
 async function fetchModeCounts() {
+    if (Date.now() - Number(state.lastModeCountsAt || 0) < 60000) return;
+    state.lastModeCountsAt = Date.now();
     // Query mode-specific cumulative decisions from DB.
     // The second value in the status panel is current open positions, updated
     // from the dashboard account summary.
@@ -1897,9 +1896,12 @@ function activatePage(page) {
     if (target) target.classList.add('active');
 }
 
-function openPage(page) {
-    activatePage(page);
-    loadPageData(page);
+function openPage(page, options = {}) {
+    const selected = page || 'dashboard';
+    if (state.activePage === selected && options.force !== true) return;
+    state.activePage = selected;
+    activatePage(selected);
+    loadPageData(selected);
 }
 
 function initSidebarNav() {
@@ -1957,24 +1959,16 @@ function initModeButtons() {
             state.executions = [];
             document.getElementById('decision-list').innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">等待决策数据...</div>';
             document.getElementById('execution-list').innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px;">暂无成交记录</div>';
-            // Refresh all data for the new mode
+            // Refresh only the visible page after the mode switch. Hidden pages
+            // keep their snapshots until the user opens them.
             await fetchDashboardSummary();
-            fetchPnlHistory();
-            fetchRecentDecisions();
-            fetchRecentExecutions();
-            fetchTrades();
-            fetchAllDecisions();
-            fetchAnalysisRecords();
-            if (isPageActive('opening-funnel')) fetchOpeningFunnel();
-            if (isPageActive('profit-attribution')) fetchProfitAttribution();
-            if (isPageActive('strategy-learning')) fetchStrategyLearning();
-            if (isPageActive('expert-memory')) {
-                fetchExpertMemories();
-                fetchTrainingEffectivenessReport();
+            if (state.activePage === 'dashboard') {
+                fetchPnlHistory();
+                fetchRecentDecisions();
+                fetchRecentExecutions();
+            } else {
+                loadPageData(state.activePage);
             }
-            fetchPositions();
-            fetchPositionHistory();
-            if (isPageActive('daily-pnl')) fetchDailyPnlRecords();
         });
     });
 }
@@ -5886,7 +5880,7 @@ function collectionStatusTone(status, enabled = true) {
     if (!enabled || value === 'disabled' || value === 'not_configured') return 'muted';
     if (['active', 'ok', 'ready', 'running', 'unknown', 'learning_only'].includes(value)) return 'good';
     if (['artifact_unavailable', 'shadow_ready', 'shadow', 'empty'].includes(value)) return 'warn';
-    if (['missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config', 'quarantined', 'downweighted'].includes(value)) return 'warn';
+    if (['partial', 'missing_dependency', 'timeout', 'warning', 'degraded', 'invalid_config', 'quarantined', 'downweighted'].includes(value)) return 'warn';
     return 'bad';
 }
 
@@ -5914,6 +5908,7 @@ function collectionStatusLabel(status, enabled = true) {
         downweighted: '已降权',
         ready: '可用',
         running: '运行中',
+        partial: '部分可用',
     };
     return map[String(status || '').toLowerCase()] || String(status || '未知');
 }
@@ -6082,7 +6077,12 @@ function renderDataCollectionOverview(data, config, stats, training) {
     const scraplingStatus = scraplingEnabled
         ? (config.external_event_scraper_dependency_installed ? 'active' : 'missing_dependency')
         : 'disabled';
+    const degradedSections = Array.isArray(data.degraded_sections) ? data.degraded_sections : [];
+    const degradedMessage = String(data.status || '').toLowerCase() === 'partial'
+        ? `部分数据暂不可用：${degradedSections.slice(0, 3).join('、') || '请查看各分区状态'}`
+        : '';
     container.innerHTML = `
+        ${degradedMessage ? `<div class="data-collection-degraded">${escHtml(degradedMessage)}</div>` : ''}
         <div class="data-collection-health-strip">
             ${collectionMetric(
                 'Scrapling 外部事件',

@@ -145,6 +145,19 @@ async def test_data_collection_status_exposes_sources_and_training(
     assert kline_timeframes == {"1m", "5m", "15m", "1h"}
 
 
+def test_collection_status_summary_exposes_degraded_sections() -> None:
+    status, degraded = data_collection_module._collection_status_summary(
+        {
+            "source_breakdown": {"status": "ok"},
+            "local_ai_training_status": {"status": "error"},
+            "training_governance": {"status": "timeout"},
+        }
+    )
+
+    assert status == "partial"
+    assert degraded == ["local_ai_training_status", "training_governance"]
+
+
 @pytest.mark.asyncio
 async def test_data_collection_kline_coverage_reports_missing_timeframes(
     monkeypatch: pytest.MonkeyPatch,
@@ -1235,6 +1248,8 @@ async def test_data_collection_status_keeps_config_when_governance_times_out(
     body = response.json()
     assert body["config"]["external_event_scraper_enabled"] is True
     assert body["config"]["external_event_scraper_interval_seconds"] == 600
+    assert body["status"] == "partial"
+    assert "training_governance" in body["degraded_sections"]
     assert body["training"]["governance"]["status"] == "error"
     assert body["training"]["governance"]["section"] == "training_governance"
 

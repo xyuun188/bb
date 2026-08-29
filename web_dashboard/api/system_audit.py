@@ -115,10 +115,10 @@ SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
 # The remaining time is reserved for serialization, process teardown, and
 # snapshot persistence; sections that cannot start in time are reported as
 # deferred instead of allowing the whole runner to hit its hard timeout.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 45.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 60.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"

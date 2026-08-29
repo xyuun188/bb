@@ -158,6 +158,19 @@ def _safe_feature_coverage_status(result: Any) -> dict[str, Any]:
     return payload
 
 
+def _collection_status_summary(sections: dict[str, Any]) -> tuple[str, list[str]]:
+    """Expose partial reads explicitly instead of hiding section failures in 200 responses."""
+    degraded: list[str] = []
+    for section, value in sections.items():
+        if not isinstance(value, dict):
+            degraded.append(section)
+            continue
+        status = str(value.get("status") or "").strip().lower()
+        if status in {"error", "timeout", "invalid", "unavailable", "degraded"}:
+            degraded.append(section)
+    return ("partial" if degraded else "ok"), degraded
+
+
 def _skipped_feature_coverage_status() -> dict[str, Any]:
     return {
         "status": "skipped",
@@ -1243,8 +1256,19 @@ async def _build_data_collection_status(
     )
     feature_coverage = _safe_feature_coverage_status(feature_coverage_result)
     settings_payload = _data_collection_settings_payload()
+    overall_status, degraded_sections = _collection_status_summary(
+        {
+            "source_breakdown": source_stats,
+            "training_sample_quality": quality,
+            "local_ai_training_status": local_ai_status,
+            "training_governance": governance,
+            "crypto_feature_coverage": feature_coverage,
+        }
+    )
     payload = {
         "checked_at": datetime.now(UTC).isoformat(),
+        "status": overall_status,
+        "degraded_sections": degraded_sections,
         "config": settings_payload["config"],
         "sources": _collection_sources_summary(),
         "stats": source_stats,

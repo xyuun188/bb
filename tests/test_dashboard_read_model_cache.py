@@ -187,10 +187,6 @@ async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
     async def prime_strategy_learning(_mode: str) -> None:
         calls.append("strategy_learning")
 
-    async def prime_model_registry() -> dict[str, Any]:
-        calls.append("model_registry")
-        return {}
-
     async def prime_data_collection() -> None:
         calls.append("data_collection")
 
@@ -206,11 +202,6 @@ async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
     )
     monkeypatch.setattr(
         dashboard,
-        "get_model_training_registry_status",
-        prime_model_registry,
-    )
-    monkeypatch.setattr(
-        dashboard,
         "_warm_dashboard_data_collection_cache",
         prime_data_collection,
     )
@@ -222,7 +213,7 @@ async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
 
     await dashboard.warm_dashboard_read_caches("paper")
 
-    assert sorted(calls) == ["balance", "model_registry", "positions"]
+    assert sorted(calls) == ["balance", "positions"]
     assert "strategy_learning" not in calls
     assert "data_collection" not in calls
 
@@ -444,6 +435,28 @@ async def test_profit_attribution_parameter_snapshot_short_circuits_watermark(
         cached_payload,
     )
     assert dashboard._dashboard_heavy_cache_get(cache_key, ttl_seconds=30.0) is None
+
+
+@pytest.mark.asyncio
+async def test_daily_pnl_postgres_snapshot_is_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("daily-pnl")
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    calls = 0
+
+    async def build(*, mode: str, days: int) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"mode": mode, "days": days, "records": []}
+
+    monkeypatch.setattr(dashboard, "_build_daily_pnl_records", build)
+
+    first = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    second = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+
+    assert first == second == {"mode": "paper", "days": 7, "records": []}
+    assert calls == 1
 
 
 @pytest.mark.asyncio

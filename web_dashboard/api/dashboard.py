@@ -3534,16 +3534,9 @@ async def warm_dashboard_read_caches(mode: str | None = None) -> None:
                 result,
                 mode=selected_mode,
             )
-    # Strategy-learning and data-collection snapshots can scan large history
-    # tables. Fetch them on demand with their own time budgets; running them
-    # during process startup made health checks compete for memory.
-    registry_result = await get_model_training_registry_status()
-    if isinstance(registry_result, BaseException):
-        _log_dashboard_fallback(
-            "dashboard model_registry cache warmup failed",
-            registry_result,
-            mode=selected_mode,
-        )
+    # Registry, strategy-learning, and data-collection snapshots can scan large
+    # history tables or probe remote model services. Keep process startup to
+    # exchange/account facts only; each page warms its own read model on demand.
 
 
 async def _warm_dashboard_strategy_learning_cache(mode: str) -> None:
@@ -10106,35 +10099,56 @@ async def get_model_contribution_stats(
             return value.replace(tzinfo=UTC)
         return value
 
+    # Index candidate decisions once by normalized symbol and side. The old
+    # implementation scanned every loaded order for every position, which made
+    # a diagnostic page grow roughly with positions x orders.
+    order_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for order in orders:
+        if order.decision_id not in decisions:
+            continue
+        decision = decisions[order.decision_id]
+        key = (
+            _normalize_dashboard_symbol(order.symbol),
+            _side_from_action(decision.action),
+        )
+        bucket = order_index.setdefault(
+            key,
+            {"ordered": [], "timed": [], "timestamps": []},
+        )
+        order_time = aware(order.filled_at or order.created_at)
+        bucket["ordered"].append((order_time, decision))
+        if order_time is not None:
+            bucket["timed"].append((order_time, decision))
+    for bucket in order_index.values():
+        bucket["timed"].sort(key=lambda item: item[0])
+        bucket["timestamps"] = [item[0].timestamp() for item in bucket["timed"]]
+
+    from bisect import bisect_left
+
     for pos in positions:
         pos_created = aware(pos.created_at)
         pos_symbol = _normalize_dashboard_symbol(pos.symbol)
-        candidates = []
-        for order in orders:
-            if _normalize_dashboard_symbol(order.symbol) != pos_symbol:
-                continue
-            if order.decision_id not in decisions:
-                continue
-            decision = decisions[order.decision_id]
-            action_side = _side_from_action(decision.action)
-            if action_side != str(pos.side or "").lower():
-                continue
-            order_time = aware(order.filled_at or order.created_at)
-            if pos_created and order_time and abs((order_time - pos_created).total_seconds()) > 180:
-                continue
-            candidates.append(
-                (
-                    (
-                        abs(((order_time or pos_created) - pos_created).total_seconds())
-                        if pos_created and order_time
-                        else 0
-                    ),
-                    decision,
-                )
-            )
-        if not candidates:
+        bucket = order_index.get((pos_symbol, str(pos.side or "").lower()))
+        if not bucket:
             continue
-        _, decision = sorted(candidates, key=lambda item: item[0])[0]
+        if pos_created is None:
+            # Preserve the prior newest-first behavior when the position has no
+            # creation timestamp to anchor a nearest-time match.
+            decision = bucket["ordered"][0][1]
+        else:
+            timed = bucket["timed"]
+            timestamps = bucket["timestamps"]
+            pivot = bisect_left(timestamps, pos_created.timestamp())
+            candidates = []
+            for index in (pivot - 1, pivot):
+                if 0 <= index < len(timed):
+                    order_time, candidate = timed[index]
+                    distance = abs((order_time - pos_created).total_seconds())
+                    if distance <= 180:
+                        candidates.append((distance, candidate))
+            if not candidates:
+                continue
+            _, decision = min(candidates, key=lambda item: item[0])
         raw = _safe_dict(decision.raw_llm_response)
         side = _side_from_action(decision.action)
         pnl = float(pos.realized_pnl or 0.0)
@@ -10781,6 +10795,22 @@ async def get_pnl_history(mode: str | None = None):
 
 @router.get("/dashboard/daily-pnl")
 async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
+    """Return a short-lived cached daily PnL snapshot for PostgreSQL deployments."""
+    selected_mode = "live" if mode == "live" else "paper"
+    capped_days = min(max(int(days or 30), 1), 180)
+    # SQLite-backed tests and local one-shot callers should keep the historical
+    # uncached behavior; production PostgreSQL reads are protected from refresh
+    # storms by the dashboard heavy-cache single-flight lock.
+    if not str(settings.database_url or "").startswith("postgresql"):
+        return await _build_daily_pnl_records(mode=selected_mode, days=capped_days)
+    return await _dashboard_heavy_cached(
+        ("daily-pnl", selected_mode, capped_days),
+        lambda: _build_daily_pnl_records(mode=selected_mode, days=capped_days),
+        ttl_seconds=30.0,
+    )
+
+
+async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
     """Daily execution PnL grouped by Beijing calendar day."""
     from sqlalchemy import select
 

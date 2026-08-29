@@ -510,6 +510,16 @@ td .ml-bar-row .ml-bar-label {
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     padding: 10px 0 0;
 }
+.data-collection-degraded {
+    margin: 0 12px 10px;
+    padding: 9px 12px;
+    border: 1px solid rgba(251, 191, 36, 0.45);
+    border-radius: var(--radius);
+    background: rgba(251, 191, 36, 0.08);
+    color: var(--accent-light);
+    font-size: 12px;
+    line-height: 1.45;
+}
 .data-collection-metric {
     min-width: 0;
     padding: 12px;
