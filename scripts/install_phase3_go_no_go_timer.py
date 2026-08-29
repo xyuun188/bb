@@ -51,7 +51,21 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_go_no_go_report.py --json-indent 0'
+TimeoutStartSec=8min
+TimeoutStopSec=30s
+KillMode=control-group
+MemoryAccounting=true
+MemoryHigh=1500M
+MemoryMax=2500M
+CPUQuota=70%
+Nice=10
+IOSchedulingClass=idle
 """
 
 

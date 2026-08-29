@@ -123,6 +123,7 @@ SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 100.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
 SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 130.0
+SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS = 900.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
@@ -6397,7 +6398,10 @@ async def system_audit_status() -> dict[str, Any]:
     cached = _cached_system_audit_status()
     if cached is None:
         _schedule_system_audit_refresh()
-        refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
+        refresh_after = max(
+            float(settings.system_audit_history_interval_seconds or 900),
+            SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS,
+        )
         return {
             "checked_at": _now().isoformat(),
             "status": "warming",
@@ -6415,7 +6419,10 @@ async def system_audit_status() -> dict[str, Any]:
         }
     checked_at, payload = cached
     age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
-    refresh_after = max(float(settings.system_audit_history_interval_seconds or 300), 60.0)
+    refresh_after = max(
+        float(settings.system_audit_history_interval_seconds or 900),
+        SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS,
+    )
     if age_seconds >= refresh_after:
         _schedule_system_audit_refresh()
     payload["cache"] = {

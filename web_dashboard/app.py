@@ -54,6 +54,13 @@ DASHBOARD_API_POOL_WAIT_SECONDS = {
     "standard": 0.5,
     "heavy": 0.15,
 }
+# Hard server-side budgets keep abandoned browser requests from retaining
+# database cursors and response buffers indefinitely.
+DASHBOARD_API_TIMEOUT_SECONDS = {
+    "light": 10.0,
+    "standard": 15.0,
+    "heavy": 20.0,
+}
 _HEAVY_API_PATH_MARKERS = (
     "/system-audit/",
     "/data-collection/status",
@@ -65,6 +72,7 @@ _HEAVY_API_PATH_MARKERS = (
     "/expert-memories",
     "/shadow-backtests",
     "/dashboard/daily-pnl",
+    "/opening-funnel",
 )
 _LIGHT_API_PATH_MARKERS = (
     "/health/",
@@ -80,7 +88,10 @@ ws_manager = WebSocketManager()
 async def _system_audit_history_loop() -> None:
     from web_dashboard.api.system_audit import refresh_system_audit_snapshot
 
-    interval = max(60, int(settings.system_audit_history_interval_seconds or 300))
+    # Full audits run in an isolated subprocess and can briefly consume
+    # significant CPU/memory. Keep the dashboard's background cadence bounded
+    # even when an old environment sets an overly aggressive interval.
+    interval = max(900, int(settings.system_audit_history_interval_seconds or 900))
     while True:
         await asyncio.sleep(interval)
         try:
@@ -145,6 +156,10 @@ def _dashboard_api_pool(path: str) -> str:
     if any(marker in normalized for marker in _LIGHT_API_PATH_MARKERS):
         return "light"
     return "standard"
+
+
+def _dashboard_api_timeout(path: str) -> float:
+    return DASHBOARD_API_TIMEOUT_SECONDS[_dashboard_api_pool(path)]
 
 
 async def _acquire_dashboard_api_pool(app: FastAPI, pool_name: str) -> bool:
@@ -255,7 +270,35 @@ def create_app() -> FastAPI:
                 )
 
         try:
-            response = await call_next(request)
+            if request.url.path.startswith("/api/"):
+                try:
+                    response = await asyncio.wait_for(
+                        call_next(request),
+                        timeout=_dashboard_api_timeout(request.url.path),
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "dashboard API request timed out",
+                        path=request.url.path,
+                        pool=pool_name,
+                        timeout_seconds=_dashboard_api_timeout(request.url.path),
+                        request_id=request_id,
+                    )
+                    return JSONResponse(
+                        content={
+                            "detail": "Dashboard request timed out; retry shortly.",
+                            "status": "timeout",
+                            "degraded_reason": "dashboard_api_timeout",
+                            "request_id": request_id,
+                        },
+                        status_code=504,
+                        headers={
+                            "Retry-After": "2",
+                            "X-Request-ID": request_id,
+                        },
+                    )
+            else:
+                response = await call_next(request)
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Request-Duration-Ms"] = str(
                 round((time.perf_counter() - request_started) * 1000, 3)
@@ -331,6 +374,7 @@ def create_app() -> FastAPI:
         return HTMLResponse(content=dashboard_login_page_html())
 
     @app.get("/health/live", include_in_schema=False)
+    @app.get("/health", include_in_schema=False)
     async def health_live() -> dict[str, str]:
         return {"status": "ok"}
 

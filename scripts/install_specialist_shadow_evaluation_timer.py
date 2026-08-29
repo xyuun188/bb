@@ -51,6 +51,12 @@ def render_service(*, hours: int = 168) -> str:
             MemoryHigh=2G
             MemoryMax=3G
             TasksMax=128
+            TimeoutStartSec=10min
+            TimeoutStopSec=30s
+            KillMode=control-group
+            CPUQuota=70%
+            Nice=10
+            IOSchedulingClass=idle
             """
         ).strip()
         + "\n"

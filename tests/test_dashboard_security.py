@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
+import web_dashboard.app as dashboard_app_module
 from config.settings import TradingMode, settings
 from core.model_runtime import HIGH_RISK_REVIEW_TOKEN_CAP, HIGH_RISK_REVIEW_TOKEN_FLOOR
 from web_dashboard.api import settings_api as settings_api_module
@@ -50,6 +51,29 @@ async def test_api_saturation_keeps_liveness_probe_available(
     assert liveness.status_code == 200
     assert liveness.json() == {"status": "ok"}
     assert held_response.status_code == 200
+    assert app.state.dashboard_api_inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_api_timeout_returns_diagnostic_and_releases_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "dashboard_auth_enabled", False)
+    monkeypatch.setitem(dashboard_app_module.DASHBOARD_API_TIMEOUT_SECONDS, "standard", 0.02)
+    app = create_app()
+
+    @app.get("/api/test/slow")
+    async def slow_api() -> dict[str, bool]:
+        await asyncio.sleep(1)
+        return {"ok": True}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/test/slow")
+
+    assert response.status_code == 504
+    assert response.json()["degraded_reason"] == "dashboard_api_timeout"
     assert app.state.dashboard_api_inflight == 0
 
 

@@ -139,6 +139,11 @@ _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
 _DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS = 4.0
 _DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 10.0
+_DASHBOARD_OPENING_FUNNEL_TIMEOUT_SECONDS = 15.0
+_DASHBOARD_OPENING_FUNNEL_DB_TIMEOUT_MILLISECONDS = 12_000
+_DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT = 1_000
+_DASHBOARD_OPENING_FUNNEL_MAX_ROWS = 50
+_DASHBOARD_OPENING_FUNNEL_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 _DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 18.0
 _DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
@@ -9109,12 +9114,29 @@ async def get_opening_funnel(
     limit: int = 500,
 ):
     try:
-        return await _build_opening_funnel_payload(mode=mode, hours=hours, limit=limit)
+        # A browser request must never leave a database cursor alive after the
+        # client has already given up.  The middleware adds a second global
+        # guard, while this endpoint keeps its own tighter budget because it
+        # reads a historical decision window.
+        cache_key = (
+            "opening-funnel",
+            "live" if mode == "live" else "paper",
+            max(1, min(int(hours or 24), 24 * 30)),
+            max(50, min(int(limit or 500), _DASHBOARD_OPENING_FUNNEL_MAX_ROWS)),
+        )
+        return await asyncio.wait_for(
+            _dashboard_heavy_cached(
+                cache_key,
+                lambda: _build_opening_funnel_payload(mode=mode, hours=hours, limit=limit),
+                ttl_seconds=_DASHBOARD_OPENING_FUNNEL_CACHE_TTL_SECONDS,
+            ),
+            timeout=_DASHBOARD_OPENING_FUNNEL_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         _log_dashboard_fallback("opening funnel fallback", exc)
         selected_mode = "live" if mode == "live" else "paper"
         capped_hours = max(1, min(int(hours or 24), 24 * 30))
-        capped_limit = max(50, min(int(limit or 500), 2000))
+        capped_limit = max(50, min(int(limit or 500), _DASHBOARD_OPENING_FUNNEL_MAX_ROWS))
         return sanitize_payload(
             {
                 "mode": selected_mode,
@@ -9159,6 +9181,11 @@ async def get_opening_funnel(
                 "recent_blocked": [],
                 "generated_at": datetime.now(UTC).isoformat(),
                 "status": "error",
+                "degraded_reason": (
+                    "opening_funnel_timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "opening_funnel_query_failed"
+                ),
                 "detail": safe_error_text(exc, limit=180),
             }
         )
@@ -9170,7 +9197,7 @@ async def _build_opening_funnel_payload(
     limit: int = 500,
 ):
     """Diagnose where new entries are filtered out before becoming positions."""
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     from db.session import get_session_ctx
     from models.decision import AIDecision
@@ -9179,12 +9206,34 @@ async def _build_opening_funnel_payload(
     selected_mode = "live" if mode == "live" else "paper"
     is_paper = selected_mode == "paper"
     capped_hours = max(1, min(int(hours or 24), 24 * 30))
-    capped_limit = max(50, min(int(limit or 500), 2000))
+    capped_limit = max(50, min(int(limit or 500), _DASHBOARD_OPENING_FUNNEL_MAX_ROWS))
     since = max(datetime.now(UTC) - timedelta(hours=capped_hours), PHASE3_CLEAN_START_UTC)
 
     async with get_session_ctx() as session:
+        if "sqlite" not in str(settings.database_url).lower():
+            # Bound the database side too; cancelling the Python coroutine alone
+            # cannot interrupt a server-side query that is already executing.
+            await session.execute(
+                text("SELECT set_config('statement_timeout', :value, true)"),
+                {"value": f"{_DASHBOARD_OPENING_FUNNEL_DB_TIMEOUT_MILLISECONDS}ms"},
+            )
+        # Do not hydrate the full AIDecision ORM row here.  It contains large
+        # feature/model payloads that the funnel never reads and can multiply
+        # memory usage when a browser retries a slow request.
+        decision_columns = (
+            AIDecision.id,
+            AIDecision.symbol,
+            AIDecision.action,
+            AIDecision.confidence,
+            AIDecision.raw_llm_response,
+            AIDecision.analysis_type,
+            AIDecision.is_paper,
+            AIDecision.was_executed,
+            AIDecision.execution_reason,
+            AIDecision.created_at,
+        )
         stmt = (
-            select(AIDecision)
+            select(*decision_columns)
             .where(
                 AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                 AIDecision.is_paper == is_paper,
@@ -9195,7 +9244,10 @@ async def _build_opening_funnel_payload(
             .limit(capped_limit)
         )
         result = await session.execute(stmt)
-        rows = list(result.scalars().all())
+        rows = [
+            SimpleNamespace(**dict(row))
+            for row in result.mappings().all()
+        ]
         decision_ids = [row.id for row in rows]
 
         order_map: dict[int, Order] = {}
@@ -9466,18 +9518,40 @@ async def get_analysis_records(
 
     async with get_session_ctx() as session:
         repo = DecisionRepository(session)
+        # Analysis lists only need the collaboration payload and scalar display
+        # fields. Avoid hydrating feature snapshots, model-health blobs, and
+        # learning snapshots for every filtered row.
+        analysis_columns = (
+            AIDecision.id,
+            AIDecision.model_name,
+            AIDecision.symbol,
+            AIDecision.action,
+            AIDecision.confidence,
+            AIDecision.reasoning,
+            AIDecision.position_size_pct,
+            AIDecision.suggested_leverage,
+            AIDecision.was_executed,
+            AIDecision.execution_reason,
+            AIDecision.executed_at,
+            AIDecision.execution_price,
+            AIDecision.created_at,
+            AIDecision.outcome,
+            AIDecision.is_paper,
+            AIDecision.raw_llm_response,
+            AIDecision.analysis_type,
+        )
         needs_server_filter = bool(normalized_analysis_type or expert_name)
         db_type_filter = bool(normalized_analysis_type and not expert_name and decision_id is None)
         total_without_server_filter = 0
         if decision_id is not None:
-            decision_stmt = select(AIDecision).where(
+            decision_stmt = select(*analysis_columns).where(
                 AIDecision.id == decision_id,
                 AIDecision.model_name == ENSEMBLE_TRADER_NAME,
             )
             if is_paper is not None:
                 decision_stmt = decision_stmt.where(AIDecision.is_paper == is_paper)
             decision_result = await session.execute(decision_stmt)
-            all_rows = list(decision_result.scalars().all())
+            all_rows = [SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()]
         elif db_type_filter:
             filters = [
                 AIDecision.model_name == ENSEMBLE_TRADER_NAME,
@@ -9493,24 +9567,33 @@ async def get_analysis_records(
             if is_paper is not None:
                 filters.append(AIDecision.is_paper == is_paper)
             decision_stmt = (
-                select(AIDecision)
+                select(*analysis_columns)
                 .where(*filters)
                 .order_by(AIDecision.created_at.desc())
                 .offset(offset)
                 .limit(effective_page_size)
             )
             decision_result = await session.execute(decision_stmt)
-            all_rows = list(decision_result.scalars().all())
+            all_rows = [SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()]
             count_result = await session.execute(select(func.count(AIDecision.id)).where(*filters))
             total_without_server_filter = int(count_result.scalar() or 0)
         else:
-            all_rows = await repo.get_recent_decisions(
-                model_name=ENSEMBLE_TRADER_NAME,
-                symbol=symbol,
-                limit=5000 if needs_server_filter else effective_page_size,
-                offset=0 if needs_server_filter else offset,
-                is_paper=is_paper,
+            server_scan_limit = _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT
+            scan_limit = server_scan_limit if needs_server_filter else effective_page_size
+            scan_offset = 0 if needs_server_filter else offset
+            projection_stmt = (
+                select(*analysis_columns)
+                .where(AIDecision.model_name == ENSEMBLE_TRADER_NAME)
+                .order_by(AIDecision.created_at.desc())
+                .offset(scan_offset)
+                .limit(scan_limit)
             )
+            if symbol:
+                projection_stmt = projection_stmt.where(AIDecision.symbol == symbol)
+            if is_paper is not None:
+                projection_stmt = projection_stmt.where(AIDecision.is_paper == is_paper)
+            projection_result = await session.execute(projection_stmt)
+            all_rows = [SimpleNamespace(**dict(row)) for row in projection_result.mappings().all()]
         if decision_id is not None:
             total_without_server_filter = len(all_rows)
         elif db_type_filter:
@@ -9953,6 +10036,12 @@ async def get_analysis_records(
         "page": page,
         "page_size": effective_page_size,
         "total_pages": total_pages,
+        "server_scan_limit": (
+            _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT if needs_server_filter else None
+        ),
+        "server_scan_limited": bool(
+            needs_server_filter and len(all_rows) >= _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT
+        ),
     }
 
 
