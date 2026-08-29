@@ -37,6 +37,8 @@ async def test_postgres_engine_uses_configured_pool_capacity(monkeypatch: pytest
         "pool_size": 16,
         "max_overflow": 24,
         "pool_timeout": 2.0,
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
     }
 
 

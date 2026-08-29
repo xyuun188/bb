@@ -5,9 +5,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -107,18 +109,20 @@ OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
 SYSTEM_AUDIT_MAX_CONCURRENCY = 2
+SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY = 2
+SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY = 6
 # Database-backed cards use independent read-only sessions, but they still
 # share the trading service's database pool and PostgreSQL resources. Keep the
 # audit wave small enough that a long snapshot cannot starve its peers.
 SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
-# Keep one audit snapshot comfortably inside the isolated runner deadline.
+# Keep one audit snapshot inside the isolated runner deadline while allowing
+# the slowest read-only preflight to finish alongside the other audit groups.
 # The remaining time is reserved for serialization, process teardown, and
-# snapshot persistence; sections that cannot start in time are reported as
-# deferred instead of allowing the whole runner to hit its hard timeout.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 45.0
+# snapshot persistence.
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 85.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 60.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 110.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
@@ -959,6 +963,115 @@ def _audit_card(
     }
 
 
+AUDIT_SECTION_TITLES: dict[str, str] = {
+    "trade_loop": "交易闭环",
+    "okx_reconciliation": "OKX 历史对账",
+    "okx_trade_fact_integrity": "OKX 交易事实",
+    "phase3_server_migration": "三期服务器迁移",
+    "phase3_model_server_readiness": "模型服务器就绪",
+    "phase3_paper_resume_preflight": "纸上交易恢复预检",
+    "phase3_paper_resume_observation": "纸上交易恢复观察",
+    "position_price_integrity": "持仓价格一致性",
+    "market_data": "行情数据",
+    "strategy_quality": "策略质量",
+    "strategy_closed_loop": "策略闭环",
+    "strategy_signal_root_cause": "策略信号根因",
+    "production_source_health": "生产数据源",
+    "model_training": "模型与训练",
+    "model_expert_health": "专家模型健康",
+    "model_expert_competition": "专家模型竞争",
+    "high_risk_review_audit": "高风险复核",
+    "crypto_feature_coverage": "数字货币特征覆盖",
+    "shadow_missed_opportunity": "影子错失机会",
+    "strong_opportunity": "强机会识别",
+    "position_capacity_release": "仓位容量释放",
+    "trade_execution_contract": "交易执行契约",
+    "strategy_gate_contract": "策略门槛契约",
+    "visible_text_encoding": "中文显示与乱码",
+    "runtime_text_integrity": "运行时文本完整性",
+}
+
+
+def _audit_exception_fingerprint(exc: BaseException) -> str:
+    """Create a stable grouping key without leaking a full traceback."""
+
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    message = safe_error_text(exc, limit=240).strip().lower()
+    normalized = re.sub(r"\b\d+(?:\.\d+)?\b", "<n>", message)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return f"{type(exc).__name__.lower()}:{normalized or '<empty>'}"
+
+
+def _audit_exception_card(section_key: str, exc: BaseException) -> dict[str, Any]:
+    """Turn an internal exception into an actionable, human-readable card."""
+
+    title = AUDIT_SECTION_TITLES.get(section_key, section_key)
+    timeout = isinstance(exc, TimeoutError)
+    error_text = safe_error_text(exc, limit=240)
+    summary = (
+        "巡检耗时较长，已保留现有结果并安排下轮重试。"
+        if timeout
+        else f"{title}巡检读取异常，本次未修改业务数据。"
+    )
+    fingerprint = _audit_exception_fingerprint(exc)
+    return _audit_card(
+        f"system_audit_deferred:{hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()[:12]}",
+        title,
+        "warning",
+        summary,
+        details={
+            "primary_section_key": section_key,
+            "affected_section_keys": [section_key],
+            "affected_sections": [title],
+            "affected_section_count": 1,
+            "error": error_text,
+            "error_type": type(exc).__name__,
+            "timeout": timeout,
+            "deferred": timeout,
+            "observing": True,
+            "report_available": False,
+            "audit_only": True,
+            "read_only": True,
+            "live_entry_mutation": False,
+            "live_exit_mutation": False,
+            "can_bypass_risk_controls": False,
+        },
+        next_actions=(
+            ["等待下一轮巡检自动重试；若连续超时，先检查训练状态采集和数据库慢查询。"]
+            if timeout
+            else ["查看详情中的异常类型和原因，先修复对应依赖后再重试巡检。"]
+        ),
+        owner_path=_owner_path_for_card(section_key),
+    )
+
+
+def _append_audit_exception_card(
+    cards: list[dict[str, Any]],
+    grouped: dict[str, dict[str, Any]],
+    section_key: str,
+    exc: BaseException,
+) -> None:
+    """Merge repeated failures from one collection wave into one card."""
+
+    fingerprint = _audit_exception_fingerprint(exc)
+    existing = grouped.get(fingerprint)
+    if existing is None:
+        card = _audit_exception_card(section_key, exc)
+        grouped[fingerprint] = card
+        cards.append(card)
+        return
+    details = existing.setdefault("details", {})
+    keys = details.setdefault("affected_section_keys", [])
+    names = details.setdefault("affected_sections", [])
+    if section_key not in keys:
+        keys.append(section_key)
+    title = AUDIT_SECTION_TITLES.get(section_key, section_key)
+    if title not in names:
+        names.append(title)
+    details["affected_section_count"] = len(keys)
+
+
 def _read_json_report(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -1086,6 +1199,7 @@ async def _run_audit_specs(
     specs: list[tuple[str, Any]],
     *,
     max_concurrency: int = SYSTEM_AUDIT_MAX_CONCURRENCY,
+    shared_semaphore: asyncio.Semaphore | None = None,
     timings: dict[str, float] | None = None,
     deadline: float | None = None,
 ) -> dict[str, dict[str, Any] | Exception]:
@@ -1096,7 +1210,11 @@ async def _run_audit_specs(
         results: dict[str, dict[str, Any] | Exception] = {}
         for key, factory in specs:
             started = time.perf_counter()
+            acquired_shared = False
             try:
+                if shared_semaphore is not None:
+                    await shared_semaphore.acquire()
+                    acquired_shared = True
                 section_timeout = _system_audit_section_timeout_seconds(key)
                 if deadline is not None:
                     remaining = deadline - time.perf_counter()
@@ -1113,6 +1231,8 @@ async def _run_audit_specs(
             except Exception as exc:
                 results[key] = exc
             finally:
+                if acquired_shared:
+                    shared_semaphore.release()
                 if timings is not None:
                     timings[key] = round(time.perf_counter() - started, 4)
         return results
@@ -1122,7 +1242,11 @@ async def _run_audit_specs(
     async def run_one(key: str, factory: Any) -> tuple[str, dict[str, Any] | Exception]:
         async with semaphore:
             started = time.perf_counter()
+            acquired_shared = False
             try:
+                if shared_semaphore is not None:
+                    await shared_semaphore.acquire()
+                    acquired_shared = True
                 section_timeout = _system_audit_section_timeout_seconds(key)
                 if deadline is not None:
                     remaining = deadline - time.perf_counter()
@@ -1139,6 +1263,8 @@ async def _run_audit_specs(
             except Exception as exc:
                 return key, exc
             finally:
+                if acquired_shared:
+                    shared_semaphore.release()
                 if timings is not None:
                     timings[key] = round(time.perf_counter() - started, 4)
 
@@ -4221,6 +4347,7 @@ async def _model_training_audit() -> dict[str, Any]:
                     if isinstance(local_tools.get("promotion_recommendation"), dict)
                     else {}
                 ),
+                "count_warnings": list(local_tools.get("count_warnings") or [])[:4],
                 "models": (
                     local_tools.get("models") if isinstance(local_tools.get("models"), dict) else {}
                 ),
@@ -6147,65 +6274,55 @@ async def _collect_system_audit_status_unlocked(
     ]
     section_timings: dict[str, float] = {}
     result_by_key: dict[str, dict[str, Any] | Exception] = {}
-    result_by_key.update(
-        await _run_audit_specs(
+    # Every audit group is read-only. Start groups together so a slow preflight
+    # or database report cannot hold the rest of the snapshot behind it; each
+    # group still keeps its own cap, while one global gate protects the shared
+    # database pool from cross-group contention.
+    shared_semaphore = asyncio.Semaphore(SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY)
+    priority_result, db_result, regular_result, heavy_result = await asyncio.gather(
+        _run_audit_specs(
             priority_specs,
-            max_concurrency=1,
+            max_concurrency=SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
             timings=section_timings,
             deadline=collection_deadline,
-        )
-    )
-    # Database and regular diagnostics are read-only and have independent
-    # concurrency caps. Run the groups together so a slow database wave does
-    # not leave the entire audit idle before regular checks can start.
-    db_result, regular_result = await asyncio.gather(
+        ),
         _run_audit_specs(
             db_specs,
             max_concurrency=SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
             timings=section_timings,
             deadline=collection_deadline,
         ),
         _run_audit_specs(
             regular_specs,
             max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
+            timings=section_timings,
+            deadline=collection_deadline,
+        ),
+        _run_audit_specs(
+            heavy_specs,
+            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
             timings=section_timings,
             deadline=collection_deadline,
         ),
     )
+    result_by_key.update(priority_result)
     result_by_key.update(db_result)
     result_by_key.update(regular_result)
-    result_by_key.update(
-        await _run_audit_specs(
-            heavy_specs,
-            max_concurrency=1,
-            timings=section_timings,
-            deadline=collection_deadline,
-        )
-    )
+    result_by_key.update(heavy_result)
     cards: list[dict[str, Any]] = []
+    grouped_exception_cards: dict[str, dict[str, Any]] = {}
     for section_key, _factory in audit_specs:
         result = result_by_key[section_key]
         if isinstance(result, Exception):
-            cards.append(
-                _audit_card(
-                    section_key,
-                    "巡检模块",
-                    "warning",
-                    "巡检模块执行失败。",
-                    details={
-                        "section_key": section_key,
-                        "error": safe_error_text(result, limit=180),
-                        "error_type": type(result).__name__,
-                        "timeout": isinstance(result, TimeoutError),
-                        "report_available": False,
-                        "audit_only": True,
-                        "read_only": True,
-                        "live_entry_mutation": False,
-                        "live_exit_mutation": False,
-                        "can_bypass_risk_controls": False,
-                    },
-                    owner_path=_owner_path_for_card(section_key),
-                )
+            _append_audit_exception_card(
+                cards,
+                grouped_exception_cards,
+                section_key,
+                result,
             )
         else:
             cards.append(result)
@@ -6253,10 +6370,11 @@ async def _collect_system_audit_status_unlocked(
                     sorted(section_timings.items(), key=lambda item: item[1], reverse=True)
                 ),
                 "group_concurrency": {
-                    "priority": 1,
+                    "priority": SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY,
                     "database": SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
                     "regular": SYSTEM_AUDIT_MAX_CONCURRENCY,
-                    "heavy": 1,
+                    "heavy": SYSTEM_AUDIT_MAX_CONCURRENCY,
+                    "global": SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY,
                 },
             },
             "safety_note": "根因雷达当前只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认。",

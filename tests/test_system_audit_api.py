@@ -468,6 +468,38 @@ async def test_audit_maybe_async_times_out_slow_sections(
         await system_audit._audit_maybe_async(slow_audit)
 
 
+def test_system_audit_exception_cards_are_actionable_and_grouped() -> None:
+    cards: list[dict[str, Any]] = []
+    grouped: dict[str, dict[str, Any]] = {}
+    first = TimeoutError("system audit collection budget exhausted before section started")
+    second = TimeoutError("system audit collection budget exhausted before section started")
+
+    system_audit._append_audit_exception_card(
+        cards,
+        grouped,
+        "model_expert_health",
+        first,
+    )
+    system_audit._append_audit_exception_card(
+        cards,
+        grouped,
+        "model_expert_competition",
+        second,
+    )
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["title"] == "专家模型健康"
+    assert card["summary"] == "巡检耗时较长，已保留现有结果并安排下轮重试。"
+    assert card["details"]["affected_section_keys"] == [
+        "model_expert_health",
+        "model_expert_competition",
+    ]
+    assert card["details"]["affected_section_count"] == 2
+    assert card["details"]["timeout"] is True
+    assert card["details"]["observing"] is True
+
+
 @pytest.mark.asyncio
 async def test_system_audit_runs_heavy_diagnostics_serially_after_regular_sections() -> None:
     import asyncio

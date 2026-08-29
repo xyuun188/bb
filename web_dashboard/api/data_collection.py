@@ -61,6 +61,7 @@ GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT = 500
 # so it can tolerate brief database pool warm-up without delaying the Dashboard.
 STATUS_SECTION_TIMEOUT_SECONDS = 12.0
 STATUS_REMOTE_MODEL_TIMEOUT_SECONDS = 2.0
+TRAINING_COUNT_TIMEOUT_SECONDS = 4.0
 STATUS_CACHE_TTL_SECONDS = 60.0
 STATUS_INITIAL_REFRESH_TIMEOUT_SECONDS = 45.0
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
@@ -549,10 +550,23 @@ async def _training_sample_quality() -> dict[str, Any]:
 
 async def _local_ai_training_status() -> dict[str, Any]:
     # Read the remote artifact cursor once and publish database counts separately.
-    status, db_completed_shadow_count, db_completed_trade_count = await asyncio.gather(
+    try:
+        scheduler_state = MODEL_TRAINING_STATE_STORE.read()
+    except Exception as exc:
+        logger.warning(
+            "training scheduler state read failed",
+            error=safe_error_text(exc, limit=180),
+        )
+        scheduler_state = {}
+    artifact_status, status_count = await asyncio.gather(
         _raw_local_ai_tools_status(),
-        _completed_training_shadow_count(),
-        _completed_training_trade_count(),
+        _training_count_snapshot(scheduler_state),
+    )
+    status, db_completed_shadow_count, db_completed_trade_count, count_warnings = (
+        artifact_status,
+        status_count[0],
+        status_count[1],
+        status_count[2],
     )
     if not isinstance(status, dict):
         return {"available": False, "status": "invalid_status"}
@@ -610,8 +624,60 @@ async def _local_ai_training_status() -> dict[str, Any]:
             status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
         ),
         "governance_report": governance_report,
+        "count_warnings": count_warnings,
         "models": status.get("models") if isinstance(status.get("models"), dict) else {},
     }
+
+
+async def _training_count_snapshot(
+    scheduler_state: dict[str, Any] | None,
+) -> tuple[int, int, list[dict[str, str]]]:
+    """Read training counts without allowing one slow outcome scan to block status."""
+
+    scheduler_state = scheduler_state if isinstance(scheduler_state, dict) else {}
+    shadow_fallback = 0
+    trade_fallback = _trade_sample_count_from_status(scheduler_state) or 0
+    models = scheduler_state.get("models")
+    if isinstance(models, dict):
+        for model_state in models.values():
+            if not isinstance(model_state, dict):
+                continue
+            for key in ("active_sample_cursor", "sample_cursor"):
+                cursor = model_state.get(key)
+                if isinstance(cursor, dict):
+                    trade_fallback = max(trade_fallback, _safe_int_count(cursor.get("trade")))
+            last_result = model_state.get("last_result")
+            if isinstance(last_result, dict):
+                trade_fallback = max(
+                    trade_fallback,
+                    _safe_int_count(last_result.get("completed_trade_sample_count")),
+                )
+
+    async def read_count(
+        name: str,
+        loader: Callable[[], Awaitable[int]],
+        fallback: int,
+    ) -> tuple[int, dict[str, str] | None]:
+        try:
+            value = await asyncio.wait_for(loader(), timeout=TRAINING_COUNT_TIMEOUT_SECONDS)
+            return max(int(value or 0), 0), None
+        except TimeoutError:
+            logger.warning("training count read timed out", count=name)
+            return fallback, {"count": name, "status": "timeout"}
+        except Exception as exc:
+            logger.warning(
+                "training count read failed",
+                count=name,
+                error=safe_error_text(exc, limit=180),
+            )
+            return fallback, {"count": name, "status": "error"}
+
+    shadow_result, trade_result = await asyncio.gather(
+        read_count("shadow", _completed_training_shadow_count, shadow_fallback),
+        read_count("trade", _completed_training_trade_count, trade_fallback),
+    )
+    warnings = [item for item in (shadow_result[1], trade_result[1]) if item]
+    return shadow_result[0], trade_result[0], warnings
 
 
 async def _raw_local_ai_tools_status() -> dict[str, Any]:

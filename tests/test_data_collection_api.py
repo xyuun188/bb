@@ -268,6 +268,86 @@ async def test_data_collection_reads_local_ai_status_once_without_fixed_outer_ti
     assert status["completed_shadow_sample_count"] == 12
 
 
+@pytest.mark.asyncio
+async def test_data_collection_training_count_timeout_keeps_last_known_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "service_available": True,
+                "status": "shadow",
+                "shadow_sample_count": 12,
+                "trade_sample_count": 3,
+            }
+
+    class FakeTrainingState:
+        @staticmethod
+        def read() -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "models": {
+                    "local_ai_profit_prediction": {
+                        "active_sample_cursor": {"trade": 37}
+                    }
+                },
+            }
+
+    async def slow_count() -> int:
+        await asyncio.sleep(0.05)
+        return 99
+
+    monkeypatch.setattr(data_collection_module._dash, "_dashboard_local_ai_tools_client", lambda: FakeLocalAIToolsClient())
+    monkeypatch.setattr(data_collection_module, "MODEL_TRAINING_STATE_STORE", FakeTrainingState())
+    monkeypatch.setattr(data_collection_module, "TRAINING_COUNT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", slow_count)
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", slow_count)
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["shadow_sample_count"] == 0
+    assert status["trade_sample_count"] == 37
+    assert {item["count"] for item in status["count_warnings"]} == {"shadow", "trade"}
+
+
+@pytest.mark.asyncio
+async def test_data_collection_training_status_survives_scheduler_state_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {"available": True, "service_available": True, "status": "shadow"}
+
+    class BrokenTrainingState:
+        @staticmethod
+        def read() -> dict[str, Any]:
+            raise OSError("state file is temporarily unavailable")
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(data_collection_module, "MODEL_TRAINING_STATE_STORE", BrokenTrainingState())
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_shadow_count",
+        AsyncMock(return_value=5),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_trade_count",
+        AsyncMock(return_value=8),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["status"] == "shadow"
+    assert status["trade_sample_count"] == 8
+    assert status["count_warnings"] == []
+
+
 def test_data_collection_local_ai_status_has_no_duplicate_normalizer_or_outer_timeout() -> None:
     source = Path(data_collection_module.__file__).read_text(encoding="utf-8")
     training_status_block = source[

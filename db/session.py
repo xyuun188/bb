@@ -44,6 +44,11 @@ async def get_engine():
                 float(settings.database_pool_timeout_seconds or 0.0),
                 0.5,
             )
+            # Production PostgreSQL connections can be closed by the server or
+            # network while they are idle. Probe a connection before handing it
+            # back to a request and recycle older connections before that happens.
+            engine_kwargs["pool_pre_ping"] = True
+            engine_kwargs["pool_recycle"] = 300
         _engine = create_async_engine(settings.database_url, **engine_kwargs)
         if is_sqlite:
             _configure_sqlite_engine(_engine)
