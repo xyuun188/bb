@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.prompts import (
@@ -53,6 +52,19 @@ from services.entry_signal_extraction import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# Kept as a patchable module attribute for tests. The real LangChain/OpenAI
+# stack is imported only when an LLM call is actually constructed; importing
+# it during trading-service startup also imports transformers and torch.
+ChatOpenAI: Any = None
+
+
+def _chat_openai_class() -> Any:
+    if ChatOpenAI is not None:
+        return ChatOpenAI
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+
+    return _ChatOpenAI
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -1145,7 +1157,7 @@ class LLMAgent(AbstractAIModel):
             model_kwargs = dict(kwargs.get("model_kwargs") or {})
             model_kwargs["response_format"] = {"type": "json_object"}
             kwargs["model_kwargs"] = model_kwargs
-        return ChatOpenAI(**kwargs)
+        return _chat_openai_class()(**kwargs)
 
     async def decide(self, features: FeatureVector, context: dict[str, Any]) -> DecisionOutput:
         expert_mode = bool(context.get("expert_mode"))

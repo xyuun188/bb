@@ -452,6 +452,9 @@ SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS = 300.0
 SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES = 240
 SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT = 25
 SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS = 30.0
+SHADOW_BACKTEST_RECOVERY_TIMEOUT_SECONDS = 15.0
+SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS = 30.0
+TRADING_STARTUP_BACKFILL_TIMEOUT_SECONDS = 20.0
 STRATEGY_CONTEXT_IO_CONCURRENCY = 2
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_FRESH_SECONDS = 20.0
 STRATEGY_CONTEXT_PERFORMANCE_SNAPSHOT_MAX_STALE_SECONDS = 300.0
@@ -2593,9 +2596,12 @@ class TradingService:
                 now + timedelta(seconds=SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS)
             )
             try:
-                recovery = await recover(
-                    lookback_minutes=SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES,
-                    limit=SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
+                recovery = await asyncio.wait_for(
+                    recover(
+                        lookback_minutes=SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES,
+                        limit=SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
+                    ),
+                    timeout=SHADOW_BACKTEST_RECOVERY_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 recovery = {
@@ -2626,7 +2632,10 @@ class TradingService:
                 "scheduled_interval_seconds": SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS,
                 "scan_limit": SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
             }
-        return await self.shadow_backtest_service.update_due(limit=limit)
+        return await asyncio.wait_for(
+            self.shadow_backtest_service.update_due(limit=limit),
+            timeout=SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS,
+        )
 
     def _ensure_market_shadow_sample_worker(self) -> None:
         """Create the bounded writer once; never make market analysis await the DB."""
@@ -5457,6 +5466,40 @@ class TradingService:
             ws_client = getattr(data_service, "ws_client", None)
             ws_stats_reader = getattr(ws_client, "get_stats", None)
             ws_stats = self._safe_dict(ws_stats_reader()) if callable(ws_stats_reader) else {}
+            data_service_runtime = {}
+            if data_service is not None:
+                for key, attr in (
+                    ("ticker_cache", "_ticker_cache"),
+                    ("kline_cache", "_kline_cache"),
+                    ("indicator_snapshot_cache", "_indicator_snapshot_cache"),
+                    ("derivatives_cache", "_derivatives_cache"),
+                    ("ticker_persist_tasks", "_ticker_persist_tasks"),
+                    ("kline_fetch_tasks", "_kline_fetch_tasks"),
+                    ("kline_background_refresh_tasks", "_kline_background_refresh_tasks"),
+                    ("indicator_snapshot_tasks", "_indicator_snapshot_tasks"),
+                ):
+                    value = getattr(data_service, attr, None)
+                    try:
+                        data_service_runtime[key] = len(value) if value is not None else 0
+                    except TypeError:
+                        data_service_runtime[key] = 0
+                data_service_runtime["ticker_persist_dropped_count"] = int(
+                    getattr(data_service, "_ticker_persist_dropped_count", 0) or 0
+                )
+            process_memory = {}
+            try:
+                with Path("/proc/self/status").open(encoding="utf-8") as status_file:
+                    for line in status_file:
+                        if line.startswith(("VmRSS:", "VmHWM:", "Threads:")):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                process_memory[parts[0].rstrip(":").lower()] = int(parts[1])
+            except (OSError, ValueError):
+                pass
+            try:
+                process_memory["asyncio_tasks"] = len(asyncio.all_tasks())
+            except RuntimeError:
+                pass
             payload = {
                 "running": bool(self._running),
                 "mode": mode_manager.mode.value,
@@ -5529,6 +5572,8 @@ class TradingService:
                 "market_analysis_deferred": self._market_defer_snapshot(),
                 "market_entry_pipeline": self._market_entry_pipeline_snapshot(),
                 "ws_stats": ws_stats,
+                "process_memory": process_memory,
+                "data_service_runtime": data_service_runtime,
                 "okx_authoritative_sync": okx_authoritative_sync,
                 "shadow_backtest_maintenance": self._shadow_backtest_maintenance_status(),
                 "stale_entry_maintenance": self._stale_entry_candidate_maintenance_status(),
@@ -9236,7 +9281,19 @@ class TradingService:
                 error=safe_error_text(exc),
             )
 
-        await self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value)
+        try:
+            await asyncio.wait_for(
+                self.expert_memory_service.backfill_trade_reflections(mode_manager.mode.value),
+                timeout=TRADING_STARTUP_BACKFILL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            # Reflection backfill is maintenance only. A slow or oversized
+            # historical read must never prevent trading loops and heartbeat
+            # tasks from starting.
+            logger.warning(
+                "trade reflection backfill deferred after startup timeout",
+                timeout_seconds=TRADING_STARTUP_BACKFILL_TIMEOUT_SECONDS,
+            )
         await self._prime_strategy_context_performance_snapshot(mode_manager.mode.value)
 
         # Subscribe to mode changes to reinitialize LLM agent

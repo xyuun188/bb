@@ -24,6 +24,11 @@ from services.training_epoch import load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
 
+# Startup backfill is maintenance, not an entry gate. Loading historical
+# decision/market JSON for every lifecycle at once previously grew the trading
+# process to several gigabytes and stalled its heartbeat.
+AUTHORITATIVE_BACKFILL_LIMIT = 200
+
 
 def _exchange_order_ids(value: Any) -> tuple[str, ...]:
     tokens = {
@@ -204,6 +209,8 @@ class ExpertMemoryService:
             outcomes = await self.authoritative_outcome_loader(
                 mode=execution_mode,
                 since=load_training_epoch_start(),
+                limit=AUTHORITATIVE_BACKFILL_LIMIT,
+                compact=True,
             )
             complete_outcomes = [
                 outcome
@@ -227,6 +234,8 @@ class ExpertMemoryService:
                     ),
                     "complete_before_reflection_sync": len(complete_outcomes),
                     "processed": processed,
+                    "truncated": len(outcomes) >= AUTHORITATIVE_BACKFILL_LIMIT,
+                    "batch_limit": AUTHORITATIVE_BACKFILL_LIMIT,
                 }
                 logger.info("trade reflection backfill completed", **report)
                 return report

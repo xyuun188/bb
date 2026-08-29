@@ -2078,7 +2078,7 @@ async def test_analysis_service_loop_keeps_fixed_rate_after_short_round(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_analysis_service_loop_does_not_add_delay_after_overrun(monkeypatch):
+async def test_analysis_service_loop_resets_after_overrun_without_tight_catchup(monkeypatch):
     calls: list[str] = []
     sleeps: list[float] = []
     running = True
@@ -2112,7 +2112,7 @@ async def test_analysis_service_loop_does_not_add_delay_after_overrun(monkeypatc
     await service.loop(lambda: 10.0)
 
     assert calls == ["market"]
-    assert sleeps == [0.0, 0.0]
+    assert sleeps == [0.0, pytest.approx(10.0, abs=0.01)]
 
 
 @pytest.mark.asyncio

@@ -95,8 +95,9 @@ class OKXWebSocketClient:
         logger.info("connecting to OKX WebSocket", url=self._ws_url)
 
         try:
-            self._ws = OkxPublicWebSocketSdkStream(self._ws_url)
-            await self._ws.connect()
+            stream = OkxPublicWebSocketSdkStream(self._ws_url)
+            await stream.connect()
+            self._ws = stream
             self._connected_at = time.time()
             self._last_ticker_time = 0.0
             logger.info("OKX WebSocket connected")

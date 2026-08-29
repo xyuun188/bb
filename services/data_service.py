@@ -124,7 +124,12 @@ KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
     "1h": 100,
 }
 KLINE_FEATURE_SEQUENCE_LIMIT = 80
-TICKER_PERSIST_THROTTLE_SECONDS = 30.0
+# WebSocket quotes are authoritative in memory. Database ticker rows are a
+# low-priority recovery/history aid and must not receive one write per symbol
+# on every market tick.
+TICKER_PERSIST_THROTTLE_SECONDS = 120.0
+TICKER_PERSIST_TASK_LIMIT = 16
+TICKER_PERSIST_TIMEOUT_SECONDS = 4.0
 TICKER_CACHE_MAX_AGE_SECONDS = max(
     10.0,
     float(_MARKET_DATA_PARAMS.indicator_snapshot_cache_ttl_seconds),
@@ -278,6 +283,7 @@ class DataService:
         self._instrument_spec_tasks: dict[str, asyncio.Task] = {}
         self._instrument_spec_failed_at: dict[str, datetime] = {}
         self._ticker_persist_tasks: set[asyncio.Task] = set()
+        self._ticker_persist_dropped_count = 0
         self._native_consistency_bars_cache: dict[str, tuple[float, list[Any]]] = {}
         self._native_consistency_bars_tasks: dict[str, asyncio.Task[list[Any]]] = {}
         self._started = False
@@ -308,8 +314,25 @@ class DataService:
             ):
                 return
             loop = asyncio.get_running_loop()
+            if len(getattr(self, "_ticker_persist_tasks", set())) >= TICKER_PERSIST_TASK_LIMIT:
+                self._ticker_persist_dropped_count = int(
+                    getattr(self, "_ticker_persist_dropped_count", 0) or 0
+                ) + 1
+                logger.debug(
+                    "ticker persistence backlog capped; keeping websocket path responsive",
+                    task_count=len(getattr(self, "_ticker_persist_tasks", set())),
+                    task_limit=TICKER_PERSIST_TASK_LIMIT,
+                )
+                return
             inflight.add(normalized)
-            task = loop.create_task(self._persist_ticker_snapshot(symbol, data))
+
+            async def persist_with_timeout() -> None:
+                await asyncio.wait_for(
+                    self._persist_ticker_snapshot(symbol, data),
+                    timeout=TICKER_PERSIST_TIMEOUT_SECONDS,
+                )
+
+            task = loop.create_task(persist_with_timeout())
             persist_tasks = getattr(self, "_ticker_persist_tasks", None)
             if not isinstance(persist_tasks, set):
                 persist_tasks = set()

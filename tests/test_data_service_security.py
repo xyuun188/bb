@@ -369,6 +369,31 @@ async def test_ticker_persistence_is_bounded_below_database_pool_capacity(
     assert len(persisted_symbols) == 40
 
 
+@pytest.mark.asyncio
+async def test_ticker_callback_caps_inflight_persistence_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    service._started = True
+    service._ticker_persist_tasks = {
+        asyncio.create_task(asyncio.sleep(60))
+        for _ in range(data_service_module.TICKER_PERSIST_TASK_LIMIT)
+    }
+    service._ticker_persist_inflight = set()
+    monkeypatch.setattr(data_service_module, "TICKER_PERSIST_TASK_LIMIT", 2)
+    service._ticker_persist_tasks = {
+        asyncio.create_task(asyncio.sleep(60)) for _ in range(2)
+    }
+
+    service._on_ticker_update("BTC/USDT", {"last_price": 100.0})
+
+    assert service._ticker_persist_dropped_count == 1
+    assert "BTC/USDT" not in service._ticker_persist_inflight
+    for task in service._ticker_persist_tasks:
+        task.cancel()
+    await asyncio.gather(*service._ticker_persist_tasks, return_exceptions=True)
+
+
 def test_indicator_snapshot_ignores_incomplete_latest_kline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

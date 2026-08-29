@@ -183,7 +183,27 @@ class OkxPublicWebSocketSdkStream:
         from okx.websocket.WsPublicAsync import WsPublicAsync
 
         self._client = WsPublicAsync(self.url, debug=False)
-        self._consume_task = await self._client.start()
+        try:
+            consume_task = await self._client.start()
+        except Exception:
+            self._client = None
+            self._consume_task = None
+            raise
+        # python-okx's WebSocketFactory historically returned None on a
+        # failed handshake, then WsPublicAsync.start still created a consumer
+        # task. That task crashes later with async-for on None and leaves the
+        # caller believing the stream connected. Fail closed here.
+        if getattr(self._client, "websocket", None) is None or consume_task is None:
+            try:
+                if consume_task is not None and not consume_task.done():
+                    consume_task.cancel()
+                    await asyncio.gather(consume_task, return_exceptions=True)
+                await self._client.stop()
+            finally:
+                self._client = None
+                self._consume_task = None
+            raise ExchangeAPIError("OKX WebSocket handshake returned no stream")
+        self._consume_task = consume_task
 
     def _on_message(self, message: str) -> None:
         text = message.decode() if isinstance(message, bytes) else str(message)
@@ -222,7 +242,7 @@ class OkxPublicWebSocketSdkStream:
         self._ticker_ready.put_nowait(inst_id)
 
     async def send(self, payload: str) -> None:
-        if self._client is None:
+        if self._client is None or getattr(self._client, "websocket", None) is None:
             raise ExchangeAPIError("OKX WebSocket SDK client is not connected")
         text = payload.decode() if isinstance(payload, bytes) else str(payload)
         if text == "ping":

@@ -109,7 +109,13 @@ class _ScopedAnalysisService:
             next_round_at += interval
             now = loop.time()
             if next_round_at <= now:
-                next_round_at = now
+                # A slow round must not trigger a tight catch-up loop.  The
+                # previous scheduler reset to ``now`` when a round overran
+                # its interval, which immediately started another round and
+                # could drive the trading process to 100% CPU while the
+                # database/exchange work was still under pressure.  Drop the
+                # missed tick and schedule one full interval after completion.
+                next_round_at = now + interval
             await asyncio.sleep(max(next_round_at - now, 0.0))
 
     async def _run_loop_round(self) -> None:

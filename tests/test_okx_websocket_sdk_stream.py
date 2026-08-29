@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 
 import pytest
 
@@ -28,6 +30,36 @@ async def test_sdk_stream_recv_propagates_consumer_failure() -> None:
 
     assert consume_task.done()
     assert isinstance(consume_task.exception(), ConnectionError)
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_rejects_handshake_that_returns_no_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.websocket = None
+            self.stopped = False
+
+        async def start(self) -> asyncio.Task[None]:
+            async def consume() -> None:
+                await asyncio.Future()
+
+            return asyncio.create_task(consume())
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    module = types.ModuleType("okx.websocket.WsPublicAsync")
+    module.WsPublicAsync = FakeClient
+    monkeypatch.setitem(sys.modules, "okx.websocket.WsPublicAsync", module)
+
+    stream = OkxPublicWebSocketSdkStream()
+    with pytest.raises(okx_perpetual_sdk.ExchangeAPIError, match="no stream"):
+        await stream.connect()
+
+    assert stream._client is None
+    assert stream._consume_task is None
 
 
 @pytest.mark.asyncio

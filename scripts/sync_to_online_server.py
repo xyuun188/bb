@@ -500,9 +500,14 @@ ExecStartPre=/bin/bash -lc 'for spec in 18000:/v1/models 18001:/health/live 1800
 StandardOutput=journal
 StandardError=journal
 MemoryAccounting=true
-MemoryHigh=6G
-MemoryMax=8G
-TasksMax=512
+MemoryHigh=4G
+MemoryMax=6G
+CPUAccounting=true
+CPUQuota=200%
+TasksMax=256
+OOMPolicy=stop
+TimeoutStartSec=120
+TimeoutStopSec=30
 """
     cleanup_prefix = (
         f'trap "rm -f {_remote_quote(local_ai_tools_key_file)}" EXIT; '

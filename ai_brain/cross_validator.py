@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.llm_agent import shared_llm_capacity_slot
@@ -36,6 +35,18 @@ from core.safe_output import safe_error_text
 from core.secret_utils import secret_fingerprint
 
 logger = structlog.get_logger(__name__)
+
+# Keep a patchable attribute for existing tests while avoiding the heavyweight
+# transformers/torch import until cross validation actually calls an LLM.
+ChatOpenAI: Any = None
+
+
+def _chat_openai_class() -> Any:
+    if ChatOpenAI is not None:
+        return ChatOpenAI
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+
+    return _ChatOpenAI
 
 EXPERT_ALIASES = {
     "trend": "trend_expert",
@@ -829,7 +840,7 @@ class CrossValidator:
         if _uses_thinking_tags(model):
             llm_kwargs["extra_body"] = non_thinking_extra_body()
             invoke_messages = self._consultation_messages_for_model(messages, model)
-        llm = ChatOpenAI(**llm_kwargs)
+        llm = _chat_openai_class()(**llm_kwargs)
         queue_wait_started = time.perf_counter()
         queue_timeout = min(
             max(
