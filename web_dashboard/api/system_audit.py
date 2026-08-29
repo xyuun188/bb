@@ -119,10 +119,10 @@ SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
 # the slowest read-only preflight to finish alongside the other audit groups.
 # The remaining time is reserved for serialization, process teardown, and
 # snapshot persistence.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 85.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 100.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 110.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 130.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SYSTEM_AUDIT_RUNNER_PATH = PROJECT_ROOT / "scripts" / "run_system_audit_snapshot.py"
