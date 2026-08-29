@@ -6394,7 +6394,12 @@ async def _collect_system_audit_status_unlocked(
 
 
 @router.get("/system-audit/status")
-async def system_audit_status() -> dict[str, Any]:
+async def system_audit_status(refresh: bool = False) -> dict[str, Any]:
+    # The page's explicit "立即巡检" action must invalidate the normal
+    # 15-minute cadence.  Keep the request read-only and non-blocking: start
+    # the isolated audit in the background, then return the last snapshot with
+    # an explicit refresh marker so the UI can poll for the new result.
+    refresh_requested = bool(refresh)
     cached = _cached_system_audit_status()
     if cached is None:
         _schedule_system_audit_refresh()
@@ -6415,6 +6420,7 @@ async def system_audit_status() -> dict[str, Any]:
                 "age_seconds": 0.0,
                 "refresh_after_seconds": round(refresh_after, 3),
                 "refresh_in_background": True,
+                "refresh_requested": refresh_requested,
             },
         }
     checked_at, payload = cached
@@ -6423,13 +6429,19 @@ async def system_audit_status() -> dict[str, Any]:
         float(settings.system_audit_history_interval_seconds or 900),
         SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS,
     )
-    if age_seconds >= refresh_after:
+    if refresh_requested or age_seconds >= refresh_after:
         _schedule_system_audit_refresh()
+    refresh_task = _system_audit_refresh_task
     payload["cache"] = {
         "hit": True,
         "age_seconds": round(age_seconds, 3),
         "refresh_after_seconds": round(refresh_after, 3),
-        "refresh_in_background": age_seconds >= refresh_after,
+        "refresh_in_background": bool(
+            refresh_requested
+            or age_seconds >= refresh_after
+            or (refresh_task is not None and not refresh_task.done())
+        ),
+        "refresh_requested": refresh_requested,
     }
     return _dashboard_system_audit_payload(payload)
 

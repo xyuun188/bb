@@ -137,6 +137,7 @@ let closingAllPositions = false;
 const positionLinkedOrdersByGroup = new Map();
 let serverMonitorRefreshInFlight = null;
 let systemAuditRefreshInFlight = null;
+let systemAuditRefreshPollTimer = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
 
 function isPageActive(page) {
@@ -6680,12 +6681,29 @@ async function searchVectorMemory() {
 async function fetchSystemAudit(options = {}) {
     if (systemAuditRefreshInFlight) return systemAuditRefreshInFlight;
     const updated = document.getElementById('system-audit-updated');
+    const forceRefresh = options.force === true
+        || document.activeElement?.dataset?.systemAuditForce === 'true';
     if (updated && !options.silent) updated.textContent = '巡检中...';
     systemAuditRefreshInFlight = (async () => {
         try {
-            const data = await fetchJSON('/api/system-audit/status');
+            let data;
+            if (forceRefresh) {
+                data = await fetchJSON('/api/system-audit/status?refresh=1');
+            } else {
+                data = await fetchJSON('/api/system-audit/status');
+            }
             state.systemAuditStatus = data || null;
             renderSystemAudit();
+            if (forceRefresh && data?.cache?.refresh_requested) {
+                if (updated) updated.textContent = '已提交刷新，等待新结果...';
+                if (systemAuditRefreshPollTimer) window.clearTimeout(systemAuditRefreshPollTimer);
+                systemAuditRefreshPollTimer = window.setTimeout(() => {
+                    systemAuditRefreshPollTimer = null;
+                    if (!document.hidden && isPageActive('system-audit')) {
+                        fetchSystemAudit({ silent: true });
+                    }
+                }, 1500);
+            }
         } catch (error) {
             const message = error?.message || String(error || '系统巡检接口请求失败');
             if (options.silent && state.systemAuditStatus) {
@@ -7325,8 +7343,18 @@ function systemAuditOverviewHtml(data) {
     const status = systemAuditTone(data.status);
     const summary = data.summary || {};
     const title = status === 'ok' ? '当前未发现关键根因' : (status === 'critical' ? '发现异常根因' : '发现需关注项');
+    const cache = data.cache || {};
+    const refreshing = cache.refresh_in_background === true;
+    const ageSeconds = Number(cache.age_seconds || 0);
+    const ageText = ageSeconds >= 3600
+        ? `${(ageSeconds / 3600).toFixed(1)} 小时`
+        : `${Math.max(1, Math.round(ageSeconds / 60))} 分钟`;
+    const freshnessNote = refreshing
+        ? `<div class="system-audit-freshness-banner">正在生成新巡检结果，下面先展示上一份快照（${ageText} 前）。新结果生成后会自动替换。</div>`
+        : '';
     return `
         <div class="system-audit-overview system-audit-overview-${status}">
+            ${freshnessNote}
             <div class="system-audit-hero">
                 <span>整体健康度</span>
                 <strong>${escHtml(data.status_label || systemAuditStatusLabel(data.status))}</strong>
@@ -7531,7 +7559,10 @@ function renderSystemAudit() {
     const data = state.systemAuditStatus || {};
     const updated = document.getElementById('system-audit-updated');
     const overview = document.getElementById('system-audit-overview');
-    if (updated) updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '等待巡检';
+    if (updated) {
+        updated.textContent = data.checked_at ? toBeijingTime(data.checked_at) : '等待巡检';
+        if (data.cache?.refresh_in_background) updated.textContent = '巡检刷新中...';
+    }
     if (!overview) return;
     if (!Object.keys(data).length) {
         overview.innerHTML = '<div class="analysis-empty">等待系统巡检结果...</div>'; 
@@ -11445,6 +11476,7 @@ function openingFunnelReasonLabel(key) {
         profit_expectancy: '收益期望',
         evidence_gate: '证据评分',
         risk_or_precheck: '风控/预检',
+        pre_order_facts: '交易前事实',
         waiting_queue: '观望/等待',
         execution_or_exchange: '执行/交易所',
         ai_budget: 'AI预算',
@@ -11493,17 +11525,19 @@ function renderOpeningFunnelSummary(data) {
         return;
     }
     const scans = Number(data.market_scans || 0);
-    const signals = Number(data.stages?.ai_entry_signals || 0);
+    const signals = Number(data.stages?.ai_entry_signals ?? data.executable_entry_signals ?? 0);
+    const observations = Number(data.stages?.analysis_only_signals ?? data.analysis_only_signals ?? 0);
     const executed = Number(data.stages?.executed_entries || 0);
     const bottleneck = data.bottleneck_label || '暂无足够数据';
     const tone = data.bottleneck === 'healthy_selective' ? 'good' : scans ? 'warn' : 'muted';
     el.innerHTML = `
         <div class="opening-funnel-verdict opening-funnel-${tone}">
             <strong>${escHtml(bottleneck)}</strong>
-            <span>市场分析 ${scans} 次，AI 开仓信号 ${signals} 次，实际开仓 ${executed} 次。总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。</span>
+            <span>扫描 ${scans} 次，可执行开仓信号 ${signals} 次，实际开仓 ${executed} 次。${observations ? `另有 ${observations} 次仅观察，不会下单。` : ''} 总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。</span>
         </div>
         <div class="opening-funnel-kpis">
-            <div><span>AI 给信号率</span><strong>${pctFmt(data.rates?.signal_rate)}</strong></div>
+            <div><span>可执行信号率</span><strong>${pctFmt(data.rates?.signal_rate)}</strong></div>
+            <div><span>仅观察占比</span><strong>${pctFmt(data.rates?.observation_rate)}</strong></div>
             <div><span>信号成单率</span><strong>${pctFmt(data.rates?.order_rate)}</strong></div>
             <div><span>信号执行率</span><strong>${pctFmt(data.rates?.execution_rate)}</strong></div>
             <div><span>平均信心</span><strong>${Number(data.average_confidence || 0).toFixed(2)}</strong></div>
@@ -11515,7 +11549,8 @@ function renderOpeningFunnelStages(data) {
     if (!el) return;
     const stages = [
         ['市场扫描', data.stages?.market_scans || 0, '系统完成的新机会分析'],
-        ['AI开仓信号', data.stages?.ai_entry_signals || 0, '最终裁决为做多/做空'],
+        ['可执行开仓信号', data.stages?.ai_entry_signals || 0, '通过交易权限检查的做多/做空'],
+        ['仅观察信号', data.stages?.analysis_only_signals || 0, '只用于扩大观察覆盖，不会下单'],
         ['生成订单', data.stages?.orders_created || 0, '本地订单表有关联记录'],
         ['实际开仓', data.stages?.executed_entries || 0, '决策标记为已执行'],
     ];
@@ -11542,7 +11577,7 @@ function renderOpeningFunnelReasons(data) {
     const items = Object.entries(buckets).filter(([, count]) => Number(count || 0) > 0);
     const total = items.reduce((sum, [, count]) => sum + Number(count || 0), 0);
     if (!items.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">没有未执行的开仓信号。</div>';
+        el.innerHTML = '<div class="opening-funnel-empty">暂无被拦截的可执行开仓信号。</div>';
         return;
     }
     el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([key, count]) => {
@@ -11567,11 +11602,12 @@ function renderOpeningFunnelSymbols(data) {
     el.innerHTML = symbols.map(item => {
         const scans = Number(item.scans || 0);
         const signals = Number(item.signals || 0);
+        const observations = Number(item.observations || 0);
         const executed = Number(item.executed || 0);
         const width = scans ? Math.max(4, (signals / scans) * 100) : 4;
         return `
             <div class="opening-funnel-row opening-funnel-symbol-row">
-                <div><strong>${escHtml(item.symbol || '-')}</strong><span>${signals}/${scans} 信号 · ${executed} 开仓</span></div>
+                <div><strong>${escHtml(item.symbol || '-')}</strong><span>${signals}/${scans} 可执行 · ${observations} 观察 · ${executed} 开仓</span></div>
                 <div class="opening-funnel-bar"><span style="width:${width}%;"></span></div>
                 <em>信号率 ${pctFmt(item.signal_rate)}</em>
             </div>`;
@@ -11583,7 +11619,7 @@ function renderOpeningFunnelBlocked(data) {
     if (!tbody) return;
     const rows = Array.isArray(data.recent_blocked) ? data.recent_blocked : [];
     if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无未执行的开仓信号</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无被拦截的可执行开仓信号</td></tr>';
         return;
     }
     tbody.innerHTML = rows.map(row => `

@@ -1236,6 +1236,7 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
     assert calls[1]["allow_cached_indicator_build"] is False
     assert calls[0]["require_funding"] is True
     assert calls[1]["require_funding"] is True
+    assert calls[1]["require_authoritative_snapshot"] is True
 
 
 @pytest.mark.asyncio
@@ -1296,6 +1297,7 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
     assert calls[0]["require_funding"] is True
     assert calls[1]["require_funding"] is True
     assert calls[1]["prioritize_native_market_data"] is True
+    assert calls[1]["require_authoritative_snapshot"] is True
 
 
 @pytest.mark.asyncio
@@ -6088,6 +6090,39 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
     assert funnel["analysis_budget"]["market_limit_diagnostics"]["read_only"] is True
     assert "threshold" in funnel["diagnostic_boundary"]
     assert decision.raw_response["market_candidate_funnel"] == funnel
+
+
+def test_market_analysis_only_boundary_persists_round_marker_on_decision() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    decision = _decision(Action.LONG)
+    funnel = {
+        "round_id": "round-1",
+        "analysis_only_selected_symbols": [],
+        "execution_availability": {
+            "analysis_only_execution_unverified": [
+                {"symbol": "BTC/USDT", "reason": "okx_private_entry_instrument_probe_deferred"}
+            ],
+            "unavailable": [],
+        },
+        "ranked_symbol_sample": [],
+        "rank_top_symbols": [],
+    }
+
+    service._attach_market_candidate_funnel(decision, funnel)
+
+    assert decision.raw_response["market_analysis_only"] is True
+    assert decision.raw_response["market_analysis_only_contract"] == {
+        "selected_for_market_analysis": True,
+        "entry_permission": False,
+        "reason": "okx_private_entry_instrument_probe_deferred",
+        "execution_candidate_state": "analysis_only_execution_unverified",
+        "round_id": "round-1",
+    }
 
 
 def test_market_deferred_rotation_starts_from_skipped_symbol() -> None:

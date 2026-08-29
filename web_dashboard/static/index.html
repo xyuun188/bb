@@ -591,14 +591,14 @@
                         <div class="opening-funnel-panel">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">未开仓原因</span>
-                                <span class="analysis-section-subtitle">只统计 AI 已给 long/short 但未执行的信号</span>
+                                <span class="analysis-section-subtitle">只统计可执行但未成交的信号</span>
                             </div>
                             <div id="opening-funnel-reasons" class="opening-funnel-list"></div>
                         </div>
                         <div class="opening-funnel-panel opening-funnel-panel-full">
                         <div class="analysis-section-head">
                             <span class="analysis-section-title">最近被挡的开仓信号</span>
-                            <span class="analysis-section-subtitle">用于定位风控、执行、排队或预算问题</span>
+                            <span class="analysis-section-subtitle">用于定位为什么没有成交</span>
                         </div>
                         <div class="table-wrap opening-funnel-table-wrap">
                         <table class="opening-funnel-table">
@@ -622,7 +622,7 @@
                         <div class="opening-funnel-panel opening-funnel-symbol-panel">
                             <div class="analysis-section-head">
                                 <span class="analysis-section-title">币种分布</span>
-                                <span class="analysis-section-subtitle">看哪些币种有信号，哪些真的成交</span>
+                                <span class="analysis-section-subtitle">区分可执行信号、仅观察和实际成交</span>
                             </div>
                             <div id="opening-funnel-symbols" class="opening-funnel-list"></div>
                         </div>
@@ -1148,7 +1148,7 @@
                     </div>
                     <div class="system-audit-toolbar">
                         <span id="system-audit-updated">等待巡检</span>
-                        <button class="btn btn-sm" onclick="fetchSystemAudit()">立即巡检</button>
+                        <button class="btn btn-sm" data-system-audit-force="true" onclick="fetchSystemAudit()">立即巡检</button>
                     </div>
                 </div>
                 <div id="system-audit-overview">

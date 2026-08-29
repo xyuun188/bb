@@ -11,6 +11,7 @@ ENTRY_FUNNEL_REASONS = (
     "direction_conflict",
     "risk_blocked",
     "funding_cost_blocked",
+    "pre_order_facts_blocked",
     "execution_blocked",
     "account_reconciliation_blocked",
     "service_error",
@@ -38,6 +39,7 @@ _REASON_FIELDS = frozenset(
         "blockers",
         "blocking_reason",
         "blocking_reasons",
+        "block_reasons",
         "execution_blocker",
     }
 )
@@ -165,6 +167,35 @@ def classify_entry_funnel_reason(
         or final_code in {"MODEL_UNAVAILABLE", "MODEL_TIMEOUT", "MODEL_INVALID_OUTPUT"}
     )
 
+    # A directional signal may be generated while the execution layer still
+    # lacks a fresh, authoritative OKX fact snapshot. This is a deliberate
+    # fail-closed pre-submit decision, not an exchange rejection.
+    pre_order_fact_tokens = (
+        "pre_order_execution_facts_ineligible",
+        "pre_order_execution_facts_fingerprint_missing",
+        "pre_order_execution_facts_unavailable",
+        "authoritative pre-order execution facts are unavailable",
+        "authoritative pre-order execution facts are incomplete",
+        "execution facts are unavailable",
+        "execution facts are incomplete",
+        "交易前权威事实不可用",
+        "交易前权威事实不完整",
+        "交易前执行事实不可用",
+        "交易前执行事实不完整",
+    )
+    pre_order_fact_blocked = bool(
+        action_text in {"long", "short"}
+        and (
+            any(token in text or token in explicit_risk_text for token in pre_order_fact_tokens)
+            or final_code in {
+                "PRE_ORDER_EXECUTION_FACTS_UNAVAILABLE",
+                "PRE_ORDER_EXECUTION_FACTS_INCOMPLETE",
+            }
+        )
+    )
+    if pre_order_fact_blocked:
+        return "pre_order_facts_blocked"
+
     if any(
         token in text
         for token in (
@@ -275,8 +306,22 @@ def build_direction_symmetry_report(rows: Iterable[dict[str, Any]]) -> dict[str,
     """Summarize long/short selection without making a trading recommendation."""
 
     sides: dict[str, dict[str, Any]] = {
-        "long": {"scan_count": 0, "signal_count": 0, "executed_count": 0, "blocked_count": 0, "block_reasons": {}},
-        "short": {"scan_count": 0, "signal_count": 0, "executed_count": 0, "blocked_count": 0, "block_reasons": {}},
+        "long": {
+            "scan_count": 0,
+            "signal_count": 0,
+            "observation_count": 0,
+            "executed_count": 0,
+            "blocked_count": 0,
+            "block_reasons": {},
+        },
+        "short": {
+            "scan_count": 0,
+            "signal_count": 0,
+            "observation_count": 0,
+            "executed_count": 0,
+            "blocked_count": 0,
+            "block_reasons": {},
+        },
     }
     for row in rows:
         side = _text(row.get("action") or row.get("side")).lower()
@@ -284,11 +329,14 @@ def build_direction_symmetry_report(rows: Iterable[dict[str, Any]]) -> dict[str,
             continue
         item = sides[side]
         item["scan_count"] += 1
-        if row.get("is_entry") is True or side in {"long", "short"}:
+        analysis_only = row.get("analysis_only") is True
+        if analysis_only:
+            item["observation_count"] += 1
+        elif row.get("is_entry") is True or side in {"long", "short"}:
             item["signal_count"] += 1
-        if row.get("was_executed", row.get("executed")) is True:
+        if not analysis_only and row.get("was_executed", row.get("executed")) is True:
             item["executed_count"] += 1
-        else:
+        elif not analysis_only:
             item["blocked_count"] += 1
             reason = _text(row.get("funnel_reason")) or "unknown"
             counts = item["block_reasons"]
@@ -321,7 +369,7 @@ def build_direction_symmetry_report(rows: Iterable[dict[str, Any]]) -> dict[str,
         status = "asymmetric" if ratio >= 3.0 else "balanced"
         dominant = "long" if long_signals > short_signals else "short" if short_signals > long_signals else None
     return {
-        "version": "2026-08-17.entry-direction-symmetry.v1",
+        "version": "2026-08-30.entry-direction-symmetry.v2",
         "read_only": True,
         "is_entry_permission": False,
         "status": status,
@@ -329,6 +377,9 @@ def build_direction_symmetry_report(rows: Iterable[dict[str, Any]]) -> dict[str,
         "long": sides["long"],
         "short": sides["short"],
         "total_directional_signals": total_signals,
+        "total_directional_observations": sum(
+            int(item["observation_count"]) for item in sides.values()
+        ),
         "policy": "diagnostic_only; never relaxes entry thresholds or risk gates",
     }
 
@@ -345,16 +396,24 @@ def build_entry_funnel_report(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         executed = row.get("was_executed", row.get("executed")) is True
         if not executed and reason in counts:
             counts[reason] += 1
+        analysis_only = row.get("analysis_only") is True
         normalized_rows.append(
             {
                 "action": row.get("action"),
-                "is_entry": _text(row.get("action")).lower() in {"long", "short"},
+                "is_entry": (
+                    not analysis_only
+                    and (
+                        row.get("is_entry") is True
+                        or _text(row.get("action")).lower() in {"long", "short"}
+                    )
+                ),
+                "analysis_only": analysis_only,
                 "was_executed": executed,
                 "funnel_reason": reason,
             }
         )
     return {
-        "version": "2026-08-17.entry-funnel.v1",
+        "version": "2026-08-29.entry-funnel.v2",
         "read_only": True,
         "is_entry_permission": False,
         "reason_counts": counts,

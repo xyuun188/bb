@@ -111,6 +111,17 @@ def test_trade_reflection_authority_status_distinguishes_pending_and_linkage_fai
     assert orphan["label"] == "本地孤立仓位已隔离"
 
 
+def test_opening_funnel_legacy_unavailable_signal_is_observation_only() -> None:
+    row = SimpleNamespace(
+        symbol="GPS/USDT",
+        was_executed=False,
+        execution_reason="ExchangeAPIError: OKX API error [51001]",
+    )
+
+    assert dashboard._opening_funnel_is_analysis_only(row, {}, has_order=False) is True
+    assert dashboard._opening_funnel_is_analysis_only(row, {}, has_order=True) is False
+
+
 class _FakeServerInfo:
     host = "203.0.113.17"
     access_host = "203.0.113.17"
@@ -1724,12 +1735,68 @@ async def test_daily_pnl_cumulative_equity_keeps_first_real_snapshot_outside_vie
     finally:
         await close_db()
 
+
     rows = {row["date"]: row for row in payload["records"]}
     assert payload["start_date"] == "2026-07-28"
     assert payload["okx_equity_series_start_date"] == "2026-07-24"
     assert payload["okx_equity_series_complete"] is False
     assert rows["2026-07-28"]["okx_cumulative_equity_pnl"] == pytest.approx(15.0)
     assert rows["2026-07-30"]["okx_cumulative_equity_pnl"] == pytest.approx(22.0)
+
+
+@pytest.mark.asyncio
+async def test_opening_funnel_excludes_observation_only_direction_from_entry_conversion(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'opening-funnel-analysis-only.db').as_posix()}",
+    )
+    await init_db()
+
+    try:
+        now = datetime.now(UTC)
+        async with get_session_ctx() as session:
+            session.add(
+                AIDecision(
+                    model_name=ENSEMBLE_TRADER_NAME,
+                    symbol="GPS/USDT",
+                    action="long",
+                    confidence=0.76,
+                    analysis_type="market",
+                    is_paper=True,
+                    was_executed=False,
+                    execution_reason="观察覆盖候选未获得交易权限",
+                    raw_llm_response={
+                        "market_analysis_only": True,
+                        "market_analysis_only_contract": {
+                            "selected_for_market_analysis": True,
+                            "entry_permission": False,
+                        },
+                    },
+                    created_at=now,
+                )
+            )
+
+        payload = await dashboard._build_opening_funnel_payload(
+            mode="paper",
+            hours=24,
+            limit=500,
+        )
+
+        assert payload["market_scans"] == 1
+        assert payload["stages"]["ai_entry_signals"] == 0
+        assert payload["stages"]["analysis_only_signals"] == 1
+        assert payload["executable_entry_signals"] == 0
+        assert payload["rates"]["order_rate"] == 0.0
+        assert payload["bottleneck"] == "analysis_only"
+        assert payload["recent_blocked"] == []
+        assert payload["top_symbols"][0]["observations"] == 1
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

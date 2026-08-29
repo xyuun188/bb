@@ -850,6 +850,7 @@ class DataService:
         require_funding: bool = False,
         prioritize_indicator_build: bool = False,
         prioritize_native_market_data: bool = False,
+        require_authoritative_snapshot: bool = False,
     ) -> FeatureVector:
         """Build a complete FeatureVector for a symbol from all available data."""
         sentiment_task = asyncio.create_task(
@@ -914,12 +915,22 @@ class DataService:
                 )
                 return {}
 
+        async def ticker_provider() -> dict[str, Any]:
+            if require_authoritative_snapshot:
+                return await self._get_feature_ticker_snapshot(
+                    symbol,
+                    block_on_remote=block_on_remote_ticker,
+                    require_authoritative_snapshot=True,
+                )
+            return await self._get_feature_ticker_snapshot(
+                symbol,
+                block_on_remote=block_on_remote_ticker,
+            )
+
         ticker_task = asyncio.create_task(
             bounded_snapshot(
                 "ticker",
-                lambda: self._get_feature_ticker_snapshot(
-                    symbol, block_on_remote=block_on_remote_ticker
-                ),
+                ticker_provider,
                 uses_native_remote=block_on_remote_ticker,
             )
         )
@@ -1095,6 +1106,7 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        require_authoritative_snapshot: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         ticker = dict(
@@ -1150,8 +1162,23 @@ class DataService:
                 "ticker_snapshot_available": False,
                 "ticker_remote_refresh_deferred": True,
             }
+        raw_ticker: dict[str, Any] = {}
         try:
-            raw_ticker = await self.rest_client.fetch_ticker(normalized)
+            ticker_fetcher = self.rest_client.fetch_ticker
+            if require_authoritative_snapshot:
+                try:
+                    raw_ticker = await ticker_fetcher(
+                        normalized,
+                        wait_for_completion=True,
+                    )
+                except TypeError as exc:
+                    # Keep source compatibility with small test doubles and
+                    # older integrations that only accept the symbol.
+                    if "wait_for_completion" not in safe_error_text(exc):
+                        raise
+                    raw_ticker = await ticker_fetcher(normalized)
+            else:
+                raw_ticker = await ticker_fetcher(normalized)
             if not isinstance(raw_ticker, dict) or (
                 raw_ticker.get("ticker_refresh_in_background")
                 and not raw_ticker.get("last")
@@ -1222,6 +1249,19 @@ class DataService:
             return selected
         except Exception as e:
             logger.debug("failed to fetch ticker", symbol=symbol, error=safe_error_text(e))
+            if require_authoritative_snapshot:
+                return {
+                    "symbol": normalized,
+                    "ticker_snapshot_available": False,
+                    "ticker_authoritative_required": True,
+                    "ticker_remote_refresh_blocked": True,
+                    "ticker_remote_refresh_in_background": bool(
+                        raw_ticker.get("ticker_refresh_in_background")
+                    ),
+                    "market_data_quality_issue": "authoritative_ticker_unavailable",
+                    "ticker_unavailable_reason": safe_error_text(e, limit=180),
+                    "source": "unavailable",
+                }
             if ticker:
                 ticker["source"] = ticker.get("source") or "stale_websocket"
                 ticker["stale"] = True
@@ -2195,12 +2235,27 @@ class DataService:
         symbol: str,
         *,
         block_on_remote: bool = True,
+        require_authoritative_snapshot: bool = False,
     ) -> dict[str, Any]:
         getter = self._get_ticker_snapshot
         try:
+            if require_authoritative_snapshot:
+                return await getter(
+                    symbol,
+                    block_on_remote=block_on_remote,
+                    require_authoritative_snapshot=True,
+                )
             return await getter(symbol, block_on_remote=block_on_remote)
         except TypeError as exc:
-            if "block_on_remote" not in safe_error_text(exc):
+            error_text = safe_error_text(exc)
+            if "require_authoritative_snapshot" in error_text:
+                try:
+                    return await getter(symbol, block_on_remote=block_on_remote)
+                except TypeError as nested_exc:
+                    if "block_on_remote" not in safe_error_text(nested_exc):
+                        raise
+                    return await getter(symbol)
+            if "block_on_remote" not in error_text:
                 raise
             return await getter(symbol)
 
@@ -2902,6 +2957,35 @@ class DataService:
                 normalized,
                 block_on_remote=True,
             )
+            if require_funding and not contract_spec:
+                # Final entry analysis must bind the order book and reference
+                # prices to one native OKX contract.  Do not turn a missing
+                # specification into a zero-depth snapshot and let the caller
+                # mistake it for ordinary illiquidity.
+                data = {
+                    "derivatives_route_status": {
+                        "completed": [],
+                        "failed": ["contract_spec"],
+                        "timed_out": [],
+                    },
+                    "derivatives_required_routes": [
+                        "contract_spec",
+                        "orderbook",
+                        "reference_prices",
+                        "funding",
+                    ],
+                    "derivatives_required_data_available": False,
+                    "derivatives_funding_required": True,
+                    "derivatives_funding_data_available": False,
+                    "derivatives_snapshot_partial": True,
+                    "derivatives_unavailable_reason": "contract_spec_unavailable",
+                }
+                logger.warning(
+                    "OKX native contract specification unavailable; blocking final derivatives snapshot",
+                    symbol=normalized,
+                )
+                failed_cache[normalized] = datetime.now(UTC)
+                return data
             fetcher = self.rest_client.fetch_derivatives_snapshot
             try:
                 fetch_call = fetcher(

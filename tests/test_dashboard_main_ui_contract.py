@@ -44,6 +44,17 @@ def test_dashboard_background_polling_only_refreshes_visible_active_pages() -> N
     assert "if (!document.hidden && isPageActive('trades')) fetchTrades();" in script
 
 
+def test_opening_funnel_labels_observation_only_separately_from_executable_entries() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "可执行开仓信号" in script
+    assert "仅观察信号" in script
+    assert "不会下单" in script
+    assert "pre_order_facts: '交易前事实'" in script
+    assert "只统计可执行但未成交的信号" in html
+
+
 def test_analysis_list_omits_heavy_ml_payload_unless_requested() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     source = (PROJECT_ROOT / "web_dashboard/api/dashboard.py").read_text(encoding="utf-8")

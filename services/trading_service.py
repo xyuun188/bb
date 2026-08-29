@@ -5186,6 +5186,7 @@ class TradingService:
         require_funding: bool = False,
         prioritize_indicator_build: bool = False,
         prioritize_native_market_data: bool = False,
+        require_authoritative_snapshot: bool = False,
     ) -> Any:
         """Read a feature vector while preserving compatibility with older test doubles."""
 
@@ -5221,6 +5222,9 @@ class TradingService:
             accepts_native_market_priority_option = (
                 "prioritize_native_market_data" in parameters or accepts_var_kwargs
             )
+            accepts_authoritative_snapshot_option = (
+                "require_authoritative_snapshot" in parameters or accepts_var_kwargs
+            )
         except (TypeError, ValueError):
             accepts_options = True
             accepts_ticker_option = True
@@ -5232,6 +5236,7 @@ class TradingService:
             accepts_funding_requirement_option = True
             accepts_indicator_priority_option = True
             accepts_native_market_priority_option = True
+            accepts_authoritative_snapshot_option = True
 
         kwargs: dict[str, Any] = {}
         if accepts_options:
@@ -5254,6 +5259,8 @@ class TradingService:
             kwargs["prioritize_indicator_build"] = prioritize_indicator_build
         if accepts_native_market_priority_option and prioritize_native_market_data:
             kwargs["prioritize_native_market_data"] = True
+        if accepts_authoritative_snapshot_option and require_authoritative_snapshot:
+            kwargs["require_authoritative_snapshot"] = True
         if kwargs:
             return await getter(symbol, **kwargs)
         return await getter(symbol)
@@ -5720,6 +5727,7 @@ class TradingService:
                     require_funding=True,
                     prioritize_indicator_build=True,
                     prioritize_native_market_data=True,
+                    require_authoritative_snapshot=True,
                 ),
                 timeout=MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS,
             )
@@ -6172,6 +6180,7 @@ class TradingService:
                     block_on_remote_indicators=False,
                     block_on_remote_derivatives=True,
                     prioritize_native_market_data=True,
+                    require_authoritative_snapshot=True,
                 ),
                 timeout=ENTRY_PRICE_RECHECK_TIMEOUT_SECONDS,
             )
@@ -7095,12 +7104,17 @@ class TradingService:
         if not decision.is_entry:
             return None
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
-        if symbol not in {
+        raw = self._safe_dict(decision.raw_response)
+        persisted_contract = self._safe_dict(raw.get("market_analysis_only_contract"))
+        persisted_observation = bool(
+            raw.get("market_analysis_only") is True
+            or persisted_contract.get("selected_for_market_analysis") is True
+        )
+        if not persisted_observation and symbol not in {
             self._normalize_position_symbol(item)
             for item in (getattr(self, "_market_analysis_only_symbols", set()) or set())
         }:
             return None
-        raw = self._safe_dict(decision.raw_response)
         if self._market_analysis_only_can_promote(decision):
             raw["market_analysis_only"] = True
             raw["market_analysis_only_contract"] = {
@@ -8425,6 +8439,12 @@ class TradingService:
             "rank_filtered_out_reason_counts": rank_diagnostics.get(
                 "filtered_out_reason_counts", []
             ),
+            "analysis_only_selected_symbols": list(
+                rank_diagnostics.get("analysis_only_selected_symbols") or []
+            ),
+            "execution_availability": self._safe_dict(
+                rank_diagnostics.get("execution_availability")
+            ),
             "rank_top_symbols": rank_diagnostics.get("symbols", []),
             "ranked_symbol_sample": rank_diagnostics.get("ranked_symbol_sample", []),
             "filtered_symbol_sample": rank_diagnostics.get("filtered_symbol_sample", []),
@@ -8486,9 +8506,78 @@ class TradingService:
         raw = self._safe_dict(decision.raw_response)
         if funnel:
             raw["market_candidate_funnel"] = funnel
+            if decision.is_entry:
+                marker = self._market_analysis_only_marker(funnel, decision.symbol)
+                if marker is not None:
+                    existing_contract = self._safe_dict(
+                        raw.get("market_analysis_only_contract")
+                    )
+                    raw["market_analysis_only"] = True
+                    if existing_contract.get("entry_permission") is not True:
+                        raw["market_analysis_only_contract"] = {
+                            "selected_for_market_analysis": True,
+                            "entry_permission": False,
+                            "reason": marker.get("reason") or "ranker_analysis_only_fill",
+                            "execution_candidate_state": marker.get("state"),
+                            "round_id": funnel.get("round_id"),
+                        }
         if progress:
             raw["market_analysis_progress"] = self._safe_dict(progress)
         decision.raw_response = raw
+
+    def _market_analysis_only_marker(
+        self,
+        funnel: dict[str, Any],
+        symbol: str,
+    ) -> dict[str, Any] | None:
+        """Read the round's observation-only decision from persisted funnel facts."""
+
+        normalized = self._normalize_position_symbol(symbol)
+        if not normalized:
+            return None
+        candidates: list[dict[str, Any]] = []
+        selected_symbols = funnel.get("analysis_only_selected_symbols")
+        if isinstance(selected_symbols, (list, tuple, set)):
+            if any(self._normalize_position_symbol(item) == normalized for item in selected_symbols):
+                return {
+                    "reason": "ranker_analysis_only_fill",
+                    "state": "analysis_only_selection",
+                }
+        availability = self._safe_dict(funnel.get("execution_availability"))
+        for key in ("analysis_only_execution_unverified", "unavailable"):
+            rows = availability.get(key)
+            if isinstance(rows, list):
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    enriched = dict(item)
+                    if key == "analysis_only_execution_unverified":
+                        enriched.setdefault("analysis_only", True)
+                        enriched.setdefault("execution_candidate_state", key)
+                    else:
+                        enriched.setdefault("analysis_only", True)
+                        enriched.setdefault("execution_candidate_state", "execution_unavailable")
+                    candidates.append(enriched)
+        for key in ("ranked_symbol_sample", "rank_top_symbols", "symbols"):
+            rows = funnel.get(key)
+            if isinstance(rows, list):
+                candidates.extend(item for item in rows if isinstance(item, dict))
+        for item in candidates:
+            if self._normalize_position_symbol(item.get("symbol")) != normalized:
+                continue
+            state = str(item.get("execution_candidate_state") or "").strip()
+            if (
+                item.get("analysis_only") is True
+                or item.get("selection_tier") == "analysis_only_fill"
+                or state in {"analysis_only_execution_unverified", "execution_unavailable"}
+            ):
+                return {
+                    "reason": item.get("reason")
+                    or item.get("non_selected_reason")
+                    or "ranker_analysis_only_fill",
+                    "state": state or item.get("selection_tier") or "analysis_only",
+                }
+        return None
 
     @staticmethod
     def _market_analysis_timeout_hold(

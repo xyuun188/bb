@@ -58,6 +58,32 @@ async def test_cold_system_audit_returns_warming_payload_and_schedules_refresh(
     assert payload["cache"]["refresh_in_background"] is True
 
 
+@pytest.mark.asyncio
+async def test_system_audit_force_refresh_schedules_even_when_snapshot_is_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC)
+    scheduled = False
+
+    def fake_schedule() -> None:
+        nonlocal scheduled
+        scheduled = True
+
+    monkeypatch.setattr(
+        system_audit,
+        "_cached_system_audit_status",
+        lambda: (checked_at, {"checked_at": checked_at.isoformat(), "status": "warning"}),
+    )
+    monkeypatch.setattr(system_audit, "_schedule_system_audit_refresh", fake_schedule)
+    monkeypatch.setattr(system_audit.settings, "system_audit_history_interval_seconds", 900)
+
+    payload = await system_audit.system_audit_status(refresh=True)
+
+    assert scheduled is True
+    assert payload["cache"]["refresh_requested"] is True
+    assert payload["cache"]["refresh_in_background"] is True
+
+
 class _CompletedProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
         self.returncode: int | None = 0

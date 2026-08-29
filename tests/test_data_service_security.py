@@ -1839,6 +1839,46 @@ async def test_ticker_snapshot_refreshes_fresh_but_inconsistent_ws_cache() -> No
 
 
 @pytest.mark.asyncio
+async def test_authoritative_ticker_refresh_never_falls_back_to_websocket_cache() -> None:
+    service = _service()
+    fresh_timestamp_ms = int(time.time() * 1000)
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "timestamp": fresh_timestamp_ms,
+                "source": "websocket",
+            }
+        }
+
+    class FakeRestClient:
+        async def fetch_ticker(self, _symbol: str, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs == {"wait_for_completion": True}
+            return {
+                "ticker_refresh_in_background": True,
+                "ticker_timeout": True,
+            }
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+
+    snapshot = await service._get_ticker_snapshot(
+        "PROS/USDT",
+        require_authoritative_snapshot=True,
+    )
+
+    assert snapshot["ticker_snapshot_available"] is False
+    assert snapshot["ticker_authoritative_required"] is True
+    assert snapshot["ticker_remote_refresh_in_background"] is True
+    assert "last_price" not in snapshot
+    assert snapshot["source"] == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_blocking_ticker_refresh_keeps_rest_as_primary_over_fresh_ws_cache() -> None:
     service = _service()
     fresh_timestamp_ms = int(time.time() * 1000)
@@ -2076,6 +2116,34 @@ async def test_market_derivatives_refresh_requests_required_routes_only() -> Non
 
     assert calls == [True]
     assert result["derivatives_required_data_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_final_derivatives_refresh_blocks_when_contract_spec_is_unavailable() -> None:
+    service = _service()
+    service._derivatives_failed_at = {}
+    service._derivatives_refresh_tasks = {}
+
+    async def missing_spec(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    service._get_instrument_spec = missing_spec  # type: ignore[method-assign]
+
+    class FakeRestClient:
+        async def fetch_derivatives_snapshot(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("must not fetch derivatives without native contract spec")
+
+    service.rest_client = FakeRestClient()
+
+    result = await service._refresh_derivatives_snapshot(
+        "ETH/USDT",
+        required_only=True,
+        require_funding=True,
+    )
+
+    assert result["derivatives_required_data_available"] is False
+    assert result["derivatives_unavailable_reason"] == "contract_spec_unavailable"
+    assert result["derivatives_route_status"]["failed"] == ["contract_spec"]
 
 
 @pytest.mark.asyncio

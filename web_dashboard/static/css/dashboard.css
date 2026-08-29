@@ -960,6 +960,15 @@ td .ml-bar-row .ml-bar-label {
     gap: 12px;
     padding: 12px;
 }
+.system-audit-freshness-banner {
+    border: 1px solid rgba(245,158,11,0.42);
+    border-radius: var(--radius);
+    background: rgba(245,158,11,0.1);
+    color: var(--text-secondary);
+    padding: 9px 11px;
+    font-size: 12px;
+    line-height: 1.5;
+}
 .system-audit-hero {
     display: grid;
     gap: 5px;
@@ -2377,15 +2386,15 @@ body {
     white-space: nowrap;
 }
 .opening-funnel-body {
-    padding: 16px 14px 14px;
+    padding: 12px 14px 14px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 12px;
 }
 .opening-funnel-overview {
     display: grid;
-    grid-template-columns: minmax(310px, 0.85fr) minmax(520px, 1.45fr);
-    gap: 14px;
+    grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.6fr);
+    gap: 12px;
     align-items: stretch;
 }
 .opening-funnel-verdict {
@@ -2393,14 +2402,14 @@ body {
     overflow: hidden;
     border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
     border-radius: var(--radius);
-    padding: 18px;
+    padding: 14px;
     display: flex;
     flex-direction: column;
     gap: 8px;
     background:
         linear-gradient(135deg, color-mix(in srgb, var(--accent-dim) 78%, transparent), transparent 68%),
         var(--bg-panel);
-    min-height: 128px;
+    min-height: 108px;
     justify-content: center;
 }
 .opening-funnel-verdict::before {
@@ -2469,7 +2478,7 @@ body {
     line-height: 1.1;
 }
 .opening-funnel-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
     align-content: stretch;
     padding: 12px;
     border: 1px solid var(--border);
@@ -3791,7 +3800,7 @@ select.form-input { cursor: pointer; }
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
-    padding: 12px;
+    padding: 10px;
 }
 .training-effectiveness-overview {
     grid-column: 1 / -1;

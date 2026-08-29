@@ -9015,6 +9015,19 @@ def _opening_funnel_reason_bucket(reason: str | None) -> str:
     if any(
         token in text
         for token in (
+            "交易前权威事实",
+            "交易前执行事实",
+            "authoritative pre-order execution facts",
+            "execution facts are unavailable",
+            "execution facts are incomplete",
+            "pre_order_execution_facts_ineligible",
+            "pre_order_execution_facts_fingerprint_missing",
+        )
+    ):
+        return "pre_order_facts"
+    if any(
+        token in text
+        for token in (
             "动态证据不足",
             "保持观望",
             "极小探针",
@@ -9107,6 +9120,102 @@ def _opening_funnel_is_repair_cleanup(decision) -> bool:
     return False
 
 
+def _opening_funnel_is_analysis_only(
+    row,
+    raw: dict[str, Any] | None = None,
+    *,
+    has_order: bool = False,
+) -> bool:
+    """Return whether a directional row was recorded for observation only.
+
+    Market coverage deliberately includes symbols that are not yet authorized
+    for execution.  Those rows are useful evidence, but must not inflate the
+    executable entry funnel or its conversion rates.
+    """
+
+    payload = raw if isinstance(raw, dict) else {}
+    contract = payload.get("market_analysis_only_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    if has_order or bool(getattr(row, "was_executed", False)):
+        return False
+    if contract.get("entry_permission") is True:
+        return False
+    if payload.get("market_analysis_only") is True or (
+        contract.get("selected_for_market_analysis") is True
+        and contract.get("entry_permission") is not True
+    ):
+        return True
+
+    # Older decisions were persisted before the round marker was added. Keep
+    # their known execution-environment failures from being shown as real entry
+    # signals, but only when the row has no order or execution evidence.
+    legacy_reason = str(getattr(row, "execution_reason", "") or "").lower()
+    legacy_payload = " ".join(
+        str(value).lower()
+        for key in (
+            "execution_reason",
+            "reason",
+            "error",
+            "error_code",
+            "blocker",
+            "blocking_reason",
+            "execution_blocker",
+        )
+        for value in [payload.get(key)]
+        if value not in (None, "", [], {})
+    )
+    legacy_text = f"{legacy_reason} {legacy_payload}"
+    if any(
+        token in legacy_text
+        for token in (
+            "okx api error [51001]",
+            "error_code: 51001",
+            "error_code=51001",
+            "instrument_unavailable",
+            "execution_instrument_unavailable",
+            "仅用于扩大市场观察覆盖",
+            "cannot enter the execution chain",
+        )
+    ):
+        return True
+
+    funnel = payload.get("market_candidate_funnel")
+    funnel = funnel if isinstance(funnel, dict) else {}
+    symbol = _normalize_dashboard_symbol(getattr(row, "symbol", ""))
+    if not symbol:
+        return False
+
+    selected = funnel.get("analysis_only_selected_symbols")
+    if isinstance(selected, (list, tuple, set)) and any(
+        _normalize_dashboard_symbol(item) == symbol for item in selected
+    ):
+        return True
+
+    availability = funnel.get("execution_availability")
+    availability = availability if isinstance(availability, dict) else {}
+    candidates: list[dict[str, Any]] = []
+    for key in ("analysis_only_execution_unverified", "unavailable"):
+        entries = availability.get(key)
+        if isinstance(entries, list):
+            candidates.extend(item for item in entries if isinstance(item, dict))
+    for key in ("ranked_symbol_sample", "rank_top_symbols", "symbols"):
+        entries = funnel.get(key)
+        if isinstance(entries, list):
+            candidates.extend(item for item in entries if isinstance(item, dict))
+
+    for item in candidates:
+        if _normalize_dashboard_symbol(item.get("symbol")) != symbol:
+            continue
+        state = str(item.get("execution_candidate_state") or "").strip().lower()
+        if (
+            item.get("analysis_only") is True
+            or item.get("selection_tier") == "analysis_only_fill"
+            or state in {"analysis_only_execution_unverified", "execution_unavailable"}
+        ):
+            return True
+    return False
+
+
 @router.get("/opening-funnel")
 async def get_opening_funnel(
     mode: str | None = None,
@@ -9147,15 +9256,19 @@ async def get_opening_funnel(
                 "counts_are_observed": False,
                 "repair_cleanup_rows": 0,
                 "market_scans": 0,
+                "executable_entry_signals": 0,
+                "analysis_only_signals": 0,
                 "average_confidence": 0.0,
                 "stages": {
                     "market_scans": 0,
                     "ai_entry_signals": 0,
+                    "analysis_only_signals": 0,
                     "orders_created": 0,
                     "executed_entries": 0,
                 },
                 "rates": {
                     "signal_rate": 0.0,
+                    "observation_rate": 0.0,
                     "order_rate": 0.0,
                     "execution_rate": 0.0,
                     "overall_open_rate": 0.0,
@@ -9165,6 +9278,7 @@ async def get_opening_funnel(
                     "profit_expectancy": 0,
                     "evidence_gate": 0,
                     "risk_or_precheck": 0,
+                    "pre_order_facts": 0,
                     "waiting_queue": 0,
                     "execution_or_exchange": 0,
                     "ai_budget": 0,
@@ -9281,6 +9395,7 @@ async def _build_opening_funnel_payload(
         "profit_expectancy": 0,
         "evidence_gate": 0,
         "risk_or_precheck": 0,
+        "pre_order_facts": 0,
         "waiting_queue": 0,
         "execution_or_exchange": 0,
         "ai_budget": 0,
@@ -9293,6 +9408,7 @@ async def _build_opening_funnel_payload(
     recent_blocked: list[dict[str, Any]] = []
 
     entry_signals = 0
+    analysis_only_signals = 0
     orders_created = 0
     executed_entries = 0
     no_order_after_signal = 0
@@ -9305,7 +9421,7 @@ async def _build_opening_funnel_payload(
         action_counts[action_key] += 1
         symbol = _normalize_dashboard_symbol(row.symbol)
         symbol_state = symbol_counts.setdefault(
-            symbol or "-", {"scans": 0, "signals": 0, "executed": 0}
+            symbol or "-", {"scans": 0, "signals": 0, "executed": 0, "observations": 0}
         )
         symbol_state["scans"] += 1
         try:
@@ -9326,9 +9442,28 @@ async def _build_opening_funnel_payload(
                 entry_funnel_reasons[funnel_reason] += 1
             continue
 
+        matched_order = order_map.get(row.id)
+        analysis_only = _opening_funnel_is_analysis_only(
+            row,
+            raw,
+            has_order=matched_order is not None,
+        )
+        if analysis_only:
+            analysis_only_signals += 1
+            symbol_state["observations"] += 1
+            directional_rows.append(
+                {
+                    "action": action,
+                    "is_entry": False,
+                    "analysis_only": True,
+                    "was_executed": False,
+                    "funnel_reason": "analysis_only",
+                }
+            )
+            continue
+
         entry_signals += 1
         symbol_state["signals"] += 1
-        matched_order = order_map.get(row.id)
         if matched_order is not None:
             orders_created += 1
         if row.was_executed:
@@ -9388,6 +9523,7 @@ async def _build_opening_funnel_payload(
     total_scans = len(market_rows)
     hold_count = action_counts["hold"]
     signal_rate = (entry_signals / total_scans) if total_scans else 0.0
+    observation_rate = (analysis_only_signals / total_scans) if total_scans else 0.0
     order_rate = (orders_created / entry_signals) if entry_signals else 0.0
     execution_rate = (executed_entries / entry_signals) if entry_signals else 0.0
     overall_open_rate = (executed_entries / total_scans) if total_scans else 0.0
@@ -9395,7 +9531,10 @@ async def _build_opening_funnel_payload(
     bottleneck = "no_data"
     bottleneck_label = "暂无足够数据"
     if total_scans:
-        if signal_rate < 0.08:
+        if analysis_only_signals and not entry_signals:
+            bottleneck = "analysis_only"
+            bottleneck_label = "当前只有观察信号，暂无可执行开仓信号"
+        elif signal_rate < 0.08:
             bottleneck = "ai_hold"
             bottleneck_label = "AI 主要选择观望"
         elif entry_signals and order_rate < 0.5:
@@ -9405,6 +9544,7 @@ async def _build_opening_funnel_payload(
                 "profit_expectancy": "收益期望不足，费后预期净收益未转正",
                 "evidence_gate": "动态证据强冲突硬拦",
                 "risk_or_precheck": "风控或入场预检未通过",
+                "pre_order_facts": "交易前权威事实未就绪，系统保护性不下单",
                 "waiting_queue": "动态证据不足，观望等待",
                 "execution_or_exchange": "执行层或交易所接口问题",
                 "ai_budget": "AI 成本预算仍在拦截",
@@ -9426,6 +9566,7 @@ async def _build_opening_funnel_payload(
                 "scans": counts["scans"],
                 "signals": counts["signals"],
                 "executed": counts["executed"],
+                "observations": counts.get("observations", 0),
                 "signal_rate": counts["signals"] / counts["scans"] if counts["scans"] else 0.0,
                 "execution_rate": (
                     counts["executed"] / counts["signals"] if counts["signals"] else 0.0
@@ -9451,17 +9592,21 @@ async def _build_opening_funnel_payload(
             },
             "repair_cleanup_rows": repair_cleanup_rows,
             "market_scans": total_scans,
+            "executable_entry_signals": entry_signals,
+            "analysis_only_signals": analysis_only_signals,
             "average_confidence": (
                 (confidence_total / confidence_count) if confidence_count else 0.0
             ),
             "stages": {
                 "market_scans": total_scans,
                 "ai_entry_signals": entry_signals,
+                "analysis_only_signals": analysis_only_signals,
                 "orders_created": orders_created,
                 "executed_entries": executed_entries,
             },
             "rates": {
                 "signal_rate": signal_rate,
+                "observation_rate": observation_rate,
                 "order_rate": order_rate,
                 "execution_rate": execution_rate,
                 "overall_open_rate": overall_open_rate,

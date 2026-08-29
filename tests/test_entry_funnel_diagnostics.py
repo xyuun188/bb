@@ -200,6 +200,24 @@ def test_funnel_classifies_environment_rejection_as_execution_blocked() -> None:
     ) == "execution_blocked"
 
 
+def test_funnel_classifies_missing_pre_order_facts_separately() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "analysis_quality_contract": {
+                "analysis_complete": True,
+                "decision_eligible": True,
+            },
+            "execution_trace": {
+                "block_reasons": ["pre_order_execution_facts_ineligible"],
+            },
+        },
+        action="long",
+        was_executed=False,
+        has_order=False,
+        reason="Authoritative pre-order execution facts are unavailable; entry fails closed.",
+    ) == "pre_order_facts_blocked"
+
+
 def test_funnel_classifies_reconciliation_before_execution() -> None:
     assert classify_entry_funnel_reason(
         raw={},
@@ -241,3 +259,31 @@ def test_direction_symmetry_report_is_read_only_and_exposes_side_rates() -> None
     assert report["short"]["executed_count"] == 1
     assert report["short"]["block_reasons"] == {"risk_blocked": 1}
     assert report["long"]["block_reasons"] == {"insufficient_evidence": 1}
+
+
+def test_direction_symmetry_does_not_count_observation_only_as_entry_signal() -> None:
+    report = build_direction_symmetry_report(
+        [
+            {
+                "action": "long",
+                "is_entry": False,
+                "analysis_only": True,
+                "was_executed": False,
+                "funnel_reason": "analysis_only",
+            },
+            {
+                "action": "short",
+                "is_entry": True,
+                "was_executed": False,
+                "funnel_reason": "risk_blocked",
+            },
+        ]
+    )
+
+    assert report["long"]["scan_count"] == 1
+    assert report["long"]["observation_count"] == 1
+    assert report["long"]["signal_count"] == 0
+    assert report["long"]["blocked_count"] == 0
+    assert report["short"]["signal_count"] == 1
+    assert report["total_directional_signals"] == 1
+    assert report["total_directional_observations"] == 1

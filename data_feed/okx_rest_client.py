@@ -53,6 +53,12 @@ TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # wait.  This is deliberately independent from the first caller's short
 # route budget so a completed shared request is not lost as a timeout stub.
 TICKER_ROUTE_JOIN_TIMEOUT_SECONDS = 2.5
+# Final entry validation may wait longer for the same single-flight request,
+# but remains bounded so a slow exchange route cannot stall the trading loop.
+TICKER_ROUTE_AUTHORITATIVE_TIMEOUT_SECONDS = max(
+    TICKER_ROUTE_TIMEOUT_SECONDS * 2.0,
+    5.0,
+)
 TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # All public market routes share one SDK session.  Without a client-level
 # gate, a market round can create several requests per symbol (ticker,
@@ -340,8 +346,18 @@ class OKXRestClient:
         markets = self._exchange.parse_markets(filtered)
         self._exchange.set_markets(markets)
 
-    async def fetch_ticker(self, symbol: str) -> dict:
-        """Fetch one ticker through a bounded per-instrument single-flight."""
+    async def fetch_ticker(
+        self,
+        symbol: str,
+        *,
+        wait_for_completion: bool = False,
+    ) -> dict:
+        """Fetch one ticker through a bounded per-instrument single-flight.
+
+        The normal market scan may return a structured background result at its
+        short route deadline.  Final entry validation can opt into the longer
+        join budget so it never falls back to an older websocket observation.
+        """
         inst_id = okx_inst_id_from_symbol(symbol)
         if not inst_id:
             return {}
@@ -379,7 +395,9 @@ class OKXRestClient:
 
         try:
             timeout_seconds = (
-                TICKER_ROUTE_JOIN_TIMEOUT_SECONDS
+                TICKER_ROUTE_AUTHORITATIVE_TIMEOUT_SECONDS
+                if wait_for_completion
+                else TICKER_ROUTE_JOIN_TIMEOUT_SECONDS
                 if joining_inflight
                 else TICKER_ROUTE_TIMEOUT_SECONDS
             )
@@ -978,7 +996,9 @@ class OKXRestClient:
             # it from a verified mark/index pair.
             ticker_task: asyncio.Task[Any] | None = None
             try:
-                ticker_task = asyncio.create_task(self.fetch_ticker(symbol))
+                ticker_task = asyncio.create_task(
+                    self.fetch_ticker(symbol, wait_for_completion=True)
+                )
                 ticker_result = await asyncio.wait_for(
                     asyncio.shield(ticker_task),
                     timeout=REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS,
