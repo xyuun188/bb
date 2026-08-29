@@ -7611,7 +7611,13 @@ async def _build_expert_memory_observability(
         )
         pending_count = max(reflection_count - len(complete_outcomes), 0)
         return {
-            "status": "ok" if outcomes else "missing",
+            "status": (
+                "ok"
+                if complete_outcomes and len(complete_outcomes) == len(outcomes)
+                else "partial"
+                if outcomes
+                else "missing"
+            ),
             "memory_count": memory_count,
             "reflection_count": reflection_count,
             "authoritative_outcome_count": len(outcomes),
