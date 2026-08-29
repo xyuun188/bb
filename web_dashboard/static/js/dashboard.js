@@ -129,6 +129,7 @@ const FIXED_AI_EXPERT_FALLBACKS = [
     },
 ];
 let recentDecisionsRefreshTimer = null;
+let dataCollectionWarmupTimer = null;
 const closingPositionIds = new Set();
 let closingAllPositions = false;
 const positionLinkedOrdersByGroup = new Map();
@@ -5860,6 +5861,24 @@ async function fetchDataCollectionStatus(options = {}) {
     }
     state.dataCollectionStatus = data;
     renderDataCollectionDashboard();
+
+    // The PostgreSQL-backed status endpoint warms its first snapshot in the
+    // background. Retry promptly so the temporary placeholder never looks
+    // like a real zero-valued collection result.
+    const loading = String(data.status || '').toLowerCase() === 'warming'
+        || data.cache?.cold_start === true;
+    const refreshing = loading || data.cache?.refresh_in_progress === true;
+    if (refreshing && isPageActive('data-collection')) {
+        if (dataCollectionWarmupTimer === null) {
+            dataCollectionWarmupTimer = window.setTimeout(() => {
+                dataCollectionWarmupTimer = null;
+                void fetchDataCollectionStatus({ silent: true });
+            }, 2500);
+        }
+    } else if (dataCollectionWarmupTimer !== null) {
+        window.clearTimeout(dataCollectionWarmupTimer);
+        dataCollectionWarmupTimer = null;
+    }
 }
 
 function collectionStatusTone(status, enabled = true) {
@@ -6031,6 +6050,18 @@ function renderDataCollectionDashboard(options = {}) {
         if (overview) {
             overview.innerHTML = '<div class="analysis-empty">数据采集状态读取失败，请检查 Dashboard API 或登录状态。</div>';
         }
+        return;
+    }
+    const warming = String(data.status || '').toLowerCase() === 'warming'
+        || data.cache?.cold_start === true;
+    if (warming) {
+        const waiting = '<div class="analysis-empty compact">正在读取真实采集数据，稍后显示最新数量...</div>';
+        ['data-collection-overview', 'data-collection-sources', 'data-collection-feature-coverage', 'data-collection-training']
+            .forEach(id => {
+                const section = document.getElementById(id);
+                if (section) section.innerHTML = waiting;
+            });
+        if (updated) updated.textContent = '正在读取真实采集数据...';
         return;
     }
     fillDataCollectionSettings(config, { force: options.forceSettings === true });
