@@ -5852,6 +5852,40 @@ def _parse_system_audit_runner_result(stdout: bytes) -> dict[str, Any]:
     return result
 
 
+def _deferred_system_audit_snapshot(*, source: str, error: Exception) -> dict[str, Any]:
+    """Persist a truthful diagnostic result when the isolated runner fails."""
+
+    checked_at = _now()
+    error_text = safe_error_text(error, limit=500)
+    return {
+        "checked_at": checked_at.isoformat(),
+        "status": "deferred",
+        "status_label": "系统审计暂缓，保留上次结果",
+        "summary": {},
+        "cards": [],
+        "root_causes": [
+            {
+                "code": "isolated_audit_deferred",
+                "label": "隔离审计未完成",
+                "reason": error_text,
+                "source": source or "api",
+            }
+        ],
+        "collection": {
+            "status": "deferred",
+            "degraded_reason": error_text,
+            "budget_seconds": SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS,
+        },
+        "audit_error": {
+            "type": type(error).__name__,
+            "message": error_text,
+            "retryable": True,
+        },
+        "degraded_reason": "isolated_system_audit_deferred",
+        "source": source or "api",
+    }
+
+
 async def _run_system_audit_subprocess_once(
     *,
     record_history: bool,
@@ -5946,6 +5980,34 @@ async def refresh_system_audit_snapshot(
         _system_audit_subprocess_task = task
     try:
         return await task
+    except (TimeoutError, RuntimeError) as exc:
+        # A failed child must never leave the Dashboard stuck on an opaque
+        # ``warming`` state.  Persist a structured deferred snapshot so the
+        # last known facts and the failure reason are visible to operators.
+        previous = _cached_system_audit_status()
+        if previous is not None:
+            _checked_at, payload = previous
+            previous_payload = copy.deepcopy(payload)
+            deferred = _deferred_system_audit_snapshot(source=source, error=exc)
+            # Keep the last readable cards/summary available while clearly
+            # marking the current refresh as deferred and recording its age.
+            deferred["summary"] = previous_payload.get("summary") or {}
+            deferred["cards"] = previous_payload.get("cards") or []
+            deferred["node_summary"] = previous_payload.get("node_summary") or {}
+            deferred["previous_checked_at"] = _checked_at.isoformat()
+        else:
+            deferred = _deferred_system_audit_snapshot(source=source, error=exc)
+        global _system_audit_status_cache
+        checked_at = _parse_utc_datetime(deferred.get("checked_at")) or _now()
+        _system_audit_status_cache = (checked_at, copy.deepcopy(deferred))
+        try:
+            _store_latest_audit_snapshot(deferred)
+        except OSError as persist_exc:
+            logger.warning(
+                "failed to store deferred system audit snapshot",
+                error=safe_error_text(persist_exc, limit=240),
+            )
+        return deferred
     finally:
         if task.done() and _system_audit_subprocess_task is task:
             _system_audit_subprocess_task = None

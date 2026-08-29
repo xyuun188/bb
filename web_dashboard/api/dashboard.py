@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -41,6 +42,7 @@ from services.account_accounting_service import (
     balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
+from services.continuous_observation import ContinuousObservationStore
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.decision_state import decision_state_from_raw
 from services.entry_funnel_diagnostics import (
@@ -79,6 +81,7 @@ from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
+from services.observability_contract import build_snapshot, status_from_sections
 from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.server_monitor_status import get_server_monitor_status_async
@@ -108,6 +111,12 @@ STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
 MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     settings.data_dir / "model_training_scheduler_state.json"
 )
+CONTINUOUS_OBSERVATION_STORES = {
+    hours: ContinuousObservationStore(
+        settings.data_dir / "dashboard_read_models" / f"continuous_observation_{hours}h.json"
+    )
+    for hours in (24, 72)
+}
 
 
 # In-memory reference to the trading service (set by main loop)
@@ -138,6 +147,12 @@ _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 2
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS = 20000
+_DASHBOARD_PROFIT_ATTRIBUTION_MAX_ORDER_ROWS = 6000
+_DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS = 5000
+_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 1
+_DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 3600
+_dashboard_daily_pnl_refresh_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
     "okx_confirmed",
     "okx_only_backfilled",
@@ -466,6 +481,11 @@ def _clear_dashboard_heavy_cache(*names: str) -> None:
             if not task.done():
                 task.cancel()
             _dashboard_closed_ledger_refresh_tasks.pop(key, None)
+    if not wanted or "daily-pnl" in wanted:
+        for key, task in list(_dashboard_daily_pnl_refresh_tasks.items()):
+            if not task.done():
+                task.cancel()
+            _dashboard_daily_pnl_refresh_tasks.pop(key, None)
 
 
 def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
@@ -7428,6 +7448,598 @@ def _load_model_training_report(relative_path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+async def _build_authoritative_profit_observability(
+    *, mode: str | None = None, since_hours: float | None = None
+) -> dict[str, Any]:
+    """Summarise only complete OKX outcomes; shadow data never enters totals."""
+
+    try:
+        from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+
+        outcomes = await load_authoritative_trade_outcomes(
+            mode=mode if mode in {"paper", "live"} else None,
+            since=(datetime.now(UTC) - timedelta(hours=float(since_hours)))
+            if since_hours is not None
+            else None,
+            limit=500,
+            compact=True,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "degraded_reason": f"authoritative_outcomes_unavailable:{safe_error_text(exc, limit=120)}",
+            "observed": False,
+        }
+
+    complete = [
+        row
+        for row in outcomes
+        if isinstance(row, dict)
+        and row.get("outcome_complete") is True
+        and row.get("trade_fact_trusted") is True
+    ]
+    totals = {
+        "gross_pnl": 0.0,
+        "fee": 0.0,
+        "slippage": 0.0,
+        "funding_fee": 0.0,
+        "liquidation_penalty": 0.0,
+        "fee_after_net_pnl": 0.0,
+        "realized_net_pnl": 0.0,
+    }
+    mismatch_count = 0
+    equation_observed_count = 0
+    for row in complete:
+        gross = _safe_float(row.get("gross_pnl_usdt", row.get("gross_pnl")), None)
+        entry_fee = _safe_float(row.get("entry_fee_usdt", row.get("entry_fee")), None)
+        close_fee = _safe_float(row.get("close_fee_usdt", row.get("close_fee")), None)
+        slippage = _safe_float(
+            row.get("execution_slippage_usdt", row.get("slippage_cost_usdt")), None
+        )
+        funding = _safe_float(row.get("funding_fee_usdt", row.get("funding_fee")), None)
+        penalty = _safe_float(row.get("liquidation_penalty_usdt", row.get("liquidation_penalty")), 0.0)
+        realized = _safe_float(
+            row.get("realized_net_pnl_usdt", row.get("realized_pnl")), None
+        )
+        if gross is not None:
+            totals["gross_pnl"] += gross
+        if entry_fee is not None:
+            totals["fee"] += entry_fee
+        if close_fee is not None:
+            totals["fee"] += close_fee
+        if slippage is not None:
+            totals["slippage"] += slippage
+        if funding is not None:
+            totals["funding_fee"] += funding
+        if penalty is not None:
+            totals["liquidation_penalty"] += penalty
+        if realized is not None:
+            totals["realized_net_pnl"] += realized
+        if None not in (gross, entry_fee, close_fee, slippage, funding, penalty, realized):
+            totals["fee_after_net_pnl"] += gross - entry_fee - close_fee - slippage + funding - penalty
+        components = row.get("realized_net_pnl_components")
+        if isinstance(components, dict):
+            expected = _safe_float(components.get("components_total_usdt"), None)
+            reported = _safe_float(
+                components.get("reported_realized_net_pnl_usdt", realized), None
+            )
+            if expected is not None and reported is not None:
+                equation_observed_count += 1
+                if not math.isclose(expected, reported, rel_tol=1e-5, abs_tol=1e-5):
+                    mismatch_count += 1
+    status = "ok" if complete and mismatch_count == 0 else "missing" if not outcomes else "partial"
+    return {
+        "status": status,
+        "observed": bool(complete),
+        "sample_count": len(complete),
+        "excluded_incomplete_count": max(len(outcomes) - len(complete), 0),
+        "equation_observed_count": equation_observed_count,
+        "attribution_mismatch_count": mismatch_count,
+        "formula": "realized_net_pnl = gross_pnl - fee - slippage + funding_fee - liquidation_penalty",
+        "totals": {key: round(value, 8) for key, value in totals.items()},
+        "shadow_excluded": True,
+        "degraded_reason": (
+            "authoritative_outcome_not_found" if not outcomes else None
+        ),
+    }
+
+
+async def _build_expert_memory_observability(
+    *, mode: str | None = None
+) -> dict[str, Any]:
+    """Expose memory authority counts without treating pending rows as evidence."""
+
+    try:
+        from sqlalchemy import select
+
+        from db.repositories.memory_repo import MemoryRepository
+        from db.session import get_session_ctx
+        from models.learning import ExpertMemory, TradeReflection
+        from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+
+        outcomes = await load_authoritative_trade_outcomes(
+            mode=mode if mode in {"paper", "live"} else None,
+            limit=500,
+            compact=True,
+        )
+        outcome_positions = {
+            int(position_id)
+            for outcome in outcomes
+            for position_id in (outcome.get("position_ids") or [outcome.get("position_id")])
+            if str(position_id or "").isdigit() and int(position_id) > 0
+        }
+        complete_outcomes = [
+            outcome
+            for outcome in outcomes
+            if outcome.get("outcome_complete") is True
+            and outcome.get("trade_fact_trusted") is True
+        ]
+        shadow_count = sum(
+            len(outcome.get("counterfactual_evidence") or []) for outcome in outcomes
+        )
+        eligible_count = sum(
+            bool(outcome.get("outcome_complete") is True and outcome.get("trade_fact_trusted") is True)
+            for outcome in outcomes
+        )
+        async with get_session_ctx() as session:
+            repo = MemoryRepository(session)
+            memory_count = await repo.count_memories()
+            reflection_count = await repo.count_reflections()
+            reflection_rows = list(
+                (
+                    await session.execute(
+                        select(TradeReflection.position_id).limit(5000)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            memory_extra_rows = list(
+                (
+                    await session.execute(select(ExpertMemory.extra).limit(5000))
+                )
+                .scalars()
+                .all()
+            )
+            authoritative_memory_count = sum(
+                isinstance(extra, dict) and bool(str(extra.get("outcome_id") or "").strip())
+                for extra in memory_extra_rows
+            )
+        orphan_reflection_count = sum(
+            int(position_id or 0) > 0 and int(position_id) not in outcome_positions
+            for position_id in reflection_rows
+        )
+        pending_count = max(reflection_count - len(complete_outcomes), 0)
+        return {
+            "status": "ok" if outcomes else "missing",
+            "memory_count": memory_count,
+            "reflection_count": reflection_count,
+            "authoritative_outcome_count": len(outcomes),
+            "complete_authoritative_outcome_count": len(complete_outcomes),
+            "pending_settlement_count": pending_count,
+            "orphan_position_count": orphan_reflection_count,
+            "shadow_sample_count": shadow_count,
+            "production_evidence_eligible_count": eligible_count,
+            "authoritative_memory_count": authoritative_memory_count,
+            "shadow_production_weight": 0.0,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "degraded_reason": f"expert_memory_observability_unavailable:{safe_error_text(exc, limit=120)}",
+        }
+
+
+async def _latest_analysis_observability() -> dict[str, Any]:
+    """Read one bounded analysis-quality sample for the model observability card."""
+
+    try:
+        from sqlalchemy import select
+
+        from db.session import get_session_ctx
+        from models.decision import AIDecision
+
+        async with get_session_ctx() as session:
+            result = await session.execute(
+                select(
+                    AIDecision.raw_llm_response,
+                    AIDecision.created_at,
+                    AIDecision.id,
+                )
+                .where(AIDecision.model_name == ENSEMBLE_TRADER_NAME)
+                .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+                .limit(50)
+            )
+            for raw, created_at, decision_id in result.all():
+                payload = raw if isinstance(raw, dict) else {}
+                quality = payload.get("analysis_quality_contract")
+                if not isinstance(quality, dict):
+                    continue
+                counts = quality.get("status_counts")
+                counts = counts if isinstance(counts, dict) else {}
+                expected = int(quality.get("expected_expert_count") or 0)
+                attempted = int(quality.get("attempted_expert_count") or 0)
+                returned = int(quality.get("returned_expert_count") or 0)
+                successful = int(quality.get("successful_expert_count") or 0)
+                quality_status = "ok" if expected > 0 else "partial"
+                return {
+                    "status": quality_status,
+                    "decision_id": decision_id,
+                    "round_id": payload.get("round_id") or quality.get("round_id"),
+                    "checked_at": created_at.isoformat() if created_at else None,
+                    "expected_expert_count": expected,
+                    "attempted_expert_count": attempted,
+                    "returned_expert_count": returned,
+                    "successful_expert_count": successful,
+                    "failed_expert_count": sum(
+                        int(counts.get(key) or 0)
+                        for key in ("timeout", "parse_failed", "empty", "unavailable")
+                    ),
+                    "skipped_expert_count": int(counts.get("skipped") or 0),
+                    "analysis_complete": quality.get("analysis_complete"),
+                    "decision_eligible": quality.get("decision_eligible"),
+                    "reason_code": quality.get("reason_code") or ("expected_expert_count_zero" if expected == 0 else None),
+                }
+    except Exception as exc:
+        _log_dashboard_fallback("model observability analysis sample fallback", exc)
+        return {
+            "status": "error",
+            "degraded_reason": f"analysis_observability_unavailable:{safe_error_text(exc, limit=120)}",
+        }
+    return {
+        "status": "missing",
+        "degraded_reason": "analysis_quality_contract_not_found",
+    }
+
+
+async def _build_model_observability_snapshot() -> dict[str, Any]:
+    """Build one versioned, read-only model/analysis observation snapshot."""
+
+    async def bounded(builder: Callable[[], Awaitable[Any]], name: str) -> dict[str, Any]:
+        try:
+            value = await asyncio.wait_for(builder(), timeout=20.0)
+            return value if isinstance(value, dict) else {"status": "error", "degraded_reason": f"{name}_invalid"}
+        except TimeoutError:
+            return {
+                "status": "timeout",
+                "degraded_reason": f"{name}_timeout",
+            }
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} observability fallback", exc)
+            return {
+                "status": "error",
+                "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
+            }
+
+    local_ml, local_tools, analysis, trade, expert_memory = await asyncio.gather(
+        bounded(get_ml_signal_status, "local_ml"),
+        bounded(get_local_ai_tools_status, "local_ai_tools"),
+        bounded(_latest_analysis_observability, "analysis"),
+        bounded(_build_trade_observability_snapshot, "trade"),
+        bounded(_build_expert_memory_observability, "expert_memory"),
+    )
+    scheduler = MODEL_TRAINING_STATE_STORE.read()
+    specialist_report = _load_model_training_report(
+        "phase3/specialist_shadow_evaluation_latest.json"
+    )
+    model_server_report = _load_model_training_report(
+        "phase3_model_server_readiness_reports/latest.json"
+    )
+    registry = build_model_training_registry(
+        local_ml_status=local_ml,
+        local_tools_status=local_tools,
+        specialist_report=specialist_report,
+        model_server_report=model_server_report,
+        contribution_performance={},
+    )
+    sections = {
+        "local_ml": local_ml,
+        "local_ai_tools": local_tools,
+        "analysis": analysis,
+        "trade": trade,
+        "expert_memory": expert_memory,
+    }
+    status, degraded_sections = status_from_sections(sections)
+    degraded_reason = ",".join(
+        str(sections[name].get("degraded_reason") or name)
+        for name in degraded_sections
+        if isinstance(sections.get(name), dict)
+    ) or None
+    return build_snapshot(
+        {
+            "sections": sections,
+            "scheduler": scheduler,
+            "registry": registry,
+            "expected_expert_names": list(MARKET_ANALYSIS_EXPERT_NAMES),
+            "expected_expert_count": len(MARKET_ANALYSIS_EXPERT_NAMES),
+            "analysis_round_id": analysis.get("round_id"),
+            "analysis_quality": analysis,
+            "trade_observability": trade,
+            "expert_memory_observability": expert_memory,
+            "model_roles": {
+                "active": [
+                    row.get("model_id")
+                    for row in registry.get("models", [])
+                    if row.get("lifecycle") in {"active", "live"}
+                ],
+                "challenger": [
+                    row.get("model_id")
+                    for row in registry.get("models", [])
+                    if row.get("lifecycle") == "canary"
+                    or row.get("evaluation_mode") == "shadow_evaluating"
+                ],
+                "baseline": ["no_model_baseline"],
+            },
+            "promotion_evidence": {
+                "required": [
+                    "fee_after_realized_net_pnl",
+                    "return_lcb",
+                    "profit_factor",
+                    "max_drawdown",
+                    "out_of_sample",
+                    "long_short_split",
+                ],
+                "models": [
+                    {
+                        "model_id": row.get("model_id"),
+                        "lifecycle": row.get("lifecycle"),
+                        "sample_count": row.get("sample_count"),
+                        "quality_state": row.get("quality_state"),
+                        "live_ml_ready": row.get("live_ml_ready") is True,
+                        "blocking_reasons": row.get("blocking_reasons") or [],
+                        "artifact_identity_verified": row.get("identity_verified") is True,
+                        "return_lcb": row.get("return_lcb_pct"),
+                        "profit_factor": row.get("profit_factor"),
+                        "max_drawdown": row.get("max_drawdown"),
+                        "out_of_sample": row.get("out_of_sample")
+                        or row.get("sample_scope")
+                        or row.get("evaluation_mode"),
+                        "long_short_split": row.get("long_short_split"),
+                    }
+                    for row in registry.get("models", [])
+                    if isinstance(row, dict)
+                ],
+            },
+            "degraded_sections": degraded_sections,
+            "conclusion": (
+                "模型和分析证据可用"
+                if status == "ok"
+                else "模型/分析证据不完整，当前只可观察，不能据此授权生产"
+            ),
+        },
+        status=status,
+        source="dashboard.model_observability",
+        stale_after_seconds=120.0,
+        degraded_reason=degraded_reason,
+    )
+
+
+async def _build_trade_observability_snapshot() -> dict[str, Any]:
+    """Aggregate bounded trade/execution facts into one truthful read snapshot."""
+
+    async def run_bounded(
+        factory: Callable[[], Awaitable[Any]], name: str, timeout_seconds: float
+    ) -> dict[str, Any]:
+        try:
+            value = await asyncio.wait_for(factory(), timeout=timeout_seconds)
+            return value if isinstance(value, dict) else {"status": "error", "degraded_reason": f"{name}_invalid"}
+        except TimeoutError:
+            return {"status": "timeout", "degraded_reason": f"{name}_timeout"}
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} trade observability fallback", exc)
+            return {"status": "error", "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}"}
+
+    async def contract_report() -> dict[str, Any]:
+        from services.trade_execution_contract import TradeExecutionContractService
+
+        return await TradeExecutionContractService().report(hours=24, limit=500)
+
+    async def fact_report() -> dict[str, Any]:
+        from services.okx_trade_fact_integrity import OkxTradeFactIntegrityService
+
+        return await OkxTradeFactIntegrityService(lookback_hours=24, limit=500).audit()
+
+    async def protection_report() -> dict[str, Any]:
+        selected_mode = "live" if mode_manager.mode.value == "live" else "paper"
+        return await _dashboard_okx_protection_audit(selected_mode)
+
+    contract, facts, protection, attribution = await asyncio.gather(
+        run_bounded(contract_report, "trade_execution_contract", 15.0),
+        run_bounded(fact_report, "okx_trade_fact_integrity", 15.0),
+        run_bounded(protection_report, "okx_protection_inventory", 10.0),
+        run_bounded(
+            lambda: _build_authoritative_profit_observability(
+                mode=mode_manager.mode.value,
+                since_hours=24,
+            ),
+            "authoritative_profit_attribution",
+            15.0,
+        ),
+    )
+
+    contract_summary = contract.get("summary") if isinstance(contract.get("summary"), dict) else {}
+    contract_available = contract.get("report_available", True) is not False and contract.get("status") not in {"timeout", "error"}
+    contract_violations = int(contract_summary.get("contract_violation_count") or 0)
+    fill_sync_pending = int(contract_summary.get("entry_authoritative_fill_sync_pending_count") or 0)
+    contract_state = (
+        "ok" if contract_available and contract_violations == 0 and fill_sync_pending == 0
+        else "partial" if contract_available else str(contract.get("status") or "error")
+    )
+
+    kind_counts = facts.get("kind_counts") if isinstance(facts.get("kind_counts"), dict) else {}
+    unassigned_fill_count = sum(
+        int(value or 0)
+        for key, value in kind_counts.items()
+        if str(key) in {"order_position_missing", "position_order_link_missing_local_order", "position_missing_entry_order_link", "closed_position_missing_close_order_link"}
+    )
+    duplicate_funding_count = sum(
+        int(value or 0)
+        for key, value in kind_counts.items()
+        if "funding" in str(key).lower() and "duplicate" in str(key).lower()
+    )
+    fact_raw_status = str(facts.get("status") or "missing").lower()
+    fact_state = (
+        "ok"
+        if fact_raw_status == "ok"
+        else "partial"
+        if fact_raw_status == "warning"
+        else "error"
+        if fact_raw_status == "critical"
+        else fact_raw_status
+    )
+
+    protection_available = protection.get("available", True) is not False and protection.get("status") not in {"timeout", "error"}
+    protection_gaps = (
+        len(protection.get("missing_keys") or [])
+        + len(protection.get("orphan_keys") or [])
+        + len(protection.get("coverage_mismatches") or [])
+        + int(protection.get("invalid_order_count") or 0)
+    )
+    protection_state = "ok" if protection_available and protection_gaps == 0 else "partial" if protection_available else str(protection.get("status") or "missing")
+    sections = {
+        "execution_contract": {"status": contract_state},
+        "trade_facts": {"status": fact_state},
+        "protection": {"status": protection_state},
+        "profit_attribution": {"status": str(attribution.get("status") or "missing")},
+    }
+    status, degraded_sections = status_from_sections(sections)
+    return build_snapshot(
+        {
+            "window_hours": 24,
+            "counts_are_observed": True,
+            "unresolved_execution_contract_count": contract_violations + fill_sync_pending,
+            "contract_violation_count": contract_violations,
+            "authoritative_fill_sync_pending_count": fill_sync_pending,
+            "unassigned_fill_count": unassigned_fill_count,
+            "duplicate_funding_attribution_count": duplicate_funding_count,
+            "funding_attribution_observed": any("funding" in str(key).lower() for key in kind_counts),
+            "profit_attribution": attribution,
+            "protection_gap_count": protection_gaps,
+            "sections": {
+                "execution_contract": contract,
+                "trade_facts": facts,
+                "protection": protection,
+            },
+            "degraded_sections": degraded_sections,
+            "conclusion": (
+                "最近24小时交易事实、执行合同和保护单均无新增异常"
+                if status == "ok"
+                else "交易闭环仍有异常或观察项，不能据此放开生产交易"
+            ),
+        },
+        status=status,
+        source="dashboard.trade_observability",
+        stale_after_seconds=120.0,
+        degraded_reason=",".join(degraded_sections) or None,
+    )
+
+
+@router.get("/trade-observability/snapshot")
+async def get_trade_observability_snapshot() -> dict[str, Any]:
+    return sanitize_payload(
+        await _dashboard_heavy_cached(
+            ("trade-observability",),
+            _build_trade_observability_snapshot,
+            ttl_seconds=30.0,
+        )
+    )
+
+
+@router.get("/model-observability/snapshot")
+async def get_model_observability_snapshot() -> dict[str, Any]:
+    """Return one cached snapshot for model, training and expert-call status."""
+
+    return sanitize_payload(
+        await _dashboard_heavy_cached(
+            ("model-observability",),
+            _build_model_observability_snapshot,
+            ttl_seconds=20.0,
+        )
+    )
+
+
+@router.get("/continuous-observation/snapshot")
+async def get_continuous_observation_snapshot() -> dict[str, Any]:
+    """Return the real elapsed 24/72-hour acceptance window state."""
+
+    windows = {
+        str(hours): store.snapshot()
+        for hours, store in CONTINUOUS_OBSERVATION_STORES.items()
+    }
+    statuses = [snapshot.get("status") for snapshot in windows.values()]
+    overall_status = (
+        "passed"
+        if all(status == "passed" for status in statuses)
+        else "blocked"
+        if any(status == "blocked" for status in statuses)
+        else "observing"
+        if any(status == "observing" for status in statuses)
+        else "not_started"
+    )
+    return sanitize_payload(
+        build_snapshot(
+            {"windows": windows, "required_windows": [24, 72]},
+            status=overall_status,
+            source="dashboard.continuous_observation",
+            stale_after_seconds=300.0,
+        )
+    )
+
+
+@router.post("/continuous-observation/start")
+async def start_continuous_observation(required_hours: int = 24) -> dict[str, Any]:
+    """Explicitly start a real observation window; no metrics are fabricated."""
+
+    try:
+        store = CONTINUOUS_OBSERVATION_STORES[int(required_hours)]
+        snapshot = store.start(required_hours=required_hours)
+    except (KeyError, ValueError) as exc:
+        return sanitize_payload(
+            build_snapshot(
+                {"error": str(exc), "required_hours": required_hours},
+                status="error",
+                source="dashboard.continuous_observation",
+                degraded_reason="invalid_observation_window",
+            )
+        )
+    return sanitize_payload(
+        build_snapshot(
+            snapshot,
+            status=snapshot.get("status"),
+            source="dashboard.continuous_observation",
+            stale_after_seconds=300.0,
+        )
+    )
+
+
+@router.post("/continuous-observation/record")
+async def record_continuous_observation(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Record one externally collected metric sample for the active window."""
+
+    try:
+        payload = dict(metrics or {})
+        required_hours = int(payload.pop("required_hours", 24))
+        store = CONTINUOUS_OBSERVATION_STORES[required_hours]
+        snapshot = store.record(payload)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        return sanitize_payload(
+            build_snapshot(
+                {"error": str(exc)},
+                status="blocked",
+                source="dashboard.continuous_observation",
+                degraded_reason="observation_sample_rejected",
+            )
+        )
+    return sanitize_payload(
+        build_snapshot(
+            snapshot,
+            status=snapshot.get("status"),
+            source="dashboard.continuous_observation",
+            stale_after_seconds=300.0,
+        )
+    )
+
+
 @router.get("/model-training/registry")
 async def get_model_training_registry_status() -> dict[str, Any]:
     """Return one truthful lifecycle view for trained and pretrained models."""
@@ -7437,32 +8049,11 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     if cached is not None:
         return sanitize_payload(cached)
 
-    async def _bounded_status(builder: Callable[[], Awaitable[dict[str, Any]]], name: str) -> dict[str, Any]:
-        try:
-            value = await asyncio.wait_for(builder(), timeout=15.0)
-            return value if isinstance(value, dict) else {"available": False, "status": f"{name}_invalid"}
-        except TimeoutError:
-            return {
-                "available": False,
-                "service_available": False,
-                "status": "timeout",
-                "error": f"{name}_status_timeout",
-                "stale": False,
-            }
-        except Exception as exc:
-            _log_dashboard_fallback(f"{name} status fallback", exc)
-            return {
-                "available": False,
-                "service_available": False,
-                "status": "error",
-                "error": f"{name}_status_failed",
-                "stale": False,
-            }
-
-    local_ml_status, local_tools_status = await asyncio.gather(
-        _bounded_status(get_ml_signal_status, "ml_signal"),
-        _bounded_status(get_local_ai_tools_status, "local_ai_tools"),
-    )
+    observability = await get_model_observability_snapshot()
+    observability_sections = observability.get("sections") if isinstance(observability, dict) else {}
+    observability_sections = observability_sections if isinstance(observability_sections, dict) else {}
+    local_ml_status = observability_sections.get("local_ml") or {"status": "missing"}
+    local_tools_status = observability_sections.get("local_ai_tools") or {"status": "missing"}
     specialist_report = _load_model_training_report(
         "phase3/specialist_shadow_evaluation_latest.json"
     )
@@ -7503,6 +8094,7 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     )
     registry["contribution_performance_status"] = contribution_status
     registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
+    registry["model_observability"] = observability
     return sanitize_payload(_dashboard_heavy_cache_set(cache_key, registry))
 
 
@@ -7612,33 +8204,67 @@ async def get_positions(
                 mode=mode,
             )
             open_rows = []
+        requested_page = page
+        open_count = len(open_rows)
+        start = (requested_page - 1) * page_size
+        end = start + page_size
+        closed_rows: list[dict[str, Any]] = []
+        closed_total = 0
+        closed_ledger_source = "okx_positions_history_official_unavailable"
+        closed_offset = max(start - open_count, 0)
+        ledger_page_size = max(page_size * 2, 40)
+        closed_page = closed_offset // ledger_page_size + 1
         async with get_session_ctx() as session:
             repo = TradeRepository(session)
-            (
-                closed_rows,
-                closed_total,
-                _closed_page,
-                _closed_pages,
-                closed_ledger_source,
-            ) = await _dashboard_closed_position_ledger_rows(
-                session,
-                repo,
-                mode=mode,
-                page=1,
-                page_size=5000,
-                paginate=False,
+            # The combined view is ordered with current positions first and
+            # settled history second.  Read only the closed page intersecting
+            # the requested window; the total is returned separately by the
+            # read model and is never used for an in-memory full-list slice.
+            closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
+                await _dashboard_closed_position_ledger_rows(
+                    session,
+                    repo,
+                    mode=mode,
+                    page=closed_page,
+                    page_size=ledger_page_size,
+                    paginate=True,
+                )
             )
-        combined_positions = [*open_rows, *closed_rows]
-        display_total = len(combined_positions)
-        display_total_pages = (
-            max(1, (display_total + page_size - 1) // page_size) if display_total else 1
-        )
-        page = min(page, display_total_pages)
+        display_total = open_count + closed_total
+        display_total_pages = max(1, (display_total + page_size - 1) // page_size) if display_total else 1
+        page = min(requested_page, display_total_pages)
+        if page != requested_page and end > open_count:
+            # A request beyond the last page must be clamped before deriving
+            # the closed-ledger offset; otherwise the endpoint can return an
+            # empty page even though the clamped page has settled rows.
+            start = (page - 1) * page_size
+            end = start + page_size
+            closed_offset = max(start - open_count, 0)
+            closed_page = closed_offset // ledger_page_size + 1
+            async with get_session_ctx() as session:
+                repo = TradeRepository(session)
+                closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
+                    await _dashboard_closed_position_ledger_rows(
+                        session,
+                        repo,
+                        mode=mode,
+                        page=closed_page,
+                        page_size=ledger_page_size,
+                        paginate=True,
+                    )
+                )
         start = (page - 1) * page_size
+        end = start + page_size
+        open_slice = open_rows[start:min(end, open_count)]
+        closed_slice: list[dict[str, Any]] = []
+        if end > open_count:
+            local_offset = closed_offset % ledger_page_size
+            closed_slice = closed_rows[local_offset:local_offset + max(page_size - len(open_slice), 0)]
+        combined_positions = [*open_slice, *closed_slice]
         return {
-            "positions": combined_positions[start : start + page_size],
-            "count": len(combined_positions[start : start + page_size]),
-            "open_count": len(open_rows),
+            "positions": combined_positions,
+            "count": len(combined_positions),
+            "open_count": open_count,
             "closed_count": closed_total,
             "total": display_total,
             "page": page,
@@ -8489,6 +9115,8 @@ async def get_opening_funnel(
                 "window_hours": capped_hours,
                 "sample_limit": capped_limit,
                 "sampled_decisions": 0,
+                "data_state": "unknown",
+                "counts_are_observed": False,
                 "repair_cleanup_rows": 0,
                 "market_scans": 0,
                 "average_confidence": 0.0,
@@ -8757,6 +9385,12 @@ async def _build_opening_funnel_payload(
             "window_hours": capped_hours,
             "sample_limit": capped_limit,
             "sampled_decisions": len(rows),
+            "data_state": "observed" if total_scans else "no_candidate",
+            "counts_are_observed": True,
+            "sample_window": {
+                "from": since.isoformat(),
+                "to": datetime.now(UTC).isoformat(),
+            },
             "repair_cleanup_rows": repair_cleanup_rows,
             "market_scans": total_scans,
             "average_confidence": (
@@ -9213,6 +9847,7 @@ async def get_analysis_records(
         record = {
             "id": str(d.id),
             "decision_id": d.id,
+            "round_id": raw.get("round_id") or _safe_dict(raw.get("analysis_quality_contract")).get("round_id"),
             "analysis_type": d.analysis_type or analysis_type,
             "analysis_type_label": (
                 "持仓分析" if (d.analysis_type or analysis_type) == "position" else "市场分析"
@@ -9882,7 +10517,10 @@ async def get_profit_attribution(
         ]
         earliest_position_time = min(position_times, default=since)
         order_since = min(since, earliest_position_time or since) - timedelta(hours=2)
-        order_limit = max(max_rows * 20, 2000)
+        order_limit = min(
+            max(max_rows * 6, 500),
+            _DASHBOARD_PROFIT_ATTRIBUTION_MAX_ORDER_ROWS,
+        )
         order_result = await session.execute(
             select(Order)
             .where(
@@ -10080,7 +10718,7 @@ async def get_model_contribution_stats(
                 Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1,
             )
             .order_by(Order.filled_at.desc(), Order.created_at.desc())
-            .limit(max_rows * 3)
+            .limit(min(max_rows * 2, _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS))
         )
         orders = list(order_result.scalars().all())
         decision_ids = list({int(o.decision_id) for o in orders if o.decision_id})
@@ -10556,6 +11194,19 @@ async def get_expert_memories(
                 ),
             }
         )
+    complete_outcome_count = sum(
+        item.get("outcome_complete") is True and item.get("trade_fact_trusted") is True
+        for item in outcomes
+    )
+    shadow_sample_count = sum(
+        len(item.get("counterfactual_evidence") or []) for item in outcomes
+    )
+    production_evidence_eligible_count = complete_outcome_count
+    orphan_reflection_count = sum(
+        int(row.position_id or 0) > 0
+        and int(row.position_id or 0) not in outcome_by_position_id
+        for row in reflections
+    )
     return {
         "memories": memory_rows,
         "reflections": reflection_rows,
@@ -10564,7 +11215,11 @@ async def get_expert_memories(
         "authoritative_outcome_contract": {
             "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
             "loaded_count": len(outcomes),
-            "complete_count": sum(item.get("outcome_complete") is True for item in outcomes),
+            "complete_count": complete_outcome_count,
+            "pending_settlement_count": max(reflection_total - complete_outcome_count, 0),
+            "orphan_reflection_count": orphan_reflection_count,
+            "shadow_sample_count": shadow_sample_count,
+            "production_evidence_eligible_count": production_evidence_eligible_count,
             "actual_outcome_overrides_shadow": True,
             "shadow_production_weight": 0.0,
         },
@@ -10803,11 +11458,105 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     # storms by the dashboard heavy-cache single-flight lock.
     if not str(settings.database_url or "").startswith("postgresql"):
         return await _build_daily_pnl_records(mode=selected_mode, days=capped_days)
+    persisted = _load_dashboard_daily_pnl_snapshot(mode=selected_mode, days=capped_days)
+    if persisted is not None:
+        saved_at, payload = persisted
+        age_seconds = max((datetime.now(UTC) - saved_at).total_seconds(), 0.0)
+        if age_seconds > 30.0:
+            _start_dashboard_daily_pnl_refresh(selected_mode, capped_days)
+        result = copy.deepcopy(payload)
+        result["status"] = "stale" if age_seconds > 30.0 else result.get("status", "ok")
+        result["freshness"] = {
+            "state": "stale" if age_seconds > 30.0 else "fresh",
+            "is_stale": age_seconds > 30.0,
+            "age_seconds": round(age_seconds, 3),
+            "stale_after_seconds": 30.0,
+        }
+        result["source"] = "dashboard.daily_pnl_read_model"
+        result["snapshot_saved_at"] = saved_at.isoformat()
+        return sanitize_payload(result)
     return await _dashboard_heavy_cached(
         ("daily-pnl", selected_mode, capped_days),
         lambda: _build_daily_pnl_records(mode=selected_mode, days=capped_days),
         ttl_seconds=30.0,
     )
+
+
+def _dashboard_daily_pnl_snapshot_path(*, mode: str, days: int) -> Path | None:
+    if not str(settings.database_url or "").startswith("postgresql"):
+        return None
+    safe_mode = "live" if mode == "live" else "paper"
+    safe_days = max(1, min(int(days or 30), 180))
+    return settings.data_dir / "dashboard_read_models" / f"daily_pnl_{safe_mode}_{safe_days}.json"
+
+
+def _load_dashboard_daily_pnl_snapshot(
+    *, mode: str, days: int
+) -> tuple[datetime, dict[str, Any]] | None:
+    path = _dashboard_daily_pnl_snapshot_path(mode=mode, days=days)
+    if path is None or not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if int(document.get("version") or 0) != _DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION:
+            return None
+        saved_at = _as_utc_datetime(document.get("saved_at"))
+        payload = document.get("payload")
+        if saved_at is None or not isinstance(payload, dict):
+            return None
+        if (datetime.now(UTC) - saved_at).total_seconds() > _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS:
+            return None
+        return saved_at, payload
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _persist_dashboard_daily_pnl_snapshot(*, mode: str, days: int, payload: dict[str, Any]) -> None:
+    path = _dashboard_daily_pnl_snapshot_path(mode=mode, days=days)
+    if path is None:
+        return
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": _DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION,
+                    "saved_at": datetime.now(UTC).isoformat(),
+                    "payload": _bounded_dashboard_payload(payload, max_depth=7, max_items=120),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError as exc:
+        _log_dashboard_fallback("daily pnl read model persist failed", exc, mode=mode)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _start_dashboard_daily_pnl_refresh(mode: str, days: int) -> None:
+    key = (mode, days)
+    task = _dashboard_daily_pnl_refresh_tasks.get(key)
+    if task is not None and not task.done():
+        return
+
+    async def refresh() -> None:
+        try:
+            payload = await _build_daily_pnl_records(mode=mode, days=days)
+            _persist_dashboard_daily_pnl_snapshot(mode=mode, days=days, payload=payload)
+            _dashboard_heavy_cache_set(("daily-pnl", mode, days), payload)
+        except Exception as exc:
+            _log_dashboard_fallback("daily pnl read model refresh failed", exc, mode=mode)
+        finally:
+            _dashboard_daily_pnl_refresh_tasks.pop(key, None)
+
+    _dashboard_daily_pnl_refresh_tasks[key] = asyncio.create_task(refresh())
 
 
 async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
@@ -10903,13 +11652,14 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             .where(
                 Order.execution_mode == selected_mode,
                 Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                Order.created_at >= start_utc,
             )
             .order_by(
                 Order.filled_at.desc().nullslast(),
                 Order.created_at.desc(),
                 Order.id.desc(),
             )
-            .limit(50000)
+            .limit(_DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS)
         )
         order_rows = list(order_result.scalars().all())
 
@@ -11240,7 +11990,7 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             )
         ]
 
-    return {
+    result_payload = {
         "mode": selected_mode,
         "timezone": "Asia/Shanghai",
         "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
@@ -11250,10 +12000,22 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             "phase3" if equity_series_complete else "first_observed_okx_snapshot"
         ),
         "pnl_source": "okx_equity_snapshots_and_okx_position_ledger",
+        "read_scope": {
+            "order_window_start": start_utc.isoformat(),
+            "order_scan_limit": _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS,
+            "order_scan_truncated": len(order_rows) >= _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS,
+            "aggregation": "bounded_time_window",
+        },
         "start_date": start_day.isoformat(),
         "end_date": today_local.isoformat(),
         "records": [records[key] for key in sorted(records.keys(), reverse=True)],
     }
+    _persist_dashboard_daily_pnl_snapshot(
+        mode=selected_mode,
+        days=days,
+        payload=result_payload,
+    )
+    return result_payload
 
 
 def _daily_pnl_ledger_row_has_okx_realized_pnl(row: dict[str, Any]) -> bool:

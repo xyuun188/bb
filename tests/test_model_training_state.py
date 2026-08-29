@@ -84,6 +84,7 @@ def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
         assert row["state"] == "succeeded"
         assert row["last_successful_training_at"] == now[0].isoformat()
         assert row["sample_cursor"] == {"shadow": 37655, "trade": 341}
+        assert row["last_run_id"] == run_id
         assert row["last_result"]["artifact_persisted"] is True
         assert [event["event"] for event in row["history"]] == ["started", "succeeded"]
 

@@ -5,22 +5,28 @@
   let refreshSequence = 0;
   let refreshInFlight = null;
   const requestTimeoutMs = Object.freeze({
-    ml: 30_000, registry: 45_000, scheduler: 30_000,
+    observability: 30_000, ml: 30_000, registry: 45_000, scheduler: 30_000,
     data: 45_000, strategy: 20_000, decisions: 30_000,
   });
   const urls = {
+    // One read-only snapshot replaces the old ML -> registry -> scheduler
+    // cascade.  Legacy URLs remain documented for older deployments but are
+    // intentionally not fetched by this page.
+    observability: '/api/model-observability/snapshot',
     ml: '/api/ml-signal/status',
     registry: '/api/model-training/registry',
     scheduler: '/api/model-training/scheduler',
     data: '/api/data-collection/status?include_feature_coverage=false',
+    continuous: '/api/continuous-observation/snapshot',
     // The strategy view is diagnostic only; a bounded recent window keeps it
     // from competing with trading/analysis work during page refreshes.
     strategy: '/api/strategy-learning?hours=24&limit=50&detail=summary',
     decisions: '/api/analysis-records?limit=12&page=1',
   };
   const endpointLabels = {
+    observability: '模型与专家观察',
     ml: '本地 ML 状态', registry: '模型注册表', scheduler: '训练调度', data: '训练数据治理',
-    strategy: '策略学习', decisions: '最近分析',
+    strategy: '策略学习', decisions: '最近分析', continuous: '连续观察',
   };
   const reasonText = Object.freeze({
     no_model: '尚未注册当前模型 Artifact',
@@ -237,6 +243,15 @@
     const baseline = ml.no_model_baseline || ml.baseline || {};
     const modelSummary = registry.summary || {};
     const contributionStatus = registry.contribution_performance_status || {};
+    const continuous = unwrap(payloads.continuous);
+    const continuousWindows = continuous.windows && typeof continuous.windows === 'object' ? continuous.windows : {};
+    const continuousText = ['24', '72'].map((hours) => {
+      const item = continuousWindows[hours] || {};
+      if (item.status === 'passed') return `${hours}小时已通过`;
+      if (item.status === 'blocked') return `${hours}小时已阻断`;
+      if (item.status === 'observing') return `${hours}小时观察中 ${fmt(item.elapsed_hours, 1)} / ${hours}`;
+      return `${hours}小时尚未启动`;
+    }).join('；');
     const schedulerState = scheduler.models || scheduler.schedulers || {};
     const schedulerRows = Object.values(schedulerState).filter(item => item && typeof item === 'object');
     const lastResult = schedulerRows.map(item => item.last_result || {}).find(item => Object.keys(item).length) || {};
@@ -254,6 +269,7 @@
       ['模拟盘权限', ml.paper_trading_permission === true ? '允许' : '未允许'],
       ['实盘权限', ml.live_trading_permission === true ? '允许' : '未晋级'],
       ['数据时间', ml.trained_at || ml.checked_at || '未提供'],
+      ['24/72 小时观察', continuousText],
     ];
     container.innerHTML = values.map(([label, value]) => evidenceItem(label, value)).join('');
     renderTrainingComparison(ml, registry);
@@ -537,7 +553,9 @@
   }
 
   function renderEndpoint(key) {
-    if (key === 'ml') {
+    if (key === 'observability') {
+      renderOverview(); renderReadiness(); renderModels(); renderTrainingEvidence(); renderScheduler();
+    } else if (key === 'ml') {
       renderOverview(); renderReadiness();
       if (payloads.registry) renderModels();
     } else if (key === 'registry') {
@@ -554,6 +572,8 @@
       renderStrategies();
     } else if (key === 'decisions') {
       renderDecisions();
+    } else if (key === 'continuous') {
+      renderTrainingEvidence();
     }
   }
 
@@ -568,7 +588,7 @@
     } else if (key === 'registry') {
       $('#model-table').innerHTML = `<tr><td colspan="8" class="empty">${esc(text)}</td></tr>`;
     } else {
-      const containers = { scheduler: '#scheduler', data: '#data-quality', strategy: '#strategies', decisions: '#recent-decisions' };
+      const containers = { observability: '#model-readiness', scheduler: '#scheduler', data: '#data-quality', strategy: '#strategies', decisions: '#recent-decisions' };
       const container = $(containers[key]);
       if (container) {
         container.classList.add('empty');
@@ -602,11 +622,19 @@
     const sequence = ++refreshSequence;
     setState('正在刷新');
     $('#error-text').hidden = true;
-    const entries = Object.entries(urls);
+    const entries = Object.entries(urls).filter(([key]) => ['observability', 'data', 'strategy', 'decisions', 'continuous'].includes(key));
     const results = await Promise.allSettled(entries.map(async ([key, url]) => {
       const value = await fetchJson(url, requestTimeoutMs[key] || 30_000);
       if (sequence === refreshSequence) {
         payloads[key] = value;
+        if (key === 'observability') {
+          const snapshot = unwrap(value);
+          const sections = snapshot.sections && typeof snapshot.sections === 'object' ? snapshot.sections : {};
+          payloads.ml = sections.local_ml || {};
+          payloads.localAITools = sections.local_ai_tools || {};
+          payloads.registry = snapshot.registry || {};
+          payloads.scheduler = snapshot.scheduler || {};
+        }
         delete requestErrors[key];
         renderEndpoint(key);
       }

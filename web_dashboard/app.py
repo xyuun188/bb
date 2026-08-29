@@ -7,17 +7,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from core.safe_output import safe_error_text
+from services.observability_contract import freshness_payload, iso_timestamp
 from web_dashboard.api.auth import dashboard_login_page_html
 from web_dashboard.api.router import api_router
 from web_dashboard.api.security import (
@@ -40,6 +43,35 @@ PUBLIC_AUTH_PATHS = {
     "/api/auth/logout",
 }
 DASHBOARD_API_CONCURRENCY_LIMIT = 24
+DASHBOARD_API_RESPONSE_SANITIZE_MAX_BYTES = 512 * 1024
+DASHBOARD_API_POOL_LIMITS = {
+    "light": 12,
+    "standard": 8,
+    "heavy": 2,
+}
+DASHBOARD_API_POOL_WAIT_SECONDS = {
+    "light": 1.0,
+    "standard": 0.5,
+    "heavy": 0.15,
+}
+_HEAVY_API_PATH_MARKERS = (
+    "/system-audit/",
+    "/data-collection/status",
+    "/strategy-learning",
+    "/profit-attribution",
+    "/model-contribution/",
+    "/model-training/registry",
+    "/training-effectiveness/",
+    "/expert-memories",
+    "/shadow-backtests",
+    "/dashboard/daily-pnl",
+)
+_LIGHT_API_PATH_MARKERS = (
+    "/health/",
+    "/auth/",
+    "/dashboard/summary",
+    "/dashboard/market",
+)
 
 # Global WebSocket manager
 ws_manager = WebSocketManager()
@@ -106,6 +138,41 @@ async def _release_dashboard_api_slot(app: FastAPI) -> None:
         app.state.dashboard_api_inflight = max(app.state.dashboard_api_inflight - 1, 0)
 
 
+def _dashboard_api_pool(path: str) -> str:
+    normalized = str(path or "").lower()
+    if any(marker in normalized for marker in _HEAVY_API_PATH_MARKERS):
+        return "heavy"
+    if any(marker in normalized for marker in _LIGHT_API_PATH_MARKERS):
+        return "light"
+    return "standard"
+
+
+async def _acquire_dashboard_api_pool(app: FastAPI, pool_name: str) -> bool:
+    semaphore = app.state.dashboard_api_pools[pool_name]
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(),
+            timeout=DASHBOARD_API_POOL_WAIT_SECONDS[pool_name],
+        )
+    except TimeoutError:
+        return False
+    return True
+
+
+def _response_from_body(response: Response, body: bytes) -> Response:
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in {"content-length", "content-type"}
+    }
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=response.media_type,
+    )
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI Crypto Trading System",
@@ -116,6 +183,9 @@ def create_app() -> FastAPI:
     app.state.dashboard_api_concurrency_limit = DASHBOARD_API_CONCURRENCY_LIMIT
     app.state.dashboard_api_inflight = 0
     app.state.dashboard_api_concurrency_lock = asyncio.Lock()
+    app.state.dashboard_api_pools = {
+        name: asyncio.Semaphore(limit) for name, limit in DASHBOARD_API_POOL_LIMITS.items()
+    }
 
     app.add_middleware(
         CORSMiddleware,
@@ -151,28 +221,63 @@ def create_app() -> FastAPI:
                         headers=getattr(exc, "headers", None),
                     )
 
+        request_started = time.perf_counter()
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        pool_name = _dashboard_api_pool(request.url.path)
+        pool_acquired = False
         api_slot_acquired = False
         if _request_uses_dashboard_api_slot(request.url.path):
+            pool_acquired = await _acquire_dashboard_api_pool(request.app, pool_name)
+            if not pool_acquired:
+                return JSONResponse(
+                    content={
+                        "detail": "Dashboard read budget is busy; retry shortly.",
+                        "status": "deferred",
+                        "degraded_reason": f"{pool_name}_pool_saturated",
+                        "request_id": request_id,
+                    },
+                    status_code=503,
+                    headers={"Retry-After": "2", "X-Request-ID": request_id},
+                )
             api_slot_acquired = await _try_acquire_dashboard_api_slot(request.app)
             if not api_slot_acquired:
+                request.app.state.dashboard_api_pools[pool_name].release()
+                pool_acquired = False
                 return JSONResponse(
-                    content={"detail": "Dashboard is busy; retry shortly."},
+                    content={
+                        "detail": "Dashboard is busy; retry shortly.",
+                        "status": "deferred",
+                        "degraded_reason": "global_dashboard_pool_saturated",
+                        "request_id": request_id,
+                    },
                     status_code=503,
-                    headers={"Retry-After": "2"},
+                    headers={"Retry-After": "2", "X-Request-ID": request_id},
                 )
 
         try:
             response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Request-Duration-Ms"] = str(
+                round((time.perf_counter() - request_started) * 1000, 3)
+            )
+            response.headers["X-Dashboard-Read-Pool"] = pool_name
             content_type = response.headers.get("content-type", "")
             if not request.url.path.startswith("/api") or "application/json" not in content_type:
                 return response
-            body = b""
+            body = bytearray()
+            oversized = False
             async for chunk in response.body_iterator:
-                body += chunk
+                body.extend(chunk)
+                if len(body) > DASHBOARD_API_RESPONSE_SANITIZE_MAX_BYTES:
+                    oversized = True
             if not body:
                 return response
+            if oversized:
+                # Large lists are already bounded by their endpoint.  Avoid a
+                # second full JSON parse/serialization pass in the middleware.
+                return _response_from_body(response, bytes(body))
             try:
-                payload = json.loads(body)
+                payload = json.loads(bytes(body))
             except Exception as exc:
                 logger.debug(
                     "dashboard JSON sanitize skipped invalid payload",
@@ -181,8 +286,23 @@ def create_app() -> FastAPI:
                     error=type(exc).__name__,
                 )
                 return JSONResponse(
-                    content=body.decode("utf-8", errors="replace"),
+                    content=bytes(body).decode("utf-8", errors="replace"),
                     status_code=response.status_code,
+                )
+            if isinstance(payload, dict) and not _is_public_auth_path(request.url.path):
+                # Keep one minimum provenance contract across all dashboard
+                # readers without overwriting endpoint-specific values.
+                payload.setdefault("request_id", request_id)
+                payload.setdefault("checked_at", iso_timestamp())
+                payload.setdefault("source", request.url.path)
+                payload.setdefault("status", "ok")
+                payload.setdefault(
+                    "degraded_reason",
+                    payload.get("error") or payload.get("reason"),
+                )
+                payload.setdefault(
+                    "freshness",
+                    freshness_payload(checked_at=payload.get("checked_at")),
                 )
             headers = {
                 key: value
@@ -197,6 +317,8 @@ def create_app() -> FastAPI:
         finally:
             if api_slot_acquired:
                 await _release_dashboard_api_slot(request.app)
+            if pool_acquired:
+                request.app.state.dashboard_api_pools[pool_name].release()
 
     app.include_router(api_router, prefix="/api")
 

@@ -38,6 +38,7 @@ from services.ml_signal_service import (
     MODEL_TRAINING_STATE_STORE,
 )
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS
+from services.observability_contract import freshness_payload
 from services.okx_training_gate import okx_training_refresh_gate
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -700,8 +701,9 @@ async def _training_governance_snapshot(
     try:
         sample_limit = max(int(GOVERNANCE_SNAPSHOT_SAMPLE_LIMIT), 1)
         epoch_started_at = load_training_epoch_start()
+        scheduler_state = MODEL_TRAINING_STATE_STORE.read()
         if trade_count is None:
-            trade_count = _trade_sample_count_from_status(MODEL_TRAINING_STATE_STORE.read())
+            trade_count = _trade_sample_count_from_status(scheduler_state)
         if trade_count is None:
             trade_count = await _completed_training_trade_count()
         async with get_session_ctx() as session:
@@ -831,6 +833,33 @@ async def _training_governance_snapshot(
         }
         local_ai_report = dict(shadow_report)
         local_ai_report["trade_sample_count"] = trade_count
+        model_evidence: dict[str, dict[str, Any]] = {}
+        scheduler_models = scheduler_state.get("models") if isinstance(scheduler_state, dict) else {}
+        for model_id, row in (scheduler_models.items() if isinstance(scheduler_models, dict) else []):
+            if not isinstance(row, dict):
+                continue
+            result = row.get("last_result") if isinstance(row.get("last_result"), dict) else {}
+            artifact_fingerprint = (
+                result.get("artifact_sha256")
+                or result.get("artifact_fingerprint")
+                or row.get("artifact_sha256")
+                or row.get("artifact_fingerprint")
+                or result.get("training_input_fingerprint")
+            )
+            model_evidence[str(model_id)] = {
+                "state": row.get("state"),
+                "run_id": row.get("active_run_id") or row.get("last_run_id"),
+                "last_started_at": row.get("last_started_at"),
+                "last_finished_at": row.get("last_finished_at"),
+                "next_check_at": row.get("next_check_at"),
+                "sample_cursor": row.get("sample_cursor") or row.get("active_sample_cursor") or {},
+                "artifact_fingerprint": artifact_fingerprint,
+                "artifact_persisted": result.get("artifact_persisted"),
+                "quality_report": result.get("quality_report") if isinstance(result.get("quality_report"), dict) else {},
+                "governance_report": result.get("governance_report") if isinstance(result.get("governance_report"), dict) else {},
+                "resource_failure_count": int(row.get("resource_failure_count") or 0),
+                "resource_circuit_open_until": row.get("resource_circuit_open_until"),
+            }
         return {
             "status": "ok",
             "training_policy": "current_training_epoch_only",
@@ -854,6 +883,14 @@ async def _training_governance_snapshot(
                 "local_ai_tools",
                 "vector_memory_reindex",
             ],
+            "governance_evidence": {
+                "scheduler_state_version": scheduler_state.get("version") if isinstance(scheduler_state, dict) else None,
+                "scheduler_status": scheduler_state.get("status") if isinstance(scheduler_state, dict) else "missing",
+                "models": model_evidence,
+                "sample_cursor_source": "model_training_scheduler_state",
+                "artifact_fingerprint_source": "last_result_or_registry_metadata",
+                "quality_report_source": "last_result.quality_report",
+            },
         }
     except Exception as exc:
         return {
@@ -1265,10 +1302,18 @@ async def _build_data_collection_status(
             "crypto_feature_coverage": feature_coverage,
         }
     )
+    checked_at = datetime.now(UTC)
     payload = {
-        "checked_at": datetime.now(UTC).isoformat(),
+        "checked_at": checked_at.isoformat(),
         "status": overall_status,
         "degraded_sections": degraded_sections,
+        "source": "dashboard.data_collection",
+        "degraded_reason": ",".join(degraded_sections) or None,
+        "freshness": freshness_payload(
+            checked_at=checked_at,
+            stale_after_seconds=STATUS_CACHE_TTL_SECONDS,
+        ),
+        "observability_version": "2026-08-29.observability.v1",
         "config": settings_payload["config"],
         "sources": _collection_sources_summary(),
         "stats": source_stats,
@@ -1325,9 +1370,19 @@ def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str,
     """Return a complete non-error shape while the first production snapshot warms."""
 
     settings_payload = _data_collection_settings_payload()
+    checked_at = datetime.now(UTC)
     payload = {
-        "checked_at": datetime.now(UTC).isoformat(),
+        "checked_at": checked_at.isoformat(),
         "status": "warming",
+        "source": "dashboard.data_collection",
+        "degraded_reason": "initial_refresh_in_progress",
+        "freshness": {
+            "state": "warming",
+            "is_stale": True,
+            "age_seconds": 0.0,
+            "stale_after_seconds": STATUS_CACHE_TTL_SECONDS,
+        },
+        "observability_version": "2026-08-29.observability.v1",
         "config": settings_payload["config"],
         "sources": _collection_sources_summary(),
         "stats": {"news": {}, "social": {}, "market": {}},

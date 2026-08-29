@@ -186,6 +186,15 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "minimum_train_sample_count",
         "minimum_train_decision_group_count",
         "artifact_persisted",
+        "artifact_sha256",
+        "artifact_fingerprint",
+        "artifact_version",
+        "model_version",
+        "model_stage",
+        "promotion_flow",
+        "sample_cursor",
+        "quality_report",
+        "governance_report",
         "readiness_state",
         "live_ml_ready",
         "training_input_fingerprint",
@@ -198,7 +207,9 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         value = payload.get(key)
         if value is None:
             continue
-        if isinstance(value, str):
+        if isinstance(value, dict) and key in {"quality_report", "governance_report", "metrics", "sample_cursor"}:
+            summary[key] = value
+        elif isinstance(value, str):
             summary[key] = value[:1000]
         elif isinstance(value, (bool, int, float)):
             summary[key] = value
@@ -630,6 +641,7 @@ class ModelTrainingStateStore:
                         "last_finished_at": _iso(now)
                         if started or failed
                         else row.get("last_finished_at"),
+                        "last_run_id": run_id,
                         "last_result": summary,
                         "last_error": error or None,
                         "next_check_at": _iso(effective_next_check_at),

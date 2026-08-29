@@ -92,6 +92,16 @@ def _fee_after_evaluation(
         "profit_factor": (
             round(profit_factor, 6) if profit_factor is not None else None
         ),
+        "return_lcb_pct": _first_present(
+            evidence.get("return_lcb_pct"), evidence.get("return_lcb")
+        ),
+        "max_drawdown": _first_present(
+            evidence.get("max_drawdown"), evidence.get("max_drawdown_pct")
+        ),
+        "out_of_sample": _first_present(
+            evidence.get("out_of_sample"), evidence.get("sample_scope")
+        ),
+        "long_short_split": evidence.get("long_short_split"),
     }
 
 
@@ -154,6 +164,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     diagnostic_timeout = str(status.get("status") or "") == "timeout"
     live = status.get("live_ml_ready") is True
     readiness_report = _safe_dict(status.get("readiness"))
+    metrics = _safe_dict(readiness_report.get("metrics"))
     readiness = str(
         readiness_report.get("state")
         or status.get("readiness_state")
@@ -187,6 +198,25 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         ),
         "live_ml_ready": live,
         "quality_state": "diagnostic_timeout" if diagnostic_timeout else readiness,
+        "return_lcb_pct": _first_present(
+            metrics.get("return_lcb_pct"),
+            metrics.get("top_long_return_lcb_pct"),
+            metrics.get("top_short_return_lcb_pct"),
+        ),
+        "profit_factor": _first_present(
+            metrics.get("profit_factor"),
+            metrics.get("top_long_profit_factor"),
+            metrics.get("top_short_profit_factor"),
+        ),
+        "max_drawdown": _first_present(
+            metrics.get("max_drawdown"), metrics.get("max_drawdown_pct")
+        ),
+        "out_of_sample": _safe_dict(status.get("walk_forward_report")).get("status")
+        or status.get("evaluation_status"),
+        "long_short_split": {
+            "long": metrics.get("top_long_return_lcb_pct"),
+            "short": metrics.get("top_short_return_lcb_pct"),
+        },
         "blocking_reasons": (
             ["status_query_timeout"]
             if diagnostic_timeout
@@ -402,6 +432,28 @@ def _specialist_rows(
                 "profit_factor": report.get("profit_factor"),
                 "authoritative_profit_factor": report.get(
                     "authoritative_profit_factor"
+                ),
+                "return_lcb_pct": _first_present(
+                    report.get("authoritative_return_lcb_pct"),
+                    report.get("return_lcb_pct"),
+                    report.get("avg_shadow_return_after_all_cost_pct"),
+                ),
+                "max_drawdown": _first_present(
+                    report.get("authoritative_max_drawdown"),
+                    report.get("max_drawdown"),
+                    report.get("max_drawdown_pct"),
+                ),
+                "out_of_sample": _first_present(
+                    report.get("out_of_sample"),
+                    report.get("sample_scope"),
+                    report.get("evaluation_mode"),
+                ),
+                "long_short_split": _first_present(
+                    report.get("long_short_split"),
+                    {
+                        "long": report.get("authoritative_long_return_lcb_pct"),
+                        "short": report.get("authoritative_short_return_lcb_pct"),
+                    },
                 ),
                 "tail_loss_count": _safe_int(report.get("tail_loss_count")),
                 "authoritative_tail_loss_count": _safe_int(

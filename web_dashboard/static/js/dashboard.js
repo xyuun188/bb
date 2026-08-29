@@ -610,7 +610,7 @@ function recoverDashboardSummaryPolling() {
 
 async function fetchPnlHistory() {
     const mode = state.mode || 'paper';
-    const data = await fetchJSON(`/api/dashboard/pnl-history?mode=${mode}&_=${Date.now()}`);
+    const data = await fetchJSON(`/api/dashboard/pnl-history?mode=${mode}`);
     if (!data || !data.history || !window._charts) return;
     window._charts.updatePnLChart(data.history);
 }
@@ -622,7 +622,7 @@ async function fetchDailyPnlRecords() {
     }
     const days = Number(document.getElementById('daily-pnl-days')?.value || 30);
     const mode = state.mode || 'paper';
-    const data = await fetchJSON(`/api/dashboard/daily-pnl?mode=${mode}&days=${days}&_=${Date.now()}`);
+    const data = await fetchJSON(`/api/dashboard/daily-pnl?mode=${mode}&days=${days}`);
     if (!data || !Array.isArray(data.records)) {
         if (tbody) {
             tbody.innerHTML = '<tr><td colspan="9" style="color:var(--red);text-align:center;padding:24px;">每日盈亏加载失败</td></tr>';
@@ -733,7 +733,7 @@ async function fetchTrades() {
 }
 
 async function fetchPositionTickerSnapshot() {
-    const data = await fetchJSON(`/api/dashboard/market?_=${Date.now()}`);
+    const data = await fetchJSON('/api/dashboard/market');
     if (!data) return;
     updateMarketData(data, state.accounts || []);
 }
@@ -11476,6 +11476,22 @@ function renderOpeningFunnel(data) {
 function renderOpeningFunnelSummary(data) {
     const el = document.getElementById('opening-funnel-summary');
     if (!el) return;
+    if (data.data_state === 'unknown' || data.counts_are_observed === false) {
+        el.innerHTML = `
+            <div class="opening-funnel-verdict opening-funnel-warn">
+                <strong>暂时无法判断开仓效果</strong>
+                <span>${escHtml(data.degraded_reason || data.detail || '数据采集或接口暂时不可用')}，页面不会把未知结果当成 0。</span>
+            </div>`;
+        return;
+    }
+    if (data.data_state === 'no_candidate') {
+        el.innerHTML = `
+            <div class="opening-funnel-verdict opening-funnel-muted">
+                <strong>最近窗口没有可用候选</strong>
+                <span>当前没有足够的市场分析样本，暂时不能评价开仓效果。</span>
+            </div>`;
+        return;
+    }
     const scans = Number(data.market_scans || 0);
     const signals = Number(data.stages?.ai_entry_signals || 0);
     const executed = Number(data.stages?.executed_entries || 0);
@@ -11511,7 +11527,7 @@ function renderOpeningFunnelStages(data) {
                 <div class="opening-funnel-stage-step">0${index + 1}</div>
                 <div class="opening-funnel-stage-head">
                     <span>${escHtml(label)}</span>
-                    <strong>${Number(value || 0)}</strong>
+                    <strong>${data.counts_are_observed === false ? '—' : Number(value || 0)}</strong>
                 </div>
                 <div class="opening-funnel-bar"><span style="width:${width}%;"></span></div>
                 <div class="opening-funnel-stage-desc">${escHtml(desc)}</div>
