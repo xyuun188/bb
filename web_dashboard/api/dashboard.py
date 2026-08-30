@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import re
@@ -151,6 +152,7 @@ _DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
+_DASHBOARD_PENDING_LEDGER_CACHE_TTL_SECONDS = 15.0
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 2
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS = 20000
@@ -476,6 +478,8 @@ async def _dashboard_heavy_cached(
 
 def _clear_dashboard_heavy_cache(*names: str) -> None:
     wanted = {name for name in names if name}
+    if "closed-position-ledger" in wanted:
+        wanted.add("pending-closed-position-ledger")
     if not wanted:
         _dashboard_heavy_cache.clear()
         return
@@ -4169,6 +4173,78 @@ async def _dashboard_pending_closed_position_rows(
     *,
     mode: str | None,
     model_names: tuple[str, ...] | None = None,
+    covered_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return pending settlement rows with short-lived read-model caching."""
+
+    # SQLite is used by local/tests and must always reflect the current
+    # transaction. The shared read-model cache is intended for the online
+    # PostgreSQL deployment where this endpoint is polled across requests.
+    if "postgresql" not in str(settings.database_url or ""):
+        return await _dashboard_pending_closed_position_rows_uncached(
+            session,
+            mode=mode,
+            model_names=model_names,
+            covered_rows=covered_rows,
+        )
+
+    cache_key = (
+        "pending-closed-position-ledger",
+        str(settings.database_url),
+        mode or "all",
+        tuple(model_names or ()),
+        _dashboard_pending_coverage_key(covered_rows),
+    )
+
+    async def build() -> list[dict[str, Any]]:
+        return await _dashboard_pending_closed_position_rows_uncached(
+            session,
+            mode=mode,
+            model_names=model_names,
+            covered_rows=covered_rows,
+        )
+
+    return await _dashboard_heavy_cached(
+        cache_key,
+        build,
+        ttl_seconds=_DASHBOARD_PENDING_LEDGER_CACHE_TTL_SECONDS,
+    )
+
+
+def _dashboard_pending_coverage_key(
+    covered_rows: list[dict[str, Any]] | None,
+) -> str:
+    """Build a compact cache discriminator for settled-row coverage."""
+
+    if not covered_rows:
+        return "none"
+    tokens: set[str] = set()
+    for row in covered_rows:
+        if not isinstance(row, dict):
+            continue
+        tokens.update(
+            f"close:{token}"
+            for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
+        )
+        tokens.update(
+            f"entry:{token}"
+            for token in _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
+        )
+        tokens.update(
+            f"position:{position_id}"
+            for position_id in row.get("position_ids", [])
+            if position_id is not None
+        )
+    digest = hashlib.sha256(",".join(sorted(tokens)).encode("utf-8")).hexdigest()
+    return f"{len(tokens)}:{digest}"
+
+
+async def _dashboard_pending_closed_position_rows_uncached(
+    session: Any,
+    *,
+    mode: str | None,
+    model_names: tuple[str, ...] | None = None,
+    covered_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build display-only rows for OKX-confirmed closes awaiting official settlement."""
     from sqlalchemy import or_, select
@@ -4265,6 +4341,57 @@ async def _dashboard_pending_closed_position_rows(
     }
     if not confirmed_order_ids:
         return []
+
+    # Only confirmed close orders can produce a visible pending-settlement row.
+    # Filtering before lifecycle grouping avoids the quadratic grouping cost for
+    # unrelated historical fragments that would be discarded below anyway.
+    pending_positions = [
+        position
+        for position in pending_positions
+        if _dashboard_split_exchange_order_ids(
+            getattr(position, "close_exchange_order_id", None)
+        )
+        & confirmed_order_ids
+    ]
+    if not pending_positions:
+        return []
+
+    if covered_rows:
+        covered_close_ids = {
+            token
+            for row in covered_rows
+            for token in _dashboard_split_exchange_order_ids(row.get("close_order_ids"))
+        }
+        covered_entry_ids = {
+            token
+            for row in covered_rows
+            for token in _dashboard_split_exchange_order_ids(row.get("entry_order_ids"))
+        }
+        covered_position_ids = {
+            int(position_id)
+            for row in covered_rows
+            for position_id in row.get("position_ids", [])
+            if position_id is not None
+        }
+        pending_positions = [
+            position
+            for position in pending_positions
+            if int(getattr(position, "id", 0) or 0) not in covered_position_ids
+            and not (
+                _dashboard_split_exchange_order_ids(
+                    getattr(position, "close_exchange_order_id", None)
+                )
+                & covered_close_ids
+            )
+            and not (
+                _dashboard_split_exchange_order_ids(
+                    getattr(position, "entry_exchange_order_id", None)
+                )
+                & covered_entry_ids
+            )
+        ]
+        if not pending_positions:
+            return []
 
     positions_by_id = {
         int(position.id): position
@@ -4464,7 +4591,11 @@ async def _dashboard_position_history_rows(
         }
         for row in settled_rows
     ]
-    pending_rows = await _dashboard_pending_closed_position_rows(session, mode=mode)
+    pending_rows = await _dashboard_pending_closed_position_rows(
+        session,
+        mode=mode,
+        covered_rows=settled_rows,
+    )
 
     pending_rows = _dashboard_filter_pending_settlement_rows(pending_rows, settled_rows)
     combined_rows = sorted(
@@ -11917,6 +12048,7 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             session,
             mode=selected_mode,
             model_names=EXECUTION_LEDGER_MODEL_NAMES,
+            covered_rows=closed_ledger_rows,
         )
         pending_settlement_rows = _dashboard_filter_pending_settlement_rows(
             pending_settlement_rows,

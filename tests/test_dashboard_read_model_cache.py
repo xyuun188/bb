@@ -173,6 +173,39 @@ async def test_closed_ledger_cold_memory_uses_persisted_snapshot_before_refresh(
 
 
 @pytest.mark.asyncio
+async def test_pending_settlement_read_model_is_cached_online(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("pending-closed-position-ledger")
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test/db")
+    builds = {"count": 0}
+
+    async def fake_build(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        builds["count"] += 1
+        return [{"row": builds["count"]}]
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_pending_closed_position_rows_uncached",
+        fake_build,
+    )
+
+    first = await dashboard._dashboard_pending_closed_position_rows(
+        object(),
+        mode="paper",
+    )
+    second = await dashboard._dashboard_pending_closed_position_rows(
+        object(),
+        mode="paper",
+    )
+
+    assert first == [{"row": 1}]
+    assert second == first
+    assert builds["count"] == 1
+    dashboard._clear_dashboard_heavy_cache("pending-closed-position-ledger")
+
+
+@pytest.mark.asyncio
 async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
