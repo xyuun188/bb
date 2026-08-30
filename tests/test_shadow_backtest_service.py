@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -694,6 +695,188 @@ async def test_shadow_backtest_quarantines_zero_turnover_robo_entry_fact(
 
     assert row.status == "quarantined"
     assert "entry:zero_notional_turnover" in row.note
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_market_fact_error_uses_bounded_price_fallback() -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=90,
+        decision_id=900,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.5)
+
+    async def broken_market_fact(_symbol: str) -> dict[str, Any]:
+        raise TimeoutError("market fact timeout")
+
+    service.latest_market_fact_provider = broken_market_fact
+
+    assert await service.update_due() == 1
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.5)
+    assert row.feature_snapshot["market_fact_contract"]["result_fact"]["source_interface"] == (
+        "legacy_price_fallback_after_market_fact_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_market_facts_are_deduplicated_per_symbol() -> None:
+    repo = _FakeRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=row_id,
+            decision_id=1000 + row_id,
+            model_name="ensemble_trader",
+            symbol="BTC/USDT",
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=10,
+            status="pending",
+            note="",
+            feature_snapshot={},
+        )
+        for row_id in (91, 92, 93)
+    ]
+    calls: list[str] = []
+    service = _service(repo, latest_price=101.0)
+
+    async def market_fact(symbol: str) -> dict[str, Any]:
+        calls.append(symbol)
+        await asyncio.sleep(0)
+        return _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS)
+
+    service.latest_market_fact_provider = market_fact
+
+    assert await service.update_due() == 3
+    assert calls == ["BTC/USDT"]
+    assert len(repo.completed) == 3
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_path_timeout_falls_back_to_endpoint_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=94,
+        decision_id=994,
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        decision_action="long",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.0)
+
+    async def slow_path(
+        _entry_fact: dict[str, Any],
+        _result_fact: dict[str, Any],
+    ) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {}
+
+    monkeypatch.setattr(
+        "services.shadow_backtest_service.SHADOW_RESULT_PATH_TIMEOUT_SECONDS",
+        0.001,
+    )
+    service.price_path_provider = slow_path
+
+    assert await service.update_due() == 1
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
+    assert row.feature_snapshot["market_fact_contract"]["assertions"][
+        "same_contract_price_path_verified"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_market_fact_batch_timeout_leaves_rows_for_next_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=95,
+        decision_id=995,
+        model_name="ensemble_trader",
+        symbol="SOL/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.0)
+
+    async def slow_market_fact(_symbol: str) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return _market_fact("SOL/USDT", 101.0, _RESULT_TIMESTAMP_MS)
+
+    monkeypatch.setattr(
+        "services.shadow_backtest_service.SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS",
+        0.001,
+    )
+    service.latest_market_fact_provider = slow_market_fact
+
+    assert await service.update_due() == 0
+    assert repo.completed == []
+    assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_batch_timeout_does_not_wait_for_stubborn_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=96,
+        decision_id=996,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.0)
+    cancelled = asyncio.Event()
+
+    async def stubborn_market_fact(_symbol: str) -> dict[str, Any]:
+        try:
+            await asyncio.sleep(30.0)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            cancelled.set()
+            return _market_fact("BTC/USDT", 101.0, _RESULT_TIMESTAMP_MS)
+        raise AssertionError("provider should not finish normally")
+
+    monkeypatch.setattr(
+        "services.shadow_backtest_service.SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS",
+        0.001,
+    )
+    service.latest_market_fact_provider = stubborn_market_fact
+
+    started = asyncio.get_running_loop().time()
+    assert await service.update_due() == 0
+    assert asyncio.get_running_loop().time() - started < 0.2
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    assert repo.completed == []
+    assert row.status == "pending"
 
 
 def test_shadow_backtest_side_label() -> None:

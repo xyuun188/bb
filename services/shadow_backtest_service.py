@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,6 +34,16 @@ logger = structlog.get_logger(__name__)
 SHADOW_BACKTEST_HORIZONS_MINUTES = (5, 15, 60, 240)
 SHADOW_LEVERAGE_SCENARIOS = (1, 2, 3, 5, 10)
 SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfactual.v1"
+# Shadow maintenance is deliberately bounded: it must make progress without
+# competing with the trading loop for the exchange client or event-loop time.
+SHADOW_RESULT_FACT_CONCURRENCY = 8
+SHADOW_RESULT_FACT_TIMEOUT_SECONDS = 3.0
+SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS = 6.0
+SHADOW_RESULT_COST_FACT_TIMEOUT_SECONDS = 5.0
+SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS = 6.0
+SHADOW_RESULT_PATH_CONCURRENCY = 8
+SHADOW_RESULT_PATH_TIMEOUT_SECONDS = 3.0
+SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS = 6.0
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
@@ -42,6 +53,41 @@ FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
 RepositoryFactory = Callable[[Any], Any]
 ExecutionCostFactsProvider = Callable[[str], Awaitable[dict[str, Any]]]
+
+
+def _consume_async_task(task: asyncio.Task[Any]) -> None:
+    """Drain a detached task so a slow provider cannot emit an unhandled error."""
+
+    try:
+        task.result()
+    except BaseException:
+        return
+
+
+async def _bounded_task_gather(
+    awaitables: Iterable[Awaitable[Any]],
+    *,
+    budget_seconds: float,
+) -> tuple[list[Any], bool]:
+    """Collect finished work without waiting for cancellation-resistant providers."""
+
+    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
+    if not tasks:
+        return [], False
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=max(float(budget_seconds or 0.0), 0.0),
+    )
+    for task in pending:
+        task.cancel()
+        task.add_done_callback(_consume_async_task)
+    results: list[Any] = []
+    for task in done:
+        try:
+            results.append(task.result())
+        except BaseException as exc:
+            results.append(exc)
+    return results, bool(pending)
 
 _SHADOW_TOOL_NAMES = (
     "profit_prediction",
@@ -641,9 +687,15 @@ class ShadowBacktestService:
                         for row in rows
                     }
                 )
-                for execution_mode in execution_modes:
+
+                async def fetch_execution_cost_facts(
+                    execution_mode: str,
+                ) -> tuple[str, dict[str, Any]]:
                     try:
-                        facts = await self.execution_cost_facts_provider(execution_mode)
+                        facts = await asyncio.wait_for(
+                            self.execution_cost_facts_provider(execution_mode),
+                            timeout=SHADOW_RESULT_COST_FACT_TIMEOUT_SECONDS,
+                        )
                     except Exception as exc:
                         logger.warning(
                             "shadow execution cost fact refresh failed",
@@ -651,46 +703,222 @@ class ShadowBacktestService:
                             error=safe_error_text(exc),
                         )
                         facts = {}
-                    execution_cost_facts[execution_mode] = (
-                        dict(facts) if isinstance(facts, dict) else {}
-                    )
+                    return execution_mode, dict(facts) if isinstance(facts, dict) else {}
 
-            # Price collection can wait on an exchange request.  Keep it outside the
+                cost_results, cost_timed_out = await _bounded_task_gather(
+                    (fetch_execution_cost_facts(mode) for mode in execution_modes),
+                    budget_seconds=SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS,
+                )
+                if cost_timed_out:
+                    logger.warning(
+                        "shadow execution cost fact batch timed out",
+                        mode_count=len(execution_modes),
+                        timeout_seconds=SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS,
+                    )
+                for item in cost_results:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        execution_mode, facts = item
+                        execution_cost_facts[str(execution_mode)] = (
+                            dict(facts) if isinstance(facts, dict) else {}
+                        )
+
+            # Price collection can wait on an exchange request. Keep it outside the
             # ORM context so low-priority shadow maintenance cannot exhaust the pool.
+            # Fetch each symbol once and in parallel; the old row-by-row loop made a
+            # 25-row batch exceed the 30-second trading-service maintenance budget.
             market_fact_cache: dict[str, dict[str, Any]] = {}
-            completions: dict[int, dict[str, Any]] = {}
+            symbols = {
+                self.symbol_normalizer(getattr(row, "symbol", ""))
+                or str(getattr(row, "symbol", "") or "")
+                for row in rows
+            }
+            symbols.discard("")
+            fact_semaphore = asyncio.Semaphore(max(1, SHADOW_RESULT_FACT_CONCURRENCY))
+
+            async def fallback_market_fact(
+                symbol: str,
+                *,
+                source: str,
+            ) -> dict[str, Any]:
+                if self.latest_price_provider is None:
+                    return {}
+                price = await asyncio.wait_for(
+                    self.latest_price_provider(symbol),
+                    timeout=SHADOW_RESULT_FACT_TIMEOUT_SECONDS,
+                )
+                return build_market_fact(
+                    symbol,
+                    {
+                        "last_price": price,
+                        "bid": price,
+                        "ask": price,
+                        "timestamp": datetime.now(UTC),
+                        "source": source,
+                        "source_endpoint": "legacy_latest_price_provider",
+                        "source_channel": "price_only",
+                    },
+                )
+
+            async def fetch_market_fact(symbol: str) -> tuple[str, dict[str, Any]]:
+                async with fact_semaphore:
+                    try:
+                        if self.latest_market_fact_provider is not None:
+                            fact = await asyncio.wait_for(
+                                self.latest_market_fact_provider(symbol),
+                                timeout=SHADOW_RESULT_FACT_TIMEOUT_SECONDS,
+                            )
+                        else:
+                            fact = await fallback_market_fact(
+                                symbol,
+                                source="legacy_price_only_observation",
+                            )
+                        normalized = dict(fact) if isinstance(fact, dict) else {}
+                        prices = normalized.get("prices")
+                        last_price = (
+                            self.float_parser(prices.get("last"), 0.0)
+                            if isinstance(prices, dict)
+                            else 0.0
+                        )
+                        # A websocket/cache price is a safe diagnostic fallback. The
+                        # resulting market-fact contract remains marked legacy or
+                        # incomplete and is quarantined from training as needed.
+                        if last_price <= 0 and self.latest_price_provider is not None:
+                            normalized = await fallback_market_fact(
+                                symbol,
+                                source="legacy_price_fallback_after_market_fact_timeout",
+                            )
+                        return symbol, normalized
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "shadow result market fact unavailable",
+                            symbol=symbol,
+                            error=safe_error_text(exc),
+                        )
+                        try:
+                            return symbol, await fallback_market_fact(
+                                symbol,
+                                source="legacy_price_fallback_after_market_fact_error",
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as fallback_exc:
+                            logger.warning(
+                                "shadow result market fact fallback unavailable",
+                                symbol=symbol,
+                                error=safe_error_text(fallback_exc),
+                            )
+                            return symbol, {}
+
+            if symbols:
+                fact_results, facts_timed_out = await _bounded_task_gather(
+                    (fetch_market_fact(symbol) for symbol in sorted(symbols)),
+                    budget_seconds=SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS,
+                )
+                if facts_timed_out:
+                    logger.warning(
+                        "shadow result market fact batch timed out",
+                        symbol_count=len(symbols),
+                        timeout_seconds=SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS,
+                    )
+                for item in fact_results:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        symbol, fact = item
+                        market_fact_cache[str(symbol)] = (
+                            dict(fact) if isinstance(fact, dict) else {}
+                        )
+
+            path_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
+            path_semaphore = asyncio.Semaphore(max(1, SHADOW_RESULT_PATH_CONCURRENCY))
+
+            async def fetch_path(
+                row: Any,
+                symbol: str,
+                entry_fact: dict[str, Any],
+                result_fact: dict[str, Any],
+            ) -> tuple[tuple[str, int, int], dict[str, Any]]:
+                entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
+                result_ms = int(result_fact.get("source_timestamp_ms") or 0)
+                cache_key = (symbol, entry_ms, result_ms)
+                async with path_semaphore:
+                    try:
+                        if self.price_path_provider is None:
+                            path = verify_market_fact_path(entry_fact, result_fact, [])
+                        else:
+                            path = await asyncio.wait_for(
+                                self.price_path_provider(entry_fact, result_fact),
+                                timeout=SHADOW_RESULT_PATH_TIMEOUT_SECONDS,
+                            )
+                        return cache_key, dict(path) if isinstance(path, dict) else {}
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "shadow native price path unavailable",
+                            symbol=symbol,
+                            shadow_backtest_id=getattr(row, "id", None),
+                            error=safe_error_text(exc),
+                        )
+                        return cache_key, verify_market_fact_path(entry_fact, result_fact, [])
+
+            path_tasks: list[Awaitable[tuple[tuple[str, int, int], dict[str, Any]]]] = []
+            path_task_rows: list[tuple[Any, str, dict[str, Any], dict[str, Any], tuple[str, int, int]]] = []
             for row in rows:
+                symbol = self.symbol_normalizer(row.symbol) or row.symbol
+                result_fact = market_fact_cache.get(symbol, {})
+                result_prices = (
+                    result_fact.get("prices")
+                    if isinstance(result_fact.get("prices"), dict)
+                    else {}
+                )
+                actual_price = self.float_parser(result_prices.get("last"), 0.0)
+                entry_price = self.float_parser(row.entry_price, 0.0)
+                if actual_price <= 0 or entry_price <= 0:
+                    continue
+                feature_snapshot = getattr(row, "feature_snapshot", None)
+                feature_snapshot = (
+                    dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
+                )
+                entry_fact = feature_snapshot.get("market_fact")
+                if not isinstance(entry_fact, dict):
+                    entry_fact = build_market_fact(
+                        symbol,
+                        {
+                            **feature_snapshot,
+                            "last_price": entry_price,
+                            "source": "legacy_shadow_entry_snapshot",
+                        },
+                        contract_spec=feature_snapshot.get("contract_spec"),
+                    )
+                    feature_snapshot["market_fact"] = entry_fact
+                entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
+                result_ms = int(result_fact.get("source_timestamp_ms") or 0)
+                cache_key = (symbol, entry_ms, result_ms)
+                path_task_rows.append((row, symbol, entry_fact, result_fact, cache_key))
+                if cache_key not in path_cache:
+                    path_tasks.append(fetch_path(row, symbol, entry_fact, result_fact))
+            if path_tasks:
+                path_results, paths_timed_out = await _bounded_task_gather(
+                    path_tasks,
+                    budget_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                )
+                if paths_timed_out:
+                    logger.warning(
+                        "shadow result price path batch timed out",
+                        path_count=len(path_tasks),
+                        timeout_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                    )
+                for item in path_results:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        cache_key, path = item
+                        path_cache[cache_key] = dict(path) if isinstance(path, dict) else {}
+
+            completions: dict[int, dict[str, Any]] = {}
+            for row, _symbol, entry_fact, result_fact, cache_key in path_task_rows:
                 row_id = int(getattr(row, "id", 0) or 0)
                 if row_id <= 0:
                     continue
-                symbol = self.symbol_normalizer(row.symbol) or row.symbol
-                if symbol not in market_fact_cache:
-                    if self.latest_market_fact_provider is not None:
-                        try:
-                            fact = await self.latest_market_fact_provider(symbol)
-                        except Exception as exc:
-                            logger.warning(
-                                "shadow result market fact unavailable",
-                                symbol=symbol,
-                                error=safe_error_text(exc),
-                            )
-                            fact = {}
-                    else:
-                        price = await self.latest_price_provider(symbol)
-                        fact = build_market_fact(
-                            symbol,
-                            {
-                                "last_price": price,
-                                "bid": price,
-                                "ask": price,
-                                "timestamp": datetime.now(UTC),
-                                "source": "legacy_price_only_observation",
-                                "source_endpoint": "legacy_latest_price_provider",
-                                "source_channel": "price_only",
-                            },
-                        )
-                    market_fact_cache[symbol] = dict(fact) if isinstance(fact, dict) else {}
-                result_fact = market_fact_cache.get(symbol, {})
                 result_prices = (
                     result_fact.get("prices")
                     if isinstance(result_fact.get("prices"), dict)
@@ -710,30 +938,10 @@ class ShadowBacktestService:
                 feature_snapshot = (
                     dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
                 )
-                entry_fact = feature_snapshot.get("market_fact")
-                if not isinstance(entry_fact, dict):
-                    entry_fact = build_market_fact(
-                        symbol,
-                        {
-                            **feature_snapshot,
-                            "last_price": entry_price,
-                            "source": "legacy_shadow_entry_snapshot",
-                        },
-                        contract_spec=feature_snapshot.get("contract_spec"),
-                    )
-                    feature_snapshot["market_fact"] = entry_fact
-                if self.price_path_provider is not None:
-                    try:
-                        price_path = await self.price_path_provider(entry_fact, result_fact)
-                    except Exception as exc:
-                        logger.warning(
-                            "shadow native price path unavailable",
-                            symbol=symbol,
-                            error=safe_error_text(exc),
-                        )
-                        price_path = verify_market_fact_path(entry_fact, result_fact, [])
-                else:
-                    price_path = verify_market_fact_path(entry_fact, result_fact, [])
+                feature_snapshot.setdefault("market_fact", entry_fact)
+                price_path = path_cache.get(cache_key) or verify_market_fact_path(
+                    entry_fact, result_fact, []
+                )
                 market_contract = build_shadow_market_fact_contract(
                     entry_fact,
                     result_fact,
