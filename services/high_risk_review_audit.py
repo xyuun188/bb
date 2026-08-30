@@ -25,12 +25,22 @@ class HighRiskReviewAuditService:
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
             result = await session.execute(
-                select(AIDecision)
+                # The audit only needs the review payload and a few identity
+                # fields.  Selecting the full decision row pulls large feature
+                # snapshots into memory and can make the read-only audit time
+                # out under normal production volume.
+                select(
+                    AIDecision.id,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.was_executed,
+                    AIDecision.raw_llm_response,
+                )
                 .where(AIDecision.created_at >= since)
                 .order_by(AIDecision.created_at.desc())
                 .limit(capped_limit)
             )
-        return summarize_high_risk_review(list(result.scalars().all()), hours=capped_hours)
+        return summarize_high_risk_review(list(result.mappings().all()), hours=capped_hours)
 
 
 def summarize_high_risk_review(decisions: list[Any], *, hours: int = 72) -> dict[str, Any]:

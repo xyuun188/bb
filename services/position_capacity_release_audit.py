@@ -226,6 +226,26 @@ class PositionCapacityReleaseAuditService:
                 ),
                 contracts[0] if contracts else {},
             )
+            primary = fragments[0] if fragments else None
+            # Keep persisted position facts visible when an older row has not
+            # received its management contract yet.  The contract still
+            # controls completeness, but missing JSON must not erase valid
+            # entry/current prices from the audit aggregate.
+            entry_price = _safe_float(management.get("entry_price")) or _safe_float(
+                getattr(primary, "entry_price", None)
+            )
+            current_price = _safe_float(management.get("current_price")) or _safe_float(
+                getattr(primary, "current_price", None)
+            )
+            entry_fee = _safe_float(management.get("entry_fee_usdt")) or _safe_float(
+                getattr(primary, "entry_fee", None)
+            )
+            stop_loss_price = _safe_float(management.get("stop_loss_price")) or _safe_float(
+                getattr(primary, "stop_loss_price", None)
+            )
+            take_profit_price = _safe_float(
+                management.get("take_profit_price")
+            ) or _safe_float(getattr(primary, "take_profit_price", None))
             local_quantity = sum(
                 abs(_safe_float(getattr(fragment, "quantity", None)))
                 for fragment in fragments
@@ -242,11 +262,11 @@ class PositionCapacityReleaseAuditService:
                 symbol=management.get("symbol") or getattr(fragments[0], "symbol", ""),
                 side=management.get("side") or getattr(fragments[0], "side", ""),
                 quantity=contract_quantity or local_quantity,
-                entry_price=_safe_float(management.get("entry_price")),
-                current_price=_safe_float(management.get("current_price")),
-                entry_fee=_safe_float(management.get("entry_fee_usdt")),
-                stop_loss_price=_safe_float(management.get("stop_loss_price")),
-                take_profit_price=_safe_float(management.get("take_profit_price")),
+                entry_price=entry_price,
+                current_price=current_price,
+                entry_fee=entry_fee,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
                 unrealized_pnl=sum(
                     _safe_float(getattr(fragment, "unrealized_pnl", None))
                     for fragment in fragments
@@ -318,6 +338,22 @@ class PositionCapacityReleaseAuditService:
             and sync_deadline is not None
             and datetime.now(UTC) <= sync_deadline
         )
+        # A newly-created local position can briefly be visible before the
+        # first OKX takeover refresh persists its prices and management
+        # contract.  Treat that narrow, evidence-free window as pending sync
+        # rather than a hard economics violation; once the grace period ends,
+        # the same row remains an incomplete position and blocks promotion.
+        initial_management_sync_pending = bool(
+            not economics_complete
+            and not management_contract
+            and quantity > 0
+            and (entry_price <= 0 or current_price <= 0 or notional <= 0)
+            and sync_deadline is not None
+            and datetime.now(UTC) <= sync_deadline
+        )
+        authoritative_entry_fact_sync_pending = (
+            authoritative_entry_fact_sync_pending or initial_management_sync_pending
+        )
         return {
             "id": int(getattr(position, "id", 0) or 0),
             "model_name": str(getattr(position, "model_name", "") or ""),
@@ -338,6 +374,11 @@ class PositionCapacityReleaseAuditService:
             "current_management_contract": management_contract,
             "authoritative_entry_fact_sync_pending": (
                 authoritative_entry_fact_sync_pending
+            ),
+            "authoritative_entry_fact_sync_pending_reason": (
+                "initial_position_management_sync"
+                if initial_management_sync_pending
+                else None
             ),
             "authoritative_entry_fact_sync_deadline_at": (
                 sync_deadline.isoformat()

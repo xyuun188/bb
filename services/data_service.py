@@ -79,7 +79,10 @@ INDICATOR_CACHED_READ_CONCURRENCY = max(
 )
 INDICATOR_CACHED_READ_TASK_LIMIT = 8
 INDICATOR_COMPUTE_CONCURRENCY = 1
-KLINE_PERSIST_CONCURRENCY = 2
+# K-line persistence is maintenance traffic, but a two-writer gate makes the
+# four-timeframe coverage wave fall behind the one-minute freshness budget.
+# Keep headroom for trading queries while allowing a refresh wave to drain.
+KLINE_PERSIST_CONCURRENCY = 4
 TICKER_PERSIST_CONCURRENCY = max(
     1,
     min(4, max(int(settings.database_pool_size or 1) // 8, 1)),

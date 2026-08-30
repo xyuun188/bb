@@ -510,6 +510,12 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
             "ON ai_decisions (model_name, analysis_type, symbol, created_at DESC, id DESC)",
         ),
         (
+            "idx_ai_decisions_market_learning_recent",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_market_learning_recent "
+            "ON ai_decisions (analysis_type, decision_learning_snapshot_version, "
+            "created_at DESC, id DESC)",
+        ),
+        (
             "idx_orders_okx_inst_id",
             "CREATE INDEX IF NOT EXISTS idx_orders_okx_inst_id ON orders (okx_inst_id)",
         ),

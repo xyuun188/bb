@@ -468,6 +468,7 @@ async def test_postgres_trade_fact_indexes_skip_existing_indexes(
             "idx_ai_decisions_recent_scan",
             "idx_ai_decisions_strategy_learning_recent",
             "idx_ai_decisions_market_selection",
+            "idx_ai_decisions_market_learning_recent",
             "idx_shadow_backtests_training_completed",
         }
     )
@@ -500,6 +501,10 @@ async def test_postgres_trade_fact_indexes_create_pending_entry_index(
     )
     assert any(
         "CREATE INDEX IF NOT EXISTS idx_ai_decisions_strategy_learning_recent" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "CREATE INDEX IF NOT EXISTS idx_ai_decisions_market_learning_recent" in statement
         for statement in fake_conn.statements
     )
     assert any(

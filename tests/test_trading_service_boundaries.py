@@ -630,6 +630,69 @@ async def test_okx_settlement_fact_sync_loop_counts_deferred_separately(
 
 
 @pytest.mark.asyncio
+async def test_okx_settlement_fact_sync_schedules_feedback_without_blocking_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._okx_settlement_fact_sync_last_started_at = None
+    service._okx_settlement_fact_sync_last_finished_at = None
+    service._okx_settlement_fact_sync_last_row = None
+    service._okx_settlement_fact_sync_last_error = None
+    service._okx_settlement_fact_sync_success_count = 0
+    service._okx_settlement_fact_sync_deferred_count = 0
+    service._okx_settlement_fact_sync_failure_count = 0
+    service._authoritative_outcome_feedback_task = None
+    service._authoritative_outcome_feedback_last_started_at = None
+    service._authoritative_outcome_feedback_last_finished_at = None
+    service._authoritative_outcome_feedback_last_result = None
+    service._authoritative_outcome_feedback_last_error = None
+    service._authoritative_outcome_feedback_scheduled_count = 0
+    service._authoritative_outcome_feedback_coalesced_count = 0
+    service.okx_settlement_fact_sync_interval_seconds = lambda: 60.0  # type: ignore[method-assign]
+    feedback_started = asyncio.Event()
+    feedback_release = asyncio.Event()
+
+    class FakeSettlementFactSync:
+        async def sync_once(self) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "position_history_inserted_count": 1,
+                "position_history_updated_count": 0,
+            }
+
+    class FakeExpertMemoryService:
+        async def backfill_trade_reflections(self, _mode: str) -> dict[str, Any]:
+            feedback_started.set()
+            await feedback_release.wait()
+            return {"status": "completed", "processed": 1}
+
+    service.okx_settlement_fact_sync_factory = lambda **_kwargs: FakeSettlementFactSync()
+    service.expert_memory_service = FakeExpertMemoryService()
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+
+    await service._okx_settlement_fact_sync_loop()
+
+    row = service._okx_settlement_fact_sync_last_row
+    assert row is not None
+    assert row["authoritative_outcome_feedback"]["status"] == "scheduled"
+    assert service._authoritative_outcome_feedback_scheduled_count == 1
+    await asyncio.wait_for(feedback_started.wait(), timeout=0.2)
+    feedback_release.set()
+    task = service._authoritative_outcome_feedback_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=0.2)
+    assert service._authoritative_outcome_feedback_last_result == {
+        "status": "completed",
+        "processed": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4037,6 +4100,39 @@ async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_c
     assert diagnostics["execution_verified_selected_count"] == 1
     assert diagnostics["analysis_only_selected_count"] == 1
     await asyncio.sleep(0.06)
+
+
+@pytest.mark.asyncio
+async def test_market_shortlist_reuses_initialized_okx_executor_without_initialization_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 1,
+        "ranked_symbol_sample": [{"symbol": "BTC/USDT", "selected": True}],
+    }
+    service._okx_paper = object()
+    service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT"}}
+    service._unavailable_entry_symbols_by_mode = {"paper": {}}
+    service._market_analysis_only_symbols = set()
+
+    async def fail_initialization(_mode: str) -> object:
+        raise AssertionError("market shortlist must reuse the initialized executor")
+
+    service._get_okx_executor_for_mode = fail_initialization
+    monkeypatch.setattr(
+        service,
+        "_schedule_market_instrument_availability_refresh",
+        lambda *_args, **_kwargs: None,
+    )
+
+    selected = await service._filter_entry_instrument_shortlist(
+        {"BTC/USDT": object()},
+        1,
+        "paper",
+    )
+
+    assert list(selected) == ["BTC/USDT"]
 
 
 @pytest.mark.asyncio

@@ -179,6 +179,12 @@ SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     "strategy_closed_loop": 60.0,
     "strategy_signal_root_cause": 60.0,
     "model_training": 180.0,
+    # These reports are read-only but can wait behind the bounded database
+    # audit pool while a fresh snapshot is being assembled.  Keep them inside
+    # the global 100s budget instead of turning a transient queue delay into a
+    # recurring deferred-audit card.
+    "high_risk_review_audit": 45.0,
+    "shadow_missed_opportunity": 45.0,
     "position_capacity_release": 100.0,
     "okx_trade_fact_integrity": OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS + 5.0,
     "production_source_health": 45.0,
@@ -1017,7 +1023,7 @@ def _audit_exception_card(section_key: str, exc: BaseException) -> dict[str, Any
     )
     fingerprint = _audit_exception_fingerprint(exc)
     return _audit_card(
-        f"system_audit_deferred:{hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()[:12]}",
+        f"system_audit_deferred:{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}",
         title,
         "warning",
         summary,
@@ -2416,10 +2422,26 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     authoritative_manual_review_count = int(authoritative_sync.get("manual_review_count") or 0)
     authoritative_repairable_count = int(authoritative_sync.get("repairable_count") or 0)
     authoritative_pull_available = bool(authoritative_sync.get("okx_pull_available"))
+    authoritative_cache = _safe_dict(authoritative_sync.get("cache"))
+    authoritative_cache_age = _safe_float(authoritative_cache.get("age_seconds"), float("inf"))
+    authoritative_degraded_runtime_clean = (
+        not authoritative_pull_available
+        and authoritative_cache.get("hit") is True
+        and authoritative_cache_age <= OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS
+        and runtime_entry_gate.get("entry_blocked") is False
+        and runtime_entry_gate.get("sync_status") == "ok"
+        and int(runtime_entry_gate.get("last_requires_attention_count") or 0) == 0
+        and daily_report.get("can_open_new_entries") is True
+        and daily_report.get("can_refresh_training") is True
+        and daily_report.get("requires_attention") is False
+    )
+    details["authoritative_degraded_runtime_clean"] = authoritative_degraded_runtime_clean
     if status == "ok" and unresolved_link_candidate_count > 0:
         status = "warning"
         warning_count = max(warning_count, 1)
-    if authoritative_issue_count or not authoritative_pull_available:
+    if authoritative_issue_count or (
+        not authoritative_pull_available and not authoritative_degraded_runtime_clean
+    ):
         if status == "ok":
             status = "warning"
         warning_count = max(warning_count, authoritative_issue_count or 1)
@@ -2441,6 +2463,8 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
         summary = "OKX 自动同步当前阻断新开仓；需先恢复 OKX/本地当前状态一致，再允许新增风险。"
     elif warning_count:
         summary = "发现 OKX/本地交易事实存在需要关注项；暂不应自动写历史数据。"
+    elif authoritative_degraded_runtime_clean:
+        summary = "OKX/本地交易事实当前一致；只读审计拉取短暂超时，运行态和日报已确认干净。"
     else:
         summary = "OKX 原始成交、订单和持仓口径在巡检窗口内一致。"
     return _audit_card(
@@ -3420,7 +3444,7 @@ async def _production_source_health_audit() -> dict[str, Any]:
     try:
         report = await ProductionSourceHealthService().report(
             hours=AUDIT_WINDOWS["strategy_hours"],
-            limit=5000,
+            limit=300,
             decision_interval_seconds=int(settings.decision_interval_seconds or 60),
         )
     except Exception as exc:

@@ -192,6 +192,26 @@ def test_capacity_audit_marks_stale_fee_fact_gap_incomplete() -> None:
     assert report["position_economics_incomplete_count"] == 1
 
 
+def test_capacity_audit_observes_new_position_before_management_refresh() -> None:
+    position = _position(
+        quantity=19_000.0,
+        entry_price=0.0,
+        current_price=0.0,
+        current_management_contract={},
+        created_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [])
+
+    assert report["position_economics_pending_count"] == 1
+    assert report["position_economics_incomplete_count"] == 0
+    pending = report["position_economics_pending"][0]
+    assert pending["authoritative_entry_fact_sync_pending"] is True
+    assert pending["authoritative_entry_fact_sync_pending_reason"] == (
+        "initial_position_management_sync"
+    )
+
+
 def test_capacity_audit_checks_fragmented_positions_as_one_net_position_group() -> None:
     contract = build_current_position_management_contract(
         {

@@ -22,6 +22,10 @@ from services.server_monitor_status import (
 DEFAULT_OBSERVATION_HOURS = 2
 DEFAULT_REPORT_MAX_AGE_SECONDS = 2 * 3600
 DEFAULT_SAMPLE_LIMIT = 800
+# A service restart temporarily clears the in-process OKX sync success marker.
+# During this short window a read-only audit timeout is expected to recover on
+# the next sync tick and must not be promoted to a hard post-resume blocker.
+RUNTIME_OKX_SYNC_WARMUP_SECONDS = 15 * 60
 
 ReportProvider = Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]
 
@@ -198,6 +202,19 @@ def _runtime_okx_sync_clean_for_entry(trading_runtime: dict[str, Any]) -> bool:
     return (_now() - success_at).total_seconds() <= stale_after
 
 
+def _runtime_okx_sync_warmup_active(trading_runtime: dict[str, Any]) -> bool:
+    """Return true only for a recently restarted, otherwise healthy runtime."""
+
+    runtime = _safe_dict(trading_runtime)
+    if not runtime.get("available") or not bool(runtime.get("running")):
+        return False
+    started_at = _parse_utc_datetime(runtime.get("started_at"))
+    if started_at is None:
+        return False
+    age = max((_now() - started_at).total_seconds(), 0.0)
+    return age <= RUNTIME_OKX_SYNC_WARMUP_SECONDS
+
+
 def evaluate_phase3_paper_resume_observation_inputs(
     *,
     sample_summary: dict[str, Any],
@@ -273,6 +290,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
         "unavailable",
     }
     runtime_okx_clean = _runtime_okx_sync_clean_for_entry(trading_runtime)
+    runtime_okx_warmup = _runtime_okx_sync_warmup_active(trading_runtime)
     current_okx_blocking_issues = [
         issue
         for issue in okx_blocking_issues
@@ -309,6 +327,24 @@ def evaluate_phase3_paper_resume_observation_inputs(
             )
         )
         passed.append("okx_runtime_authoritative_sync_clean_after_resume")
+    elif okx_audit_unhealthy and runtime_okx_warmup and not current_okx_blocking_issues:
+        warnings.append(
+            _warning(
+                "okx_authoritative_sync_warmup_after_runtime_restart",
+                (
+                    "OKX read-only audit briefly timed out after the paper service restart; "
+                    "the next runtime sync tick must establish fresh authoritative evidence."
+                ),
+                evidence={
+                    "status": okx_sync.get("status"),
+                    "fetch_errors": okx_sync.get("fetch_errors"),
+                    "error": okx_sync.get("error"),
+                    "runtime_started_at": trading_runtime.get("started_at"),
+                    "warmup_seconds": RUNTIME_OKX_SYNC_WARMUP_SECONDS,
+                },
+            )
+        )
+        passed.append("okx_authoritative_sync_warmup_after_runtime_restart")
     elif okx_audit_unhealthy:
         blockers.append(
             _blocker(
@@ -450,6 +486,7 @@ def evaluate_phase3_paper_resume_observation_inputs(
             "okx_blocking_issue_count": len(current_okx_blocking_issues),
             "okx_quarantined_issue_count": len(okx_quarantined_issues),
             "runtime_okx_sync_clean": runtime_okx_clean,
+            "runtime_okx_sync_warmup": runtime_okx_warmup,
             "specialist_report_age_seconds": (
                 None if specialist_age is None else round(specialist_age, 3)
             ),

@@ -260,6 +260,37 @@ def test_paper_resume_observation_blocks_on_okx_pull_timeout_when_runtime_is_not
     }
 
 
+def test_paper_resume_observation_warms_up_after_recent_runtime_restart() -> None:
+    okx = _okx_clean()
+    okx.update(
+        {
+            "status": "warning",
+            "okx_pull_available": False,
+            "fetch_errors": ["positions: TimeoutError"],
+            "error": "TimeoutError",
+        }
+    )
+    runtime = _trading_runtime_clean()
+    runtime["started_at"] = datetime.now(UTC).isoformat()
+    runtime["okx_authoritative_sync"]["status"] = "pending"
+    runtime["okx_authoritative_sync"]["last_success_age_seconds"] = None
+    runtime["okx_authoritative_sync"]["last_success_at"] = None
+
+    report = evaluate_phase3_paper_resume_observation_inputs(
+        **_ready_inputs(
+            okx_authoritative_sync=okx,
+            trading_runtime_status=runtime,
+        )
+    )
+
+    assert report["status"] == "warming_up"
+    assert report["blockers"] == []
+    assert report["summary"]["runtime_okx_sync_warmup"] is True
+    assert "okx_authoritative_sync_warmup_after_runtime_restart" in {
+        item["code"] for item in report["warnings"]
+    }
+
+
 def test_paper_resume_observation_does_not_use_fixed_sample_floors() -> None:
     report = evaluate_phase3_paper_resume_observation_inputs(
         **_ready_inputs(sample_summary=_samples(created_shadow_count=1, completed_shadow_count=0))

@@ -4463,6 +4463,103 @@ async def test_okx_trade_fact_integrity_warns_on_authoritative_sync_issues(
 
 
 @pytest.mark.asyncio
+async def test_okx_trade_fact_integrity_keeps_clean_runtime_ok_when_audit_pull_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTradeFactIntegrityService:
+        async def audit(self) -> dict[str, Any]:
+            return {
+                "read_only": True,
+                "status": "ok",
+                "checked_orders": 4,
+                "checked_positions": 2,
+                "issue_count": 0,
+                "critical_count": 0,
+                "warning_count": 0,
+                "issues": [],
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "OkxTradeFactIntegrityService",
+        lambda **_kwargs: FakeTradeFactIntegrityService(),
+    )
+
+    async def fake_collect_position_fact_link_scan_report(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            lookback_days=14,
+            candidate_link_count=0,
+            repairable_count=0,
+            manual_review_count=0,
+            classification_counts={},
+            scanned_position_count=2,
+            max_positions=300,
+            truncated=False,
+            diagnostics=[],
+        )
+
+    monkeypatch.setattr(
+        system_audit,
+        "collect_position_fact_link_scan_report",
+        fake_collect_position_fact_link_scan_report,
+    )
+    async def fake_okx_authoritative_sync_summary() -> dict[str, Any]:
+        return {
+            "status": "warning",
+            "read_only": True,
+            "audit_only": True,
+            "okx_pull_available": False,
+            "error": "TimeoutError",
+            "cache": {"hit": True, "age_seconds": 4.0, "ttl_seconds": 45.0},
+            "issue_count": 0,
+            "repairable_count": 0,
+            "manual_review_count": 0,
+            "okx_fill_order_count": 0,
+            "okx_position_count": 0,
+        }
+
+    monkeypatch.setattr(
+        system_audit,
+        "_okx_authoritative_sync_summary",
+        fake_okx_authoritative_sync_summary,
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_status_for_audit",
+        lambda: {
+            "available": True,
+            "running": True,
+            "heartbeat_age_seconds": 1.0,
+            "okx_authoritative_sync": {
+                "status": "ok",
+                "last_requires_attention_count": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_okx_daily_reconciliation_report_summary",
+        lambda: {
+            "available": True,
+            "status": "ok",
+            "stale": False,
+            "requires_attention": False,
+            "can_open_new_entries": True,
+            "can_refresh_training": True,
+            "entry_blocked": False,
+            "training_blocked": False,
+            "attention_buckets": {},
+        },
+    )
+
+    card = await system_audit._okx_trade_fact_integrity_audit()
+
+    assert card["status"] == "ok"
+    assert card["details"]["authoritative_degraded_runtime_clean"] is True
+    assert "运行态和日报已确认干净" in card["summary"]
+
+
+@pytest.mark.asyncio
 async def test_okx_trade_fact_integrity_surfaces_runtime_entry_gate_blocker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

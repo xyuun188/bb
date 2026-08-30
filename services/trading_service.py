@@ -108,6 +108,7 @@ from services.entry_strategy_mode import EntryStrategyModeContextPolicy
 from services.entry_suspicious_symbol import EntrySuspiciousSymbolPolicy
 from services.entry_symbol_universe import EntrySymbolUniversePolicy
 from services.exchange_backed_position_provider import ExchangeBackedPositionProvider
+from services.exchange_close_fill_evidence import normalize_external_close_fill_evidence
 from services.exchange_close_fill_finder import ExchangeCloseFillFinder
 from services.exchange_exit_decision_lineage import (
     apply_exit_decision_lineage,
@@ -270,6 +271,7 @@ MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
+AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
 # A definitive OKX capability rejection (51001 / unsupported execution
 # instrument) must not be rediscovered on every market round.  Keep this
 # separate from the executor's per-request cache so the ranked candidate pool
@@ -1002,6 +1004,7 @@ class TradingService:
             "paper": asyncio.Lock(),
             "live": asyncio.Lock(),
         }
+        self._okx_executor_init_tasks: dict[str, asyncio.Task] = {}
         self._shadow_backtest_update_task: asyncio.Task | None = None
         self._shadow_backtest_update_last_started_at: datetime | None = None
         self._shadow_backtest_update_last_finished_at: datetime | None = None
@@ -1072,6 +1075,13 @@ class TradingService:
         self._okx_settlement_fact_sync_success_count = 0
         self._okx_settlement_fact_sync_deferred_count = 0
         self._okx_settlement_fact_sync_failure_count = 0
+        self._authoritative_outcome_feedback_task: asyncio.Task | None = None
+        self._authoritative_outcome_feedback_last_started_at: datetime | None = None
+        self._authoritative_outcome_feedback_last_finished_at: datetime | None = None
+        self._authoritative_outcome_feedback_last_result: dict[str, Any] | None = None
+        self._authoritative_outcome_feedback_last_error: str | None = None
+        self._authoritative_outcome_feedback_scheduled_count = 0
+        self._authoritative_outcome_feedback_coalesced_count = 0
         self._okx_position_settlement_sync_task: asyncio.Task | None = None
         self._okx_position_settlement_sync_last_started_at: datetime | None = None
         self._okx_position_settlement_sync_last_finished_at: datetime | None = None
@@ -1843,6 +1853,52 @@ class TradingService:
             ),
             "failure_count": int(getattr(self, "_okx_settlement_fact_sync_failure_count", 0) or 0),
             "interval_seconds": round(interval_seconds, 3),
+            "authoritative_outcome_feedback": self._authoritative_outcome_feedback_status_payload(
+                now
+            ),
+        }
+
+    def _authoritative_outcome_feedback_status_payload(
+        self,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return diagnostics for the non-blocking reflection backfill."""
+
+        now = now or datetime.now(UTC)
+        task = getattr(self, "_authoritative_outcome_feedback_task", None)
+        finished_at = getattr(self, "_authoritative_outcome_feedback_last_finished_at", None)
+        age_seconds = (
+            max((now - finished_at).total_seconds(), 0.0)
+            if isinstance(finished_at, datetime)
+            else None
+        )
+        last_result = getattr(self, "_authoritative_outcome_feedback_last_result", None)
+        status = "pending"
+        if task is not None and not task.done():
+            status = "running"
+        elif isinstance(last_result, dict):
+            status = str(last_result.get("status") or "completed").lower()
+        elif getattr(self, "_authoritative_outcome_feedback_last_error", None):
+            status = "degraded"
+        started_at = getattr(self, "_authoritative_outcome_feedback_last_started_at", None)
+        return {
+            "status": status,
+            "task_running": bool(task is not None and not task.done()),
+            "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            "last_finished_at": (
+                finished_at.isoformat() if isinstance(finished_at, datetime) else None
+            ),
+            "last_finished_age_seconds": (
+                round(age_seconds, 3) if age_seconds is not None else None
+            ),
+            "last_result": last_result,
+            "last_error": getattr(self, "_authoritative_outcome_feedback_last_error", None),
+            "scheduled_count": int(
+                getattr(self, "_authoritative_outcome_feedback_scheduled_count", 0) or 0
+            ),
+            "coalesced_count": int(
+                getattr(self, "_authoritative_outcome_feedback_coalesced_count", 0) or 0
+            ),
         }
 
     def _okx_position_settlement_sync_status_payload(
@@ -2484,32 +2540,12 @@ class TradingService:
                         row.get("position_history_updated_count") or 0
                     )
                     if changed_count > 0:
-                        try:
-                            row["authoritative_outcome_feedback"] = await asyncio.wait_for(
-                                self.expert_memory_service.backfill_trade_reflections(mode),
-                                timeout=5.0,
-                            )
-                        except TimeoutError:
-                            row["authoritative_outcome_feedback"] = {
-                                "status": "deferred",
-                                "reason": "feedback_timeout",
-                            }
-                            logger.warning(
-                                "authoritative outcome feedback timed out; history mirror continues",
-                                mode=mode,
+                        row["authoritative_outcome_feedback"] = (
+                            self._schedule_authoritative_outcome_feedback(
+                                mode,
                                 changed_count=changed_count,
                             )
-                        except Exception as exc:
-                            row["authoritative_outcome_feedback"] = {
-                                "status": "degraded",
-                                "error": safe_error_text(exc, limit=180),
-                            }
-                            logger.warning(
-                                "authoritative outcome feedback failed; history mirror continues",
-                                mode=mode,
-                                changed_count=changed_count,
-                                error=safe_error_text(exc, limit=180),
-                            )
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2534,6 +2570,81 @@ class TradingService:
             finally:
                 self._okx_settlement_fact_sync_last_finished_at = datetime.now(UTC)
             await asyncio.sleep(self.okx_settlement_fact_sync_interval_seconds())
+
+    def _schedule_authoritative_outcome_feedback(
+        self,
+        mode: str,
+        *,
+        changed_count: int,
+    ) -> dict[str, Any]:
+        """Schedule reflection backfill without blocking settlement synchronization."""
+
+        task = getattr(self, "_authoritative_outcome_feedback_task", None)
+        if task is not None and not task.done():
+            self._authoritative_outcome_feedback_coalesced_count = int(
+                getattr(self, "_authoritative_outcome_feedback_coalesced_count", 0) or 0
+            ) + 1
+            return {
+                "status": "queued",
+                "reason": "feedback_in_progress",
+                "changed_count": int(changed_count or 0),
+            }
+
+        started_at = datetime.now(UTC)
+        self._authoritative_outcome_feedback_last_started_at = started_at
+        self._authoritative_outcome_feedback_last_error = None
+        self._authoritative_outcome_feedback_scheduled_count = int(
+            getattr(self, "_authoritative_outcome_feedback_scheduled_count", 0) or 0
+        ) + 1
+
+        async def run() -> None:
+            try:
+                result = await asyncio.wait_for(
+                    self.expert_memory_service.backfill_trade_reflections(mode),
+                    timeout=AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS,
+                )
+                self._authoritative_outcome_feedback_last_result = (
+                    dict(result) if isinstance(result, dict) else {"status": "completed"}
+                )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                self._authoritative_outcome_feedback_last_result = {
+                    "status": "deferred",
+                    "reason": "feedback_timeout",
+                }
+                self._authoritative_outcome_feedback_last_error = "feedback_timeout"
+                logger.warning(
+                    "authoritative outcome feedback timed out in background",
+                    mode=mode,
+                )
+            except Exception as exc:
+                error = safe_error_text(exc, limit=180)
+                self._authoritative_outcome_feedback_last_result = {
+                    "status": "degraded",
+                    "error": error,
+                }
+                self._authoritative_outcome_feedback_last_error = error
+                logger.warning(
+                    "authoritative outcome feedback failed in background",
+                    mode=mode,
+                    error=error,
+                )
+            finally:
+                self._authoritative_outcome_feedback_last_finished_at = datetime.now(UTC)
+
+        task = asyncio.create_task(run())
+        self._authoritative_outcome_feedback_task = task
+
+        def finish(finished: asyncio.Task) -> None:
+            if getattr(self, "_authoritative_outcome_feedback_task", None) is finished:
+                self._authoritative_outcome_feedback_task = None
+
+        task.add_done_callback(finish)
+        return {
+            "status": "scheduled",
+            "changed_count": int(changed_count or 0),
+        }
 
     async def _okx_position_settlement_sync_loop(self) -> None:
         """Retry official OKX settlement for recently closed local positions."""
@@ -7979,37 +8090,44 @@ class TradingService:
         # observation data. Never wait for a batch of private probes inside
         # the market-analysis critical path; refresh them independently and
         # consume only the cache that is already available for this round.
-        executor = None
-        executor_task = asyncio.create_task(self._get_okx_executor_for_mode(selected_mode))
-        try:
-            executor = await asyncio.wait_for(asyncio.shield(executor_task), timeout=0.5)
-        except Exception as exc:
-            if not executor_task.done():
-                def _deferred_executor_ready(task: asyncio.Task) -> None:
-                    try:
-                        ready_executor = task.result()
-                    except (asyncio.CancelledError, Exception) as callback_exc:
-                        logger.warning(
-                            "deferred market instrument executor initialization failed",
+        executor = (
+            getattr(self, "_okx_live", None)
+            if selected_mode == "live"
+            else getattr(self, "_okx_paper", None)
+        )
+        if executor is not None and getattr(executor, "_connected", True) is False:
+            executor = None
+        if executor is None:
+            executor_task = asyncio.create_task(self._get_okx_executor_for_mode(selected_mode))
+            try:
+                executor = await asyncio.wait_for(asyncio.shield(executor_task), timeout=0.5)
+            except Exception as exc:
+                if not executor_task.done():
+                    def _deferred_executor_ready(task: asyncio.Task) -> None:
+                        try:
+                            ready_executor = task.result()
+                        except (asyncio.CancelledError, Exception) as callback_exc:
+                            logger.warning(
+                                "deferred market instrument executor initialization failed",
+                                mode=selected_mode,
+                                error=safe_error_text(callback_exc, limit=180),
+                            )
+                            return
+                        self._schedule_market_instrument_availability_refresh(
+                            ready_executor,
+                            list(feature_vectors),
+                            target_count=target,
                             mode=selected_mode,
-                            error=safe_error_text(callback_exc, limit=180),
                         )
-                        return
-                    self._schedule_market_instrument_availability_refresh(
-                        ready_executor,
-                        list(feature_vectors),
-                        target_count=target,
-                        mode=selected_mode,
-                    )
 
-                executor_task.add_done_callback(_deferred_executor_ready)
-            else:
-                _consume_task_result(executor_task)
-            logger.warning(
-                "market instrument executor unavailable during analysis; using verified cache",
-                mode=selected_mode,
-                error=safe_error_text(exc, limit=180),
-            )
+                    executor_task.add_done_callback(_deferred_executor_ready)
+                else:
+                    _consume_task_result(executor_task)
+                logger.warning(
+                    "market instrument executor unavailable during analysis; using verified cache",
+                    mode=selected_mode,
+                    error=safe_error_text(exc, limit=180),
+                )
 
         if executor is not None:
             self._schedule_market_instrument_availability_refresh(
@@ -11250,6 +11368,11 @@ class TradingService:
                 task.cancel()
         if memory_context_tasks:
             await asyncio.gather(*memory_context_tasks, return_exceptions=True)
+        feedback_task = getattr(self, "_authoritative_outcome_feedback_task", None)
+        if feedback_task is not None and not feedback_task.done():
+            feedback_task.cancel()
+            await asyncio.gather(feedback_task, return_exceptions=True)
+        self._authoritative_outcome_feedback_task = None
         if self.paper_executor:
             await self.paper_executor.shutdown()
         for okx in (self._okx_paper, self._okx_live):
@@ -12992,10 +13115,7 @@ class TradingService:
         try:
             side = str(pos.side or "").lower()
             action = Action.CLOSE_SHORT if side == "short" else Action.CLOSE_LONG
-            close_fill_safe = {
-                key: (value.isoformat() if isinstance(value, datetime) else value)
-                for key, value in (close_fill or {}).items()
-            }
+            close_fill_safe = normalize_external_close_fill_evidence(close_fill)
             close_fraction = self._safe_float(position_size_pct, 1.0)
             close_fraction = min(max(close_fraction, 0.0), 1.0) or 1.0
             close_order_id = str(close_fill_safe.get("order_id") or "").strip()
@@ -14291,15 +14411,27 @@ class TradingService:
         """Return the OKX executor for paper/demo or live/real mode."""
         selected_mode = "live" if mode == "live" else "paper"
         attribute_name = "_okx_live" if selected_mode == "live" else "_okx_paper"
+        executor = getattr(self, attribute_name, None)
+        if executor is not None:
+            return executor
+        tasks = getattr(self, "_okx_executor_init_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._okx_executor_init_tasks = tasks
+        existing_task = tasks.get(selected_mode)
+        if isinstance(existing_task, asyncio.Task) and not existing_task.done():
+            return await asyncio.shield(existing_task)
         locks = getattr(self, "_okx_executor_init_locks", None)
         if not isinstance(locks, dict):
             locks = {}
             self._okx_executor_init_locks = locks
         init_lock = locks.setdefault(selected_mode, asyncio.Lock())
 
-        async with init_lock:
-            executor = getattr(self, attribute_name, None)
-            if executor is None:
+        async def initialize_once() -> OKXExecutor:
+            async with init_lock:
+                current = getattr(self, attribute_name, None)
+                if current is not None:
+                    return current
                 candidate = OKXExecutor(
                     mode=selected_mode,
                     load_markets_on_initialize=False,
@@ -14319,8 +14451,15 @@ class TradingService:
                         )
                     raise
                 setattr(self, attribute_name, candidate)
-                executor = candidate
-            return executor
+                return candidate
+
+        task = asyncio.create_task(initialize_once())
+        tasks[selected_mode] = task
+        try:
+            return await task
+        finally:
+            if tasks.get(selected_mode) is task:
+                tasks.pop(selected_mode, None)
 
     async def _shadow_execution_cost_facts(self, mode: str) -> dict[str, Any]:
         """Read current account fee facts once for each due-shadow mode batch."""
