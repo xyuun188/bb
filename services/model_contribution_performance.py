@@ -321,7 +321,7 @@ class ModelContributionPerformanceService:
             )
             return {}
 
-        stats = self.build_stats(positions, orders, decisions)
+        stats = self.build_stats(positions, orders, decisions, mode=selected_mode)
         self._cache_by_mode[selected_mode] = {
             "expires_at": now + timedelta(minutes=10),
             "stats": stats,
@@ -333,10 +333,13 @@ class ModelContributionPerformanceService:
         positions: Iterable[Any],
         orders: Iterable[Any],
         decisions: dict[int, Any],
+        *,
+        mode: str = "paper",
     ) -> dict[str, dict[str, Any]]:
         """Build contribution stats from loaded position/order/decision records."""
 
         stats = _default_stats()
+        selected_mode = "live" if mode == "live" else "paper"
         order_list = list(orders)
         ordered_positions = sorted(
             positions,
@@ -355,7 +358,12 @@ class ModelContributionPerformanceService:
             raw = _safe_dict(getattr(matched_decision, "raw_llm_response", None))
             opportunity = _safe_dict(raw.get("opportunity_score"))
             pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)
-            for source in self.contribution_sources(opportunity, raw, self._position_side(pos)):
+            for source in self.contribution_sources(
+                opportunity,
+                raw,
+                self._position_side(pos),
+                mode=selected_mode,
+            ):
                 self._add_sample(stats[source], pnl)
 
         for bucket in stats.values():
@@ -416,9 +424,12 @@ class ModelContributionPerformanceService:
         opportunity: dict[str, Any],
         raw: dict[str, Any],
         side: str,
+        *,
+        mode: str = "paper",
     ) -> list[str]:
         """Infer which evidence sources supported an entry decision."""
 
+        selected_mode = "live" if mode == "live" else "paper"
         breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
         source_map = {
             "local_ml": "ml_profit_model",
@@ -430,7 +441,10 @@ class ModelContributionPerformanceService:
             source_map[str(item.get("key"))]
             for item in _safe_list(breakdown.get("components"))
             if isinstance(item, dict)
-            and item.get("production_eligible") is True
+            and ModelContributionPerformanceService._component_is_eligible(
+                item,
+                selected_mode,
+            )
             and str(item.get("key")) in source_map
         ]
         normalized_side = "short" if str(side or "").lower() == "short" else "long"
@@ -451,6 +465,18 @@ class ModelContributionPerformanceService:
             ):
                 sources.append(f"expert:{name}")
         return list(dict.fromkeys(sources))
+
+    @staticmethod
+    def _component_is_eligible(item: dict[str, Any], mode: str) -> bool:
+        """Use paper or production eligibility for the matching execution mode."""
+
+        eligibility_key = "production_eligible" if mode == "live" else "paper_eligible"
+        eligibility = item.get(eligibility_key)
+        if eligibility is True:
+            return True
+        # Older decision snapshots may only contain the production flag. Keep those
+        # records attributable in paper-mode while respecting an explicit false value.
+        return mode == "paper" and eligibility is None and item.get("production_eligible") is True
 
     def score_adjustment(
         self,

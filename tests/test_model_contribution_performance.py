@@ -138,6 +138,39 @@ def test_missing_quant_sources_do_not_create_ai_fallback_attribution() -> None:
     assert service.contribution_sources({}, {}, "short") == []
 
 
+def test_component_eligibility_matches_execution_mode() -> None:
+    service = ModelContributionPerformanceService()
+    opportunity = {
+        "expected_net_breakdown": {
+            "components": [
+                {
+                    "key": "local_ml",
+                    "paper_eligible": True,
+                    "production_eligible": False,
+                },
+                {
+                    "key": "server_profit",
+                    "paper_eligible": True,
+                    "production_eligible": False,
+                },
+                {
+                    "key": "timeseries",
+                    "paper_eligible": False,
+                    "production_eligible": True,
+                },
+            ]
+        }
+    }
+
+    assert service.contribution_sources(opportunity, {}, "long", mode="paper") == [
+        "ml_profit_model",
+        "server_profit_model",
+    ]
+    assert service.contribution_sources(opportunity, {}, "long", mode="live") == [
+        "timeseries_model",
+    ]
+
+
 def test_model_contribution_cannot_adjust_production_score_or_size() -> None:
     service = ModelContributionPerformanceService()
     performance = {
