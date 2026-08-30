@@ -55,6 +55,34 @@ def _position_side(position: dict[str, Any]) -> str:
     return "long" if side in {"long", "buy"} else "short" if side in {"short", "sell"} else ""
 
 
+def _model_exit_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """Recover the original model exit request across policy re-evaluations.
+
+    Position-review decisions are evaluated once while building close evidence
+    and again immediately before execution.  The second pass must reuse the
+    model request, not the previous pass's policy-authorized fraction.
+    """
+
+    model_exit = _safe_dict(raw.get("model_exit_recommendation"))
+    if model_exit:
+        return model_exit
+
+    close_evidence = _safe_dict(raw.get("close_evidence"))
+    model_exit = _safe_dict(close_evidence.get("model_exit_recommendation"))
+    if model_exit:
+        return model_exit
+
+    # ``apply_dynamic_exit`` persists the model inputs in its assessment.  Use
+    # those values on a later pass when no explicit recommendation is present.
+    prior_policy = _safe_dict(raw.get("dynamic_exit_policy"))
+    if "model_requested_close_fraction" in prior_policy or "model_exit_confidence" in prior_policy:
+        return {
+            "requested_close_fraction": prior_policy.get("model_requested_close_fraction"),
+            "confidence": prior_policy.get("model_exit_confidence"),
+        }
+    return {}
+
+
 def _parse_utc_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
@@ -249,7 +277,7 @@ def assess_dynamic_exit(
     positions: list[dict[str, Any]],
 ) -> DynamicExitAssessment:
     raw = _safe_dict(decision.raw_response)
-    model_exit = _safe_dict(raw.get("model_exit_recommendation"))
+    model_exit = _model_exit_payload(raw)
     model_requested_close_fraction = _clamp(
         max(
             _safe_float(model_exit.get("requested_close_fraction"), 0.0),

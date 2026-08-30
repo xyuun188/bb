@@ -264,6 +264,61 @@ def test_explicit_model_close_recommendation_enters_risk_comparison() -> None:
     assert result.close_fraction == pytest.approx(0.2)
 
 
+def test_repeated_dynamic_exit_evaluation_reuses_original_model_request() -> None:
+    decision = _decision(
+        {
+            "model_exit_recommendation": {
+                "requested_close_fraction": 1.0,
+                "confidence": 0.72,
+            }
+        }
+    )
+    position = _position(
+        current_price=99.916,
+        notional_usdt=999.16,
+        unrealized_pnl=-0.84,
+        peak_unrealized_pnl=0.0,
+    )
+
+    first = apply_dynamic_exit(decision, [position])
+    second = apply_dynamic_exit(decision, [position])
+
+    assert second.model_requested_close_fraction == pytest.approx(1.0)
+    assert second.model_exit_confidence == pytest.approx(0.72)
+    assert second.close_fraction == pytest.approx(first.close_fraction)
+    assert second.target_close_fraction == pytest.approx(first.target_close_fraction)
+
+
+def test_repeated_evaluation_recovers_model_request_from_close_evidence() -> None:
+    decision = _decision(
+        {
+            "close_evidence": {
+                "model_exit_recommendation": {
+                    "requested_close_fraction": 1.0,
+                    "confidence": 0.72,
+                }
+            }
+        }
+    )
+    # This is the policy-authorized fraction written by the first pass.  It
+    # must not replace the original model request on the execution pass.
+    decision.suggested_close_fraction = 0.74591851
+    position = _position(
+        current_price=99.916,
+        notional_usdt=999.16,
+        unrealized_pnl=-0.84,
+        peak_unrealized_pnl=0.0,
+    )
+
+    first = apply_dynamic_exit(decision, [position])
+    second = apply_dynamic_exit(decision, [position])
+
+    assert first.model_requested_close_fraction == pytest.approx(1.0)
+    assert second.model_requested_close_fraction == pytest.approx(1.0)
+    assert second.model_exit_confidence == pytest.approx(0.72)
+    assert second.close_fraction == pytest.approx(first.close_fraction)
+
+
 def test_profitable_exit_without_execution_cost_fails_closed() -> None:
     result = apply_dynamic_exit(
         _decision(),
