@@ -6112,7 +6112,7 @@ function renderDataCollectionOverview(data, config, stats, training) {
             ${collectionMetric(
                 '本地量化训练',
                 collectionStatusLabel(localTools.status, localTools.available),
-                `影子 ${monitorNumber(localTools.shadow_sample_count, 0)} · 交易 ${monitorNumber(localTools.trade_sample_count, 0)} · 文本 ${monitorNumber(localTools.text_sentiment_sample_count, 0)}`,
+                `影子 ${trainingCountLabel(localTools.shadow_sample_count, localTools.sample_count_state)} · 交易 ${trainingCountLabel(localTools.trade_sample_count, localTools.sample_count_state)} · 文本 ${trainingCountLabel(localTools.text_sentiment_sample_count, localTools.sample_count_state)}`,
                 collectionStatusTone(localTools.status, localTools.available)
             )}
         </div>
@@ -6330,9 +6330,9 @@ function renderDataCollectionTraining(training) {
                 <strong>本地量化工具训练样本</strong>
                 <div class="data-collection-summary data-collection-summary-compact">
                     ${collectionMetric('服务状态', collectionStatusLabel(localTools.status, localTools.available), localTools.available ? '训练接口可用' : (localTools.error || '训练接口不可用'), collectionStatusTone(localTools.status, localTools.available))}
-                    ${collectionMetric('三期影子样本', `${monitorNumber(localTools.shadow_sample_count, 0)} 条`, completedShadowText, 'muted')}
-                    ${collectionMetric('三期交易样本', `${monitorNumber(localTools.trade_sample_count, 0)} 条`, completedTradeText, 'muted')}
-                    ${collectionMetric('文本样本', `${monitorNumber(localTools.text_sentiment_sample_count, 0)} 条`, '新闻/社媒训练输入', 'muted')}
+                    ${collectionMetric('三期影子样本', `${trainingCountLabel(localTools.shadow_sample_count, localTools.sample_count_state)} 条`, completedShadowText, 'muted')}
+                    ${collectionMetric('三期交易样本', `${trainingCountLabel(localTools.trade_sample_count, localTools.sample_count_state)} 条`, completedTradeText, 'muted')}
+                    ${collectionMetric('文本样本', `${trainingCountLabel(localTools.text_sentiment_sample_count, localTools.sample_count_state)} 条`, '新闻/社媒训练输入', 'muted')}
                 </div>
                 <div class="data-chip-list">
                     ${models.length ? models.map(([name, ready]) => `<span>${escHtml(name)}：${ready ? '已就绪' : '学习中'}</span>`).join('') : '<span>模型状态未返回</span>'}
@@ -6939,9 +6939,11 @@ function systemAuditStrategyDetails(details) {
 
 function systemAuditModelTrainingDetails(details) {
     const localTools = details.local_ai_tools || {};
+    const scheduler = localTools.training_scheduler_summary || {};
     const sourceWarnings = Array.isArray(details.source_warnings) ? details.source_warnings : [];
     const optionalSourceWarnings = Array.isArray(details.optional_source_warnings) ? details.optional_source_warnings : [];
     const criticalItems = Array.isArray(details.model_critical_items) ? details.model_critical_items : [];
+    const resourceModels = Array.isArray(scheduler.resource_models) ? scheduler.resource_models : [];
     const sourceRows = sourceWarnings.slice(0, 6).map(item => [
         item.name || item.key || '-',
         collectionStatusLabel(item.status || '-', item.enabled !== false),
@@ -6957,6 +6959,13 @@ function systemAuditModelTrainingDetails(details) {
         systemAuditStatusLabel(item.status || (item.status_code ? 'critical' : '-')),
         item.error || item.message || item.api_base || '-',
     ]);
+    const resourceRows = resourceModels.slice(0, 6).map(item => [
+        item.model || '-',
+        item.state || '-',
+        item.error || '-',
+        item.retry_count ?? '-',
+        item.next_check_at ? toBeijingTime(item.next_check_at) : '-',
+    ]);
     const modeText = details.hard_failure
         ? '硬故障'
         : (details.observing ? '学习观察' : '正常');
@@ -6964,14 +6973,17 @@ function systemAuditModelTrainingDetails(details) {
         <div class="system-audit-detail-grid">
             ${systemAuditMetric('巡检判断', modeText, details.hard_failure ? '需要立即处理' : '非硬故障不进入未修复')}
             ${systemAuditMetric('本地量化工具', localTools.available ? '可用' : '不可用', collectionStatusLabel(localTools.status || '-', true))}
-            ${systemAuditMetric('影子样本', localTools.shadow_sample_count ?? 0, '训练输入')}
-            ${systemAuditMetric('交易样本', localTools.trade_sample_count ?? 0, '真实复盘输入')}
-            ${systemAuditMetric('文本样本', localTools.text_sentiment_sample_count ?? 0, '新闻/情绪输入')}
+            ${systemAuditMetric('影子样本', trainingCountLabel(localTools.training_shadow_sample_count ?? localTools.shadow_sample_count, localTools.sample_count_state), '训练输入')}
+            ${systemAuditMetric('交易样本', trainingCountLabel(localTools.training_trade_sample_count ?? localTools.trade_sample_count, localTools.sample_count_state), '真实复盘输入')}
+            ${systemAuditMetric('文本样本', trainingCountLabel(localTools.text_sentiment_sample_count, localTools.sample_count_state), '新闻/情绪输入')}
+            ${systemAuditMetric('训练调度', scheduler.status || '未读取', '最近一次调度状态')}
+            ${systemAuditMetric('资源失败模型', scheduler.resource_failure_model_count ?? '未读取', `累计资源失败 ${scheduler.resource_failure_count ?? '未读取'} 次`)}
             ${systemAuditMetric('治理状态', details.governance_status || '-', '训练数据清洗')}
         </div>
         ${systemAuditSection('硬故障数据源', systemAuditTable(['来源', '状态', '说明'], sourceRows))}
         ${systemAuditSection('可选增强源', systemAuditTable(['来源', '状态', '说明'], optionalRows))}
-        ${systemAuditSection('模型服务异常', systemAuditTable(['项目', '状态', '说明'], criticalRows))}`;
+        ${systemAuditSection('模型服务异常', systemAuditTable(['项目', '状态', '说明'], criticalRows))}
+        ${systemAuditSection('训练资源失败', systemAuditTable(['模型', '状态', '错误', '重试', '下次检查'], resourceRows))}`;
 }
 
 function systemAuditPhase3ServerMigrationDetails(details) {
@@ -7757,6 +7769,18 @@ function monitorNumber(value, digits = 1) {
         maximumFractionDigits: fractionDigits,
         minimumFractionDigits: 0,
     });
+}
+
+function trainingCountLabel(value, state = 'known') {
+    const normalized = String(state || 'known').toLowerCase();
+    if (value === null || value === undefined || value === '') {
+        return normalized === 'warming' ? '刷新中' : '未读取';
+    }
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return '未读取';
+    if (normalized === 'warming') return '刷新中';
+    if (normalized === 'unavailable' && numeric <= 0) return '未读取';
+    return monitorNumber(numeric, 0);
 }
 
 function monitorPercentTone(value) {

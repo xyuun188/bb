@@ -235,6 +235,37 @@ def test_local_ai_tools_training_parallelism_leaves_inference_headroom(
     assert classifier.named_steps["model"].n_jobs == 2
 
 
+def test_local_ai_tools_training_bounds_large_forest_sizes() -> None:
+    module = ModuleType("local_ai_tools_tree_budget_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    regressor = module._make_regressor(5_000)
+    classifier = module._make_classifier([0, 1] * 2_500)
+
+    assert regressor.named_steps["model"].n_estimators <= 64
+    assert classifier.named_steps["model"].n_estimators <= 64
+
+
+def test_local_ai_tools_memory_failure_is_structured_and_preserves_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    monkeypatch.setattr(module, "_train_impl_inner", lambda _request: (_ for _ in ()).throw(MemoryError()))
+
+    result = module._train_impl(
+        module.TrainRequest(
+            shadow_samples=[{"id": 1}],
+            trade_samples=[{"id": 2}],
+        )
+    )
+
+    assert result["trained"] is False
+    assert result["reason"] == "resource_memory"
+    assert result["resource_failure"] is True
+    assert result["resource_failure_policy"] == "preserve_current_artifact_and_backoff"
+
+
 def test_local_ai_tools_training_rejects_overlapping_registry_mutations(
     tmp_path: Path,
 ) -> None:

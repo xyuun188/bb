@@ -21,6 +21,7 @@ from services.trade_execution_contract import (
 )
 
 ENTRY_ACTIONS = {"long", "short", "open_long", "open_short", "buy", "sell"}
+ROOT_CAUSE_DISPLAY_LIMIT = 12
 
 
 class StrategySignalRootCauseAuditService:
@@ -90,6 +91,7 @@ class StrategySignalRootCauseAuditService:
     ) -> dict[str, Any]:
         entries = [row for row in decisions if str(row.action or "").lower() in ENTRY_ACTIONS]
         blocker_counts: Counter[str] = Counter()
+        lifecycle_blocker_counts: Counter[tuple[str, str]] = Counter()
         expected_returns: list[float] = []
         return_lcbs: list[float] = []
         ready_count = 0
@@ -109,19 +111,28 @@ class StrategySignalRootCauseAuditService:
                     return_lcbs.append(lcb)
             _, reasons = validate_entry_execution_contract(raw)
             blocker_counts.update(reasons)
+            for reason in reasons:
+                lifecycle_blocker_counts[(lifecycle, reason)] += 1
             if not reasons:
                 ready_count += 1
                 lifecycle_ready_counts[lifecycle] += 1
 
-        causes = [
-            {
-                "code": code,
-                "severity": "warning",
-                "count": count,
-                "message": _cause_message(code),
+        causes = []
+        for code, count in blocker_counts.most_common(ROOT_CAUSE_DISPLAY_LIMIT):
+            lifecycle_scope = {
+                lifecycle: scoped_count
+                for (lifecycle, reason), scoped_count in lifecycle_blocker_counts.items()
+                if reason == code
             }
-            for code, count in blocker_counts.most_common()
-        ]
+            causes.append(
+                {
+                    "code": code,
+                    "severity": "warning",
+                    "count": count,
+                    "message": _cause_message(code),
+                    "lifecycle_scope": lifecycle_scope,
+                }
+            )
         ml_readiness = _safe_dict(ml_status.get("readiness"))
         shadow_missed_count = sum(
             bool(getattr(row, "missed_opportunity", False)) for row in shadows
@@ -176,6 +187,22 @@ class StrategySignalRootCauseAuditService:
             },
             "entry_contract_lifecycle_counts": dict(lifecycle_counts),
             "contract_blocker_counts": dict(blocker_counts),
+            "root_cause_display_limit": ROOT_CAUSE_DISPLAY_LIMIT,
+            "root_cause_total_count": len(blocker_counts),
+            "root_cause_overflow_count": max(
+                len(blocker_counts) - ROOT_CAUSE_DISPLAY_LIMIT,
+                0,
+            ),
+            "lifecycle_blocker_counts": {
+                lifecycle: {
+                    reason: count
+                    for (scoped_lifecycle, reason), count in lifecycle_blocker_counts.items()
+                    if scoped_lifecycle == lifecycle
+                }
+                for lifecycle in sorted(
+                    {scoped_lifecycle for scoped_lifecycle, _ in lifecycle_blocker_counts}
+                )
+            },
             "expected_net_return_distribution": _distribution(expected_returns),
             "return_lcb_distribution": _distribution(return_lcbs),
             "ml": {

@@ -436,6 +436,50 @@ async def test_data_collection_does_not_promote_artifact_counts_to_current_epoch
 
 
 @pytest.mark.asyncio
+async def test_data_collection_uses_scheduler_cursors_when_count_scan_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "service_available": True,
+                "status": "ready",
+                "shadow_sample_count": 0,
+                "trade_sample_count": 0,
+            }
+
+    class FakeTrainingState:
+        def read(self) -> dict[str, Any]:
+            return {
+                "models": {
+                    "local_ai_profit_prediction": {
+                        "sample_cursor": {"shadow": 1234, "trade": 27}
+                    }
+                }
+            }
+
+    async def timed_out() -> int:
+        raise TimeoutError("count scan timed out")
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(data_collection_module, "MODEL_TRAINING_STATE_STORE", FakeTrainingState())
+    monkeypatch.setattr(data_collection_module, "_completed_training_shadow_count", timed_out)
+    monkeypatch.setattr(data_collection_module, "_completed_training_trade_count", timed_out)
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["shadow_sample_count"] == 1234
+    assert status["trade_sample_count"] == 27
+    assert status["sample_count_state"] == "degraded"
+    assert {item["count"] for item in status["sample_count_warnings"]} == {"shadow", "trade"}
+
+
+@pytest.mark.asyncio
 async def test_data_collection_uses_epoch_db_counts_when_artifact_window_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

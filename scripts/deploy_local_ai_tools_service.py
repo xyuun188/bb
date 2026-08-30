@@ -34,6 +34,7 @@ SERVICE_CODE = r'''
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import math
 import multiprocessing
@@ -162,6 +163,22 @@ TORCH_PATCH_MAX_EPOCHS = max(
 SEQUENCE_MODEL_MAX_SAMPLES = max(
     int(os.environ.get("LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000")),
     2048,
+)
+# Keep the model artifact contract unchanged while bounding the peak memory of
+# the forest ensemble built during a refresh.  The previous 240/260-tree
+# defaults multiplied across horizons, sides, cost, sentiment, and sequence
+# models and could exhaust the training worker before an artifact was written.
+TRAINING_REGRESSOR_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_REGRESSOR_TREE_COUNT", "96")), 32),
+    192,
+)
+TRAINING_CLASSIFIER_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_CLASSIFIER_TREE_COUNT", "80")), 32),
+    192,
+)
+TRAINING_SENTIMENT_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_SENTIMENT_TREE_COUNT", "64")), 32),
+    160,
 )
 ISOLATE_TRAINING_PROCESS = os.environ.get(
     "LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS",
@@ -1396,6 +1413,28 @@ def _dynamic_min_samples_leaf(sample_count: int) -> int:
     return max(int(math.log2(max(observed_count, 2))), 1)
 
 
+def _training_gc() -> None:
+    """Release temporary sklearn/torch arrays between independent stages."""
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _training_tree_count(sample_count: int, configured: int) -> int:
+    """Use a bounded forest size so a refresh cannot starve live inference."""
+
+    observed = max(int(sample_count or 0), 1)
+    # Larger datasets are already statistically supported; extra trees mostly
+    # increase resident memory and duplicate the same feature matrix.
+    if observed >= 4096:
+        return min(int(configured), 64)
+    if observed >= 1024:
+        return min(int(configured), 80)
+    return min(int(configured), 96)
+
+
 def _available_cpu_count() -> int:
     try:
         return max(len(os.sched_getaffinity(0)), 1)
@@ -1413,7 +1452,10 @@ def _make_regressor(sample_count: int) -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", ExtraTreesRegressor(
-            n_estimators=260,
+            n_estimators=_training_tree_count(
+                sample_count,
+                TRAINING_REGRESSOR_TREE_COUNT,
+            ),
             max_depth=12,
             min_samples_leaf=_dynamic_min_samples_leaf(sample_count),
             random_state=42,
@@ -1429,7 +1471,10 @@ def _make_classifier(y: list[int]) -> Pipeline:
         estimator = DummyClassifier(strategy="prior")
     else:
         estimator = ExtraTreesClassifier(
-            n_estimators=240,
+            n_estimators=_training_tree_count(
+                len(y),
+                TRAINING_CLASSIFIER_TREE_COUNT,
+            ),
             max_depth=12,
             min_samples_leaf=_dynamic_min_samples_leaf(len(y)),
             class_weight="balanced",
@@ -3199,6 +3244,7 @@ def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | Non
     timeframes: dict[str, int] = {}
     for _, _, _, timeframe in rows:
         timeframes[str(timeframe)] = timeframes.get(str(timeframe), 0) + 1
+    _training_gc()
     return {
         "long_model": long_model,
         "short_model": short_model,
@@ -3269,6 +3315,9 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     model.eval()
     with torch.no_grad():
         train_mae = float(torch.mean(torch.abs(model(xt) - yt)).item())
+    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    del optimizer, loss_fn, xt, yt, model, X, y
+    _training_gc()
     return {
         "available": True,
         "backend": "torch_patch_mlp_cpu",
@@ -3277,7 +3326,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         "max_samples": TORCH_PATCH_MAX_SAMPLES,
         "epochs": epochs,
         "input_dim": int(X.shape[1]),
-        "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "state_dict": state_dict,
         "mean": mean.astype(float).tolist()[0],
         "std": std.astype(float).tolist()[0],
         "train_mae_pct": round(train_mae, 5),
@@ -5079,7 +5128,7 @@ def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, A
     }
 
 
-def _train_impl(req: TrainRequest) -> dict[str, Any]:
+def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     rows = _market_training_rows(req.shadow_samples or [])
     cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
     if len(rows) <= 1:
@@ -5157,6 +5206,8 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
     short_return_model.fit(X, short_y, model__sample_weight=sample_weights)
     long_loss_model.fit(X, long_loss_y, model__sample_weight=sample_weights)
     short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
+    del X, long_y, short_y, long_loss_y, short_loss_y, sample_weights
+    _training_gc()
 
     cost_side_training_counts: dict[str, int] = {}
     cost_side_fallbacks: dict[str, str | None] = {}
@@ -5181,6 +5232,7 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
 
     long_cost_model = fit_cost_model("long")
     short_cost_model = fit_cost_model("short")
+    _training_gc()
     cost_models = {"long": long_cost_model, "short": short_cost_model}
     cost_holdout_errors: dict[str, list[float]] = {"long": [], "short": []}
     for row in cost_holdout_rows:
@@ -5223,9 +5275,27 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
             "short_model": short_model,
             "samples": len(h_rows),
         }
+        del hX, long_horizon_y, short_horizon_y, h_weights
+        _training_gc()
 
-    deep_sequence_model = _train_sequence_model(req.sequence_samples or [])
-    torch_patch_model = _train_torch_patch_model(req.sequence_samples or [])
+    try:
+        deep_sequence_model = _train_sequence_model(req.sequence_samples or [])
+    except MemoryError:
+        deep_sequence_model = {
+            "available": False,
+            "reason": "resource_memory",
+            "samples": 0,
+        }
+        _training_gc()
+    try:
+        torch_patch_model = _train_torch_patch_model(req.sequence_samples or [])
+    except MemoryError:
+        torch_patch_model = {
+            "available": False,
+            "reason": "resource_memory",
+            "samples": 0,
+        }
+        _training_gc()
 
     sentiment_model = None
     sentiment_samples = []
@@ -5246,7 +5316,10 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
             return Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("model", RandomForestRegressor(
-                    n_estimators=180,
+                    n_estimators=_training_tree_count(
+                        len(sentiment_samples),
+                        TRAINING_SENTIMENT_TREE_COUNT,
+                    ),
                     max_depth=8,
                     min_samples_leaf=sentiment_leaf_size,
                     random_state=random_state,
@@ -5268,6 +5341,7 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
             [short_y for _, _, short_y, _ in sentiment_samples],
             model__sample_weight=[weight for _, _, _, weight in sentiment_samples],
         )
+        _training_gc()
     text_sentiment_model = _train_text_sentiment_model(req.text_sentiment_samples or [])
     transformers_sentiment_backend = _probe_transformers_sentiment_backend()
 
@@ -5675,6 +5749,31 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
     })
 
 
+def _train_impl(req: TrainRequest) -> dict[str, Any]:
+    """Run one training refresh without leaking resource failures to callers."""
+
+    try:
+        return _train_impl_inner(req)
+    except MemoryError:
+        # No candidate/current pointer is written until _train_impl_inner has
+        # completed, so returning a structured failure keeps the last good
+        # artifact intact and lets the scheduler apply its resource backoff.
+        return {
+            "trained": False,
+            "reason": "resource_memory",
+            "error": "MemoryError",
+            "message": (
+                "训练刷新因内存不足停止；现有模型产物保持不变，已进入资源退避。"
+            ),
+            "resource_failure": True,
+            "resource_failure_policy": "preserve_current_artifact_and_backoff",
+            "shadow_sample_count": len(req.shadow_samples or []),
+            "trade_sample_count": len(req.trade_samples or []),
+            "sequence_sample_count": len(req.sequence_samples or []),
+            "text_sentiment_sample_count": len(req.text_sentiment_samples or []),
+        }
+
+
 def _configure_training_child() -> None:
     os.environ["LOCAL_AI_TOOLS_TRAINING_CHILD"] = "1"
     try:
@@ -5888,6 +5987,26 @@ def _run_training_request(req: TrainRequest) -> dict[str, Any]:
                 "isolated local AI training exceeded its bounded request deadline "
                 f"of {TRAIN_REQUEST_TIMEOUT_SECONDS:.0f} seconds"
             ),
+            "training_process_isolated": True,
+            "training_request_id": request_id,
+            "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+            "training_worker_terminated": True,
+        }
+    except MemoryError:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        return {
+            "trained": False,
+            "reason": "resource_memory",
+            "error": "MemoryError",
+            "message": (
+                "训练刷新因内存不足停止；现有模型产物保持不变，已进入资源退避。"
+            ),
+            "resource_failure": True,
+            "resource_failure_policy": "preserve_current_artifact_and_backoff",
             "training_process_isolated": True,
             "training_request_id": request_id,
             "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,

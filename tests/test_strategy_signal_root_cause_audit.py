@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
+import services.strategy_signal_root_cause_audit as root_cause_module
 from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
 from services.trade_execution_contract import build_live_rules_canary_entry_contract
 from tests.paper_canary_fixtures import complete_paper_canary_raw
@@ -217,3 +218,23 @@ def test_complete_live_rules_canary_is_reported_in_its_own_lifecycle() -> None:
     assert report["live_rules_canary_blocked_count"] == 0
     assert report["live_ml_ready_count"] == 0
     assert report["contract_blocker_counts"] == {}
+
+
+def test_root_cause_display_is_bounded_but_raw_counts_are_preserved(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        root_cause_module,
+        "validate_entry_execution_contract",
+        lambda _raw: (None, [f"reason_{index}" for index in range(20)]),
+    )
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[_decision(complete=True)],
+        shadows=[],
+        ml_status={},
+    )
+
+    assert len(report["root_causes"]) == root_cause_module.ROOT_CAUSE_DISPLAY_LIMIT
+    assert report["root_cause_total_count"] == 20
+    assert report["root_cause_overflow_count"] == 8
+    assert len(report["contract_blocker_counts"]) == 20

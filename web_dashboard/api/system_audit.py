@@ -4253,6 +4253,47 @@ async def _model_training_audit() -> dict[str, Any]:
     training_scheduler_error = training_scheduler_state.get("status") == "error"
     training_scheduler_unavailable = training_scheduler_state.get("status") == "unavailable"
     training_timeout_exceeded = bool(training_scheduler_state.get("training_timeout_exceeded"))
+    scheduler_models = (
+        training_scheduler_state.get("models")
+        if isinstance(training_scheduler_state.get("models"), dict)
+        else {}
+    )
+    resource_failure_models: list[dict[str, Any]] = []
+    for model_id, model_state in scheduler_models.items():
+        if not isinstance(model_state, dict):
+            continue
+        last_result = model_state.get("last_result")
+        last_result = last_result if isinstance(last_result, dict) else {}
+        error_text = str(
+            model_state.get("last_error")
+            or last_result.get("error")
+            or ""
+        )
+        if "memoryerror" not in error_text.lower() and str(
+            model_state.get("resource_error_class") or ""
+        ).lower() != "resource":
+            continue
+        resource_failure_models.append(
+            {
+                "model": str(model_id),
+                "state": model_state.get("state"),
+                "error": error_text[:180] or "resource_failure",
+                "retry_count": int(model_state.get("retry_count") or 0),
+                "resource_failure_count": int(
+                    model_state.get("resource_failure_count") or 0
+                ),
+                "next_check_at": model_state.get("next_check_at"),
+            }
+        )
+    training_scheduler_summary = {
+        "status": training_scheduler_state.get("status"),
+        "resource_failure_model_count": len(resource_failure_models),
+        "resource_failure_count": sum(
+            int(item.get("resource_failure_count") or 0)
+            for item in resource_failure_models
+        ),
+        "resource_models": resource_failure_models[:8],
+    }
     hard_failure = (
         bool(model_critical)
         or bool(hard_source_warnings)
@@ -4363,6 +4404,17 @@ async def _model_training_audit() -> dict[str, Any]:
                 "shadow_sample_count": local_tools.get("shadow_sample_count"),
                 "trade_sample_count": local_tools.get("trade_sample_count"),
                 "text_sentiment_sample_count": local_tools.get("text_sentiment_sample_count"),
+                "training_shadow_sample_count": local_tools.get(
+                    "training_shadow_sample_count"
+                ),
+                "training_trade_sample_count": local_tools.get(
+                    "training_trade_sample_count"
+                ),
+                "sample_count_state": local_tools.get("sample_count_state"),
+                "sample_count_warnings": list(
+                    local_tools.get("sample_count_warnings") or []
+                )[:4],
+                "training_scheduler_summary": training_scheduler_summary,
                 "training_mode": phase3_training_governance["training_mode"],
                 "model_stage": phase3_training_governance["model_stage"],
                 "promotion_flow": phase3_training_governance["promotion_flow"],
@@ -4428,9 +4480,18 @@ async def _model_training_audit() -> dict[str, Any]:
             "model_critical_items": model_critical[:8],
         },
         evidence=[
-            {"label": "影子样本", "value": local_tools.get("shadow_sample_count") or 0},
-            {"label": "交易样本", "value": local_tools.get("trade_sample_count") or 0},
-            {"label": "文本样本", "value": local_tools.get("text_sentiment_sample_count") or 0},
+            {
+                "label": "影子样本",
+                "value": local_tools.get("training_shadow_sample_count"),
+            },
+            {
+                "label": "交易样本",
+                "value": local_tools.get("training_trade_sample_count"),
+            },
+            {
+                "label": "文本样本",
+                "value": local_tools.get("text_sentiment_sample_count"),
+            },
             {"label": "训练阶段", "value": phase3_training_governance["model_stage"]},
             {"label": "晋级流程", "value": phase3_training_governance["promotion_flow"]},
             {

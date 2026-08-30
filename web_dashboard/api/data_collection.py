@@ -590,6 +590,13 @@ async def _local_ai_training_status() -> dict[str, Any]:
     )
     training_shadow_count = db_completed_shadow_count
     training_trade_count = db_completed_trade_count
+    count_state = "known"
+    if count_warnings:
+        count_state = (
+            "degraded"
+            if training_shadow_count or training_trade_count
+            else "unavailable"
+        )
     epoch_started_at = load_training_epoch_start()
     return {
         "available": service_available,
@@ -620,6 +627,8 @@ async def _local_ai_training_status() -> dict[str, Any]:
         "text_sentiment_sample_count": text_count,
         "completed_shadow_sample_count": training_shadow_count,
         "completed_trade_sample_count": training_trade_count,
+        "sample_count_state": count_state,
+        "sample_count_warnings": count_warnings,
         "quality_report": (
             status.get("quality_report") if isinstance(status.get("quality_report"), dict) else {}
         ),
@@ -635,7 +644,17 @@ async def _training_count_snapshot(
     """Read training counts without allowing one slow outcome scan to block status."""
 
     scheduler_state = scheduler_state if isinstance(scheduler_state, dict) else {}
-    shadow_fallback = 0
+    shadow_fallback = _sample_count_from_status(
+        scheduler_state,
+        (
+            "completed_shadow_sample_count",
+            "training_shadow_sample_count",
+            "shadow_sample_count",
+            "last_trained_completed_shadow_sample_count",
+            "completed_shadow_raw_decision_group_count",
+            "last_trained_completed_sample_count",
+        ),
+    ) or 0
     trade_fallback = _trade_sample_count_from_status(scheduler_state) or 0
     models = scheduler_state.get("models")
     if isinstance(models, dict):
@@ -645,9 +664,27 @@ async def _training_count_snapshot(
             for key in ("active_sample_cursor", "sample_cursor"):
                 cursor = model_state.get(key)
                 if isinstance(cursor, dict):
+                    shadow_fallback = max(
+                        shadow_fallback,
+                        _safe_int_count(cursor.get("shadow")),
+                    )
                     trade_fallback = max(trade_fallback, _safe_int_count(cursor.get("trade")))
             last_result = model_state.get("last_result")
             if isinstance(last_result, dict):
+                shadow_fallback = max(
+                    shadow_fallback,
+                    _sample_count_from_status(
+                        last_result,
+                        (
+                            "completed_shadow_sample_count",
+                            "training_shadow_sample_count",
+                            "shadow_sample_count",
+                            "last_trained_completed_shadow_sample_count",
+                            "completed_shadow_raw_decision_group_count",
+                            "last_trained_completed_sample_count",
+                        ),
+                    ) or 0,
+                )
                 trade_fallback = max(
                     trade_fallback,
                     _safe_int_count(last_result.get("completed_trade_sample_count")),
@@ -737,6 +774,21 @@ async def _completed_training_trade_count() -> int:
 
 
 def _trade_sample_count_from_status(value: Any) -> int | None:
+    return _sample_count_from_status(
+        value,
+        (
+            "completed_trade_sample_count",
+            "training_trade_sample_count",
+            "trade_sample_count",
+            "last_trained_completed_trade_sample_count",
+        ),
+    )
+
+
+def _sample_count_from_status(
+    value: Any,
+    keys: tuple[str, ...],
+) -> int | None:
     if not isinstance(value, dict):
         return None
     candidates: list[int] = []
@@ -748,12 +800,7 @@ def _trade_sample_count_from_status(value: Any) -> int | None:
     ):
         if not isinstance(payload, dict):
             continue
-        for key in (
-            "completed_trade_sample_count",
-            "training_trade_sample_count",
-            "trade_sample_count",
-            "last_trained_completed_trade_sample_count",
-        ):
+        for key in keys:
             if payload.get(key) is None:
                 continue
             candidates.append(_safe_int_count(payload.get(key)))
@@ -1469,6 +1516,8 @@ def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str,
                 "available": False,
                 "status": "warming",
                 "service_available": None,
+                "sample_count_state": "warming",
+                "sample_count_warnings": [],
                 "models": {},
             },
             "governance": {
