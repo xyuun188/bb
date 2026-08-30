@@ -631,13 +631,14 @@ def _news_document(article: NewsArticle) -> VectorMemoryDocument | None:
 
 
 def _decision_text(decision: AIDecision, raw: dict[str, Any]) -> str:
+    outcome_pnl_pct = getattr(decision, "outcome_pnl_pct", None)
     parts = [
         f"币种 {decision.symbol}",
         f"动作 {decision.action}",
         f"信心 {float(decision.confidence or 0.0):.3f}",
         f"仓位 {float(decision.position_size_pct or 0.0):.4f}",
         f"结果 {decision.outcome or ''}",
-        f"收益 {decision.outcome_pnl_pct if decision.outcome_pnl_pct is not None else ''}",
+        f"收益 {outcome_pnl_pct}" if outcome_pnl_pct is not None else "",
         str(decision.reasoning or ""),
         str(decision.execution_reason or ""),
     ]
@@ -659,11 +660,12 @@ def _decision_text(decision: AIDecision, raw: dict[str, Any]) -> str:
 def _decision_realized_pnl_pct(decision: AIDecision) -> float | None:
     """Return realized PnL only when it belongs to this exact decision."""
 
-    if decision.outcome_pnl_pct is None:
+    outcome_pnl_pct = getattr(decision, "outcome_pnl_pct", None)
+    if outcome_pnl_pct is None:
         return None
     if not decision.outcome and not decision.was_executed:
         return None
-    return float(decision.outcome_pnl_pct)
+    return float(outcome_pnl_pct)
 
 
 def _decision_realized_outcome(decision: AIDecision, pnl_pct: float | None) -> str:

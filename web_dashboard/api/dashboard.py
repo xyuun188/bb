@@ -108,6 +108,7 @@ _training_effectiveness_generation_tasks: dict[str, asyncio.Task[Any]] = {}
 _training_effectiveness_generation_started_at: dict[str, float] = {}
 _TRAINING_EFFECTIVENESS_REFRESH_COOLDOWN_SECONDS = 60.0
 STRATEGY_LEARNING_PARAMS = DEFAULT_TRADING_PARAMS.strategy_learning
+_ANALYSIS_DETAIL_VECTOR_MEMORY_TIMEOUT_SECONDS = 3.0
 MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
     settings.data_dir / "model_training_scheduler_state.json"
 )
@@ -9626,6 +9627,41 @@ async def _build_opening_funnel_payload(
     )
 
 
+async def _safe_analysis_detail_vector_memory_context(
+    decision: Any,
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep optional vector-memory enrichment from breaking the detail response."""
+
+    try:
+        return await asyncio.wait_for(
+            get_vector_memory_service().similar_decision_context(decision, raw),
+            timeout=_ANALYSIS_DETAIL_VECTOR_MEMORY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "analysis_detail_vector_memory_timeout",
+            decision_id=getattr(decision, "id", None),
+            symbol=getattr(decision, "symbol", None),
+            timeout_seconds=_ANALYSIS_DETAIL_VECTOR_MEMORY_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.exception(
+            "analysis_detail_vector_memory_failed",
+            decision_id=getattr(decision, "id", None),
+            symbol=getattr(decision, "symbol", None),
+            error=safe_error_text(exc, limit=180),
+        )
+
+    return {
+        "enabled": True,
+        "status": "unavailable",
+        "hits": [],
+        "error": "历史相似分析暂不可用",
+        "degraded": True,
+    }
+
+
 @router.get("/analysis-records")
 async def get_analysis_records(
     limit: int = 50,
@@ -9681,6 +9717,7 @@ async def get_analysis_records(
             AIDecision.execution_price,
             AIDecision.created_at,
             AIDecision.outcome,
+            AIDecision.outcome_pnl_pct,
             AIDecision.is_paper,
             AIDecision.raw_llm_response,
             AIDecision.analysis_type,
@@ -10004,7 +10041,7 @@ async def get_analysis_records(
                 continue
         local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
         vector_memory_context = (
-            await get_vector_memory_service().similar_decision_context(d, raw)
+            await _safe_analysis_detail_vector_memory_context(d, raw)
             if include_detail and settings.vector_memory_enabled
             else {"enabled": False, "status": "disabled", "hits": []}
         )

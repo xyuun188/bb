@@ -234,3 +234,55 @@ async def test_dashboard_projects_experts_by_analysis_scope_for_legacy_records(
         assert position_record["direction_competition"] == {}
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_analysis_detail_degrades_when_vector_memory_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'analysis-detail-vector-failure.db').as_posix()}",
+    )
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    await init_db()
+
+    class FailingVectorMemory:
+        async def similar_decision_context(self, _decision, _raw):
+            raise AttributeError("lightweight projection is missing outcome_pnl_pct")
+
+    monkeypatch.setattr(dashboard, "get_vector_memory_service", lambda: FailingVectorMemory())
+    try:
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name=ENSEMBLE_TRADER_NAME,
+                symbol="BTC/USDT",
+                action="hold",
+                confidence=0.5,
+                reasoning="market analysis",
+                raw_llm_response=_legacy_raw_payload("market"),
+                analysis_type="market",
+                is_paper=True,
+                created_at=datetime.now(UTC),
+            )
+            session.add(decision)
+            await session.flush()
+            decision_id = decision.id
+
+        response = await dashboard.get_analysis_records(
+            decision_id=decision_id,
+            include_detail=True,
+            is_paper=True,
+        )
+
+        assert response["count"] == 1
+        vector_memory = response["records"][0]["vector_memory"]
+        assert vector_memory["status"] == "unavailable"
+        assert vector_memory["degraded"] is True
+        assert vector_memory["hits"] == []
+        assert response["records"][0]["expert_count"] == 4
+    finally:
+        await close_db()

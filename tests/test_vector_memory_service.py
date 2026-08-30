@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from config.settings import settings
 from services.training_epoch import write_training_epoch
 from services.vector_memory.embedding import deterministic_text_vector
-from services.vector_memory.service import _decision_document, _hit_payload, _influence_payload
+from services.vector_memory.service import (
+    _decision_document,
+    _decision_text,
+    _hit_payload,
+    _influence_payload,
+)
 from services.vector_memory.store import (
     JsonVectorMemoryStore,
     ZvecVectorMemoryStore,
@@ -205,6 +211,23 @@ def test_vector_memory_decision_document_does_not_invent_unfilled_pnl() -> None:
     assert document.outcome == ""
     assert document.metadata["has_realized_outcome"] is False
     assert document.metadata["pnl_source"] == ""
+
+
+def test_vector_memory_decision_text_accepts_lightweight_projection() -> None:
+    decision = SimpleNamespace(
+        symbol="BTC/USDT",
+        action="hold",
+        confidence=0.5,
+        position_size_pct=0.0,
+        outcome=None,
+        reasoning="保持观望",
+        execution_reason="未提交订单",
+    )
+
+    text = _decision_text(decision, {})
+
+    assert "币种 BTC/USDT" in text
+    assert "收益" not in text
 
 
 def test_vector_memory_hit_payload_hides_legacy_unverified_pnl() -> None:
