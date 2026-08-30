@@ -7712,6 +7712,10 @@ class TradingService:
             # ranker may fill unused observation slots with valid analysis-only
             # symbols; execution gates still decide whether an order is allowed.
             allow_analysis_fallback=True,
+            # Keep one complete relative-quality candidate eligible for the
+            # normal AI, market-data, risk, and exchange execution gates when
+            # strict cross-sectional medians have no intersection.
+            allow_relative_quality_fallback=True,
         )
         # A valid snapshot can still fail the dynamic cross-sectional entry
         # tier. Keep it in the observation pool when the ranker is underfilled;

@@ -224,6 +224,7 @@ class EntryFeatureRankerPolicy:
         limit: int,
         *,
         allow_analysis_fallback: bool = False,
+        allow_relative_quality_fallback: bool = False,
     ) -> EntryFeatureRankResult:
         all_items = list(feature_vectors.items())
         dynamic_policy = self._cross_sectional_policy(feature_vectors)
@@ -275,6 +276,28 @@ class EntryFeatureRankerPolicy:
             if len(selected_items) >= limit:
                 break
             selected_items.extend(bucket[: max(limit - len(selected_items), 0)])
+
+        # A strict cross-sectional intersection can be empty in a small or
+        # unusually mixed market even when one complete snapshot is still a
+        # reasonable candidate for the normal AI/risk gates. Promote at most
+        # one such candidate, and keep incomplete/fallback snapshots out.
+        relative_quality_items: list[tuple[str, Any]] = []
+        if (
+            allow_relative_quality_fallback
+            and not tradable_items
+            and len(selected_items) < max(0, int(limit or 0))
+        ):
+            relative_quality_candidates = [
+                item
+                for item in ranked_filtered
+                if self._is_relative_quality_candidate(item[1])
+            ]
+            relative_quality_items = relative_quality_candidates[:1]
+            selected_items.extend(relative_quality_items)
+
+        selected_symbols_before_analysis_fallback = {
+            symbol for symbol, _feature in selected_items
+        }
         analysis_only_items: list[tuple[str, Any]] = []
         if allow_analysis_fallback and len(selected_items) < max(0, int(limit or 0)):
             # Market observation must not disappear just because a symbol is
@@ -283,6 +306,7 @@ class EntryFeatureRankerPolicy:
             analysis_only_items = [
                 item
                 for item in ranked_filtered
+                if item[0] not in selected_symbols_before_analysis_fallback
                 if self.is_auto_analysis_candidate_feature(item[1])
             ]
             selected_items.extend(
@@ -291,6 +315,7 @@ class EntryFeatureRankerPolicy:
         selected = dict(selected_items)
         selected_symbols = {symbol for symbol, _ in selected_items}
         analysis_only_symbols = {symbol for symbol, _ in analysis_only_items}
+        relative_quality_symbols = {symbol for symbol, _ in relative_quality_items}
 
         def symbol_diagnostic(
             symbol: str,
@@ -299,7 +324,9 @@ class EntryFeatureRankerPolicy:
             selected_item: bool,
         ) -> dict[str, Any]:
             raw_score = self.feature_opportunity_score(feature)
-            if symbol in analysis_only_symbols:
+            if symbol in relative_quality_symbols:
+                tier = "relative_quality_fill"
+            elif symbol in analysis_only_symbols:
                 tier = "analysis_only_fill"
             elif symbol in tradable_symbols:
                 tier = "hard_filter"
@@ -308,7 +335,9 @@ class EntryFeatureRankerPolicy:
             else:
                 tier = "filtered_out"
             filter_diag = filter_diagnostics.get(symbol, {})
-            if selected_item and symbol in analysis_only_symbols:
+            if selected_item and symbol in relative_quality_symbols:
+                reason = "selected_for_relative_quality_entry"
+            elif selected_item and symbol in analysis_only_symbols:
                 reason = "selected_for_market_analysis_only"
             elif selected_item:
                 reason = "selected_for_market_analysis"
@@ -327,7 +356,7 @@ class EntryFeatureRankerPolicy:
                     filter_diag.get(
                         (
                             "analysis_reasons"
-                            if tier in {"filtered_out", "analysis_only_fill"}
+                            if tier in {"filtered_out", "analysis_only_fill", "relative_quality_fill"}
                             else "tradable_reasons"
                         ),
                         [],
@@ -350,7 +379,12 @@ class EntryFeatureRankerPolicy:
                 "change_24h": round(_feature_float(feature, "change_24h_pct"), 2),
             }
 
-        ranked_candidates = [*ranked_tradable, *ranked_soft, *analysis_only_items]
+        ranked_candidates = [
+            *ranked_tradable,
+            *ranked_soft,
+            *relative_quality_items,
+            *analysis_only_items,
+        ]
         rank_sample_items = []
         seen_symbols: set[str] = set()
         for symbol, feature in [*selected_items, *ranked_candidates]:
@@ -387,6 +421,16 @@ class EntryFeatureRankerPolicy:
                 symbol for symbol, _feature in analysis_only_items
             ],
             "analysis_fallback_enabled": bool(allow_analysis_fallback),
+            "relative_quality_candidates": sum(
+                1
+                for _symbol, feature in ranked_filtered
+                if self._is_relative_quality_candidate(feature)
+            ),
+            "relative_quality_selected_count": len(relative_quality_items),
+            "relative_quality_selected_symbols": [
+                symbol for symbol, _feature in relative_quality_items
+            ],
+            "relative_quality_fallback_enabled": bool(allow_relative_quality_fallback),
             "dynamic_policy": {
                 "version": "2026-07-12.dynamic-market-cross-section.v1",
                 "values": {name: item.to_dict() for name, item in dynamic_policy.items()},
@@ -424,6 +468,23 @@ class EntryFeatureRankerPolicy:
             ],
         }
         return EntryFeatureRankResult(selected=selected, diagnostics=diagnostics)
+
+    def _is_relative_quality_candidate(self, feature: Any) -> bool:
+        """Allow one complete candidate through when strict medians have no intersection."""
+
+        if self._missing_indicator_snapshot(feature) or self._uses_fallback_indicator_snapshot(
+            feature
+        ):
+            return False
+        parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=False)
+        if parsed is None:
+            return False
+        _symbol, current_price, volume_24h, volume_ratio, volatility, day_change, adx = parsed
+        notional = self._feature_notional_24h_usdt(feature, current_price, volume_24h)
+        return all(
+            math.isfinite(value)
+            for value in (current_price, notional, volume_ratio, volatility, day_change, adx)
+        ) and notional > 0 and volume_ratio > 0 and volatility >= 0 and adx >= 0
 
     def _feature_filter_diagnostic(
         self,

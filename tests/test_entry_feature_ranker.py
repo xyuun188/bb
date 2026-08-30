@@ -216,3 +216,78 @@ def test_analysis_fallback_still_excludes_missing_market_anchor() -> None:
     assert result.selected == {}
     assert result.diagnostics["analysis_only_selected_count"] == 0
     assert result.diagnostics["rank_underfill_reason"] == "missing_indicator_snapshot"
+
+
+def test_relative_quality_fallback_promotes_one_complete_candidate_when_strict_intersection_is_empty() -> None:
+    features = {
+        "A/USDT": _feature(
+            "A/USDT",
+            volume_ratio=4.0,
+            volume_24h=100_000.0,
+            adx_14=5.0,
+            volatility_20=0.90,
+            change_24h_pct=30.0,
+            indicator_snapshot_available=True,
+        ),
+        "B/USDT": _feature(
+            "B/USDT",
+            volume_ratio=0.1,
+            volume_24h=1_000.0,
+            adx_14=40.0,
+            volatility_20=0.01,
+            change_24h_pct=1.0,
+            indicator_snapshot_available=True,
+        ),
+        "C/USDT": _feature(
+            "C/USDT",
+            volume_ratio=3.0,
+            volume_24h=1_000.0,
+            adx_14=35.0,
+            volatility_20=0.80,
+            change_24h_pct=20.0,
+            indicator_snapshot_available=True,
+        ),
+        "D/USDT": _feature(
+            "D/USDT",
+            volume_ratio=0.2,
+            volume_24h=100_000.0,
+            adx_14=6.0,
+            volatility_20=0.02,
+            change_24h_pct=2.0,
+            indicator_snapshot_available=True,
+        ),
+    }
+
+    result = _ranker().rank(
+        features,
+        4,
+        allow_relative_quality_fallback=True,
+    )
+
+    assert result.diagnostics["tradable_candidates"] == 0
+    assert result.diagnostics["relative_quality_selected_count"] == 1
+    assert result.diagnostics["relative_quality_selected_symbols"] == ["A/USDT"]
+    assert result.diagnostics["analysis_only_selected_count"] == 0
+    assert "A/USDT" in result.selected
+    diagnostic = next(
+        item for item in result.diagnostics["symbols"] if item["symbol"] == "A/USDT"
+    )
+    assert diagnostic["selection_tier"] == "relative_quality_fill"
+    assert diagnostic["non_selected_reason"] == "selected_for_relative_quality_entry"
+
+
+def test_relative_quality_fallback_excludes_fallback_indicator_snapshots() -> None:
+    fallback = _feature(
+        "A/USDT",
+        indicator_snapshot_available=False,
+        volume_ratio=2.0,
+        volume_24h=100_000.0,
+    )
+    result = _ranker().rank(
+        {"A/USDT": fallback},
+        1,
+        allow_relative_quality_fallback=True,
+    )
+
+    assert result.selected == {}
+    assert result.diagnostics["relative_quality_selected_count"] == 0
