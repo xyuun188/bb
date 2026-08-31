@@ -6712,15 +6712,27 @@ async function fetchSystemAudit(options = {}) {
             }
             state.systemAuditStatus = data || null;
             renderSystemAudit();
-            if (forceRefresh && data?.cache?.refresh_requested) {
-                if (updated) updated.textContent = '已提交刷新，等待新结果...';
+            const warming = String(data?.status || '').toLowerCase() === 'warming'
+                || data?.cache?.cold_start === true;
+            const refreshing = warming || data?.cache?.refresh_in_background === true;
+            if (forceRefresh && data?.cache?.refresh_requested && updated) {
+                updated.textContent = '已提交刷新，等待新结果...';
+            }
+            // Cold starts and explicit refreshes need a short poll interval so
+            // the page replaces the placeholder as soon as the background
+            // audit finishes; the regular 60-second interval remains the
+            // steady-state fallback.
+            if (refreshing && isPageActive('system-audit')) {
                 if (systemAuditRefreshPollTimer) window.clearTimeout(systemAuditRefreshPollTimer);
                 systemAuditRefreshPollTimer = window.setTimeout(() => {
                     systemAuditRefreshPollTimer = null;
                     if (!document.hidden && isPageActive('system-audit')) {
                         fetchSystemAudit({ silent: true });
                     }
-                }, 1500);
+                }, 2000);
+            } else if (systemAuditRefreshPollTimer) {
+                window.clearTimeout(systemAuditRefreshPollTimer);
+                systemAuditRefreshPollTimer = null;
             }
         } catch (error) {
             const message = error?.message || String(error || '系统巡检接口请求失败');

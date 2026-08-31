@@ -9,6 +9,7 @@ import json
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -64,11 +65,67 @@ STATUS_REMOTE_MODEL_TIMEOUT_SECONDS = 2.0
 TRAINING_COUNT_TIMEOUT_SECONDS = 4.0
 STATUS_CACHE_TTL_SECONDS = 60.0
 STATUS_INITIAL_REFRESH_TIMEOUT_SECONDS = 45.0
+STATUS_SNAPSHOT_FILE_PREFIX = "data_collection_status_latest"
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _status_cache: dict[bool, tuple[datetime, dict[str, Any]]] = {}
 _status_refresh_tasks: dict[bool, asyncio.Task[Any]] = {}
 _status_refresh_locks: dict[bool, asyncio.Lock] = {}
+
+
+def _status_snapshot_path(include_feature_coverage: bool) -> Path:
+    scope = "full" if include_feature_coverage else "basic"
+    return settings.data_dir / f"{STATUS_SNAPSHOT_FILE_PREFIX}_{scope}.json"
+
+
+def _persist_status_snapshot(
+    include_feature_coverage: bool,
+    payload: dict[str, Any],
+) -> None:
+    """Keep the latest real status available to isolated audit processes."""
+
+    if str(payload.get("source") or "") != "dashboard.data_collection":
+        return
+    path = _status_snapshot_path(include_feature_coverage)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError as exc:
+        logger.warning(
+            "failed to persist data collection status snapshot",
+            error=safe_error_text(exc, limit=180),
+        )
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def load_persisted_data_collection_status(
+    include_feature_coverage: bool = False,
+) -> tuple[datetime, dict[str, Any]] | None:
+    """Load the latest completed status without starting a DB-heavy refresh."""
+
+    path = _status_snapshot_path(include_feature_coverage)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    checked_at_value = payload.get("checked_at")
+    try:
+        checked_at = datetime.fromisoformat(str(checked_at_value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=UTC)
+    return checked_at.astimezone(UTC), payload
 
 
 def _status_error_payload(section: str, exc: BaseException) -> dict[str, Any]:
@@ -1464,6 +1521,7 @@ async def _refresh_data_collection_status(include_feature_coverage: bool) -> dic
     async with lock:
         payload = await _build_data_collection_status(include_feature_coverage)
         _status_cache[include_feature_coverage] = (datetime.now(UTC), payload)
+        _persist_status_snapshot(include_feature_coverage, payload)
         return payload
 
 

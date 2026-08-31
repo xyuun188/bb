@@ -84,6 +84,105 @@ async def test_system_audit_force_refresh_schedules_even_when_snapshot_is_fresh(
     assert payload["cache"]["refresh_in_background"] is True
 
 
+@pytest.mark.asyncio
+async def test_audit_reads_persisted_data_collection_snapshot_before_warming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC)
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "ok",
+        "source": "dashboard.data_collection",
+        "training": {"local_ai_tools": {"status": "ready"}},
+    }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "load_persisted_data_collection_status",
+        lambda include_feature_coverage=False: (checked_at, persisted),
+    )
+
+    async def unexpected_warming_read(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("persisted snapshot should avoid the warming placeholder")
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        unexpected_warming_read,
+    )
+
+    payload = await system_audit._data_collection_status_for_audit()
+
+    assert payload["status"] == "ok"
+    assert payload["cache"]["persisted_snapshot"] is True
+    assert payload["training"]["local_ai_tools"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_audit_cold_start_waits_for_one_bounded_data_collection_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "load_persisted_data_collection_status",
+        lambda include_feature_coverage=False: None,
+    )
+
+    async def fake_get_status(
+        include_feature_coverage: bool = True,
+        *,
+        start_background_refresh: bool = True,
+        wait_for_initial_refresh: bool = False,
+    ) -> dict[str, Any]:
+        calls.append(
+            {
+                "include_feature_coverage": include_feature_coverage,
+                "start_background_refresh": start_background_refresh,
+                "wait_for_initial_refresh": wait_for_initial_refresh,
+            }
+        )
+        return {"status": "ok", "cache": {"cold_start": False}}
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "get_data_collection_status",
+        fake_get_status,
+    )
+
+    payload = await system_audit._data_collection_status_for_audit()
+
+    assert payload["status"] == "ok"
+    assert calls == [
+        {
+            "include_feature_coverage": False,
+            "start_background_refresh": True,
+            "wait_for_initial_refresh": True,
+        }
+    ]
+
+
+def test_warming_snapshot_is_not_reused_as_a_durable_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_path = tmp_path / "system_audit_latest.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "checked_at": datetime.now(UTC).isoformat(),
+                "status": "warming",
+                "summary": {},
+                "cards": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(system_audit, "_latest_audit_path", lambda: snapshot_path)
+
+    assert system_audit._load_latest_audit_snapshot() is None
+
+
 class _CompletedProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
         self.returncode: int | None = 0

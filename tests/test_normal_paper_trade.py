@@ -16,6 +16,7 @@ from services.normal_paper_trade import (
     normal_paper_order_identity_reasons,
     normal_paper_settlement_contract_reasons,
     normal_paper_trade_contract_reasons,
+    quality_observation_risk_fraction,
     select_normal_paper_trade_side,
 )
 from tests.legacy_paper_contract_fixtures import (
@@ -179,7 +180,12 @@ def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> No
     assert contract["paper_quality_mode"] == "quality_observation"
     assert contract["paper_quality_observation_only"] is True
     assert contract["production_permission"] is False
-    assert contract["single_trade_risk_fraction_cap"] == (
+    assert contract["single_trade_risk_fraction_cap"] == quality_observation_risk_fraction(
+        expected_net_return_pct=0.4,
+        objective_net_return_pct=-0.2,
+        loss_probability=0.4,
+    )
+    assert contract["single_trade_risk_fraction_cap"] > (
         NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
     )
 

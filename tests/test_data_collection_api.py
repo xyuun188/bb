@@ -1538,5 +1538,30 @@ async def test_data_collection_status_audit_read_does_not_start_refresh(
     assert body["cache"]["cold_start"] is True
 
 
+def test_persisted_data_collection_status_round_trips(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        data_collection_module,
+        "_status_snapshot_path",
+        lambda _include: tmp_path / "data_collection_status_latest_basic.json",
+    )
+    payload = {
+        "checked_at": "2026-08-30T18:00:00+00:00",
+        "source": "dashboard.data_collection",
+        "status": "ok",
+        "training": {"local_ai_tools": {"status": "ready"}},
+    }
+
+    data_collection_module._persist_status_snapshot(False, payload)
+    loaded = data_collection_module.load_persisted_data_collection_status(False)
+
+    assert loaded is not None
+    checked_at, loaded_payload = loaded
+    assert checked_at == datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    assert loaded_payload["training"]["local_ai_tools"]["status"] == "ready"
+
+
 async def _async_value(value: Any) -> Any:
     return value

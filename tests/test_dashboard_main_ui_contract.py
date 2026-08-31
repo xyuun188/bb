@@ -818,6 +818,8 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "fetchSystemAudit()" in html
     assert "systemAuditStatus: null" in script
     assert "let systemAuditRefreshInFlight = null" in script
+    assert "const warming = String(data?.status || '').toLowerCase() === 'warming'" in script
+    assert "Cold starts and explicit refreshes need a short poll interval" in script
     assert "if (page === 'system-audit') fetchSystemAudit();" in script
     assert "if (isPageActive('system-audit'))" in script
     assert "fetchJSON('/api/system-audit/status')" in script

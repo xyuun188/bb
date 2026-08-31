@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -40,6 +41,47 @@ _RESOURCE_ERROR_MARKERS = (
     "training_process_interrupted",
     "training process interrupted",
 )
+
+
+def training_input_fingerprint(value: Any) -> str:
+    """Build a stable, compact identity for one training cursor/probe payload.
+
+    Callers use this identity when reopening a resource circuit: a changed
+    sample cursor or distribution profile is safe to try once even if the
+    previous input exhausted memory.
+    """
+
+    payload = value if isinstance(value, dict) else {}
+    normalized = {
+        key: payload.get(key)
+        for key in (
+            "completed_shadow_sample_count",
+            "completed_trade_sample_count",
+            "completed_training_decision_group_count",
+            "completed_market_sample_count",
+            "completed_authoritative_cost_sample_count",
+            "completed_market_decision_group_count",
+            "completed_authoritative_cost_decision_group_count",
+            "training_distribution_profile",
+            "cursor_policy",
+        )
+        if key in payload
+    }
+    if not normalized:
+        normalized = {
+            key: payload.get(key)
+            for key in sorted(payload)
+            if key in {"reason", "trained", "error"}
+        }
+    return hashlib.sha256(
+        json.dumps(
+            normalized,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def classify_training_failure(

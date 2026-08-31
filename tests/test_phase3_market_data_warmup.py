@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from scripts.install_phase3_market_data_warmup_timer import render_service
+from scripts.install_phase3_market_data_warmup_timer import render_service, render_timer
 from scripts.run_phase3_market_data_warmup import _parse_symbols, warm_market_data
 from services.data_service import KLINE_PERSIST_TIMEFRAME_LIMITS
 
@@ -209,3 +209,10 @@ def test_market_data_warmup_timer_contract_does_not_start_trading() -> None:
     assert "bb-paper-trading" not in service
     assert "trading_service" not in service
     assert "systemctl start" not in service
+
+
+def test_market_data_warmup_timer_matches_kline_freshness_budget() -> None:
+    timer = render_timer()
+
+    assert "OnCalendar=*-*-* *:00/2:00" in timer
+    assert "RandomizedDelaySec=15" in timer

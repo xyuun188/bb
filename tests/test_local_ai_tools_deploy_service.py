@@ -205,12 +205,12 @@ def test_local_ai_tools_training_separates_authoritative_cost_and_tail_policy() 
     assert 'LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000"' in SERVICE_CODE
 
 
-def test_deploy_blocks_python_incompatible_training_executor_arguments() -> None:
+def test_deploy_requires_supported_python_training_executor() -> None:
     command = deploy._remote_training_runtime_compatibility_command()
 
-    assert "max_tasks_per_child" not in SERVICE_CODE
-    assert "grep -Fq max_tasks_per_child" in command
-    assert "ProcessPoolExecutor(max_workers=1)" in command
+    assert "max_tasks_per_child=1" in SERVICE_CODE
+    assert "sys.version_info < (3, 11)" in command
+    assert "ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)" in command
     assert "phase3_training_executor_compatibility_ok" in command
 
 
@@ -263,7 +263,38 @@ def test_local_ai_tools_memory_failure_is_structured_and_preserves_artifact(
     assert result["trained"] is False
     assert result["reason"] == "resource_memory"
     assert result["resource_failure"] is True
-    assert result["resource_failure_policy"] == "preserve_current_artifact_and_backoff"
+    assert result["resource_failure_policy"] == (
+        "preserve_current_artifact_after_bounded_retry"
+    )
+    assert result["resource_recovery"]["attempted"] is True
+
+
+def test_local_ai_tools_memory_failure_retries_with_bounded_training_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    calls: list[tuple[int, int]] = []
+
+    def train_inner(request):
+        counts = (len(request.shadow_samples), len(request.trade_samples))
+        calls.append(counts)
+        if len(calls) == 1:
+            raise MemoryError()
+        return {"trained": True, "reason": "trained", "observed_counts": counts}
+
+    monkeypatch.setattr(module, "_train_impl_inner", train_inner)
+    result = module._train_impl(
+        module.TrainRequest(
+            shadow_samples=[{"id": index} for index in range(10)],
+            trade_samples=[{"id": index} for index in range(6)],
+        )
+    )
+
+    assert result["trained"] is True
+    assert calls == [(10, 6), (5, 3)]
+    assert result["resource_recovery"]["fraction"] == 0.5
+    assert result["resource_recovery"]["reduced_counts"]["shadow_samples"] == 5
 
 
 def test_local_ai_tools_training_rejects_overlapping_registry_mutations(
@@ -1579,6 +1610,15 @@ def test_local_ai_registry_replaces_only_incompatible_champion_contract(
     monkeypatch.setattr(module, "_resolve_artifact_pointer", corrupted)
     with pytest.raises(ValueError, match="model hash verification failed"):
         module._replaceable_current_artifact()
+
+    comparison = module._compare_candidate_to_current(
+        _test_artifact_metadata(module),
+        candidate_stage="shadow",
+    )
+    assert comparison["accepted"] is False
+    assert comparison["reason"] == "champion_integrity_unverified"
+    assert comparison["retryable"] is True
+    assert comparison["blocking_reasons"] == ["champion_integrity_unverified"]
 
 
 def test_local_ai_registry_replaces_incompatible_activation_permission_contract(

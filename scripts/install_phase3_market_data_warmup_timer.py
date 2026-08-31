@@ -23,7 +23,11 @@ SERVICE_NAME = "bb-phase3-market-data-warmup.service"
 TIMER_NAME = "bb-phase3-market-data-warmup.timer"
 REPORT_DIR_REL = "data/phase3_market_data_warmup"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* *:04,19,34,49:00"
+# The audit treats 1m/5m bars as stale after 180/600 seconds.  A 15-minute
+# calendar therefore guarantees recurring false warnings even when every
+# warmup run succeeds.  Run the small, bounded warmup every two minutes and
+# keep jitter short enough to stay inside the 1m freshness budget.
+DEFAULT_ON_CALENDAR = "*-*-* *:00/2:00"
 
 
 def _remote_quote(value: str) -> str:
@@ -67,7 +71,7 @@ Description=Run BB Phase 3 market-data warmup
 [Timer]
 OnCalendar={on_calendar}
 Persistent=true
-RandomizedDelaySec=90
+RandomizedDelaySec=15
 Unit={SERVICE_NAME}
 
 [Install]

@@ -562,6 +562,39 @@ class TrainRequest(BaseModel):
     confirm_phase3_rebuild: bool = False
 
 
+_RESOURCE_RECOVERY_FRACTIONS = (0.50, 0.25)
+
+
+def _bounded_training_rows(rows: list[dict[str, Any]], fraction: float) -> list[dict[str, Any]]:
+    """Keep an evenly spaced chronological subset for memory recovery."""
+
+    source = list(rows or [])
+    if len(source) <= 2:
+        return source
+    target = max(2, min(len(source), int(math.ceil(len(source) * fraction))))
+    if target >= len(source):
+        return source
+    indices = {
+        round(index * (len(source) - 1) / max(target - 1, 1))
+        for index in range(target)
+    }
+    return [source[index] for index in sorted(indices)]
+
+
+def _reduced_training_request(req: TrainRequest, fraction: float) -> TrainRequest:
+    """Build a bounded retry request without mutating the caller's payload."""
+
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    for key in (
+        "shadow_samples",
+        "trade_samples",
+        "sequence_samples",
+        "text_sentiment_samples",
+    ):
+        payload[key] = _bounded_training_rows(payload.get(key) or [], fraction)
+    return TrainRequest(**payload)
+
+
 def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
     try:
         raw = features.get(key, default)
@@ -1964,13 +1997,25 @@ def _compare_candidate_to_current(
     *,
     candidate_stage: str,
 ) -> dict[str, Any]:
-    current, incompatible_reason = _replaceable_current_artifact()
     report: dict[str, Any] = {
         "policy": "local_ai_tools_fee_after_champion_v1",
         "candidate_stage": candidate_stage,
         "accepted": False,
         "blocking_reasons": [],
     }
+    try:
+        current, incompatible_reason = _replaceable_current_artifact()
+    except ValueError as exc:
+        # A transient/incomplete champion registry must not turn /train into a
+        # 500 or allow an unverified replacement. Leave the current pointer
+        # untouched and let the scheduler retry after the registry is stable.
+        return {
+            **report,
+            "reason": "champion_integrity_unverified",
+            "blocking_reasons": ["champion_integrity_unverified"],
+            "champion_integrity_error": safe_error(exc, ERROR_TEXT_LIMIT),
+            "retryable": True,
+        }
     if current is None:
         return {
             **report,
@@ -3315,6 +3360,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     model.eval()
     with torch.no_grad():
         train_mae = float(torch.mean(torch.abs(model(xt) - yt)).item())
+    input_dim = int(X.shape[1])
     state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     del optimizer, loss_fn, xt, yt, model, X, y
     _training_gc()
@@ -3325,7 +3371,7 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
         "source_samples": source_sample_count,
         "max_samples": TORCH_PATCH_MAX_SAMPLES,
         "epochs": epochs,
-        "input_dim": int(X.shape[1]),
+        "input_dim": input_dim,
         "state_dict": state_dict,
         "mean": mean.astype(float).tolist()[0],
         "std": std.astype(float).tolist()[0],
@@ -5695,11 +5741,26 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     )
     if champion_comparison.get("accepted") is not True:
         challenger = reject_candidate_artifact(champion_comparison)
-        champion = _resolve_artifact_pointer(
-            CURRENT_POINTER_PATH,
-            role="current",
-            deserialize_bundle=False,
-        )
+        try:
+            champion = _resolve_artifact_pointer(
+                CURRENT_POINTER_PATH,
+                role="current",
+                deserialize_bundle=False,
+            )
+        except ValueError as exc:
+            return _with_post_training_inference_warmup({
+                "trained": False,
+                "reason": "champion_integrity_unverified",
+                "retryable": True,
+                "artifact_integrity_failure": True,
+                "challenger_rejected": True,
+                "challenger_version": challenger["version"],
+                "champion_retained": None,
+                "champion_version": None,
+                "champion_integrity_error": safe_error(exc, ERROR_TEXT_LIMIT),
+                "champion_comparison": champion_comparison,
+                **metadata,
+            })
         return _with_post_training_inference_warmup({
             "trained": True,
             "reason": "trained_challenger_rejected",
@@ -5755,22 +5816,58 @@ def _train_impl(req: TrainRequest) -> dict[str, Any]:
     try:
         return _train_impl_inner(req)
     except MemoryError:
-        # No candidate/current pointer is written until _train_impl_inner has
-        # completed, so returning a structured failure keeps the last good
-        # artifact intact and lets the scheduler apply its resource backoff.
+        # Retry with bounded chronological windows before opening the resource
+        # circuit. No candidate/current pointer is written until the inner
+        # trainer completes, so the last good artifact remains intact.
+        original_counts = {
+            key: len(getattr(req, key, None) or [])
+            for key in (
+                "shadow_samples",
+                "trade_samples",
+                "sequence_samples",
+                "text_sentiment_samples",
+            )
+        }
+        for fraction in _RESOURCE_RECOVERY_FRACTIONS:
+            reduced_request = _reduced_training_request(req, fraction)
+            try:
+                recovered = _train_impl_inner(reduced_request)
+            except MemoryError:
+                continue
+            if recovered.get("trained") is True:
+                recovered["resource_recovery"] = {
+                    "attempted": True,
+                    "fraction": fraction,
+                    "original_counts": original_counts,
+                    "reduced_counts": {
+                        key: len(getattr(reduced_request, key, None) or [])
+                        for key in original_counts
+                    },
+                    "policy": "chronological_window_retry_before_circuit",
+                }
+                return recovered
+
+        # No candidate/current pointer is written on a failed recovery. Return
+        # a structured failure so the scheduler can apply resource backoff.
         return {
             "trained": False,
             "reason": "resource_memory",
             "error": "MemoryError",
             "message": (
-                "训练刷新因内存不足停止；现有模型产物保持不变，已进入资源退避。"
+                "训练刷新因内存不足停止；已尝试缩小训练窗口，现有模型产物保持不变。"
             ),
             "resource_failure": True,
-            "resource_failure_policy": "preserve_current_artifact_and_backoff",
+            "resource_failure_policy": "preserve_current_artifact_after_bounded_retry",
             "shadow_sample_count": len(req.shadow_samples or []),
             "trade_sample_count": len(req.trade_samples or []),
             "sequence_sample_count": len(req.sequence_samples or []),
             "text_sentiment_sample_count": len(req.text_sentiment_samples or []),
+            "resource_recovery": {
+                "attempted": True,
+                "fractions": list(_RESOURCE_RECOVERY_FRACTIONS),
+                "original_counts": original_counts,
+                "policy": "chronological_window_retry_before_circuit",
+            },
         }
 
 
@@ -5938,6 +6035,7 @@ def _training_executor() -> ProcessPoolExecutor:
             _TRAIN_EXECUTOR = ProcessPoolExecutor(
                 max_workers=1,
                 mp_context=multiprocessing.get_context("spawn"),
+                max_tasks_per_child=1,
             )
         return _TRAIN_EXECUTOR
 
@@ -7007,11 +7105,12 @@ def _remote_training_runtime_compatibility_command() -> str:
 
     return (
         "set -euo pipefail; "
-        f"if grep -Fq max_tasks_per_child {sh(PHASE3_APP_DIR + '/local_ai_tools_api.py')}; then "
-        "echo phase3_training_unsupported_executor_argument >&2; exit 1; fi; "
         f"{PHASE3_PYTHON_BIN} - <<'PY'\n"
+        "import sys\n"
         "from concurrent.futures import ProcessPoolExecutor\n"
-        "executor = ProcessPoolExecutor(max_workers=1)\n"
+        "if sys.version_info < (3, 11):\n"
+        "    raise SystemExit('phase3_training_requires_python_3_11_or_newer')\n"
+        "executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)\n"
         "executor.shutdown(wait=False, cancel_futures=True)\n"
         "print('phase3_training_executor_compatibility_ok')\n"
         "PY"

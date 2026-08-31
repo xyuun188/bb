@@ -162,6 +162,7 @@ from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
+    training_input_fingerprint,
 )
 from services.normal_paper_trade import normal_paper_trade_contract_reasons
 from services.okx_error_classifier import is_okx_temporary_service_error
@@ -11695,6 +11696,29 @@ class TradingService:
                 model_ids=LOCAL_AI_TOOL_MODEL_IDS,
                 force=force,
             )
+            if (
+                not bool(gate_result.get("allowed"))
+                and gate_result.get("reason") == "resource_blocked"
+            ):
+                # A resource circuit must be reopened automatically when the
+                # canonical training cursor has moved. Older callers did not
+                # persist a fingerprint, so this probe also migrates those
+                # rows without weakening the circuit for an unchanged input.
+                cursor_probe = await self._run_local_ai_tools_training_cursor_subprocess()
+                probe_fingerprint = (
+                    training_input_fingerprint(cursor_probe)
+                    if cursor_probe.get("reason") == "cursor_probe_complete"
+                    else ""
+                )
+                if probe_fingerprint:
+                    gate_result = gate(
+                        scheduler_id="local_ai_tools_auto_train",
+                        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                        force=force,
+                        input_fingerprint=probe_fingerprint,
+                    )
+                    gate_result["input_fingerprint"] = probe_fingerprint
+                    gate_result["cursor_probe"] = cursor_probe
             if not bool(gate_result.get("allowed")):
                 return {
                     "trained": False,
@@ -11732,6 +11756,7 @@ class TradingService:
             raise
         try:
             result = await self._maybe_train_local_ai_tools_process(force=force)
+            result.setdefault("training_input_fingerprint", training_input_fingerprint(result))
             failed = str(result.get("reason") or "") in {
                 "error",
                 "load_samples_error",

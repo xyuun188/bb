@@ -37,7 +37,11 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "paper_quality_observation",
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
+# Legacy floor retained so historical v8 contracts remain verifiable. New
+# quality-observation contracts graduate between this floor and the bounded
+# v2 ceiling below; validated strategy trades still use the normal cap above.
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION = 0.0001
+NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT = 0.0003
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 # Keep paper training samples flowing while preventing a materially stressed
 # portfolio from continuing to stack one direction.
@@ -59,6 +63,10 @@ def _float(value: Any, default: float | None = 0.0) -> float | None:
     return number if isfinite(number) else default
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return min(max(float(value), lower), upper)
+
+
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -68,6 +76,55 @@ def _fingerprint(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def quality_observation_risk_fraction(
+    *,
+    expected_net_return_pct: Any,
+    objective_net_return_pct: Any,
+    loss_probability: Any,
+) -> float:
+    """Return a bounded observation risk cap from current, non-promoted evidence."""
+
+    expected = max(_float(expected_net_return_pct, 0.0) or 0.0, 0.0)
+    objective = _float(objective_net_return_pct, None)
+    parsed_loss = _float(loss_probability, None)
+    loss = _clamp(
+        (
+            parsed_loss
+            if parsed_loss is not None
+            else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+        ),
+        0.0,
+        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY,
+    )
+    # Positive expected return earns capacity gradually; high loss probability
+    # and a negative lower bound keep the observation side conservative.
+    edge_score = _clamp(expected / 1.0, 0.0, 1.0)
+    loss_score = _clamp(
+        (NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY - loss) / 0.30,
+        0.0,
+        1.0,
+    )
+    objective_score = (
+        _clamp((objective + 0.50) / 0.50, 0.0, 1.0)
+        if objective is not None
+        else 0.0
+    )
+    confidence = _clamp(
+        0.50 * edge_score + 0.30 * loss_score + 0.20 * objective_score,
+        0.0,
+        1.0,
+    )
+    return round(
+        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+        + (
+            NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT
+            - NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+        )
+        * confidence,
+        8,
+    )
 
 
 def normal_paper_client_order_id(decision_id: Any) -> str:
@@ -445,7 +502,11 @@ def build_normal_paper_trade_contract(
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
         "single_trade_risk_fraction_cap": (
-            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+            quality_observation_risk_fraction(
+                expected_net_return_pct=expected_net,
+                objective_net_return_pct=objective_net,
+                loss_probability=loss_probability,
+            )
             if quality_observation_only
             else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         ),
@@ -637,11 +698,30 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_horizon_invalid")
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     expected_single_cap = (
-        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+        quality_observation_risk_fraction(
+            expected_net_return_pct=contract.get("expected_net_return_pct"),
+            objective_net_return_pct=contract.get("objective_net_return_pct"),
+            loss_probability=contract.get("loss_probability"),
+        )
+        if observation_mode and expected_version == NORMAL_PAPER_TRADE_VERSION
+        else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
         if observation_mode
         else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
-    if not isclose(single_cap, expected_single_cap, abs_tol=1e-12):
+    if observation_mode and expected_version == NORMAL_PAPER_TRADE_VERSION:
+        legacy_floor = isclose(
+            single_cap,
+            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
+            abs_tol=1e-12,
+        )
+        graduated_cap = isclose(single_cap, expected_single_cap, abs_tol=1e-8)
+        if not (
+            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+            <= single_cap
+            <= NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT
+        ) or not (legacy_floor or graduated_cap):
+            reasons.append("normal_paper_trade_single_risk_cap_invalid")
+    elif not isclose(single_cap, expected_single_cap, abs_tol=1e-12):
         reasons.append("normal_paper_trade_single_risk_cap_invalid")
     if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
         reasons.append("normal_paper_trade_leverage_policy_invalid")

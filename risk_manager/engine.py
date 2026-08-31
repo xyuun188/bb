@@ -15,10 +15,10 @@ from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
+    quality_observation_risk_fraction,
 )
 
 logger = structlog.get_logger(__name__)
@@ -202,7 +202,15 @@ class RiskEngine:
             )
             if quality_observation:
                 expected_single_cap = (
-                    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+                    quality_observation_risk_fraction(
+                        expected_net_return_pct=normal_trade.get(
+                            "expected_net_return_pct"
+                        ),
+                        objective_net_return_pct=normal_trade.get(
+                            "objective_net_return_pct"
+                        ),
+                        loss_probability=normal_trade.get("loss_probability"),
+                    )
                 )
             if equity <= 0 or risk_budget > (
                 equity * expected_single_cap + 1e-8

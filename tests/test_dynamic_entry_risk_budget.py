@@ -444,7 +444,8 @@ async def test_quality_observation_forces_one_x_and_prices_negative_lcb_risk() -
     assert decision.suggested_leverage == 1.0
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.033)
     assert sizing["stressed_loss_fraction"] >= 0.033
-    assert sizing["risk_budget_usdt"] <= 0.1 + 1e-8
+    assert sizing["risk_budget_usdt"] <= 0.3 + 1e-8
+    assert sizing["risk_budget_usdt"] > 0.1
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assessment = RiskEngine().assess(decision, [], _balance)
     assert assessment.approved is True, assessment.rejection_reason

@@ -56,6 +56,7 @@ from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
+    training_input_fingerprint,
 )
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
@@ -3245,6 +3246,32 @@ class MLSignalService:
                 model_ids=LOCAL_ML_MODEL_IDS,
                 force=force,
             )
+            if (
+                not bool(gate_result.get("allowed"))
+                and gate_result.get("reason") == "resource_blocked"
+            ):
+                # Reopen a resource circuit only for a changed canonical
+                # cursor. This prevents an old MemoryError from suppressing
+                # fresh shadow data for the full circuit duration.
+                try:
+                    completed_shadow = await self._completed_shadow_sample_count()
+                    completed_groups = await count_shadow_training_decision_groups()
+                    probe = {
+                        "completed_shadow_sample_count": int(completed_shadow),
+                        "completed_training_decision_group_count": int(completed_groups),
+                        "cursor_policy": "canonical_clean_independent_decision_group_view",
+                    }
+                    probe_fingerprint = training_input_fingerprint(probe)
+                    gate_result = gate(
+                        scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                        model_ids=LOCAL_ML_MODEL_IDS,
+                        force=force,
+                        input_fingerprint=probe_fingerprint,
+                    )
+                    gate_result["input_fingerprint"] = probe_fingerprint
+                    gate_result["cursor_probe"] = probe
+                except Exception as exc:
+                    gate_result["cursor_probe_error"] = safe_error_text(exc, limit=180)
             if not bool(gate_result.get("allowed")):
                 return {
                     "trained": False,
@@ -3283,6 +3310,7 @@ class MLSignalService:
             raise
         try:
             result = await self._maybe_auto_train_process(force=force)
+            result.setdefault("training_input_fingerprint", training_input_fingerprint(result))
             failed = str(result.get("reason") or "") in {
                 "error",
                 "load_samples_error",

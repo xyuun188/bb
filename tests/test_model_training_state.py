@@ -12,6 +12,7 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     MODEL_TRAINING_STATE_VERSION,
     ModelTrainingStateStore,
+    training_input_fingerprint,
 )
 
 
@@ -26,6 +27,38 @@ def test_pytest_scheduler_state_isolated_from_runtime_data() -> None:
     assert test_store.path.resolve() != runtime_path
     assert trading_service.MODEL_TRAINING_STATE_STORE is test_store
     assert data_collection.MODEL_TRAINING_STATE_STORE is test_store
+
+
+def test_training_input_fingerprint_changes_with_canonical_cursor() -> None:
+    first = training_input_fingerprint(
+        {
+            "reason": "cursor_probe_complete",
+            "completed_shadow_sample_count": 100,
+            "completed_trade_sample_count": 20,
+            "completed_training_decision_group_count": 40,
+            "training_distribution_profile": {"features": {"returns_5": {"mean": 0.1}}},
+        }
+    )
+    same = training_input_fingerprint(
+        {
+            "reason": "ignored_diagnostic_change",
+            "completed_shadow_sample_count": 100,
+            "completed_trade_sample_count": 20,
+            "completed_training_decision_group_count": 40,
+            "training_distribution_profile": {"features": {"returns_5": {"mean": 0.1}}},
+        }
+    )
+    changed = training_input_fingerprint(
+        {
+            "completed_shadow_sample_count": 101,
+            "completed_trade_sample_count": 20,
+            "completed_training_decision_group_count": 41,
+            "training_distribution_profile": {"features": {"returns_5": {"mean": 0.1}}},
+        }
+    )
+
+    assert first == same
+    assert changed != first
 
 
 def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
