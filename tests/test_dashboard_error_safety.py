@@ -1610,6 +1610,10 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
     assert today["okx_equity_pnl"] == pytest.approx(-1.63)
     assert today["okx_cumulative_equity_pnl"] == pytest.approx(-1.63)
     assert today["total_pnl"] == pytest.approx(-1.63)
+    assert today["daily_total_pnl"] == pytest.approx(-1.63)
+    assert today["daily_settled_pnl"] == pytest.approx(0.0)
+    assert today["current_unsettled_pnl"] == pytest.approx(0.0)
+    assert today["unrealized_pnl"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -1679,6 +1683,9 @@ async def test_daily_pnl_assigns_midnight_equity_change_to_completed_beijing_day
     )
     assert rows["2026-06-29"]["okx_equity_pnl"] == pytest.approx(20.0)
     assert rows["2026-06-30"]["okx_equity_pnl"] == pytest.approx(5.0)
+    assert rows["2026-06-28"]["current_unsettled_pnl"] is None
+    assert rows["2026-06-29"]["current_unsettled_pnl"] is None
+    assert rows["2026-06-30"]["current_unsettled_pnl"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio

@@ -459,19 +459,18 @@
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
-                    按北京时间自然日统计；已平仓净盈亏来自 OKX 成交/仓位事实，OKX 权益变化来自账户权益快照。
+                    当日总盈亏按 OKX 账户权益当日变化计算；已结算是已完成平仓结果，未结算是当前持仓浮动盈亏，累计总盈亏从首个有效权益快照累计计算。
                 </div>
                 <div class="table-wrap">
                     <table>
                         <thead>
                             <tr>
                                 <th>北京时间日期</th>
-                                <th>亏损合计</th>
-                                <th>盈利合计</th>
-                                <th>已平仓净盈亏</th>
-                                <th>OKX权益变化</th>
-                                <th>三期累计权益变化</th>
-                                <th>交易数</th>
+                                <th>当日总盈亏</th>
+                                <th>当日已结算盈亏</th>
+                                <th>当前未结算盈亏</th>
+                                <th>累计总盈亏</th>
+                                <th>交易笔数</th>
                                 <th>详情</th>
                             </tr>
                         </thead>
@@ -1832,7 +1831,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-    <script src="/static/js/dashboard.js?v=20260829-data-collection-warmup-v1"></script>
+    <script src="/static/js/dashboard.js?v=20260829-data-collection-warmup-v1&daily-pnl-readable-v1"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260714-runtime-prior-clarity"></script>
 </body>
 </html>

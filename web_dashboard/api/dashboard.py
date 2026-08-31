@@ -11991,7 +11991,9 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             "realized_profit": 0.0,
             "realized_loss": 0.0,
             "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
+            # Only today's row has a live mark-to-market value.  Historical
+            # rows must stay unknown instead of looking like a real zero.
+            "unrealized_pnl": None,
             "total_pnl": 0.0,
             "trade_count": 0,
             "win_count": 0,
@@ -12366,6 +12368,11 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
         else:
             row["total_pnl"] = row["okx_equity_pnl"]
             row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
+        # Stable API names for the four values shown in the dashboard.  Keep
+        # the legacy fields above for existing consumers and cached payloads.
+        row["daily_total_pnl"] = row["total_pnl"]
+        row["daily_settled_pnl"] = row["realized_pnl"]
+        row["current_unsettled_pnl"] = row["unrealized_pnl"]
         row["cumulative_realized_pnl"] = round(cumulative, 8)
         row["settled_close_count"] = int(row["trade_count"] or 0)
         row["pending_settlement_close_count"] = int(pending_settlement_by_date.get(date_key, 0))

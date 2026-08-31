@@ -117,6 +117,25 @@ def test_execution_account_ui_uses_okx_equity_pnl_not_local_trade_fallback() -> 
     assert "pending_settlement_close_count" in script
 
 
+def test_daily_pnl_table_uses_plain_language_metrics() -> None:
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    for label in (
+        "当日总盈亏",
+        "当日已结算盈亏",
+        "当前未结算盈亏",
+        "累计总盈亏",
+    ):
+        assert f"<th>{label}</th>" in html
+        assert label in script
+    assert "<th>亏损合计</th>" not in html
+    assert "<th>盈利合计</th>" not in html
+    assert "<th>OKX权益变化</th>" not in html
+    assert "function dailyPnlUnsettledDisplay(row)" in script
+    assert '<td colspan="7"' in script
+
+
 def test_ai_model_settings_recognize_keyless_loopback_configuration() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
@@ -133,7 +152,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "dashboard.js?v=20260829-data-collection-warmup-v1&daily-pnl-readable-v1" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
