@@ -115,14 +115,14 @@ SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY = 6
 # share the trading service's database pool and PostgreSQL resources. Keep the
 # audit wave small enough that a long snapshot cannot starve its peers.
 SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
-# Keep one audit snapshot inside the isolated runner deadline while allowing
-# the slowest read-only preflight to finish alongside the other audit groups.
-# The remaining time is reserved for serialization, process teardown, and
-# snapshot persistence.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 100.0
+# Keep one audit snapshot bounded while allowing the two slow read-only
+# integrity scans to finish without starving the required contract card.
+# This work runs in the background; the API serves the last completed snapshot
+# while a new one is being assembled.
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 130.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
 SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS = 900.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -185,19 +185,15 @@ SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     # recurring deferred-audit card.
     "high_risk_review_audit": 45.0,
     "shadow_missed_opportunity": 45.0,
-    "position_capacity_release": 100.0,
-    "okx_trade_fact_integrity": OKX_TRADE_FACT_INTEGRITY_TIMEOUT_SECONDS + 5.0,
+    "position_capacity_release": 115.0,
+    "okx_trade_fact_integrity": 110.0,
     "production_source_health": 45.0,
     "crypto_feature_coverage": 45.0,
     "visible_text_encoding": 60.0,
     "runtime_text_integrity": 60.0,
 }
 PRIORITY_AUDIT_KEYS = (
-    "okx_reconciliation",
     "trade_execution_contract",
-    "production_source_health",
-    "okx_trade_fact_integrity",
-    "position_capacity_release",
 )
 DB_AUDIT_KEYS = (
     "trade_loop",
@@ -291,6 +287,7 @@ _trade_execution_contract_cache: tuple[
     dict[str, Any],
 ] | None = None
 _trade_execution_contract_report_task: asyncio.Task[dict[str, Any]] | None = None
+_trade_execution_contract_report_lock: asyncio.Lock | None = None
 
 
 def _system_audit_lock() -> asyncio.Lock:
@@ -298,6 +295,34 @@ def _system_audit_lock() -> asyncio.Lock:
     if _system_audit_collect_lock is None:
         _system_audit_collect_lock = asyncio.Lock()
     return _system_audit_collect_lock
+
+
+def _trade_execution_contract_lock() -> asyncio.Lock:
+    global _trade_execution_contract_report_lock
+    if _trade_execution_contract_report_lock is None:
+        _trade_execution_contract_report_lock = asyncio.Lock()
+    return _trade_execution_contract_report_lock
+
+
+def _cache_trade_execution_contract_task_result(
+    task: asyncio.Task[dict[str, Any]],
+    cache_key: tuple[int, int],
+) -> None:
+    """Persist a shared report even when every waiter is cancelled by a deadline."""
+
+    global _trade_execution_contract_cache
+    if task.cancelled():
+        return
+    try:
+        report = task.result()
+    except Exception:
+        return
+    if isinstance(report, dict):
+        _trade_execution_contract_cache = (
+            time.monotonic(),
+            cache_key,
+            copy.deepcopy(report),
+        )
 
 
 def _u(escaped: str) -> str:
@@ -3574,51 +3599,76 @@ async def _load_trade_execution_contract_report() -> dict[str, Any]:
 
     global _trade_execution_contract_cache, _trade_execution_contract_report_task
     cache_key = (TRADE_EXECUTION_CONTRACT_AUDIT_HOURS, TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT)
-    now = time.monotonic()
-    cached = _trade_execution_contract_cache
-    if cached is not None:
+    def _cached_report() -> dict[str, Any] | None:
+        cached = _trade_execution_contract_cache
+        if cached is None:
+            return None
         cached_at, cached_key, cached_report = cached
         ttl = (
             TRADE_EXECUTION_CONTRACT_FAILURE_CACHE_TTL_SECONDS
             if cached_report.get("report_available") is False
             else TRADE_EXECUTION_CONTRACT_CACHE_TTL_SECONDS
         )
-        if cached_key == cache_key and now - cached_at <= ttl:
-            return copy.deepcopy(cached_report)
+        if cached_key != cache_key or time.monotonic() - cached_at > ttl:
+            return None
+        return copy.deepcopy(cached_report)
 
-    task = _trade_execution_contract_report_task
-    if task is None or task.done():
-        async def collect() -> dict[str, Any]:
-            try:
-                report = await asyncio.wait_for(
-                    TradeExecutionContractService().report(
-                        hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
-                        limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
-                    ),
-                    timeout=TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS,
+    cached_report = _cached_report()
+    if cached_report is not None:
+        return cached_report
+
+    async def collect() -> dict[str, Any]:
+        try:
+            report = await asyncio.wait_for(
+                TradeExecutionContractService().report(
+                    hours=TRADE_EXECUTION_CONTRACT_AUDIT_HOURS,
+                    limit=TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT,
+                ),
+                timeout=TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "report_available": False,
+                "error": safe_error_text(exc, limit=240),
+                "error_type": type(exc).__name__,
+                "timeout": isinstance(exc, TimeoutError),
+                "audit_only": True,
+                "read_only": True,
+                "live_entry_mutation": False,
+                "live_exit_mutation": False,
+                "can_bypass_risk_controls": False,
+                "summary": {},
+            }
+
+        normalized = copy.deepcopy(report if isinstance(report, dict) else {})
+        normalized["report_available"] = True
+        return normalized
+
+    # Both the contract card and the closed-loop card ask for this report in
+    # the same audit wave. Serialize task creation so they cannot launch two
+    # competing database scans and let one of them time out under contention.
+    async with _trade_execution_contract_lock():
+        cached_report = _cached_report()
+        if cached_report is not None:
+            return cached_report
+        task = _trade_execution_contract_report_task
+        if task is not None and task.done():
+            _cache_trade_execution_contract_task_result(task, cache_key)
+            cached_report = _cached_report()
+            if cached_report is not None:
+                return cached_report
+            task = None
+        if task is None or task.done():
+            task = asyncio.create_task(collect())
+            _trade_execution_contract_report_task = task
+            task.add_done_callback(
+                lambda completed: _cache_trade_execution_contract_task_result(
+                    completed,
+                    cache_key,
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                return {
-                    "report_available": False,
-                    "error": safe_error_text(exc, limit=240),
-                    "error_type": type(exc).__name__,
-                    "timeout": isinstance(exc, TimeoutError),
-                    "audit_only": True,
-                    "read_only": True,
-                    "live_entry_mutation": False,
-                    "live_exit_mutation": False,
-                    "can_bypass_risk_controls": False,
-                    "summary": {},
-                }
-
-            normalized = copy.deepcopy(report if isinstance(report, dict) else {})
-            normalized["report_available"] = True
-            return normalized
-
-        task = asyncio.create_task(collect())
-        _trade_execution_contract_report_task = task
+            )
 
     try:
         # A section-level timeout must not cancel the shared read.  A later
@@ -3627,9 +3677,10 @@ async def _load_trade_execution_contract_report() -> dict[str, Any]:
         report = await asyncio.shield(task)
     finally:
         if task.done() and _trade_execution_contract_report_task is task:
+            _cache_trade_execution_contract_task_result(task, cache_key)
             _trade_execution_contract_report_task = None
 
-    _trade_execution_contract_cache = (time.monotonic(), cache_key, copy.deepcopy(report))
+    _cache_trade_execution_contract_task_result(task, cache_key)
     return copy.deepcopy(report)
 
 
@@ -4014,20 +4065,56 @@ async def _audit_platform_runtime_status(
 async def _data_collection_status_for_audit() -> dict[str, Any]:
     """Read the current snapshot without blocking the audit on cold refresh.
 
-    A first request may legitimately return ``warming`` while the background
-    refresh builds the production snapshot.  The next scheduled audit will use
-    that cached result; blocking here for the full initial-refresh timeout made
-    every cold audit consume most of the global 120-second budget.
+    The audit runs in an isolated process, so the Dashboard process' in-memory
+    cache is not available here.  Prefer the latest completed snapshot written
+    by the Dashboard; only a genuinely empty installation should report the
+    transient ``warming`` placeholder.
     """
 
+    persisted_loader = getattr(
+        data_collection_api,
+        "load_persisted_data_collection_status",
+        None,
+    )
+    if callable(persisted_loader):
+        persisted = persisted_loader(include_feature_coverage=False)
+        if persisted is not None:
+            checked_at, payload = persisted
+            result = copy.deepcopy(payload)
+            age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
+            freshness = result.get("freshness")
+            freshness = dict(freshness) if isinstance(freshness, dict) else {}
+            freshness.update(
+                {
+                    "age_seconds": round(age_seconds, 3),
+                    "is_stale": age_seconds > float(
+                        getattr(data_collection_api, "STATUS_CACHE_TTL_SECONDS", 60.0)
+                    ),
+                }
+            )
+            result["freshness"] = freshness
+            result["cache"] = {
+                "age_seconds": round(age_seconds, 3),
+                "ttl_seconds": float(
+                    getattr(data_collection_api, "STATUS_CACHE_TTL_SECONDS", 60.0)
+                ),
+                "refresh_in_progress": False,
+                "cold_start": False,
+                "persisted_snapshot": True,
+            }
+            return sanitize_payload(result)
+
     getter = data_collection_api.get_data_collection_status
-    kwargs: dict[str, Any] = {"include_feature_coverage": False}
+    kwargs: dict[str, Any] = {
+        "include_feature_coverage": False,
+        "start_background_refresh": True,
+        "wait_for_initial_refresh": True,
+    }
     try:
         parameters = inspect.signature(getter).parameters
     except (TypeError, ValueError):
         parameters = {}
-    if "start_background_refresh" in parameters:
-        kwargs["start_background_refresh"] = False
+    kwargs = {name: value for name, value in kwargs.items() if name in parameters}
     return await getter(**kwargs)
 
 
@@ -5965,6 +6052,9 @@ def _history_path() -> Path:
 
 
 def _latest_audit_path() -> Path:
+    isolated_path = str(os.environ.get("BB_SYSTEM_AUDIT_SNAPSHOT_PATH") or "").strip()
+    if isolated_path:
+        return Path(isolated_path)
     return settings.data_dir / SYSTEM_AUDIT_LATEST_FILE
 
 
@@ -5978,6 +6068,11 @@ def _load_latest_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
         return None
     checked_at = _parse_utc_datetime(payload.get("checked_at"))
     if checked_at is None:
+        return None
+    # ``warming`` is only a transient API response.  It must never become a
+    # durable snapshot, otherwise every subsequent request can keep replaying
+    # the placeholder instead of scheduling/reading a real audit result.
+    if str(payload.get("status") or "").lower() == "warming":
         return None
     return checked_at, payload
 
@@ -6114,6 +6209,11 @@ async def _run_system_audit_subprocess_once(
         command.append("--no-record-history")
     process_env = os.environ.copy()
     process_env["PYTHONIOENCODING"] = "utf-8"
+    isolated_snapshot_path = (
+        settings.data_dir
+        / f".system_audit_runner_{os.getpid()}_{time.time_ns()}.json"
+    )
+    process_env["BB_SYSTEM_AUDIT_SNAPSHOT_PATH"] = str(isolated_snapshot_path)
 
     # Keep diagnostic work in its own process group so a timeout can reap the
     # complete child tree without ever signalling the dashboard process.
@@ -6164,14 +6264,31 @@ async def _run_system_audit_subprocess_once(
             "isolated system audit failed: "
             + (safe_error_text(error, limit=500) if error else "unknown error")
         )
-    snapshot = _reload_system_audit_status_cache()
-    if snapshot is None:
-        raise RuntimeError("isolated system audit completed without a readable snapshot")
-    checked_at, payload = snapshot
-    runner_checked_at = _parse_utc_datetime(result.get("checked_at"))
-    if runner_checked_at is None or checked_at != runner_checked_at:
-        raise RuntimeError("isolated system audit snapshot does not match its result frame")
-    return payload
+    try:
+        snapshot_payload = _read_json_report(isolated_snapshot_path)
+        if snapshot_payload:
+            checked_at = _parse_utc_datetime(snapshot_payload.get("checked_at"))
+            runner_checked_at = _parse_utc_datetime(result.get("checked_at"))
+            if runner_checked_at is None or checked_at != runner_checked_at:
+                raise RuntimeError("isolated system audit snapshot does not match its result frame")
+            _store_latest_audit_snapshot(snapshot_payload)
+            global _system_audit_status_cache
+            _system_audit_status_cache = (checked_at, copy.deepcopy(snapshot_payload))
+            return snapshot_payload
+        # Test doubles and older runners may still write the canonical path.
+        snapshot = _reload_system_audit_status_cache()
+        if snapshot is None:
+            raise RuntimeError("isolated system audit completed without a readable snapshot")
+        checked_at, payload = snapshot
+        runner_checked_at = _parse_utc_datetime(result.get("checked_at"))
+        if runner_checked_at is None or checked_at != runner_checked_at:
+            raise RuntimeError("isolated system audit snapshot does not match its result frame")
+        return payload
+    finally:
+        try:
+            isolated_snapshot_path.unlink()
+        except OSError:
+            pass
 
 
 async def refresh_system_audit_snapshot(

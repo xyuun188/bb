@@ -42,13 +42,32 @@ def _details(card: dict[str, Any]) -> dict[str, Any]:
     return _safe_dict(card.get("details"))
 
 
+def _deferred_section_keys(cards: list[dict[str, Any]]) -> set[str]:
+    """Return sections represented by a grouped timeout/deferred card."""
+
+    keys: set[str] = set()
+    for card in cards:
+        if not str(card.get("key") or "").startswith("system_audit_deferred:"):
+            continue
+        details = _details(card)
+        for key in _safe_list(details.get("affected_section_keys")):
+            if key:
+                keys.add(str(key))
+        primary = details.get("primary_section_key")
+        if primary:
+            keys.add(str(primary))
+    return keys
+
+
 def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any]:
     """Require current return/cost provenance and real execution facts."""
 
     by_key = _cards_by_key(cards)
+    deferred_keys = _deferred_section_keys(cards)
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     passed: list[str] = []
+    deferred_required: list[str] = []
 
     required_cards = {
         "okx_trade_fact_integrity": "authoritative OKX trade facts",
@@ -60,6 +79,9 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     for key, label in required_cards.items():
         card = by_key.get(key)
         if not card:
+            if key in deferred_keys:
+                deferred_required.append(key)
+                continue
             blockers.append(_blocker(f"{key}_missing", f"Missing {label} audit card."))
             continue
         status = str(card.get("status") or "unknown").lower()
@@ -81,6 +103,15 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         else:
             passed.append(f"{key}_available")
+
+    if deferred_required:
+        blockers.append(
+            _blocker(
+                "required_audits_deferred",
+                "Required audit sections did not complete within the collection budget; retry before changing readiness.",
+                {"sections": sorted(deferred_required)},
+            )
+        )
 
     trade_card = by_key.get("trade_execution_contract", {})
     trade = _details(trade_card)
@@ -128,7 +159,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     # An unavailable audit cannot prove or disprove individual policy fields.
     # Keep the single availability blocker instead of misreporting a timeout as
     # a malformed contract payload.
-    if report_available is not False and missing_policy:
+    if "trade_execution_contract" not in deferred_required and report_available is not False and missing_policy:
         blockers.append(
             _blocker(
                 "dynamic_return_contract_policy_incomplete",
@@ -137,7 +168,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         )
     violation_count = _safe_int(trade_summary.get("contract_violation_count"))
-    if report_available is not False and violation_count > 0:
+    if "trade_execution_contract" not in deferred_required and report_available is not False and violation_count > 0:
         blockers.append(
             _blocker(
                 "dynamic_return_contract_current_violations",
@@ -145,12 +176,15 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                 evidence=trade_summary,
             )
         )
-    elif report_available is not False and trade_summary:
+    elif "trade_execution_contract" not in deferred_required and report_available is not False and trade_summary:
         passed.append("dynamic_return_contract_current_window_clean")
 
     capacity = _details(by_key.get("position_capacity_release", {}))
     capacity_policy = _safe_dict(capacity.get("policy"))
-    if capacity_policy.get("strategy_learning_cannot_expand_capacity") is not True:
+    if (
+        "position_capacity_release" not in deferred_required
+        and capacity_policy.get("strategy_learning_cannot_expand_capacity") is not True
+    ):
         blockers.append(
             _blocker(
                 "hard_capacity_boundary_unproven",
@@ -159,7 +193,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         )
     economics_gaps = _safe_int(capacity.get("position_economics_incomplete_count"))
     exit_gaps = _safe_int(capacity.get("executed_dynamic_exit_contract_gap_count"))
-    if economics_gaps or exit_gaps:
+    if "position_capacity_release" not in deferred_required and (economics_gaps or exit_gaps):
         blockers.append(
             _blocker(
                 "position_economics_or_exit_contract_gap",

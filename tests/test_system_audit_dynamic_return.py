@@ -467,3 +467,71 @@ async def test_trade_execution_contract_report_is_shared_across_audit_cards(
     assert contract_card["details"]["report_available"] is True
     assert closed_loop_card["status"] == "ok"
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_trade_execution_contract_report_creation_is_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    calls = 0
+
+    class FakeContractService:
+        async def report(self, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return {
+                "summary": {
+                    "contract_violation_count": 0,
+                    "entry_authoritative_fill_sync_pending_count": 0,
+                }
+            }
+
+    monkeypatch.setattr(system_audit, "TradeExecutionContractService", FakeContractService)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_cache", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_task", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_lock", None)
+
+    reports = await asyncio.gather(
+        system_audit._load_trade_execution_contract_report(),
+        system_audit._load_trade_execution_contract_report(),
+    )
+
+    assert calls == 1
+    assert all(report["report_available"] is True for report in reports)
+
+
+@pytest.mark.asyncio
+async def test_trade_execution_contract_result_is_cached_when_waiter_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    calls = 0
+
+    class SlowContractService:
+        async def report(self, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.03)
+            return {"summary": {"contract_violation_count": 0}}
+
+    monkeypatch.setattr(system_audit, "TradeExecutionContractService", SlowContractService)
+    monkeypatch.setattr(system_audit, "TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_cache", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_task", None)
+    monkeypatch.setattr(system_audit, "_trade_execution_contract_report_lock", None)
+
+    waiter = asyncio.create_task(system_audit._load_trade_execution_contract_report())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0.05)
+
+    report = await system_audit._load_trade_execution_contract_report()
+
+    assert calls == 1
+    assert report["report_available"] is True

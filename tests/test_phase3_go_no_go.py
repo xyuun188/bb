@@ -70,6 +70,43 @@ def test_phase3_go_no_go_fails_closed_when_required_audit_is_missing() -> None:
     assert "trade_execution_contract_missing" in report["blocker_codes"]
 
 
+def test_phase3_go_no_go_does_not_turn_deferred_audit_into_missing_architecture() -> None:
+    cards = [
+        card
+        for card in _cards()
+        if card["key"] not in {
+            "okx_trade_fact_integrity",
+            "trade_execution_contract",
+            "position_capacity_release",
+        }
+    ]
+    cards.append(
+        {
+            "key": "system_audit_deferred:test",
+            "status": "warning",
+            "details": {
+                "primary_section_key": "okx_trade_fact_integrity",
+                "affected_section_keys": [
+                    "okx_trade_fact_integrity",
+                    "trade_execution_contract",
+                    "position_capacity_release",
+                ],
+            },
+        }
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["blocker_codes"] == ["required_audits_deferred"]
+    assert report["blockers"][0]["evidence"] == {
+        "sections": [
+            "okx_trade_fact_integrity",
+            "position_capacity_release",
+            "trade_execution_contract",
+        ]
+    }
+
+
 def test_phase3_go_no_go_rejects_incomplete_return_contract_policy() -> None:
     cards = deepcopy(_cards())
     trade = next(card for card in cards if card["key"] == "trade_execution_contract")
