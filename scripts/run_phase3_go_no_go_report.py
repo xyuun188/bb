@@ -28,6 +28,7 @@ from web_dashboard.api.system_audit import collect_system_audit_status  # noqa: 
 
 DEFAULT_REPORT_DIR = "phase3_go_no_go_reports"
 DEFAULT_LATEST_MAX_AGE_SECONDS = 60 * 60
+DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS = 15 * 60
 
 
 def _now_iso() -> str:
@@ -79,6 +80,34 @@ def _load_latest_report(output_dir: Path, *, max_age_seconds: int) -> dict[str, 
     return result
 
 
+def _load_latest_system_audit(*, max_age_seconds: int) -> dict[str, Any] | None:
+    """Reuse a recent dashboard audit instead of repeating all heavy cards."""
+
+    candidates = (
+        settings.data_dir / "system_audit_latest.json",
+        ROOT / "data" / "system_audit_latest.json",
+    )
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        checked_at = _parse_report_datetime(payload.get("checked_at"))
+        if checked_at is None:
+            continue
+        age_seconds = max((datetime.now(UTC) - checked_at).total_seconds(), 0.0)
+        if age_seconds > max(60, int(max_age_seconds or DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS)):
+            continue
+        result = dict(payload)
+        result["report_source"] = "system_audit_latest"
+        result["system_audit_path"] = str(path)
+        result["system_audit_age_seconds"] = round(age_seconds, 3)
+        return result
+    return None
+
+
 def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = str(report.get("checked_at") or _now_iso())
@@ -92,8 +121,21 @@ def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None
     return artifacts
 
 
-async def collect_phase3_go_no_go_report() -> dict[str, Any]:
-    audit = await collect_system_audit_status(record_history=False, source="phase3_go_no_go_report")
+async def collect_phase3_go_no_go_report(
+    *,
+    use_latest_system_audit: bool = False,
+    latest_system_audit_max_age_seconds: int = DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    audit = (
+        _load_latest_system_audit(max_age_seconds=latest_system_audit_max_age_seconds)
+        if use_latest_system_audit
+        else None
+    )
+    if audit is None:
+        audit = await collect_system_audit_status(
+            record_history=False,
+            source="phase3_go_no_go_report",
+        )
     cards = [card for card in audit.get("cards") or [] if isinstance(card, dict)]
     gate_card = next((card for card in cards if card.get("key") == "phase3_go_no_go"), {})
     gate_details = gate_card.get("details") if isinstance(gate_card.get("details"), dict) else {}
@@ -125,6 +167,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stdout-only", action="store_true")
     parser.add_argument("--prefer-latest", action="store_true")
     parser.add_argument("--latest-only", action="store_true")
+    parser.add_argument(
+        "--prefer-system-audit-latest",
+        action="store_true",
+        help="Use a recent persisted system-audit snapshot instead of rerunning heavy cards.",
+    )
+    parser.add_argument(
+        "--max-system-audit-age-seconds",
+        type=int,
+        default=DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS,
+    )
     parser.add_argument(
         "--max-latest-age-seconds",
         type=int,
@@ -164,7 +216,20 @@ async def _main() -> int:
                 "report_source": "latest_persisted_unavailable",
             }
         if report is None:
-            report = await collect_phase3_go_no_go_report()
+            if bool(getattr(args, "prefer_system_audit_latest", False)):
+                report = await collect_phase3_go_no_go_report(
+                    use_latest_system_audit=True,
+                    latest_system_audit_max_age_seconds=int(
+                        getattr(
+                            args,
+                            "max_system_audit_age_seconds",
+                            DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS,
+                        )
+                        or DEFAULT_SYSTEM_AUDIT_MAX_AGE_SECONDS
+                    ),
+                )
+            else:
+                report = await collect_phase3_go_no_go_report()
         if not args.stdout_only:
             try:
                 write_report(report, output_dir, indent=indent)

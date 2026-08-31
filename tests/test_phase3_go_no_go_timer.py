@@ -12,6 +12,7 @@ def test_phase3_go_no_go_timer_service_is_read_only() -> None:
     assert "WorkingDirectory=/data/bb/app" in service
     assert "EnvironmentFile=/etc/bb/bb-runtime.env" in service
     assert "run_phase3_go_no_go_report.py --json-indent 0" in service
+    assert "--prefer-system-audit-latest" in service
     assert "bb-paper-trading.service" not in service
     assert "systemctl start" not in service
     assert "OnCalendar=*-*-* *:12,42:00" in timer

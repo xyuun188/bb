@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the online systemd timer for the Phase 3 go/no-go report."""
+"""Install the online systemd timer for the Phase 3 paper-resume preflight report."""
 
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ from core.safe_output import safe_print  # noqa: E402
 
 REMOTE_APP_DIR = "/data/bb/app"
 REMOTE_OWNER = "bb:bb"
-SERVICE_NAME = "bb-phase3-go-no-go.service"
-TIMER_NAME = "bb-phase3-go-no-go.timer"
+SERVICE_NAME = "bb-phase3-paper-resume-preflight.service"
+TIMER_NAME = "bb-phase3-paper-resume-preflight.timer"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
-REPORT_DIR_REL = "data/phase3_go_no_go_reports"
+REPORT_DIR_REL = "data/phase3_paper_resume_preflight_reports"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* *:12,42:00"
+DEFAULT_ON_CALENDAR = "*-*-* *:02,32:00"
 
 
 def _remote_quote(value: str) -> str:
@@ -40,7 +40,7 @@ def _owner_parts(owner: str) -> tuple[str, str]:
 def render_service(*, remote_app_dir: str = REMOTE_APP_DIR, owner: str = REMOTE_OWNER) -> str:
     user, group = _owner_parts(owner)
     return f"""[Unit]
-Description=BB Phase 3 go/no-go report
+Description=BB Phase 3 paper-resume preflight report
 After=network-online.target postgresql.service redis-server.service redis.service
 Wants=network-online.target
 
@@ -51,27 +51,13 @@ Group={group}
 WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
-Environment=MALLOC_ARENA_MAX=2
-Environment=OMP_NUM_THREADS=1
-Environment=MKL_NUM_THREADS=1
-Environment=OPENBLAS_NUM_THREADS=1
-Environment=NUMEXPR_NUM_THREADS=1
-ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_go_no_go_report.py --json-indent 0 --prefer-system-audit-latest --max-system-audit-age-seconds 900'
-TimeoutStartSec=8min
-TimeoutStopSec=30s
-KillMode=control-group
-MemoryAccounting=true
-MemoryHigh=1500M
-MemoryMax=2500M
-CPUQuota=70%
-Nice=10
-IOSchedulingClass=idle
+ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_paper_resume_preflight.py --json-indent 0'
 """
 
 
 def render_timer(*, on_calendar: str = DEFAULT_ON_CALENDAR) -> str:
     return f"""[Unit]
-Description=Run BB Phase 3 go/no-go report
+Description=Run BB Phase 3 paper-resume preflight report
 
 [Timer]
 OnCalendar={on_calendar}
@@ -89,7 +75,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-app-dir", default=REMOTE_APP_DIR)
     parser.add_argument("--owner", default=REMOTE_OWNER)
     parser.add_argument("--on-calendar", default=DEFAULT_ON_CALENDAR)
-    parser.add_argument("--run-now", action="store_true", help="Start the oneshot once after install.")
+    parser.add_argument("--run-now", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -164,8 +150,7 @@ def install_timer(
         if run_now:
             commands.append(f"systemctl start {SERVICE_NAME} || true")
             commands.append(f"systemctl status {SERVICE_NAME} --no-pager -l || true")
-            commands.append("printf 'paper='; systemctl is-active bb-paper-trading.service || true")
-        safe_print(run_remote_text(ssh, " && ".join(commands), timeout=300, check=True))
+        safe_print(run_remote_text(ssh, " && ".join(commands), timeout=240, check=True))
     finally:
         ssh.close()
 

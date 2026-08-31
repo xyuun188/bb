@@ -171,6 +171,10 @@ PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS = 45
 PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS = 24
 PHASE3_PAPER_RESUME_OBSERVATION_TIMEOUT_SECONDS = 70
 PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS = 70
+# The preflight timer owns the expensive read-only checks.  Reuse its recent
+# report in the dashboard audit so a routine refresh does not repeat the same
+# remote probes and turn a healthy system into a timeout warning.
+PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_MAX_AGE_SECONDS = 45 * 60
 SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     "phase3_server_migration": PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS + 5,
     "phase3_model_server_readiness": PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS + 5,
@@ -4749,13 +4753,29 @@ def _phase3_model_readiness_probe_failed_before_remote(report: dict[str, Any]) -
 
 
 async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
-    report = await asyncio.wait_for(
-        Phase3PaperResumePreflightService(
-            okx_sync_provider=_okx_authoritative_sync_summary,
-            model_server_timeout_seconds=PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS,
-        ).report(),
-        timeout=PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS,
-    )
+    report = _read_latest_phase3_report(PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_REL_PATH)
+    checked_at = _report_checked_at(report)
+    if checked_at is not None:
+        age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
+    else:
+        age_seconds = None
+    if not _report_fresh(
+        report,
+        max_age_seconds=PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_MAX_AGE_SECONDS,
+    ):
+        report = await asyncio.wait_for(
+            Phase3PaperResumePreflightService(
+                okx_sync_provider=_okx_authoritative_sync_summary,
+                model_server_timeout_seconds=PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS,
+            ).report(),
+            timeout=PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+        report = dict(report)
+        report.setdefault("report_source", "live_probe")
+    else:
+        report = dict(report)
+        report["report_source"] = "persisted_timer"
+        report["report_age_seconds"] = round(float(age_seconds or 0.0), 3)
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     can_resume = bool(report.get("can_resume_paper"))

@@ -1076,6 +1076,67 @@ async def test_phase3_paper_resume_preflight_audit_ready(
 
 
 @pytest.mark.asyncio
+async def test_phase3_paper_resume_preflight_audit_reuses_fresh_timer_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC).isoformat()
+    persisted_report = {
+        "checked_at": checked_at,
+        "status": "blocked",
+        "read_only": True,
+        "audit_only": True,
+        "mutates_database": False,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "changes_model_routing": False,
+        "can_resume_paper": False,
+        "requires_operator_start": True,
+        "blockers": [
+            {
+                "code": "paper_trading_already_active",
+                "severity": "blocking",
+                "message": "Preflight was already consumed.",
+            }
+        ],
+        "warnings": [],
+        "summary": {
+            "okx_issue_count": 0,
+            "model_server_runtime_ready": True,
+            "phase3_quant_api_available": True,
+        },
+        "inputs": {
+            "platform_server": {
+                "services": [
+                    {"name": "bb-paper-trading.service", "active": True},
+                ]
+            }
+        },
+    }
+
+    class FailIfCalledPreflightService:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise AssertionError("fresh timer report should avoid live preflight")
+
+    monkeypatch.setattr(
+        system_audit,
+        "_read_latest_phase3_report",
+        lambda _relative_path: dict(persisted_report),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumePreflightService",
+        FailIfCalledPreflightService,
+    )
+
+    card = await system_audit._phase3_paper_resume_preflight_audit()
+
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "persisted_timer"
+    assert card["details"]["report_age_seconds"] >= 0
+    assert card["details"]["consumed_after_resume"] is True
+
+
+@pytest.mark.asyncio
 async def test_phase3_paper_resume_preflight_audit_is_consumed_after_paper_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
