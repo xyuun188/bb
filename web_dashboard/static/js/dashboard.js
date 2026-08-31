@@ -10010,15 +10010,20 @@ function openDailyPnlModal(date) {
     const pendingSettlementCount = Number(row.pending_settlement_close_count || 0);
     const snapshotNotice = dailyPnlMissingSnapshotNotice(row);
     const orderOnlyDetails = orderDetails.length && !details.length && !positionDetails.length;
+    const pendingSettlementLabel = pendingSettlementCount
+        ? ` <small>待结算 ${pendingSettlementCount}</small>`
+        : '';
+    const orderActivityMarkup = `
+        <div><span>成交订单</span><strong>${orderCount}</strong></div>
+        <div><span>开仓成交</span><strong>${entryCount}</strong></div>
+        <div><span>平仓成交</span><strong>${closeCount}</strong></div>
+        <div><span>已结算笔数</span><strong>${closedCount}</strong>${pendingSettlementLabel}</div>
+    `;
+    const tradeCountMarkup = `<div><span>交易笔数</span><strong>${Number(row.trade_count || 0)}</strong></div>`;
     title.textContent = `${date} 盈亏详情（北京时间）`;
     if (orderOnlyDetails) {
         body.innerHTML = `
-            ${dailyPnlSummaryHtml(row, `
-                <div><span>成交订单</span><strong>${orderCount}</strong></div>
-                <div><span>开仓成交</span><strong>${entryCount}</strong></div>
-                <div><span>平仓成交</span><strong>${closeCount}</strong></div>
-                <div><span>已结算笔数</span><strong>${closedCount}</strong>${pendingSettlementCount ? ` <small>待结算 ${pendingSettlementCount}</small>` : ''}</div>
-            `)}
+            ${dailyPnlSummaryHtml(row, orderActivityMarkup)}
             ${snapshotNotice}
             ${renderDailyPnlOrderDetails(orderDetails)}
         `;
@@ -10032,7 +10037,7 @@ function openDailyPnlModal(date) {
             || valueNumber(row.okx_equity_pnl ?? row.total_pnl) !== null;
         body.innerHTML = hasOverview
             ? `<div style="color:var(--text-muted);font-size:12px;padding:8px;">当日有盈亏汇总，但没有按币种拆分明细。可能是历史记录未保存 symbol_pnl，或该日只保留了总览数据。</div>
-               ${dailyPnlSummaryHtml(row, `<div><span>交易笔数</span><strong>${Number(row.trade_count || 0)}</strong></div>`)}
+               ${dailyPnlSummaryHtml(row, tradeCountMarkup)}`
             : '<div style="color:var(--text-muted);font-size:12px;padding:8px;">当日没有已平仓交易。</div>';
         if (snapshotNotice && hasOverview) {
             body.innerHTML = snapshotNotice + body.innerHTML;
@@ -10041,7 +10046,7 @@ function openDailyPnlModal(date) {
         return;
     }
     body.innerHTML = `
-        ${dailyPnlSummaryHtml(row, `<div><span>交易笔数</span><strong>${Number(row.trade_count || 0)}</strong></div>`)}
+        ${dailyPnlSummaryHtml(row, tradeCountMarkup)}
         ${snapshotNotice}
         ${orderDetails.length ? renderDailyPnlOrderDetails(orderDetails) : ''}
         ${positionDetails.length ? renderDailyPnlPositionDetails(positionDetails) : ''}
