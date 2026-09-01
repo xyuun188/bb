@@ -1,6 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
-from services.continuous_observation import ContinuousObservationStore
+import pytest
+
+from services.continuous_observation import (
+    ContinuousObservationScheduler,
+    ContinuousObservationStore,
+)
 from services.observability_contract import normalize_status
 
 
@@ -64,3 +69,52 @@ def test_observation_statuses_are_valid_snapshot_states():
     assert normalize_status("passed") == "passed"
     assert normalize_status("observing") == "observing"
     assert normalize_status("not_started") == "not_started"
+
+
+def test_observation_counter_metrics_are_relative_to_window_baseline(tmp_path):
+    store = ContinuousObservationStore(tmp_path / "observation.json")
+    started = datetime(2026, 8, 29, tzinfo=UTC)
+    store.start(
+        required_hours=24,
+        now=started,
+        baseline_metrics=_metrics(service_restart_count=3, dashboard_timeout_storm_count=2),
+    )
+    store.record(
+        _metrics(service_restart_count=4, dashboard_timeout_storm_count=2),
+        now=started + timedelta(minutes=5),
+    )
+    latest = store.snapshot(now=started + timedelta(minutes=5))["latest_metrics"]
+    assert latest["service_restart_count"] == 1
+    assert latest["dashboard_timeout_storm_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_starts_both_windows_and_records_real_samples(tmp_path):
+    metrics = _metrics()
+    calls = 0
+
+    async def collect():
+        nonlocal calls
+        calls += 1
+        return metrics
+
+    stores = {
+        24: ContinuousObservationStore(tmp_path / "24.json"),
+        72: ContinuousObservationStore(tmp_path / "72.json"),
+    }
+    scheduler = ContinuousObservationScheduler(
+        stores,
+        collect,
+        interval_seconds=60,
+        startup_delay_seconds=0,
+    )
+    await scheduler.start()
+    try:
+        snapshots = await scheduler.sample_once()
+        assert set(snapshots) == {"24", "72"}
+        assert calls >= 2  # one baseline plus one real sample
+        assert stores[24].snapshot()["status"] == "observing"
+        assert stores[24].snapshot()["sample_count"] == 1
+        assert stores[72].snapshot()["sample_count"] == 1
+    finally:
+        await scheduler.stop()

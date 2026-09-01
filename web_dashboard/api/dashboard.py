@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from typing import Any, overload
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from config.settings import (
     ENSEMBLE_TRADER_NAME,
@@ -196,6 +196,8 @@ _dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]]
 _DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS = 20.0
 _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
+_model_observability_refresh_task: asyncio.Task[Any] | None = None
+_dashboard_summary_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 
 
 def _bounded_dashboard_payload(
@@ -8088,17 +8090,254 @@ async def get_trade_observability_snapshot() -> dict[str, Any]:
     )
 
 
-@router.get("/model-observability/snapshot")
-async def get_model_observability_snapshot() -> dict[str, Any]:
-    """Return one cached snapshot for model, training and expert-call status."""
-
-    return sanitize_payload(
+async def _refresh_model_observability_cache() -> None:
+    global _model_observability_refresh_task
+    try:
         await _dashboard_heavy_cached(
             ("model-observability",),
             _build_model_observability_snapshot,
             ttl_seconds=20.0,
         )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_dashboard_fallback("model observability background refresh failed", exc)
+    finally:
+        _model_observability_refresh_task = None
+
+
+async def shutdown_dashboard_observability_tasks() -> None:
+    global _model_observability_refresh_task
+    task = _model_observability_refresh_task
+    _model_observability_refresh_task = None
+    tasks = [task] if task is not None else []
+    tasks.extend(_dashboard_summary_refresh_tasks.values())
+    _dashboard_summary_refresh_tasks.clear()
+    for pending in tasks:
+        if pending.done():
+            continue
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+
+
+def _warming_model_observability_payload() -> dict[str, Any]:
+    checked_at = datetime.now(UTC).isoformat()
+    warming = {"status": "warming", "degraded_reason": "initial_refresh_in_progress"}
+    return {
+        "status": "warming",
+        "source": "dashboard.model_observability",
+        "checked_at": checked_at,
+        "conclusion": "模型观察结果正在后台生成。",
+        "sections": {
+            "local_ml": warming,
+            "local_ai_tools": warming,
+            "analysis": warming,
+            "trade": warming,
+            "expert_memory": warming,
+        },
+        "registry": {"models": [], "summary": {}},
+        "scheduler": {},
+        "cache": {
+            "hit": False,
+            "refresh_in_background": True,
+            "reason": "initial_refresh_in_progress",
+        },
+    }
+
+
+@router.get("/model-observability/snapshot")
+async def get_model_observability_snapshot(request: Request = None) -> dict[str, Any]:
+    """Return a fast cached snapshot; cold refreshes run in the background."""
+
+    global _model_observability_refresh_task
+    key = ("model-observability",)
+    if request is None:
+        return sanitize_payload(
+            await _dashboard_heavy_cached(
+                key,
+                _build_model_observability_snapshot,
+                ttl_seconds=20.0,
+            )
+        )
+    cached = _dashboard_heavy_cache_get(key, ttl_seconds=20.0)
+    if cached is not None:
+        cached["cache"] = {"hit": True, "refresh_in_background": False}
+        return sanitize_payload(cached)
+    if _model_observability_refresh_task is None or _model_observability_refresh_task.done():
+        _model_observability_refresh_task = asyncio.create_task(
+            _refresh_model_observability_cache()
+        )
+    return sanitize_payload(_warming_model_observability_payload())
+
+
+def _count_timeout_statuses(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 1 if str(value.get("status") or "").lower() == "timeout" else 0
+        return count + sum(_count_timeout_statuses(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_timeout_statuses(item) for item in value)
+    return 0
+
+
+async def _continuous_observation_system_restart_count() -> int | None:
+    """Read restart counters when systemd is available; otherwise use dashboard process data."""
+
+    from services.dashboard_runtime_metrics import get_dashboard_runtime_metrics
+
+    fallback = get_dashboard_runtime_metrics(
+        settings.data_dir / "dashboard_runtime_metrics.json"
+    ).snapshot()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "show",
+            "--property=NRestarts",
+            "--value",
+            "bb-dashboard.service",
+            "bb-paper-trading.service",
+            "bb-model-tunnels.service",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=2.0)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return int(fallback.get("process_restart_count") or 0)
+        if process.returncode != 0:
+            return int(fallback.get("process_restart_count") or 0)
+        values = [int(line) for line in stdout.decode(errors="replace").splitlines() if line.strip().isdigit()]
+        return sum(values) if len(values) == 3 else int(fallback.get("process_restart_count") or 0)
+    except (FileNotFoundError, OSError, ValueError):
+        return int(fallback.get("process_restart_count") or 0)
+
+
+async def _continuous_analysis_metrics() -> dict[str, Any]:
+    """Calculate interval and duplicate facts from persisted decisions."""
+
+    try:
+        from sqlalchemy import distinct, func, select
+
+        from db.session import get_session_ctx
+        from models.decision import AIDecision
+
+        since = datetime.now(UTC) - timedelta(hours=24)
+        async with get_session_ctx() as session:
+            result = await session.execute(
+                select(AIDecision.created_at)
+                .where(AIDecision.created_at >= since)
+                .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
+                .limit(2000)
+            )
+            timestamps = [value for (value,) in result.all() if isinstance(value, datetime)]
+            count_result = await session.execute(
+                select(
+                    func.count(AIDecision.id),
+                    func.count(distinct(AIDecision.analysis_idempotency_key)),
+                ).where(
+                    AIDecision.created_at >= since,
+                    AIDecision.analysis_idempotency_key.is_not(None),
+                )
+            )
+            total_with_keys, distinct_keys = count_result.one()
+        max_gap = None
+        if len(timestamps) >= 2:
+            max_gap = max(
+                max((right - left).total_seconds(), 0.0)
+                for left, right in zip(timestamps, timestamps[1:], strict=False)
+            )
+        duplicate_count = max(int(total_with_keys or 0) - int(distinct_keys or 0), 0)
+        return {
+            "max_analysis_interval_seconds": max_gap,
+            "duplicate_analysis_count": duplicate_count,
+        }
+    except Exception as exc:
+        return {
+            "blocked_reason": f"analysis_metrics_error:{type(exc).__name__}",
+        }
+
+
+async def collect_continuous_observation_metrics() -> dict[str, Any]:
+    """Collect only persisted/runtime facts for the acceptance observer."""
+
+    from services.dashboard_runtime_metrics import get_dashboard_runtime_metrics
+    from web_dashboard.api import data_collection as data_collection_api
+
+    async def bounded(factory: Callable[[], Awaitable[Any]], name: str) -> Any:
+        try:
+            return await asyncio.wait_for(factory(), timeout=20.0)
+        except Exception as exc:
+            return {"status": "error", "degraded_reason": f"{name}:{type(exc).__name__}"}
+
+    trade, model, analysis = await asyncio.gather(
+        bounded(_build_trade_observability_snapshot, "trade_observability"),
+        bounded(_build_model_observability_snapshot, "model_observability"),
+        bounded(_continuous_analysis_metrics, "analysis_metrics"),
     )
+    persisted = data_collection_api.load_persisted_data_collection_status(False)
+    data = persisted[1] if isinstance(persisted, tuple) and len(persisted) == 2 else None
+    if not isinstance(data, dict):
+        data = await bounded(
+            lambda: data_collection_api.get_data_collection_status(
+                include_feature_coverage=False,
+                start_background_refresh=True,
+                wait_for_initial_refresh=False,
+            ),
+            "data_collection",
+        )
+    trade = trade if isinstance(trade, dict) else {}
+    model = model if isinstance(model, dict) else {}
+    analysis = analysis if isinstance(analysis, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    runtime_metrics = await _continuous_observation_system_restart_count()
+    runtime = get_dashboard_runtime_metrics(
+        settings.data_dir / "dashboard_runtime_metrics.json"
+    ).snapshot()
+    timeout_count = int(runtime.get("dashboard_timeout_count") or 0)
+    if str(data.get("status") or "").lower() in {"warming", "error", "timeout"}:
+        data_timeout_count: int | None = None
+    else:
+        data_timeout_count = _count_timeout_statuses(data)
+    scheduler = model.get("scheduler") if isinstance(model.get("scheduler"), dict) else {}
+    training_state_clear = (
+        bool(scheduler)
+        and scheduler.get("status") not in {"error", "unavailable"}
+        and scheduler.get("heartbeat_stale") is not True
+        and scheduler.get("training_timeout_exceeded") is not True
+    )
+    attribution = trade.get("profit_attribution") if isinstance(trade.get("profit_attribution"), dict) else {}
+    metrics: dict[str, Any] = {
+        "service_restart_count": runtime_metrics,
+        "dashboard_timeout_storm_count": timeout_count,
+        "max_analysis_interval_seconds": analysis.get("max_analysis_interval_seconds"),
+        "duplicate_analysis_count": analysis.get("duplicate_analysis_count"),
+        "unexplained_data_collection_timeout_count": data_timeout_count,
+        "unresolved_trade_contract_count": trade.get("unresolved_execution_contract_count"),
+        "unassigned_fill_count": trade.get("unassigned_fill_count"),
+        "duplicate_funding_attribution_count": trade.get("duplicate_funding_attribution_count"),
+        "model_tunnel_unresolved_timeout_count": _count_timeout_statuses(model),
+        "training_state_clear": training_state_clear if scheduler else None,
+        "attribution_mismatch_count": attribution.get("attribution_mismatch_count"),
+        "source": "dashboard.runtime_observation_collector",
+    }
+    reasons = [
+        f"{name}:{value.get('degraded_reason') or value.get('status')}"
+        for name, value in (
+            ("trade", trade),
+            ("model", model),
+            ("analysis", analysis),
+            ("data", data),
+        )
+        if isinstance(value, dict)
+        and str(value.get("status") or "").lower() in {"error", "timeout"}
+    ]
+    if reasons:
+        metrics["collection_errors"] = ";".join(reasons)[:300]
+    return metrics
 
 
 @router.get("/continuous-observation/snapshot")
@@ -8284,15 +8523,76 @@ async def _build_dashboard_summary() -> dict[str, Any]:
     }
 
 
-@router.get("/dashboard/summary")
-async def get_dashboard_summary():
-    """Aggregate dashboard data with single-flight protection."""
+async def _refresh_dashboard_summary_cache(key: tuple[Any, ...]) -> None:
+    try:
+        await _dashboard_heavy_cached(
+            key,
+            _build_dashboard_summary,
+            ttl_seconds=_DASHBOARD_SUMMARY_CACHE_TTL_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_dashboard_fallback("dashboard summary background refresh failed", exc)
+    finally:
+        _dashboard_summary_refresh_tasks.pop(key, None)
 
-    return await _dashboard_heavy_cached(
-        ("dashboard-summary", mode_manager.mode.value),
-        _build_dashboard_summary,
-        ttl_seconds=_DASHBOARD_SUMMARY_CACHE_TTL_SECONDS,
-    )
+
+def _dashboard_summary_warming_payload() -> dict[str, Any]:
+    return {
+        "status": "warming",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "mode": mode_manager.mode.value,
+        "paused": mode_manager.is_paused,
+        "market": {},
+        "model_rankings": [],
+        "execution_account": {},
+        "accounts": [],
+        "okx_account": {},
+        "today_decisions_total": None,
+        "today_decisions_timezone": "Asia/Shanghai",
+        "cache": {
+            "hit": False,
+            "refresh_in_background": True,
+            "reason": "initial_refresh_in_progress",
+        },
+    }
+
+
+@router.get("/dashboard/summary")
+async def get_dashboard_summary(request: Request = None):
+    """Return the latest summary immediately while refreshing slow reads in background."""
+
+    key = ("dashboard-summary", mode_manager.mode.value)
+    if request is None:
+        return await _dashboard_heavy_cached(
+            key,
+            _build_dashboard_summary,
+            ttl_seconds=_DASHBOARD_SUMMARY_CACHE_TTL_SECONDS,
+        )
+    cached_entry = _dashboard_heavy_cache.get(key)
+    if cached_entry is not None:
+        cached_at, cached_payload = cached_entry
+        age = max((datetime.now(UTC) - cached_at).total_seconds(), 0.0)
+        if age <= _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS:
+            return sanitize_payload(cached_payload)
+        if key not in _dashboard_summary_refresh_tasks:
+            _dashboard_summary_refresh_tasks[key] = asyncio.create_task(
+                _refresh_dashboard_summary_cache(key)
+            )
+        stale_payload = copy.deepcopy(cached_payload)
+        stale_payload["cache"] = {
+            "hit": True,
+            "stale": True,
+            "refresh_in_background": True,
+            "age_seconds": round(age, 3),
+        }
+        return sanitize_payload(stale_payload)
+    if key not in _dashboard_summary_refresh_tasks:
+        _dashboard_summary_refresh_tasks[key] = asyncio.create_task(
+            _refresh_dashboard_summary_cache(key)
+        )
+    return sanitize_payload(_dashboard_summary_warming_payload())
 
 
 @router.get("/dashboard/market")
@@ -9769,7 +10069,7 @@ async def _safe_analysis_detail_vector_memory_context(
             get_vector_memory_service().similar_decision_context(decision, raw),
             timeout=_ANALYSIS_DETAIL_VECTOR_MEMORY_TIMEOUT_SECONDS,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "analysis_detail_vector_memory_timeout",
             decision_id=getattr(decision, "id", None),

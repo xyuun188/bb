@@ -20,6 +20,8 @@ from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from core.safe_output import safe_error_text
+from services.continuous_observation import ContinuousObservationScheduler
+from services.dashboard_runtime_metrics import get_dashboard_runtime_metrics
 from services.observability_contract import freshness_payload, iso_timestamp
 from web_dashboard.api.auth import dashboard_login_page_html
 from web_dashboard.api.router import api_router
@@ -63,6 +65,7 @@ DASHBOARD_API_TIMEOUT_SECONDS = {
 }
 _HEAVY_API_PATH_MARKERS = (
     "/system-audit/",
+    "/system/self-check",
     "/data-collection/status",
     "/strategy-learning",
     "/profit-attribution",
@@ -83,6 +86,9 @@ _LIGHT_API_PATH_MARKERS = (
 
 # Global WebSocket manager
 ws_manager = WebSocketManager()
+_dashboard_runtime_metrics = get_dashboard_runtime_metrics(
+    settings.data_dir / "dashboard_runtime_metrics.json"
+)
 
 
 async def _system_audit_history_loop() -> None:
@@ -105,6 +111,38 @@ async def _system_audit_history_loop() -> None:
             )
 
 
+async def _continuous_observation_loop() -> None:
+    """Keep the durable 24/72-hour acceptance windows sampled in production."""
+
+    from web_dashboard.api.dashboard import (
+        CONTINUOUS_OBSERVATION_STORES,
+        collect_continuous_observation_metrics,
+    )
+
+    scheduler = ContinuousObservationScheduler(
+        CONTINUOUS_OBSERVATION_STORES,
+        collect_continuous_observation_metrics,
+        interval_seconds=300.0,
+        startup_delay_seconds=0.0,
+    )
+    try:
+        # Let the HTTP app finish startup before the first database/model probe.
+        await asyncio.sleep(5.0)
+        await scheduler.start()
+        task = scheduler.task
+        if task is not None:
+            await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "continuous observation loop failed",
+            error=safe_error_text(exc, limit=240),
+        )
+    finally:
+        await scheduler.stop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -115,6 +153,7 @@ async def lifespan(app: FastAPI):
         if settings.system_audit_history_enabled
         else None
     )
+    observation_task = asyncio.create_task(_continuous_observation_loop())
     try:
         yield
     finally:
@@ -124,8 +163,32 @@ async def lifespan(app: FastAPI):
                 await audit_task
             except asyncio.CancelledError:
                 pass
-        from web_dashboard.api.dashboard import shutdown_dashboard_read_clients
+        observation_task.cancel()
+        try:
+            await observation_task
+        except asyncio.CancelledError:
+            pass
+        from web_dashboard.api import system_health
 
+        try:
+            await system_health.shutdown_system_self_check_tasks()
+        except Exception as exc:
+            logger.warning(
+                "system self-check task shutdown failed",
+                error=safe_error_text(exc, limit=240),
+            )
+        from web_dashboard.api.dashboard import (
+            shutdown_dashboard_observability_tasks,
+            shutdown_dashboard_read_clients,
+        )
+
+        try:
+            await shutdown_dashboard_observability_tasks()
+        except Exception as exc:
+            logger.warning(
+                "dashboard observability task shutdown failed",
+                error=safe_error_text(exc, limit=240),
+            )
         try:
             await shutdown_dashboard_read_clients()
         except Exception as exc:
@@ -244,6 +307,10 @@ def create_app() -> FastAPI:
         if _request_uses_dashboard_api_slot(request.url.path):
             pool_acquired = await _acquire_dashboard_api_pool(request.app, pool_name)
             if not pool_acquired:
+                _dashboard_runtime_metrics.record_request(
+                    status_code=503,
+                    duration_ms=(time.perf_counter() - request_started) * 1000,
+                )
                 return JSONResponse(
                     content={
                         "detail": "Dashboard read budget is busy; retry shortly.",
@@ -258,6 +325,10 @@ def create_app() -> FastAPI:
             if not api_slot_acquired:
                 request.app.state.dashboard_api_pools[pool_name].release()
                 pool_acquired = False
+                _dashboard_runtime_metrics.record_request(
+                    status_code=503,
+                    duration_ms=(time.perf_counter() - request_started) * 1000,
+                )
                 return JSONResponse(
                     content={
                         "detail": "Dashboard is busy; retry shortly.",
@@ -277,6 +348,11 @@ def create_app() -> FastAPI:
                         timeout=_dashboard_api_timeout(request.url.path),
                     )
                 except TimeoutError:
+                    _dashboard_runtime_metrics.record_request(
+                        status_code=504,
+                        duration_ms=(time.perf_counter() - request_started) * 1000,
+                        timed_out=True,
+                    )
                     logger.warning(
                         "dashboard API request timed out",
                         path=request.url.path,
@@ -299,6 +375,11 @@ def create_app() -> FastAPI:
                     )
             else:
                 response = await call_next(request)
+            if response.status_code >= 500:
+                _dashboard_runtime_metrics.record_request(
+                    status_code=response.status_code,
+                    duration_ms=(time.perf_counter() - request_started) * 1000,
+                )
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Request-Duration-Ms"] = str(
                 round((time.perf_counter() - request_started) * 1000, 3)

@@ -7,13 +7,15 @@ elapsed time and all required checks are present.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-CONTINUOUS_OBSERVATION_VERSION = "2026-08-29.continuous-observation.v1"
+CONTINUOUS_OBSERVATION_VERSION = "2026-09-01.continuous-observation.v2"
 ALLOWED_WINDOW_HOURS = (24, 72)
 MAX_SAMPLES = 2000
 
@@ -32,6 +34,8 @@ _REQUIRED_72H_METRICS = _REQUIRED_24H_METRICS + (
     "training_state_clear",
     "attribution_mismatch_count",
 )
+
+ObservationMetricsCollector = Callable[[], Awaitable[dict[str, Any]]]
 
 
 def _now() -> datetime:
@@ -99,6 +103,7 @@ class ContinuousObservationStore:
             "required_hours": 24,
             "window_started_at": None,
             "last_sample_at": None,
+            "baseline_metrics": {},
             "samples": [],
         }
 
@@ -108,6 +113,8 @@ class ContinuousObservationStore:
         except (OSError, json.JSONDecodeError):
             return self._default()
         if not isinstance(payload, dict):
+            return self._default()
+        if payload.get("version") != CONTINUOUS_OBSERVATION_VERSION:
             return self._default()
         result = self._default()
         result.update(payload)
@@ -126,7 +133,13 @@ class ContinuousObservationStore:
             temporary = Path(handle.name)
         temporary.replace(self.path)
 
-    def start(self, *, required_hours: int = 24, now: datetime | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        *,
+        required_hours: int = 24,
+        now: datetime | None = None,
+        baseline_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         hours = int(required_hours)
         if hours not in ALLOWED_WINDOW_HOURS:
             raise ValueError("required_hours must be 24 or 72")
@@ -134,6 +147,9 @@ class ContinuousObservationStore:
         if payload.get("window_started_at") and int(payload.get("required_hours") or 24) == hours:
             return self.snapshot(now=now)
         started = now or _now()
+        normalized_baseline = _normalise_metrics(baseline_metrics or {})
+        normalized_baseline.pop("source", None)
+        normalized_baseline.pop("blocked_reason", None)
         payload.update(
             {
                 "version": CONTINUOUS_OBSERVATION_VERSION,
@@ -141,6 +157,7 @@ class ContinuousObservationStore:
                 "required_hours": hours,
                 "window_started_at": _iso(started),
                 "last_sample_at": None,
+                "baseline_metrics": normalized_baseline,
                 "samples": [],
                 "blocked_reason": None,
             }
@@ -153,7 +170,17 @@ class ContinuousObservationStore:
         if not payload.get("window_started_at"):
             raise RuntimeError("observation_window_not_started")
         observed_at = now or _now()
-        row = {"observed_at": _iso(observed_at), "metrics": _normalise_metrics(metrics)}
+        normalized = _normalise_metrics(metrics)
+        baseline = payload.get("baseline_metrics")
+        baseline = baseline if isinstance(baseline, dict) else {}
+        for key in dict.fromkeys(_REQUIRED_24H_METRICS + _REQUIRED_72H_METRICS):
+            if key in {"max_analysis_interval_seconds", "training_state_clear"}:
+                continue
+            current = normalized.get(key)
+            initial = baseline.get(key)
+            if isinstance(current, (int, float)) and isinstance(initial, (int, float)):
+                normalized[key] = max(int(current) - int(initial), 0)
+        row = {"observed_at": _iso(observed_at), "metrics": normalized}
         samples = [item for item in payload.get("samples", []) if isinstance(item, dict)]
         samples.append(row)
         payload["samples"] = samples[-MAX_SAMPLES:]
@@ -169,6 +196,8 @@ class ContinuousObservationStore:
         current = now or _now()
         started = _parse(payload.get("window_started_at"))
         required_hours = int(payload.get("required_hours") or 24)
+        baseline = payload.get("baseline_metrics")
+        baseline = baseline if isinstance(baseline, dict) else {}
         samples = [item for item in payload.get("samples", []) if isinstance(item, dict)]
         latest_metrics = samples[-1].get("metrics", {}) if samples else {}
         elapsed_hours = (
@@ -211,6 +240,7 @@ class ContinuousObservationStore:
             "failed_metrics": failures,
             "blocked_reason": blocked_reason,
             "latest_metrics": latest_metrics,
+            "baseline_metrics": baseline if isinstance(baseline, dict) else {},
             "evidence": {
                 "real_elapsed_time_required": True,
                 "synthetic_time_allowed": False,
@@ -218,3 +248,106 @@ class ContinuousObservationStore:
             },
         }
 
+
+class ContinuousObservationScheduler:
+    """Start and sample both real 24/72-hour observation windows."""
+
+    def __init__(
+        self,
+        stores: dict[int, ContinuousObservationStore],
+        collector: ObservationMetricsCollector,
+        *,
+        interval_seconds: float = 300.0,
+        startup_delay_seconds: float = 5.0,
+    ) -> None:
+        self.stores = stores
+        self.collector = collector
+        self.interval_seconds = max(float(interval_seconds), 1.0)
+        self.startup_delay_seconds = max(float(startup_delay_seconds), 0.0)
+        self._task: asyncio.Task[Any] | None = None
+        self._stop_event = asyncio.Event()
+
+    @property
+    def task(self) -> asyncio.Task[Any] | None:
+        return self._task
+
+    async def start(self) -> None:
+        """Ensure windows exist, then launch one sampler task."""
+
+        if self._task is not None and not self._task.done():
+            return
+        self._stop_event = asyncio.Event()
+        try:
+            baseline = await self.collector()
+        except Exception:
+            baseline = {}
+        now = _now()
+        for hours in ALLOWED_WINDOW_HOURS:
+            store = self.stores.get(hours)
+            if store is None:
+                continue
+            snapshot = store.snapshot(now=now)
+            if snapshot.get("status") == "not_started":
+                store.start(
+                    required_hours=hours,
+                    now=now,
+                    baseline_metrics=baseline,
+                )
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        task = self._task
+        self._task = None
+        self._stop_event.set()
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def sample_once(self) -> dict[str, Any]:
+        """Collect and persist one sample for every active window."""
+
+        try:
+            metrics = await self.collector()
+            if not isinstance(metrics, dict):
+                raise TypeError("observation_collector_must_return_mapping")
+        except Exception as exc:
+            metrics = {
+                "source": "continuous_observation_scheduler",
+                "collection_error": f"collector_error:{type(exc).__name__}",
+            }
+        snapshots: dict[str, Any] = {}
+        for hours in ALLOWED_WINDOW_HOURS:
+            store = self.stores.get(hours)
+            if store is None:
+                continue
+            try:
+                snapshots[str(hours)] = store.record(
+                    metrics,
+                    now=_now(),
+                )
+            except RuntimeError:
+                continue
+        return snapshots
+
+    async def _run(self) -> None:
+        if self.startup_delay_seconds:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self.startup_delay_seconds
+                )
+                return
+            except TimeoutError:
+                pass
+        while True:
+            await self.sample_once()
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self.interval_seconds
+                )
+                return
+            except TimeoutError:
+                continue

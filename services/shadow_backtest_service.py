@@ -44,6 +44,8 @@ SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS = 6.0
 SHADOW_RESULT_PATH_CONCURRENCY = 8
 SHADOW_RESULT_PATH_TIMEOUT_SECONDS = 3.0
 SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS = 6.0
+SHADOW_RESULT_PATH_RETRY_COUNT = 1
+SHADOW_RESULT_PATH_RETRY_DELAY_SECONDS = 0.05
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
@@ -842,25 +844,31 @@ class ShadowBacktestService:
                 result_ms = int(result_fact.get("source_timestamp_ms") or 0)
                 cache_key = (symbol, entry_ms, result_ms)
                 async with path_semaphore:
-                    try:
-                        if self.price_path_provider is None:
-                            path = verify_market_fact_path(entry_fact, result_fact, [])
-                        else:
+                    if self.price_path_provider is None:
+                        return cache_key, verify_market_fact_path(entry_fact, result_fact, [])
+                    last_error: Exception | None = None
+                    for attempt in range(SHADOW_RESULT_PATH_RETRY_COUNT + 1):
+                        try:
                             path = await asyncio.wait_for(
                                 self.price_path_provider(entry_fact, result_fact),
                                 timeout=SHADOW_RESULT_PATH_TIMEOUT_SECONDS,
                             )
-                        return cache_key, dict(path) if isinstance(path, dict) else {}
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning(
-                            "shadow native price path unavailable",
-                            symbol=symbol,
-                            shadow_backtest_id=getattr(row, "id", None),
-                            error=safe_error_text(exc),
-                        )
-                        return cache_key, verify_market_fact_path(entry_fact, result_fact, [])
+                            return cache_key, dict(path) if isinstance(path, dict) else {}
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            last_error = exc
+                            if attempt < SHADOW_RESULT_PATH_RETRY_COUNT:
+                                await asyncio.sleep(SHADOW_RESULT_PATH_RETRY_DELAY_SECONDS)
+                                continue
+                    logger.warning(
+                        "shadow native price path unavailable",
+                        symbol=symbol,
+                        shadow_backtest_id=getattr(row, "id", None),
+                        attempts=SHADOW_RESULT_PATH_RETRY_COUNT + 1,
+                        error=safe_error_text(last_error) if last_error else "unknown_error",
+                    )
+                    return cache_key, verify_market_fact_path(entry_fact, result_fact, [])
 
             path_tasks: list[Awaitable[tuple[tuple[str, int, int], dict[str, Any]]]] = []
             path_task_rows: list[tuple[Any, str, dict[str, Any], dict[str, Any], tuple[str, int, int]]] = []

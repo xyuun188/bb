@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sqlalchemy import func, select
 
 from config.settings import DECISION_MAKER_NAME, FIXED_AI_MODEL_SLOTS, settings
@@ -76,6 +77,22 @@ HANDLED_TERMINAL_FAILURE_MARKERS = tuple(
         *UNTRADABLE_EXCHANGE_ERROR_MARKERS,
     )
 )
+_SYSTEM_SELF_CHECK_CACHE_TTL_SECONDS = 30.0
+_system_self_check_cache: tuple[datetime, dict[str, Any]] | None = None
+_system_self_check_refresh_task: asyncio.Task[Any] | None = None
+
+
+async def shutdown_system_self_check_tasks() -> None:
+    global _system_self_check_refresh_task
+    task = _system_self_check_refresh_task
+    _system_self_check_refresh_task = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def _now_iso() -> str:
@@ -1506,8 +1523,7 @@ async def _model_training_identity_item() -> dict[str, Any]:
     )
 
 
-@router.get("/system/self-check")
-async def system_self_check() -> dict[str, Any]:
+async def _collect_system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
     trading_task = asyncio.create_task(
         _run_self_check_section(_trading_service_running_item())
@@ -1649,8 +1665,87 @@ async def system_self_check() -> dict[str, Any]:
     )
 
 
+def _warming_system_self_check_payload() -> dict[str, Any]:
+    checked_at = datetime.now(UTC).isoformat()
+    return {
+        "status": "warming",
+        "status_label": "正在生成系统自检",
+        "checked_at": checked_at,
+        "summary": {"total": 0, "critical": 0, "warning": 0, "ok": 0, "info": 0},
+        "items": [],
+        "cache": {
+            "hit": False,
+            "refresh_in_background": True,
+            "reason": "initial_refresh_in_progress",
+        },
+    }
+
+
+async def _refresh_system_self_check() -> None:
+    global _system_self_check_cache, _system_self_check_refresh_task
+    try:
+        payload = await _collect_system_self_check()
+        checked_at = _as_utc_datetime(payload.get("checked_at")) or datetime.now(UTC)
+        _system_self_check_cache = (checked_at, copy.deepcopy(payload))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _system_self_check_cache = (
+            datetime.now(UTC),
+            {
+                **_warming_system_self_check_payload(),
+                "status": "warning",
+                "status_label": "系统自检暂不可用",
+                "cache": {
+                    "hit": False,
+                    "refresh_in_background": False,
+                    "reason": f"refresh_failed:{type(exc).__name__}",
+                },
+            },
+        )
+    finally:
+        _system_self_check_refresh_task = None
+
+
+@router.get("/system/self-check")
+async def system_self_check(request: Request = None) -> dict[str, Any]:
+    """Return a cached self-check to keep the dashboard request non-blocking."""
+
+    if request is None:
+        # Preserve the direct callable used by unit tests and internal callers.
+        return await _collect_system_self_check()
+    global _system_self_check_refresh_task
+    now = datetime.now(UTC)
+    cached = _system_self_check_cache
+    if cached is not None:
+        checked_at, payload = cached
+        age = max((now - checked_at).total_seconds(), 0.0)
+        if age <= _SYSTEM_SELF_CHECK_CACHE_TTL_SECONDS:
+            result = copy.deepcopy(payload)
+            result["cache"] = {
+                "hit": True,
+                "refresh_in_background": False,
+                "age_seconds": round(age, 3),
+            }
+            return sanitize_payload(result)
+    if _system_self_check_refresh_task is None or _system_self_check_refresh_task.done():
+        _system_self_check_refresh_task = asyncio.create_task(_refresh_system_self_check())
+    if cached is None:
+        return sanitize_payload(_warming_system_self_check_payload())
+    _checked_at, payload = cached
+    result = copy.deepcopy(payload)
+    result["cache"] = {
+        "hit": True,
+        "refresh_in_background": True,
+        "age_seconds": round(max((now - _checked_at).total_seconds(), 0.0), 3),
+    }
+    return sanitize_payload(result)
+
+
 @router.post("/system/self-check/repair")
 async def system_self_check_repair() -> dict[str, Any]:
+    global _system_self_check_cache
+    _system_self_check_cache = None
     actions: list[dict[str, Any]] = []
     try:
         clear_server_monitor_cache()

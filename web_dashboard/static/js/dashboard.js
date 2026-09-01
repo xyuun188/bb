@@ -136,6 +136,7 @@ const closingPositionIds = new Set();
 let closingAllPositions = false;
 const positionLinkedOrdersByGroup = new Map();
 let serverMonitorRefreshInFlight = null;
+let systemSelfCheckWarmupTimer = null;
 let systemAuditRefreshInFlight = null;
 let systemAuditRefreshPollTimer = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
@@ -7639,6 +7640,13 @@ async function fetchSystemSelfCheck() {
     const data = await fetchJSON('/api/system/self-check');
     state.systemSelfCheck = data || null;
     renderSystemSelfCheck();
+    if (data?.status === 'warming' || (data?.cache?.refresh_in_background && !data?.items?.length)) {
+        if (systemSelfCheckWarmupTimer) window.clearTimeout(systemSelfCheckWarmupTimer);
+        systemSelfCheckWarmupTimer = window.setTimeout(() => {
+            systemSelfCheckWarmupTimer = null;
+            refreshServerMonitorPage();
+        }, 2000);
+    }
 }
 
 async function refreshServerMonitorPage() {
@@ -7758,7 +7766,9 @@ function renderSystemSelfCheck() {
     if (!panel) return;
     const items = Array.isArray(data.items) ? data.items : [];
     if (!items.length) {
-        panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">还没有自检结果。</div>';
+        panel.innerHTML = data.status === 'warming'
+            ? '<div style="color:var(--text-muted);font-size:12px;padding:16px;">正在后台生成自检结果，请稍候...</div>'
+            : '<div style="color:var(--text-muted);font-size:12px;padding:16px;">还没有自检结果。</div>';
         return;
     }
     const summary = data.summary || {};
