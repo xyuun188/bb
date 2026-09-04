@@ -8693,7 +8693,6 @@ class TradingService:
             state = str(item.get("execution_candidate_state") or "").strip()
             if (
                 item.get("analysis_only") is True
-                or item.get("selection_tier") == "analysis_only_fill"
                 or state in {"analysis_only_execution_unverified", "execution_unavailable"}
             ):
                 return {
