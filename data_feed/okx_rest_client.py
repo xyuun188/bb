@@ -77,7 +77,7 @@ PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 2
 # must not queue behind the larger indicator K-line fan-out, while still being
 # bounded so a provider outage cannot consume all public-request capacity.
 PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 2
-PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
+PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 60.0  # Extended for slow REST API when WebSocket fails
 
 PUBLIC_MARKET_METHODS = frozenset(
     {

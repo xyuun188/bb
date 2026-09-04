@@ -43,8 +43,12 @@ from db.session import get_session_ctx
 from models.news import NewsArticle, SocialPost
 from services.external_event_service import ExternalEventService
 from services.trading_params import DEFAULT_TRADING_PARAMS
+from services.trading_params import EntryMarketDataQualityParams
 
 logger = structlog.get_logger(__name__)
+
+ENABLE_WEBSOCKET = EntryMarketDataQualityParams().enable_websocket
+REST_API_POLL_INTERVAL = EntryMarketDataQualityParams().rest_api_ticker_poll_interval_seconds
 
 ABNORMAL_WICK_LOOKBACK_HOURS = 72.0
 ABNORMAL_WICK_MIN_RATIO = 1.50
@@ -291,6 +295,7 @@ class DataService:
         self._native_consistency_bars_tasks: dict[str, asyncio.Task[list[Any]]] = {}
         self._started = False
         self._stopping = False
+        self._rest_api_poll_task: asyncio.Task | None = None
 
         # Register ticker callback for real-time price updates
         self.ws_client.on_ticker(self._on_ticker_update)
@@ -444,22 +449,49 @@ class DataService:
             self.ws_client._subscribe_symbols = settings.symbols
             self._kline_coverage_symbols = self._normalize_symbols(settings.symbols)
 
-        try:
-            await self.ws_client.connect()
-        except WebSocketConnectionError as exc:
-            logger.warning(
-                "initial OKX WebSocket connection failed; background recovery enabled",
-                error=safe_error_text(exc),
-            )
-        asyncio.create_task(self.ws_client.listen())
+        # Start WebSocket or REST API polling based on configuration
+        if ENABLE_WEBSOCKET:
+            try:
+                await self.ws_client.connect()
+            except WebSocketConnectionError as exc:
+                logger.warning(
+                    "initial OKX WebSocket connection failed; background recovery enabled",
+                    error=safe_error_text(exc),
+                )
+            asyncio.create_task(self.ws_client.listen())
+            logger.info("WebSocket enabled")
+        else:
+            logger.info("WebSocket disabled, starting REST API ticker polling")
+            self._rest_api_poll_task = asyncio.create_task(self._rest_api_ticker_poll_loop())
+        
         self._start_kline_coverage_refresh()
         await self.external_event_service.start_controller()
         logger.info("data service started")
+
+
+    async def _rest_api_ticker_poll_loop(self) -> None:
+        """Poll tickers via REST API when WebSocket is disabled."""
+        while not self._stopping:
+            try:
+                symbols = self.ws_client._subscribe_symbols or settings.symbols
+                for symbol in symbols:
+                    try:
+                        ticker = await self.rest_client.fetch_ticker(symbol)
+                        if ticker:
+                            self._on_ticker_update(symbol, ticker)
+                    except Exception as e:
+                        logger.debug("rest ticker poll failed", symbol=symbol, error=safe_error_text(e))
+                await asyncio.sleep(REST_API_POLL_INTERVAL)
+            except Exception as e:
+                logger.error("rest ticker poll loop error", error=safe_error_text(e))
+                await asyncio.sleep(10)
 
     async def stop(self) -> None:
         """Stop all data feed connections."""
         self._stopping = True
         self._started = False
+        if self._rest_api_poll_task:
+            self._rest_api_poll_task.cancel()
         await self._stop_ticker_persistence()
         derivative_tasks = list(self._derivatives_refresh_task_map().values())
         for task in derivative_tasks:
@@ -1387,7 +1419,47 @@ class DataService:
         *,
         block_on_remote: bool,
     ) -> dict[str, Any]:
+        logger.info("_attach_native_market_fact called", symbol=symbol, block_on_remote=block_on_remote)
         enriched = dict(snapshot)
+        
+        # Merge WebSocket cached orderbook data if available
+        normalized = self._normalize_symbols([symbol])[0]
+        ws_orderbook = self.ws_client.latest_orderbooks.get(symbol) or self.ws_client.latest_orderbooks.get(normalized)
+        
+        # First try WebSocket cache
+        orderbook_available = False
+        if ws_orderbook:
+            enriched["bid_depth_native"] = ws_orderbook.get("bid_depth_native", 0)
+            enriched["ask_depth_native"] = ws_orderbook.get("ask_depth_native", 0)
+            enriched["bid_depth_usdt"] = ws_orderbook.get("bid_depth_usdt", 0)
+            enriched["ask_depth_usdt"] = ws_orderbook.get("ask_depth_usdt", 0)
+            orderbook_available = enriched["bid_depth_usdt"] > 0 or enriched["ask_depth_usdt"] > 0
+        
+        logger.info("orderbook check", symbol=symbol, ws_orderbook_exists=bool(ws_orderbook), orderbook_available=orderbook_available, bid_depth=enriched.get("bid_depth_usdt"), ask_depth=enriched.get("ask_depth_usdt"))
+        
+        # Fallback to REST API if WebSocket cache is empty
+        if not orderbook_available:
+            logger.info("REST降级：WebSocket订单簿缓存为空", symbol=symbol)
+            try:
+                spec = await self._get_instrument_spec(symbol, block_on_remote=True)
+                rest_book = await self.rest_client.fetch_order_book_metrics(symbol, contract_spec=spec)
+                if rest_book.get("orderbook_data_available"):
+                    enriched["bid_depth_usdt"] = rest_book.get("orderbook_bid_depth", 0)
+                    enriched["ask_depth_usdt"] = rest_book.get("orderbook_ask_depth", 0)
+                    enriched["bid_depth_native"] = 0  # REST doesn't provide native depth
+                    enriched["ask_depth_native"] = 0
+                    orderbook_available = True
+                    logger.info("REST降级成功", symbol=symbol, bid_depth=rest_book.get("orderbook_bid_depth"), ask_depth=rest_book.get("orderbook_ask_depth"))
+                else:
+                    logger.warning("REST降级失败：订单簿不可用", symbol=symbol)
+            except Exception as e:
+                logger.error("REST降级异常", symbol=symbol, error=str(e), exc_info=True)
+        
+        # Merge WebSocket cached mark price if available
+        ws_mark_price = self.ws_client.latest_mark_prices.get(symbol) or self.ws_client.latest_mark_prices.get(normalized)
+        if ws_mark_price:
+            enriched["mark_price"] = ws_mark_price.get("mark_price")
+        
         spec = await self._get_instrument_spec(symbol, block_on_remote=block_on_remote)
         if spec:
             enriched["contract_spec"] = spec

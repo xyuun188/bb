@@ -53,6 +53,8 @@ class OKXWebSocketClient:
     def __init__(self) -> None:
         self._ws_url = WS_PUBLIC_URL  # Public data always from ws.okx.com
         self._ws: Any = None
+        self.latest_orderbooks: dict[str, dict] = {}
+        self.latest_mark_prices: dict[str, dict] = {}
         self._running = False
         self._ticker_callbacks: list[Callable[..., Any]] = []
         self._kline_callbacks: list[Callable[..., Any]] = []
@@ -109,16 +111,29 @@ class OKXWebSocketClient:
             raise WebSocketConnectionError(f"Failed to connect: {error_text}") from e
 
     async def _subscribe(self) -> None:
-        """Subscribe to ticker channels for configured symbols."""
+        """Subscribe to ticker, orderbook, and mark-price channels for configured symbols."""
         symbols = getattr(self, "_subscribe_symbols", settings.symbols)
-        ticker_channels = []
+        
+        # Build all channels
+        all_channels = []
         for symbol in symbols:
             inst_id = self._to_ws_inst_id(symbol)
-            ticker_channels.append({"channel": "tickers", "instId": inst_id})
+            all_channels.append({"channel": "tickers", "instId": inst_id})
+            all_channels.append({"channel": "books5", "instId": inst_id})
+            all_channels.append({"channel": "mark-price", "instId": inst_id})
 
-        sub_msg = {"op": "subscribe", "args": ticker_channels}
-        await self._ws.send(json.dumps(sub_msg))
-        logger.info("subscribed to channels", tickers=len(ticker_channels))
+        # Subscribe in batches (max 100 channels per batch to avoid "message too big")
+        batch_size = 100
+        for i in range(0, len(all_channels), batch_size):
+            batch = all_channels[i:i+batch_size]
+            sub_msg = {"op": "subscribe", "args": batch}
+            await self._ws.send(json.dumps(sub_msg))
+            logger.info("subscribed to batch", batch_num=i//batch_size+1, channels=len(batch))
+            # Small delay between batches to avoid overwhelming the server
+            if i + batch_size < len(all_channels):
+                await asyncio.sleep(0.1)
+        
+        logger.info("all subscriptions complete", symbols=len(symbols), total_channels=len(all_channels))
 
     async def _handle_message(self, raw: str) -> None:
         """Parse and route incoming WebSocket messages."""
@@ -140,6 +155,11 @@ class OKXWebSocketClient:
 
         channel = data["arg"].get("channel", "")
         inst_id = data["arg"].get("instId", "")
+        
+        # Debug: log non-ticker channels
+        if channel != "tickers":
+            if channel == "books5":
+                logger.info("books5 message received", inst_id=inst_id, data_count=len(data.get("data", [])))
 
         if channel == "tickers":
             if data["data"]:
@@ -189,8 +209,49 @@ class OKXWebSocketClient:
                         logger.debug(
                             "ticker callback failed",
                             symbol=symbol,
-                            error=safe_error_text(exc),
-                        )
+                              error=safe_error_text(exc),
+                          )
+
+        elif channel == "books5":
+            # Order book depth updates
+            for book in data["data"]:
+                symbol = inst_id.replace("-SWAP", "").replace("-", "/")
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                # Calculate depths in native currency (contracts) and USDT
+                bid_depth_native = sum(safe_float(q, 0.0) for p, q, *_ in bids)
+                ask_depth_native = sum(safe_float(q, 0.0) for p, q, *_ in asks)
+                # For USDT depth, multiply by price
+                bid_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in bids)
+                ask_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in asks)
+                
+                orderbook_data = {
+                    "bid_depth_native": bid_depth_native,
+                    "ask_depth_native": ask_depth_native,
+                    "bid_depth_usdt": bid_depth_usdt,
+                    "ask_depth_usdt": ask_depth_usdt,
+                    "timestamp": int(safe_float(book.get("ts"), 0.0)),
+                }
+                # Store in cache for data service to pick up
+                self.latest_orderbooks[symbol] = orderbook_data
+
+        elif channel == "mark-price":
+            # Mark price updates
+            for mark in data["data"]:
+                symbol = inst_id.replace("-SWAP", "").replace("-", "/")
+                mark_price_data = {
+                    "symbol": symbol,
+                    "inst_id": inst_id,
+                    "mark_price": safe_float(mark.get("markPx"), 0.0),
+                    "timestamp": int(safe_float(mark.get("ts"), 0.0)),
+                    "source_timestamp_ms": int(safe_float(mark.get("ts"), 0.0)),
+                    "received_at": datetime.now(UTC).isoformat(),
+                    "source": "websocket",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "mark-price",
+                }
+                # Store in cache for data service to pick up
+                self.latest_mark_prices[symbol] = mark_price_data
 
         elif channel and channel.startswith("candle"):
             timeframe = channel.replace("candle", "")

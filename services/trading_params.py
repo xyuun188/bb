@@ -16,11 +16,13 @@ from ai_brain.base_model import DecisionOutput
 @dataclass(frozen=True, slots=True)
 class EntryMarketDataQualityParams:
     min_indicator_rows: int = 21
+    enable_websocket: bool = False  # Disable WebSocket when network blocks it, rely on REST API polling
     kline_cache_max_age_multiplier: float = 3.0
     kline_cache_min_max_age_seconds: float = 180.0
-    feature_snapshot_timeout_seconds: float = 5.0
-    kline_remote_fetch_timeout_seconds: float = 3.5
-    indicator_snapshot_cache_ttl_seconds: float = 30.0
+    feature_snapshot_timeout_seconds: float = 30.0  # Extended for REST API fallback when WebSocket fails
+    kline_remote_fetch_timeout_seconds: float = 20.0  # Extended for REST API fallback when WebSocket fails
+    indicator_snapshot_cache_ttl_seconds: float = 120.0  # Extended for REST API fallback when WebSocket fails
+    rest_api_ticker_poll_interval_seconds: float = 30.0  # Poll tickers via REST when WebSocket is disabled
     kline_background_refresh_min_interval_seconds: float = 45.0
     kline_coverage_refresh_interval_seconds: float = 60.0
     kline_coverage_refresh_batch_size: int = 4

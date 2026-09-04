@@ -124,7 +124,7 @@ class EntryFeatureRankerPolicy:
             "tradable_volume_floor": empirical_policy_value(
                 "tradable_volume_floor",
                 metrics["volume_ratio"],
-                selector="median",
+                selector="lower_hinge",
                 observation_window=window,
             ),
             "analysis_adx_floor": empirical_policy_value(
@@ -136,7 +136,7 @@ class EntryFeatureRankerPolicy:
             "tradable_adx_floor": empirical_policy_value(
                 "tradable_adx_floor",
                 metrics["adx"],
-                selector="median",
+                selector="lower_hinge",
                 observation_window=window,
             ),
             "analysis_volatility_cap": empirical_policy_value(
@@ -148,7 +148,7 @@ class EntryFeatureRankerPolicy:
             "tradable_volatility_cap": empirical_policy_value(
                 "tradable_volatility_cap",
                 metrics["volatility"],
-                selector="median",
+                selector="upper_hinge",
                 observation_window=window,
             ),
             "analysis_day_change_cap": empirical_policy_value(
@@ -160,14 +160,14 @@ class EntryFeatureRankerPolicy:
             "tradable_day_change_cap": empirical_policy_value(
                 "tradable_day_change_cap",
                 metrics["day_change"],
-                selector="median",
+                selector="upper_hinge",
                 observation_window=window,
             ),
             **{
                 f"{tier}_{group}_notional_floor": empirical_policy_value(
                     f"{tier}_{group}_notional_floor",
                     metrics[f"{group}_notional"],
-                    selector="median" if tier == "tradable" else "lower_hinge",
+                    selector="lower_hinge",
                     observation_window=window,
                 )
                 for tier in ("analysis", "tradable")
