@@ -1662,6 +1662,65 @@ def test_okx_private_api_circuit_elects_one_probe_across_instances() -> None:
         paper_second._enter_private_api_circuit("privateGetAccountPositions", tracked=True)
 
 
+def test_okx_private_api_circuit_reclaims_stale_probe() -> None:
+    executor = OKXExecutor(mode="paper")
+    state = executor._private_api_circuit_state_for_mode("paper")
+    state.open_until = okx_module.time.monotonic() - 1.0
+    state.probe_in_flight = True
+    state.probe_started_at = (
+        okx_module.time.monotonic() - okx_module.OKX_PRIVATE_API_CIRCUIT_PROBE_STALE_SECONDS - 1
+    )
+
+    assert executor._enter_private_api_circuit("privateGetAccountBalance", tracked=True) is True
+    assert state.probe_in_flight is True
+    assert state.probe_started_at >= okx_module.time.monotonic() - 1.0
+
+
+@pytest.mark.asyncio
+async def test_okx_with_retry_clears_probe_when_time_resync_fails() -> None:
+    async def fail_resync() -> int:
+        raise RuntimeError("sync boom")
+
+    async def private_position_call(_params: dict[str, Any]) -> dict[str, Any]:
+        raise ExchangeAPIError('okx {"msg":"Timestamp request expired","code":"50102"}')
+
+    private_position_call.__name__ = "privateGetAccountPositions"
+    executor = OKXExecutor(mode="paper")
+    executor._connected = True
+    executor._sync_time_difference = fail_resync  # type: ignore[method-assign]
+    executor._private_api_circuit_open_until = okx_module.time.monotonic() - 1.0
+
+    with pytest.raises(RuntimeError, match="sync boom"):
+        await executor._with_retry(private_position_call, {"instType": "SWAP"})
+
+    assert executor._private_api_circuit_probe_in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_okx_with_retry_clears_probe_when_reinitialize_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_init_error(_params: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("broken rest url")
+
+    slow_init_error.__name__ = "privateGetAccountPositions"
+    executor = OKXExecutor(mode="paper")
+    executor._connected = True
+
+    async def fail_reinitialize() -> None:
+        raise RuntimeError("reinit boom")
+
+    executor.reinitialize = fail_reinitialize  # type: ignore[method-assign]
+    monkeypatch.setattr(OKXExecutor, "_is_broken_rest_url_error", staticmethod(lambda _exc: True))
+    executor._private_api_circuit_open_until = okx_module.time.monotonic() - 1.0
+
+    with pytest.raises(RuntimeError, match="reinit boom"):
+        await executor._with_retry(slow_init_error, {"instType": "SWAP"})
+
+    assert executor._private_api_circuit_probe_in_flight is False
+
+
+
 def test_okx_retry_classifier_recognizes_busy_50013() -> None:
     assert (
         OKXExecutor._is_transient_system_error(

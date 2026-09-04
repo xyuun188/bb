@@ -61,6 +61,7 @@ OKX_REST_CALL_TIMEOUT = 10.0
 OKX_TIME_DIFFERENCE_SYNC_TIMEOUT = 3.0
 OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS = 5.0
 OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS = 30.0
+OKX_PRIVATE_API_CIRCUIT_PROBE_STALE_SECONDS = 30.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
@@ -83,6 +84,7 @@ class _PrivateApiCircuitState:
     failure_count: int = 0
     open_until: float = 0.0
     probe_in_flight: bool = False
+    probe_started_at: float = 0.0
 
 
 class TokenBucket:
@@ -196,6 +198,8 @@ class OKXExecutor(AbstractExecutor):
     def _private_api_circuit_probe_in_flight(self, value: bool) -> None:
         with self._private_api_circuit_states_lock:
             self._private_api_circuit_state_for_mode(self._private_api_circuit_key).probe_in_flight = bool(value)
+            if not bool(value):
+                self._private_api_circuit_state_for_mode(self._private_api_circuit_key).probe_started_at = 0.0
 
     async def initialize(self) -> None:
         mode = self.executor_mode
@@ -573,7 +577,12 @@ class OKXExecutor(AbstractExecutor):
                         attempt=attempt,
                         error=message,
                     )
-                    await self._sync_time_difference()
+                    try:
+                        await self._sync_time_difference()
+                    except Exception:
+                        if circuit_probe:
+                            self._private_api_circuit_probe_in_flight = False
+                        raise
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
@@ -635,7 +644,12 @@ class OKXExecutor(AbstractExecutor):
                         attempt=attempt,
                         error=safe_error_text(e),
                     )
-                    await self.reinitialize()
+                    try:
+                        await self.reinitialize()
+                    except Exception:
+                        if circuit_probe:
+                            self._private_api_circuit_probe_in_flight = False
+                        raise
                     if method_name and self._exchange is not None:
                         fn = getattr(self._exchange, method_name, fn)
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
@@ -701,12 +715,25 @@ class OKXExecutor(AbstractExecutor):
             elif circuit.open_until <= 0:
                 return False
             elif circuit.probe_in_flight:
+                if (
+                    circuit.probe_started_at > 0
+                    and now - circuit.probe_started_at
+                    > OKX_PRIVATE_API_CIRCUIT_PROBE_STALE_SECONDS
+                ):
+                    logger.warning(
+                        "OKX private API circuit probe stale; reclaiming probe ownership",
+                        mode=self.executor_mode,
+                        method=method_name,
+                    )
+                    circuit.probe_started_at = now
+                    return True
                 message = (
                     "OKX API error [50001]: private service recovery probe in progress; "
                     f"retry later ({method_name})"
                 )
             else:
                 circuit.probe_in_flight = True
+                circuit.probe_started_at = now
                 return True
         raise ExchangeAPIError(message, code="50001")
 
@@ -726,6 +753,7 @@ class OKXExecutor(AbstractExecutor):
             )
             circuit.open_until = time.monotonic() + cooldown
             circuit.probe_in_flight = False
+            circuit.probe_started_at = 0.0
             failure_count = circuit.failure_count
         logger.warning(
             "OKX private API temporary-service circuit opened",
@@ -743,6 +771,7 @@ class OKXExecutor(AbstractExecutor):
             circuit.failure_count = 0
             circuit.open_until = 0.0
             circuit.probe_in_flight = False
+            circuit.probe_started_at = 0.0
         if recovered:
             logger.info(
                 "OKX private API temporary-service circuit recovered",
