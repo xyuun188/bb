@@ -184,7 +184,11 @@ class OkxPublicWebSocketSdkStream:
 
         self._client = WsPublicAsync(self.url, debug=False)
         try:
-            consume_task = await self._client.start()
+            # 增加60秒超时避免握手卡死
+            consume_task = await asyncio.wait_for(
+                self._client.start(),
+                timeout=60.0
+            )
         except Exception:
             self._client = None
             self._consume_task = None
