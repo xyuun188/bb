@@ -79,7 +79,11 @@ PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 2
 # must not queue behind the larger indicator K-line fan-out, while still being
 # bounded so a provider outage cannot consume all public-request capacity.
 PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 2
-PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 60.0  # Extended for slow REST API when WebSocket fails
+# Bound the underlying SDK call as well as each caller's route wait.  A route
+# can still finish in the background after a 2-3 second caller deadline, but
+# a dead exchange connection must not occupy a shared request slot for a full
+# minute and starve executable quotes.
+PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
 
 PUBLIC_MARKET_METHODS = frozenset(
     {
@@ -1370,10 +1374,13 @@ class OKXRestClient:
             or (require_funding and merged.get("funding_data_available") is not True)
         )
         if timed_out_routes:
-            logger.warning(
+            required_timed_out = sorted(set(timed_out_routes) & required_routes)
+            log_method = logger.warning if required_timed_out else logger.debug
+            log_method(
                 "OKX derivatives snapshot returned partial data within deadline",
                 symbol=symbol,
                 timed_out_routes=timed_out_routes,
+                required_timed_out_routes=required_timed_out,
                 completed_routes=sorted(completed_routes),
                 timeout_seconds=round(max(float(timeout_seconds or 0.0), 0.05), 3),
             )

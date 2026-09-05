@@ -473,6 +473,22 @@ def test_vector_memory_auto_reindex_due_for_empty_or_stale_index(
     assert service._auto_reindex_due(12) is True
 
 
+def test_vector_memory_auto_reindex_failure_backoff_prevents_retry_storm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    service = VectorMemoryService(data_dir=tmp_path)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", True)
+    service._next_reindex_retry_at = datetime.now(UTC) + timedelta(seconds=60)
+
+    assert service._auto_reindex_due(0) is False
+
+    service._next_reindex_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert service._auto_reindex_due(0) is True
+
+
 @pytest.mark.asyncio
 async def test_vector_memory_clear_index_uses_training_epoch(
     monkeypatch: pytest.MonkeyPatch,

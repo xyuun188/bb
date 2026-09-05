@@ -24,6 +24,9 @@ from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 logger = structlog.get_logger(__name__)
 _VECTOR_MEMORY_DECISION_RAW_KEYS = ("opportunity_score", "decision_maker")
 _VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX = "vector_memory_raw__"
+_VECTOR_MEMORY_MAX_DECISION_INDEX_ROWS = 400
+_VECTOR_MEMORY_MAX_NEWS_INDEX_ROWS = 500
+_VECTOR_MEMORY_REINDEX_FAILURE_BACKOFF_SECONDS = 300
 
 
 def _vector_memory_decision_from_mapping(mapping: Any) -> SimpleNamespace:
@@ -59,6 +62,7 @@ class VectorMemoryService:
         self._lock = asyncio.Lock()
         self._last_reindex_at: datetime | None = None
         self._last_error: str = ""
+        self._next_reindex_retry_at: datetime | None = None
         self._auto_reindex_task: asyncio.Task | None = None
         self._auto_reindex_started_at: datetime | None = None
 
@@ -123,6 +127,7 @@ class VectorMemoryService:
             self._store = None
             self._last_error = ""
             self._last_reindex_at = None
+            self._next_reindex_retry_at = None
 
     async def clear_index(self, *, reason: str = "training_derived_state_reset") -> dict[str, Any]:
         """Clear vector documents before rebuilding from the current training epoch."""
@@ -134,6 +139,7 @@ class VectorMemoryService:
                 removed = self._get_store().clear()
                 self._last_error = ""
                 self._last_reindex_at = None
+                self._next_reindex_retry_at = None
                 return {
                     "enabled": self.enabled,
                     "status": "cleared",
@@ -264,6 +270,7 @@ class VectorMemoryService:
                 indexed = self._get_store().upsert(documents)
                 self._last_reindex_at = datetime.now(UTC)
                 self._last_error = ""
+                self._next_reindex_retry_at = None
                 return {
                     "enabled": True,
                     "status": "ok",
@@ -284,6 +291,7 @@ class VectorMemoryService:
                         indexed = self._get_store().upsert(documents)
                         self._last_reindex_at = datetime.now(UTC)
                         self._last_error = ""
+                        self._next_reindex_retry_at = None
                         return {
                             "enabled": True,
                             "status": "ok",
@@ -304,6 +312,9 @@ class VectorMemoryService:
                     except Exception as retry_exc:
                         exc = retry_exc
                 self._last_error = safe_error_text(exc, limit=240)
+                self._next_reindex_retry_at = datetime.now(UTC) + timedelta(
+                    seconds=_VECTOR_MEMORY_REINDEX_FAILURE_BACKOFF_SECONDS
+                )
                 logger.warning("vector memory reindex failed", error=self._last_error)
                 return {
                     "enabled": True,
@@ -458,6 +469,11 @@ class VectorMemoryService:
             return False
         if self._auto_reindex_running():
             return False
+        if (
+            self._next_reindex_retry_at is not None
+            and datetime.now(UTC) < self._next_reindex_retry_at
+        ):
+            return False
         if document_count <= 0:
             return self._last_reindex_at is None or datetime.now(UTC) - self._last_reindex_at >= timedelta(
                 seconds=self._auto_reindex_interval()
@@ -539,7 +555,10 @@ class VectorMemoryService:
                 for row in (
                     await session.execute(
                         decision_query.order_by(AIDecision.id.desc()).limit(
-                            int(settings.vector_memory_decision_index_limit)
+                            min(
+                                max(int(settings.vector_memory_decision_index_limit), 1),
+                                _VECTOR_MEMORY_MAX_DECISION_INDEX_ROWS,
+                            )
                         )
                     )
                 ).mappings().all()
@@ -548,7 +567,10 @@ class VectorMemoryService:
                 (
                     await session.execute(
                         news_query.order_by(NewsArticle.id.desc()).limit(
-                            int(settings.vector_memory_news_index_limit)
+                            min(
+                                max(int(settings.vector_memory_news_index_limit), 1),
+                                _VECTOR_MEMORY_MAX_NEWS_INDEX_ROWS,
+                            )
                         )
                     )
                 )

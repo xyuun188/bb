@@ -482,6 +482,10 @@ AUTO_SCAN_FEATURE_FETCH_CONCURRENCY = AUTO_SCAN_PARAMS.feature_fetch_concurrency
 ALT_LONG_ALLOWED_SYMBOLS = set(AUTO_SCAN_PARAMS.major_symbols)
 MARKET_ANALYSIS_SELECTION_PARAMS = DEFAULT_TRADING_PARAMS.market_analysis_selection
 MARKET_ANALYSIS_SELECTION_HISTORY_TIMEOUT_SECONDS = 3.0
+# The selector remembers at most one observation per symbol.  Reading several
+# thousand JSON projections on every restart adds latency without improving
+# coverage for the configured universe, so keep the warm-up bounded.
+MARKET_ANALYSIS_SELECTION_HISTORY_MAX_ROWS = 600
 
 
 class TradingService:
@@ -7601,9 +7605,6 @@ class TradingService:
                 1,
             )
         )
-        timeout_path = AIDecision.raw_llm_response["market_model_timeout"][
-            "isolated_to_symbol"
-        ].as_boolean().label("isolated_timeout")
         feature_columns = [
             cast(AIDecision.feature_snapshot[key].as_float(), Float).label(key)
             for key in MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS
@@ -7616,7 +7617,7 @@ class TradingService:
                         select(
                             AIDecision.symbol,
                             AIDecision.created_at,
-                            timeout_path,
+                            AIDecision.reasoning,
                             *feature_columns,
                         )
                         .where(
@@ -7626,7 +7627,12 @@ class TradingService:
                             AIDecision.created_at >= cutoff,
                         )
                         .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
-                        .limit(max(int(MARKET_ANALYSIS_SELECTION_PARAMS.history_limit), 1))
+                        .limit(
+                            min(
+                                max(int(MARKET_ANALYSIS_SELECTION_PARAMS.history_limit), 1),
+                                MARKET_ANALYSIS_SELECTION_HISTORY_MAX_ROWS,
+                            )
+                        )
                     )
                 ).all()
 
@@ -7636,7 +7642,10 @@ class TradingService:
                 remembered_symbols: set[str] = set()
                 for row in rows:
                     row_values = row._mapping if hasattr(row, "_mapping") else vars(row)
-                    if row_values.get("isolated_timeout") is True:
+                    if not self._persisted_market_analysis_completed(
+                        row_values.get("reasoning"),
+                        {},
+                    ):
                         continue
                     symbol = str(row.symbol or "")
                     symbol_key = self._normalize_position_symbol(symbol)

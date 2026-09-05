@@ -159,7 +159,13 @@ class OKXWebSocketClient:
         # Debug: log non-ticker channels
         if channel != "tickers":
             if channel == "books5":
-                logger.info("books5 message received", inst_id=inst_id, data_count=len(data.get("data", [])))
+                # books5 is emitted continuously for every subscribed symbol;
+                # keep per-message diagnostics out of the production info log.
+                logger.debug(
+                    "books5 message received",
+                    inst_id=inst_id,
+                    data_count=len(data.get("data", [])),
+                )
 
         if channel == "tickers":
             if data["data"]:
@@ -224,13 +230,37 @@ class OKXWebSocketClient:
                 # For USDT depth, multiply by price
                 bid_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in bids)
                 ask_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in asks)
-                
+                timestamp_ms = int(safe_float(book.get("ts"), 0.0))
+                best_bid = safe_float(bids[0][0], 0.0) if bids else 0.0
+                best_ask = safe_float(asks[0][0], 0.0) if asks else 0.0
+                orderbook_fact = {
+                    "inst_id": inst_id,
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "books5",
+                    "source_timestamp_ms": timestamp_ms,
+                    "bid": best_bid,
+                    "ask": best_ask,
+                    "bid_depth_usdt": bid_depth_usdt,
+                    "ask_depth_usdt": ask_depth_usdt,
+                }
                 orderbook_data = {
+                    "symbol": symbol,
+                    "inst_id": inst_id,
+                    "inst_type": "SWAP",
                     "bid_depth_native": bid_depth_native,
                     "ask_depth_native": ask_depth_native,
                     "bid_depth_usdt": bid_depth_usdt,
                     "ask_depth_usdt": ask_depth_usdt,
-                    "timestamp": int(safe_float(book.get("ts"), 0.0)),
+                    "orderbook_bid_depth": bid_depth_usdt,
+                    "orderbook_ask_depth": ask_depth_usdt,
+                    "timestamp": timestamp_ms,
+                    "source_timestamp_ms": timestamp_ms,
+                    "received_at": datetime.now(UTC).isoformat(),
+                    "source": "websocket",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "books5",
+                    "orderbook_fact": orderbook_fact,
                 }
                 # Store in cache for data service to pick up
                 self.latest_orderbooks[symbol] = orderbook_data
@@ -239,16 +269,27 @@ class OKXWebSocketClient:
             # Mark price updates
             for mark in data["data"]:
                 symbol = inst_id.replace("-SWAP", "").replace("-", "/")
+                mark_price = safe_float(mark.get("markPx"), 0.0)
+                timestamp_ms = int(safe_float(mark.get("ts"), 0.0))
                 mark_price_data = {
                     "symbol": symbol,
                     "inst_id": inst_id,
-                    "mark_price": safe_float(mark.get("markPx"), 0.0),
-                    "timestamp": int(safe_float(mark.get("ts"), 0.0)),
-                    "source_timestamp_ms": int(safe_float(mark.get("ts"), 0.0)),
+                    "inst_type": "SWAP",
+                    "mark_price": mark_price,
+                    "timestamp": timestamp_ms,
+                    "source_timestamp_ms": timestamp_ms,
                     "received_at": datetime.now(UTC).isoformat(),
                     "source": "websocket",
                     "source_endpoint": "okx_ws_public",
                     "source_channel": "mark-price",
+                    "mark_price_fact": {
+                        "inst_id": inst_id,
+                        "inst_type": "SWAP",
+                        "source_endpoint": "okx_ws_public",
+                        "source_channel": "mark-price",
+                        "source_timestamp_ms": timestamp_ms,
+                        "price": mark_price,
+                    },
                 }
                 # Store in cache for data service to pick up
                 self.latest_mark_prices[symbol] = mark_price_data

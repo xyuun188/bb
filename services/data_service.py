@@ -1519,7 +1519,11 @@ class DataService:
         block_on_remote: bool,
         require_authoritative_snapshot: bool = False,
     ) -> dict[str, Any]:
-        logger.info("_attach_native_market_fact called", symbol=symbol, block_on_remote=block_on_remote)
+        logger.debug(
+            "_attach_native_market_fact called",
+            symbol=symbol,
+            block_on_remote=block_on_remote,
+        )
         enriched = dict(snapshot)
         
         # Merge WebSocket cached orderbook data if available
@@ -1572,12 +1576,19 @@ class DataService:
                 enriched["orderbook_fact"] = dict(ws_orderbook["orderbook_fact"])
             orderbook_available = ws_bid_depth > 0 and ws_ask_depth > 0
         
-        logger.info("orderbook check", symbol=symbol, ws_orderbook_exists=bool(ws_orderbook), orderbook_available=orderbook_available, bid_depth=enriched.get("bid_depth_usdt"), ask_depth=enriched.get("ask_depth_usdt"))
+        logger.debug(
+            "orderbook check",
+            symbol=symbol,
+            ws_orderbook_exists=bool(ws_orderbook),
+            orderbook_available=orderbook_available,
+            bid_depth=enriched.get("bid_depth_usdt"),
+            ask_depth=enriched.get("ask_depth_usdt"),
+        )
         
         # Only an explicitly blocking caller may perform REST fallback. Market
         # screening calls this method non-blocking and must remain cache-only.
         if not orderbook_available and block_on_remote:
-            logger.info("REST降级：WebSocket订单簿缓存为空", symbol=symbol)
+            logger.debug("REST降级：WebSocket订单簿缓存为空", symbol=symbol)
             try:
                 spec = await self._get_instrument_spec(
                     symbol,
@@ -1599,7 +1610,12 @@ class DataService:
                     if isinstance(rest_book.get("orderbook_fact"), dict):
                         enriched["orderbook_fact"] = dict(rest_book["orderbook_fact"])
                     orderbook_available = True
-                    logger.info("REST降级成功", symbol=symbol, bid_depth=rest_book.get("orderbook_bid_depth"), ask_depth=rest_book.get("orderbook_ask_depth"))
+                    logger.debug(
+                        "REST降级成功",
+                        symbol=symbol,
+                        bid_depth=rest_book.get("orderbook_bid_depth"),
+                        ask_depth=rest_book.get("orderbook_ask_depth"),
+                    )
                 else:
                     logger.warning("REST降级失败：订单簿不可用", symbol=symbol)
             except Exception as e:
