@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -15,6 +15,7 @@ from core.market_facts import (
     build_market_fact,
     build_shadow_market_fact_contract,
     compact_market_fact_contract,
+    market_fact_reasons,
     verify_market_fact_path,
 )
 from core.safe_output import safe_error_text
@@ -39,9 +40,13 @@ SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfact
 SHADOW_RESULT_FACT_CONCURRENCY = 8
 SHADOW_RESULT_FACT_TIMEOUT_SECONDS = 3.0
 SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS = 6.0
+# A timed-out market-fact build is kept alive by DataService single-flight.
+# Do not hammer the same symbol every maintenance round while that refresh is
+# still pending; retry after a short bounded cooldown instead.
+SHADOW_RESULT_FACT_RETRY_COOLDOWN_SECONDS = 15.0
 SHADOW_RESULT_COST_FACT_TIMEOUT_SECONDS = 5.0
 SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS = 6.0
-SHADOW_RESULT_PATH_CONCURRENCY = 16
+SHADOW_RESULT_PATH_CONCURRENCY = 2
 SHADOW_RESULT_PATH_TIMEOUT_SECONDS = 30.0
 SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS = 60.0
 SHADOW_RESULT_PATH_RETRY_COUNT = 1
@@ -503,6 +508,7 @@ class ShadowBacktestService:
     latest_market_fact_provider: LatestMarketFactProvider | None = None
     price_path_provider: PricePathProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
+    _market_fact_retry_after: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     async def create(
         self,
@@ -763,6 +769,9 @@ class ShadowBacktestService:
 
             async def fetch_market_fact(symbol: str) -> tuple[str, dict[str, Any]]:
                 async with fact_semaphore:
+                    retry_after = self._market_fact_retry_after.get(symbol, 0.0)
+                    if retry_after > asyncio.get_running_loop().time():
+                        return symbol, {}
                     try:
                         if self.latest_market_fact_provider is not None:
                             fact = await asyncio.wait_for(
@@ -775,6 +784,15 @@ class ShadowBacktestService:
                                 source="legacy_price_only_observation",
                             )
                         normalized = dict(fact) if isinstance(fact, dict) else {}
+                        if self.latest_market_fact_provider is not None:
+                            reasons = market_fact_reasons(normalized)
+                            if reasons:
+                                logger.info(
+                                    "shadow result market fact not clean; keeping sample pending",
+                                    symbol=symbol,
+                                    reasons=reasons,
+                                )
+                                return symbol, {}
                         prices = normalized.get("prices")
                         last_price = (
                             self.float_parser(prices.get("last"), 0.0)
@@ -784,7 +802,11 @@ class ShadowBacktestService:
                         # A websocket/cache price is a safe diagnostic fallback. The
                         # resulting market-fact contract remains marked legacy or
                         # incomplete and is quarantined from training as needed.
-                        if last_price <= 0 and self.latest_price_provider is not None:
+                        if (
+                            self.latest_market_fact_provider is None
+                            and last_price <= 0
+                            and self.latest_price_provider is not None
+                        ):
                             normalized = await fallback_market_fact(
                                 symbol,
                                 source="legacy_price_fallback_after_market_fact_timeout",
@@ -798,6 +820,12 @@ class ShadowBacktestService:
                             symbol=symbol,
                             error=safe_error_text(exc),
                         )
+                        self._market_fact_retry_after[symbol] = (
+                            asyncio.get_running_loop().time()
+                            + SHADOW_RESULT_FACT_RETRY_COOLDOWN_SECONDS
+                        )
+                        if self.latest_market_fact_provider is not None:
+                            return symbol, {}
                         try:
                             return symbol, await fallback_market_fact(
                                 symbol,

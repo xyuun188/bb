@@ -3847,9 +3847,14 @@ class OKXExecutor(AbstractExecutor):
         if not inst_id:
             raise ExchangeAPIError(f"Cannot resolve OKX instId for ticker: {symbol}")
         ccxt = await self._get_ccxt()
-        fetch_ticker = getattr(ccxt, "executionGetMarketTicker", None)
+        # Public market facts are identical for live execution and are the
+        # authoritative analysis source for paper execution. OKX demo does not
+        # expose every otherwise tradable SWAP through its single-instrument
+        # ticker route, so using the demo public transport here creates false
+        # 51001 rejections after the batch compatibility probe has succeeded.
+        fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
         if not callable(fetch_ticker):
-            fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
+            fetch_ticker = getattr(ccxt, "executionGetMarketTicker", None)
         if not callable(fetch_ticker):
             raise ExchangeAPIError("OKX native market ticker API is unavailable")
         response = await self._with_retry(fetch_ticker, {"instId": inst_id})
@@ -3877,9 +3882,9 @@ class OKXExecutor(AbstractExecutor):
         if not inst_id:
             raise ExchangeAPIError(f"Cannot resolve OKX instId for price limit: {symbol}")
         ccxt = await self._get_ccxt()
-        fetch_price_limit = getattr(ccxt, "executionGetPublicPriceLimit", None)
+        fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
         if not callable(fetch_price_limit):
-            fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
+            fetch_price_limit = getattr(ccxt, "executionGetPublicPriceLimit", None)
         if not callable(fetch_price_limit):
             if isinstance(ccxt, OkxPerpetualSdkExchange):
                 raise ExchangeAPIError("OKX SDK price-limit API is unavailable")
@@ -5921,43 +5926,13 @@ class OKXExecutor(AbstractExecutor):
                     )
                     return native_inst_id
                 return str(market["symbol"])
-            try:
-                positions = await self.get_positions_strict(symbol)
-            except ExchangeAPIError as exc:
-                error_text = safe_error_text(exc, limit=220)
-                error_code = self._exchange_error_code(exc, error_text)
-                if error_code != "51001" and "[51001]" not in error_text:
-                    raise
-                # A missing position for an otherwise addressable native
-                # instrument is expected.  It must not turn symbol resolution
-                # into a hard failure; the direct native instId candidate is
-                # still usable by OKX execution endpoints.
-                logger.debug(
-                    "OKX position snapshot has no instrument while resolving swap symbol",
-                    symbol=symbol,
-                    error=error_text,
-                )
-                positions = []
-            for position in positions or []:
-                info = position.get("info") or {}
-                native_position_symbol = str(
-                    info.get("instId") or position.get("symbol") or ""
-                ).strip()
-                native_symbol = symbol_from_okx_payload(
-                    {"symbol": native_position_symbol, "info": info},
-                    fallback=symbol,
-                )
-                if (
-                    native_position_symbol
-                    and requested_symbol
-                    and native_symbol == requested_symbol
-                ):
-                    logger.warning(
-                        "OKX swap symbol resolved from existing position snapshot",
-                        symbol=symbol,
-                        okx_symbol=native_position_symbol,
-                    )
-                    return native_position_symbol
+            # USDT perpetual instIds are deterministic. Querying the private
+            # positions endpoint to resolve a symbol with no open position adds
+            # latency and returns 51001 for demo-only capability gaps. The SDK
+            # adapter accepts the canonical CCXT symbol and converts it to the
+            # same native instId before every request.
+            if requested_symbol:
+                return candidate
         except ExchangeAPIError:
             raise
         except Exception as exc:
@@ -6759,12 +6734,12 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         inst_id = okx_inst_id_from_symbol(symbol)
         ccxt = await self._get_ccxt()
-        fetch_order_book = getattr(ccxt, "executionFetchOrderBook", None)
+        fetch_order_book = getattr(ccxt, "fetch_order_book", None)
         if not callable(fetch_order_book):
-            fetch_order_book = ccxt.fetch_order_book
-        fetch_mark_price = getattr(ccxt, "executionGetPublicMarkPrice", None)
+            fetch_order_book = ccxt.executionFetchOrderBook
+        fetch_mark_price = getattr(ccxt, "publicGetPublicMarkPrice", None)
         if not callable(fetch_mark_price):
-            fetch_mark_price = ccxt.publicGetPublicMarkPrice
+            fetch_mark_price = ccxt.executionGetPublicMarkPrice
         ticker, book, mark_response, specs, fee, balance_snapshot = await asyncio.gather(
             self._fetch_native_ticker(symbol),
             self._with_retry(fetch_order_book, okx_symbol),

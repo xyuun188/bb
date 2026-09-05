@@ -447,7 +447,7 @@ LOCAL_QUANT_PROMPT_ENABLED = True
 LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
 OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
 OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
-MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 5.0
+MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 30.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
 # Shadow maintenance is low priority; keep the foreground batch within the
 # same bounded latency envelope as market-only background refreshes.
@@ -5766,8 +5766,13 @@ class TradingService:
                 return candidate, None
             quality_details = getattr(quality_issue, "details", None)
             quality_details = quality_details if isinstance(quality_details, dict) else {}
-            logger.warning(
-                "fresh feature vector failed entry market data quality; deferring symbol",
+            log_method = logger.info if source == "fresh_local_market_cache" else logger.warning
+            log_method(
+                (
+                    "local market fact is incomplete; waiting for authoritative refresh"
+                    if source == "fresh_local_market_cache"
+                    else "fresh feature vector failed entry market data quality; deferring symbol"
+                ),
                 symbol=symbol,
                 source=source,
                 diagnostic_code=getattr(quality_issue, "code", "market_data_quality"),

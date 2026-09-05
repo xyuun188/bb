@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -252,6 +253,161 @@ async def test_fetch_ticker_timeout_keeps_and_reuses_inflight_request(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_authoritative_ticker_bypasses_single_route_backoff_with_batch(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    client._ticker_retry_at["SPK-USDT-SWAP"] = time.monotonic() + 10.0
+    calls: list[tuple[list[str] | None, bool]] = []
+
+    async def batch_tickers(
+        symbols: list[str] | None = None,
+        *,
+        priority: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        calls.append((symbols, priority))
+        ticker = {
+            "symbol": "SPK/USDT",
+            "id": "SPK-USDT-SWAP",
+            "last": 0.0123,
+            "bid": 0.0122,
+            "ask": 0.0124,
+            "timestamp": 1_780_000_000_000,
+            "info": {"instId": "SPK-USDT-SWAP"},
+        }
+        return {"SPK/USDT": ticker, "SPK-USDT-SWAP": ticker}
+
+    monkeypatch.setattr(client, "fetch_tickers", batch_tickers)
+
+    ticker = await client.fetch_ticker("SPK/USDT", wait_for_completion=True)
+
+    assert ticker["last"] == pytest.approx(0.0123)
+    assert calls == [(None, True)]
+    assert "SPK-USDT-SWAP" not in client._ticker_retry_at
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ticker_batch_fallback_is_singleflight_across_symbols(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    client._ticker_retry_at.update(
+        {
+            "SPK-USDT-SWAP": time.monotonic() + 10.0,
+            "HOME-USDT-SWAP": time.monotonic() + 10.0,
+        }
+    )
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def batch_tickers(
+        symbols: list[str] | None = None,
+        *,
+        priority: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        nonlocal calls
+        assert symbols is None
+        assert priority is True
+        calls += 1
+        started.set()
+        await release.wait()
+        results: dict[str, dict[str, Any]] = {}
+        for symbol, inst_id, last in (
+            ("SPK/USDT", "SPK-USDT-SWAP", 0.0123),
+            ("HOME/USDT", "HOME-USDT-SWAP", 0.0222),
+        ):
+            ticker = {
+                "symbol": symbol,
+                "id": inst_id,
+                "last": last,
+                "bid": last - 0.0001,
+                "ask": last + 0.0001,
+                "info": {"instId": inst_id},
+            }
+            results[symbol] = ticker
+            results[inst_id] = ticker
+        return results
+
+    monkeypatch.setattr(client, "fetch_tickers", batch_tickers)
+
+    spk = asyncio.create_task(
+        client.fetch_ticker("SPK/USDT", wait_for_completion=True)
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    home = asyncio.create_task(
+        client.fetch_ticker("HOME/USDT", wait_for_completion=True)
+    )
+    await asyncio.sleep(0)
+    release.set()
+    spk_result, home_result = await asyncio.gather(spk, home)
+
+    assert calls == 1
+    assert spk_result["last"] == pytest.approx(0.0123)
+    assert home_result["last"] == pytest.approx(0.0222)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ticker_remains_unavailable_when_batch_fallback_fails(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    client._ticker_retry_at["SPK-USDT-SWAP"] = time.monotonic() + 10.0
+
+    async def missing_batch(
+        _symbols: list[str] | None = None,
+        *,
+        priority: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        assert priority is True
+        return {}
+
+    monkeypatch.setattr(client, "fetch_tickers", missing_batch)
+
+    ticker = await client.fetch_ticker("SPK/USDT", wait_for_completion=True)
+
+    assert ticker["ticker_refresh_in_background"] is True
+    assert ticker["ticker_retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_authoritative_ticker_recovers_empty_single_route_with_batch(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    calls: list[str] = []
+
+    async def empty_single(_inst_id: str) -> dict[str, Any]:
+        calls.append("single")
+        return {}
+
+    async def batch_tickers(
+        _symbols: list[str] | None = None,
+        *,
+        priority: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        assert priority is True
+        calls.append("batch")
+        ticker = {
+            "symbol": "SPK/USDT",
+            "id": "SPK-USDT-SWAP",
+            "last": 0.0123,
+            "bid": 0.0122,
+            "ask": 0.0124,
+            "info": {"instId": "SPK-USDT-SWAP"},
+        }
+        return {"SPK-USDT-SWAP": ticker}
+
+    monkeypatch.setattr(client, "_fetch_ticker_uncached", empty_single)
+    monkeypatch.setattr(client, "fetch_tickers", batch_tickers)
+
+    ticker = await client.fetch_ticker("SPK/USDT", wait_for_completion=True)
+
+    assert calls == ["single", "batch"]
+    assert ticker["last"] == pytest.approx(0.0123)
+
+
+@pytest.mark.asyncio
 async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch) -> None:
     client = OKXRestClient()
 
@@ -330,6 +486,60 @@ async def test_fetch_instrument_spec_reuses_loaded_native_market_without_remote_
     assert spec["instId"] == "ROBO-USDT-SWAP"
     assert spec["ctVal"] == "1"
     assert spec["source"] == "okx_public_instruments_cache"
+
+
+@pytest.mark.asyncio
+async def test_fetch_instrument_spec_refreshes_incomplete_loaded_market(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    client._exchange = type(
+        "LoadedExchange",
+        (),
+        {
+            "markets": {
+                "ROBO-USDT-SWAP": {
+                    "info": {
+                        "instId": "ROBO-USDT-SWAP",
+                        "instType": "SWAP",
+                    }
+                }
+            }
+        },
+    )()
+    calls: list[str] = []
+
+    async def remote_call(method_name: str, *_args, **_kwargs):
+        calls.append(method_name)
+        return {
+            "data": [
+                {
+                    "instId": "ROBO-USDT-SWAP",
+                    "instType": "SWAP",
+                    "uly": "ROBO-USDT",
+                    "instFamily": "ROBO-USDT",
+                    "instCategory": "1",
+                    "ctType": "linear",
+                    "ctVal": "1",
+                    "ctMult": "1",
+                    "ctValCcy": "ROBO",
+                    "settleCcy": "USDT",
+                    "lotSz": "1",
+                    "minSz": "1",
+                    "tickSz": "0.00001",
+                    "state": "live",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", remote_call)
+
+    spec = await client.fetch_instrument_spec("ROBO/USDT")
+
+    assert calls == ["publicGetPublicInstruments"]
+    assert spec["uly"] == "ROBO-USDT"
+    assert spec["ctVal"] == "1"
+    assert spec["source"] == "okx_public_instruments"
 
 
 @pytest.mark.asyncio
@@ -427,6 +637,50 @@ async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
     assert mark_task is not None and not mark_task.done()
     mark_task.cancel()
     await asyncio.gather(mark_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reference_prices_wait_for_shared_ticker_beyond_old_short_deadline(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        if method_name in {
+            "publicGetPublicMarkPrice",
+            "publicGetMarketIndexTickers",
+        }:
+            await asyncio.sleep(60)
+        assert method_name == "publicGetMarketTicker"
+        await asyncio.sleep(0.4)
+        return {
+            "data": [
+                {
+                    "instId": "ROBO-USDT-SWAP",
+                    "last": "0.01291",
+                    "ts": "1783990800000",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    monkeypatch.setattr(
+        "data_feed.okx_rest_client.REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    prices = await client.fetch_reference_prices(
+        "ROBO/USDT",
+        contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
+    )
+
+    assert prices["mark_price"] == pytest.approx(0.01291)
+    assert prices["index_price"] == pytest.approx(0.01291)
+    assert prices["mark_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+    route_tasks = list(client._reference_route_tasks.values())
+    for task in route_tasks:
+        task.cancel()
+    await asyncio.gather(*route_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -942,6 +1196,22 @@ async def test_fetch_tickers_filters_by_okx_native_inst_ids(monkeypatch) -> None
     ]
     assert set(tickers) == {"SPK/USDT", "SPK-USDT-SWAP"}
     assert tickers["SPK/USDT"]["id"] == "SPK-USDT-SWAP"
+
+
+@pytest.mark.asyncio
+async def test_fetch_tickers_propagates_foreground_priority(monkeypatch) -> None:
+    client = OKXRestClient()
+    calls: list[tuple[str, bool | None]] = []
+
+    async def fake_ccxt_call(method_name: str, *_args, **kwargs):
+        calls.append((method_name, kwargs.get("_request_priority")))
+        return {"data": []}
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    await client.fetch_tickers(["SPK/USDT"], priority=True)
+
+    assert calls == [("publicGetMarketTickers", True)]
 
 
 @pytest.mark.asyncio

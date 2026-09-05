@@ -1891,11 +1891,14 @@ async def test_okx_resolve_swap_symbol_falls_back_to_native_id_when_market_cache
 
 
 @pytest.mark.asyncio
-async def test_okx_resolve_swap_symbol_treats_51001_position_lookup_as_no_position() -> None:
+async def test_okx_resolve_swap_symbol_does_not_query_private_positions_for_missing_market() -> None:
     executor = _executor(_MissingMarketCacheCcxt())
     executor._markets_loaded = True
+    calls = 0
 
     async def missing_position(_symbol: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
         raise ExchangeAPIError(
             "OKX API error [51001]: Instrument ID doesn't exist.",
             code="51001",
@@ -1906,14 +1909,18 @@ async def test_okx_resolve_swap_symbol_treats_51001_position_lookup_as_no_positi
     resolved = await executor._resolve_swap_symbol("NEW/USDT")
 
     assert resolved == "NEW/USDT:USDT"
+    assert calls == 0
 
 
 @pytest.mark.asyncio
-async def test_okx_resolve_swap_symbol_keeps_non_51001_position_errors_strict() -> None:
+async def test_okx_resolve_swap_symbol_is_independent_of_private_position_outages() -> None:
     executor = _executor(_MissingMarketCacheCcxt())
     executor._markets_loaded = True
+    calls = 0
 
     async def failed_position_lookup(_symbol: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
         raise ExchangeAPIError(
             "OKX API error [50001]: Service temporarily unavailable.",
             code="50001",
@@ -1921,8 +1928,10 @@ async def test_okx_resolve_swap_symbol_keeps_non_51001_position_errors_strict() 
 
     executor.get_positions_strict = failed_position_lookup  # type: ignore[method-assign]
 
-    with pytest.raises(ExchangeAPIError, match="50001"):
-        await executor._resolve_swap_symbol("NEW/USDT")
+    resolved = await executor._resolve_swap_symbol("NEW/USDT")
+
+    assert resolved == "NEW/USDT:USDT"
+    assert calls == 0
 
 
 @pytest.mark.asyncio
@@ -1936,7 +1945,7 @@ async def test_okx_resolve_swap_symbol_ignores_mismatched_markets_by_id_alias() 
 
 
 @pytest.mark.asyncio
-async def test_okx_position_symbol_matching_prefers_native_inst_id_over_ccxt_alias() -> None:
+async def test_okx_position_symbol_matching_does_not_drive_entry_symbol_resolution() -> None:
     executor = _executor(_PositionAliasMismatchCcxt())
     executor._markets_loaded = True
 
@@ -1945,7 +1954,7 @@ async def test_okx_position_symbol_matching_prefers_native_inst_id_over_ccxt_ali
 
     assert len(positions) == 1
     assert positions[0]["info"]["instId"] == "SPK-USDT-SWAP"
-    assert resolved == "SPK-USDT-SWAP"
+    assert resolved == "SPK/USDT:USDT"
 
 
 @pytest.mark.asyncio
@@ -2456,6 +2465,9 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
         urls = {"api": {"rest": "https://www.okx.com"}}
         hostname = "www.okx.com"
 
+        def __init__(self) -> None:
+            self.live_market_calls: list[str] = []
+
         def market(self, symbol: str) -> dict[str, Any]:
             return {
                 "symbol": symbol,
@@ -2463,11 +2475,9 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 "info": {"instId": "BTC-USDT-SWAP"},
             }
 
-        async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must not use live ticker")
-
-        async def executionGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+        async def publicGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
+            self.live_market_calls.append("ticker")
             return {
                 "data": [
                     {
@@ -2480,23 +2490,36 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 ]
             }
 
-        async def fetch_order_book(self, _symbol: str) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must not use live order book")
+        async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must use live public ticker")
 
-        async def executionFetchOrderBook(self, symbol: str) -> dict[str, Any]:
+        async def fetch_order_book(self, symbol: str) -> dict[str, Any]:
             assert symbol == "BTC/USDT:USDT"
+            self.live_market_calls.append("orderbook")
             return {
                 "bids": [[99.9, 2.0]],
                 "asks": [[100.1, 3.0]],
                 "timestamp": 1780000000001,
             }
 
-        async def publicGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must not use live mark price")
+        async def executionFetchOrderBook(self, _symbol: str) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must use live public order book")
 
-        async def executionGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
+        async def publicGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
-            return {"data": [{"instId": "BTC-USDT-SWAP", "markPx": "100.05", "ts": "2"}]}
+            self.live_market_calls.append("mark_price")
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "markPx": "100.05",
+                        "ts": "1780000000002",
+                    }
+                ]
+            }
+
+        async def executionGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("paper execution facts must use live public mark price")
 
         async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
             raise AssertionError("paper execution facts must not use live contract rules")
@@ -2539,7 +2562,8 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
             assert params == {"instType": "SWAP"}
             return {"data": [{"taker": "-0.0005", "ts": "1780000000002"}]}
 
-    executor = _executor(_PreOrderFactsCcxt())
+    exchange = _PreOrderFactsCcxt()
+    executor = _executor(exchange)
 
     facts = await executor.pre_order_execution_facts("BTC/USDT", "long")
 
@@ -2551,6 +2575,7 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
     assert snapshot["mark_price"] == pytest.approx(100.05)
     assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
+    assert exchange.live_market_calls == ["ticker", "orderbook", "mark_price"]
 
 
 class _FloorAmountPrecisionCcxt:

@@ -1709,6 +1709,8 @@ async def test_ticker_snapshot_can_defer_rest_for_market_batch_scan() -> None:
 async def test_native_consistency_bars_are_singleflight_and_short_cached() -> None:
     service = _service()
     calls = 0
+    snapshot_timestamp = int(time.time() * 1000)
+    snapshot_minute = (snapshot_timestamp // 60_000) * 60_000
 
     class FakeRestClient:
         async def fetch_ohlcv(
@@ -1719,10 +1721,10 @@ async def test_native_consistency_bars_are_singleflight_and_short_cached() -> No
             assert limit >= 1
             calls += 1
             await asyncio.sleep(0.01)
-            return [[1_000.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
+            return [[float(snapshot_minute), 1.0, 1.1, 0.9, 1.05, 10.0]]
 
     service.rest_client = FakeRestClient()
-    snapshots = [{"timestamp": int(time.time() * 1000)}]
+    snapshots = [{"timestamp": snapshot_timestamp}]
 
     first, second = await asyncio.gather(
         service._fetch_native_consistency_bars("BTC/USDT", snapshots),
@@ -1732,6 +1734,182 @@ async def test_native_consistency_bars_are_singleflight_and_short_cached() -> No
 
     assert first == second == third
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_bars_refresh_when_cache_misses_fact_window() -> None:
+    service = _service()
+    calls = 0
+    current_timestamp = int(time.time() * 1000)
+    current_minute = (current_timestamp // 60_000) * 60_000
+    previous_minute = current_minute - 60_000
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self, _symbol: str, *, timeframe: str, limit: int
+        ) -> list[list[float]]:
+            nonlocal calls
+            assert timeframe == "1m"
+            assert limit >= 1
+            calls += 1
+            open_time = previous_minute if calls == 1 else current_minute
+            return [[float(open_time), 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    previous = await service._fetch_native_consistency_bars(
+        "BTC/USDT",
+        [{"timestamp": previous_minute}],
+    )
+    current = await service._fetch_native_consistency_bars(
+        "BTC/USDT",
+        [{"timestamp": current_timestamp}],
+    )
+
+    assert int(previous[0][0]) == previous_minute
+    assert int(current[0][0]) == current_minute
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_bars_do_not_join_an_older_inflight_window() -> None:
+    service = _service()
+    current_minute = (int(time.time() * 1000) // 60_000) * 60_000
+    previous_minute = current_minute - 60_000
+    previous_started = asyncio.Event()
+    release_previous = asyncio.Event()
+    requested_windows: list[int | None] = []
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self,
+            _symbol: str,
+            *,
+            timeframe: str,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+        ) -> list[list[float]]:
+            assert timeframe == "1m"
+            assert limit >= 1
+            requested_windows.append(end_timestamp_ms)
+            if end_timestamp_ms == previous_minute:
+                previous_started.set()
+                await release_previous.wait()
+            return [[float(end_timestamp_ms or 0), 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    previous_task = asyncio.create_task(
+        service._fetch_native_consistency_bars(
+            "BTC/USDT",
+            [{"timestamp": previous_minute}],
+        )
+    )
+    await previous_started.wait()
+
+    current = await service._fetch_native_consistency_bars(
+        "BTC/USDT",
+        [{"timestamp": current_minute}],
+    )
+    release_previous.set()
+    previous = await previous_task
+
+    assert int(previous[0][0]) == previous_minute
+    assert int(current[0][0]) == current_minute
+    assert requested_windows == [previous_minute, current_minute]
+    cached_rows = service._native_consistency_bars_cache["BTC/USDT"][1]
+    assert {int(row[0]) for row in cached_rows} == {previous_minute, current_minute}
+
+
+@pytest.mark.asyncio
+async def test_shadow_market_fact_path_is_anchored_to_result_minute() -> None:
+    service = _service()
+    entry_ms = 1_780_000_059_900
+    result_ms = 1_780_000_300_100
+    first_open = entry_ms - entry_ms % 60_000
+    last_open = result_ms - result_ms % 60_000
+    requested: dict[str, Any] = {}
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self,
+            symbol: str,
+            *,
+            timeframe: str,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+        ) -> list[list[float]]:
+            requested.update(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                end_timestamp_ms=end_timestamp_ms,
+            )
+            return [
+                [float(open_time), 100.0, 101.0, 99.0, 100.5, 10.0]
+                for open_time in range(first_open, last_open + 60_000, 60_000)
+            ]
+
+    service.rest_client = FakeRestClient()
+    entry_fact = {
+        "symbol": "BTC/USDT",
+        "source_timestamp_ms": entry_ms,
+    }
+    result_fact = {
+        "symbol": "BTC/USDT",
+        "source_timestamp_ms": result_ms,
+    }
+
+    await service.verify_market_fact_path(entry_fact, result_fact)
+
+    assert requested == {
+        "symbol": "BTC/USDT",
+        "timeframe": "1m",
+        "limit": ((last_open - first_open) // 60_000) + 3,
+        "end_timestamp_ms": last_open + 60_000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_shadow_market_fact_path_prefers_isolated_native_lane() -> None:
+    service = _service()
+    entry_ms = 1_780_000_059_900
+    result_ms = 1_780_000_300_100
+    first_open = entry_ms - entry_ms % 60_000
+    last_open = result_ms - result_ms % 60_000
+    requested: dict[str, Any] = {}
+
+    class FakeRestClient:
+        async def fetch_native_consistency_ohlcv(
+            self,
+            symbol: str,
+            *,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+        ) -> list[list[float]]:
+            requested.update(
+                symbol=symbol,
+                limit=limit,
+                end_timestamp_ms=end_timestamp_ms,
+            )
+            return [
+                [float(open_time), 100.0, 101.0, 99.0, 100.5, 10.0]
+                for open_time in range(first_open, last_open + 60_000, 60_000)
+            ]
+
+        async def fetch_ohlcv(self, *_args: Any, **_kwargs: Any) -> list[list[float]]:
+            raise AssertionError("shadow verification must use the isolated native lane")
+
+    service.rest_client = FakeRestClient()
+
+    await service.verify_market_fact_path(
+        {"symbol": "BTC/USDT", "source_timestamp_ms": entry_ms},
+        {"symbol": "BTC/USDT", "source_timestamp_ms": result_ms},
+    )
+
+    assert requested == {
+        "symbol": "BTC/USDT",
+        "limit": ((last_open - first_open) // 60_000) + 3,
+        "end_timestamp_ms": last_open,
+    }
 
 
 @pytest.mark.asyncio
@@ -2306,6 +2484,223 @@ async def test_feature_market_fact_proves_rest_ws_book_reference_and_native_path
     assert vector.market_fact["quality"]["status"] == "clean"
 
 
+@pytest.mark.asyncio
+async def test_attach_native_market_fact_maps_rest_depth_to_canonical_fields() -> None:
+    service = _service()
+    spec = {
+        "instId": "PEPE-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "PEPE-USDT",
+        "instFamily": "PEPE-USDT",
+        "ctType": "linear",
+        "ctVal": "1",
+        "ctMult": "1",
+        "ctValCcy": "PEPE",
+        "settleCcy": "USDT",
+        "lotSz": "1",
+        "minSz": "1",
+        "tickSz": "0.000001",
+        "state": "live",
+    }
+
+    class FakeWsClient:
+        latest_orderbooks: dict[str, dict[str, Any]] = {}
+        latest_mark_prices: dict[str, dict[str, Any]] = {}
+
+    class FakeRestClient:
+        async def fetch_order_book_metrics(
+            self, _symbol: str, *, contract_spec: dict[str, Any]
+        ) -> dict[str, Any]:
+            assert contract_spec == spec
+            return {
+                "orderbook_data_available": True,
+                "orderbook_bid_depth": 321.0,
+                "orderbook_ask_depth": 456.0,
+                "orderbook_imbalance": -0.173,
+                "orderbook_fact": {
+                    "inst_id": "PEPE-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "source_timestamp_ms": 1_700_000_000_000,
+                    "bid": 0.000010,
+                    "ask": 0.000011,
+                    "bid_depth_usdt": 321.0,
+                    "ask_depth_usdt": 456.0,
+                },
+            }
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    service._get_instrument_spec = (  # type: ignore[method-assign]
+        lambda _symbol, **_kwargs: asyncio.sleep(0, result=spec)
+    )
+
+    enriched = await service._attach_native_market_fact(
+        "PEPE/USDT",
+        {
+            "symbol": "PEPE/USDT",
+            "inst_id": "PEPE-USDT-SWAP",
+            "source": "rest",
+            "last_price": 0.0000105,
+            "bid": 0.000010,
+            "ask": 0.000011,
+            "notional_24h_usdt": 1_000_000.0,
+            "timestamp": 1_700_000_000_000,
+        },
+        block_on_remote=True,
+    )
+
+    assert enriched["orderbook_bid_depth"] == 321.0
+    assert enriched["orderbook_ask_depth"] == 456.0
+    assert enriched["bid_depth_usdt"] == 321.0
+    assert enriched["ask_depth_usdt"] == 456.0
+    assert enriched["orderbook_imbalance"] == -0.173
+    assert enriched["market_fact"]["liquidity"]["bid_depth_usdt"] == 321.0
+    assert enriched["market_fact"]["liquidity"]["ask_depth_usdt"] == 456.0
+
+
+@pytest.mark.asyncio
+async def test_attach_native_market_fact_reuses_snapshot_depth_without_rest() -> None:
+    service = _service()
+    rest_calls: list[str] = []
+    spec = {
+        "instId": "DOGE-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "DOGE-USDT",
+        "ctVal": "10",
+        "ctMult": "1",
+    }
+
+    class FakeWsClient:
+        latest_orderbooks: dict[str, dict[str, Any]] = {}
+        latest_mark_prices: dict[str, dict[str, Any]] = {}
+
+    class FakeRestClient:
+        async def fetch_order_book_metrics(self, symbol: str, **_kwargs) -> dict[str, Any]:
+            rest_calls.append(symbol)
+            return {}
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    result = await service._attach_native_market_fact(
+        "DOGE/USDT",
+        {
+            "contract_spec": spec,
+            "orderbook_bid_depth": 784_735.0,
+            "orderbook_ask_depth": 758_481.0,
+            "orderbook_fact": {"source": "rest"},
+        },
+        block_on_remote=False,
+    )
+
+    assert rest_calls == []
+    assert result["bid_depth_usdt"] == 784_735.0
+    assert result["ask_depth_usdt"] == 758_481.0
+    assert result["orderbook_fact"] == {"source": "rest"}
+    assert result["contract_spec"] == spec
+
+
+@pytest.mark.asyncio
+async def test_attach_native_market_fact_nonblocking_missing_depth_skips_rest() -> None:
+    service = _service()
+    rest_calls: list[str] = []
+
+    class FakeWsClient:
+        latest_orderbooks: dict[str, dict[str, Any]] = {}
+        latest_mark_prices: dict[str, dict[str, Any]] = {}
+
+    class FakeRestClient:
+        async def fetch_order_book_metrics(self, symbol: str, **_kwargs) -> dict[str, Any]:
+            rest_calls.append(symbol)
+            return {}
+
+        async def fetch_instrument_spec(self, symbol: str) -> dict[str, Any]:
+            rest_calls.append(symbol)
+            return {}
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    service._instrument_spec_cache = {}
+    service._instrument_spec_tasks = {}
+    service._instrument_spec_failed_at = {}
+
+    await service._attach_native_market_fact(
+        "DOGE/USDT",
+        {"symbol": "DOGE/USDT"},
+        block_on_remote=False,
+    )
+
+    assert rest_calls == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_instrument_spec_refresh_rejects_incomplete_cached_identity() -> None:
+    service = _service()
+    service._instrument_spec_cache = {
+        "PEPE/USDT": {
+            "instId": "PEPE-USDT-SWAP",
+            "instType": "SWAP",
+        }
+    }
+    service._instrument_spec_tasks = {}
+    service._instrument_spec_failed_at = {
+        "PEPE/USDT": datetime.now(UTC),
+    }
+    calls: list[str] = []
+    complete = {
+        "instId": "PEPE-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "PEPE-USDT",
+        "ctVal": "10000000",
+        "ctMult": "1",
+    }
+
+    class FakeRestClient:
+        async def fetch_instrument_spec(self, symbol: str) -> dict[str, Any]:
+            calls.append(symbol)
+            return complete
+
+    service.rest_client = FakeRestClient()
+
+    result = await service._get_instrument_spec(
+        "PEPE/USDT",
+        block_on_remote=True,
+        force_refresh=True,
+    )
+
+    assert calls == ["PEPE/USDT"]
+    assert result == complete
+    assert service._instrument_spec_cache["PEPE/USDT"] == complete
+    assert "PEPE/USDT" not in service._instrument_spec_failed_at
+
+
+@pytest.mark.asyncio
+async def test_incomplete_instrument_spec_response_is_not_cached() -> None:
+    service = _service()
+    service._instrument_spec_cache = {}
+    service._instrument_spec_tasks = {}
+    service._instrument_spec_failed_at = {}
+
+    class FakeRestClient:
+        async def fetch_instrument_spec(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "instId": "PEPE-USDT-SWAP",
+                "instType": "SWAP",
+                "uly": "PEPE-USDT",
+                "ctVal": "10000000",
+            }
+
+    service.rest_client = FakeRestClient()
+
+    result = await service._get_instrument_spec(
+        "PEPE/USDT",
+        block_on_remote=True,
+    )
+
+    assert result == {}
+    assert service._instrument_spec_cache == {}
+    assert "PEPE/USDT" in service._instrument_spec_failed_at
+
+
 def test_news_item_summary_keeps_safe_external_url() -> None:
     service = _service()
 
@@ -2440,10 +2835,14 @@ async def test_candidate_indicator_build_overtakes_queued_background_work() -> N
     service._indicator_snapshot_priority_gate = data_service_module._PriorityBuildGate(1)
     first_started = asyncio.Event()
     release_first = asyncio.Event()
-    build_order: list[str] = []
+    build_order: list[tuple[str, bool]] = []
 
-    async def build(symbol: str) -> dict[str, Any]:
-        build_order.append(symbol)
+    async def build(
+        symbol: str,
+        *,
+        priority: bool = False,
+    ) -> dict[str, Any]:
+        build_order.append((symbol, priority))
         if symbol == "BACKGROUND-1/USDT":
             first_started.set()
             await release_first.wait()
@@ -2464,9 +2863,46 @@ async def test_candidate_indicator_build_overtakes_queued_background_work() -> N
     await asyncio.gather(first, queued_background, priority_candidate)
 
     assert build_order == [
-        "BACKGROUND-1/USDT",
+        ("BACKGROUND-1/USDT", False),
+        ("CANDIDATE/USDT", True),
+        ("BACKGROUND-2/USDT", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidate_indicator_build_marks_all_remote_klines_as_priority() -> None:
+    service = _service()
+    calls: list[tuple[str, bool]] = []
+
+    async def no_cached_features(_symbol: str) -> dict[str, Any]:
+        return {}
+
+    async def fetch_indicator(
+        _symbol: str,
+        timeframe: str,
+        _limit: int,
+        *,
+        priority: bool = False,
+    ) -> tuple[str, list[list[float]]]:
+        calls.append((timeframe, priority))
+        return timeframe, [[1_780_000_000_000.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    async def compute_features(_klines: dict[str, list]) -> dict[str, Any]:
+        return {"indicator_snapshot_available": True}
+
+    service._indicator_features_from_cached_klines = no_cached_features  # type: ignore[method-assign]
+    service._fetch_indicator_klines = fetch_indicator  # type: ignore[method-assign]
+    service._compute_indicator_features_off_loop = compute_features  # type: ignore[method-assign]
+
+    result = await service._build_indicator_snapshot_uncached(
         "CANDIDATE/USDT",
-        "BACKGROUND-2/USDT",
+        priority=True,
+    )
+
+    assert result["indicator_snapshot_available"] is True
+    assert calls == [
+        (timeframe, True)
+        for timeframe in data_service_module.KLINE_PERSIST_TIMEFRAME_LIMITS
     ]
 
 
@@ -2496,3 +2932,131 @@ async def test_candidate_indicator_prewarm_reports_unavailable_symbols() -> None
     assert diagnostics["available_count"] == 1
     assert diagnostics["unavailable_symbols"] == ["ETH/USDT"]
     assert all(kwargs["prioritize_build"] is True for _symbol, kwargs in calls)
+
+
+@pytest.mark.asyncio
+async def test_latest_market_fact_keeps_valid_ticker_facts_when_derivatives_are_empty() -> None:
+    service = _service()
+    timestamp = 1_783_990_800_000
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "instFamily": "BTC-USDT",
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "1",
+        "ctValCcy": "BTC",
+        "settleCcy": "USDT",
+        "lotSz": "0.01",
+        "minSz": "0.01",
+        "tickSz": "0.1",
+        "state": "live",
+    }
+    ticker = {
+        "symbol": "BTC/USDT",
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "uly": "BTC-USDT",
+        "contract_spec": spec,
+        "source": "rest",
+        "source_endpoint": "okx_rest_market_ticker",
+        "source_channel": "tickers",
+        "timestamp": timestamp,
+        "last_price": 100.0,
+        "bid": 99.9,
+        "ask": 100.1,
+        "notional_24h_usdt": 1_000_000.0,
+        "volume_24h_contracts": 10_000.0,
+        "volume_24h_base": 100.0,
+        "orderbook_bid_depth": 500_000.0,
+        "orderbook_ask_depth": 600_000.0,
+        "mark_price": 100.0,
+        "index_price": 100.0,
+        "orderbook_fact": {
+            "inst_id": "BTC-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source_timestamp_ms": timestamp,
+            "bid": 99.9,
+            "ask": 100.1,
+            "bid_depth_usdt": 500_000.0,
+            "ask_depth_usdt": 600_000.0,
+        },
+        "mark_price_fact": {
+            "inst_id": "BTC-USDT-SWAP",
+            "inst_type": "SWAP",
+            "source_timestamp_ms": timestamp,
+            "price": 100.0,
+        },
+        "index_price_fact": {
+            "inst_id": "BTC-USDT",
+            "inst_type": "INDEX",
+            "source_timestamp_ms": timestamp,
+            "price": 100.0,
+        },
+        "native_consistency_bars_1m": [
+            [timestamp, 99.8, 100.2, 99.7, 100.0, 1_000.0]
+        ],
+    }
+
+    async def ticker_snapshot(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return dict(ticker)
+
+    async def derivatives_snapshot(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "orderbook_bid_depth": 0.0,
+            "orderbook_ask_depth": 0.0,
+            "mark_price": 0.0,
+            "index_price": 0.0,
+            "orderbook_fact": {},
+            "mark_price_fact": {},
+            "index_price_fact": {},
+            "derivatives_snapshot_stale": True,
+        }
+
+    service._get_ticker_snapshot = ticker_snapshot  # type: ignore[method-assign]
+    service._get_derivatives_snapshot = derivatives_snapshot  # type: ignore[method-assign]
+
+    fact = await service.get_latest_market_fact("BTC/USDT")
+
+    assert fact["liquidity"]["bid_depth_usdt"] == pytest.approx(500_000.0)
+    assert fact["liquidity"]["ask_depth_usdt"] == pytest.approx(600_000.0)
+    assert fact["prices"]["mark"] == pytest.approx(100.0)
+    assert fact["prices"]["index"] == pytest.approx(100.0)
+    assert fact["stale"] is False
+    assert fact["quality"]["status"] == "clean"
+
+
+@pytest.mark.asyncio
+async def test_latest_market_fact_is_single_flight_and_reuses_clean_cache() -> None:
+    service = _service()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    clean_fact = {
+        "symbol": "BTC/USDT",
+        "quality": {"status": "clean", "reasons": []},
+    }
+
+    async def build(_symbol: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return dict(clean_fact)
+
+    service._build_latest_market_fact = build  # type: ignore[method-assign]
+    first = asyncio.create_task(service.get_latest_market_fact("BTC/USDT"))
+    second = asyncio.create_task(service.get_latest_market_fact("BTC/USDT"))
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    assert calls == 1
+    release.set()
+
+    first_result, second_result = await asyncio.gather(first, second)
+    await asyncio.sleep(0)
+    cached_result = await service.get_latest_market_fact("BTC/USDT")
+
+    assert first_result == clean_fact
+    assert second_result == clean_fact
+    assert cached_result == clean_fact
+    assert calls == 1

@@ -169,6 +169,10 @@ class _AccountApi:
         self.calls.append(("get_fee_rates", dict(kwargs)))
         return {"code": "0", "data": [{"taker": "-0.0005", "ts": "1783931709453"}]}
 
+    def get_positions(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_positions", dict(kwargs)))
+        return {"code": "0", "data": []}
+
 
 class _ConcurrentProbeApi:
     def __init__(self) -> None:
@@ -302,6 +306,59 @@ async def test_native_consistency_candles_use_isolated_market_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_consistency_candles_can_anchor_to_fact_minute() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    native_api = _MarketApi()
+    exchange._native_consistency_market_api = native_api
+
+    rows = await exchange.fetch_native_consistency_ohlcv(
+        "BTC/USDT",
+        limit=5,
+        end_timestamp_ms=1_780_000_123_456,
+    )
+
+    assert rows
+    assert native_api.calls == [
+        (
+            "get_candlesticks",
+            {
+                "instId": "BTC-USDT-SWAP",
+                "bar": "1m",
+                "limit": "5",
+                "after": "1780000183456",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ohlcv_can_anchor_a_historical_shadow_window_at_result_time() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    market_api = _MarketApi()
+    exchange._market_api = market_api
+
+    rows = await exchange.fetch_ohlcv(
+        "BTC/USDT",
+        timeframe="1m",
+        limit=7,
+        end_timestamp_ms=1_780_000_123_456,
+    )
+
+    assert rows
+    assert market_api.calls == [
+        (
+            "get_candlesticks",
+            {
+                "instId": "BTC-USDT-SWAP",
+                "bar": "1m",
+                "limit": "7",
+                "after": "1780000123456",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sdk_adapter_disposable_http_clients_close_and_recreate_after_each_call() -> None:
     exchange = OkxPerpetualSdkExchange("paper", close_http_after_call=True)
     instances: list[Any] = []
@@ -341,7 +398,7 @@ async def test_sdk_adapter_forces_public_tickers_to_swap() -> None:
 
     await exchange.publicGetMarketTickers({"instType": "SWAP"})
 
-    assert market_api.calls == [("get_tickers", {"instType": "SWAP", "uly": "", "instFamily": ""})]
+    assert market_api.calls == [("get_tickers", {"instType": "SWAP"})]
 
 
 @pytest.mark.asyncio
@@ -373,15 +430,24 @@ async def test_sdk_adapter_exposes_native_mark_and_index_price_calls() -> None:
             "get_mark_price",
             {
                 "instType": "SWAP",
-                "uly": "",
-                "instFamily": "",
                 "instId": "ROBO-USDT-SWAP",
             },
         )
     ]
     assert market_api.calls == [
-        ("get_index_tickers", {"quoteCcy": "", "instId": "ROBO-USDT"})
+        ("get_index_tickers", {"instId": "ROBO-USDT"})
     ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_adapter_omits_empty_account_position_filters() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    account_api = _AccountApi()
+    exchange._account_api = account_api
+
+    await exchange.privateGetAccountPositions({"instType": "SWAP"})
+
+    assert account_api.calls == [("get_positions", {"instType": "SWAP"})]
 
 
 @pytest.mark.asyncio
@@ -549,10 +615,6 @@ async def test_sdk_adapter_reads_account_level_swap_fee_rate() -> None:
             "get_fee_rates",
             {
                 "instType": "SWAP",
-                "instId": "",
-                "uly": "",
-                "category": "",
-                "instFamily": "",
             },
         )
     ]

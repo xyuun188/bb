@@ -281,6 +281,19 @@ def build_feature_vector(
         fv.volume_24h = fv.volume_24h_base if fv.volume_24h_base > 0 else legacy_volume
         fv.change_24h_pct = _safe_float(ticker.get("change_24h_pct"), 0.0)
         fv.spread_pct = _safe_float(ticker.get("spread_pct"), 0.0)
+        # The ticker path can complete an authoritative REST order-book
+        # fallback before the derivatives route returns. Keep those values on
+        # the vector so a partial derivatives response cannot replace them
+        # with zero placeholders.
+        fv.orderbook_bid_depth = _safe_float(ticker.get("orderbook_bid_depth"), 0.0)
+        fv.orderbook_ask_depth = _safe_float(ticker.get("orderbook_ask_depth"), 0.0)
+        fv.orderbook_imbalance = _safe_float(ticker.get("orderbook_imbalance"), 0.0)
+        fv.mark_price = _safe_float(ticker.get("mark_price"), 0.0)
+        fv.index_price = _safe_float(ticker.get("index_price"), 0.0)
+        for key in ("orderbook_fact", "mark_price_fact", "index_price_fact"):
+            value = ticker.get(key)
+            if isinstance(value, dict):
+                setattr(fv, key, dict(value))
 
     # Technical indicators
     if indicators:
@@ -344,6 +357,32 @@ def build_feature_vector(
     if derivatives:
         for key, value in derivatives.items():
             if hasattr(fv, key):
+                # A derivatives timeout may return zero placeholders while
+                # the ticker path has already completed a valid REST
+                # fallback. Never let an unavailable route erase executable
+                # depth or reference prices from that successful snapshot.
+                if key in {
+                    "orderbook_bid_depth",
+                    "orderbook_ask_depth",
+                    "mark_price",
+                    "index_price",
+                }:
+                    try:
+                        current_value = float(getattr(fv, key) or 0.0)
+                        derivative_value = float(value or 0.0)
+                    except (TypeError, ValueError):
+                        current_value = 0.0
+                        derivative_value = 0.0
+                    if current_value > 0.0 and derivative_value <= 0.0:
+                        continue
+                if key in {"orderbook_fact", "mark_price_fact", "index_price_fact"}:
+                    current_fact = getattr(fv, key)
+                    if (
+                        isinstance(current_fact, dict)
+                        and current_fact
+                        and (not isinstance(value, dict) or not value)
+                    ):
+                        continue
                 setattr(fv, key, value)
 
     ticker_fact_input = dict(ticker or {})
@@ -362,6 +401,9 @@ def build_feature_vector(
             "price_reconciliation_warning": fv.price_reconciliation_warning,
             "mark_price": fv.mark_price,
             "index_price": fv.index_price,
+            "orderbook_fact": fv.orderbook_fact,
+            "mark_price_fact": fv.mark_price_fact,
+            "index_price_fact": fv.index_price_fact,
             # Funding/open-interest are optional analytical enrichments. A
             # delayed optional route must remain visible on the feature vector
             # and can still block execution-cost completeness, but it must not

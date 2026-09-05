@@ -138,9 +138,12 @@ _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 8.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
-_DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 20.0
+_DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS = 180.0
+_DASHBOARD_OKX_PROTECTION_INITIAL_WAIT_SECONDS = 0.35
+_DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS = 4.0
-_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 10.0
+_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 15.0
 _DASHBOARD_OPENING_FUNNEL_TIMEOUT_SECONDS = 15.0
 _DASHBOARD_OPENING_FUNNEL_DB_TIMEOUT_MILLISECONDS = 12_000
 _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT = 1_000
@@ -173,6 +176,7 @@ _dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
 _dashboard_okx_position_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _dashboard_okx_protection_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_okx_protection_locks: dict[str, asyncio.Lock] = {}
+_dashboard_okx_protection_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _exchange_mark_cache: dict[str, tuple[datetime, dict[tuple[str, str], dict[str, Any]]]] = {}
 _exchange_open_symbol_cache: dict[str, tuple[datetime, set[str]]] = {}
 _public_ticker_cache: dict[str, tuple[datetime, dict[str, dict]]] = {}
@@ -3052,27 +3056,53 @@ def _dashboard_position_risk_envelope(
     }
 
 
-async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
-    from services.protection_order_integrity import audit_protection_order_integrity
-
+def _dashboard_okx_protection_snapshot(
+    selected_mode: str,
+    *,
+    allow_stale: bool,
+    stale_reason: str = "refresh",
+) -> dict[str, Any] | None:
     cached = _dashboard_okx_protection_cache.get(selected_mode)
-    if cached is not None:
-        cached_at, audit = cached
-        if (
-            datetime.now(UTC) - cached_at
-        ).total_seconds() <= _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS:
-            return audit
+    if cached is None:
+        return None
+    cached_at, audit = cached
+    age_seconds = max(0.0, (datetime.now(UTC) - cached_at).total_seconds())
+    if age_seconds <= _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS:
+        snapshot = copy.deepcopy(audit)
+        snapshot.update(
+            {
+                "stale": False,
+                "degraded": False,
+                "checked_at": cached_at.isoformat(),
+                "snapshot_age_seconds": round(age_seconds, 3),
+            }
+        )
+        return snapshot
+    if not allow_stale or age_seconds > _DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS:
+        return None
+    snapshot = copy.deepcopy(audit)
+    snapshot.update(
+        {
+            "stale": True,
+            "degraded": True,
+            "stale_reason": stale_reason,
+            "checked_at": cached_at.isoformat(),
+            "snapshot_age_seconds": round(age_seconds, 3),
+            "refresh_in_background": True,
+        }
+    )
+    return snapshot
+
+
+async def _refresh_dashboard_okx_protection_cache(selected_mode: str) -> dict[str, Any]:
+    from services.protection_order_integrity import audit_protection_order_integrity
 
     lock = _dashboard_okx_protection_locks.setdefault(selected_mode, asyncio.Lock())
     await _acquire_dashboard_lock(lock, label="dashboard OKX protection audit")
     try:
-        cached = _dashboard_okx_protection_cache.get(selected_mode)
-        if cached is not None:
-            cached_at, audit = cached
-            if (
-                datetime.now(UTC) - cached_at
-            ).total_seconds() <= _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS:
-                return audit
+        fresh = _dashboard_okx_protection_snapshot(selected_mode, allow_stale=False)
+        if fresh is not None:
+            return fresh
 
         executor = _dashboard_okx_executor_for_mode(selected_mode)
         owns_executor = executor is None
@@ -3094,11 +3124,11 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
                 positions_coro,
                 asyncio.wait_for(
                     executor.get_position_protection_orders(),
-                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                    timeout=_DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS,
                 ),
                 asyncio.wait_for(
                     executor.get_open_orders_strict(),
-                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                    timeout=_DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS,
                 ),
             )
             get_contract_specs = getattr(executor, "get_contract_specs_strict", None)
@@ -3113,7 +3143,7 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
                             }
                         )
                     ),
-                    timeout=_DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS,
+                    timeout=_DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS,
                 )
                 if callable(get_contract_specs)
                 else {}
@@ -3126,7 +3156,7 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
                 pending_snapshot_complete=True,
             )
             _dashboard_okx_protection_cache[selected_mode] = (datetime.now(UTC), audit)
-            return audit
+            return _dashboard_okx_protection_snapshot(selected_mode, allow_stale=False) or audit
         finally:
             if owns_executor:
                 await _shutdown_dashboard_client_bounded(
@@ -3136,6 +3166,100 @@ async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
                 )
     finally:
         lock.release()
+
+
+def _start_dashboard_okx_protection_refresh(selected_mode: str) -> asyncio.Task[Any]:
+    task = _dashboard_okx_protection_refresh_tasks.get(selected_mode)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(_refresh_dashboard_okx_protection_cache(selected_mode))
+    _dashboard_okx_protection_refresh_tasks[selected_mode] = task
+    task.add_done_callback(
+        _consume_dashboard_refresh_task(
+            _dashboard_okx_protection_refresh_tasks,
+            selected_mode,
+            label="okx protection",
+        )
+    )
+    return task
+
+
+async def _dashboard_okx_protection_audit(selected_mode: str) -> dict[str, Any]:
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    fresh = _dashboard_okx_protection_snapshot(selected_mode, allow_stale=False)
+    if fresh is not None:
+        return fresh
+
+    stale = _dashboard_okx_protection_snapshot(
+        selected_mode,
+        allow_stale=True,
+        stale_reason="expired_refresh",
+    )
+    if stale is not None:
+        _start_dashboard_okx_protection_refresh(selected_mode)
+        return stale
+
+    task = _start_dashboard_okx_protection_refresh(selected_mode)
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=max(_DASHBOARD_OKX_PROTECTION_INITIAL_WAIT_SECONDS, 0.01),
+        )
+        if task in done:
+            return task.result()
+        stale = _dashboard_okx_protection_snapshot(
+            selected_mode,
+            allow_stale=True,
+            stale_reason="timeout",
+        )
+        if stale is not None:
+            return stale
+        return {
+            "available": False,
+            "pending": True,
+            "degraded": True,
+            "refresh_in_background": True,
+            "stale_reason": "initial_refresh",
+            "protection_orders": [],
+            "missing_keys": [],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+            "coverage_mismatches": [],
+            "repair_blockers": [],
+            "blockers": [],
+        }
+    except Exception as exc:
+        stale = _dashboard_okx_protection_snapshot(
+            selected_mode,
+            allow_stale=True,
+            stale_reason="refresh_error",
+        )
+        if stale is not None:
+            _log_dashboard_fallback(
+                "dashboard OKX protection refresh failed; using stale snapshot",
+                exc,
+                mode=selected_mode,
+            )
+            return stale
+        _log_dashboard_fallback(
+            "dashboard OKX protection refresh failed; retrying in background",
+            exc,
+            mode=selected_mode,
+        )
+        return {
+            "available": False,
+            "pending": True,
+            "degraded": True,
+            "refresh_in_background": True,
+            "stale_reason": "refresh_error",
+            "protection_orders": [],
+            "missing_keys": [],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+            "coverage_mismatches": [],
+            "repair_blockers": [],
+            "blockers": [],
+        }
 
 
 async def _dashboard_open_position_protection_evidence(
@@ -3180,6 +3304,17 @@ async def _dashboard_open_position_protection_evidence(
             "orphan_keys": [],
             "split_coverage_keys": [],
         }
+    if audit.get("pending") is True:
+        for item in positions:
+            item["protection_contract"] = {
+                "available": False,
+                "pending": True,
+                "degraded": True,
+                "refresh_in_background": True,
+                "orders": [],
+                "blockers": [],
+            }
+        return dict(audit)
     orders_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for order in _safe_list(audit.get("protection_orders")):
         if not isinstance(order, dict):
@@ -3210,6 +3345,11 @@ async def _dashboard_open_position_protection_evidence(
             blockers.append("invalid_okx_protection_order")
         item["protection_contract"] = {
             "available": True,
+            "stale": bool(audit.get("stale")),
+            "degraded": bool(audit.get("degraded")),
+            "stale_reason": audit.get("stale_reason"),
+            "checked_at": audit.get("checked_at"),
+            "snapshot_age_seconds": audit.get("snapshot_age_seconds"),
             "contract_version": audit.get("contract_version"),
             "order_count": len(orders),
             "unique": len(orders) == 1,
@@ -3229,6 +3369,12 @@ async def _dashboard_open_position_protection_evidence(
         }
     return {
         "available": True,
+        "stale": bool(audit.get("stale")),
+        "degraded": bool(audit.get("degraded")),
+        "stale_reason": audit.get("stale_reason"),
+        "checked_at": audit.get("checked_at"),
+        "snapshot_age_seconds": audit.get("snapshot_age_seconds"),
+        "refresh_in_background": bool(audit.get("refresh_in_background")),
         "contract_version": audit.get("contract_version"),
         "position_count": audit.get("position_count"),
         "protection_order_count": audit.get("protection_order_count"),
@@ -3239,6 +3385,39 @@ async def _dashboard_open_position_protection_evidence(
         "invalid_order_count": len(_safe_list(audit.get("invalid_orders"))),
         "repair_blockers": audit.get("repair_blockers"),
         "inventory_fingerprint": audit.get("input_fingerprint"),
+        "blockers": [],
+    }
+
+
+def _dashboard_pending_protection_evidence(
+    positions: list[dict[str, Any]],
+    *,
+    stale_reason: str,
+) -> dict[str, Any]:
+    """Represent a slow protection read as pending, never as missing protection."""
+
+    for item in positions:
+        item["protection_contract"] = {
+            "available": False,
+            "pending": True,
+            "degraded": True,
+            "refresh_in_background": True,
+            "stale_reason": stale_reason,
+            "orders": [],
+            "blockers": [],
+        }
+    return {
+        "available": False,
+        "pending": True,
+        "degraded": True,
+        "refresh_in_background": True,
+        "stale_reason": stale_reason,
+        "protection_orders": [],
+        "missing_keys": [],
+        "orphan_keys": [],
+        "split_coverage_keys": [],
+        "coverage_mismatches": [],
+        "repair_blockers": [],
         "blockers": [],
     }
 
@@ -3265,10 +3444,19 @@ async def _dashboard_open_position_evidence_bounded(
         if task not in done:
             task.cancel()
             task.add_done_callback(_consume_detached_dashboard_task)
-            results[label] = TimeoutError(
-                f"open position {label} evidence timed out after "
-                f"{_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS:g}s"
-            )
+            if label == "protection":
+                # The account-wide refresh task is single-flight and continues
+                # in the background. A dashboard deadline is not evidence that
+                # an exchange protection order is absent or invalid.
+                results[label] = _dashboard_pending_protection_evidence(
+                    positions,
+                    stale_reason="evidence_deadline",
+                )
+            else:
+                results[label] = TimeoutError(
+                    f"open position {label} evidence timed out after "
+                    f"{_DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS:g}s"
+                )
             continue
         try:
             results[label] = task.result()
@@ -3591,6 +3779,7 @@ async def shutdown_dashboard_read_clients() -> None:
         for task in (
             *_dashboard_okx_position_refresh_tasks.values(),
             *_dashboard_okx_balance_refresh_tasks.values(),
+            *_dashboard_okx_protection_refresh_tasks.values(),
             *_dashboard_closed_ledger_refresh_tasks.values(),
         )
         if task is not None and not task.done()
@@ -3607,6 +3796,7 @@ async def shutdown_dashboard_read_clients() -> None:
         for task in pending:
             task.add_done_callback(_consume_detached_dashboard_task)
     _dashboard_closed_ledger_refresh_tasks.clear()
+    _dashboard_okx_protection_refresh_tasks.clear()
     _dashboard_okx_protection_cache.clear()
     _dashboard_okx_protection_locks.clear()
     executors = list(dict.fromkeys(_dashboard_read_only_okx_executors.values()))

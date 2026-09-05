@@ -9420,7 +9420,10 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             && p.protection_contract?.available === true
             && !managementBlockers.length
             && !protectionBlockers.length;
-        const evidenceLabel = evidenceReady
+        const protectionPending = p.protection_contract?.pending === true;
+        const evidenceLabel = protectionPending
+            ? '保护证据读取中'
+            : evidenceReady
             ? (riskEnvelope.current_management_authoritative === true && riskEnvelope.available !== true
                 ? '接管/OCO 完整'
                 : '风险/OCO 完整')
@@ -9448,7 +9451,7 @@ function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItem
             <td>
                 <div class="position-action-stack">
                     <button class="btn btn-sm js-position-evidence" data-position-index="${positionIndex}">查看证据</button>
-                    <span class="position-evidence-state ${evidenceReady ? 'ok' : 'warn'}">${evidenceLabel}</span>
+                    <span class="position-evidence-state ${protectionPending ? 'pending' : evidenceReady ? 'ok' : 'warn'}">${evidenceLabel}</span>
                     <button ${closeButtonAttrs}>${closeLabel}</button>
                 </div>
             </td>
@@ -9763,7 +9766,9 @@ function openPositionEvidenceModal(positionIndex) {
             }).join('')
             : `<div class="position-evidence-empty">无法追溯入场订单对应的独立风险合同。${positionEvidenceBlockers(riskEnvelope.blockers)}</div>`;
 
-    const protectionHtml = protectionOrders.length
+    const protectionHtml = protection.pending === true
+        ? '<div class="position-evidence-stale">正在后台读取 OKX 保护单，页面会自动刷新结果。</div>'
+        : protectionOrders.length
         ? protectionOrders.map(order => `
             <article class="position-protection-order">
                 <div><span>OKX algo ID</span><strong>${escHtml(order.algo_id || '证据缺失')}</strong></div>
@@ -9785,15 +9790,21 @@ function openPositionEvidenceModal(positionIndex) {
             <div><strong>${positionEvidenceValue(position.unrealized_pnl, ' U')}</strong><span>当前浮盈亏</span></div>
             <div><strong>${management.management_eligible === true ? '有效' : '阻断'}</strong><span>当前接管</span></div>
             <div><strong>${riskEnvelope.available === true ? '完整' : historicalEntryArchived ? '旧版已归档' : '历史缺口'}</strong><span>入场合同</span></div>
-            <div><strong>${protection.available === true ? `${protection.order_count ?? 0} 张` : '读取失败'}</strong><span>OKX 保护</span></div>
+            <div><strong>${protection.pending === true ? '读取中' : protection.available === true ? `${protection.order_count ?? 0} 张${protection.stale === true ? '（上次快照）' : ''}` : '暂不可确认'}</strong><span>OKX 保护</span></div>
         </div>
         ${positionEvidenceBlockers([...(management.blockers || []), ...(protection.blockers || [])])}
         <section class="position-evidence-section"><h3>当前仓位接管与只减仓边界</h3>${managementHtml}</section>
         <section class="position-evidence-section"><h3>历史入场风险合同</h3>${riskHtml}</section>
-        <section class="position-evidence-section"><h3>OKX OCO / 保护生命周期</h3>${protectionHtml}</section>
+        <section class="position-evidence-section"><h3>OKX OCO / 保护生命周期</h3>
+            ${protection.stale === true ? `<div class="position-evidence-stale">当前显示最近一次成功快照（${escHtml(protection.snapshot_age_seconds == null ? '时间未知' : `${Number(protection.snapshot_age_seconds).toFixed(0)} 秒前`)}），OKX 正在后台刷新；快照期间不代表新增或取消了保护单。</div>` : ''}
+            ${protectionHtml}</section>
         <section class="position-evidence-section"><h3>全账户保护告警</h3>
-            ${inventory.available === false
+            ${inventory.pending === true
+                ? '<div class="position-evidence-stale">正在后台读取全账户保护快照，完成后会自动更新。</div>'
+                : inventory.available === false
                 ? positionEvidenceBlockers(inventory.blockers)
+                : inventory.stale === true
+                    ? `<div class="position-evidence-stale">全账户保护快照暂时沿用最近一次成功读取，正在后台刷新。</div>`
                 : inventoryWarnings.length
                     ? `<div class="position-evidence-blockers">${inventoryWarnings.map(item => escHtml(item)).join(' / ')}</div>`
                     : '<div class="position-evidence-ok">当前快照未发现孤儿或多张保护方向。</div>'}

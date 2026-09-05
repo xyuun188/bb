@@ -5074,6 +5074,7 @@ select.form-input { cursor: pointer; }
 }
 .position-evidence-state.ok { color: var(--green); }
 .position-evidence-state.warn { color: var(--accent-light); }
+.position-evidence-state.pending { color: var(--text-muted); }
 .position-evidence-summary {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -5154,6 +5155,7 @@ select.form-input { cursor: pointer; }
 .position-evidence-provenance { color: var(--text-muted); }
 .position-evidence-blockers,
 .position-evidence-empty,
+.position-evidence-stale,
 .position-evidence-ok {
     padding: 9px 10px;
     border-radius: var(--radius-sm);
@@ -5163,6 +5165,7 @@ select.form-input { cursor: pointer; }
 }
 .position-evidence-blockers { border: 1px solid rgba(239,68,68,0.38); color: var(--red); background: var(--red-dim); }
 .position-evidence-empty { border: 1px dashed var(--border-light); color: var(--text-muted); }
+.position-evidence-stale { border: 1px solid rgba(245,158,11,0.38); color: var(--yellow); background: rgba(245,158,11,0.08); }
 .position-evidence-ok { border: 1px solid rgba(34,197,94,0.34); color: var(--green); background: var(--green-dim); }
 .reason-block {
     color: var(--text);

@@ -43,7 +43,6 @@ DERIVATIVES_ROUTE_CACHE_TTL_SECONDS = 20.0
 DERIVATIVES_ROUTE_STALE_CACHE_TTL_SECONDS = 10 * 60
 DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 1.5
-REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS = 0.35
 REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
 REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
 ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 2.5
@@ -53,12 +52,15 @@ TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # wait.  This is deliberately independent from the first caller's short
 # route budget so a completed shared request is not lost as a timeout stub.
 TICKER_ROUTE_JOIN_TIMEOUT_SECONDS = 2.5
+REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS = TICKER_ROUTE_JOIN_TIMEOUT_SECONDS
 # Final entry validation may wait longer for the same single-flight request,
 # but remains bounded so a slow exchange route cannot stall the trading loop.
 TICKER_ROUTE_AUTHORITATIVE_TIMEOUT_SECONDS = max(
     TICKER_ROUTE_TIMEOUT_SECONDS * 2.0,
     5.0,
 )
+TICKER_ROUTE_AUTHORITATIVE_FALLBACK_TIMEOUT_SECONDS = 5.0
+TICKER_ROUTE_AUTHORITATIVE_BATCH_CACHE_SECONDS = 1.0
 TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # All public market routes share one SDK session.  Without a client-level
 # gate, a market round can create several requests per symbol (ticker,
@@ -195,6 +197,8 @@ class OKXRestClient:
         self._reference_price_failure_cache: dict[str, float] = {}
         self._ticker_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._ticker_retry_at: dict[str, float] = {}
+        self._authoritative_ticker_batch_task: asyncio.Task[dict[str, Any]] | None = None
+        self._authoritative_ticker_batch_cache: tuple[float, dict[str, Any]] | None = None
         self._orderbook_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._orderbook_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._derivatives_route_cache: dict[
@@ -367,6 +371,11 @@ class OKXRestClient:
         if task is None or task.done():
             retry_at = self._ticker_retry_at.get(inst_id, 0.0)
             if retry_at > now:
+                if wait_for_completion:
+                    fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
+                    if fallback:
+                        self._ticker_retry_at.pop(inst_id, None)
+                        return fallback
                 return {
                     "ticker_refresh_in_background": True,
                     "ticker_retry_after_seconds": round(retry_at - now, 3),
@@ -401,13 +410,24 @@ class OKXRestClient:
                 if joining_inflight
                 else TICKER_ROUTE_TIMEOUT_SECONDS
             )
-            return dict(
+            result = dict(
                 await asyncio.wait_for(
                     asyncio.shield(task),
                     timeout=timeout_seconds,
                 )
             )
+            if wait_for_completion and not self._ticker_has_executable_quote(result):
+                fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
+                if fallback:
+                    self._ticker_retry_at.pop(inst_id, None)
+                    return fallback
+            return result
         except TimeoutError:
+            if wait_for_completion:
+                fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
+                if fallback:
+                    self._ticker_retry_at.pop(inst_id, None)
+                    return fallback
             # Keep the shared request alive. A later analysis round must wait on
             # this task instead of issuing another request against the same SDK.
             # Do not mark the instrument as failed here: the in-flight request
@@ -417,6 +437,15 @@ class OKXRestClient:
                 "ticker_refresh_in_background": True,
                 "ticker_timeout": True,
             }
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if wait_for_completion:
+                fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
+                if fallback:
+                    self._ticker_retry_at.pop(inst_id, None)
+                    return fallback
+            raise
 
     async def _fetch_ticker_uncached(self, inst_id: str) -> dict[str, Any]:
         response = await self._ccxt_call("publicGetMarketTicker", {"instId": inst_id})
@@ -424,6 +453,74 @@ class OKXRestClient:
         if not rows:
             return {}
         return self._native_ticker_to_ccxt_shape(rows[0])
+
+    async def _fetch_authoritative_ticker_fallback(
+        self,
+        inst_id: str,
+    ) -> dict[str, Any]:
+        """Recover a strict ticker read through OKX's public batch route."""
+
+        symbol = symbol_from_okx_inst_id(inst_id)
+        if not symbol:
+            return {}
+        now = time.monotonic()
+        cached = self._authoritative_ticker_batch_cache
+        cache_fresh = bool(
+            cached is not None
+            and now - cached[0] <= TICKER_ROUTE_AUTHORITATIVE_BATCH_CACHE_SECONDS
+        )
+        if cache_fresh and cached is not None:
+            tickers = cached[1]
+            task = None
+        else:
+            task = self._authoritative_ticker_batch_task
+            if task is None or task.done():
+                task = asyncio.create_task(self.fetch_tickers(priority=True))
+                task.add_done_callback(_consume_cancelled_task)
+                self._authoritative_ticker_batch_task = task
+        try:
+            if not cache_fresh and task is not None:
+                tickers = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=TICKER_ROUTE_AUTHORITATIVE_FALLBACK_TIMEOUT_SECONDS,
+                )
+                if isinstance(tickers, dict) and tickers:
+                    self._authoritative_ticker_batch_cache = (
+                        time.monotonic(),
+                        dict(tickers),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "OKX authoritative batch ticker fallback failed",
+                inst_id=inst_id,
+                error=safe_error_text(exc),
+            )
+            return {}
+        ticker = tickers.get(inst_id) or tickers.get(symbol)
+        if not isinstance(ticker, dict):
+            return {}
+        info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        ticker_inst_id = str(
+            ticker.get("id") or info.get("instId") or ""
+        ).strip().upper()
+        if ticker_inst_id != inst_id:
+            return {}
+        return dict(ticker) if self._ticker_has_executable_quote(ticker) else {}
+
+    @staticmethod
+    def _ticker_has_executable_quote(ticker: Any) -> bool:
+        if not isinstance(ticker, dict):
+            return False
+        info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        try:
+            last = float(ticker.get("last") or info.get("last") or 0.0)
+            bid = float(ticker.get("bid") or info.get("bidPx") or 0.0)
+            ask = float(ticker.get("ask") or info.get("askPx") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return last > 0 and bid > 0 and ask >= bid
 
     async def fetch_instrument_spec(self, symbol: str) -> dict[str, Any]:
         # Coalesce the rare fallback instrument request. The first caller may
@@ -447,7 +544,10 @@ class OKXRestClient:
         market = markets.get(inst_id)
         if isinstance(market, dict):
             info = market.get("info")
-            if isinstance(info, dict) and str(info.get("instId") or "").strip().upper() == inst_id:
+            if (
+                isinstance(info, dict)
+                and self._instrument_spec_is_complete(info, inst_id=inst_id)
+            ):
                 return {
                     key: info.get(key)
                     for key in (
@@ -472,6 +572,12 @@ class OKXRestClient:
         )
         if not isinstance(row, dict):
             return {}
+        if not self._instrument_spec_is_complete(row, inst_id=inst_id):
+            logger.warning(
+                "OKX public instrument response is incomplete",
+                inst_id=inst_id,
+            )
+            return {}
         return {
             key: row.get(key)
             for key in (
@@ -491,7 +597,32 @@ class OKXRestClient:
             )
         } | {"source": "okx_public_instruments"}
 
-    async def fetch_tickers(self, symbols: list[str] | None = None) -> dict:
+    def _instrument_spec_is_complete(
+        self,
+        value: Any,
+        *,
+        inst_id: str,
+    ) -> bool:
+        raw = value if isinstance(value, dict) else {}
+        normalized = normalize_okx_contract_spec(raw)
+        return bool(
+            str(normalized.get("inst_id") or "").upper() == inst_id
+            and str(raw.get("instType") or raw.get("inst_type") or "").upper()
+            == "SWAP"
+            and str(normalized.get("uly") or "").strip()
+            and self._safe_float(normalized.get("contract_value")) > 0
+            and self._safe_float(
+                raw.get("ctMult") or raw.get("contract_multiplier")
+            )
+            > 0
+        )
+
+    async def fetch_tickers(
+        self,
+        symbols: list[str] | None = None,
+        *,
+        priority: bool = False,
+    ) -> dict:
         target_inst_ids = {
             inst_id for symbol in symbols or [] if (inst_id := okx_inst_id_from_symbol(symbol))
         }
@@ -499,7 +630,11 @@ class OKXRestClient:
         if not target_inst_ids:
             exchange = await self._get_exchange()
         supported_inst_ids = target_inst_ids or self._loaded_market_inst_ids(exchange)
-        response = await self._ccxt_call("publicGetMarketTickers", {"instType": "SWAP"})
+        response = await self._ccxt_call(
+            "publicGetMarketTickers",
+            {"instType": "SWAP"},
+            _request_priority=priority,
+        )
         rows = response.get("data", []) if isinstance(response, dict) else []
         tickers: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -531,25 +666,44 @@ class OKXRestClient:
         return inst_ids
 
     async def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1h", limit: int = 100
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        limit: int = 100,
+        *,
+        end_timestamp_ms: int | None = None,
+        priority: bool = False,
     ) -> list[list[float]]:
+        kwargs: dict[str, Any] = {"limit": limit}
+        if int(end_timestamp_ms or 0) > 0:
+            kwargs["end_timestamp_ms"] = int(end_timestamp_ms or 0)
         return await self._ccxt_call(
             "fetch_ohlcv",
             self._to_swap_symbol(symbol),
             timeframe,
-            limit=limit,
+            _request_priority=priority,
+            **kwargs,
         )
 
     async def fetch_native_consistency_ohlcv(
-        self, symbol: str, limit: int = 5
+        self,
+        symbol: str,
+        limit: int = 5,
+        *,
+        end_timestamp_ms: int | None = None,
     ) -> list[list[float]]:
         """Fetch the short 1m path on its own bounded request lane."""
+        kwargs: dict[str, Any] = {
+            "limit": limit,
+            "_request_gate": self._native_consistency_gate(),
+            "_request_priority": False,
+        }
+        if int(end_timestamp_ms or 0) > 0:
+            kwargs["end_timestamp_ms"] = int(end_timestamp_ms)
         return await self._ccxt_call(
             "fetch_native_consistency_ohlcv",
             self._to_swap_symbol(symbol),
-            limit=limit,
-            _request_gate=self._native_consistency_gate(),
-            _request_priority=False,
+            **kwargs,
         )
 
     async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:
@@ -1742,6 +1896,9 @@ class OKXRestClient:
 
     async def close(self) -> None:
         ticker_tasks = list(self._ticker_tasks.values())
+        batch_task = self._authoritative_ticker_batch_task
+        if batch_task is not None and not batch_task.done():
+            batch_task.cancel()
         for task in ticker_tasks:
             if not task.done():
                 task.cancel()
@@ -1749,6 +1906,8 @@ class OKXRestClient:
             await asyncio.gather(*ticker_tasks, return_exceptions=True)
         self._ticker_tasks.clear()
         self._ticker_retry_at.clear()
+        self._authoritative_ticker_batch_task = None
+        self._authoritative_ticker_batch_cache = None
         if self._exchange:
             await self._exchange.close()
             self._exchange = None

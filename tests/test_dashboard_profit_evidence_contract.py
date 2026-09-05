@@ -17,6 +17,156 @@ HTML = (ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 STYLE = (ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
 
+def test_dashboard_protection_expired_snapshot_is_explicitly_stale() -> None:
+    cached_at = datetime.now(UTC).replace(microsecond=0)
+    dashboard._dashboard_okx_protection_cache["paper"] = (
+        cached_at,
+        {
+            "available": True,
+            "protection_orders": [{"algo_id": "oco-1"}],
+            "missing_keys": [],
+        },
+    )
+    original_ttl = dashboard._DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS
+    original_stale_ttl = dashboard._DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS
+    try:
+        dashboard._DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 0.0
+        dashboard._DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS = 180.0
+        snapshot = dashboard._dashboard_okx_protection_snapshot(
+            "paper",
+            allow_stale=True,
+            stale_reason="timeout",
+        )
+    finally:
+        dashboard._dashboard_okx_protection_cache.pop("paper", None)
+        dashboard._DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = original_ttl
+        dashboard._DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS = original_stale_ttl
+
+    assert snapshot is not None
+    assert snapshot["stale"] is True
+    assert snapshot["degraded"] is True
+    assert snapshot["stale_reason"] == "timeout"
+    assert snapshot["refresh_in_background"] is True
+
+
+@pytest.mark.asyncio
+async def test_dashboard_protection_initial_refresh_is_nonblocking_and_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._dashboard_okx_protection_cache.pop("paper", None)
+    dashboard._dashboard_okx_protection_refresh_tasks.pop("paper", None)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_refresh(_mode: str) -> dict:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        audit = {
+            "available": True,
+            "protection_orders": [],
+            "missing_keys": [],
+        }
+        dashboard._dashboard_okx_protection_cache["paper"] = (
+            datetime.now(UTC),
+            audit,
+        )
+        return audit
+
+    monkeypatch.setattr(
+        dashboard,
+        "_refresh_dashboard_okx_protection_cache",
+        slow_refresh,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_DASHBOARD_OKX_PROTECTION_INITIAL_WAIT_SECONDS",
+        0.01,
+    )
+
+    first = await asyncio.wait_for(
+        dashboard._dashboard_okx_protection_audit("paper"),
+        timeout=0.1,
+    )
+    second = await asyncio.wait_for(
+        dashboard._dashboard_okx_protection_audit("paper"),
+        timeout=0.1,
+    )
+
+    assert started.is_set()
+    assert calls == 1
+    assert first["pending"] is True
+    assert second["pending"] is True
+    assert first["blockers"] == []
+    release.set()
+    task = dashboard._dashboard_okx_protection_refresh_tasks["paper"]
+    await asyncio.wait_for(task, timeout=0.1)
+    await asyncio.sleep(0)
+    dashboard._dashboard_okx_protection_cache.pop("paper", None)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_protection_refresh_error_returns_pending_without_false_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._dashboard_okx_protection_cache.pop("paper", None)
+    dashboard._dashboard_okx_protection_refresh_tasks.pop("paper", None)
+
+    async def failed_refresh(_mode: str) -> dict:
+        raise TimeoutError("protection read timeout")
+
+    monkeypatch.setattr(
+        dashboard,
+        "_refresh_dashboard_okx_protection_cache",
+        failed_refresh,
+    )
+
+    result = await dashboard._dashboard_okx_protection_audit("paper")
+    await asyncio.sleep(0)
+
+    assert result["pending"] is True
+    assert result["refresh_in_background"] is True
+    assert result["stale_reason"] == "refresh_error"
+    assert result["blockers"] == []
+    dashboard._dashboard_okx_protection_refresh_tasks.pop("paper", None)
+
+
+@pytest.mark.asyncio
+async def test_open_position_pending_protection_refresh_has_no_false_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def pending_audit(_mode: str) -> dict:
+        return {
+            "available": False,
+            "pending": True,
+            "degraded": True,
+            "refresh_in_background": True,
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(dashboard, "_dashboard_okx_protection_audit", pending_audit)
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_positions_temporarily_unavailable",
+        lambda _mode: False,
+    )
+    rows = [{"symbol": "EDGE/USDT", "side": "long"}]
+
+    inventory = await dashboard._dashboard_open_position_protection_evidence(
+        rows,
+        mode="paper",
+    )
+
+    assert inventory["pending"] is True
+    assert inventory["blockers"] == []
+    assert rows[0]["protection_contract"]["pending"] is True
+    assert rows[0]["protection_contract"]["blockers"] == []
+    assert "保护证据读取中" in SCRIPT
+    assert "正在后台读取 OKX 保护单" in SCRIPT
+
+
 @pytest.mark.asyncio
 async def test_open_position_evidence_deadline_does_not_hang_endpoint(
     monkeypatch: pytest.MonkeyPatch,
@@ -46,7 +196,16 @@ async def test_open_position_evidence_deadline_does_not_hang_endpoint(
     )
 
     assert isinstance(risk_result, TimeoutError)
-    assert isinstance(protection_result, TimeoutError)
+    assert protection_result["pending"] is True
+    assert protection_result["stale_reason"] == "evidence_deadline"
+    assert protection_result["blockers"] == []
+
+
+def test_open_position_evidence_budget_exceeds_protection_read_budget() -> None:
+    assert (
+        dashboard._DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS
+        > dashboard._DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS
+    )
 
 
 def test_market_direction_without_execution_permission_is_displayed_as_observation() -> None:

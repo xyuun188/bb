@@ -132,6 +132,39 @@ def test_feature_vector_carries_one_native_market_fact_after_depth_enrichment() 
     assert vector.to_dict()["market_fact"]["fact_id"] == vector.market_fact["fact_id"]
 
 
+def test_feature_vector_keeps_valid_ticker_orderbook_when_derivatives_timeout_returns_zero() -> None:
+    ticker = _snapshot(100.0, 1_700_000_000_000)
+    ticker.update(
+        {
+            "orderbook_bid_depth": 500.0,
+            "orderbook_ask_depth": 600.0,
+            "orderbook_fact": {
+                "inst_id": "ROBO-USDT-SWAP",
+                "inst_type": "SWAP",
+                "source_timestamp_ms": 1_700_000_000_000,
+                "bid": 99.99,
+                "ask": 100.01,
+                "bid_depth_usdt": 500.0,
+                "ask_depth_usdt": 600.0,
+            },
+        }
+    )
+    vector = build_feature_vector(
+        "ROBO/USDT",
+        ticker=ticker,
+        derivatives={
+            "orderbook_bid_depth": 0.0,
+            "orderbook_ask_depth": 0.0,
+            "orderbook_fact": {},
+        },
+    )
+
+    assert vector.orderbook_bid_depth == 500.0
+    assert vector.orderbook_ask_depth == 600.0
+    assert vector.orderbook_fact["bid_depth_usdt"] == 500.0
+    assert vector.market_fact["liquidity"]["bid_depth_usdt"] == 500.0
+
+
 def test_optional_derivatives_staleness_does_not_quarantine_fresh_market_fact() -> None:
     ticker = {
         **_snapshot(0.0129, 1_783_990_800_000),

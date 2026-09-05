@@ -22,6 +22,7 @@ from core.exceptions import WebSocketConnectionError
 from core.market_facts import (
     build_market_fact,
     build_market_source_consistency,
+    normalize_okx_contract_spec,
 )
 from core.market_facts import (
     verify_market_fact_path as verify_native_market_fact_path,
@@ -42,8 +43,7 @@ from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
 from models.news import NewsArticle, SocialPost
 from services.external_event_service import ExternalEventService
-from services.trading_params import DEFAULT_TRADING_PARAMS
-from services.trading_params import EntryMarketDataQualityParams
+from services.trading_params import DEFAULT_TRADING_PARAMS, EntryMarketDataQualityParams
 
 logger = structlog.get_logger(__name__)
 
@@ -147,6 +147,7 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
 # actual quote route.  Keep a short single-flight cache; the market-fact
 # validator still rejects missing or stale paths.
 NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS = 30.0
+LATEST_MARKET_FACT_CACHE_TTL_SECONDS = 15.0
 AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
 CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
     float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) + 2.0,
@@ -292,7 +293,11 @@ class DataService:
         self._ticker_persist_tasks: set[asyncio.Task] = set()
         self._ticker_persist_dropped_count = 0
         self._native_consistency_bars_cache: dict[str, tuple[float, list[Any]]] = {}
-        self._native_consistency_bars_tasks: dict[str, asyncio.Task[list[Any]]] = {}
+        self._native_consistency_bars_tasks: dict[
+            tuple[str, int, int], asyncio.Task[list[Any]]
+        ] = {}
+        self._latest_market_fact_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._latest_market_fact_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._started = False
         self._stopping = False
         self._rest_api_poll_task: asyncio.Task | None = None
@@ -490,8 +495,9 @@ class DataService:
         """Stop all data feed connections."""
         self._stopping = True
         self._started = False
-        if self._rest_api_poll_task:
-            self._rest_api_poll_task.cancel()
+        rest_poll_task = getattr(self, "_rest_api_poll_task", None)
+        if rest_poll_task is not None and not rest_poll_task.done():
+            rest_poll_task.cancel()
         await self._stop_ticker_persistence()
         derivative_tasks = list(self._derivatives_refresh_task_map().values())
         for task in derivative_tasks:
@@ -1252,6 +1258,7 @@ class DataService:
                 normalized,
                 snapshot,
                 block_on_remote=True,
+                require_authoritative_snapshot=require_authoritative_snapshot,
             )
             source_snapshots = [rest_snapshot]
             selected = rest_snapshot
@@ -1265,6 +1272,7 @@ class DataService:
                     normalized,
                     websocket_snapshot,
                     block_on_remote=True,
+                    require_authoritative_snapshot=require_authoritative_snapshot,
                 )
                 # A blocking refresh has an authoritative REST snapshot. Keep
                 # the fresh WebSocket observation only as a comparison source;
@@ -1337,19 +1345,54 @@ class DataService:
         if not isinstance(tasks, dict):
             tasks = {}
             self._native_consistency_bars_tasks = tasks
+        timestamp_sources: list[dict[str, Any]] = []
+        for snapshot in source_snapshots:
+            timestamp_sources.append(snapshot)
+            for key in ("orderbook_fact", "mark_price_fact", "index_price_fact"):
+                nested = snapshot.get(key)
+                if isinstance(nested, dict):
+                    timestamp_sources.append(nested)
+        timestamps = [
+            self._ticker_timestamp_from_raw(snapshot)
+            for snapshot in timestamp_sources
+            if self._ticker_timestamp_from_raw(snapshot) > 0
+        ]
+        minute_ms = 60_000
+        required_first_open = (min(timestamps) // minute_ms) * minute_ms if timestamps else 0
+        required_last_open = (max(timestamps) // minute_ms) * minute_ms if timestamps else 0
+
+        def covers_required_window(rows: list[Any]) -> bool:
+            if not rows or required_first_open <= 0 or required_last_open <= 0:
+                return False
+            open_times: set[int] = set()
+            for row in rows:
+                if isinstance(row, (list, tuple)) and row:
+                    value = row[0]
+                elif isinstance(row, dict):
+                    value = row.get("open_time_ms") or row.get("timestamp")
+                else:
+                    continue
+                try:
+                    open_time = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+                open_times.add((open_time // minute_ms) * minute_ms)
+            expected = set(
+                range(required_first_open, required_last_open + minute_ms, minute_ms)
+            )
+            return bool(expected and expected.issubset(open_times))
+
         cached = cache.get(normalized)
         if cached is not None:
             cached_at, cached_rows = cached
-            if now - cached_at <= NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS:
+            if (
+                now - cached_at <= NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS
+                and covers_required_window(list(cached_rows))
+            ):
                 return list(cached_rows)
 
-        timestamps = [
-            self._ticker_timestamp_from_raw(snapshot)
-            for snapshot in source_snapshots
-            if self._ticker_timestamp_from_raw(snapshot) > 0
-        ]
         elapsed_minutes = (
-            max((max(timestamps) - min(timestamps)) // 60_000, 0) + 1
+            max((required_last_open - required_first_open) // minute_ms, 0) + 1
             if timestamps
             else 1
         )
@@ -1361,24 +1404,52 @@ class DataService:
         if not callable(fetcher):
             return []
 
-        existing = tasks.get(normalized)
+        task_key = (normalized, required_first_open, required_last_open)
+        existing = tasks.get(task_key)
         if existing is not None and not existing.done():
             try:
-                return list(
+                rows = list(
                     await asyncio.wait_for(
                         asyncio.shield(existing),
                         timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
                     )
                 )
+                return rows if covers_required_window(rows) else []
             except TimeoutError:
                 return []
 
         async def fetch() -> list[Any]:
             try:
+                if use_native_fetcher:
+                    # The native endpoint is cursor based and otherwise
+                    # returns only the latest candles. Anchor it to the latest
+                    # fact minute so delayed REST/WS observations are covered.
+                    try:
+                        request = fetcher(
+                            normalized,
+                            limit=limit,
+                            end_timestamp_ms=required_last_open,
+                        )
+                    except TypeError as exc:
+                        # Small test doubles and older adapters may not expose
+                        # the optional anchor yet; keep them source-compatible.
+                        if "end_timestamp_ms" not in safe_error_text(exc):
+                            raise
+                        request = fetcher(normalized, limit=limit)
+                else:
+                    try:
+                        request = fetcher(
+                            normalized,
+                            timeframe="1m",
+                            limit=limit,
+                            end_timestamp_ms=required_last_open,
+                        )
+                    except TypeError as exc:
+                        if "end_timestamp_ms" not in safe_error_text(exc):
+                            raise
+                        request = fetcher(normalized, timeframe="1m", limit=limit)
                 rows = await asyncio.wait_for(
-                    fetcher(normalized, limit=limit)
-                    if use_native_fetcher
-                    else fetcher(normalized, timeframe="1m", limit=limit),
+                    request,
                     timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
                 )
             except Exception as exc:
@@ -1390,25 +1461,53 @@ class DataService:
                 return []
             result = rows if isinstance(rows, list) else []
             if result:
-                cache[normalized] = (asyncio.get_running_loop().time(), list(result))
+                # Concurrent requests can legitimately target adjacent minutes.
+                # Merge their rows so a slower, older request cannot replace a
+                # newer cached path with a window that no longer covers it.
+                cached_rows = cache.get(normalized, (0.0, []))[1]
+                merged_by_open: dict[int, Any] = {}
+                unkeyed_rows: list[Any] = []
+                for row in [*list(cached_rows), *result]:
+                    if isinstance(row, (list, tuple)) and row:
+                        raw_open = row[0]
+                    elif isinstance(row, dict):
+                        raw_open = row.get("open_time_ms") or row.get("timestamp")
+                    else:
+                        unkeyed_rows.append(row)
+                        continue
+                    try:
+                        open_time = int(float(raw_open))
+                    except (TypeError, ValueError):
+                        unkeyed_rows.append(row)
+                        continue
+                    merged_by_open[open_time] = row
+                merged_rows = [
+                    merged_by_open[open_time]
+                    for open_time in sorted(merged_by_open)[-300:]
+                ]
+                remaining = max(0, 300 - len(merged_rows))
+                if remaining:
+                    merged_rows.extend(unkeyed_rows[-remaining:])
+                cache[normalized] = (asyncio.get_running_loop().time(), merged_rows)
             return result
 
         task = asyncio.create_task(fetch())
-        tasks[normalized] = task
+        tasks[task_key] = task
 
         def cleanup(finished: asyncio.Task[list[Any]]) -> None:
-            if tasks.get(normalized) is finished:
-                tasks.pop(normalized, None)
+            if tasks.get(task_key) is finished:
+                tasks.pop(task_key, None)
             _consume_task_result(finished)
 
         task.add_done_callback(cleanup)
         try:
-            return list(
+            rows = list(
                 await asyncio.wait_for(
                     asyncio.shield(task),
                     timeout=max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 1.0),
                 )
             )
+            return rows if covers_required_window(rows) else []
         except TimeoutError:
             return []
 
@@ -1418,36 +1517,87 @@ class DataService:
         snapshot: dict[str, Any],
         *,
         block_on_remote: bool,
+        require_authoritative_snapshot: bool = False,
     ) -> dict[str, Any]:
         logger.info("_attach_native_market_fact called", symbol=symbol, block_on_remote=block_on_remote)
         enriched = dict(snapshot)
         
         # Merge WebSocket cached orderbook data if available
         normalized = self._normalize_symbols([symbol])[0]
-        ws_orderbook = self.ws_client.latest_orderbooks.get(symbol) or self.ws_client.latest_orderbooks.get(normalized)
-        
-        # First try WebSocket cache
-        orderbook_available = False
-        if ws_orderbook:
+        latest_orderbooks = getattr(self.ws_client, "latest_orderbooks", {})
+        if not isinstance(latest_orderbooks, dict):
+            latest_orderbooks = {}
+        ws_orderbook = latest_orderbooks.get(symbol) or latest_orderbooks.get(normalized)
+
+        # Ticker snapshots can already contain a valid REST order book. Reuse
+        # it before consulting the websocket cache so a zero/empty cache cannot
+        # erase a complete observation or trigger another remote request.
+        bid_depth = self._safe_float(
+            enriched.get("orderbook_bid_depth")
+            or enriched.get("bid_depth_usdt"),
+            0.0,
+        )
+        ask_depth = self._safe_float(
+            enriched.get("orderbook_ask_depth")
+            or enriched.get("ask_depth_usdt"),
+            0.0,
+        )
+        orderbook_available = bid_depth > 0 and ask_depth > 0
+        if orderbook_available:
+            enriched["orderbook_bid_depth"] = bid_depth
+            enriched["orderbook_ask_depth"] = ask_depth
+            enriched["bid_depth_usdt"] = bid_depth
+            enriched["ask_depth_usdt"] = ask_depth
+        elif ws_orderbook:
+            ws_bid_depth = self._safe_float(
+                ws_orderbook.get("orderbook_bid_depth")
+                or ws_orderbook.get("bid_depth_usdt"),
+                0.0,
+            )
+            ws_ask_depth = self._safe_float(
+                ws_orderbook.get("orderbook_ask_depth")
+                or ws_orderbook.get("ask_depth_usdt"),
+                0.0,
+            )
             enriched["bid_depth_native"] = ws_orderbook.get("bid_depth_native", 0)
             enriched["ask_depth_native"] = ws_orderbook.get("ask_depth_native", 0)
-            enriched["bid_depth_usdt"] = ws_orderbook.get("bid_depth_usdt", 0)
-            enriched["ask_depth_usdt"] = ws_orderbook.get("ask_depth_usdt", 0)
-            orderbook_available = enriched["bid_depth_usdt"] > 0 or enriched["ask_depth_usdt"] > 0
+            enriched["bid_depth_usdt"] = ws_bid_depth
+            enriched["ask_depth_usdt"] = ws_ask_depth
+            # Keep the canonical market-fact fields in sync with the legacy
+            # websocket cache names consumed by downstream quality checks.
+            enriched["orderbook_bid_depth"] = ws_bid_depth
+            enriched["orderbook_ask_depth"] = ws_ask_depth
+            enriched["orderbook_imbalance"] = ws_orderbook.get("orderbook_imbalance", 0)
+            if isinstance(ws_orderbook.get("orderbook_fact"), dict):
+                enriched["orderbook_fact"] = dict(ws_orderbook["orderbook_fact"])
+            orderbook_available = ws_bid_depth > 0 and ws_ask_depth > 0
         
         logger.info("orderbook check", symbol=symbol, ws_orderbook_exists=bool(ws_orderbook), orderbook_available=orderbook_available, bid_depth=enriched.get("bid_depth_usdt"), ask_depth=enriched.get("ask_depth_usdt"))
         
-        # Fallback to REST API if WebSocket cache is empty
-        if not orderbook_available:
+        # Only an explicitly blocking caller may perform REST fallback. Market
+        # screening calls this method non-blocking and must remain cache-only.
+        if not orderbook_available and block_on_remote:
             logger.info("REST降级：WebSocket订单簿缓存为空", symbol=symbol)
             try:
-                spec = await self._get_instrument_spec(symbol, block_on_remote=True)
+                spec = await self._get_instrument_spec(
+                    symbol,
+                    block_on_remote=True,
+                    force_refresh=require_authoritative_snapshot,
+                )
                 rest_book = await self.rest_client.fetch_order_book_metrics(symbol, contract_spec=spec)
                 if rest_book.get("orderbook_data_available"):
-                    enriched["bid_depth_usdt"] = rest_book.get("orderbook_bid_depth", 0)
-                    enriched["ask_depth_usdt"] = rest_book.get("orderbook_ask_depth", 0)
+                    enriched["orderbook_bid_depth"] = rest_book.get("orderbook_bid_depth", 0)
+                    enriched["orderbook_ask_depth"] = rest_book.get("orderbook_ask_depth", 0)
+                    enriched["orderbook_imbalance"] = rest_book.get("orderbook_imbalance", 0)
+                    enriched["bid_depth_usdt"] = enriched["orderbook_bid_depth"]
+                    enriched["ask_depth_usdt"] = enriched["orderbook_ask_depth"]
                     enriched["bid_depth_native"] = 0  # REST doesn't provide native depth
                     enriched["ask_depth_native"] = 0
+                    # Keep the authoritative REST order-book fact alongside
+                    # the ticker so source-consistency validation sees the
+                    # same successful data that was just used for liquidity.
+                    if isinstance(rest_book.get("orderbook_fact"), dict):
+                        enriched["orderbook_fact"] = dict(rest_book["orderbook_fact"])
                     orderbook_available = True
                     logger.info("REST降级成功", symbol=symbol, bid_depth=rest_book.get("orderbook_bid_depth"), ask_depth=rest_book.get("orderbook_ask_depth"))
                 else:
@@ -1456,14 +1606,46 @@ class DataService:
                 logger.error("REST降级异常", symbol=symbol, error=str(e), exc_info=True)
         
         # Merge WebSocket cached mark price if available
-        ws_mark_price = self.ws_client.latest_mark_prices.get(symbol) or self.ws_client.latest_mark_prices.get(normalized)
+        latest_mark_prices = getattr(self.ws_client, "latest_mark_prices", {})
+        if not isinstance(latest_mark_prices, dict):
+            latest_mark_prices = {}
+        ws_mark_price = latest_mark_prices.get(symbol) or latest_mark_prices.get(normalized)
         if ws_mark_price:
-            enriched["mark_price"] = ws_mark_price.get("mark_price")
+            ws_mark_value = self._safe_float(ws_mark_price.get("mark_price"), 0.0)
+            if ws_mark_value > 0:
+                enriched["mark_price"] = ws_mark_value
+                if isinstance(ws_mark_price.get("mark_price_fact"), dict):
+                    enriched["mark_price_fact"] = dict(
+                        ws_mark_price["mark_price_fact"]
+                    )
         
-        spec = await self._get_instrument_spec(symbol, block_on_remote=block_on_remote)
+        snapshot_spec = enriched.get("contract_spec")
+        if (
+            not require_authoritative_snapshot
+            and self._instrument_spec_is_complete(normalized, snapshot_spec)
+        ):
+            spec = dict(snapshot_spec)
+        else:
+            spec = await self._get_instrument_spec(
+                symbol,
+                block_on_remote=block_on_remote,
+                force_refresh=require_authoritative_snapshot,
+            )
         if spec:
             enriched["contract_spec"] = spec
             enriched["uly"] = spec.get("uly")
+        # A fresh websocket tick replaces the enriched REST snapshot in the
+        # in-memory ticker map. Reuse a still-covered native 1m path from the
+        # short-lived cache so the normal cache-only read does not manufacture
+        # a false "path missing" diagnostic on every tick. The helper never
+        # performs I/O; a cache miss remains fail-closed and is handled by the
+        # blocking authoritative refresh path.
+        cached_path = self._cached_native_consistency_bars(
+            normalized,
+            [enriched],
+        )
+        if cached_path:
+            enriched["native_consistency_bars_1m"] = cached_path
         info = enriched.get("info") if isinstance(enriched.get("info"), dict) else {}
         enriched["inst_id"] = (
             enriched.get("inst_id")
@@ -1479,11 +1661,64 @@ class DataService:
         )
         return enriched
 
+    def _cached_native_consistency_bars(
+        self,
+        symbol: str,
+        source_snapshots: list[dict[str, Any]],
+    ) -> list[Any]:
+        """Return cached 1m bars only when they cover the snapshot minute."""
+
+        cache = getattr(self, "_native_consistency_bars_cache", None)
+        if not isinstance(cache, dict):
+            return []
+        cached = cache.get(self._normalize_symbols([symbol])[0])
+        if not isinstance(cached, tuple) or len(cached) != 2:
+            return []
+        cached_at, cached_rows = cached
+        try:
+            age = asyncio.get_running_loop().time() - float(cached_at)
+        except (TypeError, ValueError):
+            return []
+        if age < 0 or age > NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS:
+            return []
+        timestamps: list[int] = []
+        for snapshot in source_snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            timestamp = self._ticker_timestamp_from_raw(snapshot)
+            if timestamp > 0:
+                timestamps.append(timestamp)
+            for key in ("orderbook_fact", "mark_price_fact", "index_price_fact"):
+                nested = snapshot.get(key)
+                if isinstance(nested, dict):
+                    timestamp = self._ticker_timestamp_from_raw(nested)
+                    if timestamp > 0:
+                        timestamps.append(timestamp)
+        if not timestamps:
+            return []
+        first_open = min(timestamps) // 60_000 * 60_000
+        last_open = max(timestamps) // 60_000 * 60_000
+        expected = set(range(first_open, last_open + 60_000, 60_000))
+        available: set[int] = set()
+        for row in cached_rows if isinstance(cached_rows, list) else []:
+            if isinstance(row, (list, tuple)) and row:
+                value = row[0]
+            elif isinstance(row, dict):
+                value = row.get("open_time_ms") or row.get("timestamp")
+            else:
+                continue
+            try:
+                available.add(int(float(value)) // 60_000 * 60_000)
+            except (TypeError, ValueError):
+                continue
+        return list(cached_rows) if expected and expected.issubset(available) else []
+
     async def _get_instrument_spec(
         self,
         symbol: str,
         *,
         block_on_remote: bool,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         cache = getattr(self, "_instrument_spec_cache", None)
@@ -1499,12 +1734,20 @@ class DataService:
             failed_cache = {}
             self._instrument_spec_failed_at = failed_cache
         cached = cache.get(normalized)
-        if isinstance(cached, dict) and cached:
+        if self._instrument_spec_is_complete(normalized, cached):
             return dict(cached)
+        if isinstance(cached, dict) and cached:
+            cache.pop(normalized, None)
+            logger.warning(
+                "discarding incomplete OKX instrument specification cache",
+                symbol=normalized,
+                missing_fields=self._instrument_spec_missing_fields(cached),
+            )
         failed_at = failed_cache.get(normalized)
         if (
             not block_on_remote
-            or failed_at is not None
+            or not force_refresh
+            and failed_at is not None
             and (datetime.now(UTC) - failed_at).total_seconds()
             < INSTRUMENT_SPEC_FAILURE_CACHE_SECONDS
         ):
@@ -1535,9 +1778,16 @@ class DataService:
                 )
                 return {}
             value = dict(result) if isinstance(result, dict) else {}
-            if value:
+            if self._instrument_spec_is_complete(normalized, value):
                 cache[normalized] = value
-            return value
+                return value
+            if value:
+                logger.warning(
+                    "OKX instrument specification response incomplete",
+                    symbol=normalized,
+                    missing_fields=self._instrument_spec_missing_fields(value),
+                )
+            return {}
 
         task = asyncio.create_task(fetch())
         tasks[normalized] = task
@@ -1571,8 +1821,102 @@ class DataService:
             # still be reused by the next derivatives refresh.
             return {}
 
+    def _instrument_spec_missing_fields(self, value: Any) -> list[str]:
+        raw = value if isinstance(value, dict) else {}
+        normalized = normalize_okx_contract_spec(raw)
+        missing: list[str] = []
+        if not str(raw.get("instId") or raw.get("inst_id") or "").strip():
+            missing.append("instId")
+        if not str(raw.get("instType") or raw.get("inst_type") or "").strip():
+            missing.append("instType")
+        if not str(normalized.get("uly") or "").strip():
+            missing.append("uly")
+        if self._safe_float(normalized.get("contract_value"), 0.0) <= 0:
+            missing.append("ctVal")
+        raw_multiplier = raw.get("ctMult") or raw.get("contract_multiplier")
+        if self._safe_float(raw_multiplier, 0.0) <= 0:
+            missing.append("ctMult")
+        return missing
+
+    def _instrument_spec_is_complete(self, symbol: str, value: Any) -> bool:
+        if self._instrument_spec_missing_fields(value):
+            return False
+        raw = value if isinstance(value, dict) else {}
+        normalized = normalize_okx_contract_spec(raw)
+        canonical_symbol = self._normalize_symbols([symbol])[0]
+        expected_inst_id = f"{canonical_symbol.replace('/', '-').upper()}-SWAP"
+        return (
+            str(normalized.get("inst_id") or "").upper() == expected_inst_id
+            and str(normalized.get("inst_type") or "").upper() == "SWAP"
+        )
+
     async def get_latest_market_fact(self, symbol: str) -> dict[str, Any]:
         """Return one executable, native-instrument-bound OKX market fact."""
+
+        normalized = self._normalize_symbols([symbol])[0]
+        now = asyncio.get_running_loop().time()
+        cache = getattr(self, "_latest_market_fact_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._latest_market_fact_cache = cache
+        tasks = getattr(self, "_latest_market_fact_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._latest_market_fact_tasks = tasks
+        cached = cache.get(normalized)
+        if cached is not None:
+            cached_at, cached_fact = cached
+            if now - cached_at <= LATEST_MARKET_FACT_CACHE_TTL_SECONDS:
+                return dict(cached_fact)
+            cache.pop(normalized, None)
+
+        task = tasks.get(normalized)
+        if task is None or task.done():
+            task = asyncio.create_task(self._build_latest_market_fact(normalized))
+            tasks[normalized] = task
+
+            def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+                if tasks.get(normalized) is finished:
+                    tasks.pop(normalized, None)
+                try:
+                    fact = finished.result()
+                except (asyncio.CancelledError, Exception):
+                    return
+                quality = fact.get("quality") if isinstance(fact, dict) else {}
+                if isinstance(quality, dict) and quality.get("status") == "clean":
+                    cache[normalized] = (
+                        asyncio.get_running_loop().time(),
+                        dict(fact),
+                    )
+
+            task.add_done_callback(cleanup)
+
+        # Callers such as shadow maintenance have a tighter batch deadline.
+        # Preserve the shared exchange request when one caller times out so the
+        # next round can join it or consume its clean cached result.
+        return dict(await asyncio.shield(task))
+
+    async def _build_latest_market_fact(self, symbol: str) -> dict[str, Any]:
+        # Shadow settlement is read-only maintenance. When the WebSocket has a
+        # fresh ticker plus executable book/mark facts, build from that native
+        # cache first instead of opening a second REST fan-out for the same
+        # symbol. A clean result is returned immediately; incomplete cache data
+        # falls through to the authoritative REST refresh below.
+        cached_ticker = await self._get_ticker_snapshot(
+            symbol,
+            block_on_remote=False,
+        )
+        if cached_ticker:
+            cached_fact = build_market_fact(
+                symbol,
+                cached_ticker,
+                contract_spec=cached_ticker.get("contract_spec"),
+                received_at=cached_ticker.get("received_at"),
+            )
+            if isinstance(cached_fact.get("quality"), dict) and cached_fact["quality"].get(
+                "status"
+            ) == "clean":
+                return cached_fact
 
         ticker_result, derivatives_result = await asyncio.gather(
             self._get_ticker_snapshot(symbol, block_on_remote=True),
@@ -1581,16 +1925,16 @@ class DataService:
         )
         ticker = ticker_result if isinstance(ticker_result, dict) else {}
         derivatives = derivatives_result if isinstance(derivatives_result, dict) else {}
-        ticker = self._attach_market_source_consistency(symbol, ticker, derivatives)
-        merged = {**ticker, **derivatives}
-        merged["stale"] = bool(
-            ticker.get("stale") or derivatives.get("derivatives_snapshot_stale")
-        )
+        merged = self._attach_market_source_consistency(symbol, ticker, derivatives)
+        # _attach_market_source_consistency already performs the guarded merge.
+        # Reapplying raw derivative placeholders here used to erase valid depth
+        # and reference facts after a successful ticker/order-book refresh.
+        merged["stale"] = bool(merged.get("stale"))
         return build_market_fact(
             symbol,
             merged,
-            contract_spec=ticker.get("contract_spec"),
-            received_at=ticker.get("received_at"),
+            contract_spec=merged.get("contract_spec"),
+            received_at=merged.get("received_at"),
         )
 
     def _attach_market_source_consistency(
@@ -1601,17 +1945,60 @@ class DataService:
     ) -> dict[str, Any]:
         if not ticker:
             return {}
-        enriched = {**ticker, **derivatives}
         raw_sources = ticker.get("market_source_snapshots")
         source_snapshots = (
             [dict(item) for item in raw_sources if isinstance(item, dict)]
             if isinstance(raw_sources, list)
             else [dict(ticker)]
         )
+        def merge_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+            """Merge derivative routes without replacing valid ticker facts with zeroes."""
+
+            merged = {**snapshot, **derivatives}
+            # A timed-out/stale derivatives route can return zero placeholders
+            # while the ticker path has already fetched a valid REST order book.
+            # Keep the valid observation so one slow route cannot quarantine the
+            # whole native market fact after a successful fallback.
+            for key in ("orderbook_bid_depth", "orderbook_ask_depth"):
+                if (
+                    self._safe_float(snapshot.get(key), 0.0) > 0
+                    and self._safe_float(derivatives.get(key), 0.0) <= 0
+                ):
+                    merged[key] = snapshot[key]
+            def usable_orderbook_fact(value: Any) -> bool:
+                if not isinstance(value, dict) or not value:
+                    return False
+                return (
+                    self._safe_float(value.get("bid"), 0.0) > 0
+                    and self._safe_float(value.get("ask"), 0.0) > 0
+                    and self._safe_float(value.get("bid_depth_usdt"), 0.0) > 0
+                    and self._safe_float(value.get("ask_depth_usdt"), 0.0) > 0
+                )
+
+            snapshot_orderbook = snapshot.get("orderbook_fact")
+            derivative_orderbook = derivatives.get("orderbook_fact")
+            if usable_orderbook_fact(snapshot_orderbook) and not usable_orderbook_fact(
+                derivative_orderbook
+            ):
+                merged["orderbook_fact"] = snapshot_orderbook
+
+            for key in ("mark_price_fact", "index_price_fact"):
+                snapshot_fact = snapshot.get(key)
+                derivative_fact = derivatives.get(key)
+                if isinstance(snapshot_fact, dict) and snapshot_fact:
+                    if not isinstance(derivative_fact, dict) or not derivative_fact:
+                        merged[key] = snapshot_fact
+            for key in ("mark_price", "index_price"):
+                if snapshot.get(key) and not derivatives.get(key):
+                    merged[key] = snapshot[key]
+            return merged
+
+        enriched = merge_snapshot(ticker)
+
         facts = [
             build_market_fact(
                 symbol,
-                {**snapshot, **derivatives},
+                merge_snapshot(snapshot),
                 contract_spec=snapshot.get("contract_spec") or ticker.get("contract_spec"),
                 received_at=snapshot.get("received_at"),
             )
@@ -1621,9 +2008,9 @@ class DataService:
         enriched["market_source_consistency"] = build_market_source_consistency(
             primary_fact,
             facts[1:],
-            orderbook_fact=derivatives.get("orderbook_fact"),
-            mark_price_fact=derivatives.get("mark_price_fact"),
-            index_price_fact=derivatives.get("index_price_fact"),
+            orderbook_fact=enriched.get("orderbook_fact"),
+            mark_price_fact=enriched.get("mark_price_fact"),
+            index_price_fact=enriched.get("index_price_fact"),
             bars=ticker.get("native_consistency_bars_1m") or [],
         )
         return enriched
@@ -1635,20 +2022,42 @@ class DataService:
     ) -> dict[str, Any]:
         entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
         result_ms = int(result_fact.get("source_timestamp_ms") or 0)
+        minute_ms = 60_000
+        entry_open_ms = entry_ms - entry_ms % minute_ms if entry_ms > 0 else 0
+        result_open_ms = result_ms - result_ms % minute_ms if result_ms > 0 else 0
         elapsed_minutes = (
-            max((result_ms - entry_ms) // 60_000, 0) + 1
+            max((result_open_ms - entry_open_ms) // minute_ms, 0) + 1
             if entry_ms > 0 and result_ms >= entry_ms
             else 1
         )
         # OKX's public candle API caps a single response; this is an exchange boundary,
         # while the requested window is derived from the actual fact timestamps.
         limit = min(elapsed_minutes + 2, 300)
+        result_open_ms = result_ms - result_ms % 60_000 if result_ms > 0 else 0
         try:
-            rows = await self.rest_client.fetch_ohlcv(
-                str(entry_fact.get("symbol") or ""),
-                timeframe="1m",
-                limit=limit,
+            symbol = str(entry_fact.get("symbol") or "")
+            isolated_fetcher = getattr(
+                self.rest_client,
+                "fetch_native_consistency_ohlcv",
+                None,
             )
+            if callable(isolated_fetcher):
+                rows = await isolated_fetcher(
+                    symbol,
+                    limit=limit,
+                    end_timestamp_ms=result_open_ms if result_open_ms > 0 else None,
+                )
+            else:
+                rows = await self.rest_client.fetch_ohlcv(
+                    symbol,
+                    timeframe="1m",
+                    limit=limit,
+                    # OKX after cursor is exclusive of the supplied minute. Move
+                    # one minute forward so the result candle is included.
+                    end_timestamp_ms=(result_open_ms + 60_000)
+                    if result_open_ms > 0
+                    else None,
+                )
         except Exception as exc:
             logger.warning(
                 "OKX native 1m path unavailable for shadow outcome",
@@ -2267,11 +2676,19 @@ class DataService:
         gate = self._indicator_snapshot_build_gate()
         await gate.acquire(priority=priority)
         try:
-            return await self._build_indicator_snapshot_uncached(symbol)
+            return await self._build_indicator_snapshot_uncached(
+                symbol,
+                priority=priority,
+            )
         finally:
             gate.release()
 
-    async def _build_indicator_snapshot_uncached(self, symbol: str) -> dict[str, Any]:
+    async def _build_indicator_snapshot_uncached(
+        self,
+        symbol: str,
+        *,
+        priority: bool = False,
+    ) -> dict[str, Any]:
         try:
             cached_features = await self._indicator_features_from_cached_klines(symbol)
             if cached_features:
@@ -2283,7 +2700,12 @@ class DataService:
             async with gate:
                 kline_results = await asyncio.gather(
                     *(
-                        self._fetch_indicator_klines(symbol, timeframe, limit)
+                        self._fetch_indicator_klines(
+                            symbol,
+                            timeframe,
+                            limit,
+                            priority=priority,
+                        )
                         for timeframe, limit in KLINE_PERSIST_TIMEFRAME_LIMITS.items()
                     ),
                     return_exceptions=True,
@@ -2568,12 +2990,15 @@ class DataService:
         symbol: str,
         timeframe: str,
         limit: int,
+        *,
+        priority: bool = False,
     ) -> tuple[str, list]:
         rows = await self._fetch_remote_klines_with_cache(
             symbol,
             timeframe,
             limit,
             persist_before_return=False,
+            priority=priority,
         )
         return timeframe, rows
 
@@ -2584,15 +3009,28 @@ class DataService:
         limit: int,
         *,
         persist_before_return: bool,
+        priority: bool = False,
     ) -> list:
         try:
             timeout = max(float(KLINE_REMOTE_FETCH_TIMEOUT_SECONDS), 0.5)
-            klines = await asyncio.wait_for(
-                self.rest_client.fetch_ohlcv(
+            fetcher = self.rest_client.fetch_ohlcv
+            try:
+                request = fetcher(
                     symbol,
                     timeframe=timeframe,
                     limit=limit,
-                ),
+                    priority=priority,
+                )
+            except TypeError as exc:
+                if "priority" not in safe_error_text(exc):
+                    raise
+                request = fetcher(
+                    symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            klines = await asyncio.wait_for(
+                request,
                 timeout=timeout,
             )
             if klines:
@@ -3177,6 +3615,31 @@ class DataService:
         try:
             symbols = await task
             normalized = [dict(item) for item in symbols if isinstance(item, dict)]
+            # The symbol discovery call already loaded authoritative OKX
+            # instruments into the REST adapter. Index those in-memory rows
+            # here; issuing one REST request per symbol during startup would
+            # recreate the burst that starved the executable quote routes.
+            exchange = getattr(self.rest_client, "_exchange", None)
+            markets = getattr(exchange, "markets", {}) if exchange is not None else {}
+            for market in markets.values() if isinstance(markets, dict) else []:
+                if not isinstance(market, dict):
+                    continue
+                info = market.get("info")
+                symbol_value = str(market.get("symbol") or "")
+                inst_id = str(market.get("id") or "").strip().upper()
+                if not isinstance(info, dict) or not symbol_value or not inst_id.endswith("-SWAP"):
+                    continue
+                if self._instrument_spec_is_complete(symbol_value, info):
+                    self._instrument_spec_cache[
+                        self._normalize_symbols([symbol_value])[0]
+                    ] = {
+                        key: info.get(key)
+                        for key in (
+                            "instId", "instType", "uly", "instFamily", "ctType",
+                            "ctVal", "ctMult", "ctValCcy", "settleCcy", "lotSz",
+                            "minSz", "tickSz", "state",
+                        )
+                    } | {"source": "okx_public_instruments_cache"}
             if normalized:
                 self._available_symbols_cache = normalized
                 self._available_symbols_cache_updated_at = datetime.now(UTC)

@@ -360,6 +360,22 @@ def _swap_params(params: Mapping[str, Any] | None, *, require_inst_id: bool = Fa
     return source
 
 
+def _non_empty_params(params: Mapping[str, Any] | None, *keys: str) -> dict[str, Any]:
+    """Keep optional OKX query fields out of SDK calls when they are blank.
+
+    python-okx serializes explicit empty instrument fields as query parameters.
+    Account-wide endpoints interpret those values as an invalid instrument and
+    return 51001, although the same endpoint works when the field is omitted.
+    """
+
+    source = dict(params or {})
+    return {
+        key: str(source.get(key) or "")
+        for key in keys
+        if str(source.get(key) or "").strip()
+    }
+
+
 def _instrument_to_market(instrument: Mapping[str, Any]) -> dict[str, Any]:
     inst_id = str(instrument.get("instId") or "").strip().upper()
     symbol = symbol_from_okx_inst_id(inst_id)
@@ -903,33 +919,32 @@ class OkxPerpetualSdkExchange:
 
     async def executionGetMarketTickers(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "uly", "instFamily")
         return await self._call_sdk(
             lambda: self.execution_market_api,
             "get_tickers",
             instType=OKX_SWAP_INST_TYPE,
-            uly=str(params.get("uly") or ""),
-            instFamily=str(params.get("instFamily") or ""),
+            **optional,
         )
 
     async def publicGetMarketTickers(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "uly", "instFamily")
         return await self._call_sdk(
             lambda: self.market_api,
             "get_tickers",
             instType=OKX_SWAP_INST_TYPE,
-            uly=str(params.get("uly") or ""),
-            instFamily=str(params.get("instFamily") or ""),
+            **optional,
         )
 
     async def publicGetPublicMarkPrice(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "uly", "instFamily", "instId")
         return await self._call_sdk(
             lambda: self.public_api,
             "get_mark_price",
             instType=OKX_SWAP_INST_TYPE,
-            uly=str(params.get("uly") or ""),
-            instFamily=str(params.get("instFamily") or ""),
-            instId=str(params.get("instId") or ""),
+            **optional,
         )
 
     async def executionGetPublicMarkPrice(
@@ -937,13 +952,12 @@ class OkxPerpetualSdkExchange:
         params: Mapping[str, Any],
     ) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "uly", "instFamily", "instId")
         return await self._call_sdk(
             lambda: self.execution_public_api,
             "get_mark_price",
             instType=OKX_SWAP_INST_TYPE,
-            uly=str(params.get("uly") or ""),
-            instFamily=str(params.get("instFamily") or ""),
-            instId=str(params.get("instId") or ""),
+            **optional,
         )
 
     async def publicGetPublicPriceLimit(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -969,12 +983,11 @@ class OkxPerpetualSdkExchange:
         self,
         params: Mapping[str, Any],
     ) -> dict[str, Any]:
-        source = dict(params or {})
+        source = _non_empty_params(params, "quoteCcy", "instId")
         return await self._call_sdk(
             lambda: self.market_api,
             "get_index_tickers",
-            quoteCcy=str(source.get("quoteCcy") or ""),
-            instId=str(source.get("instId") or ""),
+            **source,
         )
 
     async def privateGetAccountBalance(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -986,39 +999,32 @@ class OkxPerpetualSdkExchange:
 
     async def privateGetAccountFeeRates(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "uly", "category", "instFamily", "instId")
         return await self._call_sdk(
             lambda: self.account_api,
             "get_fee_rates",
             instType=OKX_SWAP_INST_TYPE,
-            instId="",
-            uly=str(params.get("uly") or ""),
-            category=str(params.get("category") or ""),
-            instFamily=str(params.get("instFamily") or ""),
+            **optional,
         )
 
     async def privateGetAccountPositions(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "instId", "posId")
         return await self._call_sdk(
             lambda: self.account_api,
             "get_positions",
             instType=OKX_SWAP_INST_TYPE,
-            instId=str(params.get("instId") or ""),
-            posId=str(params.get("posId") or ""),
+            **optional,
         )
 
     async def privateGetAccountPositionsHistory(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
+        optional = _non_empty_params(params, "instId", "mgnMode", "type", "posId", "after", "before", "limit")
         return await self._call_sdk(
             lambda: self.account_api,
             "get_positions_history",
             instType=OKX_SWAP_INST_TYPE,
-            instId=str(params.get("instId") or ""),
-            mgnMode=str(params.get("mgnMode") or ""),
-            type=str(params.get("type") or ""),
-            posId=str(params.get("posId") or ""),
-            after=str(params.get("after") or ""),
-            before=str(params.get("before") or ""),
-            limit=str(params.get("limit") or ""),
+            **optional,
         )
 
     async def privateGetAccountBills(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1385,15 +1391,25 @@ class OkxPerpetualSdkExchange:
         symbol: str,
         timeframe: str = "1h",
         limit: int = 100,
+        *,
+        end_timestamp_ms: int | None = None,
     ) -> list[list[float]]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
         bar = _timeframe_to_okx_bar(timeframe)
+        request = {
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(max(1, int(limit or 100))),
+        }
+        if int(end_timestamp_ms or 0) > 0:
+            # OKX names the backwards cursor `after`: it returns candles older
+            # than the supplied timestamp. Anchoring at the result fact keeps
+            # delayed shadow samples on their actual decision-to-result window.
+            request["after"] = str(int(end_timestamp_ms or 0))
         response = await self._call_sdk(
             lambda: self.market_api,
             "get_candlesticks",
-            instId=inst_id,
-            bar=bar,
-            limit=str(max(1, int(limit or 100))),
+            **request,
         )
         return self._parse_ohlcv_rows(response)
 
@@ -1420,15 +1436,24 @@ class OkxPerpetualSdkExchange:
         self,
         symbol: str,
         limit: int = 5,
+        *,
+        end_timestamp_ms: int | None = None,
     ) -> list[list[float]]:
         """Fetch the executable-fact 1m path on an isolated public client."""
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
+        request = {
+            "instId": inst_id,
+            "bar": "1m",
+            "limit": str(max(1, int(limit or 5))),
+        }
+        if int(end_timestamp_ms or 0) > 0:
+            # after is OKX's backwards cursor. Add one minute so the candle
+            # containing the requested end timestamp is included as well.
+            request["after"] = str(int(end_timestamp_ms) + 60_000)
         response = await self._call_sdk(
             lambda: self.native_consistency_market_api,
             "get_candlesticks",
-            instId=inst_id,
-            bar="1m",
-            limit=str(max(1, int(limit or 5))),
+            **request,
         )
         return self._parse_ohlcv_rows(response)
 
