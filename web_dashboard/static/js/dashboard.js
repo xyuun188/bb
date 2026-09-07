@@ -12031,11 +12031,17 @@ function profitAttributionEvidenceStatusChip(label, status, options = {}) {
     const typeClass = options.type ? ` evidence-${String(options.type).replace(/[^a-z0-9_-]/gi, '')}` : '';
     if (!available) {
         const reason = sourceStatus.missing_reason || `${label}证据未匹配`;
+        // 优化：非关键证据缺失时静默隐藏，减少视觉噪音
+        const isCritical = reason.includes('未匹配到开仓 AI 决策');
+        if (!isCritical) {
+            return { tone: 'hidden', text: '', html: '' };
+        }
+        // 关键证据缺失，显示灰色低调提示
         const missingLabel = profitAttributionMissingLabel(reason);
         return {
-            tone: 'missing',
+            tone: 'info',
             text: `${label} ${reason}`,
-            html: `<span class="profit-attribution-evidence-chip${typeClass} missing" title="${escHtml(reason)}"><b>${escHtml(label)}</b><em>${escHtml(missingLabel)}</em></span>`,
+            html: `<span class="profit-attribution-evidence-chip${typeClass} info" title="${escHtml(reason)}" style="opacity: 0.5;"><b>${escHtml(label)}</b><em style="color: var(--text-muted);">${escHtml(missingLabel)}</em></span>`,
         };
     }
     return profitAttributionEvidenceChip(label, side, {
