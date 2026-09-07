@@ -581,8 +581,52 @@ async def test_dashboard_okx_balance_failure_cache_prevents_retry(
     assert [event["source"] for event in dashboard_fallback_events] == ["isolated_executor"]
 
 
-def test_dashboard_okx_balance_failure_cache_retries_on_next_poll() -> None:
-    assert dashboard._DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS < 10.0
+def test_dashboard_okx_balance_failure_cache_covers_exchange_timeout_window() -> None:
+    assert dashboard._DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS >= 30.0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_okx_balance_background_and_foreground_share_singleflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def one_read(_mode: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {
+            "free": 5.0,
+            "used": 1.0,
+            "total": 6.0,
+            "cash": 6.0,
+            "equity": 7.0,
+            "allocatable": 7.0,
+        }
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_locks", {})
+    monkeypatch.setattr(
+        dashboard,
+        "_fetch_dashboard_okx_balance_uncached_with_total_budget",
+        one_read,
+    )
+
+    background = asyncio.create_task(dashboard._refresh_dashboard_okx_balance_cache("paper"))
+    await started.wait()
+    foreground = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert calls == 1
+    assert foreground.get("refresh_in_progress") is True
+    release.set()
+    await background
+    completed = await dashboard._get_dashboard_okx_account_snapshot("paper")
+    assert completed["equity"] == 7.0
 
 
 async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(

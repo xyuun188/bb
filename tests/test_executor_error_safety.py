@@ -1554,6 +1554,41 @@ async def test_okx_temporary_service_circuit_stops_private_request_storm(
 
 
 @pytest.mark.asyncio
+async def test_okx_timeout_opens_private_circuit_and_fails_followup_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def slow_private_call(_params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        return {"data": []}
+
+    slow_private_call.__name__ = "privateGetAccountBalance"
+    executor = OKXExecutor(mode="paper")
+    executor._connected = True
+    monkeypatch.setattr(okx_module, "OKX_REST_CALL_TIMEOUT", 0.001)
+    monkeypatch.setattr(okx_module, "RETRY_DELAY", 0.0)
+    OKXExecutor.reset_private_api_circuit_states()
+
+    try:
+        with pytest.raises(ExchangeAPIError, match="timed out after"):
+            await executor._with_retry(slow_private_call, {"ccy": "USDT"}, _max_attempts=1)
+
+        assert calls == 1
+        status = executor.private_api_circuit_status()
+        assert status["state"] == "open"
+        assert status["failure_count"] == 1
+
+        with pytest.raises(ExchangeAPIError, match="circuit open"):
+            await executor._with_retry(slow_private_call, {"ccy": "USDT"}, _max_attempts=1)
+        assert calls == 1
+    finally:
+        OKXExecutor.reset_private_api_circuit_states()
+
+
+@pytest.mark.asyncio
 async def test_okx_temporary_service_circuit_tracks_unified_fetch_leverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

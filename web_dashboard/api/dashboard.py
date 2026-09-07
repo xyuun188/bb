@@ -136,7 +136,10 @@ _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
-_DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 8.0
+# Keep a failed private read cached longer than the exchange timeout and
+# circuit-breaker probe window so dashboard polling cannot recreate a request
+# storm while OKX account APIs are recovering.
+_DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_OKX_PROTECTION_CACHE_TTL_SECONDS = 20.0
 _DASHBOARD_OKX_PROTECTION_STALE_CACHE_TTL_SECONDS = 180.0
@@ -683,7 +686,27 @@ async def _fetch_dashboard_okx_balance_uncached_with_total_budget(
 async def _refresh_dashboard_okx_balance_cache(selected_mode: str) -> None:
     selected_mode = "live" if selected_mode == "live" else "paper"
     executor_identity = _dashboard_okx_executor_for_mode(selected_mode)
+    lock = _dashboard_okx_balance_locks.setdefault(selected_mode, asyncio.Lock())
+    # Foreground summary reads and this background poll are one single-flight
+    # operation. If a foreground read is already in progress, skip this poll;
+    # it will either populate the cache or publish its own failure state.
+    if lock.locked():
+        return
     try:
+        await _acquire_dashboard_lock(lock, label="dashboard OKX balance cache refresh")
+    except TimeoutError:
+        # A foreground read may win the race after the unlocked check. Do not
+        # turn that expected contention into a new exchange error cache entry.
+        return
+
+    try:
+        now = datetime.now(UTC)
+        cached = _dashboard_okx_balance_cache.get(selected_mode)
+        if cached and (now - cached[0]).total_seconds() <= _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
+            return
+        cached_error = _dashboard_okx_balance_error_cache.get(selected_mode)
+        if cached_error and (now - cached_error[0]).total_seconds() <= _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS:
+            return
         snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(selected_mode)
         if snapshot:
             _dashboard_okx_balance_cache[selected_mode] = (
@@ -705,6 +728,8 @@ async def _refresh_dashboard_okx_balance_cache(selected_mode: str) -> None:
             executor_identity,
         )
         raise
+    finally:
+        lock.release()
 
 
 def _start_dashboard_okx_balance_refresh(selected_mode: str) -> None:

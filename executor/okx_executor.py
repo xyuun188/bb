@@ -562,6 +562,15 @@ class OKXExecutor(AbstractExecutor):
                     await asyncio.sleep(RETRY_DELAY * (2**attempt))
                     last_error = e
                     continue
+                if private_api_call:
+                    # Timeouts are exchange outages too. Open the shared
+                    # private circuit so concurrent account reads fail fast
+                    # during the recovery window instead of all waiting on
+                    # another full socket timeout.
+                    self._open_private_api_circuit(
+                        method_name=method_name,
+                        error_code="timeout",
+                    )
                 if circuit_probe:
                     self._private_api_circuit_probe_in_flight = False
                 raise ExchangeAPIError(
