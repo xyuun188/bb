@@ -118,25 +118,25 @@ class EntryFeatureRankerPolicy:
             "analysis_volume_floor": empirical_policy_value(
                 "analysis_volume_floor",
                 metrics["volume_ratio"],
-                selector="lower_hinge",
+                selector="median",
                 observation_window=window,
             ),
             "tradable_volume_floor": empirical_policy_value(
                 "tradable_volume_floor",
                 metrics["volume_ratio"],
-                selector="lower_hinge",
+                selector="median",
                 observation_window=window,
             ),
             "analysis_adx_floor": empirical_policy_value(
                 "analysis_adx_floor",
                 metrics["adx"],
-                selector="lower_hinge",
+                selector="median",
                 observation_window=window,
             ),
             "tradable_adx_floor": empirical_policy_value(
                 "tradable_adx_floor",
                 metrics["adx"],
-                selector="lower_hinge",
+                selector="median",
                 observation_window=window,
             ),
             "analysis_volatility_cap": empirical_policy_value(
@@ -167,7 +167,7 @@ class EntryFeatureRankerPolicy:
                 f"{tier}_{group}_notional_floor": empirical_policy_value(
                     f"{tier}_{group}_notional_floor",
                     metrics[f"{group}_notional"],
-                    selector="lower_hinge",
+                    selector="median",
                     observation_window=window,
                 )
                 for tier in ("analysis", "tradable")
