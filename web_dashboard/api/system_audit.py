@@ -164,7 +164,10 @@ PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_REL_PATH = "phase3_paper_resume_preflight_r
 PHASE3_OPERATOR_APPROVAL_REPORT_MAX_AGE_SECONDS = 3 * 3600
 OKX_POSITION_FACT_LINK_AUDIT_DAYS = 14
 OKX_POSITION_FACT_LINK_AUDIT_MAX_POSITIONS = 300
-OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 1000
+# Keep the dashboard dry-run ahead of the current history while retaining a
+# bounded query.  The previous 1,000-row cap started reporting seven
+# unscanned orders as an unresolved incident once history grew to 1,007 rows.
+OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 2000
 HISTORICAL_TRADE_FACT_AUDIT_DAYS = 180
 HISTORICAL_TRADE_FACT_AUDIT_LIMIT = 2000
 PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS = 45
@@ -1131,6 +1134,44 @@ def _report_fresh(report: dict[str, Any], *, max_age_seconds: int) -> bool:
         return False
     age = _age_seconds(checked_at)
     return age is not None and age <= max_age_seconds
+
+
+def _phase3_preflight_needs_live_refresh(
+    report: dict[str, Any],
+    *,
+    report_age_seconds: float | None,
+) -> tuple[bool, str | None]:
+    """Avoid replaying an OKX blocker from a snapshot superseded by a sync.
+
+    The timer report is normally reused to keep the dashboard cheap.  A
+    persisted report that still contains an OKX difference must be compared
+    with the newest reconciliation artifact, otherwise a successful repair
+    can remain visible as an unresolved incident for up to 45 minutes.
+    """
+    blocker_codes = {
+        str(item.get("code") or "")
+        for item in _safe_list(report.get("blockers"))
+        if isinstance(item, dict)
+    }
+    if not blocker_codes.intersection(
+        {
+            "okx_authoritative_sync_not_clean",
+            "okx_authoritative_sync_has_differences",
+        }
+    ):
+        return False, None
+    reconciliation = _load_okx_daily_reconciliation_report_summary()
+    reconciliation_at = _parse_utc_datetime(reconciliation.get("generated_at"))
+    persisted_at = _report_checked_at(report)
+    if reconciliation_at is None or persisted_at is None:
+        return True, "okx_blocker_without_comparable_reconciliation_timestamp"
+    if reconciliation_at > persisted_at:
+        return True, "okx_reconciliation_newer_than_preflight"
+    # A very old persisted blocker should not survive a dashboard refresh even
+    # when the daily artifact is unavailable or has the same timestamp.
+    if report_age_seconds is None or report_age_seconds > 5 * 60:
+        return True, "okx_blocker_snapshot_older_than_live_probe_window"
+    return False, None
 
 
 def _read_latest_phase3_report(relative_path: str) -> dict[str, Any]:
@@ -4759,7 +4800,14 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
         age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
     else:
         age_seconds = None
-    if not _report_fresh(
+    needs_live_refresh, refresh_reason = _phase3_preflight_needs_live_refresh(
+        report,
+        report_age_seconds=age_seconds,
+    )
+    if needs_live_refresh:
+        global _okx_authoritative_sync_cache
+        _okx_authoritative_sync_cache = None
+    if needs_live_refresh or not _report_fresh(
         report,
         max_age_seconds=PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_MAX_AGE_SECONDS,
     ):
@@ -4772,6 +4820,8 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
         )
         report = dict(report)
         report.setdefault("report_source", "live_probe")
+        if refresh_reason:
+            report["report_refresh_reason"] = refresh_reason
     else:
         report = dict(report)
         report["report_source"] = "persisted_timer"

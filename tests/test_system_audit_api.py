@@ -20,7 +20,7 @@ AuditFactory = Callable[[], Awaitable[dict[str, Any]]]
 
 
 def test_okx_reconciliation_dashboard_scan_capacity_covers_current_history() -> None:
-    assert system_audit.OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS >= 1000
+    assert system_audit.OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS >= 2000
 
 
 def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> None:
@@ -1134,6 +1134,88 @@ async def test_phase3_paper_resume_preflight_audit_reuses_fresh_timer_report(
     assert card["details"]["report_source"] == "persisted_timer"
     assert card["details"]["report_age_seconds"] >= 0
     assert card["details"]["consumed_after_resume"] is True
+
+
+@pytest.mark.asyncio
+async def test_phase3_paper_resume_preflight_refreshes_persisted_okx_blocker_after_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted_checked_at = datetime.now(UTC) - timedelta(minutes=2)
+    persisted_report = {
+        "checked_at": persisted_checked_at.isoformat(),
+        "status": "blocked",
+        "can_resume_paper": False,
+        "blockers": [
+            {
+                "code": "okx_authoritative_sync_not_clean",
+                "severity": "blocking",
+                "message": "Old OKX difference.",
+            }
+        ],
+        "warnings": [],
+        "summary": {"okx_issue_count": 1},
+    }
+    live_report = {
+        "status": "ready",
+        "read_only": True,
+        "audit_only": True,
+        "mutates_database": False,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "changes_model_routing": False,
+        "can_resume_paper": True,
+        "requires_operator_start": True,
+        "blockers": [],
+        "warnings": [],
+        "summary": {
+            "okx_issue_count": 0,
+            "model_server_runtime_ready": True,
+            "phase3_quant_api_available": True,
+        },
+    }
+
+    class FakePhase3PaperResumePreflightService:
+        calls = 0
+
+        def __init__(self, *, model_server_timeout_seconds: int, **_kwargs: Any) -> None:
+            assert model_server_timeout_seconds == (
+                system_audit.PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS
+            )
+
+        async def report(self) -> dict[str, Any]:
+            type(self).calls += 1
+            return dict(live_report)
+
+    monkeypatch.setattr(
+        system_audit,
+        "_read_latest_phase3_report",
+        lambda _relative_path: dict(persisted_report),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_okx_daily_reconciliation_report_summary",
+        lambda: {
+            "available": True,
+            "generated_at": (persisted_checked_at + timedelta(seconds=30)).isoformat(),
+            "status": "ok",
+            "stale": False,
+        },
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumePreflightService",
+        FakePhase3PaperResumePreflightService,
+    )
+
+    card = await system_audit._phase3_paper_resume_preflight_audit()
+
+    assert FakePhase3PaperResumePreflightService.calls == 1
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "live_probe"
+    assert card["details"]["report_refresh_reason"] == (
+        "okx_reconciliation_newer_than_preflight"
+    )
+    assert card["details"]["effective_blockers"] == []
 
 
 @pytest.mark.asyncio

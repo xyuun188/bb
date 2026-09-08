@@ -19,7 +19,10 @@ from services.phase3_model_server_readiness import Phase3ModelServerReadinessAud
 from services.server_monitor_status import get_cached_platform_runtime_status
 
 DEFAULT_OKX_LOOKBACK_HOURS = 24
-DEFAULT_OKX_LIMIT = 120
+# The resume gate must cover the same current-fill window as the dashboard
+# audit.  A 120-row limit truncated the active account and produced false
+# missing-position blockers once the recent ledger grew beyond that size.
+DEFAULT_OKX_LIMIT = 500
 DEFAULT_OKX_TIMEOUT_SECONDS = 5.0
 DEFAULT_ACCOUNT_EQUITY_ATTEMPTS = 2
 ACCOUNT_EQUITY_RETRY_DELAY_SECONDS = 0.5
@@ -550,6 +553,10 @@ class Phase3PaperResumePreflightService:
     okx_lookback_hours: int = DEFAULT_OKX_LOOKBACK_HOURS
     okx_limit: int = DEFAULT_OKX_LIMIT
     okx_timeout_seconds: float = DEFAULT_OKX_TIMEOUT_SECONDS
+    # Resume gates must use the current-state/recent-fill scope. Historical
+    # archive differences are handled by the separate integrity audit and
+    # should not block an already-running paper service.
+    okx_recent_fills_only: bool = True
     model_server_timeout_seconds: int = 24
     specialist_report_max_age_seconds: int = DEFAULT_SPECIALIST_REPORT_MAX_AGE_SECONDS
 
@@ -629,6 +636,7 @@ class Phase3PaperResumePreflightService:
             lookback_hours=self.okx_lookback_hours,
             limit=self.okx_limit,
             timeout_seconds=self.okx_timeout_seconds,
+            recent_fills_only=self.okx_recent_fills_only,
         ).collect()
 
     async def _default_okx_integrity(self) -> dict[str, Any]:

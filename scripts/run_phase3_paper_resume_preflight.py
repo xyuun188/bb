@@ -60,7 +60,7 @@ def write_report(report: dict[str, Any], output_dir: Path, *, indent: int | None
 async def collect_phase3_paper_resume_preflight(
     *,
     okx_lookback_hours: int = 24,
-    okx_limit: int = 120,
+    okx_limit: int = 500,
     okx_timeout_seconds: float = 5.0,
     model_server_timeout_seconds: int = 24,
     specialist_report_max_age_seconds: int = 7200,
@@ -77,7 +77,7 @@ async def collect_phase3_paper_resume_preflight(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--okx-lookback-hours", type=int, default=24)
-    parser.add_argument("--okx-limit", type=int, default=120)
+    parser.add_argument("--okx-limit", type=int, default=500)
     parser.add_argument("--okx-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--model-server-timeout-seconds", type=int, default=24)
     parser.add_argument("--specialist-report-max-age-seconds", type=int, default=7200)

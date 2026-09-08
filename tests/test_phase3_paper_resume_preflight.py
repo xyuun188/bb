@@ -368,6 +368,31 @@ async def test_phase3_paper_resume_preflight_service_uses_injected_providers() -
     assert main_thread_id not in provider_thread_ids
 
 
+@pytest.mark.asyncio
+async def test_phase3_paper_resume_preflight_uses_recent_okx_fill_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeOkxAuthoritativeSyncService:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def collect(self) -> dict[str, Any]:
+            return _okx_sync_clean()
+
+    monkeypatch.setattr(
+        "services.phase3_paper_resume_preflight.OkxAuthoritativeSyncService",
+        FakeOkxAuthoritativeSyncService,
+    )
+
+    report = await Phase3PaperResumePreflightService()._default_okx_sync()
+
+    assert report["status"] == "ok"
+    assert captured["limit"] == 500
+    assert captured["recent_fills_only"] is True
+
+
 def test_phase3_paper_resume_preflight_cli_writes_latest_report(tmp_path) -> None:
     report = {
         "status": "ready",
