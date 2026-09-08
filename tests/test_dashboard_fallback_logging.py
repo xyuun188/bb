@@ -776,6 +776,63 @@ async def test_dashboard_lifespan_closes_read_clients(
     assert calls == ["read_clients", "websockets"]
 
 
+async def test_continuous_observation_reuses_trade_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_dashboard.api import data_collection
+
+    trade_calls = 0
+    captured_trade: dict[str, Any] | None = None
+    trade_snapshot = {
+        "status": "ok",
+        "unresolved_execution_contract_count": 0,
+        "unassigned_fill_count": 0,
+        "duplicate_funding_attribution_count": 0,
+        "profit_attribution": {"attribution_mismatch_count": 0},
+    }
+
+    async def build_trade() -> dict[str, Any]:
+        nonlocal trade_calls
+        trade_calls += 1
+        return trade_snapshot
+
+    async def build_model(
+        *, trade_snapshot: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        nonlocal captured_trade
+        captured_trade = trade_snapshot
+        return {"status": "ok", "scheduler": {"status": "ok"}}
+
+    async def analysis_metrics() -> dict[str, Any]:
+        return {
+            "max_analysis_interval_seconds": 60,
+            "duplicate_analysis_count": 0,
+        }
+
+    async def restart_count() -> int:
+        return 0
+
+    monkeypatch.setattr(dashboard, "_build_trade_observability_snapshot", build_trade)
+    monkeypatch.setattr(dashboard, "_build_model_observability_snapshot", build_model)
+    monkeypatch.setattr(dashboard, "_continuous_analysis_metrics", analysis_metrics)
+    monkeypatch.setattr(
+        dashboard,
+        "_continuous_observation_system_restart_count",
+        restart_count,
+    )
+    monkeypatch.setattr(
+        data_collection,
+        "load_persisted_data_collection_status",
+        lambda _include: (datetime.now(UTC), {"status": "ok"}),
+    )
+    dashboard._clear_dashboard_heavy_cache("trade-observability", "model-observability")
+
+    await dashboard.collect_continuous_observation_metrics()
+
+    assert trade_calls == 1
+    assert captured_trade == trade_snapshot
+
+
 async def test_dashboard_okx_position_cache_is_bound_to_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

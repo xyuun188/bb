@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -20,7 +21,6 @@ from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from core.safe_output import safe_error_text
-from services.continuous_observation import ContinuousObservationScheduler
 from services.dashboard_runtime_metrics import get_dashboard_runtime_metrics
 from services.observability_contract import freshness_payload, iso_timestamp
 from web_dashboard.api.auth import dashboard_login_page_html
@@ -112,26 +112,38 @@ async def _system_audit_history_loop() -> None:
 
 
 async def _continuous_observation_loop() -> None:
-    """Keep the durable 24/72-hour acceptance windows sampled in production."""
+    """Run acceptance sampling outside the HTTP event loop."""
 
-    from web_dashboard.api.dashboard import (
-        CONTINUOUS_OBSERVATION_STORES,
-        collect_continuous_observation_metrics,
-    )
-
-    scheduler = ContinuousObservationScheduler(
-        CONTINUOUS_OBSERVATION_STORES,
-        collect_continuous_observation_metrics,
-        interval_seconds=300.0,
-        startup_delay_seconds=0.0,
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_continuous_observation.py"
     )
     try:
-        # Let the HTTP app finish startup before the first database/model probe.
+        # The collector scans trade facts and can wait on remote probes.  A
+        # child process prevents that work from stalling all HTTP requests.
         await asyncio.sleep(5.0)
-        await scheduler.start()
-        task = scheduler.task
-        if task is not None:
-            await task
+        while True:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script_path),
+                cwd=str(script_path.parents[1]),
+            )
+            try:
+                return_code = await process.wait()
+            except asyncio.CancelledError:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10.0)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+                raise
+            logger.warning(
+                "continuous observation worker exited; restarting",
+                return_code=return_code,
+            )
+            await asyncio.sleep(30.0)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -139,10 +151,6 @@ async def _continuous_observation_loop() -> None:
             "continuous observation loop failed",
             error=safe_error_text(exc, limit=240),
         )
-    finally:
-        await scheduler.stop()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""

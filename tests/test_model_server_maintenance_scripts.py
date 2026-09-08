@@ -83,6 +83,34 @@ def test_dashboard_stays_running_while_model_tunnels_recover() -> None:
     assert "TasksMax=256" in unit
 
 
+def test_dashboard_proxy_exposes_standard_http_entrypoint() -> None:
+    from scripts.sync_to_online_server import _render_dashboard_proxy_config
+
+    config = _render_dashboard_proxy_config()
+
+    assert "listen 80;" in config
+    assert "listen [::]:80;" in config
+    assert "proxy_pass http://127.0.0.1:8002;" in config
+    assert "proxy_connect_timeout 5s;" in config
+    assert "proxy_read_timeout 120s;" in config
+    assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;" in config
+
+
+def test_dashboard_proxy_install_is_idempotent_and_validated() -> None:
+    from scripts.sync_to_online_server import _install_dashboard_proxy_command
+
+    command = _install_dashboard_proxy_command()
+
+    assert "if ! command -v nginx" in command
+    assert "apt-get install -y -qq nginx" in command
+    assert "ln -sfn /etc/nginx/sites-available/bb-dashboard" in command
+    assert "rm -f /etc/nginx/sites-enabled/default" in command
+    assert "nginx -t" in command
+    assert "systemctl enable --now 'nginx.service'" in command
+    assert "systemctl reload 'nginx.service'" in command
+    assert command.endswith("systemctl is-active 'nginx.service'")
+
+
 def test_split_service_deploy_stops_model_consumers_before_tunnel_restart() -> None:
     from scripts.sync_to_online_server import _split_services_restart_command
 

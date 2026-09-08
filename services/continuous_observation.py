@@ -277,22 +277,28 @@ class ContinuousObservationScheduler:
         if self._task is not None and not self._task.done():
             return
         self._stop_event = asyncio.Event()
-        try:
-            baseline = await self.collector()
-        except Exception:
-            baseline = {}
         now = _now()
+        pending_stores: list[tuple[int, ContinuousObservationStore]] = []
         for hours in ALLOWED_WINDOW_HOURS:
             store = self.stores.get(hours)
             if store is None:
                 continue
             snapshot = store.snapshot(now=now)
             if snapshot.get("status") == "not_started":
-                store.start(
-                    required_hours=hours,
-                    now=now,
-                    baseline_metrics=baseline,
-                )
+                pending_stores.append((hours, store))
+        baseline: dict[str, Any] = {}
+        if pending_stores:
+            try:
+                collected = await self.collector()
+                baseline = collected if isinstance(collected, dict) else {}
+            except Exception:
+                baseline = {}
+        for hours, store in pending_stores:
+            store.start(
+                required_hours=hours,
+                now=now,
+                baseline_metrics=baseline,
+            )
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:

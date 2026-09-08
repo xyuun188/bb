@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -116,5 +117,34 @@ async def test_scheduler_starts_both_windows_and_records_real_samples(tmp_path):
         assert stores[24].snapshot()["status"] == "observing"
         assert stores[24].snapshot()["sample_count"] == 1
         assert stores[72].snapshot()["sample_count"] == 1
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_recollect_baseline_for_existing_windows(tmp_path):
+    calls = 0
+
+    async def collect():
+        nonlocal calls
+        calls += 1
+        return _metrics()
+
+    stores = {
+        24: ContinuousObservationStore(tmp_path / "24.json"),
+        72: ContinuousObservationStore(tmp_path / "72.json"),
+    }
+    for hours, store in stores.items():
+        store.start(required_hours=hours, baseline_metrics=_metrics())
+    scheduler = ContinuousObservationScheduler(
+        stores,
+        collect,
+        interval_seconds=60,
+        startup_delay_seconds=60,
+    )
+    await scheduler.start()
+    try:
+        await asyncio.sleep(0)
+        assert calls == 0
     finally:
         await scheduler.stop()

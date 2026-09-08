@@ -35,6 +35,9 @@ REMOTE_SERVICE_NAME = "bb-paper-trading.service"
 REMOTE_DASHBOARD_SERVICE_NAME = "bb-dashboard.service"
 REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"
 REMOTE_MODEL_READINESS_SERVICE_NAME = "bb-phase3-model-server-readiness.service"
+REMOTE_DASHBOARD_PROXY_SERVICE_NAME = "nginx.service"
+REMOTE_DASHBOARD_PROXY_SITE = "/etc/nginx/sites-available/bb-dashboard"
+REMOTE_DASHBOARD_PROXY_LINK = "/etc/nginx/sites-enabled/bb-dashboard"
 MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS = 75
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REMOTE_OWNER = "bb:bb"
@@ -140,6 +143,51 @@ TasksMax=256
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def _render_dashboard_proxy_config() -> str:
+    return """server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    client_max_body_size 20m;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8002;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+    }
+}
+"""
+
+
+def _install_dashboard_proxy_command() -> str:
+    proxy_config = _render_dashboard_proxy_config()
+    return (
+        "set -e; "
+        "if ! command -v nginx >/dev/null 2>&1; then "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get update -qq; apt-get install -y -qq nginx; "
+        "fi; "
+        "install -d -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled; "
+        f"cat > /tmp/bb-dashboard.nginx <<'NGINX'\n{proxy_config}\nNGINX\n"
+        f"install -m 0644 /tmp/bb-dashboard.nginx {REMOTE_DASHBOARD_PROXY_SITE}; "
+        f"ln -sfn {REMOTE_DASHBOARD_PROXY_SITE} {REMOTE_DASHBOARD_PROXY_LINK}; "
+        "rm -f /etc/nginx/sites-enabled/default; "
+        "nginx -t; "
+        f"systemctl enable --now {_remote_quote(REMOTE_DASHBOARD_PROXY_SERVICE_NAME)} "
+        ">/dev/null; "
+        f"systemctl reload {_remote_quote(REMOTE_DASHBOARD_PROXY_SERVICE_NAME)}; "
+        f"systemctl is-active {_remote_quote(REMOTE_DASHBOARD_PROXY_SERVICE_NAME)}"
+    )
 
 
 def _render_model_tunnel_service(remote_app_dir: str, owner: str) -> str:
@@ -900,6 +948,15 @@ def main() -> None:
         if args.skip_restart:
             safe_print("Skipped service restart.")
             return
+        safe_print("Ensuring the public Dashboard proxy is installed and healthy.")
+        safe_print(
+            run_remote_text(
+                ssh,
+                _install_dashboard_proxy_command(),
+                timeout=300,
+                check=True,
+            )
+        )
         if args.split_services:
             run_remote_text(
                 ssh,

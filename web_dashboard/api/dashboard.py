@@ -8052,7 +8052,10 @@ async def _latest_analysis_observability() -> dict[str, Any]:
     }
 
 
-async def _build_model_observability_snapshot() -> dict[str, Any]:
+async def _build_model_observability_snapshot(
+    *,
+    trade_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build one versioned, read-only model/analysis observation snapshot."""
 
     async def bounded(builder: Callable[[], Awaitable[Any]], name: str) -> dict[str, Any]:
@@ -8071,11 +8074,16 @@ async def _build_model_observability_snapshot() -> dict[str, Any]:
                 "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
             }
 
+    async def trade_section() -> dict[str, Any]:
+        if isinstance(trade_snapshot, dict):
+            return copy.deepcopy(trade_snapshot)
+        return await bounded(_build_trade_observability_snapshot, "trade")
+
     local_ml, local_tools, analysis, trade, expert_memory = await asyncio.gather(
         bounded(get_ml_signal_status, "local_ml"),
         bounded(get_local_ai_tools_status, "local_ai_tools"),
         bounded(_latest_analysis_observability, "analysis"),
-        bounded(_build_trade_observability_snapshot, "trade"),
+        trade_section(),
         bounded(_build_expert_memory_observability, "expert_memory"),
     )
     scheduler = MODEL_TRAINING_STATE_STORE.read()
@@ -8488,11 +8496,28 @@ async def collect_continuous_observation_metrics() -> dict[str, Any]:
         except Exception as exc:
             return {"status": "error", "degraded_reason": f"{name}:{type(exc).__name__}"}
 
-    trade, model, analysis = await asyncio.gather(
-        bounded(_build_trade_observability_snapshot, "trade_observability"),
-        bounded(_build_model_observability_snapshot, "model_observability"),
-        bounded(_continuous_analysis_metrics, "analysis_metrics"),
+    analysis_task = asyncio.create_task(
+        bounded(_continuous_analysis_metrics, "analysis_metrics")
     )
+    trade = await bounded(
+        lambda: _dashboard_heavy_cached(
+            ("trade-observability",),
+            _build_trade_observability_snapshot,
+            ttl_seconds=30.0,
+        ),
+        "trade_observability",
+    )
+    model = await bounded(
+        lambda: _dashboard_heavy_cached(
+            ("model-observability",),
+            lambda: _build_model_observability_snapshot(
+                trade_snapshot=trade if isinstance(trade, dict) else None
+            ),
+            ttl_seconds=20.0,
+        ),
+        "model_observability",
+    )
+    analysis = await analysis_task
     persisted = data_collection_api.load_persisted_data_collection_status(False)
     data = persisted[1] if isinstance(persisted, tuple) and len(persisted) == 2 else None
     if not isinstance(data, dict):
