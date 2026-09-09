@@ -108,21 +108,21 @@ OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
 OKX_AUTHORITATIVE_SYNC_CACHE_TTL_SECONDS = 45
 MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_AUDIT_SECTION_TIMEOUT_SECONDS = 20.0
-SYSTEM_AUDIT_MAX_CONCURRENCY = 2
-SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY = 2
-SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY = 6
+SYSTEM_AUDIT_MAX_CONCURRENCY = 1
+SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY = 1
+SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY = 2
 # Database-backed cards use independent read-only sessions, but they still
 # share the trading service's database pool and PostgreSQL resources. Keep the
 # audit wave small enough that a long snapshot cannot starve its peers.
-SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 2
+SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 1
 # Keep one audit snapshot bounded while allowing the two slow read-only
 # integrity scans to finish without starving the required contract card.
 # This work runs in the background; the API serves the last completed snapshot
 # while a new one is being assembled.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 45.0
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 60.0
 SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS = 900.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -161,6 +161,9 @@ SPECIALIST_SHADOW_EVALUATION_ALT_REL_PATH = (
 )
 PHASE3_GO_NO_GO_REPORT_REL_PATH = "phase3_go_no_go_reports/latest.json"
 PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_REL_PATH = "phase3_paper_resume_preflight_reports/latest.json"
+PHASE3_PAPER_RESUME_OBSERVATION_REPORT_REL_PATH = (
+    "phase3_paper_resume_observation_reports/latest.json"
+)
 PHASE3_OPERATOR_APPROVAL_REPORT_MAX_AGE_SECONDS = 3 * 3600
 OKX_POSITION_FACT_LINK_AUDIT_DAYS = 14
 OKX_POSITION_FACT_LINK_AUDIT_MAX_POSITIONS = 300
@@ -178,6 +181,9 @@ PHASE3_PAPER_RESUME_PREFLIGHT_TIMEOUT_SECONDS = 70
 # report in the dashboard audit so a routine refresh does not repeat the same
 # remote probes and turn a healthy system into a timeout warning.
 PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_MAX_AGE_SECONDS = 45 * 60
+# The observation timer runs every 30 minutes. A completed timer snapshot is
+# authoritative for a routine dashboard audit until the next expected run.
+PHASE3_PAPER_RESUME_OBSERVATION_REPORT_MAX_AGE_SECONDS = 45 * 60
 SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
     "phase3_server_migration": PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS + 5,
     "phase3_model_server_readiness": PHASE3_MODEL_SERVER_READINESS_TIMEOUT_SECONDS + 5,
@@ -203,6 +209,9 @@ PRIORITY_AUDIT_KEYS = (
     "trade_execution_contract",
 )
 DB_AUDIT_KEYS = (
+    # This card feeds the entry/risk nodes. Run it before slow historical
+    # reports so a queue delay cannot be presented as a capacity violation.
+    "position_capacity_release",
     "trade_loop",
     "okx_trade_fact_integrity",
     "position_price_integrity",
@@ -216,7 +225,6 @@ DB_AUDIT_KEYS = (
     "crypto_feature_coverage",
     "shadow_missed_opportunity",
     "strong_opportunity",
-    "position_capacity_release",
 )
 HEAVY_AUDIT_KEYS = (
     "model_expert_health",
@@ -1272,6 +1280,35 @@ async def _audit_maybe_async(
     return result
 
 
+async def _acquire_shared_audit_slot(
+    semaphore: asyncio.Semaphore | None,
+    *,
+    key: str,
+    deadline: float | None,
+) -> bool:
+    """Acquire the cross-group slot without exceeding the audit deadline."""
+
+    if semaphore is None:
+        return False
+    if deadline is None:
+        await semaphore.acquire()
+        return True
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError(
+            "system audit collection budget exhausted before "
+            f"section {key} acquired a shared slot"
+        )
+    try:
+        await asyncio.wait_for(semaphore.acquire(), timeout=remaining)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            "system audit collection budget exhausted while waiting for "
+            f"a shared slot for section {key}"
+        ) from exc
+    return True
+
+
 async def _run_audit_specs(
     specs: list[tuple[str, Any]],
     *,
@@ -1289,9 +1326,11 @@ async def _run_audit_specs(
             started = time.perf_counter()
             acquired_shared = False
             try:
-                if shared_semaphore is not None:
-                    await shared_semaphore.acquire()
-                    acquired_shared = True
+                acquired_shared = await _acquire_shared_audit_slot(
+                    shared_semaphore,
+                    key=key,
+                    deadline=deadline,
+                )
                 section_timeout = _system_audit_section_timeout_seconds(key)
                 if deadline is not None:
                     remaining = deadline - time.perf_counter()
@@ -1321,9 +1360,11 @@ async def _run_audit_specs(
             started = time.perf_counter()
             acquired_shared = False
             try:
-                if shared_semaphore is not None:
-                    await shared_semaphore.acquire()
-                    acquired_shared = True
+                acquired_shared = await _acquire_shared_audit_slot(
+                    shared_semaphore,
+                    key=key,
+                    deadline=deadline,
+                )
                 section_timeout = _system_audit_section_timeout_seconds(key)
                 if deadline is not None:
                     remaining = deadline - time.perf_counter()
@@ -4209,28 +4250,34 @@ async def _model_training_audit() -> dict[str, Any]:
             timeout=MODEL_RUNTIME_PROBE_TIMEOUT_SECONDS * 2,
         )
     )
-    runtime_task.add_done_callback(_consume_background_task_exception)
-    try:
-        data_status = await _data_collection_status_for_audit()
-    except Exception as exc:
-        data_status = exc
-    try:
-        historical_trade_facts = await HistoricalTradeFactAuditService(
+    data_status_task = asyncio.create_task(_data_collection_status_for_audit())
+    historical_trade_facts_task = asyncio.create_task(
+        HistoricalTradeFactAuditService(
             lookback_days=HISTORICAL_TRADE_FACT_AUDIT_DAYS,
             limit=HISTORICAL_TRADE_FACT_AUDIT_LIMIT,
         ).report()
-    except Exception as exc:
-        historical_trade_facts = exc
-    try:
-        artifact_retirement = await ArtifactRetirementAuditService().report()
-    except Exception as exc:
-        artifact_retirement = exc
+    )
+    artifact_retirement_task = asyncio.create_task(ArtifactRetirementAuditService().report())
+    # These probes use separate read-only sources. Running them together
+    # prevents a slow runtime check from serially extending the audit window.
+    (
+        data_status,
+        historical_trade_facts,
+        artifact_retirement,
+        runtime_result,
+    ) = await asyncio.gather(
+        data_status_task,
+        historical_trade_facts_task,
+        artifact_retirement_task,
+        runtime_task,
+        return_exceptions=True,
+    )
     runtime_probe_attempts = 1
     runtime_probe_retried = False
-    try:
-        runtime_status, runtime_probe_attempts, runtime_probe_retried = await runtime_task
-    except Exception as exc:
-        runtime_status = exc
+    if isinstance(runtime_result, Exception):
+        runtime_status = runtime_result
+    else:
+        runtime_status, runtime_probe_attempts, runtime_probe_retried = runtime_result
     if isinstance(data_status, Exception):
         return _audit_card(
             "model_training",
@@ -4911,12 +4958,31 @@ async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
 
 
 async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
-    report = await asyncio.wait_for(
-        Phase3PaperResumeObservationService(
-            okx_sync_provider=_okx_authoritative_sync_summary,
-        ).report(),
-        timeout=PHASE3_PAPER_RESUME_OBSERVATION_TIMEOUT_SECONDS,
+    report = _read_latest_phase3_report(PHASE3_PAPER_RESUME_OBSERVATION_REPORT_REL_PATH)
+    checked_at = _report_checked_at(report)
+    age_seconds = (
+        max((_now() - checked_at).total_seconds(), 0.0)
+        if checked_at is not None
+        else None
     )
+    if _report_fresh(
+        report,
+        max_age_seconds=PHASE3_PAPER_RESUME_OBSERVATION_REPORT_MAX_AGE_SECONDS,
+    ):
+        report = dict(report)
+        report["report_source"] = "persisted_timer"
+        report["report_age_seconds"] = round(float(age_seconds or 0.0), 3)
+    else:
+        report = await asyncio.wait_for(
+            Phase3PaperResumeObservationService(
+                okx_sync_provider=_okx_authoritative_sync_summary,
+            ).report(),
+            timeout=PHASE3_PAPER_RESUME_OBSERVATION_TIMEOUT_SECONDS,
+        )
+        report = dict(report)
+        report.setdefault("report_source", "live_probe")
+        if age_seconds is not None:
+            report["superseded_report_age_seconds"] = round(age_seconds, 3)
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     status_value = str(report.get("status") or "unknown")
@@ -6279,6 +6345,8 @@ async def _run_system_audit_subprocess_once(
         command.append("--no-record-history")
     process_env = os.environ.copy()
     process_env["PYTHONIOENCODING"] = "utf-8"
+    if os.name != "nt":
+        process_env["BB_SYSTEM_AUDIT_NICE"] = "10"
     isolated_snapshot_path = (
         settings.data_dir
         / f".system_audit_runner_{os.getpid()}_{time.time_ns()}.json"

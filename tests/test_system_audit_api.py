@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -612,6 +614,28 @@ async def test_system_audit_records_section_timings() -> None:
     assert set(result) == {"trade_loop", "market_data"}
     assert set(timings) == {"trade_loop", "market_data"}
     assert all(value >= 0 for value in timings.values())
+
+
+@pytest.mark.asyncio
+async def test_system_audit_shared_slot_wait_obeys_collection_deadline() -> None:
+    shared_semaphore = asyncio.Semaphore(0)
+    started = time.perf_counter()
+
+    result = await system_audit._run_audit_specs(
+        [("position_capacity_release", lambda: {"status": "ok"})],
+        shared_semaphore=shared_semaphore,
+        deadline=started + 0.01,
+    )
+
+    assert isinstance(result["position_capacity_release"], TimeoutError)
+    assert "waiting for a shared slot" in str(result["position_capacity_release"])
+    assert time.perf_counter() - started < 0.2
+
+
+def test_system_audit_schedules_position_capacity_before_slow_database_cards() -> None:
+    assert system_audit.DB_AUDIT_KEYS.index("position_capacity_release") < (
+        system_audit.DB_AUDIT_KEYS.index("model_training")
+    )
 
 
 @pytest.mark.asyncio
@@ -1381,6 +1405,7 @@ async def test_phase3_paper_resume_observation_audit_waits_for_resume(
         "Phase3PaperResumeObservationService",
         FakePhase3PaperResumeObservationService,
     )
+    monkeypatch.setattr(system_audit, "_read_latest_phase3_report", lambda _path: {})
 
     card = await system_audit._phase3_paper_resume_observation_audit()
     state, _label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
@@ -1424,6 +1449,7 @@ async def test_phase3_paper_resume_observation_audit_reports_healthy(
         "Phase3PaperResumeObservationService",
         FakePhase3PaperResumeObservationService,
     )
+    monkeypatch.setattr(system_audit, "_read_latest_phase3_report", lambda _path: {})
 
     card = await system_audit._phase3_paper_resume_observation_audit()
 
@@ -1431,6 +1457,51 @@ async def test_phase3_paper_resume_observation_audit_reports_healthy(
     assert card["details"]["paper_active"] is True
     assert card["details"]["observing"] is False
     assert card["evidence"][3]["value"] == 12
+
+
+@pytest.mark.asyncio
+async def test_phase3_paper_resume_observation_audit_reuses_fresh_timer_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(minutes=2)
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "healthy",
+        "read_only": True,
+        "audit_only": True,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "paper_active": True,
+        "blockers": [],
+        "warnings": [],
+        "summary": {
+            "created_shadow_count": 12,
+            "completed_shadow_count": 3,
+            "specialist_eligible_shadow_count": 2,
+        },
+    }
+
+    monkeypatch.setattr(
+        system_audit,
+        "_read_latest_phase3_report",
+        lambda _path: dict(persisted),
+    )
+
+    class UnexpectedLiveProbe:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise AssertionError("fresh timer report must not trigger a live probe")
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumeObservationService",
+        UnexpectedLiveProbe,
+    )
+
+    card = await system_audit._phase3_paper_resume_observation_audit()
+
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "persisted_timer"
+    assert card["details"]["report_age_seconds"] >= 0
 
 
 @pytest.mark.asyncio
@@ -1817,7 +1888,7 @@ async def test_model_training_audit_reports_retired_artifacts_as_rebuild_gate(
 
 
 @pytest.mark.asyncio
-async def test_model_training_audit_runs_database_reports_serially(
+async def test_model_training_audit_runs_independent_reports_concurrently(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
@@ -1913,13 +1984,13 @@ async def test_model_training_audit_runs_database_reports_serially(
     card = await system_audit._model_training_audit()
 
     assert card["status"] == "ok"
-    assert max_active_db_reports == 1
-    assert events == [
+    assert max_active_db_reports == 2
+    assert set(events) == {
         "start:data_collection",
         "end:data_collection",
         "start:historical_trade_facts",
         "end:historical_trade_facts",
-    ]
+    }
 
 
 @pytest.mark.asyncio
