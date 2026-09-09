@@ -120,6 +120,11 @@ SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 1
 # This work runs in the background; the API serves the last completed snapshot
 # while a new one is being assembled.
 SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 45.0
+# These two cards directly feed the phase-3 go/no-go decision. They must be
+# collected before the diagnostic backlog so queue contention cannot turn a
+# healthy required check into ``required_audits_deferred``.
+REQUIRED_AUDIT_MAX_CONCURRENCY = 2
+REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS = 10 * 60
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
 SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 60.0
@@ -207,6 +212,10 @@ SYSTEM_AUDIT_SECTION_TIMEOUT_OVERRIDES = {
 }
 PRIORITY_AUDIT_KEYS = (
     "trade_execution_contract",
+)
+REQUIRED_AUDIT_KEYS = (
+    "model_training",
+    "position_capacity_release",
 )
 DB_AUDIT_KEYS = (
     # This card feeds the entry/risk nodes. Run it before slow historical
@@ -6213,6 +6222,60 @@ def _load_latest_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
     return checked_at, payload
 
 
+def _load_canonical_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
+    """Read the last completed snapshot even inside an isolated runner.
+
+    The runner writes to a temporary path via ``BB_SYSTEM_AUDIT_SNAPSHOT_PATH``;
+    required-card reuse must still consult the canonical snapshot from the
+    previous completed run rather than that not-yet-created temporary file.
+    """
+
+    path = settings.data_dir / SYSTEM_AUDIT_LATEST_FILE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    checked_at = _parse_utc_datetime(payload.get("checked_at"))
+    if checked_at is None or str(payload.get("status") or "").lower() in {
+        "warming",
+        "deferred",
+    }:
+        return None
+    return checked_at, payload
+
+
+def _cached_required_audit_card(key: str) -> dict[str, Any] | None:
+    """Reuse a recent completed required card without repeating its DB scan."""
+
+    snapshot = _load_canonical_audit_snapshot()
+    if snapshot is None:
+        return None
+    checked_at, payload = snapshot
+    age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
+    if age_seconds > REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+    cards = payload.get("cards") if isinstance(payload.get("cards"), list) else []
+    card = next(
+        (
+            item
+            for item in cards
+            if isinstance(item, dict) and str(item.get("key") or "") == key
+        ),
+        None,
+    )
+    if not isinstance(card, dict):
+        return None
+    cached = copy.deepcopy(card)
+    details = cached.setdefault("details", {})
+    if isinstance(details, dict):
+        details["report_source"] = "persisted_audit"
+        details["report_age_seconds"] = round(age_seconds, 3)
+        details["report_max_age_seconds"] = REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS
+    return cached
+
+
 def _store_latest_audit_snapshot(payload: dict[str, Any]) -> None:
     path = _latest_audit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6550,6 +6613,24 @@ def _append_history_record(payload: dict[str, Any], *, source: str) -> None:
     path.write_text(text + "\n", encoding="utf-8")
 
 
+async def _run_required_audit(
+    key: str,
+    factory: Any,
+) -> dict[str, Any]:
+    """Serve a recent required card or run the bounded live audit once."""
+
+    cached = _cached_required_audit_card(key)
+    if cached is not None:
+        return cached
+    result = await _audit_maybe_async(
+        factory,
+        timeout_seconds=_system_audit_section_timeout_seconds(key),
+    )
+    if not isinstance(result, dict):
+        return result
+    return result
+
+
 async def collect_system_audit_status(
     *, record_history: bool = True, source: str = "api"
 ) -> dict[str, Any]:
@@ -6579,14 +6660,23 @@ async def _collect_system_audit_status_unlocked(
         ("strategy_closed_loop", _strategy_closed_loop_audit),
         ("strategy_signal_root_cause", _strategy_signal_root_cause_audit),
         ("production_source_health", _production_source_health_audit),
-        ("model_training", _model_training_audit),
+        (
+            "model_training",
+            lambda: _run_required_audit("model_training", _model_training_audit),
+        ),
         ("model_expert_health", _model_expert_health_audit),
         ("model_expert_competition", _model_expert_competition_audit),
         ("high_risk_review_audit", _high_risk_review_audit),
         ("crypto_feature_coverage", _crypto_feature_coverage_audit),
         ("shadow_missed_opportunity", _shadow_missed_opportunity_audit),
         ("strong_opportunity", _strong_opportunity_audit),
-        ("position_capacity_release", _position_capacity_release_audit),
+        (
+            "position_capacity_release",
+            lambda: _run_required_audit(
+                "position_capacity_release",
+                _position_capacity_release_audit,
+            ),
+        ),
         ("trade_execution_contract", _trade_execution_contract_audit),
         (
             "strategy_gate_contract",
@@ -6595,16 +6685,30 @@ async def _collect_system_audit_status_unlocked(
         ("visible_text_encoding", lambda: asyncio.to_thread(_source_visible_text_audit)),
         ("runtime_text_integrity", _runtime_text_integrity_audit),
     ]
-    priority_specs = [(key, factory) for key, factory in audit_specs if key in PRIORITY_AUDIT_KEYS]
+    required_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in REQUIRED_AUDIT_KEYS
+    ]
+    priority_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in PRIORITY_AUDIT_KEYS and key not in REQUIRED_AUDIT_KEYS
+    ]
     heavy_specs = [
         (key, factory)
         for key, factory in audit_specs
-        if key in HEAVY_AUDIT_KEYS and key not in PRIORITY_AUDIT_KEYS
+        if key in HEAVY_AUDIT_KEYS
+        and key not in PRIORITY_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
     ]
     db_specs = [
         (key, factory)
         for key, factory in audit_specs
-        if key in DB_AUDIT_KEYS and key not in PRIORITY_AUDIT_KEYS and key not in HEAVY_AUDIT_KEYS
+        if key in DB_AUDIT_KEYS
+        and key not in PRIORITY_AUDIT_KEYS
+        and key not in HEAVY_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
     ]
     regular_specs = [
         (key, factory)
@@ -6612,14 +6716,21 @@ async def _collect_system_audit_status_unlocked(
         if key not in PRIORITY_AUDIT_KEYS
         and key not in HEAVY_AUDIT_KEYS
         and key not in DB_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
     ]
     section_timings: dict[str, float] = {}
     result_by_key: dict[str, dict[str, Any] | Exception] = {}
-    # Every audit group is read-only. Start groups together so a slow preflight
-    # or database report cannot hold the rest of the snapshot behind it; each
-    # group still keeps its own cap, while one global gate protects the shared
-    # database pool from cross-group contention.
+    # Required cards run first. The remaining groups are read-only and can run
+    # together behind the same bounded gate without delaying the go/no-go
+    # inputs. This avoids presenting queue contention as a missing audit.
     shared_semaphore = asyncio.Semaphore(SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY)
+    required_result = await _run_audit_specs(
+        required_specs,
+        max_concurrency=REQUIRED_AUDIT_MAX_CONCURRENCY,
+        shared_semaphore=shared_semaphore,
+        timings=section_timings,
+        deadline=collection_deadline,
+    )
     priority_result, db_result, regular_result, heavy_result = await asyncio.gather(
         _run_audit_specs(
             priority_specs,
@@ -6650,6 +6761,7 @@ async def _collect_system_audit_status_unlocked(
             deadline=collection_deadline,
         ),
     )
+    result_by_key.update(required_result)
     result_by_key.update(priority_result)
     result_by_key.update(db_result)
     result_by_key.update(regular_result)
@@ -6711,6 +6823,7 @@ async def _collect_system_audit_status_unlocked(
                     sorted(section_timings.items(), key=lambda item: item[1], reverse=True)
                 ),
                 "group_concurrency": {
+                    "required": REQUIRED_AUDIT_MAX_CONCURRENCY,
                     "priority": SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY,
                     "database": SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
                     "regular": SYSTEM_AUDIT_MAX_CONCURRENCY,

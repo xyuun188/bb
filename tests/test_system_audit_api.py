@@ -25,6 +25,50 @@ def test_okx_reconciliation_dashboard_scan_capacity_covers_current_history() -> 
     assert system_audit.OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS >= 2000
 
 
+def test_required_audit_card_reuses_recent_completed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(seconds=15)
+    monkeypatch.setattr(
+        system_audit,
+        "_load_canonical_audit_snapshot",
+        lambda: (
+            checked_at,
+            {
+                "status": "ok",
+                "checked_at": checked_at.isoformat(),
+                "cards": [
+                    {
+                        "key": "model_training",
+                        "status": "ok",
+                        "details": {"optimization_target": "fee_after_return"},
+                    }
+                ],
+            },
+        ),
+    )
+
+    card = system_audit._cached_required_audit_card("model_training")
+
+    assert card is not None
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "persisted_audit"
+    assert card["details"]["report_age_seconds"] >= 15
+
+
+def test_required_audit_card_does_not_reuse_deferred_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC)
+    monkeypatch.setattr(
+        system_audit,
+        "_load_canonical_audit_snapshot",
+        lambda: None,
+    )
+
+    assert system_audit._cached_required_audit_card("position_capacity_release") is None
+
+
 def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> None:
     payload = {
         "status": "warning",

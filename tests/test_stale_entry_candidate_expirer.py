@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import services.stale_entry_candidate_expirer as stale_expirer_module
 from services.decision_state import (
     DecisionStage,
     DecisionStageStatus,
@@ -15,6 +16,7 @@ from services.decision_state import (
 from services.stale_entry_candidate_expirer import (
     STALE_ENTRY_MAINTENANCE_BATCH_LIMIT,
     STALE_ENTRY_MAINTENANCE_LOOKBACK,
+    STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS,
     StaleEntryCandidateExpirer,
     _stale_entry_row_from_mapping,
     action_label,
@@ -32,6 +34,25 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+@pytest.mark.asyncio
+async def test_expire_skips_database_scan_during_maintenance_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now_monotonic = 100.0
+    expirer = StaleEntryCandidateExpirer(_float)
+    expirer._last_completed_monotonic = (
+        now_monotonic - STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS + 0.1
+    )
+    monkeypatch.setattr(stale_expirer_module, "monotonic", lambda: now_monotonic)
+
+    def unexpected_session() -> Any:
+        raise AssertionError("maintenance cooldown should avoid opening a database session")
+
+    monkeypatch.setattr(stale_expirer_module, "get_session_ctx", unexpected_session)
+
+    assert await expirer.expire() == 0
 
 
 def _row(

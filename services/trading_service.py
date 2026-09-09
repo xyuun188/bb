@@ -5407,7 +5407,12 @@ class TradingService:
             # final AI/entry gates still require complete current evidence.
             "allow_cached_indicator_build": True,
             "allow_indicator_background_refresh": not market_only,
-            "allow_derivatives_background_refresh": not market_only,
+            # Market-only discovery consumes orderbook/mark-price facts during
+            # the final quality gate. Keep their bounded two-worker refresh
+            # alive even when the foreground scan is cache-only; otherwise a
+            # cold or expired derivatives cache can keep every candidate at
+            # zero depth indefinitely.
+            "allow_derivatives_background_refresh": True,
         }
 
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:

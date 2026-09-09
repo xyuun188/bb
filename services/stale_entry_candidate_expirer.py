@@ -6,8 +6,9 @@ import contextlib
 import copy
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any
 
@@ -40,6 +41,7 @@ logger = structlog.get_logger(__name__)
 ENTRY_PENDING_EXECUTION_MAX_SECONDS = 45.0
 STALE_ENTRY_MAINTENANCE_BATCH_LIMIT = 250
 STALE_ENTRY_MAINTENANCE_LOOKBACK = timedelta(hours=24)
+STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS = 60.0
 _STALE_ENTRY_RAW_COLUMN_PREFIX = "stale_entry_raw__"
 PENDING_EXECUTION_PREFIXES = (
     "正在提交 OKX",
@@ -227,9 +229,19 @@ class StaleEntryCandidateExpirer:
     """Clear stale entry candidates that can otherwise suppress fresh entries."""
 
     float_parser: FloatParser
+    _last_completed_monotonic: float | None = field(default=None, init=False, repr=False)
 
     async def expire(self) -> int:
         """Expire one bounded batch without retaining a session during evaluation."""
+
+        current_monotonic = monotonic()
+        last_completed_monotonic = self._last_completed_monotonic
+        if (
+            last_completed_monotonic is not None
+            and current_monotonic - last_completed_monotonic
+            < STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS
+        ):
+            return 0
 
         now = datetime.utcnow()
         maintenance_since = now - STALE_ENTRY_MAINTENANCE_LOOKBACK
@@ -321,6 +333,10 @@ class StaleEntryCandidateExpirer:
         except Exception as exc:
             logger.warning("failed to expire stale entry candidates", error=safe_error_text(exc))
             return 0
+        finally:
+            # A failed maintenance pass must also cool down; otherwise a
+            # database or serialization failure can be retried every loop.
+            self._last_completed_monotonic = monotonic()
 
     async def _persist_postgres_updates(self, session: Any, updates: dict[int, Any]) -> None:
         """Patch terminal state in PostgreSQL without fetching large decision JSON."""
