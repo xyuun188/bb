@@ -31,6 +31,29 @@ _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 
 
+class HighRiskReviewGatewayError(RuntimeError):
+    """Provider/network failure with an explicit audit category."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+class HighRiskReviewSchemaError(ValueError):
+    """Reachable provider response that violates the review JSON contract."""
+
+    category = "invalid_schema"
+
+
 @dataclass(frozen=True)
 class HighRiskReviewResult:
     """Parsed result returned by the online high-risk reviewer."""
@@ -145,6 +168,7 @@ class HighRiskReviewService:
         attempts: list[dict[str, Any]] = []
         content = ""
         metadata: dict[str, Any] = {}
+        last_gateway_error: HighRiskReviewGatewayError | None = None
         attempt_specs: list[dict[str, Any]] = [
             {
                 "messages": self._primary_messages(prompt),
@@ -167,15 +191,31 @@ class HighRiskReviewService:
                     "high-risk review exceeded total timeout before a usable response"
                 )
             max_tokens = int(cast(int, attempt["max_tokens"]))
-            _payload, content, metadata = await self.call_model(
-                api_base=api_base,
-                api_key=api_key,
-                model=model,
-                messages=cast(list[dict[str, str]], attempt["messages"]),
-                use_json_mode=bool(attempt["use_json_mode"]),
-                max_tokens=max_tokens,
-                request_timeout=min(request_timeout, remaining_timeout),
-            )
+            try:
+                _payload, content, metadata = await self.call_model(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model=model,
+                    messages=cast(list[dict[str, str]], attempt["messages"]),
+                    use_json_mode=bool(attempt["use_json_mode"]),
+                    max_tokens=max_tokens,
+                    request_timeout=min(request_timeout, remaining_timeout),
+                )
+            except HighRiskReviewGatewayError as exc:
+                last_gateway_error = exc
+                attempts.append(
+                    {
+                        "attempt": attempt_no,
+                        "json_mode": bool(attempt["use_json_mode"]),
+                        "max_tokens": max_tokens,
+                        "content_present": False,
+                        "error_category": exc.category,
+                        "status_code": exc.status_code,
+                    }
+                )
+                if not exc.retryable or attempt_no >= len(attempt_specs):
+                    raise
+                continue
             attempts.append(
                 {
                     "attempt": attempt_no,
@@ -192,25 +232,33 @@ class HighRiskReviewService:
                 break
 
         if not content:
+            if last_gateway_error is not None:
+                raise last_gateway_error
             finish_reason = metadata.get("finish_reason") or "unknown"
-            raise ValueError(f"模型两次都没有返回可解析 JSON，finish_reason={finish_reason}")
+            raise HighRiskReviewGatewayError(
+                f"模型两次都没有返回可解析 JSON，finish_reason={finish_reason}",
+                category="empty_response",
+            )
 
-        parsed_raw = json.loads(content)
+        try:
+            parsed_raw = json.loads(content)
+        except (TypeError, ValueError) as exc:
+            raise HighRiskReviewSchemaError("模型返回的内容不是有效 JSON") from exc
         if not isinstance(parsed_raw, dict):
-            raise ValueError("模型返回的 JSON 不是对象")
+            raise HighRiskReviewSchemaError("模型返回的 JSON 不是对象")
         parsed = cast(dict[str, Any], parsed_raw)
         approved = parsed.get("approved")
         confidence = parsed.get("confidence")
         reason = parsed.get("reason")
         if type(approved) is not bool:
-            raise ValueError("模型返回的 approved 必须是 boolean")
+            raise HighRiskReviewSchemaError("模型返回的 approved 必须是 boolean")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-            raise ValueError("模型返回的 confidence 必须是 0 到 1 的数字")
+            raise HighRiskReviewSchemaError("模型返回的 confidence 必须是 0 到 1 的数字")
         confidence_value = float(confidence)
         if not math.isfinite(confidence_value) or not 0.0 <= confidence_value <= 1.0:
-            raise ValueError("模型返回的 confidence 必须位于 0 到 1")
+            raise HighRiskReviewSchemaError("模型返回的 confidence 必须位于 0 到 1")
         if not isinstance(reason, str):
-            raise ValueError("模型返回的 reason 必须是字符串")
+            raise HighRiskReviewSchemaError("模型返回的 reason 必须是字符串")
         self.record_success()
         return HighRiskReviewResult(
             approved=approved,
@@ -260,9 +308,17 @@ class HighRiskReviewService:
                     headers={"Authorization": f"Bearer {api_key}"},
                     json=request_body,
                 )
+        except httpx.TimeoutException as exc:
+            raise HighRiskReviewGatewayError(
+                f"high-risk review request timed out: {safe_error_text(exc)}",
+                category="timeout",
+                retryable=True,
+            ) from exc
         except httpx.RequestError as exc:
-            raise RuntimeError(
-                f"high-risk review request could not reach the service: {safe_error_text(exc)}"
+            raise HighRiskReviewGatewayError(
+                f"high-risk review request could not reach the service: {safe_error_text(exc)}",
+                category="network_error",
+                retryable=True,
             ) from exc
         payload = self._parse_response(response)
         content, metadata = self.extract_content(payload)
@@ -280,13 +336,31 @@ class HighRiskReviewService:
                 message = f"high-risk review request failed with HTTP {response.status_code}"
             if detail:
                 message = f"{message}: {detail}"
-            raise RuntimeError(message)
+            category = (
+                "rate_limited"
+                if response.status_code == 429
+                else "provider_server_error"
+                if response.status_code >= 500
+                else "provider_http_error"
+            )
+            raise HighRiskReviewGatewayError(
+                message,
+                category=category,
+                status_code=response.status_code,
+                retryable=response.status_code == 429 or response.status_code >= 500,
+            )
         try:
             parsed = response.json()
         except ValueError as exc:
-            raise RuntimeError("high-risk review request returned invalid JSON") from exc
+            raise HighRiskReviewGatewayError(
+                "high-risk review request returned invalid JSON",
+                category="invalid_json",
+            ) from exc
         if not isinstance(parsed, Mapping):
-            raise RuntimeError("high-risk review request returned a non-object JSON payload")
+            raise HighRiskReviewGatewayError(
+                "high-risk review request returned a non-object JSON payload",
+                category="invalid_payload",
+            )
         return dict(parsed)
 
     def _response_error_excerpt(self, response: httpx.Response) -> str:

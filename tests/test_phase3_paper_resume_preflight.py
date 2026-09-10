@@ -323,6 +323,55 @@ def test_phase3_paper_resume_preflight_accepts_healthy_external_decision_route()
     }
 
 
+def test_phase3_paper_resume_preflight_blocks_unverified_target_topology_even_if_legacy_models_are_healthy() -> None:
+    model_server = _model_server_ready()
+    model_server["target_model_topology"] = {
+        "model_id": "qwen3.8-27b-unverified",
+        "stage": "candidate_not_configured",
+        "activation_blocked": True,
+        "identity_complete": False,
+        "local_model_count_target": 1,
+        "blockers": ["candidate_model_identity_unverified"],
+    }
+    report = evaluate_phase3_paper_resume_preflight_inputs(
+        **_ready_inputs(
+            model_server_readiness=model_server,
+            platform_runtime=_platform_runtime_ready_with_models(),
+        )
+    )
+    assert report["status"] == "blocked"
+    assert report["can_resume_paper"] is False
+    assert "phase3_target_model_topology_not_ready" in {
+        item["code"] for item in report["blockers"]
+    }
+
+
+def test_phase3_paper_resume_preflight_accepts_verified_paper_target_only_when_endpoint_matches() -> None:
+    model_server = _model_server_ready()
+    model_server["target_model_topology"] = {
+        "model_id": "qwen3.8-27b-awq",
+        "stage": "paper",
+        "activation_blocked": False,
+        "identity_complete": True,
+        "local_model_count_target": 1,
+        "blockers": [],
+    }
+    runtime = _platform_runtime_ready()
+    runtime["ai_models"] = [
+        {
+            "name": "decision_maker",
+            "model": "qwen3.8-27b-awq",
+            "available": True,
+            "models": ["qwen3.8-27b-awq"],
+        }
+    ]
+    report = evaluate_phase3_paper_resume_preflight_inputs(
+        **_ready_inputs(model_server_readiness=model_server, platform_runtime=runtime)
+    )
+    assert report["status"] == "ready"
+    assert report["can_resume_paper"] is True
+
+
 def test_phase3_paper_resume_preflight_blocks_stale_specialist_report() -> None:
     specialist = _specialist_ready()
     specialist["generated_at"] = "2026-06-27T00:00:00+00:00"

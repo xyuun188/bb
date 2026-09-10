@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 TopologyStage = Literal[
     "legacy_shadow",
@@ -41,6 +41,26 @@ class ModelServiceSpec:
             for value in (self.model_id, self.repo_id, self.revision, self.path)
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a secret-free, stable representation for audits and APIs."""
+
+        return {
+            "model_id": self.model_id,
+            "role": self.role,
+            "repo_id": self.repo_id,
+            "revision": self.revision,
+            "path": self.path,
+            "endpoint": self.endpoint,
+            "port": self.port,
+            "tokenizer": self.tokenizer,
+            "context_length": self.context_length,
+            "max_concurrency": self.max_concurrency,
+            "gpu_memory_budget_gib": self.gpu_memory_budget_gib,
+            "stage": self.stage,
+            "identity_complete": self.identity_complete,
+            "live_routing_enabled": self.live_routing_enabled,
+        }
+
 
 @dataclass(frozen=True)
 class ModelTopology:
@@ -55,6 +75,21 @@ class ModelTopology:
 
     def by_role(self, role: str) -> ModelServiceSpec | None:
         return next((model for model in self.models if model.role == role), None)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the topology contract without credentials or runtime secrets."""
+
+        return {
+            "models": [model.to_dict() for model in self.models],
+            "quant_api_port": self.quant_api_port,
+            "cloud_reviewer_enabled": self.cloud_reviewer_enabled,
+            "cloud_reviewer_required_for_high_risk_entry": (
+                self.cloud_reviewer_required_for_high_risk_entry
+            ),
+            "local_model_count_target": self.local_model_count_target,
+            "live_routing_enabled": self.live_routing_enabled,
+            "validation_errors": list(self.validate()),
+        }
 
     def validate(self) -> tuple[str, ...]:
         errors: list[str] = []

@@ -29,6 +29,7 @@ from core.phase3_model_contract import (
     PHASE3_PLATFORM_ENDPOINTS,
     PHASE3_QUANT_API_ID,
     PHASE3_RISK_MODEL_ID,
+    PHASE3_TARGET_MODEL_TOPOLOGY,
 )
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
@@ -776,6 +777,7 @@ def collect_platform_server_status() -> dict[str, Any]:
             "memory": _platform_memory_snapshot(),
             "disks": [root_disk],
             "services": services,
+            "target_model_topology": PHASE3_TARGET_MODEL_TOPOLOGY.to_dict(),
         }
     except Exception as exc:
         return {
@@ -1076,6 +1078,7 @@ def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict
         ),
     )
     return {
+        "target_model_topology": PHASE3_TARGET_MODEL_TOPOLOGY.to_dict(),
         "vllm": dict(primary),
         "vllm_endpoints": endpoint_rows,
         "local_ai_tools": {
@@ -1553,6 +1556,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         "ai_models": ai_rows,
         "local_ai_tools": local_tools,
         "model_tunnels": _platform_model_tunnel_summary(ai_rows, local_tools),
+        "target_model_topology": PHASE3_TARGET_MODEL_TOPOLOGY.to_dict(),
         "checked_at": datetime.now(UTC).isoformat(),
     }
 

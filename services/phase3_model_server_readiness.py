@@ -124,6 +124,7 @@ def _target_topology_report() -> dict[str, Any]:
         "repo_id": model.repo_id,
         "revision": model.revision,
         "path": model.path,
+        "identity_complete": model.identity_complete,
         "context_length": model.context_length,
         "max_concurrency": model.max_concurrency,
         "gpu_memory_budget_gib": model.gpu_memory_budget_gib,

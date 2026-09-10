@@ -100,7 +100,28 @@ def _warning(code: str, message: str, *, evidence: Any | None = None) -> dict[st
     return item
 
 
-def _platform_model_runtime_ready(runtime: dict[str, Any]) -> bool:
+def _target_model_topology(model_server: dict[str, Any]) -> dict[str, Any]:
+    target = model_server.get("target_model_topology")
+    return target if isinstance(target, dict) else {}
+
+
+def _target_model_identity(model_server: dict[str, Any]) -> str:
+    target = _target_model_topology(model_server)
+    model_id = str(target.get("model_id") or "").strip().lower()
+    if not model_id or bool(target.get("activation_blocked")):
+        return ""
+    if str(target.get("stage") or "").strip().lower() not in {"paper", "live"}:
+        return ""
+    if not bool(target.get("identity_complete")):
+        return ""
+    return model_id
+
+
+def _platform_model_runtime_ready(
+    runtime: dict[str, Any],
+    *,
+    target_model_id: str = "",
+) -> bool:
     rows = [
         item for item in _safe_list(runtime.get("ai_models")) if isinstance(item, dict)
     ]
@@ -119,6 +140,22 @@ def _platform_model_runtime_ready(runtime: dict[str, Any]) -> bool:
             served_text = str(served or "").strip().lower()
             if served_text:
                 available.add(served_text)
+    if target_model_id:
+        for row in rows:
+            if not bool(row.get("available")) or str(row.get("name") or "").strip().lower() != "decision_maker":
+                continue
+            candidates = {
+                str(row.get("model") or "").strip().lower(),
+                *{
+                    str(value or "").strip().lower()
+                    for value in _safe_list(row.get("models"))
+                    if str(value or "").strip()
+                },
+            }
+            if target_model_id in candidates:
+                return True
+        return False
+
     if required.issubset(available):
         return True
 
@@ -309,7 +346,54 @@ def evaluate_phase3_paper_resume_preflight_inputs(
     else:
         passed.append("okx_account_equity_truth_available")
 
-    platform_model_runtime_ready = _platform_model_runtime_ready(runtime)
+    target_topology = _target_model_topology(model_server)
+    target_model_id = _target_model_identity(model_server)
+    topology_blockers: list[dict[str, Any]] = []
+    if "target_model_topology" in model_server and not target_topology:
+        topology_blockers.append(
+            _blocker(
+                "phase3_target_model_topology_missing",
+                "The target one-model topology contract is missing from model-server readiness.",
+            )
+        )
+    elif target_topology:
+        topology_stage = str(target_topology.get("stage") or "").strip().lower()
+        target_blockers = _safe_list(target_topology.get("blockers"))
+        if bool(target_topology.get("activation_blocked")) or not target_model_id:
+            topology_blockers.append(
+                _blocker(
+                    "phase3_target_model_topology_not_ready",
+                    "The verified single local target model is not ready for paper trading.",
+                    evidence={
+                        "model_id": target_topology.get("model_id"),
+                        "stage": topology_stage,
+                        "activation_blocked": target_topology.get("activation_blocked"),
+                        "blockers": target_blockers[:8],
+                    },
+                )
+            )
+        elif topology_stage != "paper":
+            topology_blockers.append(
+                _blocker(
+                    "phase3_target_model_not_in_paper_stage",
+                    "The target model identity is verified but has not completed paper-stage activation.",
+                    evidence={"model_id": target_model_id, "stage": topology_stage},
+                )
+            )
+        elif _safe_int(target_topology.get("local_model_count_target"), 1) != 1:
+            topology_blockers.append(
+                _blocker(
+                    "phase3_target_model_count_contract_invalid",
+                    "The target topology must contain exactly one local production model.",
+                    evidence={"local_model_count_target": target_topology.get("local_model_count_target")},
+                )
+            )
+    blockers.extend(topology_blockers)
+
+    platform_model_runtime_ready = _platform_model_runtime_ready(
+        runtime,
+        target_model_id=target_model_id,
+    )
     if not bool(model_server.get("runtime_ready")):
         if platform_model_runtime_ready:
             warnings.append(

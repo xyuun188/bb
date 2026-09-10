@@ -301,6 +301,8 @@ class EntryHighRiskReviewGatePolicy:
                 "status": "error_blocked",
                 "approved": False,
                 "error_code": "reviewer_call_failed",
+                "error_category": str(getattr(exc, "category", "reviewer_call_failed") or "reviewer_call_failed"),
+                "provider_status_code": getattr(exc, "status_code", None),
                 "error": error_text,
                 "input_fingerprint": fingerprint,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),

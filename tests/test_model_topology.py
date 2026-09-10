@@ -34,3 +34,13 @@ def test_verified_candidate_is_single_local_model_and_never_live_by_accident():
     assert topology.models[0].stage == "paper"
     assert topology.live_routing_enabled is False
     assert topology.validate() == ()
+
+
+def test_topology_serialization_exposes_identity_and_validation_without_secrets():
+    topology = qwen27_candidate_topology()
+    payload = topology.to_dict()
+    assert payload["local_model_count_target"] == 1
+    assert payload["models"][0]["model_id"] == "qwen3.8-27b-unverified"
+    assert payload["models"][0]["identity_complete"] is False
+    assert payload["validation_errors"] == []
+    assert "api_key" not in str(payload).lower()

@@ -10,7 +10,10 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.model_runtime import HIGH_RISK_REVIEW_TOKEN_CAP
 from services.entry_high_risk_review import EntryHighRiskReviewGatePolicy
-from services.high_risk_review_service import HighRiskReviewService
+from services.high_risk_review_service import (
+    HighRiskReviewGatewayError,
+    HighRiskReviewService,
+)
 
 
 @pytest.fixture
@@ -302,6 +305,63 @@ def test_high_risk_review_auth_failure_is_redacted() -> None:
     assert "HIGH_RISK_REVIEW_API_KEY" in message
     assert leaked_value not in message
     assert "Authorization: ***" in message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "category", "retryable"),
+    [(429, "rate_limited", True), (500, "provider_server_error", True), (400, "provider_http_error", False)],
+)
+def test_high_risk_review_gateway_classifies_provider_http_failures(
+    status_code: int,
+    category: str,
+    retryable: bool,
+) -> None:
+    response = httpx.Response(
+        status_code,
+        json={"error": "provider failure"},
+        request=httpx.Request("POST", "https://review.example.invalid/v1/chat/completions"),
+    )
+    with pytest.raises(HighRiskReviewGatewayError) as exc_info:
+        HighRiskReviewService()._parse_response(response)
+    assert exc_info.value.category == category
+    assert exc_info.value.retryable is retryable
+    assert exc_info.value.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_high_risk_review_retries_retryable_gateway_failure_with_shared_budget(
+    high_risk_settings: None,
+) -> None:
+    class RetryReviewer(HighRiskReviewService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def call_model(self, **_kwargs: Any) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            self.calls += 1
+            if self.calls == 1:
+                raise HighRiskReviewGatewayError(
+                    "provider busy",
+                    category="provider_server_error",
+                    status_code=503,
+                    retryable=True,
+                )
+            return (
+                {},
+                '{"approved": false, "confidence": 0.8, "reason": "风险过高"}',
+                {"finish_reason": "stop"},
+            )
+
+    reviewer = RetryReviewer()
+    result = await reviewer.review_trade(
+        {"symbol": "BTC/USDT", "side": "long"},
+        api_base="https://review.example.invalid/v1",
+        api_key="review-key",
+        model="review-model",
+    )
+    assert reviewer.calls == 2
+    assert result.approved is False
+    assert result.attempts[0]["error_category"] == "provider_server_error"
 
 
 def test_high_risk_review_circuit_payload_exposes_redacted_last_failure(
