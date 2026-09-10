@@ -103,3 +103,29 @@ async def test_dashboard_route_reads_cache_without_building(monkeypatch, tmp_pat
     monkeypatch.setattr(dashboard, "apply_report_filters", lambda report, **_: report)
     result = await dashboard.get_training_effectiveness_report(mode="all")
     assert result["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_route_exposes_failure_sidecar_without_overwriting_valid_report(monkeypatch):
+    from web_dashboard.api import dashboard
+
+    valid = {
+        "status": "complete",
+        "metrics": {"observed": {"sample_count": 2}},
+        "freshness": {"is_stale": False},
+    }
+    failure = {
+        "status": "generation_failed",
+        "report_id": "te-failed",
+        "generated_at": "2026-09-11T00:00:00Z",
+        "sample_quality": {"load_error_code": "generation_timeout"},
+    }
+    monkeypatch.setattr(dashboard, "load_cached_training_effectiveness_report", lambda **_: valid)
+    monkeypatch.setattr(dashboard, "load_generation_failure_report", lambda **_: failure)
+    monkeypatch.setattr(dashboard, "apply_report_filters", lambda report, **_: report)
+
+    result = await dashboard.get_training_effectiveness_report(mode="all")
+
+    assert result["status"] == "complete"
+    assert result["metrics"]["observed"]["sample_count"] == 2
+    assert result["generation_failure"]["error_code"] == "generation_timeout"

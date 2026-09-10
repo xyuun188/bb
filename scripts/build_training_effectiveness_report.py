@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -21,7 +20,9 @@ from config.settings import settings  # noqa: E402
 from services.training_effectiveness_report import (  # noqa: E402
     TRAINING_EFFECTIVENESS_REPORT_VERSION,
     TrainingEffectivenessReportService,
+    build_generation_failed_report,
     build_input_fingerprint,
+    generation_failure_report_path,
     load_cached_training_effectiveness_report,
     report_directory,
 )  # noqa: E402
@@ -103,30 +104,47 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     started = time.monotonic()
     try:
+        generation_failed = False
         try:
             report = asyncio.run(_build(args, fingerprint))
         except TimeoutError:
-            now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            report = {
-                "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
-                "report_id": f"te-{fingerprint[7:19]}",
-                "generated_at": now,
-                "data_cutoff_at": args.end or now,
-                "status": "partial",
-                "input_fingerprint": fingerprint,
-                "run": {"run_id": args.run_id or fingerprint[7:19], "stage": args.stage},
-                "versions": {}, "filters": _freshness_inputs(args), "metrics": {},
-                "cost_attribution": {"gross_pnl": 0, "fee": 0, "slippage": 0, "funding_fee": 0, "fee_after_net_pnl": 0},
-                "expert_contributions": [], "execution_funnel": {}, "sample_quality": {},
-                "conclusion": {"promotion_eligible": False, "blocking_reasons": ["generation_timeout"]},
-                "freshness": {"state": "timeout", "is_stale": True},
-            }
+            generation_failed = True
+            report = build_generation_failed_report(
+                filters=_freshness_inputs(args),
+                run_id=args.run_id,
+                input_fingerprint=fingerprint,
+                error_code="generation_timeout",
+                stage=args.stage,
+            )
         report.setdefault("run", {})["stage"] = args.stage
         report.setdefault("run", {})["elapsed_seconds"] = round(time.monotonic() - started, 3)
         report_path = root / f"{report['report_id']}.json"
         _atomic_write(report_path, report)
-        _atomic_write(root / "latest.json", report)
-        print(json.dumps({"status": "written", "report_id": report.get("report_id"), "path": str(report_path), "input_fingerprint": fingerprint}))
+        if generation_failed:
+            failure_path = generation_failure_report_path(
+                data_dir=settings.data_dir,
+                mode=args.mode,
+            )
+            _atomic_write(failure_path, report)
+            print(
+                json.dumps(
+                    {
+                        "status": "generation_failed",
+                        "report_id": report.get("report_id"),
+                        "path": str(report_path),
+                        "failure_path": str(failure_path),
+                        "latest_preserved": True,
+                        "input_fingerprint": fingerprint,
+                    }
+                )
+            )
+        else:
+            _atomic_write(root / "latest.json", report)
+            generation_failure_report_path(
+                data_dir=settings.data_dir,
+                mode=args.mode,
+            ).unlink(missing_ok=True)
+            print(json.dumps({"status": "written", "report_id": report.get("report_id"), "path": str(report_path), "input_fingerprint": fingerprint}))
         return 0
     finally:
         _release_lock(lock_path, descriptor)

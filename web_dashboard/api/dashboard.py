@@ -90,7 +90,10 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_effectiveness_report import (
     TrainingEffectivenessReportService,
     apply_report_filters,
+    build_generation_failed_report,
+    generation_failure_report_path,
     load_cached_training_effectiveness_report,
+    load_generation_failure_report,
     report_directory,
 )
 from services.training_epoch import load_training_epoch_start
@@ -12625,9 +12628,21 @@ async def get_training_effectiveness_report(
     selected_mode = mode if mode in {"paper", "live"} else "all"
     cache_id = report_id or (None if selected_mode == "all" else f"latest-{selected_mode}")
     report = load_cached_training_effectiveness_report(report_id=cache_id)
+    if report_id is None:
+        failure = load_generation_failure_report(data_dir=settings.data_dir, mode=selected_mode)
+        if failure is not None:
+            report = dict(report)
+            report["generation_failure"] = {
+                "status": failure.get("status"),
+                "error_code": failure.get("sample_quality", {}).get("load_error_code"),
+                "generated_at": failure.get("generated_at"),
+                "report_id": failure.get("report_id"),
+            }
+            if report.get("status") in {"missing", "invalid"}:
+                report = failure
     refresh_state = "idle"
     if refresh and report_id is None and (
-        report.get("status") in {"missing", "partial", "invalid"}
+        report.get("status") in {"missing", "partial", "invalid", "generation_failed"}
         or report.get("freshness", {}).get("is_stale") is True
     ):
         global _training_effectiveness_generation_tasks
@@ -12682,7 +12697,39 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
                 handle.write("\n")
                 temporary = Path(handle.name)
             await asyncio.to_thread(temporary.replace, path)
+        failure_path = generation_failure_report_path(
+            data_dir=settings.data_dir,
+            mode=selected_mode,
+        )
+        await asyncio.to_thread(lambda: failure_path.unlink(missing_ok=True))
+    except TimeoutError:
+        report = build_generation_failed_report(
+            filters=filters,
+            error_code="generation_timeout",
+            stage="dashboard",
+        )
+        failure_path = generation_failure_report_path(data_dir=settings.data_dir, mode=selected_mode)
+        root = report_directory(settings.data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        await asyncio.to_thread(temporary.replace, failure_path)
     except Exception as exc:
+        report = build_generation_failed_report(
+            filters=filters,
+            error_code="generation_failed",
+            stage="dashboard",
+        )
+        failure_path = generation_failure_report_path(data_dir=settings.data_dir, mode=selected_mode)
+        root = report_directory(settings.data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        await asyncio.to_thread(temporary.replace, failure_path)
         logger.warning("training effectiveness report generation failed", error=safe_error_text(exc))
 
 

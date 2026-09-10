@@ -93,6 +93,93 @@ def build_input_fingerprint(inputs: Any) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def generation_failure_report_path(
+    *, data_dir: Path | None = None, mode: str = "all"
+) -> Path:
+    """Return the sidecar path used for the latest failed generation attempt."""
+
+    selected_mode = mode if mode in {"paper", "live"} else "all"
+    suffix = f"-{selected_mode}" if selected_mode != "all" else ""
+    return report_directory(data_dir) / f"latest{suffix}-generation-failed.json"
+
+
+def load_generation_failure_report(
+    *, data_dir: Path | None = None, mode: str = "all"
+) -> dict[str, Any] | None:
+    """Load the latest failure sidecar without mutating the valid report cache."""
+
+    path = generation_failure_report_path(data_dir=data_dir, mode=mode)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) and payload.get("status") == "generation_failed" else None
+
+
+def build_generation_failed_report(
+    *,
+    filters: dict[str, Any] | None = None,
+    run_id: str | None = None,
+    input_fingerprint: str | None = None,
+    error_code: str = "generation_failed",
+    stage: str = "baseline",
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Build an explicit failure artifact without inventing financial values."""
+
+    selected_filters = dict(filters or {})
+    generated = (generated_at or datetime.now(UTC)).replace(microsecond=0)
+    fingerprint = input_fingerprint or build_input_fingerprint(
+        {
+            "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
+            "filters": selected_filters,
+            "error_code": error_code,
+        }
+    )
+    report_token = (run_id or fingerprint[7:19]).replace("/", "-")
+    now = generated.isoformat().replace("+00:00", "Z")
+    return {
+        "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
+        "report_id": f"te-{report_token}-generation-failed",
+        "generated_at": now,
+        "data_cutoff_at": selected_filters.get("to") or now,
+        "status": "generation_failed",
+        "input_fingerprint": fingerprint,
+        "run": {"run_id": run_id or report_token, "stage": stage},
+        "versions": {},
+        "filters": selected_filters,
+        "metrics": {},
+        "cost_attribution": {
+            "known": False,
+            "gross_pnl": None,
+            "fee": None,
+            "slippage": None,
+            "funding_fee": None,
+            "realized_net_pnl": None,
+            "estimated_net_pnl": None,
+            "fee_after_net_pnl": None,
+            "net_basis": "unknown",
+        },
+        "expert_contributions": [],
+        "execution_funnel": {},
+        "sample_quality": {
+            "load_status": "generation_failed",
+            "load_error_code": error_code,
+            "valid_sample_count": None,
+        },
+        "conclusion": {
+            "promotion_eligible": False,
+            "blocking_reasons": [error_code],
+        },
+        "freshness": {
+            "state": "timeout"
+            if error_code in {"query_timeout", "generation_timeout"}
+            else "failed",
+            "is_stale": True,
+        },
+    }
+
+
 def calculate_fee_after_return(
     gross_pnl: Any,
     fee: Any,
@@ -234,29 +321,30 @@ def validate_report(report: dict[str, Any]) -> list[str]:
         errors.append("invalid:time_order")
     costs = report.get("cost_attribution")
     if isinstance(costs, dict):
-        gross = _finite_float(costs.get("gross_pnl"))
-        fee = _finite_float(costs.get("fee"))
-        slippage = _finite_float(costs.get("slippage"))
-        funding = _finite_float(costs.get("funding_fee"))
-        actual = _finite_float(costs.get("fee_after_net_pnl"), math.nan)
-        if costs.get("net_basis") == "authoritative_realized":
-            expected = _finite_float(costs.get("realized_net_pnl"), math.nan)
-            if math.isnan(expected) or math.isnan(actual) or not math.isclose(
-                actual, expected, abs_tol=1e-7
-            ):
-                errors.append("invalid:authoritative_net_pnl_equation")
-        elif costs.get("net_basis") == "mixed_authoritative_and_estimated":
-            expected = _finite_float(costs.get("realized_net_pnl"), math.nan) + _finite_float(
-                costs.get("estimated_net_pnl"), math.nan
-            )
-            if math.isnan(expected) or math.isnan(actual) or not math.isclose(
-                actual, expected, abs_tol=1e-7
-            ):
-                errors.append("invalid:mixed_net_pnl_equation")
-        else:
-            expected = calculate_fee_after_return(gross, fee, slippage, funding)
-            if math.isnan(actual) or not math.isclose(actual, expected, abs_tol=1e-7):
-                errors.append("invalid:cost_attribution_equation")
+        if costs.get("known") is not False and costs.get("net_basis") != "unknown":
+            gross = _finite_float(costs.get("gross_pnl"))
+            fee = _finite_float(costs.get("fee"))
+            slippage = _finite_float(costs.get("slippage"))
+            funding = _finite_float(costs.get("funding_fee"))
+            actual = _finite_float(costs.get("fee_after_net_pnl"), math.nan)
+            if costs.get("net_basis") == "authoritative_realized":
+                expected = _finite_float(costs.get("realized_net_pnl"), math.nan)
+                if math.isnan(expected) or math.isnan(actual) or not math.isclose(
+                    actual, expected, abs_tol=1e-7
+                ):
+                    errors.append("invalid:authoritative_net_pnl_equation")
+            elif costs.get("net_basis") == "mixed_authoritative_and_estimated":
+                expected = _finite_float(costs.get("realized_net_pnl"), math.nan) + _finite_float(
+                    costs.get("estimated_net_pnl"), math.nan
+                )
+                if math.isnan(expected) or math.isnan(actual) or not math.isclose(
+                    actual, expected, abs_tol=1e-7
+                ):
+                    errors.append("invalid:mixed_net_pnl_equation")
+            else:
+                expected = calculate_fee_after_return(gross, fee, slippage, funding)
+                if math.isnan(actual) or not math.isclose(actual, expected, abs_tol=1e-7):
+                    errors.append("invalid:cost_attribution_equation")
     return list(dict.fromkeys(errors))
 
 

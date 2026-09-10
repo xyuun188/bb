@@ -4610,11 +4610,17 @@ function renderTrainingEffectivenessFreshness(report) {
     if (!element) return;
     const available = trainingEffectivenessAvailable(report);
     const generating = report.refresh_state === 'running';
+    const failure = report.generation_failure || (report.status === 'generation_failed' ? report : null);
     element.className = `training-effectiveness-status ${available ? 'complete' : (report.status || 'missing')}`;
-    const statusDetail = generating
+    const statusDetail = failure && !generating
+        ? `本次读取失败（${escHtml(failure.error_code || failure.sample_quality?.load_error_code || 'generation_failed')}），${report.metrics ? '页面保留上一份有效报告' : '当前没有可用报告'}`
+        : generating
         ? '正在读取成交数据，完成后自动刷新'
         : `更新 ${escHtml(report.generated_at || '未生成')} · 数据截止 ${escHtml(report.data_cutoff_at || '无数据')}`;
-    element.innerHTML = `<strong>${available ? '报告完整' : (generating ? '正在生成报告' : '暂无完整报告')}</strong><span>${statusDetail}</span>`;
+    const statusLabel = failure && !generating
+        ? '成交数据读取失败'
+        : (available ? '报告完整' : (generating ? '正在生成报告' : '暂无完整报告'));
+    element.innerHTML = `<strong>${statusLabel}</strong><span>${statusDetail}</span>`;
 }
 
 function renderTrainingEffectivenessVersions(report) {

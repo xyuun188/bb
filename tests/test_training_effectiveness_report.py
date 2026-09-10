@@ -6,6 +6,7 @@ from services.training_effectiveness_report import (
     TrainingEffectivenessReportService,
     _aggregate_metrics,
     _build_observed_funnel,
+    build_generation_failed_report,
     build_input_fingerprint,
     calculate_fee_after_return,
     calculate_metric_delta,
@@ -81,6 +82,21 @@ def test_service_surfaces_authoritative_provider_failure_without_faking_zero_sam
     assert "sample_provider:query_failed" in report["conclusion"]["blocking_reasons"]
     assert report["sample_quality"]["load_status"] == "generation_failed"
     assert calls == ["registry"]
+
+
+def test_generation_failure_report_keeps_financial_values_unknown():
+    report = build_generation_failed_report(
+        filters={"mode": "all"},
+        run_id="timeout-run",
+        input_fingerprint="sha256:" + "2" * 64,
+        error_code="generation_timeout",
+    )
+    assert report["status"] == "generation_failed"
+    assert report["cost_attribution"]["known"] is False
+    assert report["cost_attribution"]["fee_after_net_pnl"] is None
+    assert report["conclusion"]["promotion_eligible"] is False
+    assert report["freshness"] == {"state": "timeout", "is_stale": True}
+    assert validate_report(report) == []
 
 
 def test_service_distinguishes_real_empty_result_from_provider_failure():
