@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.model_candidate_manifest import ModelCandidateManifest  # noqa: E402
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
@@ -40,6 +41,122 @@ QWEN_START_SCRIPT = "/data/trade_ai/scripts/start_qwen3_14b_trade.sh"
 RISK_START_SCRIPT = "/data/trade_ai/scripts/start_deepseek_r1_14b_risk.sh"
 EXPERT_GATEWAY_SCRIPT = "/data/BB/services/finquant_expert_gateway/gateway.py"
 SERVICE_MANIFEST = "/data/BB/manifests/phase3_model_service_manifest.json"
+TARGET_SERVICE = "bb-phase3-llm-target.service"
+TARGET_START_SCRIPT = "/data/BB/scripts/start_target_single_model.sh"
+
+
+def sh(value: str | int | float) -> str:
+    text = str(value)
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def target_service_manifest(candidate: ModelCandidateManifest) -> dict[str, object]:
+    """Render the only executable local-model service for the target profile."""
+
+    return {
+        "schema_version": 3,
+        "policy_id": "phase3_target_single_model.v1",
+        "phase3_root": "/data/BB",
+        "topology_profile": "target_single_model",
+        "candidate_manifest": "/data/BB/manifests/target_model_candidate.json",
+        "candidate_model_id": candidate.model_id,
+        "candidate_revision": candidate.revision,
+        "shadow_only": True,
+        "live_routing_enabled": False,
+        "services": [
+            {
+                "slot": "llm_decision_and_expert_carrier",
+                "role": "decision_and_expert_carrier",
+                "service_name": TARGET_SERVICE,
+                "served_model_name": candidate.model_id,
+                "model_dir": candidate.model_path,
+                "tokenizer_dir": candidate.tokenizer_path,
+                "port": 8000,
+                "max_model_len": candidate.context_length,
+                "max_num_seqs": candidate.max_concurrency,
+                "shadow_only": True,
+                "live_routing_enabled": False,
+            }
+        ],
+        "cloud_reviewer_required_for_high_risk_entry": True,
+        "can_start_trading": False,
+    }
+
+
+def _target_start_script(candidate: ModelCandidateManifest) -> str:
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        source /data/BB/env/phase3.env
+        export CUDA_VISIBLE_DEVICES=0
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+        exec /data/BB/envs/phase3-quant/bin/python -m vllm.entrypoints.openai.api_server \\
+          --host 127.0.0.1 \\
+          --port 8000 \\
+          --model {sh(candidate.model_path)} \\
+          --served-model-name {sh(candidate.model_id)} \\
+          --trust-remote-code \\
+          --tokenizer {sh(candidate.tokenizer_path)} \\
+          --max-model-len {candidate.context_length} \\
+          --gpu-memory-utilization 0.88 \\
+          --max-num-seqs {candidate.max_concurrency} \\
+          --tensor-parallel-size 1 >> /data/BB/logs/services/target-single-model.log 2>&1
+        """
+    )
+
+
+def render_target_migration(candidate: ModelCandidateManifest) -> str:
+    """Generate an explicit, fail-closed target migration command."""
+
+    manifest = json.dumps(target_service_manifest(candidate), ensure_ascii=False, indent=2, sort_keys=True)
+    manifest_block = textwrap.indent(manifest, "        ")
+    candidate_block = textwrap.indent(
+        json.dumps(candidate.to_dict(), ensure_ascii=False, indent=2, sort_keys=True), "        "
+    )
+    start_block = textwrap.indent(_target_start_script(candidate).rstrip(), "        ")
+    forbidden_names = " ".join(CONTROL_FORBIDDEN_SERVICES)
+    return textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        test -x /data/BB/envs/phase3-quant/bin/python
+        test -f /data/BB/env/phase3.env
+        test -d {sh(candidate.model_path)}
+        test -f {sh(candidate.model_path + '/config.json')}
+        test -d {sh(candidate.tokenizer_path)}
+        mkdir -p /data/BB/scripts /data/BB/logs/services /data/BB/manifests
+        cat > /data/BB/manifests/target_model_candidate.json <<'JSON'
+{candidate_block}
+        JSON
+        cat > {TARGET_START_SCRIPT} <<'SCRIPT'
+{start_block}
+        SCRIPT
+        chmod 0755 {TARGET_START_SCRIPT}
+        cat > {SERVICE_MANIFEST} <<'JSON'
+{manifest_block}
+        JSON
+        cat > /tmp/{TARGET_SERVICE} <<'UNIT'
+        {_unit(description='BB Phase 3 target single verified model', exec_start=TARGET_START_SCRIPT).rstrip()}
+        UNIT
+        sudo -n install -m 0644 /tmp/{TARGET_SERVICE} /etc/systemd/system/{TARGET_SERVICE}
+        sudo -n systemctl disable {forbidden_names} >/dev/null 2>&1 || true
+        sudo -n systemctl stop {forbidden_names} >/dev/null 2>&1 || true
+        sudo -n systemctl daemon-reload
+        sudo -n systemctl enable {TARGET_SERVICE} >/dev/null
+        sudo -n systemctl restart {TARGET_SERVICE}
+        for i in $(seq 1 120); do
+          curl -fsS --max-time 5 http://127.0.0.1:8000/v1/models | grep -F {sh(candidate.model_id)} >/dev/null && break
+          sleep 3
+        done
+        sudo -n systemctl is-active --quiet {TARGET_SERVICE}
+        curl -fsS --max-time 10 http://127.0.0.1:8000/v1/models | grep -F {sh(candidate.model_id)} >/dev/null
+        for legacy in {forbidden_names}; do
+          if systemctl is-active --quiet "$legacy"; then echo "legacy service still active: $legacy" >&2; exit 4; fi
+        done
+        printf '%s\\n' 'phase3-target-single-model-migrated'
+        """
+    )
 
 
 def control_manifests() -> tuple[dict[str, object], dict[str, object]]:
@@ -301,10 +418,39 @@ def main(argv: list[str] | None = None) -> int:
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--apply", action="store_true")
     actions.add_argument("--sync-control-manifests", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=("target_single_model", "legacy_shadow"),
+        default="legacy_shadow",
+        help="Use target_single_model for any new deployment; legacy_shadow is audit/rollback only.",
+    )
+    parser.add_argument("--candidate-manifest", default="", help="Verified model-host candidate manifest.")
     args = parser.parse_args(argv)
     if not args.apply and not args.sync_control_manifests:
-        safe_print(json.dumps(service_manifest(), ensure_ascii=False, indent=2))
+        if args.profile == "target_single_model":
+            if not args.candidate_manifest:
+                raise RuntimeError("target_single_model plan requires --candidate-manifest")
+            candidate = ModelCandidateManifest.load(args.candidate_manifest)
+            safe_print(json.dumps(target_service_manifest(candidate), ensure_ascii=False, indent=2))
+        else:
+            safe_print(json.dumps(service_manifest(), ensure_ascii=False, indent=2))
         return 0
+
+    if args.profile == "legacy_shadow":
+        if args.apply:
+            raise RuntimeError(
+                "legacy_shadow deployment is retired; use --profile target_single_model "
+                "with a verified candidate manifest. Legacy is read-only audit/rollback."
+            )
+    if args.profile == "target_single_model" and args.apply:
+        if not args.candidate_manifest:
+            raise RuntimeError("target_single_model migration requires --candidate-manifest")
+        candidate = ModelCandidateManifest.load(args.candidate_manifest)
+        command = render_target_migration(candidate)
+    elif args.profile == "target_single_model":
+        raise RuntimeError("target_single_model control-manifest sync requires a running target service")
+    else:
+        command = render_remote_control_manifest_sync()
 
     info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
@@ -313,9 +459,7 @@ def main(argv: list[str] | None = None) -> int:
             run_remote_text(
                 ssh,
                 (
-                    render_remote_migration()
-                    if args.apply
-                    else render_remote_control_manifest_sync()
+                    command
                 ),
                 timeout=720,
                 check=True,

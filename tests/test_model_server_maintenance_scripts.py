@@ -70,13 +70,23 @@ def test_sync_to_online_server_keeps_explicit_remote_owner() -> None:
 
 
 def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
+    from scripts import sync_to_online_server as sync
+
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 
     assert 'REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"' in source
     assert "scripts/start_online_model_tunnels.py" in source
     assert "systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}" in source
-    assert "endpoints = ((18000, '/v1/models'), (18001, '/health/live')" in source
-    assert "(18002, '/v1/models'), (18003, '/v1/models')" in source
+    assert sync._model_tunnel_endpoint_pairs("legacy_shadow") == (
+        (18000, "/v1/models"),
+        (18001, "/health/live"),
+        (18002, "/v1/models"),
+        (18003, "/v1/models"),
+    )
+    assert sync._model_tunnel_endpoint_pairs("target_single_model") == (
+        (18000, "/v1/models"),
+        (18001, "/health/live"),
+    )
     assert "deadline = time.time() + {MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS}" in source
     assert "http.client.HTTPConnection('127.0.0.1', port, timeout=8)" in source
     assert "connection.request('GET', path" in source
@@ -169,21 +179,68 @@ def test_sync_to_online_server_requires_okx_network_route() -> None:
 
 
 def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
+    from scripts import sync_to_online_server as sync
+
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 
-    assert "http://127.0.0.1:18000/v1" in source
+    legacy_json = sync._online_tunnel_ai_models_json("legacy_shadow")
+    assert "http://127.0.0.1:18000/v1" in legacy_json
+    assert "http://127.0.0.1:18003/v1" in legacy_json
+    assert "BB-FinQuant-Expert-14B" in legacy_json
     assert "http://127.0.0.1:18001" in source
-    assert "http://127.0.0.1:18003/v1" in source
-    assert "BB-FinQuant-Expert-14B" in source
     assert "values['LOCAL_AI_TOOLS_ENABLED'] = 'true'" in source
     assert "values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'" in source
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" not in source
-    assert "qwen3-14b-trade" in source
+    assert "qwen3-14b-trade" in legacy_json
     assert "ONLINE_HIGH_RISK_REVIEW_API_BASE" in source
     assert "CLOUD_HIGH_RISK_REVIEW_MODEL" in source
     assert "values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'" not in source
+
+
+def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch, tmp_path) -> None:
+    from core.model_candidate_manifest import MANIFEST_VERSION
+    from scripts import sync_to_online_server as sync
+
+    monkeypatch.setenv("BB_TARGET_MODEL_ID", "fake-model-from-env")
+    monkeypatch.delenv("BB_TARGET_MODEL_MANIFEST", raising=False)
+    with pytest.raises(RuntimeError, match="verified candidate identity"):
+        sync._online_tunnel_ai_models_json("target_single_model")
+
+    manifest_path = tmp_path / "candidate.json"
+    manifest_path.write_text(
+        __import__("json").dumps(
+            {
+                "manifest_version": MANIFEST_VERSION,
+                "status": "verified",
+                "model_id": "qwen3.8-27b-awq",
+                "repo_id": "verified/qwen3.8-27b-awq",
+                "revision": "sha256:" + "d" * 64,
+                "model_path": "/data/trade_models/verified/qwen3.8-27b-awq",
+                "tokenizer_path": "/data/trade_models/verified/qwen3.8-27b-awq",
+                "license": "apache-2.0",
+                "quantization": "awq-int4",
+                "context_length": 8192,
+                "config_sha256": "a" * 64,
+                "tokenizer_sha256": "b" * 64,
+                "weight_files": [
+                    {"path": "model.safetensors", "size_bytes": 1, "sha256": "c" * 64}
+                ],
+                "gpu_memory_peak_gib": 33.5,
+                "inference_p95_ms": 1800,
+                "max_concurrency": 1,
+                "validated_at": "2026-09-10T08:00:00Z",
+                "validator_version": "bb-model-validator.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", str(manifest_path))
+
+    rendered = sync._online_tunnel_ai_models_json("target_single_model")
+    assert rendered.count("qwen3.8-27b-awq") == 6
+    assert "deepseek" not in rendered.lower()
 
 
 def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
@@ -488,14 +545,16 @@ def test_sync_to_online_server_only_filter_rejects_unsafe_paths() -> None:
 
 
 def test_start_online_model_tunnels_use_approved_internal_ports() -> None:
-    source = (ROOT / "scripts" / "start_online_model_tunnels.py").read_text(encoding="utf-8")
+    from scripts import start_online_model_tunnels as tunnels
 
-    assert "local_port=18_000" in source and "remote_port=8000" in source
-    assert "local_port=18_001" in source and "remote_port=8101" in source
-    assert "local_port=18_002" in source and "remote_port=8002" in source
-    assert "local_port=18_003" in source and "remote_port=8003" in source
-    assert "phase3-quant-api" in source
-    assert "21840" not in source and "21841" not in source and "21842" not in source
+    legacy = {spec.name: spec for spec in tunnels.build_default_tunnels(profile="legacy_shadow")}
+    assert (legacy["qwen3-14b-trade"].local_port, legacy["qwen3-14b-trade"].remote_port) == (18000, 8000)
+    assert (legacy["phase3-quant-api"].local_port, legacy["phase3-quant-api"].remote_port) == (18001, 8101)
+    assert (legacy["deepseek-r1-14b-risk"].local_port, legacy["deepseek-r1-14b-risk"].remote_port) == (18002, 8002)
+    assert (legacy["BB-FinQuant-Expert-14B"].local_port, legacy["BB-FinQuant-Expert-14B"].remote_port) == (18003, 8003)
+    target = tunnels.build_default_tunnels(profile="target_single_model")
+    assert [(spec.local_port, spec.remote_port) for spec in target] == [(18000, 8000), (18001, 8101)]
+    assert "21840" not in (ROOT / "scripts" / "start_online_model_tunnels.py").read_text(encoding="utf-8")
 
 
 def test_start_online_model_tunnels_preserve_long_quant_training_requests() -> None:

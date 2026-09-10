@@ -1,14 +1,43 @@
+from core.model_candidate_manifest import ModelCandidateManifest
 from scripts.migrate_phase3_model_service_identity import (
     CONTROL_FORBIDDEN_SERVICES,
     EXPERT_SERVICE,
     LEGACY_SERVICES,
     QWEN_SERVICE,
     RISK_SERVICE,
+    TARGET_SERVICE,
     control_manifests,
     render_remote_control_manifest_sync,
     render_remote_migration,
+    render_target_migration,
     service_manifest,
+    target_service_manifest,
 )
+
+
+def _candidate() -> ModelCandidateManifest:
+    return ModelCandidateManifest.from_dict(
+        {
+            "manifest_version": "bb.model-candidate.v1",
+            "status": "verified",
+            "model_id": "qwen3.8-27b-awq",
+            "repo_id": "verified/qwen3.8-27b-awq",
+            "revision": "sha256:" + "d" * 64,
+            "model_path": "/data/trade_models/verified/qwen3.8-27b-awq",
+            "tokenizer_path": "/data/trade_models/verified/qwen3.8-27b-awq",
+            "license": "apache-2.0",
+            "quantization": "awq-int4",
+            "context_length": 8192,
+            "config_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "weight_files": [{"path": "model.safetensors", "size_bytes": 1, "sha256": "c" * 64}],
+            "gpu_memory_peak_gib": 33.5,
+            "inference_p95_ms": 1800,
+            "max_concurrency": 1,
+            "validated_at": "2026-09-10T08:00:00Z",
+            "validator_version": "bb-model-validator.v1",
+        }
+    )
 
 
 def test_service_identity_manifest_matches_verified_runtime() -> None:
@@ -93,3 +122,18 @@ def test_control_manifest_sync_verifies_runtime_without_restarting_services() ->
     assert " restart " not in rendered
     assert "systemctl restart" not in rendered
     assert "phase3-model-control-manifests-synchronized" in rendered
+
+
+def test_target_profile_renders_one_verified_model_and_disables_legacy_services() -> None:
+    candidate = _candidate()
+    payload = target_service_manifest(candidate)
+    assert payload["topology_profile"] == "target_single_model"
+    assert payload["candidate_model_id"] == candidate.model_id
+    assert len(payload["services"]) == 1
+    assert payload["services"][0]["port"] == 8000
+    rendered = render_target_migration(candidate)
+    assert "target_model_candidate.json" in rendered
+    assert candidate.model_id in rendered
+    assert TARGET_SERVICE in rendered
+    assert "systemctl stop" in rendered
+    assert "deepseek-r1-14b-risk.service" in rendered

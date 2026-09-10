@@ -12,6 +12,41 @@ TopologyStage = Literal[
     "paper",
     "live",
 ]
+TopologyProfile = Literal["legacy_shadow", "target_single_model"]
+
+LEGACY_SHADOW_PROFILE: TopologyProfile = "legacy_shadow"
+TARGET_SINGLE_MODEL_PROFILE: TopologyProfile = "target_single_model"
+
+
+def normalize_topology_profile(profile: str | None) -> TopologyProfile:
+    selected = LEGACY_SHADOW_PROFILE if profile is None else profile.strip().lower()
+    if selected not in {LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE}:
+        raise ValueError(f"unsupported model topology profile: {profile!r}")
+    return selected
+
+
+@dataclass(frozen=True)
+class ModelTunnelRoute:
+    name: str
+    local_port: int
+    remote_port: int
+    health_path: str
+
+
+def model_tunnel_routes(profile: str | None = None) -> tuple[ModelTunnelRoute, ...]:
+    """Describe connectivity only; reachable ports never authorize trading."""
+
+    selected = normalize_topology_profile(profile)
+    quant = ModelTunnelRoute("phase3-quant-api", 18001, 8101, "/health/live")
+    if selected == TARGET_SINGLE_MODEL_PROFILE:
+        return (ModelTunnelRoute("target-single-model", 18000, 8000, "/v1/models"), quant)
+    legacy = legacy_14b_topology()
+    models = sorted(legacy.models, key=lambda model: model.port)
+    routes = tuple(
+        ModelTunnelRoute(model.model_id, model.port + 10000, model.port, "/v1/models")
+        for model in models
+    )
+    return (routes[0], quant, *routes[1:])
 
 
 @dataclass(frozen=True)
@@ -38,8 +73,9 @@ class ModelServiceSpec:
             isinstance(value, str)
             and bool(value.strip())
             and value.strip().lower() not in {"unknown", "unverified", "pending"}
+            and not any(char in value for char in ("\n", "\r", "\x00"))
             for value in (self.model_id, self.repo_id, self.revision, self.path)
-        )
+        ) and "unverified" not in self.model_id.lower()
 
     def to_dict(self) -> dict[str, Any]:
         """Return a secret-free, stable representation for audits and APIs."""
@@ -73,6 +109,14 @@ class ModelTopology:
     local_model_count_target: int = 1
     live_routing_enabled: bool = False
 
+    @property
+    def profile(self) -> TopologyProfile:
+        """Return the deployment profile represented by this topology."""
+
+        if len(self.models) == 1 and self.models[0].role == "decision_and_expert_carrier":
+            return TARGET_SINGLE_MODEL_PROFILE
+        return LEGACY_SHADOW_PROFILE
+
     def by_role(self, role: str) -> ModelServiceSpec | None:
         return next((model for model in self.models if model.role == role), None)
 
@@ -80,6 +124,7 @@ class ModelTopology:
         """Return the topology contract without credentials or runtime secrets."""
 
         return {
+            "profile": self.profile,
             "models": [model.to_dict() for model in self.models],
             "quant_api_port": self.quant_api_port,
             "cloud_reviewer_enabled": self.cloud_reviewer_enabled,
@@ -110,6 +155,10 @@ class ModelTopology:
                 errors.append(f"live_stage_without_topology_live_flag:{model.model_id}")
             if model.max_concurrency < 1:
                 errors.append(f"invalid_max_concurrency:{model.model_id}")
+            if not 1 <= model.port <= 65535:
+                errors.append(f"invalid_model_port:{model.model_id}")
+            if model.context_length < 1:
+                errors.append(f"invalid_context_length:{model.model_id}")
         return tuple(dict.fromkeys(errors))
 
 
@@ -178,6 +227,66 @@ def qwen27_candidate_topology(
         live_routing_enabled=False,
     )
     return ModelTopology(models=(model,))
+
+
+def target_topology_ready(topology: ModelTopology) -> bool:
+    """Check the requested route contract, not deployment or promotion evidence."""
+
+    model = topology.by_role("decision_and_expert_carrier")
+    return bool(
+        topology.profile == TARGET_SINGLE_MODEL_PROFILE
+        and topology.local_model_count_target == 1
+        and model is not None
+        and model.identity_complete
+        and model.stage in {"candidate_validated", "paper"}
+        and topology.cloud_reviewer_enabled
+        and topology.cloud_reviewer_required_for_high_risk_entry
+        and model.model_id.lower() not in {
+            legacy.model_id.lower() for legacy in legacy_14b_topology().models
+        }
+        and not topology.live_routing_enabled
+        and not model.live_routing_enabled
+        and not topology.validate()
+    )
+
+
+def topology_for_profile(
+    profile: str | None = None,
+    *,
+    model_id: str | None = None,
+    repo_id: str | None = None,
+    revision: str | None = None,
+    path: str | None = None,
+    stage: TopologyStage = "candidate_not_configured",
+) -> ModelTopology:
+    """Build a deployment topology without silently guessing model identity.
+
+    ``legacy_shadow`` is retained only for audit/rollback compatibility. The
+    target profile requires all identity fields and remains non-live by
+    construction.
+    """
+
+    selected = normalize_topology_profile(profile)
+    if selected == LEGACY_SHADOW_PROFILE:
+        return legacy_14b_topology()
+    if selected != TARGET_SINGLE_MODEL_PROFILE:
+        raise ValueError(f"unsupported model topology profile: {profile!r}")
+    topology = qwen27_candidate_topology(stage=stage)
+    values = (model_id, repo_id, revision, path)
+    if all(isinstance(value, str) and value.strip() for value in values):
+        if stage not in {"candidate_not_configured", "candidate_validated", "paper"}:
+            raise ValueError("candidate configuration cannot enable live routing")
+        model = replace(
+            topology.models[0],
+            model_id=str(model_id).strip(),
+            repo_id=str(repo_id).strip(),
+            revision=str(revision).strip(),
+            path=str(path).strip(),
+            tokenizer=str(path).strip(),
+            stage=stage,
+        )
+        return replace(topology, models=(model,))
+    return topology
 
 
 def activate_verified_candidate(

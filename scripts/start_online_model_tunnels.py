@@ -4,10 +4,12 @@ The online platform must not call the model server through fragile public port
 forwarding for high-volume POST traffic. This process runs on the platform
 server and forwards loopback-only ports to the model server's loopback services:
 
-- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (qwen3-14b-trade)
+- 127.0.0.1:18000 -> model server 127.0.0.1:8000 (single target model)
 - 127.0.0.1:18001 -> model server 127.0.0.1:8101 (phase3 quant API health)
-- 127.0.0.1:18002 -> model server 127.0.0.1:8002 (deepseek-r1-14b-risk)
-- 127.0.0.1:18003 -> model server 127.0.0.1:8003 (BB-FinQuant-Expert-14B)
+
+The explicit ``legacy_shadow`` profile additionally exposes the historical
+14B shadow endpoints for rollback/audit. The ``target_single_model`` profile
+never starts local risk/expert model tunnels; high-risk review is remote.
 
 Model-server SSH credentials are loaded from encrypted secure settings on the
 platform. Secrets are never printed.
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import os
 import select
 import socket
 import socketserver
@@ -32,6 +35,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.model_topology import (  # noqa: E402
+    LEGACY_SHADOW_PROFILE,
+    TARGET_SINGLE_MODEL_PROFILE,
+    model_tunnel_routes,
+)
 from core.remote_ssh import connect_remote_ssh  # noqa: E402
 from core.safe_output import safe_error_text, safe_print  # noqa: E402
 from services.model_server_config import (  # noqa: E402
@@ -54,13 +62,14 @@ FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS = 15.0
 # below the model server's sshd MaxSessions limit.
 FORWARD_CHANNELS_PER_TRANSPORT = 5
 FORWARD_TRANSPORT_POOL_SIZES = {
+    "target-single-model": 3,
     "phase3-quant-api": 2,
     "BB-FinQuant-Expert-14B": 2,
 }
 FORWARD_DEFAULT_MAX_CONNECTION_SECONDS = 600.0
 FORWARD_QUANT_MAX_CONNECTION_SECONDS = 1_800.0
 # Training can briefly saturate the quant API while the SSH transport remains healthy.
-# Require a sustained semantic outage before rebuilding all four isolated tunnels.
+    # Require a sustained semantic outage before rebuilding isolated tunnels.
 TUNNEL_HEALTH_FAILURE_LIMIT = 6
 REQUIRED_HTTP_HEALTH_PATHS = {"phase3-quant-api": "/health/live"}
 
@@ -427,39 +436,28 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                 pass
 
 
-def build_default_tunnels(local_host: str = "127.0.0.1") -> list[TunnelSpec]:
-    """Return the approved platform-to-model-server tunnels."""
+def build_default_tunnels(
+    local_host: str = "127.0.0.1",
+    *,
+    profile: str | None = None,
+) -> list[TunnelSpec]:
+    """Return tunnels for the selected topology profile."""
 
+    selected = profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
     return [
         TunnelSpec(
-            name="qwen3-14b-trade",
+            name=route.name,
             local_host=local_host,
-            local_port=18_000,
+            local_port=route.local_port,
             remote_host="127.0.0.1",
-            remote_port=8000,
-        ),
-        TunnelSpec(
-            name="phase3-quant-api",
-            local_host=local_host,
-            local_port=18_001,
-            remote_host="127.0.0.1",
-            remote_port=8101,
-            max_connection_seconds=FORWARD_QUANT_MAX_CONNECTION_SECONDS,
-        ),
-        TunnelSpec(
-            name="deepseek-r1-14b-risk",
-            local_host=local_host,
-            local_port=18_002,
-            remote_host="127.0.0.1",
-            remote_port=8002,
-        ),
-        TunnelSpec(
-            name="BB-FinQuant-Expert-14B",
-            local_host=local_host,
-            local_port=18_003,
-            remote_host="127.0.0.1",
-            remote_port=8003,
-        ),
+            remote_port=route.remote_port,
+            max_connection_seconds=(
+                FORWARD_QUANT_MAX_CONNECTION_SECONDS
+                if route.name == "phase3-quant-api"
+                else FORWARD_DEFAULT_MAX_CONNECTION_SECONDS
+            ),
+        )
+        for route in model_tunnel_routes(selected)
     ]
 
 
@@ -610,8 +608,8 @@ def run_tunnels(specs: list[TunnelSpec]) -> None:
                 if unhealthy_names:
                     # A forwarded HTTP health request can legitimately time out while
                     # the model is occupied with inference/training.  The SSH transport
-                    # above is the authoritative tunnel liveness signal; rebuilding all
-                    # four transports here creates a larger outage than the slow request.
+                     # above is the authoritative tunnel liveness signal; rebuilding every
+                     # transport here creates a larger outage than the slow request.
                     _log(
                         "model backend is busy; keeping active SSH tunnels for: "
                         + ", ".join(unhealthy_names)
@@ -641,29 +639,38 @@ def parse_port(value: str) -> int:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local-host", default="127.0.0.1")
+    parser.add_argument(
+        "--profile",
+        choices=(LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE),
+        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", LEGACY_SHADOW_PROFILE),
+    )
     parser.add_argument("--qwen-local-port", type=parse_port, default=18_000)
     parser.add_argument("--quant-api-local-port", type=parse_port, default=18_001)
     parser.add_argument("--deepseek-local-port", type=parse_port, default=18_002)
     parser.add_argument("--expert-local-port", type=parse_port, default=18_003)
     args = parser.parse_args(argv)
 
-    specs = build_default_tunnels(local_host=args.local_host)
+    specs = build_default_tunnels(local_host=args.local_host, profile=args.profile)
+    local_ports = {
+        "target-single-model": args.qwen_local_port,
+        "phase3-quant-api": args.quant_api_local_port,
+        "qwen3-14b-trade": args.qwen_local_port,
+        "deepseek-r1-14b-risk": args.deepseek_local_port,
+        "BB-FinQuant-Expert-14B": args.expert_local_port,
+    }
     specs = [
         TunnelSpec(
             name=spec.name,
             local_host=spec.local_host,
-            local_port={
-                "qwen3-14b-trade": args.qwen_local_port,
-                "phase3-quant-api": args.quant_api_local_port,
-                "deepseek-r1-14b-risk": args.deepseek_local_port,
-                "BB-FinQuant-Expert-14B": args.expert_local_port,
-            }[spec.name],
+            local_port=local_ports[spec.name],
             remote_host=spec.remote_host,
             remote_port=spec.remote_port,
             max_connection_seconds=spec.max_connection_seconds,
         )
         for spec in specs
     ]
+    if len({(spec.local_host, spec.local_port) for spec in specs}) != len(specs):
+        parser.error("tunnel listener ports must be unique")
     run_tunnels(specs)
 
 

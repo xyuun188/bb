@@ -23,6 +23,12 @@ import httpx
 import paramiko
 
 from config.settings import settings
+from core.model_topology import (
+    LEGACY_SHADOW_PROFILE,
+    TARGET_SINGLE_MODEL_PROFILE,
+    model_tunnel_routes,
+    normalize_topology_profile,
+)
 from core.phase3_model_contract import (
     PHASE3_DECISION_MODEL_ID,
     PHASE3_EXPERT_MODEL_ID,
@@ -122,6 +128,45 @@ ONLINE_PHASE3_TUNNEL_CONTRACTS = (
         "model": PHASE3_EXPERT_MODEL_ID,
     },
 )
+
+
+def active_phase3_tunnel_contracts() -> tuple[dict[str, Any], ...]:
+    """Return the monitor contract matching the configured deployment profile."""
+
+    profile = normalize_topology_profile(
+        str(getattr(settings, "model_topology_profile", LEGACY_SHADOW_PROFILE) or "")
+    )
+    legacy_by_name = {str(item["name"]): item for item in ONLINE_PHASE3_TUNNEL_CONTRACTS}
+    target_contract = {
+        "name": "target-single-model",
+        "role": "decision_maker",
+        "capability": "create_strategy_and_expert",
+        "model": "",
+        "api_base": "http://127.0.0.1:18000/v1",
+    }
+    contracts: list[dict[str, Any]] = []
+    for route in model_tunnel_routes(profile):
+        if profile == TARGET_SINGLE_MODEL_PROFILE and route.name == "target-single-model":
+            item = dict(target_contract)
+        elif route.name == "phase3-quant-api":
+            item = dict(legacy_by_name["phase3-quant-api"])
+        else:
+            item = dict(legacy_by_name[route.name])
+        item["local_port"] = route.local_port
+        contracts.append(item)
+    return tuple(contracts)
+
+
+def active_phase3_default_ai_models() -> tuple[dict[str, Any], ...]:
+    """Return fallback probe routes for the active profile only."""
+
+    if normalize_topology_profile(
+        str(getattr(settings, "model_topology_profile", LEGACY_SHADOW_PROFILE) or "")
+    ) == TARGET_SINGLE_MODEL_PROFILE:
+        # The actual model id must come from the verified runtime AI_MODELS route.
+        # Never probe the qwen3.8 placeholder from PHASE3_TARGET_MODEL_TOPOLOGY.
+        return ()
+    return ONLINE_PHASE3_DEFAULT_AI_MODELS
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 InfoLoader = Callable[[Path], Any]
@@ -888,9 +933,15 @@ def _platform_model_tunnel_summary(
     )
     tunnels: list[dict[str, Any]] = []
     unavailable: list[dict[str, Any]] = []
-    for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS:
+    active_contracts = active_phase3_tunnel_contracts()
+    for spec in active_contracts:
         model = str(spec.get("model") or "").strip()
+        if spec.get("name") == "target-single-model" and not model:
+            # The target profile intentionally has no placeholder model id. The
+            # runtime env or fixed model slots are the only source of truth.
+            model = decision_model
         is_decision_tunnel = str(spec.get("role") or "") == "decision_maker"
+        is_quant_tunnel = str(spec.get("name") or "") == "phase3-quant-api"
         required = True
         if is_decision_tunnel and decision_uses_external_route:
             required = False
@@ -926,7 +977,7 @@ def _platform_model_tunnel_summary(
                 row["status"] = "standby" if endpoint_ok else "standby_unavailable"
                 row["active_decision_model"] = decision_model
                 row["active_decision_api_base"] = decision_api_base
-        else:
+        elif is_quant_tunnel:
             health = local_tools.get("health") if isinstance(local_tools.get("health"), dict) else {}
             status_probe = (
                 local_tools.get("status") if isinstance(local_tools.get("status"), dict) else {}
@@ -967,14 +1018,42 @@ def _platform_model_tunnel_summary(
                     or ""
                 ),
             }
+        else:
+            # A target model tunnel without a configured runtime model is not a
+            # quant-tool health probe. Keep it visible as a configuration blocker.
+            row = {
+                "name": spec["name"],
+                "role": spec["role"],
+                "capability": spec["capability"],
+                "local_port": spec["local_port"],
+                "required": required,
+                "expected_api_base": spec["api_base"],
+                "api_base": spec["api_base"],
+                "model": "",
+                "available": False,
+                "endpoint_ok": False,
+                "model_available": False,
+                "status": "not_configured",
+                "status_code": None,
+                "latency_ms": None,
+                "error": "target_model_runtime_route_not_configured",
+            }
         tunnels.append(row)
         if row["required"] and not row["available"]:
             unavailable.append(row)
 
     by_name = {str(row.get("name") or ""): row for row in tunnels}
-    local_decision_available = bool(by_name.get(PHASE3_DECISION_MODEL_ID, {}).get("available"))
+    decision_spec = next(
+        (spec for spec in active_contracts if spec.get("role") == "decision_maker"),
+        {},
+    )
+    decision_tunnel_name = str(decision_spec.get("name") or PHASE3_DECISION_MODEL_ID)
+    local_decision_available = bool(by_name.get(decision_tunnel_name, {}).get("available"))
     can_call_decision = bool(decision_available or local_decision_available)
-    can_call_expert = bool(by_name.get(PHASE3_EXPERT_MODEL_ID, {}).get("available"))
+    if str(getattr(settings, "model_topology_profile", "legacy_shadow") or "").strip().lower() == TARGET_SINGLE_MODEL_PROFILE:
+        can_call_expert = local_decision_available
+    else:
+        can_call_expert = bool(by_name.get(PHASE3_EXPERT_MODEL_ID, {}).get("available"))
     can_call_quant_tool = bool(by_name.get("phase3-quant-api", {}).get("available"))
     blocker_codes = [
         f"tunnel_port_{int(row['local_port'])}_{str(row['status'] or 'unavailable')}"
@@ -988,7 +1067,7 @@ def _platform_model_tunnel_summary(
         )
     unavailable_all = [row for row in tunnels if not row["available"]]
     return {
-        "expected_ports": [int(spec["local_port"]) for spec in ONLINE_PHASE3_TUNNEL_CONTRACTS],
+        "expected_ports": [int(spec["local_port"]) for spec in active_phase3_tunnel_contracts()],
         "ready": not unavailable and can_call_decision,
         "available_count": sum(1 for row in tunnels if row["available"]),
         "unavailable_count": len(unavailable_all),
@@ -1242,7 +1321,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         )
         model_configs = list(fixed_model_rows)
         if default_models_enabled:
-            model_configs.extend(dict(item, default_phase3_tunnel=True) for item in ONLINE_PHASE3_DEFAULT_AI_MODELS)
+            model_configs.extend(active_phase3_default_ai_models())
 
         for cfg in model_configs:
             if not isinstance(cfg, dict) or cfg.get("enabled") is False:

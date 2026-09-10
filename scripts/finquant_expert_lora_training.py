@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import posixpath
 import re
 import subprocess
@@ -31,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings  # noqa: E402
+from core.model_candidate_manifest import ModelCandidateManifest  # noqa: E402
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text, safe_print  # noqa: E402
@@ -71,11 +73,12 @@ REMOTE_LEGACY_ALIAS_SERVICE = "bb-finquant-expert-alias.service"
 REMOTE_TRAIN_LOG_DIR = f"{REMOTE_TRAINING_DIR}/logs"
 REMOTE_DOWNLOAD_MANIFEST = f"{REMOTE_ROOT}/manifests/phase3_model_download_manifest.json"
 REMOTE_VALIDATION_MANIFEST = f"{REMOTE_ROOT}/manifests/phase3_model_validation.json"
+REMOTE_TARGET_MODEL_MANIFEST = f"{REMOTE_ROOT}/manifests/target_model_candidate.json"
 REMOTE_PLATFORM_APP_DIR = "/data/bb/app"
 REMOTE_PLATFORM_SCRIPT = f"{REMOTE_PLATFORM_APP_DIR}/scripts/finquant_expert_lora_training.py"
 REMOTE_PLATFORM_EXPORT_DIR = f"{REMOTE_PLATFORM_APP_DIR}/data/finquant_expert_training"
 REMOTE_PLATFORM_EXPORT_WRAPPER = f"{REMOTE_PLATFORM_EXPORT_DIR}/export_wrapper.py"
-MODEL_NAME = "BB-FinQuant-Expert-14B"
+MODEL_NAME = os.environ.get("BB_TARGET_MODEL_ID", "BB-FinQuant-Expert-14B").strip()
 BASE_MODEL_NAME = "qwen3-14b-trade"
 FINQUANT_GATEWAY_RUNTIME_VERSION = "4.0"
 FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE = 128
@@ -93,6 +96,27 @@ REQUIRED_TRAINING_TABLES = (
     "shadow_backtests",
     "expert_memories",
 )
+
+
+def _verified_training_candidate() -> ModelCandidateManifest:
+    """Load the exact candidate used for a new training run.
+
+    Historical dataset exports retain the old 14B identity for reproducibility,
+    but a new adapter must never be trained against that base implicitly. The
+    caller provides a model-host-generated manifest through
+    ``BB_TARGET_MODEL_MANIFEST``; without it training is refused closed.
+    """
+
+    manifest_path = str(os.environ.get("BB_TARGET_MODEL_MANIFEST") or "").strip()
+    if not manifest_path:
+        raise RuntimeError(
+            "target model training requires BB_TARGET_MODEL_MANIFEST pointing to a verified candidate"
+        )
+    candidate = ModelCandidateManifest.load(manifest_path)
+    evidence_errors = candidate.validate_evidence()
+    if evidence_errors:
+        raise RuntimeError("target model candidate evidence invalid: " + ", ".join(evidence_errors))
+    return candidate
 
 
 REMOTE_TRAINER_CODE = r"""
@@ -199,6 +223,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--base-model-repo", required=True)
+    parser.add_argument("--model-name", required=True)
     parser.add_argument("--inference-base-model", default="")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--version-id", required=True)
@@ -472,7 +497,7 @@ def main() -> None:
     inference_config_path = Path(args.inference_base_model) / "config.json"
     manifest = {
         "registry_version": "bb_finquant_lora.v2",
-        "model_name": "BB-FinQuant-Expert-14B",
+        "model_name": args.model_name,
         "adapter_version": args.version_id,
         "base_model": args.base_model,
         "base_model_repo": args.base_model_repo,
@@ -485,7 +510,7 @@ def main() -> None:
         ),
         "adapter_path": str(output_dir),
         "lora_adapter": str(output_dir),
-        "specialization_id": f"BB-FinQuant-Expert-14B-{args.version_id}",
+        "specialization_id": f"{args.model_name}-{args.version_id}",
         "specialization_status": "trained_shadow_not_live",
         "training_artifact": str(output_dir),
         "dataset": str(dataset_path),
@@ -576,7 +601,9 @@ LEGACY = ROOT / "BB-FinQuant-Expert-14B-v1"
 LEGACY_MANIFEST = LEGACY / "specialization_manifest.json"
 DOWNLOAD_MANIFEST = Path("/data/BB/manifests/phase3_model_download_manifest.json")
 VALIDATION_MANIFEST = Path("/data/BB/manifests/phase3_model_validation.json")
-INFERENCE_BASE = "/data/trade_models/Qwen/Qwen3-14B-AWQ"
+INFERENCE_BASE = os.environ.get(
+    "BB_TARGET_INFERENCE_MODEL_PATH", "/data/trade_models/Qwen/Qwen3-14B-AWQ"
+).strip()
 
 
 def sha256_file(path: Path) -> str:
@@ -2232,7 +2259,10 @@ def deploy_and_optionally_train(
     dataset_version = str(dataset_manifest["dataset_version"])
     remote_dataset, remote_dataset_manifest = _remote_dataset_paths(dataset_version)
     if train and not stop_inference_for_training:
-        raise ValueError("LoRA training requires stopping all conflicting 14B services")
+        raise ValueError(
+            "LoRA training requires stopping all conflicting 14B services/model services"
+        )
+    candidate = _verified_training_candidate() if train else None
     info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
@@ -2278,6 +2308,7 @@ def deploy_and_optionally_train(
             "service_switched": False,
         }
         if train:
+            assert candidate is not None
             selected_version = adapter_version or _new_adapter_version(dataset_manifest)
             adapter_dir, specialization_manifest, train_log = _remote_adapter_paths(
                 selected_version
@@ -2285,17 +2316,18 @@ def deploy_and_optionally_train(
             pre = (
                 f"sudo -n systemctl stop {REMOTE_GATEWAY_SERVICE} "
                 f"{REMOTE_LEGACY_ALIAS_SERVICE} {REMOTE_QWEN_SERVICE} "
-                f"{REMOTE_RISK_SERVICE} || true; "
+                f"{REMOTE_RISK_SERVICE} bb-phase3-quant-api.service || true; "
             )
             post = (
                 f"sudo -n systemctl start {REMOTE_QWEN_SERVICE} "
-                f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} || true; "
+                f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} "
+                f"bb-phase3-quant-api.service || true; "
             )
             train_cmd = (
                 "set -euo pipefail; "
                 f"mkdir -p {sh(REMOTE_TRAINING_DIR)} {sh(REMOTE_ADAPTER_VERSIONS_DIR)} "
                 f"{sh(REMOTE_TRAIN_LOG_DIR)}; "
-                f"{_remote_train_base_prepare_command()}; "
+                f"{_remote_train_base_prepare_command(repo_id=candidate.repo_id, model_path=candidate.model_path)}; "
                 "/data/BB/envs/phase3-quant/bin/python -c "
                 "'import datasets, trl; print(trl.__version__)'; "
                 f"{pre}"
@@ -2303,9 +2335,10 @@ def deploy_and_optionally_train(
                 f"--dataset {sh(remote_dataset)} "
                 f"--dataset-manifest {sh(remote_dataset_manifest)} "
                 f"--output-dir {sh(adapter_dir)} "
-                f"--base-model {sh(REMOTE_TRAIN_BASE_MODEL)} "
-                f"--base-model-repo {sh(REMOTE_TRAIN_BASE_REPO)} "
-                f"--inference-base-model {sh(REMOTE_INFERENCE_BASE_MODEL)} "
+                f"--base-model {sh(candidate.model_path)} "
+                f"--base-model-repo {sh(candidate.repo_id)} "
+                f"--model-name {sh(candidate.model_id)} "
+                f"--inference-base-model {sh(candidate.model_path)} "
                 f"--manifest {sh(specialization_manifest)} "
                 f"--version-id {sh(selected_version)} "
                 f"--max-steps {int(max_steps)} "
@@ -2334,6 +2367,8 @@ def deploy_and_optionally_train(
             result["specialization_manifest"] = _json_object_from_remote_output(raw)
             promoted = run_remote_text(
                 ssh,
+                f"BB_TARGET_MODEL_ID={sh(candidate.model_id)} "
+                f"BB_TARGET_INFERENCE_MODEL_PATH={sh(candidate.model_path)} "
                 f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_REGISTRY_TOOL)} "
                 f"promote --manifest {sh(specialization_manifest)}",
                 timeout=180,
@@ -2347,12 +2382,12 @@ def deploy_and_optionally_train(
         ssh.close()
 
 
-def _remote_train_base_prepare_command() -> str:
+def _remote_train_base_prepare_command(*, repo_id: str, model_path: str) -> str:
     return textwrap.dedent(f"""
-        if [ -s {sh(REMOTE_TRAIN_BASE_MODEL + "/config.json")} ]; then
+        if [ -s {sh(model_path + "/config.json")} ]; then
           echo train-base-ready
         else
-          mkdir -p {sh(REMOTE_TRAIN_BASE_MODEL)}
+          mkdir -p {sh(model_path)}
           /data/BB/envs/phase3-quant/bin/python - <<'PY'
 import os
 
@@ -2362,8 +2397,8 @@ os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 from huggingface_hub import snapshot_download
 
 snapshot_download(
-    repo_id={REMOTE_TRAIN_BASE_REPO!r},
-    local_dir={REMOTE_TRAIN_BASE_MODEL!r},
+    repo_id={repo_id!r},
+    local_dir={model_path!r},
     resume_download=True,
     local_dir_use_symlinks=False,
     max_workers=4,

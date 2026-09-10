@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import posixpath
 import secrets
 import stat
@@ -24,6 +25,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import FIXED_AI_MODEL_SLOTS  # noqa: E402
+from core.model_candidate_manifest import ModelCandidateManifest  # noqa: E402
+from core.model_topology import (  # noqa: E402
+    LEGACY_SHADOW_PROFILE,
+    TARGET_SINGLE_MODEL_PROFILE,
+    ModelTopology,
+    model_tunnel_routes,
+    normalize_topology_profile,
+    target_topology_ready,
+    topology_for_profile,
+)
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from scripts.audit_online_secret_files import (
@@ -209,9 +220,17 @@ def _install_dashboard_proxy_command() -> str:
     )
 
 
-def _render_model_tunnel_service(remote_app_dir: str, owner: str) -> str:
+def _render_model_tunnel_service(
+    remote_app_dir: str,
+    owner: str,
+    *,
+    profile: str | None = None,
+) -> str:
     user, _sep, group = owner.partition(":")
     group = group or user
+    selected_profile = normalize_topology_profile(
+        profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+    )
     return f"""[Unit]
 Description=BB Platform to Model Server Tunnels
 After=network-online.target postgresql.service
@@ -229,7 +248,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=NUMEXPR_NUM_THREADS=1
-ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then exec .venv/bin/python scripts/start_online_model_tunnels.py; elif [ -x venv/bin/python ]; then exec venv/bin/python scripts/start_online_model_tunnels.py; else exec python3 scripts/start_online_model_tunnels.py; fi'
+ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then exec .venv/bin/python scripts/start_online_model_tunnels.py --profile {selected_profile}; elif [ -x venv/bin/python ]; then exec venv/bin/python scripts/start_online_model_tunnels.py --profile {selected_profile}; else exec python3 scripts/start_online_model_tunnels.py --profile {selected_profile}; fi'
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -239,28 +258,85 @@ WantedBy=multi-user.target
 """
 
 
-def _online_tunnel_ai_models_json() -> str:
+def _model_tunnel_endpoint_pairs(profile: str | None = None) -> tuple[tuple[int, str], ...]:
+    """Return health endpoints required by the selected tunnel profile."""
+
+    selected = profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+    return tuple((route.local_port, route.health_path) for route in model_tunnel_routes(selected))
+
+
+def _target_topology_from_environment() -> ModelTopology:
+    """Load only a model-host-generated verified manifest.
+
+    Identity environment variables are intentionally ignored.  They are useful
+    for diagnostics but are not evidence that weights, tokenizer and runtime
+    measurements were checked on the model server.
+    """
+
+    manifest_path = str(os.environ.get("BB_TARGET_MODEL_MANIFEST") or "").strip()
+    if not manifest_path:
+        return topology_for_profile(TARGET_SINGLE_MODEL_PROFILE)
+    manifest = ModelCandidateManifest.load(manifest_path)
+    topology = manifest.to_topology(stage="candidate_validated")
+    if not target_topology_ready(topology):
+        raise RuntimeError("verified candidate manifest did not produce a ready target topology")
+    return topology
+
+
+def _online_tunnel_ai_models_json(
+    profile: str | None = None,
+    *,
+    topology: ModelTopology | None = None,
+) -> str:
+    """Render fixed slots from an explicit model topology.
+
+    Legacy shadow remains available for rollback/audit only. The target
+    profile refuses to render until the candidate identity is fully verified,
+    preventing an unverified or guessed 27B model from entering paper/live.
+
+    """
+
+    selected_profile = normalize_topology_profile(
+        profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+    )
+    resolved = topology or (
+        topology_for_profile(LEGACY_SHADOW_PROFILE)
+        if selected_profile == LEGACY_SHADOW_PROFILE
+        else _target_topology_from_environment()
+    )
+    if selected_profile == TARGET_SINGLE_MODEL_PROFILE and not target_topology_ready(resolved):
+        raise RuntimeError(
+            "target_single_model requires a verified candidate identity and non-live topology"
+        )
+    if resolved.profile != selected_profile:
+        raise RuntimeError(
+            f"model topology profile mismatch: requested={selected_profile} actual={resolved.profile}"
+        )
+
+    carrier = resolved.by_role("decision_and_expert_carrier")
     rows = []
     for slot in FIXED_AI_MODEL_SLOTS:
         name = str(slot["name"])
-        if name == "decision_maker":
-            api_base = "http://127.0.0.1:18000/v1"
-            model = "qwen3-14b-trade"
+        if selected_profile == TARGET_SINGLE_MODEL_PROFILE:
+            selected_model = carrier
+        elif name == "decision_maker":
+            selected_model = resolved.by_role("decision_maker")
         else:
-            api_base = "http://127.0.0.1:18003/v1"
-            model = "BB-FinQuant-Expert-14B"
+            selected_model = resolved.by_role("expert_pool")
         rows.append(
             {
                 "name": name,
                 "role": slot["role"],
                 "label": slot["label"],
                 "weight": slot["weight"],
-                "api_base": api_base,
+                "api_base": selected_model.endpoint if selected_model else "",
                 "api_key": "",
-                "model": model,
+                "model": selected_model.model_id if selected_model else "",
                 "enabled": True,
             }
         )
+    if any(not str(row["api_base"]).strip() or not str(row["model"]).strip() for row in rows):
+        raise RuntimeError(f"topology {selected_profile} has incomplete AI slot routing")
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -270,9 +346,15 @@ def _runtime_env_update_script(
     local_ai_tools_key_file: str = "",
     backup_runtime_env: bool = False,
     emit_summary: bool = False,
+    model_topology_profile: str | None = None,
 ) -> str:
     local_ai_tools_key_path = local_ai_tools_key_file if local_ai_tools_key_file else ""
-    online_ai_models = _online_tunnel_ai_models_json()
+    topology_profile = str(
+        model_topology_profile
+        or os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+        or LEGACY_SHADOW_PROFILE
+    ).strip().lower()
+    online_ai_models = _online_tunnel_ai_models_json(topology_profile)
     return f"""from pathlib import Path
 import json
 import os
@@ -284,6 +366,7 @@ runtime_path = Path({REMOTE_RUNTIME_ENV_PATH!r})
 app_env_path = Path({remote_app_dir!r}) / '.env'
 local_ai_tools_key_path = Path({local_ai_tools_key_path!r}) if {bool(local_ai_tools_key_path)!r} else None
 online_ai_models = {online_ai_models!r}
+topology_profile = {topology_profile!r}
 backup_runtime_env = {bool(backup_runtime_env)!r}
 emit_summary = {bool(emit_summary)!r}
 app_env_ai_route_keys = {{
@@ -362,10 +445,17 @@ def scrub_app_env_ai_routes(path, keys, prefixes):
 
 
 rows = json.loads(online_ai_models)
-if any(row.get('model') == 'qwen3-14b-expert-pool' for row in rows):
-    raise RuntimeError('refusing to write stale qwen3-14b-expert-pool AI_MODELS')
-if not any(row.get('model') == 'BB-FinQuant-Expert-14B' for row in rows):
-    raise RuntimeError('refusing to write AI_MODELS without BB-FinQuant-Expert-14B')
+if not rows or any(not row.get('api_base') or not row.get('model') for row in rows):
+    raise RuntimeError('refusing to write AI_MODELS with incomplete topology routes')
+if topology_profile == 'target_single_model':
+    model_ids = {{str(row.get('model') or '').strip() for row in rows}}
+    if len(model_ids) != 1 or any(
+        'deepseek' in model_id.lower()
+        or '14b' in model_id.lower()
+        or 'finquant-expert' in model_id.lower()
+        for model_id in model_ids
+    ):
+        raise RuntimeError('refusing to write legacy model route under target_single_model')
 
 current_runtime_text = runtime_path.read_text(encoding='utf-8') if runtime_path.exists() else ''
 values = parse_env(runtime_path)
@@ -443,7 +533,7 @@ decision_model = first_non_empty(
     app_env_values.get('AI_DECISION_MAKER_MODEL'),
     current_decision_route.get('model'),
 )
-if decision_api_base:
+if decision_api_base and topology_profile == 'legacy_shadow':
     for row in rows:
         if row.get('name') == 'decision_maker':
             row['api_base'] = decision_api_base.rstrip('/')
@@ -474,6 +564,7 @@ values['DASHBOARD_INLINE_ENABLED'] = 'false'
 values['USE_FAKEREDIS'] = 'false'
 values['REDIS_URL'] = 'redis://127.0.0.1:6379/0'
 values['AI_MODELS'] = online_ai_models
+values['BB_MODEL_TOPOLOGY_PROFILE'] = topology_profile
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
 cloud_reviewer_api_base = first_non_empty(
@@ -562,12 +653,14 @@ def _runtime_env_only_command(
     *,
     remote_app_dir: str,
     local_ai_tools_key_file: str = "",
+    model_topology_profile: str | None = None,
 ) -> str:
     runtime_env_script = _runtime_env_update_script(
         remote_app_dir=remote_app_dir,
         local_ai_tools_key_file=local_ai_tools_key_file,
         backup_runtime_env=True,
         emit_summary=True,
+        model_topology_profile=model_topology_profile,
     )
     cleanup_prefix = (
         f'trap "rm -f {_remote_quote(local_ai_tools_key_file)}" EXIT; '
@@ -585,12 +678,26 @@ def _install_split_service_command(
     dashboard_service: str,
     model_tunnel_service: str,
     local_ai_tools_key_file: str = "",
+    model_topology_profile: str | None = None,
 ) -> str:
     dashboard_unit = _render_dashboard_service(remote_app_dir, owner)
-    model_tunnel_unit = _render_model_tunnel_service(remote_app_dir, owner)
+    selected_profile = str(
+        model_topology_profile
+        or os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+        or LEGACY_SHADOW_PROFILE
+    ).strip().lower()
+    model_tunnel_unit = _render_model_tunnel_service(
+        remote_app_dir,
+        owner,
+        profile=selected_profile,
+    )
     runtime_env_script = _runtime_env_update_script(
         remote_app_dir=remote_app_dir,
         local_ai_tools_key_file=local_ai_tools_key_file,
+        model_topology_profile=selected_profile,
+    )
+    tunnel_checks = " ".join(
+        f"{port}:{path}" for port, path in _model_tunnel_endpoint_pairs(selected_profile)
     )
     trading_dropin = f"""[Service]
 EnvironmentFile=-{remote_app_dir}/.env
@@ -600,7 +707,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=NUMEXPR_NUM_THREADS=1
-ExecStartPre=/bin/bash -lc 'for spec in 18000:/v1/models 18001:/health/live 18002:/v1/models 18003:/v1/models; do port=${{spec%%:*}}; path=${{spec#*:}}; for i in $(seq 1 60); do curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 && break; sleep 1; done; curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 || exit 1; done'
+ExecStartPre=/bin/bash -lc 'for spec in {tunnel_checks}; do port=${{spec%%:*}}; path=${{spec#*:}}; for i in $(seq 1 60); do curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 && break; sleep 1; done; curl -fsS --max-time 4 http://127.0.0.1:$port$path >/dev/null 2>&1 || exit 1; done'
 StandardOutput=journal
 StandardError=journal
 MemoryAccounting=true
@@ -884,6 +991,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--service", default=REMOTE_SERVICE_NAME)
     parser.add_argument("--dashboard-service", default=REMOTE_DASHBOARD_SERVICE_NAME)
     parser.add_argument("--owner", default=REMOTE_OWNER)
+    parser.add_argument(
+        "--model-topology-profile",
+        choices=(LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE),
+        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", LEGACY_SHADOW_PROFILE),
+        help="Select legacy audit tunnels or the verified one-local-model target profile.",
+    )
     parser.add_argument("--include-tests", action="store_true")
     parser.add_argument(
         "--split-services",
@@ -941,7 +1054,10 @@ def main() -> None:
             safe_print(
                 run_remote_text(
                     ssh,
-                    _runtime_env_only_command(remote_app_dir=args.remote_app_dir),
+                    _runtime_env_only_command(
+                        remote_app_dir=args.remote_app_dir,
+                        model_topology_profile=args.model_topology_profile,
+                    ),
                     timeout=60,
                     check=True,
                 )
@@ -1024,6 +1140,7 @@ def main() -> None:
                     dashboard_service=args.dashboard_service,
                     model_tunnel_service=REMOTE_MODEL_TUNNEL_SERVICE_NAME,
                     local_ai_tools_key_file=remote_secret_path,
+                    model_topology_profile=args.model_topology_profile,
                 ),
                 timeout=120,
                 check=True,
@@ -1031,8 +1148,7 @@ def main() -> None:
             model_tunnel_probe = "python3 -c " + _remote_quote(
                 "import http.client, time\n"
                 f"deadline = time.time() + {MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS}\n"
-                "endpoints = ((18000, '/v1/models'), (18001, '/health/live'), "
-                "(18002, '/v1/models'), (18003, '/v1/models'))\n"
+                f"endpoints = {_model_tunnel_endpoint_pairs(args.model_topology_profile)!r}\n"
                 "for port, path in endpoints:\n"
                 "    while True:\n"
                 "        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)\n"

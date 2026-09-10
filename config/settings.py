@@ -346,6 +346,9 @@ class Settings(BaseSettings):
     local_ai_tools_timeout_seconds: float = 12.0
     local_ai_tools_circuit_breaker_failures: int = 3
     local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
+    # Deployment profile is explicit so monitors and sync scripts cannot drift
+    # into incompatible tunnel contracts.
+    model_topology_profile: str = "legacy_shadow"
     high_risk_review_enabled: bool = True
     high_risk_review_api_base: str = ""
     high_risk_review_api_key: str = ""
