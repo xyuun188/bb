@@ -40,9 +40,9 @@ REMOTE_DASHBOARD_PROXY_SITE = "/etc/nginx/sites-available/bb-dashboard"
 REMOTE_DASHBOARD_PROXY_LINK = "/etc/nginx/sites-enabled/bb-dashboard"
 MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS = 75
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
-# The online platform deploys /data/bb/app as the existing `linux` account.
-# Keep this overridable for installations that provision a dedicated service user.
-REMOTE_OWNER = "linux:linux"
+# The online platform may use a different service account than the model host.
+# Resolve the existing application directory owner unless explicitly overridden.
+REMOTE_OWNER = "auto"
 
 REMOTE_MANAGED_SOURCE_ROOTS = (
     "ai_brain",
@@ -112,6 +112,23 @@ SKIP_NAME_PARTS = (
 
 def _remote_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _resolve_remote_owner(ssh: object, remote_app_dir: str, configured_owner: str) -> str:
+    """Resolve a valid remote service owner without assuming model-host users."""
+
+    owner = str(configured_owner or "").strip()
+    if owner and owner.lower() != "auto":
+        return owner
+    detected = run_remote_text(
+        ssh,
+        f"stat -c %U:%G {_remote_quote(remote_app_dir)}",
+        timeout=30,
+        check=True,
+    ).strip()
+    if not detected or ":" not in detected or any(char.isspace() for char in detected):
+        raise RuntimeError(f"could not resolve a valid owner for {remote_app_dir!r}")
+    return detected
 
 
 def _render_dashboard_service(remote_app_dir: str, owner: str) -> str:
@@ -918,6 +935,7 @@ def main() -> None:
 
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
+        resolved_owner = _resolve_remote_owner(ssh, args.remote_app_dir, args.owner)
         if args.runtime_env_only:
             safe_print("Updating runtime env only; no file upload or service restart will run.")
             safe_print(
@@ -981,7 +999,7 @@ def main() -> None:
             quoted_paths = " ".join(_remote_quote(path) for path in uploaded)
             run_remote_text(
                 ssh,
-                f"chown {_remote_quote(args.owner)} {quoted_paths}",
+                f"chown {_remote_quote(resolved_owner)} {quoted_paths}",
                 timeout=120,
             )
         if args.skip_restart:
@@ -1001,7 +1019,7 @@ def main() -> None:
                 ssh,
                 _install_split_service_command(
                     remote_app_dir=args.remote_app_dir,
-                    owner=args.owner,
+                    owner=resolved_owner,
                     trading_service=args.service,
                     dashboard_service=args.dashboard_service,
                     model_tunnel_service=REMOTE_MODEL_TUNNEL_SERVICE_NAME,

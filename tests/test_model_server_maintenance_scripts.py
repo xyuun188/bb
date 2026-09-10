@@ -48,6 +48,27 @@ def test_sync_to_online_server_installs_updated_requirements() -> None:
     assert 'path.endswith("/requirements.txt")' in source
 
 
+def test_sync_to_online_server_resolves_existing_remote_owner(monkeypatch) -> None:
+    from scripts import sync_to_online_server as sync
+
+    calls: list[str] = []
+
+    def fake_run_remote_text(_ssh, command, **_kwargs):
+        calls.append(command)
+        return "bb:bb\n"
+
+    monkeypatch.setattr(sync, "run_remote_text", fake_run_remote_text)
+
+    assert sync._resolve_remote_owner(object(), "/data/bb/app", "auto") == "bb:bb"
+    assert calls == ["stat -c %U:%G '/data/bb/app'"]
+
+
+def test_sync_to_online_server_keeps_explicit_remote_owner() -> None:
+    from scripts import sync_to_online_server as sync
+
+    assert sync._resolve_remote_owner(object(), "/data/bb/app", "root:root") == "root:root"
+
+
 def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 
