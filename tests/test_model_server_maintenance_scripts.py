@@ -152,16 +152,17 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
 
     assert "http://127.0.0.1:18000/v1" in source
     assert "http://127.0.0.1:18001" in source
-    assert "http://127.0.0.1:18002/v1" in source
     assert "http://127.0.0.1:18003/v1" in source
     assert "BB-FinQuant-Expert-14B" in source
     assert "values['LOCAL_AI_TOOLS_ENABLED'] = 'true'" in source
     assert "values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'" in source
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
-    assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" in source
+    assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" not in source
     assert "qwen3-14b-trade" in source
-    assert "deepseek-r1-14b-risk" in source
+    assert "ONLINE_HIGH_RISK_REVIEW_API_BASE" in source
+    assert "CLOUD_HIGH_RISK_REVIEW_MODEL" in source
+    assert "values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'" not in source
 
 
 def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(

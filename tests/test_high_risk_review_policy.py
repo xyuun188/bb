@@ -589,6 +589,44 @@ async def test_entry_high_risk_review_blocks_on_timeout_and_annotates_fingerprin
 
 
 @pytest.mark.asyncio
+async def test_entry_high_risk_review_records_gateway_failure_category_and_attempts(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerUnavailable:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise HighRiskReviewGatewayError(
+                "provider overloaded",
+                category="provider_server_error",
+                status_code=503,
+                retryable=True,
+                attempts=[
+                    {"attempt": 1, "error_category": "provider_server_error", "status_code": 503},
+                    {"attempt": 2, "error_category": "provider_server_error", "status_code": 503},
+                ],
+            )
+
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test",
+        raw_response={"opinions": [{"action": "long"}, {"action": "short"}]},
+    )
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerUnavailable()).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+    assert result is not None and result.blocker == "high_risk_review_failed"
+    review = decision.raw_response["high_risk_review"]
+    assert review["error_category"] == "provider_server_error"
+    assert review["provider_status_code"] == 503
+    assert review["retry_count"] == 1
+    assert len(review["attempts"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_entry_high_risk_review_does_not_call_reviewer_for_ordinary_entry(
     high_risk_settings: None,
 ) -> None:

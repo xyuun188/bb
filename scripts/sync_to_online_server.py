@@ -277,7 +277,9 @@ app_env_ai_route_keys = {{
     'LOCAL_AI_TOOLS_API_BASE',
     'HIGH_RISK_REVIEW_ENABLED',
     'HIGH_RISK_REVIEW_API_BASE',
+    'HIGH_RISK_REVIEW_API_KEY',
     'HIGH_RISK_REVIEW_MODEL',
+    'HIGH_RISK_REVIEW_MODEL_REVISION',
 }}
 app_env_ai_route_prefixes = ('MODEL_SERVER_',)
 
@@ -457,9 +459,44 @@ values['REDIS_URL'] = 'redis://127.0.0.1:6379/0'
 values['AI_MODELS'] = online_ai_models
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
-values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
-values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'
-values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'
+cloud_reviewer_api_base = first_non_empty(
+    values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
+    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
+    values.get('CLOUD_HIGH_RISK_REVIEW_API_BASE'),
+    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_API_BASE'),
+)
+cloud_reviewer_api_key = first_non_empty(
+    values.get('ONLINE_HIGH_RISK_REVIEW_API_KEY'),
+    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_API_KEY'),
+    values.get('CLOUD_HIGH_RISK_REVIEW_API_KEY'),
+    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_API_KEY'),
+)
+cloud_reviewer_model = first_non_empty(
+    values.get('ONLINE_HIGH_RISK_REVIEW_MODEL'),
+    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_MODEL'),
+    values.get('CLOUD_HIGH_RISK_REVIEW_MODEL'),
+    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_MODEL'),
+)
+cloud_reviewer_revision = first_non_empty(
+    values.get('ONLINE_HIGH_RISK_REVIEW_MODEL_REVISION'),
+    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_MODEL_REVISION'),
+    values.get('CLOUD_HIGH_RISK_REVIEW_MODEL_REVISION'),
+    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_MODEL_REVISION'),
+)
+if cloud_reviewer_api_base and cloud_reviewer_api_key and cloud_reviewer_model:
+    values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
+    values['HIGH_RISK_REVIEW_API_BASE'] = cloud_reviewer_api_base.rstrip('/')
+    values['HIGH_RISK_REVIEW_API_KEY'] = cloud_reviewer_api_key
+    values['HIGH_RISK_REVIEW_MODEL'] = cloud_reviewer_model
+    values['HIGH_RISK_REVIEW_MODEL_REVISION'] = cloud_reviewer_revision
+else:
+    # Never resurrect the removed local DeepSeek reviewer.  Keeping the feature
+    # enabled with an incomplete route makes the entry gate fail closed.
+    values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
+    values['HIGH_RISK_REVIEW_API_BASE'] = ''
+    values['HIGH_RISK_REVIEW_API_KEY'] = ''
+    values['HIGH_RISK_REVIEW_MODEL'] = ''
+    values['HIGH_RISK_REVIEW_MODEL_REVISION'] = ''
 try:
     current_tools_timeout = float(values.get('LOCAL_AI_TOOLS_TIMEOUT_SECONDS') or 0)
 except ValueError:
