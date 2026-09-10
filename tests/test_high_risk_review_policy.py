@@ -422,17 +422,21 @@ async def test_high_risk_review_compacts_oversized_expected_net_breakdown(
 
 
 @pytest.mark.asyncio
-async def test_entry_high_risk_review_is_observation_only_and_never_calls_reviewer(
+async def test_entry_high_risk_review_fail_closed_when_reviewer_rejects_or_fails(
     high_risk_settings: None,
 ) -> None:
-    class ReviewerMustNotRun:
+    class ReviewerRejects:
         called = False
 
-        async def review_trade(self, *_args: Any, **_kwargs: Any) -> None:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
             self.called = True
-            raise AssertionError("observation-only review must not call an external model")
+            return type(
+                "Review",
+                (),
+                {"approved": False, "confidence": 0.9, "reason": "风险过高", "attempts": []},
+            )()
 
-    reviewer = ReviewerMustNotRun()
+    reviewer = ReviewerRejects()
     decision = DecisionOutput(
         model_name="ensemble_trader",
         symbol="BTC/USDT",
@@ -454,13 +458,82 @@ async def test_entry_high_risk_review_is_observation_only_and_never_calls_review
         [],
     )
 
-    assert result is None
-    assert reviewer.called is False
+    assert result is not None
+    assert result.passed is False
+    assert result.blocker == "high_risk_review_rejected"
+    assert reviewer.called is True
     review = decision.raw_response["high_risk_review"]
-    assert review["read_only"] is True
+    assert review["read_only"] is False
     assert review["production_permission"] is False
+    assert review["status"] == "rejected"
+    assert review["hard_review_required"] is True
     assert review["expert_disagreement"] == 0.5
     assert review["ml_ai_direction_conflict"] is True
+
+
+@pytest.mark.asyncio
+async def test_entry_high_risk_review_blocks_on_timeout_and_annotates_fingerprint(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerTimeout:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise TimeoutError("review timeout")
+
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test",
+        raw_response={"opinions": [{"action": "long"}, {"action": "short"}]},
+    )
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerTimeout()).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+
+    assert result is not None
+    assert result.blocker == "high_risk_review_failed"
+    review = decision.raw_response["high_risk_review"]
+    assert review["status"] == "error_blocked"
+    assert review["approved"] is False
+    assert review["input_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_entry_high_risk_review_does_not_call_reviewer_for_ordinary_entry(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerMustNotRun:
+        called = False
+
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.called = True
+            raise AssertionError("ordinary entry must not call high-risk reviewer")
+
+    reviewer = ReviewerMustNotRun()
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="test",
+        raw_response={"opportunity_score": {"expected_net_return_pct": 0.4}},
+        position_size_pct=0.02,
+        suggested_leverage=2.0,
+    )
+
+    result = await EntryHighRiskReviewGatePolicy(reviewer=reviewer).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+
+    assert result is not None and result.passed is True
+    assert reviewer.called is False
+    assert decision.raw_response["high_risk_review"]["status"] == "not_required"
+    assert decision.raw_response["high_risk_review"]["approved"] is None
 
 
 @pytest.mark.asyncio

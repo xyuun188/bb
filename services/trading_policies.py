@@ -398,6 +398,14 @@ class EntryPolicy:
         paper_plan_gate = self._paper_trade_plan_gate(decision, model_mode, context)
         if paper_plan_gate is not None:
             return paper_plan_gate
+        if self.high_risk_review_gate_policy is not None:
+            high_risk_result = await self.high_risk_review_gate(
+                decision,
+                model_mode,
+                open_positions=open_positions or [],
+            )
+            if high_risk_result is not None and not high_risk_result.passed:
+                return high_risk_result
         if str(model_mode or "").lower() == "paper":
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             contract = raw.get("normal_paper_trade")

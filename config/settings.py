@@ -350,10 +350,16 @@ class Settings(BaseSettings):
     high_risk_review_api_base: str = ""
     high_risk_review_api_key: str = ""
     high_risk_review_model: str = "deepseek-reasoner"
+    high_risk_review_model_revision: str = ""
     high_risk_review_timeout_seconds: float = 30.0
     high_risk_review_max_tokens: int = 480
     high_risk_review_circuit_breaker_failures: int = 2
     high_risk_review_circuit_breaker_cooldown_seconds: float = 120.0
+    high_risk_review_disagreement_threshold: float = 1 / 3
+    high_risk_review_tail_risk_threshold: float = 0.65
+    high_risk_review_leverage_threshold: float = 8.0
+    high_risk_review_position_size_threshold: float = 0.12
+    high_risk_review_min_confidence: float = 0.5
 
     # --- Database ---
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"

@@ -88,6 +88,7 @@ from services.entry_execution_handoff import await_entry_execution_handoff
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_funnel_diagnostics import build_entry_funnel_report
+from services.entry_high_risk_review import EntryHighRiskReviewGatePolicy
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.entry_market_data_quality import (
     EntryMarketDataQualityPolicy,
@@ -901,6 +902,10 @@ class TradingService:
             entry_profit_risk_sizing=self.entry_profit_risk_sizing,
             entry_price_guard=self.entry_price_guard,
             entry_opportunity_gate=self.entry_opportunity_gate,
+            high_risk_review_gate=EntryHighRiskReviewGatePolicy(
+                reviewer=self.high_risk_review_service,
+                allocation_state_provider=self.execution_allocation_state,
+            ),
         )
         self.entry_candidate_queue = EntryCandidateQueuePolicy(
             score_candidate=self.entry_policy.score_candidate,
