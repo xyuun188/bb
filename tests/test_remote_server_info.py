@@ -149,6 +149,21 @@ def test_find_server_info_file_prefers_platform_file(tmp_path) -> None:
     assert find_server_info_file(tmp_path) == platform_path
 
 
+def test_find_server_info_file_prefers_user_platform_file_over_model_file(tmp_path) -> None:
+    model_path = tmp_path / "大模型服务器信息.txt"
+    model_path.write_text(
+        "IP：10.0.0.2\n用户名：model\n密码：secret\n端口：22",
+        encoding="utf-8",
+    )
+    platform_path = tmp_path / "量化用户端服务器信息.txt"
+    platform_path.write_text(
+        "IP：10.0.0.1\n用户名：admin\n密码：secret\n端口：22",
+        encoding="utf-8",
+    )
+
+    assert find_server_info_file(tmp_path) == platform_path
+
+
 def test_find_server_info_file_uses_account_info_dir(tmp_path, monkeypatch) -> None:
     account_dir = tmp_path / "accounts"
     account_dir.mkdir()

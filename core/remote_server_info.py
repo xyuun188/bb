@@ -24,6 +24,8 @@ DEFAULT_ACCOUNT_INFO_DIRS = (
 PROJECT_ACCOUNT_INFO_DIR_NAME = "\u8d26\u6237\u4fe1\u606f"
 
 SERVER_INFO_CANDIDATE_NAMES = (
+    "\u91cf\u5316\u7528\u6237\u7aef\u670d\u52a1\u5668\u4fe1\u606f.txt",  # platform user-end server info
+    "\u7528\u6237\u7aef\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt",  # legacy platform label
     "\u5e73\u53f0\u670d\u52a1\u5668\u4fe1\u606f.txt",  # platform server info
     "\u670d\u52a1\u5668\u8d44\u6599.txt",  # server data
     "\u670d\u52a1\u5668\u4fe1\u606f.txt",  # server info
@@ -246,7 +248,19 @@ def _candidate_roots(project_root: Path) -> list[Path]:
 
 def find_server_info_file(project_root: Path) -> Path:
     """Find an ignored server-info file without inspecting unrelated files."""
+    # A broad server-info fallback also matches model-server credentials. Never
+    # silently route platform deployment or monitoring to the GPU host.
+    model_paths = {
+        path.resolve()
+        for path in _candidate_paths(
+            project_root,
+            names=MODEL_SERVER_INFO_CANDIDATE_NAMES,
+            globs=MODEL_SERVER_INFO_GLOBS,
+        )
+    }
     for path in _candidate_paths(project_root):
+        if path.resolve() in model_paths:
+            continue
         if path.exists() and path.is_file():
             return path
     raise FileNotFoundError(
