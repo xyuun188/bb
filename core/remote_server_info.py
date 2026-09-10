@@ -16,7 +16,11 @@ from pathlib import Path
 from core.secret_utils import mask_secret
 
 ACCOUNT_INFO_DIR_ENV = "BB_ACCOUNT_INFO_DIR"
-DEFAULT_ACCOUNT_INFO_DIR = Path("F:/\u8d26\u6237\u4fe1\u606f")
+DEFAULT_ACCOUNT_INFO_DIRS = (
+    Path("F:/\u8d26\u6237\u4fe1\u606f"),
+    Path("D:/\u8d26\u6237\u4fe1\u606f/\u91cf\u5316\u5e73\u53f0\u8d26\u6237"),
+    Path("D:/\u8d26\u6237\u4fe1\u606f"),
+)
 PROJECT_ACCOUNT_INFO_DIR_NAME = "\u8d26\u6237\u4fe1\u606f"
 
 SERVER_INFO_CANDIDATE_NAMES = (
@@ -230,7 +234,8 @@ def _candidate_roots(project_root: Path) -> list[Path]:
 
     roots = [project_root, project_root / PROJECT_ACCOUNT_INFO_DIR_NAME]
     configured = os.environ.get(ACCOUNT_INFO_DIR_ENV, "").strip()
-    for raw_path in (configured, str(DEFAULT_ACCOUNT_INFO_DIR)):
+    configured_paths = (configured,) if configured else ()
+    for raw_path in (*configured_paths, *(str(path) for path in DEFAULT_ACCOUNT_INFO_DIRS)):
         if not raw_path:
             continue
         path = Path(raw_path).expanduser()

@@ -40,7 +40,9 @@ REMOTE_DASHBOARD_PROXY_SITE = "/etc/nginx/sites-available/bb-dashboard"
 REMOTE_DASHBOARD_PROXY_LINK = "/etc/nginx/sites-enabled/bb-dashboard"
 MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS = 75
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
-REMOTE_OWNER = "bb:bb"
+# The online platform deploys /data/bb/app as the existing `linux` account.
+# Keep this overridable for installations that provision a dedicated service user.
+REMOTE_OWNER = "linux:linux"
 
 REMOTE_MANAGED_SOURCE_ROOTS = (
     "ai_brain",
