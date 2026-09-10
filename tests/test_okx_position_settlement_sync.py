@@ -38,8 +38,10 @@ from services.position_settlement import SETTLEMENT_STATUS_UNRESOLVED
 
 @pytest.mark.asyncio
 async def test_position_settlement_loads_history_mirror_once_per_batch(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "position-settlement-batch.db")
     service = OkxPositionSettlementSyncService(mode="paper", limit=2)
     candidates = [
         SettlementCandidate(
@@ -101,12 +103,15 @@ async def test_position_settlement_loads_history_mirror_once_per_batch(
     monkeypatch.setattr(service, "_settle_candidate", settle_candidate)
     monkeypatch.setattr(service, "_apply_failures", apply_failures)
 
-    report = await service.sync_once()
+    try:
+        report = await service.sync_once()
 
-    assert report["checked_count"] == 2
-    assert load_calls == 1
-    assert seen_rows == [history_rows, history_rows]
-    assert failure_batches == [[1, 2]]
+        assert report["checked_count"] == 2
+        assert load_calls == 1
+        assert seen_rows == [history_rows, history_rows]
+        assert failure_batches == [[1, 2]]
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio
