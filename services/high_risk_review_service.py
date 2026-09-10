@@ -41,11 +41,13 @@ class HighRiskReviewGatewayError(RuntimeError):
         category: str,
         status_code: int | None = None,
         retryable: bool = False,
+        attempts: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.retryable = retryable
+        self.attempts = attempts or []
 
 
 class HighRiskReviewSchemaError(ValueError):
@@ -214,6 +216,7 @@ class HighRiskReviewService:
                     }
                 )
                 if not exc.retryable or attempt_no >= len(attempt_specs):
+                    exc.attempts = list(attempts)
                     raise
                 continue
             attempts.append(
@@ -238,6 +241,7 @@ class HighRiskReviewService:
             raise HighRiskReviewGatewayError(
                 f"模型两次都没有返回可解析 JSON，finish_reason={finish_reason}",
                 category="empty_response",
+                attempts=attempts,
             )
 
         try:

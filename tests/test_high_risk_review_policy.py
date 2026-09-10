@@ -584,6 +584,7 @@ async def test_entry_high_risk_review_blocks_on_timeout_and_annotates_fingerprin
     review = decision.raw_response["high_risk_review"]
     assert review["status"] == "error_blocked"
     assert review["approved"] is False
+    assert review["error_category"] == "reviewer_call_failed"
     assert review["input_fingerprint"]
 
 
