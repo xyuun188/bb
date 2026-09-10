@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -198,13 +199,25 @@ class HighRiskReviewService:
         if not isinstance(parsed_raw, dict):
             raise ValueError("模型返回的 JSON 不是对象")
         parsed = cast(dict[str, Any], parsed_raw)
+        approved = parsed.get("approved")
+        confidence = parsed.get("confidence")
+        reason = parsed.get("reason")
+        if type(approved) is not bool:
+            raise ValueError("模型返回的 approved 必须是 boolean")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ValueError("模型返回的 confidence 必须是 0 到 1 的数字")
+        confidence_value = float(confidence)
+        if not math.isfinite(confidence_value) or not 0.0 <= confidence_value <= 1.0:
+            raise ValueError("模型返回的 confidence 必须位于 0 到 1")
+        if not isinstance(reason, str):
+            raise ValueError("模型返回的 reason 必须是字符串")
         self.record_success()
         return HighRiskReviewResult(
-            approved=bool(parsed.get("approved")),
-            confidence=_safe_float(parsed.get("confidence"), 0.0),
+            approved=approved,
+            confidence=confidence_value,
             reason=_normalize_review_reason(
-                parsed.get("reason"),
-                approved=bool(parsed.get("approved")),
+                reason,
+                approved=approved,
             )[:500],
             attempts=attempts,
         )

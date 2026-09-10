@@ -343,6 +343,32 @@ def test_high_risk_review_rejects_non_object_json_response() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ('{"approved":"false","confidence":0.9,"reason":"异常"}', "approved"),
+        ('{"approved":false,"confidence":1.2,"reason":"异常"}', "confidence"),
+        ('{"approved":false,"confidence":0.9,"reason":123}', "reason"),
+    ],
+)
+async def test_high_risk_review_rejects_invalid_result_schema(
+    content: str,
+    message: str,
+) -> None:
+    class InvalidSchemaReviewer(HighRiskReviewService):
+        async def call_model(self, **_kwargs: Any) -> tuple[dict[str, Any], str, dict[str, Any]]:
+            return {}, content, {"finish_reason": "stop"}
+
+    with pytest.raises(ValueError, match=message):
+        await InvalidSchemaReviewer().review_trade(
+            {"symbol": "BTC/USDT", "side": "long"},
+            api_base="https://review.example.invalid/v1",
+            api_key="review-key",
+            model="review-model",
+        )
+
+
+@pytest.mark.asyncio
 async def test_high_risk_review_call_model_enforces_runtime_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
