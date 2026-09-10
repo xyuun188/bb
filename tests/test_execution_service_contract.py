@@ -53,6 +53,7 @@ def _test_execution_service(
     order_fact_recovery_trigger=None,
     open_positions_execution_applier=None,
     decision_stage_recorder=None,
+    entry_instrument_unavailable_marker=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
         if reasons is not None:
@@ -115,6 +116,7 @@ def _test_execution_service(
         entry_policy_evaluator=entry_policy_evaluator or allow_entry,
         exit_policy_evaluator=exit_policy_evaluator or allow_entry,
         production_trade_gate_provider=production_trade_gate_provider,
+        entry_instrument_unavailable_marker=entry_instrument_unavailable_marker,
         execution_skills_provider=lambda **_kwargs: [],
         execution_skills_attacher=lambda *_args, **_kwargs: None,
         execution_skills_block_reason_provider=lambda *_args, **_kwargs: None,
@@ -159,6 +161,7 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "strong_expert_opposition": False,
         },
     )
+
     raw["opportunity_score"]["execution_cost"].update(
         {
             "total_pct": 0.08,
@@ -206,6 +209,43 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
     decision.position_size_pct = 0.04
     decision.suggested_leverage = 1.0
     return decision
+
+
+def test_execution_service_persists_okx_51001_entry_negative_cache() -> None:
+    marked: list[tuple[str, str, dict[str, Any]]] = []
+    service = _test_execution_service(
+        okx_executor_provider=lambda _mode: _noop_async(),
+        entry_instrument_unavailable_marker=lambda mode, symbol, facts: marked.append(
+            (mode, symbol, facts)
+        ),
+    )
+
+    from core.exceptions import ExchangeAPIError
+
+    service._remember_entry_instrument_failure(
+        mode="paper",
+        symbol="PEPE/USDT",
+        error=ExchangeAPIError(
+            "OKX API error [51001]: Instrument ID doesn't exist.",
+            code="51001",
+        ),
+    )
+
+    assert marked == [
+        (
+            "paper",
+            "PEPE/USDT",
+            {
+                "available": False,
+                "reason": "okx_private_entry_instrument_unavailable",
+                "error_code": "51001",
+                "error": "OKX API error [51001]: Instrument ID doesn't exist.",
+                "source": "execution_service_order_submit",
+                "analysis_only": True,
+                "execution_verified": False,
+            },
+        )
+    ]
 
 
 def _dynamic_return_ready_decision() -> DecisionOutput:

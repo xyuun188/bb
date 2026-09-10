@@ -7,6 +7,7 @@ import pytest
 
 from config.settings import settings
 from db.session import close_db, init_db
+from web_dashboard.api import auth as dashboard_auth_api
 from web_dashboard.api.security import hash_dashboard_password
 from web_dashboard.app import create_app
 
@@ -218,3 +219,62 @@ async def test_dashboard_account_rejects_disabled_current_user(
     assert response.status_code == 401
     assert status_response.status_code == 401
     assert "重新登录" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_auth_status_uses_stale_cache_when_database_is_temporarily_slow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = await _create_auth_client(monkeypatch, tmp_path)
+    dashboard_auth_api._auth_status_cache.clear()
+    try:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "InitialPass123"},
+        )
+        monkeypatch.setattr(dashboard_auth_api, "_AUTH_STATUS_CACHE_TTL_SECONDS", -1.0)
+
+        async def unavailable(_username: str) -> bool:
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(dashboard_auth_api, "_read_auth_status_from_db", unavailable)
+        response = await client.get("/api/auth/status")
+    finally:
+        dashboard_auth_api._auth_status_cache.clear()
+        await client.aclose()
+        await close_db()
+
+    assert login.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["auth_check_stale"] is True
+    assert response.json()["username"] == "admin"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_auth_status_returns_fast_refreshing_response_without_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = await _create_auth_client(monkeypatch, tmp_path)
+    dashboard_auth_api._auth_status_cache.clear()
+    try:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "InitialPass123"},
+        )
+        dashboard_auth_api._auth_status_cache.clear()
+
+        async def unavailable(_username: str) -> bool:
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(dashboard_auth_api, "_read_auth_status_from_db", unavailable)
+        response = await client.get("/api/auth/status")
+    finally:
+        dashboard_auth_api._auth_status_cache.clear()
+        await client.aclose()
+        await close_db()
+
+    assert login.status_code == 200
+    assert response.status_code == 503
+    assert response.json()["detail"]["status"] == "auth_status_refreshing"

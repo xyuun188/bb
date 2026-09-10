@@ -7,7 +7,7 @@ from typing import Any
 
 from config.settings import ENSEMBLE_TRADER_NAME
 from db.repositories.trade_repo import TradeRepository
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx
 from services.daily_performance_service import DailyPerformanceService
 from services.daily_side_performance import DailySidePerformanceService
 from services.symbol_side_performance import SymbolSidePerformanceService
@@ -15,7 +15,9 @@ from services.symbol_side_performance import SymbolSidePerformanceService
 SessionFactory = Callable[[], Any]
 TradeRepositoryFactory = Callable[[Any], TradeRepository]
 
-STRATEGY_CONTEXT_POSITION_LIMIT = 5000
+# This snapshot feeds current strategy posture; reading thousands of old
+# positions on every refresh only increases pool contention and adds no signal.
+STRATEGY_CONTEXT_POSITION_LIMIT = 500
 
 
 class StrategyContextPerformanceService:
@@ -24,7 +26,7 @@ class StrategyContextPerformanceService:
     def __init__(
         self,
         *,
-        session_factory: SessionFactory = get_session_ctx,
+        session_factory: SessionFactory = get_read_session_ctx,
         trade_repository_factory: TradeRepositoryFactory = TradeRepository,
         model_name: str = ENSEMBLE_TRADER_NAME,
         position_limit: int = STRATEGY_CONTEXT_POSITION_LIMIT,

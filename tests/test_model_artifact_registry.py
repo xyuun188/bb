@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+import services.model_artifact_registry as registry_module
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -240,6 +241,46 @@ def test_registry_persists_versioned_hash_verified_artifact(tmp_path) -> None:
     assert current.activation_manifest["activation_stage"] == "shadow"
     assert current.activation_manifest["live_ml_ready"] is False
     assert not registry.candidate_path.exists()
+
+
+def test_metadata_status_does_not_deserialize_model_bundle(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ModelArtifactRegistry(
+        root=tmp_path / "model_artifacts",
+        model_id="local_ml_profit_quality",
+    )
+    persisted = registry.persist_candidate_joblib(
+        {"weights": [1, 2, 3]},
+        _metadata(),
+        parent_model_identity="sklearn RandomForest/Dummy classifier-regressor pipelines",
+        code_version=SOURCE_CODE_VERSION,
+    )
+    registry.promote_candidate(_shadow_activation())
+
+    def fail_bundle_load(*_args, **_kwargs):
+        raise AssertionError("metadata status must not deserialize the model bundle")
+
+    monkeypatch.setattr(
+        "services.model_artifact_registry.load_trusted_joblib",
+        fail_bundle_load,
+    )
+    original_sha256 = registry_module._sha256
+
+    def fail_model_hash(path):
+        if path.suffix == ".joblib":
+            raise AssertionError("metadata status must not read the model bundle")
+        return original_sha256(path)
+
+    monkeypatch.setattr("services.model_artifact_registry._sha256", fail_model_hash)
+
+    resolved = registry.resolve_current_metadata()
+    status = registry.status_metadata()
+
+    assert resolved is not None
+    assert resolved.version == persisted.version
+    assert status["available"] is True
+    assert status["version"] == persisted.version
 
 
 def test_registry_rejects_tampered_current_artifact(tmp_path) -> None:

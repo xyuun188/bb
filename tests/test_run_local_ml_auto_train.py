@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts import run_local_ml_auto_train
+
+
+def test_training_process_installs_memory_guard_before_project_imports() -> None:
+    source = run_local_ml_auto_train.__file__
+    assert source is not None
+    text = Path(source).read_text(encoding="utf-8")
+    assert "LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES" in text
+    assert "resource.RLIMIT_AS" in text
 
 
 @pytest.mark.asyncio

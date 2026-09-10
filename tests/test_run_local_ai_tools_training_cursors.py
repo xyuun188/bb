@@ -154,3 +154,42 @@ async def test_run_once_returns_structured_error_and_closes_database(
     assert result["error"] == "cursor query failed"
     assert result["training_process_isolated"] is True
     assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_cursor_scans_shadow_history_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans = 0
+
+    async def stream():
+        nonlocal scans
+        scans += 1
+        yield {"id": 1, "decision_id": 1}
+
+    async def no_trades() -> list[dict]:
+        return []
+
+    monkeypatch.setattr(script, "_iter_shadow_samples_stream", stream)
+    monkeypatch.setattr(script, "annotate_sample", lambda sample, _kind: sample)
+    monkeypatch.setattr(
+        script,
+        "market_training_identity",
+        lambda _sample: {
+            "decision_group": "shadow_decision:1",
+            "features": {"returns_5": 0.1},
+            "long_return_pct": 0.2,
+            "short_return_pct": -0.2,
+        },
+    )
+    monkeypatch.setattr(script, "_load_trade_samples", no_trades)
+    monkeypatch.setattr(
+        script,
+        "annotate_training_payload",
+        lambda **payload: payload,
+    )
+
+    result = await script._streaming_cursor_probe()
+
+    assert scans == 1
+    assert result["completed_market_sample_count"] == 1

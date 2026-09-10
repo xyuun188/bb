@@ -104,6 +104,58 @@ async def test_okx_ws_ticker_processing_is_bounded_per_symbol(
 
 
 @pytest.mark.asyncio
+async def test_okx_ws_books_and_mark_price_include_native_source_facts() -> None:
+    client = OKXWebSocketClient()
+
+    await client._handle_message(
+        json.dumps(
+            {
+                "arg": {"channel": "books5", "instId": "PEPE-USDT-SWAP"},
+                "data": [
+                    {
+                        "bids": [["0.000002354", "5000000", "0", "1"]],
+                        "asks": [["0.000002356", "6000000", "0", "1"]],
+                        "ts": "1782432000000",
+                    }
+                ],
+            }
+        )
+    )
+    await client._handle_message(
+        json.dumps(
+            {
+                "arg": {"channel": "mark-price", "instId": "PEPE-USDT-SWAP"},
+                "data": [{"markPx": "0.000002355", "ts": "1782432000100"}],
+            }
+        )
+    )
+
+    book = client.latest_orderbooks["PEPE/USDT"]
+    mark = client.latest_mark_prices["PEPE/USDT"]
+    assert book["orderbook_bid_depth"] > 0
+    assert book["orderbook_ask_depth"] > 0
+    assert book["orderbook_fact"] == {
+        "inst_id": "PEPE-USDT-SWAP",
+        "inst_type": "SWAP",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "books5",
+        "source_timestamp_ms": 1_782_432_000_000,
+        "bid": pytest.approx(0.000002354),
+        "ask": pytest.approx(0.000002356),
+        "bid_depth_usdt": pytest.approx(11.77),
+        "ask_depth_usdt": pytest.approx(14.136),
+    }
+    assert mark["mark_price_fact"] == {
+        "inst_id": "PEPE-USDT-SWAP",
+        "inst_type": "SWAP",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "mark-price",
+        "source_timestamp_ms": 1_782_432_000_100,
+        "price": pytest.approx(0.000002355),
+    }
+
+
+@pytest.mark.asyncio
 async def test_okx_ws_connect_uses_unified_sdk_stream(monkeypatch) -> None:
     instances: list[Any] = []
 
@@ -132,7 +184,11 @@ async def test_okx_ws_connect_uses_unified_sdk_stream(monkeypatch) -> None:
             "op": "subscribe",
             "args": [
                 {"channel": "tickers", "instId": "BTC-USDT-SWAP"},
+                {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+                {"channel": "mark-price", "instId": "BTC-USDT-SWAP"},
                 {"channel": "tickers", "instId": "ETH-USDT-SWAP"},
+                {"channel": "books5", "instId": "ETH-USDT-SWAP"},
+                {"channel": "mark-price", "instId": "ETH-USDT-SWAP"},
             ],
         }
     ]

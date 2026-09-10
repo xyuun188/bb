@@ -1188,7 +1188,7 @@ def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> Non
         "block_on_remote_derivatives": False,
         "allow_cached_indicator_build": True,
         "allow_indicator_background_refresh": False,
-        "allow_derivatives_background_refresh": False,
+        "allow_derivatives_background_refresh": True,
     }
 
 
@@ -7326,13 +7326,16 @@ def test_parallel_loop_intervals_are_not_market_throttles(
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
 
-    assert service.market_loop_interval_seconds() == pytest.approx(10.5)
-    assert service.position_loop_interval_seconds() == pytest.approx(19.5)
+    assert service.market_loop_interval_seconds() == pytest.approx(30.0)
+    assert service.position_loop_interval_seconds() == pytest.approx(30.0)
     assert service.round_start_reconcile_timeout_seconds() == pytest.approx(15.0)
     assert service.okx_authoritative_sync_timeout_seconds() == pytest.approx(45.0)
     assert service.okx_settlement_fact_sync_interval_seconds() == pytest.approx(60.0)
-    assert service.market_loop_interval_seconds() < service.position_loop_interval_seconds()
-    assert service.market_loop_interval_seconds() < service.market_round_time_budget_seconds()
+    assert service.market_loop_interval_seconds() <= service.position_loop_interval_seconds()
+    # The scan cadence must not start a new round before the previous round's
+    # normal budget has elapsed; otherwise slow rounds accumulate and saturate
+    # the trading process.
+    assert service.market_loop_interval_seconds() >= service.market_round_time_budget_seconds()
 
 
 def test_paper_runner_has_one_trading_service_initialization_owner() -> None:
@@ -7623,7 +7626,7 @@ def test_position_round_watchdog_follows_position_review_cadence(
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
     assert service.position_review_stage_timeout_seconds() == 113.0
-    assert service.position_loop_interval_seconds() == pytest.approx(19.5)
+    assert service.position_loop_interval_seconds() == pytest.approx(30.0)
     assert service.position_round_watchdog_seconds() == pytest.approx(226.0)
 
 

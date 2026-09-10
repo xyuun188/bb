@@ -118,7 +118,7 @@ class EntryFeatureRankerPolicy:
             "analysis_volume_floor": empirical_policy_value(
                 "analysis_volume_floor",
                 metrics["volume_ratio"],
-                selector="median",
+                selector="lower_hinge",
                 observation_window=window,
             ),
             "tradable_volume_floor": empirical_policy_value(
@@ -130,7 +130,7 @@ class EntryFeatureRankerPolicy:
             "analysis_adx_floor": empirical_policy_value(
                 "analysis_adx_floor",
                 metrics["adx"],
-                selector="median",
+                selector="lower_hinge",
                 observation_window=window,
             ),
             "tradable_adx_floor": empirical_policy_value(
@@ -299,6 +299,7 @@ class EntryFeatureRankerPolicy:
             symbol for symbol, _feature in selected_items
         }
         analysis_only_items: list[tuple[str, Any]] = []
+        analysis_only_selected_items: list[tuple[str, Any]] = []
         if allow_analysis_fallback and len(selected_items) < max(0, int(limit or 0)):
             # Market observation must not disappear just because a symbol is
             # below the entry-quality cross-section. Keep invalid or missing
@@ -309,9 +310,10 @@ class EntryFeatureRankerPolicy:
                 if item[0] not in selected_symbols_before_analysis_fallback
                 if self.is_auto_analysis_candidate_feature(item[1])
             ]
-            selected_items.extend(
-                analysis_only_items[: max(limit - len(selected_items), 0)]
-            )
+            analysis_only_selected_items = analysis_only_items[
+                : max(limit - len(selected_items), 0)
+            ]
+            selected_items.extend(analysis_only_selected_items)
         selected = dict(selected_items)
         selected_symbols = {symbol for symbol, _ in selected_items}
         analysis_only_symbols = {symbol for symbol, _ in analysis_only_items}
@@ -416,9 +418,9 @@ class EntryFeatureRankerPolicy:
             "secondary_candidates": len(soft_items),
             "filtered_out_candidates": len(filtered_items),
             "analysis_only_candidates": len(analysis_only_items),
-            "analysis_only_selected_count": len(analysis_only_items),
+            "analysis_only_selected_count": len(analysis_only_selected_items),
             "analysis_only_selected_symbols": [
-                symbol for symbol, _feature in analysis_only_items
+                symbol for symbol, _feature in analysis_only_selected_items
             ],
             "analysis_fallback_enabled": bool(allow_analysis_fallback),
             "relative_quality_candidates": sum(

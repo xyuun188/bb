@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import time
+from typing import Final
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -32,6 +36,60 @@ from web_dashboard.api.security import (
 )
 
 router = APIRouter()
+
+_AUTH_STATUS_DB_TIMEOUT_SECONDS: Final[float] = 2.0
+_AUTH_STATUS_CACHE_TTL_SECONDS: Final[float] = 30.0
+_AUTH_STATUS_STALE_MAX_SECONDS: Final[float] = 120.0
+_auth_status_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _cache_auth_status(username: str, is_active: bool) -> None:
+    normalized = normalize_username(username)
+    if normalized:
+        _auth_status_cache[normalized] = (time.monotonic(), bool(is_active))
+
+
+def _invalidate_auth_status_cache(username: str | None = None) -> None:
+    if username:
+        _auth_status_cache.pop(normalize_username(username), None)
+    else:
+        _auth_status_cache.clear()
+
+
+async def _read_auth_status_from_db(username: str) -> bool:
+    async with get_session_ctx() as db_session:
+        current = await get_dashboard_user(db_session, username)
+    return current is not None and bool(current.is_active)
+
+
+async def _check_session_user_status(username: str) -> tuple[bool, bool]:
+    """Return (is_active, is_stale) without allowing DB stalls to block probes."""
+    normalized = normalize_username(username)
+    now = time.monotonic()
+    cached = _auth_status_cache.get(normalized)
+    if cached is not None:
+        cached_at, cached_active = cached
+        age = max(now - cached_at, 0.0)
+        if age <= _AUTH_STATUS_CACHE_TTL_SECONDS:
+            return cached_active, False
+    try:
+        is_active = await asyncio.wait_for(
+            _read_auth_status_from_db(normalized),
+            timeout=_AUTH_STATUS_DB_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        if cached is not None and now - cached[0] <= _AUTH_STATUS_STALE_MAX_SECONDS:
+            return bool(cached[1]), True
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "登录状态正在刷新，请稍后重试。",
+                "status": "auth_status_refreshing",
+            },
+            headers={"Retry-After": "2"},
+        ) from exc
+    _cache_auth_status(normalized, is_active)
+    return is_active, False
 
 
 class DashboardLoginRequest(BaseModel):
@@ -86,10 +144,10 @@ async def auth_status(
             "auth_method": "admin_key",
         }
     session = ensure_dashboard_login(request)
+    auth_check_stale = False
     if session is not None and settings.dashboard_auth_enabled:
-        async with get_session_ctx() as db_session:
-            current = await get_dashboard_user(db_session, session.username)
-        if current is None or not current.is_active:
+        is_active, auth_check_stale = await _check_session_user_status(session.username)
+        if not is_active:
             raise HTTPException(
                 status_code=401,
                 detail="当前登录账号不存在或已停用，请重新登录。",
@@ -100,6 +158,7 @@ async def auth_status(
         "login_required": dashboard_login_required(request),
         "auth_enabled": bool(settings.dashboard_auth_enabled),
         "auth_method": "session" if session else "local",
+        "auth_check_stale": auth_check_stale,
     }
 
 
@@ -142,6 +201,7 @@ async def login(request: Request, payload: DashboardLoginRequest) -> JSONRespons
         authenticated_username = configured_username
 
     session_token = create_dashboard_session(authenticated_username)
+    _cache_auth_status(authenticated_username, True)
     response = JSONResponse({"authenticated": True, "redirect": "/"})
     login_response_cookie(response, session_token)
     return response
@@ -197,6 +257,8 @@ async def update_dashboard_account(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     settings.dashboard_auth_username = user.username
     settings.dashboard_auth_email = user.email
+    _invalidate_auth_status_cache(context.username)
+    _cache_auth_status(user.username, True)
     response = JSONResponse({"status": "ok", "user": user.as_dict()})
     if user.username != context.username:
         login_response_cookie(response, create_dashboard_session(user.username))
@@ -223,6 +285,8 @@ async def change_dashboard_password(
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_auth_status_cache(context.username)
+    _cache_auth_status(context.username, bool(user.is_active))
     return {"status": "ok", "user": user.as_dict()}
 
 
@@ -258,6 +322,7 @@ async def create_dashboard_account_user(
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_auth_status_cache(user.username)
     return {"status": "ok", "user": user.as_dict()}
 
 
@@ -286,6 +351,7 @@ async def update_dashboard_account_user(
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_auth_status_cache(username)
     return {"status": "ok", "user": user.as_dict()}
 
 
@@ -304,6 +370,7 @@ async def deactivate_dashboard_account_user(
             user = await deactivate_dashboard_user(session, username)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_auth_status_cache(user.username)
     return {"status": "ok", "user": user.as_dict()}
 
 
@@ -322,6 +389,7 @@ async def delete_dashboard_account_user(
             user = await delete_dashboard_user(session, username)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _invalidate_auth_status_cache(username)
     return {"status": "ok", "user": user.as_dict()}
 
 

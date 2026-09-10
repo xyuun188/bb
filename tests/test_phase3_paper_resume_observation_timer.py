@@ -21,6 +21,10 @@ def test_phase3_paper_resume_observation_timer_service_is_read_only() -> None:
     assert "--report-max-age-seconds 3600" in service
     assert "bb-paper-trading.service" not in service
     assert "systemctl start" not in service
+    assert "MemoryHigh=1G" in service
+    assert "MemoryMax=1536M" in service
+    assert "CPUQuota=35%" in service
+    assert "TimeoutStartSec=120s" in service
     assert "OnCalendar=*-*-* *:07,37:00" in timer
     assert "Persistent=true" in timer
     assert "Unit=bb-phase3-paper-resume-observation.service" in timer

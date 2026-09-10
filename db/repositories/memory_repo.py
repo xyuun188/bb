@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Float, cast, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
@@ -221,9 +222,40 @@ class MemoryRepository(BaseRepository):
             if existing is not None:
                 return existing
         row = ShadowBacktest(**data)
-        self.session.add(row)
-        await self.session.flush()
-        return row
+        try:
+            # The pre-read keeps the common path cheap, while the savepoint
+            # closes the race between concurrent live creation and recovery.
+            # A uniqueness conflict rolls back only this insert, leaving the
+            # outer request transaction usable for the canonical-row lookup.
+            begin_nested = getattr(self.session, "begin_nested", None)
+            if callable(begin_nested):
+                async with begin_nested():
+                    self.session.add(row)
+                    await self.session.flush()
+            else:
+                # Small repository fakes used by isolated tests may expose only
+                # add/flush. The real async SQLAlchemy session always takes the
+                # savepoint path above.
+                self.session.add(row)
+                await self.session.flush()
+            return row
+        except IntegrityError:
+            if decision_id <= 0 or horizon_minutes <= 0:
+                raise
+            existing = (
+                await self.session.execute(
+                    select(ShadowBacktest)
+                    .where(
+                        ShadowBacktest.decision_id == decision_id,
+                        ShadowBacktest.horizon_minutes == horizon_minutes,
+                        ShadowBacktest.label_version == data["label_version"],
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise
+            return existing
 
     async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
         now = datetime.now(UTC)
@@ -261,8 +293,27 @@ class MemoryRepository(BaseRepository):
             .correlate(AIDecision)
             .scalar_subquery()
         )
+        # Recovery only needs the decision contract used by ShadowBacktestService.
+        # Avoid hydrating model-health and retention columns for every missing
+        # row; those wide JSON fields were the source of periodic 15s recovery
+        # timeouts under normal trading load.
         stmt = (
-            select(AIDecision)
+            select(
+                AIDecision.id,
+                AIDecision.model_name,
+                AIDecision.symbol,
+                AIDecision.action,
+                AIDecision.confidence,
+                AIDecision.reasoning,
+                AIDecision.position_size_pct,
+                AIDecision.suggested_leverage,
+                AIDecision.stop_loss_pct,
+                AIDecision.take_profit_pct,
+                AIDecision.is_paper,
+                AIDecision.created_at,
+                AIDecision.raw_llm_response,
+                AIDecision.feature_snapshot,
+            )
             .where(
                 AIDecision.analysis_type == "market",
                 AIDecision.created_at >= since,

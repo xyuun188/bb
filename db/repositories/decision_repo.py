@@ -136,7 +136,7 @@ class DecisionRepository(BaseRepository):
             AIDecision.is_paper,
         ]
         columns.extend(
-            AIDecision.raw_llm_response[key].label(f"raw_{key}")
+            AIDecision.decision_learning_snapshot[key].label(f"raw_{key}")
             for key in _DASHBOARD_RAW_PAYLOAD_KEYS
         )
         stmt = (

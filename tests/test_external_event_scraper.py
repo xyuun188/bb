@@ -100,6 +100,7 @@ def test_external_event_runtime_settings_reload_from_env(
         "\n".join(
             [
                 "EXTERNAL_EVENT_SCRAPER_ENABLED=true",
+                "EXTERNAL_EVENT_SCRAPER_TRADING_PROCESS_ENABLED=false",
                 "EXTERNAL_EVENT_SCRAPER_INTERVAL_SECONDS=600",
                 "EXTERNAL_EVENT_SCRAPER_TIMEOUT_SECONDS=5",
                 "EXTERNAL_EVENT_SCRAPER_MAX_SOURCES=2",
@@ -122,6 +123,7 @@ def test_external_event_runtime_settings_reload_from_env(
 
     assert loaded == {"enabled": True, "source_count": 1, "interval_seconds": 600}
     assert settings.external_event_scraper_enabled is True
+    assert settings.external_event_scraper_trading_process_enabled is False
     assert settings.external_event_scraper_sources[0]["name"] == "ethereum_blog"
 
 

@@ -759,6 +759,38 @@ async def test_shadow_backtest_incomplete_authoritative_fact_stays_pending() -> 
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_incomplete_fact_sets_symbol_retry_cooldown() -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=902,
+        decision_id=9002,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.5)
+    calls = 0
+
+    async def incomplete_market_fact(symbol: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return _market_fact(symbol, 101.5, _RESULT_TIMESTAMP_MS, notional_24h_usdt=0.0)
+
+    service.latest_market_fact_provider = incomplete_market_fact
+
+    assert await service.update_due() == 0
+    assert await service.update_due() == 0
+    assert calls == 1
+    assert "BTC/USDT" in service._market_fact_retry_after
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_market_facts_are_deduplicated_per_symbol() -> None:
     repo = _FakeRepo()
     repo.due_rows = [

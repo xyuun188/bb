@@ -225,3 +225,69 @@ def test_realized_fee_after_pnl_is_attributed_to_each_aligned_expert() -> None:
     assert stats["expert:trend_expert"]["pnl"] == pytest.approx(-2.5)
     assert stats["expert:momentum_expert"]["count"] == 0
     assert stats["expert:sentiment_expert"]["count"] == 0
+
+
+class _ContributionResult:
+    def __init__(self, rows: list[object]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[object]:
+        return self._rows
+
+
+class _ContributionSession:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.statements: list[object] = []
+
+    async def execute(self, statement: object) -> _ContributionResult:
+        self.statements.append(statement)
+        if self.fail:
+            raise TimeoutError("read pool timeout")
+        return _ContributionResult([])
+
+
+class _ContributionSessionContext:
+    def __init__(self, session: _ContributionSession) -> None:
+        self.session = session
+
+    async def __aenter__(self) -> _ContributionSession:
+        return self.session
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_recent_applies_bounded_queries_and_uses_read_session() -> None:
+    session = _ContributionSession()
+    service = ModelContributionPerformanceService(
+        session_factory=lambda: _ContributionSessionContext(session),
+        position_limit=7,
+        order_limit=11,
+    )
+
+    stats = await service.recent("paper")
+
+    assert all(bucket["count"] == 0 for bucket in stats.values())
+    assert len(session.statements) == 1
+    sql = str(session.statements[0])
+    assert "LIMIT" in sql.upper()
+
+
+@pytest.mark.asyncio
+async def test_recent_preserves_last_good_snapshot_after_refresh_failure() -> None:
+    session = _ContributionSession()
+    service = ModelContributionPerformanceService(
+        session_factory=lambda: _ContributionSessionContext(session),
+    )
+    good = {"ml_profit_model": {"count": 3, "pnl": 9.0}}
+    service._cache_by_mode["paper"] = {
+        "expires_at": datetime.now(UTC) - timedelta(seconds=1),
+        "stats": good,
+    }
+    session.fail = True
+
+    result = await service.recent("paper")
+
+    assert result is good

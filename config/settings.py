@@ -402,6 +402,8 @@ class Settings(BaseSettings):
     coinmarketcal_api_key: str = ""
     newsapi_api_key: str = ""
     external_event_scraper_enabled: bool = False
+    # Optional collector-only switch; keep the trading hot path isolated.
+    external_event_scraper_trading_process_enabled: bool = False
     external_event_scraper_sources: Annotated[list[dict[str, Any]], NoDecode] = Field(
         default_factory=list
     )

@@ -209,6 +209,10 @@ def test_market_data_warmup_timer_contract_does_not_start_trading() -> None:
     assert "bb-paper-trading" not in service
     assert "trading_service" not in service
     assert "systemctl start" not in service
+    assert "MemoryHigh=768M" in service
+    assert "MemoryMax=1G" in service
+    assert "CPUQuota=25%" in service
+    assert "TimeoutStartSec=90s" in service
 
 
 def test_market_data_warmup_timer_matches_kline_freshness_budget() -> None:

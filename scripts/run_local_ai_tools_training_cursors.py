@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import and_, or_, select  # noqa: E402
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
@@ -118,6 +118,13 @@ async def _iter_shadow_samples_stream():
         ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
+        or_(
+            ShadowBacktest.decision_action.in_(["long", "short"]),
+            and_(
+                ShadowBacktest.missed_opportunity.is_(True),
+                ShadowBacktest.best_action.in_(["long", "short"]),
+            ),
+        ),
     )
     while True:
         async with get_read_session_ctx() as session:
@@ -169,48 +176,14 @@ def _shadow_group_key(sample: dict[str, Any]) -> str:
 
 
 async def _streaming_cursor_probe() -> dict[str, Any]:
-    """Compute the canonical cursor with bounded memory and exact row counts."""
-
-    group_counts: dict[str, int] = defaultdict(int)
-    group_trainable_counts: dict[str, int] = defaultdict(int)
-    group_weight_sums: dict[str, float] = defaultdict(float)
-    group_budgets: dict[str, float] = defaultdict(float)
-    first_pass_seen: dict[tuple[int, int, str], int] = {}
-
-    async for raw in _iter_shadow_samples_stream():
-        sample = annotate_sample(_duplicate_metadata(raw, first_pass_seen), "shadow")
-        key = _shadow_group_key(sample)
-        group_counts[key] += 1
-        if not bool(sample.get("exclude_from_training")):
-            weight = max(_safe_float(sample.get("sample_weight")), 0.0)
-            group_trainable_counts[key] += 1
-            group_weight_sums[key] += weight
-            group_budgets[key] = max(group_budgets[key], weight)
+    """Compute the canonical cursor in one bounded-memory database pass."""
 
     profile_stats: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
     market_count = 0
     market_groups: set[str] = set()
-    second_pass_seen: dict[tuple[int, int, str], int] = {}
+    seen: dict[tuple[int, int, str], int] = {}
     async for raw in _iter_shadow_samples_stream():
-        sample = annotate_sample(_duplicate_metadata(raw, second_pass_seen), "shadow")
-        key = _shadow_group_key(sample)
-        base = max(_safe_float(sample.get("sample_weight")), 0.0)
-        total = group_weight_sums.get(key, 0.0)
-        budget = group_budgets.get(key, 0.0)
-        multiplier = budget / total if total > 0.0 else 0.0
-        adjusted = 0.0 if sample.get("exclude_from_training") else base * multiplier
-        sample["sample_weight"] = adjusted
-        sample["correlation_weight"] = {
-            "source": "shared_decision_or_authoritative_lifecycle_identity",
-            "correlation_group": key,
-            "group_sample_count": group_counts[key],
-            "group_trainable_count": group_trainable_counts[key],
-            "base_quality_weight": base,
-            "group_effective_weight_budget": budget,
-            "normalization_multiplier": multiplier,
-            "effective_sample_weight": adjusted,
-            "fixed_sampling_ratio": False,
-        }
+        sample = annotate_sample(_duplicate_metadata(raw, seen), "shadow")
         identity = market_training_identity(sample)
         if identity is None:
             continue

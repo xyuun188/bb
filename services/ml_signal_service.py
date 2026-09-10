@@ -143,6 +143,12 @@ def _training_source_code_version() -> str:
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 FULL_TRAINING_PROBE_INTERVAL_SECONDS = 6 * 60 * 60
+LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = max(
+    int(os.environ.get("LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", "5000")),
+    MIN_TRAINING_DECISION_GROUP_COUNT,
+    2,
+)
+LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -2841,8 +2847,11 @@ def train_from_frame(
             frame_quality_report,
             persist_artifact=persist_artifact,
         ),
-        "training_window_policy": "all_current_clean_separated_supervision_samples",
-        "training_cursor_note": "last_trained_completed_shadow_sample_count is the cumulative cursor used for auto-training.",
+        "training_window_policy": "resource_bounded_time_stratified_clean_separated_supervision_samples",
+        "training_cursor_note": (
+            "last_trained_completed_shadow_sample_count is the cumulative cursor; "
+            "model fitting uses a bounded time-stratified decision-group window."
+        ),
         "test_count": int(len(test)),
         "feature_count": len(FEATURE_KEYS),
         "feature_contract_version": FEATURE_CONTRACT_VERSION,
@@ -3113,6 +3122,89 @@ class MLSignalService:
                 "模型已获得实盘候选资格；实盘订单仍需逐笔通过生产门禁。"
                 if live_ml_ready
                 else "模型可正常参与模拟盘分析和交易；晋升状态只阻断实盘权限。"
+            ),
+            **auto_status,
+        }
+
+    def status_metadata(self) -> dict[str, Any]:
+        """Return dashboard-safe status without deserializing the model bundle."""
+
+        auto_status = self._auto_train_status()
+        try:
+            resolved = self.artifact_registry.resolve_current_metadata()
+        except Exception as exc:
+            return {
+                "available": False,
+                "status": "artifact_metadata_error",
+                "artifact_status": "unknown",
+                "live_ml_ready": False,
+                "paper_trading_permission": None,
+                "message": "模型元数据读取失败，未加载模型文件。",
+                "error": safe_error_text(exc, limit=180),
+                **auto_status,
+            }
+        if resolved is None:
+            return {
+                "available": False,
+                "status": "no_model",
+                "artifact_status": "unavailable",
+                "live_ml_ready": False,
+                "paper_trading_permission": False,
+                "model_bundle_available": False,
+                "artifact_registry": self.artifact_registry.status_metadata(),
+                "message": "本地 ML 尚未注册当前模型 Artifact。",
+                **auto_status,
+            }
+        metadata = _safe_dict(resolved.manifest)
+        activation = _safe_dict(resolved.activation_manifest)
+        influence = _influence_policy(metadata)
+        readiness = build_ml_readiness_report(metadata, influence)
+        influence, readiness = _activation_gated_policy(
+            influence,
+            readiness,
+            resolved,
+        )
+        live_ml_ready = bool(readiness.get("live_ml_ready"))
+        advisory_enabled = bool(
+            influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
+        )
+        return {
+            "available": True,
+            "service_available": True,
+            "model_bundle_available": True,
+            "artifact_status": "ready",
+            "model_path": str(resolved.model_path),
+            "artifact_registry": self.artifact_registry.status_metadata(),
+            **metadata,
+            "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
+            "artifact_activation_manifest": activation,
+            "readiness_state": readiness.get("state"),
+            "readiness": readiness,
+            "live_ml_ready": live_ml_ready,
+            "paper_analysis_permission": True,
+            "paper_trading_permission": True,
+            "live_trading_permission": live_ml_ready,
+            "advisory_enabled": advisory_enabled,
+            "influence_policy": influence,
+            "training_shadow_sample_count": int(
+                metadata.get("training_shadow_sample_count")
+                or metadata.get("sample_count")
+                or 0
+            ),
+            "training_policy": metadata.get("training_policy")
+            or "current_training_epoch_only",
+            "training_window_policy": metadata.get("training_window_policy")
+            or "all_current_clean_cost_complete_samples",
+            "status": (
+                "ready"
+                if live_ml_ready
+                else str(readiness.get("state") or influence.get("status") or "learning_only")
+            ),
+            "mode": "entry_profit_filter" if live_ml_ready else "paper_model",
+            "note": (
+                "模型可正常参与模拟盘分析和交易；晋升状态只阻断实盘权限。"
+                if not live_ml_ready
+                else "模型已获得实盘候选资格；实盘订单仍需逐笔通过生产门禁。"
             ),
             **auto_status,
         }
@@ -4870,7 +4962,9 @@ class MLSignalService:
             "details": [],
         }
 
-    def _artifact_registry_status(self) -> dict[str, Any]:
+    def _artifact_registry_status(self, *, load_bundle: bool = True) -> dict[str, Any]:
+        if not load_bundle:
+            return self.artifact_registry.status_metadata()
         current = self._resolved_artifact
         status_method = getattr(self.artifact_registry, "status", None)
         registry_status = status_method() if callable(status_method) else {}
@@ -5092,15 +5186,54 @@ class MLSignalService:
 
 
 async def load_shadow_training_rows() -> list[Any]:
+    """Load a time-stratified, resource-bounded clean training window.
+
+    The cumulative training cursor is counted separately. Keeping the fit
+    window bounded prevents large JSON snapshots from exhausting the trading
+    service while retaining coverage across the full current training epoch.
+    """
+
     epoch_start = load_training_epoch_start()
     base_filters = _shadow_training_candidate_filters(epoch_start)
-    order_by = (ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
     columns = _shadow_training_columns()
-
+    selected_ids: list[int] = []
     async with get_read_session_ctx() as session:
-        stmt = select(*columns).where(*base_filters).order_by(*order_by)
-        result = await session.execute(stmt)
-        rows = [_shadow_training_row_from_mapping(row) for row in result.mappings().all()]
+        identity_result = await session.stream(
+            select(
+                ShadowBacktest.id,
+                ShadowBacktest.decision_id,
+            )
+            .where(*base_filters)
+            .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+        )
+        group_ids: dict[int, list[int]] = {}
+        async for mapping in identity_result.mappings():
+            sample_id = int(mapping.get("id") or 0)
+            decision_id = int(mapping.get("decision_id") or 0)
+            if sample_id <= 0:
+                continue
+            group_ids.setdefault(decision_id or -sample_id, []).append(sample_id)
+
+        groups = list(group_ids.values())
+        if len(groups) > LOCAL_ML_TRAINING_MAX_DECISION_GROUPS:
+            budget = LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
+            selected_group_indexes = {
+                round(index * (len(groups) - 1) / (budget - 1))
+                for index in range(budget)
+            }
+            groups = [groups[index] for index in sorted(selected_group_indexes)]
+        selected_ids = [sample_id for group in groups for sample_id in group]
+
+        rows: list[ShadowTrainingRow] = []
+        for offset in range(0, len(selected_ids), LOCAL_ML_TRAINING_READ_PAGE_SIZE):
+            page_ids = selected_ids[offset : offset + LOCAL_ML_TRAINING_READ_PAGE_SIZE]
+            result = await session.execute(
+                select(*columns).where(ShadowBacktest.id.in_(page_ids))
+            )
+            rows.extend(
+                _shadow_training_row_from_mapping(row)
+                for row in result.mappings()
+            )
     return select_shadow_training_rows(rows)
 
 

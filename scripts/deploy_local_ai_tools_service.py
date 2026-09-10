@@ -238,6 +238,7 @@ _SPECIALIST_NUM_THREADS = max(
 _TRAIN_LOCK = threading.Lock()
 _TRAIN_EXECUTOR_LOCK = threading.Lock()
 _TRAIN_EXECUTOR: ProcessPoolExecutor | None = None
+_TRAIN_EXECUTOR_MANUAL_RECYCLE = False
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
     "phase",
@@ -3360,6 +3361,9 @@ def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | 
     model.eval()
     with torch.no_grad():
         train_mae = float(torch.mean(torch.abs(model(xt) - yt)).item())
+    # Capture the shape before releasing the large feature arrays below.
+    # Reading X after ``del X`` caused every Torch-backed refresh to fail with
+    # UnboundLocalError.
     input_dim = int(X.shape[1])
     state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     del optimizer, loss_fn, xt, yt, model, X, y
@@ -6028,15 +6032,26 @@ def _isolated_training_worker(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _training_executor() -> ProcessPoolExecutor:
-    global _TRAIN_EXECUTOR
+    global _TRAIN_EXECUTOR, _TRAIN_EXECUTOR_MANUAL_RECYCLE
 
     with _TRAIN_EXECUTOR_LOCK:
         if _TRAIN_EXECUTOR is None:
-            _TRAIN_EXECUTOR = ProcessPoolExecutor(
-                max_workers=1,
-                mp_context=multiprocessing.get_context("spawn"),
-                max_tasks_per_child=1,
-            )
+            executor_kwargs = {
+                "max_workers": 1,
+                "mp_context": multiprocessing.get_context("spawn"),
+            }
+            try:
+                # max_tasks_per_child was added in Python 3.11. Keep the
+                # worker isolated on older runtimes and recycle it explicitly
+                # after each completed request.
+                _TRAIN_EXECUTOR = ProcessPoolExecutor(
+                    **executor_kwargs,
+                    max_tasks_per_child=1,
+                )
+                _TRAIN_EXECUTOR_MANUAL_RECYCLE = False
+            except TypeError:
+                _TRAIN_EXECUTOR = ProcessPoolExecutor(**executor_kwargs)
+                _TRAIN_EXECUTOR_MANUAL_RECYCLE = True
         return _TRAIN_EXECUTOR
 
 
@@ -6124,6 +6139,14 @@ def _run_training_request(req: TrainRequest) -> dict[str, Any]:
         result.setdefault("training_process_isolated", True)
         result.setdefault("training_request_id", request_id)
         result.setdefault("training_timeout_seconds", TRAIN_REQUEST_TIMEOUT_SECONDS)
+        if _TRAIN_EXECUTOR_MANUAL_RECYCLE:
+            # Python 3.10 has no max_tasks_per_child. Recycle the completed
+            # worker explicitly so model tensors and sklearn arenas cannot
+            # accumulate across scheduled refreshes.
+            _terminate_training_executor(executor)
+            with _TRAIN_EXECUTOR_LOCK:
+                if _TRAIN_EXECUTOR is executor:
+                    _TRAIN_EXECUTOR = None
     if bool(req.persist_artifact) and bool(result.get("trained")):
         _invalidate_parent_bundle_cache()
         result = _with_post_training_inference_warmup(result)
@@ -7108,11 +7131,16 @@ def _remote_training_runtime_compatibility_command() -> str:
         f"{PHASE3_PYTHON_BIN} - <<'PY'\n"
         "import sys\n"
         "from concurrent.futures import ProcessPoolExecutor\n"
-        "if sys.version_info < (3, 11):\n"
-        "    raise SystemExit('phase3_training_requires_python_3_11_or_newer')\n"
-        "executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)\n"
+        "try:\n"
+        "    executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)\n"
+        "    recycle_mode = 'max_tasks_per_child'\n"
+        "except TypeError:\n"
+        "    if sys.version_info >= (3, 11):\n"
+        "        raise\n"
+        "    executor = ProcessPoolExecutor(max_workers=1)\n"
+        "    recycle_mode = 'manual'\n"
         "executor.shutdown(wait=False, cancel_futures=True)\n"
-        "print('phase3_training_executor_compatibility_ok')\n"
+        "print('phase3_training_executor_compatibility_ok:' + recycle_mode)\n"
         "PY"
     )
 

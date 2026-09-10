@@ -64,6 +64,20 @@ async def test_trade_fact_audit_uses_postgres_consistent_read_snapshot() -> None
 
 
 @pytest.mark.asyncio
+async def test_trade_fact_audit_reuses_read_session_snapshot() -> None:
+    class _FakeSession:
+        info = {"bb_consistent_read_snapshot_started": True}
+
+        def get_bind(self):
+            raise AssertionError("an initialized snapshot must be reused")
+
+        async def execute(self, _statement) -> None:
+            raise AssertionError("an initialized snapshot must not be reset")
+
+    await _start_consistent_read_snapshot(_FakeSession())
+
+
+@pytest.mark.asyncio
 async def test_trade_fact_audit_keeps_sqlite_test_reads_compatible() -> None:
     class _FakeBind:
         class dialect:

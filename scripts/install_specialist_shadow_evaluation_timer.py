@@ -74,6 +74,7 @@ def render_timer(*, minutes: int = DEFAULT_TIMER_MINUTES) -> str:
             OnActiveSec={int(minutes)}min
             OnUnitActiveSec={int(minutes)}min
             AccuracySec=1min
+            RandomizedDelaySec=300
             Persistent=true
             Unit={SERVICE_NAME}
 

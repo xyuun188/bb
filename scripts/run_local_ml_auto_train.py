@@ -6,10 +6,31 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+
+def _limit_training_process_memory() -> None:
+    """Prevent model fitting from exhausting memory reserved for trading."""
+
+    if os.name == "nt":
+        return
+    try:
+        import resource
+
+        configured = int(
+            os.environ.get("LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES", "2147483648")
+        )
+        limit = max(configured, 1024 * 1024 * 1024)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ImportError, OSError, ValueError):
+        return
+
+
+_limit_training_process_memory()
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -18,7 +19,7 @@ from core.phase3_model_contract import (
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
 from data_feed.external_event_scraper import SCRAPLING_SOURCE_PREFIX
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
@@ -35,6 +36,10 @@ from services.server_monitor_status import (
 from services.trade_execution_contract import entry_opportunity_evidence_score
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.text_sanitize import sanitize_payload
+
+# Preserve the module-level hook name used by existing tests/extensions while
+# routing production reads through the isolated read-only session factory.
+get_session_ctx = get_read_session_ctx
 
 router = APIRouter()
 
@@ -72,10 +77,7 @@ TERMINAL_FAILED_ORDER_STATUSES = {
     "expired",
 }
 HANDLED_TERMINAL_FAILURE_MARKERS = tuple(
-    str(marker).lower()
-    for marker in (
-        *UNTRADABLE_EXCHANGE_ERROR_MARKERS,
-    )
+    str(marker).lower() for marker in (*UNTRADABLE_EXCHANGE_ERROR_MARKERS,)
 )
 _SYSTEM_SELF_CHECK_CACHE_TTL_SECONDS = 30.0
 _system_self_check_cache: tuple[datetime, dict[str, Any]] | None = None
@@ -137,6 +139,41 @@ def _check_item(
 
 def _order_status(row: Any) -> str:
     return str(getattr(row, "status", "") or "").lower()
+
+
+def _compact_decision_namespace(row: Any) -> SimpleNamespace:
+    """Keep self-check diagnostics off the large raw decision transcript."""
+
+    snapshot = getattr(row, "decision_learning_snapshot", None)
+    if not isinstance(snapshot, dict):
+        snapshot = getattr(row, "raw_llm_response", None)
+    return SimpleNamespace(
+        id=getattr(row, "id", None),
+        model_name=getattr(row, "model_name", ""),
+        symbol=getattr(row, "symbol", ""),
+        action=getattr(row, "action", ""),
+        analysis_type=getattr(row, "analysis_type", None),
+        was_executed=getattr(row, "was_executed", False),
+        created_at=getattr(row, "created_at", None),
+        execution_reason=getattr(row, "execution_reason", None),
+        reasoning=getattr(row, "reasoning", None),
+        raw_llm_response=dict(snapshot) if isinstance(snapshot, dict) else {},
+    )
+
+
+def _result_rows(result: Any) -> list[Any]:
+    """Read SQLAlchemy rows while keeping lightweight test fakes compatible."""
+
+    all_rows = getattr(result, "all", None)
+    if callable(all_rows):
+        return list(all_rows())
+    scalars = getattr(result, "scalars", None)
+    return list(scalars().all()) if callable(scalars) else []
+
+
+def _row_namespace(row: Any) -> Any:
+    mapping = getattr(row, "_mapping", None)
+    return SimpleNamespace(**dict(mapping)) if mapping is not None else row
 
 
 def _recent_order_reason_text(row: Any, decisions_by_id: dict[int, Any]) -> str:
@@ -783,9 +820,7 @@ def _expert_model_diversity_item(
     status = "warning" if same_provider_risk else "ok"
     if not expert_rows:
         status = "warning"
-        message = (
-            "No fixed expert model routing was found, so expert diversity cannot be audited."
-        )
+        message = "No fixed expert model routing was found, so expert diversity cannot be audited."
     elif same_provider_risk:
         message = (
             f"{largest_shared_count} expert slots share the same api_base/model; prompts still "
@@ -837,9 +872,7 @@ def _required_runtime_models() -> set[str]:
 def _external_event_collection_health(now: datetime) -> dict[str, Any]:
     payload = load_external_event_source_health()
     checked_at = _as_utc_datetime(payload.get("checked_at"))
-    age_seconds = (
-        max((now - checked_at).total_seconds(), 0.0) if checked_at is not None else None
-    )
+    age_seconds = max((now - checked_at).total_seconds(), 0.0) if checked_at is not None else None
     max_age_seconds = max(
         int(settings.external_event_scraper_interval_seconds or 0) * 3,
         EXTERNAL_EVENT_HEALTH_MIN_MAX_AGE_SECONDS,
@@ -924,10 +957,8 @@ async def _data_source_items() -> list[dict[str, Any]]:
                     func.max(
                         func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)
                     ).filter(NewsArticle.source.like(f"{SCRAPLING_SOURCE_PREFIX}%")),
-                )
-                .where(
-                    func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at)
-                    >= news_since
+                ).where(
+                    func.coalesce(NewsArticle.published_at, NewsArticle.fetched_at) >= news_since
                 )
             )
         ).one()
@@ -937,8 +968,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                     func.count(SocialPost.id),
                     func.count(func.distinct(SocialPost.platform)),
                     func.max(SocialPost.posted_at),
-                )
-                .where(SocialPost.posted_at >= social_since)
+                ).where(SocialPost.posted_at >= social_since)
             )
         ).one()
 
@@ -1080,15 +1110,17 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 )
                 if external_event_ok and collection_health_available
                 else (
-                    f"Scrapling events have {external_event_source_count} recent-content "
-                    f"sources and {external_event_count} samples; latest about "
-                    f"{_age_minutes(external_event_latest)} minutes ago."
-                )
-                if external_event_ok
-                else (
-                    "Scrapling external event samples are empty or stale; official "
-                    "announcements, project blogs, exchange listings, and regulatory "
-                    "events will be under-covered."
+                    (
+                        f"Scrapling events have {external_event_source_count} recent-content "
+                        f"sources and {external_event_count} samples; latest about "
+                        f"{_age_minutes(external_event_latest)} minutes ago."
+                    )
+                    if external_event_ok
+                    else (
+                        "Scrapling external event samples are empty or stale; official "
+                        "announcements, project blogs, exchange listings, and regulatory "
+                        "events will be under-covered."
+                    )
                 )
             ),
             details={
@@ -1096,9 +1128,7 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 "source_count": external_event_source_count,
                 "recent_content_source_count": external_event_source_count,
                 "effective_healthy_source_count": effective_source_count,
-                "latest_at": (
-                    external_event_latest.isoformat() if external_event_latest else None
-                ),
+                "latest_at": (external_event_latest.isoformat() if external_event_latest else None),
                 "age_minutes": _age_minutes(external_event_latest),
                 "fresh_limit_hours": round(EXTERNAL_EVENT_FRESH_SECONDS / 3600, 1),
                 "source_diversity_ok": external_event_diverse,
@@ -1253,19 +1283,39 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
     since = datetime.now(UTC) - timedelta(hours=6)
     async with get_session_ctx() as session:
         orders_result = await session.execute(
-            select(Order)
+            select(
+                Order.id,
+                Order.status,
+                Order.created_at,
+                Order.decision_id,
+                Order.exchange_order_id,
+            )
             .where(Order.created_at >= since)
-            .order_by(Order.created_at.desc())
+            .order_by(Order.created_at.desc(), Order.id.desc())
             .limit(80)
         )
-        orders = list(orders_result.scalars().all())
+        orders = [_row_namespace(row) for row in _result_rows(orders_result)]
         decisions_result = await session.execute(
-            select(AIDecision)
+            select(
+                AIDecision.id,
+                AIDecision.model_name,
+                AIDecision.symbol,
+                AIDecision.action,
+                AIDecision.analysis_type,
+                AIDecision.was_executed,
+                AIDecision.created_at,
+                AIDecision.execution_reason,
+                AIDecision.reasoning,
+                AIDecision.decision_learning_snapshot,
+            )
             .where(AIDecision.created_at >= since)
-            .order_by(AIDecision.created_at.desc())
+            .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
             .limit(80)
         )
-        decisions = list(decisions_result.scalars().all())
+        decisions = [
+            _compact_decision_namespace(_row_namespace(row))
+            for row in _result_rows(decisions_result)
+        ]
         order_decision_ids = {
             int(row.decision_id) for row in orders if getattr(row, "decision_id", None) is not None
         }
@@ -1275,9 +1325,23 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
         missing_order_decision_ids = sorted(order_decision_ids - loaded_decision_ids)
         if missing_order_decision_ids:
             linked_decisions_result = await session.execute(
-                select(AIDecision).where(AIDecision.id.in_(missing_order_decision_ids[:80]))
+                select(
+                    AIDecision.id,
+                    AIDecision.model_name,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.analysis_type,
+                    AIDecision.was_executed,
+                    AIDecision.created_at,
+                    AIDecision.execution_reason,
+                    AIDecision.reasoning,
+                    AIDecision.decision_learning_snapshot,
+                ).where(AIDecision.id.in_(missing_order_decision_ids[:80]))
             )
-            decisions.extend(linked_decisions_result.scalars().all())
+            decisions.extend(
+                _compact_decision_namespace(_row_namespace(row))
+                for row in _result_rows(linked_decisions_result)
+            )
 
     failed_orders = [row for row in orders if str(row.status or "").lower() != "filled"]
     executed_orders = [row for row in orders if str(row.status or "").lower() == "filled"]
@@ -1482,16 +1546,18 @@ async def _run_self_check_section(
 async def _model_training_identity_item() -> dict[str, Any]:
     registry = await _dash.get_model_training_registry_status()
     summary = registry.get("summary") if isinstance(registry.get("summary"), dict) else {}
-    alias_only = summary.get("alias_only_models") if isinstance(summary.get("alias_only_models"), list) else []
+    alias_only = (
+        summary.get("alias_only_models")
+        if isinstance(summary.get("alias_only_models"), list)
+        else []
+    )
     identity_failures = (
         summary.get("identity_failure_models")
         if isinstance(summary.get("identity_failure_models"), list)
         else []
     )
     scheduler_state = (
-        registry.get("scheduler_state")
-        if isinstance(registry.get("scheduler_state"), dict)
-        else {}
+        registry.get("scheduler_state") if isinstance(registry.get("scheduler_state"), dict) else {}
     )
     scheduler_unhealthy = bool(
         scheduler_state.get("heartbeat_stale")
@@ -1525,9 +1591,7 @@ async def _model_training_identity_item() -> dict[str, Any]:
 
 async def _collect_system_self_check() -> dict[str, Any]:
     items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
-    trading_task = asyncio.create_task(
-        _run_self_check_section(_trading_service_running_item())
-    )
+    trading_task = asyncio.create_task(_run_self_check_section(_trading_service_running_item()))
     monitor_task = asyncio.create_task(
         _run_self_check_section(
             get_server_monitor_status_async(),

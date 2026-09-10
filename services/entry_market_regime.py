@@ -59,8 +59,11 @@ class EntryMarketRegimeContextPolicy:
             "avg_price_vs_sma20": round(average("price_vs_sma20"), 8),
             "avg_price_vs_sma50": round(average("price_vs_sma50"), 8),
             "avg_adx_14": round(average("adx_14"), 8),
-            "production_permission": True,
-            "reason": "Paper trading mode: allow entry based on tradable candidates.",
+            "production_permission": False,
+            "reason": (
+                "Market breadth is observation-only; entry permission is decided by "
+                "the authoritative candidate and execution contracts."
+            ),
             "policy_provenance": {
                 "source": "current_market_cross_section",
                 "observation_window": "current_analysis_round",

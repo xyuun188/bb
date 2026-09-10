@@ -82,7 +82,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
             await session.commit()
-        except Exception:
+        except BaseException:
             await session.rollback()
             raise
 
@@ -94,21 +94,70 @@ async def get_session_ctx() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
             await session.commit()
-        except Exception:
+        except BaseException:
             await session.rollback()
             raise
 
 
 @asynccontextmanager
-async def get_read_session_ctx() -> AsyncGenerator[AsyncSession, None]:
-    """Open a session for read-only dashboard queries without committing."""
+async def get_read_session_ctx(
+    *,
+    statement_timeout_ms: int = 12_000,
+    idle_transaction_timeout_ms: int = 15_000,
+    transaction_isolation: str | None = None,
+) -> AsyncGenerator[AsyncSession, None]:
+    """Open a bounded read-only transaction and always release it promptly."""
+
     maker = await get_sessionmaker()
     async with maker() as session:
         try:
+            if "postgresql" in settings.database_url:
+                normalized_isolation = str(transaction_isolation or "").strip().upper()
+                if normalized_isolation:
+                    # This must be the first statement in the transaction.  Keep
+                    # the accepted values explicit so a caller cannot inject SQL.
+                    allowed_isolations = {
+                        "REPEATABLE READ READ ONLY",
+                        "SERIALIZABLE READ ONLY",
+                    }
+                    if normalized_isolation not in allowed_isolations:
+                        raise ValueError(
+                            f"unsupported read transaction isolation: {transaction_isolation!r}"
+                        )
+                    await session.execute(
+                        text(f"SET TRANSACTION ISOLATION LEVEL {normalized_isolation}")
+                    )
+                    session.info["bb_consistent_read_snapshot_started"] = True
+                statement_timeout = max(int(statement_timeout_ms), 100)
+                idle_timeout = max(int(idle_transaction_timeout_ms), 100)
+                # Transaction-local limits protect the shared pool from a
+                # cancelled browser request without constraining writes,
+                # migrations, or model training connections.
+                await session.execute(
+                    text("SELECT set_config('statement_timeout', :value, true)"),
+                    {"value": f"{statement_timeout}ms"},
+                )
+                await session.execute(
+                    text("SELECT set_config('idle_in_transaction_session_timeout', :value, true)"),
+                    {"value": f"{idle_timeout}ms"},
+                )
             yield session
-        except Exception:
-            await session.rollback()
-            raise
+        finally:
+            # SELECT starts a transaction in PostgreSQL.  Roll it back even
+            # after a successful response, and especially after cancellation,
+            # so a pooled connection is never left idle in transaction.
+            # Detach already-loaded ORM rows first: rollback expires them, but
+            # callers intentionally build response/strategy state after the
+            # context closes.
+            expunge_all = getattr(session, "expunge_all", None)
+            if callable(expunge_all):
+                expunge_all()
+            try:
+                await session.rollback()
+            except Exception:
+                # A dropped connection is already unusable; do not mask the
+                # original request error while returning it to the pool.
+                pass
 
 
 async def init_db(*, migrate_schema: bool = True) -> None:
@@ -205,7 +254,8 @@ async def init_db(*, migrate_schema: bool = True) -> None:
         await _ensure_ai_decision_idempotency_column(conn)
         await _ensure_shadow_backtest_training_snapshot_columns(conn)
         await _ensure_runtime_data_retention_columns(conn)
-        await _repair_duplicate_exchange_order_facts(conn)
+        await _ensure_runtime_audit_indexes(conn)
+        await _repair_duplicate_exchange_order_facts_once(conn)
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
         await _ensure_okx_position_history_column_widths(conn)
@@ -651,6 +701,7 @@ async def _repair_duplicate_exchange_order_facts(conn: Any) -> None:
         """)
     )
 
+
     # Older settlement mirrors stored several exchange order ids as a comma
     # separated lifecycle.  The single-order pass above cannot match those
     # values to ``orders.exchange_order_id``.  Retire only exact duplicate
@@ -799,6 +850,48 @@ async def _repair_duplicate_exchange_order_facts(conn: Any) -> None:
     )
 
 
+_DUPLICATE_EXCHANGE_FACT_REPAIR_MIGRATION = (
+    "2026-08-24.exchange-order-fact-idempotency.v1"
+)
+
+
+async def _repair_duplicate_exchange_order_facts_once(conn: Any) -> None:
+    """Run the historical fact repair once, not on every service restart."""
+
+    if "postgresql" not in settings.database_url:
+        return
+    await conn.execute(
+        text("""
+            CREATE TABLE IF NOT EXISTS bb_schema_migrations (
+                migration_key VARCHAR(160) PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    )
+    result = await conn.execute(
+        text("""
+            SELECT migration_key
+            FROM bb_schema_migrations
+            WHERE migration_key = :migration_key
+        """),
+        {"migration_key": _DUPLICATE_EXCHANGE_FACT_REPAIR_MIGRATION},
+    )
+    if result.fetchall():
+        return
+
+    # The marker is written only after all repair statements succeed.  A failed
+    # transaction therefore remains retryable on the next startup.
+    await _repair_duplicate_exchange_order_facts(conn)
+    await conn.execute(
+        text("""
+            INSERT INTO bb_schema_migrations (migration_key)
+            VALUES (:migration_key)
+            ON CONFLICT (migration_key) DO NOTHING
+        """),
+        {"migration_key": _DUPLICATE_EXCHANGE_FACT_REPAIR_MIGRATION},
+    )
+
+
 async def _ensure_runtime_data_retention_columns(conn: Any) -> None:
     """Persist compaction lifecycle state outside large TOAST JSON payloads."""
 
@@ -920,6 +1013,61 @@ async def _ensure_runtime_data_retention_columns(conn: Any) -> None:
                 },
             )
         await conn.execute(text(index_ddl))
+
+
+async def _ensure_runtime_audit_indexes(conn: Any) -> None:
+    """Keep bounded integrity scans off sequential sorts of runtime tables."""
+
+    index_ddls = (
+        (
+            "idx_strategy_events_recent_scan",
+            "CREATE INDEX IF NOT EXISTS idx_strategy_events_recent_scan "
+            "ON strategy_learning_events (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_expert_memories_recent_scan",
+            "CREATE INDEX IF NOT EXISTS idx_expert_memories_recent_scan "
+            "ON expert_memories (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_trade_reflections_recent_scan",
+            "CREATE INDEX IF NOT EXISTS idx_trade_reflections_recent_scan "
+            "ON trade_reflections (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_shadow_backtests_recent_scan",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_backtests_recent_scan "
+            "ON shadow_backtests (created_at DESC, id DESC)",
+        ),
+        (
+            "idx_okx_position_history_opened_scan",
+            "CREATE INDEX IF NOT EXISTS idx_okx_position_history_opened_scan "
+            "ON okx_position_history (opened_at DESC, id DESC)",
+        ),
+        (
+            "idx_ai_decisions_mode_created",
+            "CREATE INDEX IF NOT EXISTS idx_ai_decisions_mode_created "
+            "ON ai_decisions (is_paper, created_at DESC, id DESC)",
+        ),
+        (
+            "idx_orders_mode_created",
+            "CREATE INDEX IF NOT EXISTS idx_orders_mode_created "
+            "ON orders (execution_mode, created_at DESC, id DESC)",
+        ),
+        (
+            "idx_positions_mode_closed_created",
+            "CREATE INDEX IF NOT EXISTS idx_positions_mode_closed_created "
+            "ON positions (execution_mode, is_open, closed_at DESC, created_at DESC, id DESC)",
+        ),
+    )
+    if "postgresql" in settings.database_url:
+        index_names = await _postgres_index_names(conn)
+        for name, ddl in index_ddls:
+            if name not in index_names:
+                await conn.execute(text(ddl))
+        return
+    for _name, ddl in index_ddls:
+        await conn.execute(text(ddl))
 
 
 async def _ensure_ai_decision_idempotency_column(conn: Any) -> None:

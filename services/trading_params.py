@@ -16,7 +16,9 @@ from ai_brain.base_model import DecisionOutput
 @dataclass(frozen=True, slots=True)
 class EntryMarketDataQualityParams:
     min_indicator_rows: int = 21
-    enable_websocket: bool = False  # Disable WebSocket when network blocks it, rely on REST API polling
+    # WebSocket is the primary low-latency source for ticker/orderbook/mark facts.
+    # REST remains the bounded fallback when the stream is unavailable.
+    enable_websocket: bool = True
     kline_cache_max_age_multiplier: float = 3.0
     kline_cache_min_max_age_seconds: float = 180.0
     feature_snapshot_timeout_seconds: float = 30.0  # Extended for REST API fallback when WebSocket fails

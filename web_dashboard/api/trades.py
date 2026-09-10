@@ -11,11 +11,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from core.symbols import normalize_trading_symbol, symbol_query_variants
 from db.repositories.risk_repo import RiskRepository
 from db.repositories.trade_repo import TradeRepository
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
@@ -643,13 +644,13 @@ async def get_trades(
     """Get recent trades with optional filters."""
     page_size = max(1, min(int(limit or 50), 500))
     offset = (max(int(page or 1), 1) - 1) * page_size
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = TradeRepository(session)
         # De-duplication is a presentation concern, so SQL offset must not be
         # applied before it. Load a bounded recent window, merge safe twins, and
         # only then apply the requested page. This keeps page boundaries stable
         # when an OKX backfill row sits beside its local execution row.
-        recent_window = min(max(5000, offset + page_size), 20000)
+        recent_window = min(max(250, offset + page_size * 4), 2000)
         orders = await repo.get_recent_orders(
             model_name=model_name,
             symbol=symbol,
@@ -740,10 +741,26 @@ async def get_trades(
             position_stmt = position_stmt.where(Position.symbol.in_(position_symbol_variants))
         else:
             position_stmt = position_stmt.where(Position.id == -1)
-        position_rows = await session.execute(position_stmt.limit(1000))
+        position_rows = await session.execute(
+            position_stmt.order_by(
+                Position.closed_at.desc().nullslast(),
+                Position.created_at.desc(),
+                Position.id.desc(),
+            ).limit(500)
+        )
         all_positions = list(position_rows.all())
         closed_positions = [p for p in all_positions if not p.is_open]
-        authoritative_history_stmt = select(OkxPositionHistory)
+        authoritative_history_stmt = select(OkxPositionHistory).options(
+            load_only(
+                OkxPositionHistory.id,
+                OkxPositionHistory.side,
+                OkxPositionHistory.close_status,
+                OkxPositionHistory.close_order_ids,
+                OkxPositionHistory.realized_pnl,
+                OkxPositionHistory.close_avg_px,
+                OkxPositionHistory.updated_at_okx,
+            )
+        )
         if mode:
             authoritative_history_stmt = authoritative_history_stmt.where(
                 OkxPositionHistory.mode == mode
@@ -762,7 +779,7 @@ async def get_trades(
                     authoritative_history_stmt.order_by(
                         OkxPositionHistory.updated_at_okx.desc().nullslast(),
                         OkxPositionHistory.id.desc(),
-                    ).limit(10000)
+                    ).limit(min(max(page_size * 10, 200), 1000))
                 )
             )
             .scalars()
@@ -1191,7 +1208,7 @@ async def get_trades(
 @router.get("/trades/{trade_id}")
 async def get_trade_detail(trade_id: int):
     """Get a single trade by ID."""
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = TradeRepository(session)
         order = await repo.get(trade_id)
         decision = None
@@ -1221,15 +1238,29 @@ async def get_trade_detail(trade_id: int):
                 )
             position_result = await session.execute(position_stmt.limit(50))
             closed_positions = list(position_result.scalars().all())
-            history_stmt = select(OkxPositionHistory).where(
-                OkxPositionHistory.mode == order.execution_mode,
-                OkxPositionHistory.symbol.in_(_symbol_query_variants({order.symbol})),
+            history_stmt = (
+                select(OkxPositionHistory)
+                .options(
+                    load_only(
+                        OkxPositionHistory.id,
+                        OkxPositionHistory.side,
+                        OkxPositionHistory.close_status,
+                        OkxPositionHistory.close_order_ids,
+                        OkxPositionHistory.realized_pnl,
+                        OkxPositionHistory.close_avg_px,
+                        OkxPositionHistory.updated_at_okx,
+                    )
+                )
+                .where(
+                    OkxPositionHistory.mode == order.execution_mode,
+                    OkxPositionHistory.symbol.in_(_symbol_query_variants({order.symbol})),
+                )
             )
             history_result = await session.execute(
                 history_stmt.order_by(
                     OkxPositionHistory.updated_at_okx.desc().nullslast(),
                     OkxPositionHistory.id.desc(),
-                ).limit(10000)
+                ).limit(500)
             )
             authoritative_history_rows = list(history_result.scalars().all())
 
@@ -1372,7 +1403,7 @@ async def get_trade_detail(trade_id: int):
 async def get_positions(mode: str | None = None):
     """Get positions with OKX-native grouped history for closed lifecycles."""
     selected_mode = mode or None
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = TradeRepository(session)
         positions = await repo.get_position_records(execution_mode=selected_mode, limit=500)
         closed_positions = [
@@ -1396,7 +1427,10 @@ async def get_positions(mode: str | None = None):
             order_stmt = order_stmt.where(Order.exchange_order_id.in_(sorted(linked_order_ids)))
         else:
             order_stmt = order_stmt.where(Order.id == -1)
-        order_rows = list((await session.execute(order_stmt.limit(10000))).scalars().all())
+        linked_order_limit = min(max(len(linked_order_ids) * 2, 100), 1500)
+        order_rows = list(
+            (await session.execute(order_stmt.limit(linked_order_limit))).scalars().all()
+        )
         account_bill_rows = await _okx_account_bill_rows_for_closed_positions(
             session,
             closed_positions=closed_positions,

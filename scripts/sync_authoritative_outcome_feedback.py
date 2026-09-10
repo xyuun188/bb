@@ -19,7 +19,14 @@ from services.expert_memory_service import ExpertMemoryService
 
 
 async def sync_feedback(*, mode: str, apply: bool) -> dict[str, Any]:
-    outcomes = await load_authoritative_trade_outcomes(mode=mode)
+    # Feedback only needs the compact decision-learning projection.  Loading
+    # full AIDecision rows here detoasts raw_llm_response and can hold the
+    # PostgreSQL statement timeout for the entire sync.
+    outcomes = await load_authoritative_trade_outcomes(
+        mode=mode,
+        compact=True,
+        include_decision_evidence=True,
+    )
     trusted = [item for item in outcomes if item.get("settlement_fact_trusted") is True]
     if not apply:
         return {

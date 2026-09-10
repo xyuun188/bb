@@ -82,6 +82,24 @@ async def _apply_actions(
     return await apply_protection_repair_actions(executor, actions)
 
 
+async def _snapshot_after_repair(
+    executor: OKXExecutor,
+    *,
+    attempts: int = 6,
+    delay_seconds: float = 0.75,
+) -> dict[str, Any]:
+    """Allow OKX's algo-pending snapshot to converge after a cancel."""
+
+    latest = await _snapshot(executor)
+    for _attempt in range(1, max(int(attempts), 1)):
+        report = latest["report"]
+        if not report.get("orphan_keys"):
+            return latest
+        await asyncio.sleep(max(float(delay_seconds), 0.0))
+        latest = await _snapshot(executor)
+    return latest
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     executor = OKXExecutor(mode=args.mode, load_markets_on_initialize=False)
     try:
@@ -129,7 +147,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             position_rebalances.append(rebalance)
             output["applied_actions"].extend(rebalance.get("applied_actions") or [])
 
-        intermediate = await _snapshot(executor)
+        intermediate = await _snapshot_after_repair(executor)
         positions_unchanged_before_remaining = bool(
             report.get("position_inventory_fingerprint")
             == intermediate["report"].get("position_inventory_fingerprint")
@@ -151,7 +169,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             if remaining_actions:
                 output["applied_actions"].extend(await _apply_actions(executor, remaining_actions))
 
-        after = await _snapshot(executor)
+        after = await _snapshot_after_repair(executor)
         output["fallback_rebalances"] = position_rebalances
         output["position_rebalances"] = position_rebalances
         output["rebalance_failed"] = rebalance_failed

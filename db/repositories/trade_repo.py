@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from core.symbols import trading_symbol_variants
 from db.repositories.base import BaseRepository
@@ -59,8 +61,47 @@ class TradeRepository(BaseRepository):
                 await self.session.flush()
                 return existing, False
         order = Order(**data)
-        self.session.add(order)
-        await self.session.flush()
+        try:
+            # A separate recovery process may have inserted the same exchange
+            # fact after the initial lookup. Keep the conflict inside a
+            # savepoint so one duplicate cannot abort the whole sync
+            # transaction.
+            async with self.session.begin_nested():
+                self.session.add(order)
+                await self.session.flush()
+        except IntegrityError:
+            if not exchange_order_id or not execution_mode:
+                raise
+            # The failed INSERT can leave its pending instance attached to
+            # the session even though the savepoint rolled back. Expunge it
+            # before the recovery lookup and suppress autoflush so SQLAlchemy
+            # cannot replay the same INSERT while we read the winner.
+            try:
+                self.session.expunge(order)
+            except (AttributeError, KeyError):
+                pass
+            no_autoflush = getattr(self.session, "no_autoflush", None)
+            if callable(no_autoflush):
+                no_autoflush = no_autoflush()
+            context = no_autoflush if no_autoflush is not None else nullcontext()
+            with context:
+                result = await self.session.execute(
+                    select(Order)
+                    .where(
+                        Order.execution_mode == execution_mode,
+                        Order.exchange_order_id == exchange_order_id,
+                    )
+                    .order_by(Order.id.asc())
+                    .with_for_update()
+                    .limit(1)
+                )
+            existing = result.scalar_one_or_none()
+            if existing is None:
+                raise
+            self._merge_order_fact(existing, data)
+            await self._prefer_authoritative_decision(existing, data)
+            await self.session.flush()
+            return existing, False
         return order, True
 
     @staticmethod

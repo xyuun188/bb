@@ -389,11 +389,17 @@ function renderStrategyLearning(data) {
     const eventFeedback = feedback.event_feedback || {};
     const problems = Array.isArray(feedback.problems) ? feedback.problems : [];
     const historicalPriorContextEnabled = runtime.historical_prior_context_enabled === true && governedCount > 0;
+    const snapshotNotice = data?.stale === true
+        ? `<div class="strategy-learning-inline-alert warn"><strong>当前显示最近一次有效快照</strong><span>后台刷新暂时较慢，快照时间：${strategyLearningEsc(data.snapshot_saved_at ? toBeijingTime(data.snapshot_saved_at) : '未知')}</span><em>系统会自动重试，不影响交易服务运行</em></div>`
+        : data?.status === 'timeout'
+            ? '<div class="strategy-learning-inline-alert warn"><strong>数据刷新较慢</strong><span>当前窗口查询超时，稍后会自动重试。</span><em>这不代表策略服务已停止</em></div>'
+            : '';
 
     const updated = document.getElementById('strategy-learning-updated');
     if (updated) updated.textContent = feedback.generated_at ? toBeijingTime(feedback.generated_at) : '暂无生成时间';
 
     strategyLearningSetHtml('strategy-learning-summary', `
+        ${snapshotNotice}
         ${strategyLearningProductionOverview(data)}
         ${strategyLearningRuntimeUsage(usage, governedCount)}
         ${strategyLearningReturnSummary(observation)}`);

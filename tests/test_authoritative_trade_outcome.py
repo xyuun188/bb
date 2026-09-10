@@ -56,12 +56,82 @@ async def test_stale_compact_outcomes_return_immediately_and_refresh_once(
         "_compact_outcome_refresh_task",
         None,
     )
+    monkeypatch.setattr(
+        authoritative_trade_outcome,
+        "_compact_outcome_refresh_failed_until",
+        0.0,
+    )
 
     first = await load_authoritative_trade_outcomes(mode="paper", compact=True)
     second = await load_authoritative_trade_outcomes(mode="paper", compact=True)
 
     assert first == second == [{"outcome_id": "cached", "execution_mode": "paper"}]
     assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_stale_compact_refresh_uses_backoff_and_keeps_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+
+    class FailedTask:
+        def done(self) -> bool:
+            return False
+
+        def add_done_callback(self, _callback: object) -> None:
+            return None
+
+        def cancelled(self) -> bool:
+            return False
+
+        def result(self) -> object:
+            raise RuntimeError("statement timeout")
+
+    def create_task(coroutine: object) -> FailedTask:
+        coroutine.close()  # type: ignore[attr-defined]
+        task = FailedTask()
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(authoritative_trade_outcome.asyncio, "create_task", create_task)
+    monkeypatch.setattr(
+        authoritative_trade_outcome,
+        "_compact_outcome_cache",
+        (
+            time.monotonic()
+            - authoritative_trade_outcome._COMPACT_OUTCOME_CACHE_TTL_SECONDS
+            - 1,
+            [{"outcome_id": "cached", "execution_mode": "paper"}],
+        ),
+    )
+    monkeypatch.setattr(authoritative_trade_outcome, "_compact_outcome_refresh_task", None)
+    monkeypatch.setattr(authoritative_trade_outcome, "_compact_outcome_refresh_failed_until", 0.0)
+
+    first = await load_authoritative_trade_outcomes(mode="paper", compact=True)
+    authoritative_trade_outcome._compact_outcome_refresh_done(created[0])  # type: ignore[arg-type]
+    second = await load_authoritative_trade_outcomes(mode="paper", compact=True)
+
+    assert first == second == [{"outcome_id": "cached", "execution_mode": "paper"}]
+    assert len(created) == 1
+    assert authoritative_trade_outcome._compact_outcome_refresh_failed_until > time.monotonic()
+
+
+def test_merge_compact_outcomes_keeps_history_and_prefers_refreshed_rows() -> None:
+    merged = authoritative_trade_outcome._merge_compact_outcomes(
+        [
+            {"outcome_id": "old", "label_timestamp": "2026-08-01T00:00:00+00:00"},
+            {"outcome_id": "same", "label_timestamp": "2026-08-02T00:00:00+00:00", "value": 1},
+        ],
+        [
+            {"outcome_id": "same", "label_timestamp": "2026-08-02T00:00:00+00:00", "value": 2},
+            {"outcome_id": "new", "label_timestamp": "2026-08-03T00:00:00+00:00"},
+        ],
+    )
+
+    assert [row["outcome_id"] for row in merged] == ["old", "same", "new"]
+    assert merged[1]["value"] == 2
 
 
 def _sample(**overrides):

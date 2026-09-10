@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -22,6 +23,13 @@ from scripts.runtime_env_bootstrap import (  # noqa: E402
 
 load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
+if os.name != "nt":
+    try:
+        nice_value = int(os.environ.get("BB_SYSTEM_AUDIT_NICE", "0") or 0)
+        if nice_value:
+            os.nice(nice_value)
+    except (OSError, ValueError):
+        pass
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db  # noqa: E402

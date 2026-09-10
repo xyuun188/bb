@@ -1328,13 +1328,19 @@ def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
     quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
     if not pos_id or not entry_ids or quantity <= 0:
         return None
+    # Position quantities are derived from exchange contract sizes and can
+    # differ by a few IEEE-754 ulps across two persistence paths.  Keep the
+    # quantity in the identity so genuine partial-close fragments remain
+    # distinct, but bucket only at a relative precision that is far below a
+    # meaningful contract-size change.
+    quantity_bucket = format(quantity, ".12g")
     return (
         str(getattr(position, "execution_mode", "") or "").lower(),
         pos_id,
         normalize_trading_symbol(str(getattr(position, "symbol", "") or "")),
         str(getattr(position, "side", "") or "").lower(),
         entry_ids,
-        round(quantity, 12),
+        quantity_bucket,
     )
 
 

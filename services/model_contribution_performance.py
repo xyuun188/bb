@@ -20,7 +20,7 @@ from sqlalchemy import and_, or_, select
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol, symbol_query_variants
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Order, Position
 from services.manual_close_marker import position_has_manual_close_order
@@ -32,8 +32,9 @@ from services.trade_fact_trust import (
 SessionFactory = Callable[[], Any]
 
 DEFAULT_CONTRIBUTION_LOOKBACK_DAYS = 7.0
-DEFAULT_POSITION_LIMIT = 800
-DEFAULT_ORDER_LIMIT = 3000
+DEFAULT_POSITION_LIMIT = 300
+DEFAULT_ORDER_LIMIT = 1200
+CONTRIBUTION_FAILURE_CACHE_SECONDS = 30.0
 MANUAL_CLOSE_LOOKUP_GRACE_SECONDS = 15.0
 OKX_AUTHORITATIVE_LEDGER_MODEL = "okx_authoritative_sync"
 EXPERT_CONTRIBUTION_NAMES = (
@@ -131,7 +132,10 @@ class ModelContributionPerformanceService:
     def __init__(
         self,
         *,
-        session_factory: SessionFactory = get_session_ctx,
+        # This service only reads closed trade/decision facts. Keep it on the
+        # isolated read pool so a contribution refresh cannot delay order and
+        # fill writes in the primary pool.
+        session_factory: SessionFactory = get_read_session_ctx,
         model_name: str = ENSEMBLE_TRADER_NAME,
         ledger_model_names: tuple[str, ...] | None = None,
         lookback_days: float = DEFAULT_CONTRIBUTION_LOOKBACK_DAYS,
@@ -241,6 +245,8 @@ class ModelContributionPerformanceService:
                                 ),
                             ),
                         )
+                        .order_by(Order.filled_at.desc(), Order.created_at.desc())
+                        .limit(self._order_limit)
                     )
                     manual_close_orders = [
                         SimpleNamespace(**dict(row._mapping))
@@ -287,6 +293,7 @@ class ModelContributionPerformanceService:
                         Order.exchange_order_id.in_(entry_order_ids),
                     )
                     .order_by(Order.filled_at.desc(), Order.created_at.desc())
+                    .limit(self._order_limit)
                 )
                 orders = [SimpleNamespace(**dict(row._mapping)) for row in orders_result.all()]
                 decision_ids = [o.decision_id for o in orders if o.decision_id]
@@ -319,7 +326,21 @@ class ModelContributionPerformanceService:
                 "failed to calculate model contribution performance",
                 error=safe_error_text(exc),
             )
-            return {}
+            # A contribution refresh is optional observability. Preserve the
+            # last good snapshot so a slow/temporarily unavailable database
+            # cannot turn the strategy context into a repeated empty refresh.
+            fallback = cache_entry.get("stats")
+            if isinstance(fallback, dict):
+                self._cache_by_mode[selected_mode] = {
+                    "expires_at": now + timedelta(seconds=CONTRIBUTION_FAILURE_CACHE_SECONDS),
+                    "stats": fallback,
+                }
+                return fallback
+            self._cache_by_mode[selected_mode] = {
+                "expires_at": now + timedelta(seconds=CONTRIBUTION_FAILURE_CACHE_SECONDS),
+                "stats": stats,
+            }
+            return stats
 
         stats = self.build_stats(positions, orders, decisions, mode=selected_mode)
         self._cache_by_mode[selected_mode] = {

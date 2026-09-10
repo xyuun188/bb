@@ -616,6 +616,7 @@ class TradingService:
             trade_notional_recorder=self.record_executed_trade_notional,
             exit_execution_singleflight=self.exit_execution_singleflight,
             production_trade_gate_provider=self.production_trade_gate_snapshot,
+            entry_instrument_unavailable_marker=self._remember_unavailable_entry_symbol,
         )
         self._exchange_reconcile_lock = asyncio.Lock()
         self.position_protection_fallback = PositionProtectionFallbackPolicy(self._safe_float)
@@ -1592,14 +1593,18 @@ class TradingService:
 
         settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        return max(5.0, interval * 0.65)
+        # Position review owns private exchange reads and protective-order
+        # reconciliation. Keep enough spacing to prevent overlapping rounds.
+        return max(30.0, interval * 0.65)
 
     def market_loop_interval_seconds(self) -> float:
         """Return the sleep interval between independent market-scan rounds."""
 
         settings.refresh_runtime_env()
         interval = max(10.0, float(settings.decision_interval_seconds or 60))
-        return max(8.0, min(14.0, interval * 0.35))
+        # Market scans fan out feature, model, and exchange work. A 30s floor
+        # prevents an over-eager runtime value from creating catch-up loops.
+        return max(30.0, min(60.0, interval * 0.35))
 
     def market_round_watchdog_seconds(self) -> float:
         """Return the hard watchdog for a genuinely stuck market-analysis round."""

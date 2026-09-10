@@ -161,7 +161,13 @@ def _finquant_specialization_verified(
 
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
-    diagnostic_timeout = str(status.get("status") or "") == "timeout"
+    diagnostic_timeout = str(status.get("status") or "").lower() in {
+        "timeout",
+        "status_timeout",
+        "status_error",
+        "client_error",
+        "request_error",
+    }
     live = status.get("live_ml_ready") is True
     readiness_report = _safe_dict(status.get("readiness"))
     metrics = _safe_dict(readiness_report.get("metrics"))
@@ -491,8 +497,12 @@ def _llm_rows(
     def current_slot_runtime(slot: dict[str, Any]) -> bool:
         runtime = _safe_dict(runtime_reports.get(str(slot.get("slot") or ""))) or slot
         return bool(
-            runtime.get("service_active")
-            and runtime.get("endpoint_ready")
+            (runtime.get("service_active") is True or runtime.get("active") is True)
+            and (
+                runtime.get("endpoint_ready") is True
+                or runtime.get("ready") is True
+                or runtime.get("health_ok") is True
+            )
         )
 
     specialization = _safe_dict(finquant_slot.get("specialization_evidence"))

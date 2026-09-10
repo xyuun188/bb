@@ -175,6 +175,29 @@ def test_dashboard_refreshes_active_local_ml_status() -> None:
     assert "fetchMLSignalDashboard();" in script
 
 
+def test_dashboard_distinguishes_ml_status_refresh_from_model_unavailable() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "const statusRefreshing = status.refresh_in_background === true" in script
+    assert "statusCode === 'status_timeout'" in script
+    assert "statusCode === 'request_error'" in script
+    assert "const statusDisplay = statusRefreshing" in script
+    assert "'状态刷新中'" in script
+    assert "模型状态读取较慢，系统正在后台重试。" in script
+    assert "暂时无法取得模型状态，系统正在自动重试。" in script
+
+
+def test_strategy_learning_distinguishes_stale_snapshot_from_request_failure() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    view = (PROJECT_ROOT / "web_dashboard/static/js/strategy_learning_view.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert r"\u7b56\u7565\u8c03\u5ea6\u6682\u65f6\u65e0\u6cd5\u5237\u65b0" in script
+    assert "当前显示最近一次有效快照" in view
+    assert "这不代表策略服务已停止" in view
+
+
 def test_trade_reflections_distinguish_pending_settlement_from_missing_evidence() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")

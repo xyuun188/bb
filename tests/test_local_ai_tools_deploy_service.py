@@ -209,8 +209,11 @@ def test_deploy_requires_supported_python_training_executor() -> None:
     command = deploy._remote_training_runtime_compatibility_command()
 
     assert "max_tasks_per_child=1" in SERVICE_CODE
-    assert "sys.version_info < (3, 11)" in command
     assert "ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)" in command
+    assert "except TypeError" in command
+    assert "sys.version_info >= (3, 11)" in command
+    assert "ProcessPoolExecutor(max_workers=1)" in command
+    assert "recycle_mode = 'manual'" in command
     assert "phase3_training_executor_compatibility_ok" in command
 
 

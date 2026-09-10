@@ -32,6 +32,7 @@ EXTERNAL_EVENT_SOURCE_HEALTH_FILE = "external_event_source_health.json"
 
 _SCRAPER_SETTING_KEYS = (
     "EXTERNAL_EVENT_SCRAPER_ENABLED",
+    "EXTERNAL_EVENT_SCRAPER_TRADING_PROCESS_ENABLED",
     "EXTERNAL_EVENT_SCRAPER_INTERVAL_SECONDS",
     "EXTERNAL_EVENT_SCRAPER_TIMEOUT_SECONDS",
     "EXTERNAL_EVENT_SCRAPER_MAX_SOURCES",
@@ -107,6 +108,10 @@ def load_external_event_settings_from_env() -> dict[str, Any]:
     settings.external_event_scraper_enabled = _bool_env(
         values.get("EXTERNAL_EVENT_SCRAPER_ENABLED"),
         bool(settings.external_event_scraper_enabled),
+    )
+    settings.external_event_scraper_trading_process_enabled = _bool_env(
+        values.get("EXTERNAL_EVENT_SCRAPER_TRADING_PROCESS_ENABLED"),
+        bool(settings.external_event_scraper_trading_process_enabled),
     )
     settings.external_event_scraper_interval_seconds = _int_env(
         values.get("EXTERNAL_EVENT_SCRAPER_INTERVAL_SECONDS"),

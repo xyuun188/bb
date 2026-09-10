@@ -51,6 +51,7 @@ _MAX_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0
 # long enough to avoid saturating the dedicated SSH tunnel during UI polling.
 _STATUS_CACHE_TTL_SECONDS = 60.0
 _STATUS_ERROR_CACHE_TTL_SECONDS = 2.0
+_STATUS_STALE_FALLBACK_MAX_AGE_SECONDS = 15 * 60.0
 _MAX_TIMESERIES_SEQUENCE_LENGTH = 80
 _HTTP_MAX_KEEPALIVE_CONNECTIONS = 4
 _HTTP_MAX_CONNECTIONS = 8
@@ -81,6 +82,10 @@ class LocalAIToolsClient:
         self._last_failure: str = ""
         self._last_success_at: datetime | None = None
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        # Keep the last verified status separate from the short normal cache.
+        # A transient tunnel/HTTP timeout must not erase a known-good artifact
+        # and make the dashboard claim that the model service is offline.
+        self._last_successful_status: tuple[float, dict[str, Any]] | None = None
         self._inference_slots: asyncio.Queue[int] = asyncio.Queue(
             maxsize=_MAX_CONCURRENT_INFERENCE_BATCHES
         )
@@ -799,6 +804,21 @@ class LocalAIToolsClient:
             )
         circuit_open = self._circuit_open_payload()
         if circuit_open:
+            stale = self._stale_status_fallback(
+                reason=str(circuit_open.get("error") or "local_ai_tools_circuit_open"),
+                enabled_for_trading=enabled_for_trading,
+            )
+            if stale is not None:
+                stale.update(circuit_open)
+                stale["available"] = True
+                stale["service_available"] = True
+                stale["status"] = "status_stale"
+                stale["stale"] = True
+                stale["refresh_in_background"] = True
+                return self._status_contract_payload(
+                    stale,
+                    enabled_for_trading=enabled_for_trading,
+                )
             return self._status_contract_payload(circuit_open, enabled_for_trading=enabled_for_trading)
         cached = self._read_status_cache()
         if cached is not None:
@@ -871,7 +891,9 @@ class LocalAIToolsClient:
             or health.get("model_bundle_available")
             or health.get("trained_models_available")
         )
-        service_available = bool(status_ok or health_ok or child_available)
+        # `/health/live` is a transport/liveness contract.  A slow metadata
+        # endpoint must not turn a reachable model service into "unavailable".
+        service_available = bool(health_ok or status_ok or child_available)
 
         status["model_bundle_available"] = model_bundle_available
         status["service_available"] = service_available
@@ -891,6 +913,13 @@ class LocalAIToolsClient:
             else "unavailable"
         )
         status["transport_status"] = "ok" if service_available else "unavailable"
+        status["status_refresh"] = (
+            "fresh"
+            if status_ok
+            else "liveness_only"
+            if health_ok
+            else "unavailable"
+        )
         status["artifact_status"] = "ready" if model_bundle_available else "unavailable"
         status["inference_probe_status"] = status["child_contract_status"]
         training_state = status.get("training_status") or status.get("training_state")
@@ -979,10 +1008,18 @@ class LocalAIToolsClient:
         if service_available:
             self._record_success()
             status.update(self._breaker_fields())
+            self._last_successful_status = (monotonic(), copy.deepcopy(status))
             return self._write_status_cache(status)
 
         error = status_error or "local AI tools service is unavailable"
         self._record_failure(error, open_circuit=False)
+        stale = self._stale_status_fallback(
+            reason=error,
+            enabled_for_trading=enabled_for_trading,
+        )
+        if stale is not None:
+            stale.update(self._breaker_fields())
+            return self._write_status_cache(stale)
         return self._write_status_cache(
             self._status_contract_payload(
                 {
@@ -1215,6 +1252,61 @@ class LocalAIToolsClient:
         }
         self._status_cache = (monotonic(), copy.deepcopy(data))
         return data
+
+    def _stale_status_fallback(
+        self,
+        *,
+        reason: str,
+        enabled_for_trading: bool,
+    ) -> dict[str, Any] | None:
+        """Return a bounded stale status while a fresh probe is recovering."""
+
+        cached = self._last_successful_status
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        age = monotonic() - cached_at
+        if age > _STATUS_STALE_FALLBACK_MAX_AGE_SECONDS:
+            return None
+        stale = copy.deepcopy(payload)
+        stale["available"] = True
+        stale["service_available"] = True
+        stale["enabled_for_trading"] = bool(enabled_for_trading)
+        stale["status"] = "status_stale"
+        stale["stale"] = True
+        stale["refresh_in_background"] = True
+        stale["status_error"] = safe_error_text(reason, limit=180)
+        stale["stale_age_seconds"] = round(max(age, 0.0), 2)
+        stale["message"] = "量化服务在线，状态刷新暂时较慢；当前显示最近一次成功状态。"
+        stale["status_cache"] = {
+            "hit": True,
+            "stale": True,
+            "age_seconds": round(max(age, 0.0), 2),
+            "ttl_seconds": _STATUS_STALE_FALLBACK_MAX_AGE_SECONDS,
+        }
+        return self._status_contract_payload(
+            stale,
+            enabled_for_trading=enabled_for_trading,
+        )
+
+    def stale_status_snapshot(
+        self,
+        *,
+        reason: str = "status_refresh_timeout",
+        max_age_seconds: float = _STATUS_STALE_FALLBACK_MAX_AGE_SECONDS,
+    ) -> dict[str, Any] | None:
+        """Expose the last verified status for bounded dashboard fallbacks."""
+
+        cached = self._last_successful_status
+        if cached is None:
+            return None
+        cached_at, _payload = cached
+        if monotonic() - cached_at > max(float(max_age_seconds), 0.0):
+            return None
+        return self._stale_status_fallback(
+            reason=reason,
+            enabled_for_trading=self.enabled(),
+        )
 
     def _record_success(self) -> None:
         self._failure_count = 0

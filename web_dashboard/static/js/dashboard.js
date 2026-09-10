@@ -5604,6 +5604,11 @@ function renderModelContributionStats() {
     const container = document.getElementById('model-contribution-stats');
     if (!container) return;
     const data = state.modelContributionStats || {};
+    if (data.status === 'warming') {
+        container.innerHTML = `
+            <div class="analysis-empty">${escHtml(data.summary || '模型贡献统计正在后台生成，稍后会自动显示结果。')}</div>`;
+        return;
+    }
     const rows = Array.isArray(data.stats) ? data.stats : [];
     const lineage = data.lineage || {};
     const lineageHtml = renderModelContributionLineage(lineage);
@@ -5659,6 +5664,7 @@ function renderModelContributionLineage(lineage = {}) {
     const tone = ready ? 'positive' : (total > 0 ? 'warning' : 'muted');
     const reasonMap = {
         ok: '归因链路正常，已平仓样本可以进入模型贡献学习。',
+        refresh_in_progress: '模型贡献统计正在后台生成，页面其它数据不受影响。',
         no_closed_positions: '最近窗口没有已平仓仓位，贡献统计等待新样本。',
         no_filled_orders_for_symbols: '有已平仓仓位，但没有找到同币种成交订单，需检查 OKX 同步/订单留存。',
         filled_orders_missing_decision_id: '有成交订单，但订单没有 decision_id，模型贡献无法回溯到当时决策。',
@@ -11231,7 +11237,22 @@ function renderMLSignalOverview() {
         latestPrediction?.best_side,
     );
     const ready = status.available === true;
+    const statusCode = String(status.status || '').toLowerCase();
+    const statusRefreshing = status.refresh_in_background === true
+        || statusCode === 'status_timeout'
+        || statusCode === 'status_stale'
+        || statusCode === 'request_error';
     const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
+    const statusDisplay = statusRefreshing
+        ? '状态刷新中'
+        : (ready ? (status.paper_trading_permission === true ? '模拟盘参与中' : '仅加载') : '不可用');
+    const statusDetail = statusRefreshing
+        ? (statusCode === 'status_timeout'
+            ? '模型状态读取较慢，系统正在后台重试。'
+            : statusCode === 'status_stale'
+                ? '模型服务在线，当前显示最近一次成功状态。'
+            : '暂时无法取得模型状态，系统正在自动重试。')
+        : (ready ? (status.live_ml_ready === true ? '实盘候选已就绪' : '实盘未晋升') : unavailableReason);
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
     const readiness = status.readiness || {};
@@ -11275,7 +11296,9 @@ function renderMLSignalOverview() {
     }).length;
 
     if (updatedEl) {
-        updatedEl.textContent = ready
+        updatedEl.textContent = statusRefreshing
+            ? statusDetail
+            : ready
             ? `市场标签 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · 模拟盘${allowPaperTrading ? '正常参与' : '不可用'} · 实盘${influenceEnabled ? '候选就绪' : '未授权'}`
             : `模型不可用 · ${unavailableReason}`;
     }
@@ -11300,7 +11323,7 @@ function renderMLSignalOverview() {
             </div>
         </div>
         <div class="ml-overview-grid">
-            ${mlMetricCard('模型状态', ready ? (allowPaperTrading ? '模拟盘参与中' : '仅加载') : '不可用', ready ? (influenceEnabled ? '实盘候选已就绪' : '实盘未晋升') : unavailableReason, ready ? (allowPaperTrading ? 'good' : 'warn') : 'bad')}
+            ${mlMetricCard('模型状态', statusDisplay, statusDetail, statusRefreshing ? 'warn' : (ready ? (allowPaperTrading ? 'good' : 'warn') : 'bad'))}
             ${mlMetricCard('就绪判断', readinessDisplayState, readinessReasonText, readinessTone)}
             ${mlMetricCard('模拟盘交易权限', allowPaperTrading ? '允许' : '不可用', allowPaperTrading ? '晋升、LCB、PF 不参与模拟盘授权' : '模型制品或运行链不可用', allowPaperTrading ? 'good' : 'bad')}
             ${mlMetricCard('实盘候选权限', allowLivePositionInfluence ? '允许逐笔检查' : '未晋升', allowLivePositionInfluence ? '仍须 production_trade_gate 逐笔授权' : '不影响模拟盘分析、交易和训练', allowLivePositionInfluence ? 'good' : 'warn')}
@@ -12088,7 +12111,7 @@ async function fetchStrategyLearning() {
     } catch (err) {
         const summary = document.getElementById('strategy-learning-summary');
         if (summary) {
-            summary.innerHTML = `<div class="opening-funnel-verdict opening-funnel-warn"><strong>\u7b56\u7565\u8c03\u5ea6\u52a0\u8f7d\u5931\u8d25</strong><span>${escHtml(err.message || err)}</span></div>`;
+            summary.innerHTML = `<div class="opening-funnel-verdict opening-funnel-warn"><strong>\u7b56\u7565\u8c03\u5ea6\u6682\u65f6\u65e0\u6cd5\u5237\u65b0</strong><span>\u4fdd\u7559\u4e0a\u6b21\u6709\u6548\u6570\u636e\uff0c\u540e\u53f0\u4f1a\u81ea\u52a8\u91cd\u8bd5\u3002${escHtml(err.message || err)}</span></div>`;
         }
     }
 }

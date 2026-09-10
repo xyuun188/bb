@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from time import perf_counter
@@ -314,6 +315,9 @@ class ExecutionService:
             ]
             | None
         ) = None,
+        entry_instrument_unavailable_marker: (
+            Callable[[str, str, dict[str, Any]], None] | None
+        ) = None,
     ) -> None:
         self.execution_lock = execution_lock
         self.risk_event_logger = risk_event_logger
@@ -355,6 +359,53 @@ class ExecutionService:
         self.trade_notional_recorder = trade_notional_recorder
         self.exit_execution_singleflight = exit_execution_singleflight
         self.production_trade_gate_provider = production_trade_gate_provider
+        self.entry_instrument_unavailable_marker = entry_instrument_unavailable_marker
+
+    @staticmethod
+    def _exchange_error_code(error: BaseException | str) -> str:
+        explicit = str(getattr(error, "code", "") or "").strip()
+        if explicit:
+            return explicit
+        match = re.search(r"\[(\d{5})\]", str(error or ""))
+        return match.group(1) if match else ""
+
+    def _remember_entry_instrument_failure(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        error: BaseException | str,
+    ) -> None:
+        """Close the execution loop for durable OKX entry capability failures."""
+
+        if self.entry_instrument_unavailable_marker is None:
+            return
+        error_text = safe_error_text(error, limit=220)
+        if self._exchange_error_code(error) != "51001" and (
+            "instrument id doesn't exist" not in error_text.lower()
+        ):
+            return
+        try:
+            self.entry_instrument_unavailable_marker(
+                mode,
+                symbol,
+                {
+                    "available": False,
+                    "reason": "okx_private_entry_instrument_unavailable",
+                    "error_code": "51001",
+                    "error": error_text,
+                    "source": "execution_service_order_submit",
+                    "analysis_only": True,
+                    "execution_verified": False,
+                },
+            )
+        except Exception as marker_error:  # pragma: no cover - defensive boundary
+            logger.warning(
+                "failed to persist entry instrument negative cache",
+                mode=mode,
+                symbol=symbol,
+                error=safe_error_text(marker_error, limit=180),
+            )
 
     def _required_execution_lock(self) -> AbstractAsyncContextManager[Any]:
         if self.execution_lock is None:
@@ -1509,6 +1560,12 @@ class ExecutionService:
                 )
         except Exception as e:
             error_text = safe_error_text(e, limit=180)
+            if decision.is_entry:
+                self._remember_entry_instrument_failure(
+                    mode=model_mode,
+                    symbol=symbol,
+                    error=e,
+                )
             logger.error(
                 "decision execution failed",
                 model=model_name,

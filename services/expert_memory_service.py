@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
@@ -23,6 +24,11 @@ from services.trade_fact_trust import closed_position_trade_fact_trusted
 from services.training_epoch import load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
+
+# Hit counts are telemetry only. Rewriting the same expert rows for every
+# symbol analysis creates avoidable row-lock contention with the trading loop.
+MEMORY_HIT_MARK_TTL_SECONDS = 30.0
+MEMORY_HIT_MARK_TIMEOUT_SECONDS = 0.75
 
 # Startup backfill is maintenance, not an entry gate. Loading historical
 # decision/market JSON for every lifecycle at once previously grew the trading
@@ -89,6 +95,66 @@ class ExpertMemoryService:
         self.ensemble_model_name = ensemble_model_name
         self.authoritative_outcome_loader = authoritative_outcome_loader
         self.memory_feedback_policy = MemoryFeedbackPolicy()
+        self._memory_hit_marked_at: dict[int, float] = {}
+        self._memory_hit_mark_lock: asyncio.Lock | None = None
+
+    async def _mark_memories_used_best_effort(
+        self,
+        session: Any,
+        repo: MemoryRepository,
+        memory_ids: list[int],
+    ) -> None:
+        """Record prompt hits without letting telemetry stall model analysis."""
+
+        ids = sorted({int(memory_id or 0) for memory_id in memory_ids if int(memory_id or 0) > 0})
+        if not ids:
+            return
+        if self._memory_hit_mark_lock is None:
+            self._memory_hit_mark_lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        async with self._memory_hit_mark_lock:
+            cutoff = now - MEMORY_HIT_MARK_TTL_SECONDS
+            self._memory_hit_marked_at = {
+                memory_id: marked_at
+                for memory_id, marked_at in self._memory_hit_marked_at.items()
+                if marked_at > cutoff
+            }
+            fresh_ids = [
+                memory_id
+                for memory_id in ids
+                if memory_id not in self._memory_hit_marked_at
+            ]
+            if not fresh_ids:
+                return
+            marked_at = loop.time()
+            for memory_id in fresh_ids:
+                self._memory_hit_marked_at[memory_id] = marked_at
+            try:
+                await asyncio.wait_for(
+                    repo.mark_memories_used(fresh_ids),
+                    timeout=MEMORY_HIT_MARK_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                for memory_id in fresh_ids:
+                    self._memory_hit_marked_at.pop(memory_id, None)
+                raise
+            except Exception as exc:
+                # A lock timeout or transient database failure must not erase
+                # the already-serialized prompt context or delay model calls.
+                for memory_id in fresh_ids:
+                    self._memory_hit_marked_at.pop(memory_id, None)
+                rollback = getattr(session, "rollback", None)
+                if callable(rollback):
+                    try:
+                        await rollback()
+                    except Exception:
+                        pass
+                logger.debug(
+                    "expert memory hit telemetry skipped",
+                    memory_count=len(fresh_ids),
+                    error=safe_error_text(exc),
+                )
 
     async def context(self, symbol: str) -> dict[str, Any]:
         """Fetch compact long-term memories and expert weight hints for prompts."""
@@ -121,7 +187,7 @@ class ExpertMemoryService:
                         by_expert[expert_name] = serialized
                         flat.extend(serialized)
                         used_ids.extend([row.id for row in rows if row.id])
-                await repo.mark_memories_used(used_ids)
+                await self._mark_memories_used_best_effort(session, repo, used_ids)
         except Exception as exc:
             logger.warning(
                 "failed to fetch expert memories",

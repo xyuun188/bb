@@ -58,6 +58,26 @@ MODEL_BY_TABLE = {
 }
 
 
+def _recent_record_ids_statement(model: Any, *, since: datetime, limit: int) -> Any:
+    return (
+        select(model.id)
+        .where(model.created_at >= since)
+        .order_by(model.created_at.desc(), model.id.desc())
+        .limit(max(1, int(limit)))
+    )
+
+
+def _runtime_text_projection_statement(
+    table: str,
+    model: Any,
+    *,
+    record_ids: list[int],
+) -> Any:
+    selected_columns = [model.id, model.created_at, model.updated_at]
+    selected_columns.extend(getattr(model, field) for field in TEXT_AUDIT_FIELDS.get(table, ()))
+    return select(*selected_columns).where(model.id.in_(record_ids))
+
+
 def _record_time(row: Any) -> datetime | None:
     value = getattr(row, "updated_at", None) or getattr(row, "created_at", None)
     return value if isinstance(value, datetime) else None
@@ -179,20 +199,31 @@ async def collect_runtime_text_integrity_report(
     collected: list[tuple[str, Any]] = []
     async with get_read_session_ctx() as session:
         for table, model in MODEL_BY_TABLE.items():
-            selected_columns = [model.id, model.created_at, model.updated_at]
-            selected_columns.extend(
-                getattr(model, field) for field in TEXT_AUDIT_FIELDS.get(table, ())
+            id_result = await session.execute(
+                _recent_record_ids_statement(
+                    model,
+                    since=since,
+                    limit=max(1, int(limit_per_table or 200)),
+                )
             )
-            stmt = select(*selected_columns).order_by(model.id.desc()).limit(
-                max(1, int(limit_per_table or 200))
+            record_ids = [int(value) for value in id_result.scalars().all()]
+            if not record_ids:
+                continue
+            result = await session.execute(
+                _runtime_text_projection_statement(
+                    table,
+                    model,
+                    record_ids=record_ids,
+                )
             )
-            created_at = getattr(model, "created_at", None)
-            if created_at is not None:
-                stmt = stmt.where(created_at >= since)
-            result = await session.execute(stmt)
-            collected.extend(
-                (table, SimpleNamespace(**dict(row)))
+            rows_by_id = {
+                int(row["id"]): SimpleNamespace(**dict(row))
                 for row in result.mappings().all()
+            }
+            collected.extend(
+                (table, rows_by_id[record_id])
+                for record_id in record_ids
+                if record_id in rows_by_id
             )
     return build_runtime_text_integrity_report(collected, example_limit=example_limit)
 

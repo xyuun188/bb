@@ -56,6 +56,16 @@ WorkingDirectory={remote_app_dir}
 EnvironmentFile=-{remote_app_dir}/.env
 EnvironmentFile={REMOTE_RUNTIME_ENV_PATH}
 ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_phase3_paper_resume_observation.py --observation-hours {int(observation_hours)} --report-max-age-seconds {int(report_max_age_seconds)} --json-indent 0'
+MemoryAccounting=true
+MemoryHigh=1G
+MemoryMax=1536M
+CPUQuota=35%
+TasksMax=96
+TimeoutStartSec=120s
+TimeoutStopSec=15s
+KillMode=control-group
+Nice=10
+IOSchedulingClass=idle
 """
 
 

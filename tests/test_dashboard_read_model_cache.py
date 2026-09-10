@@ -252,6 +252,111 @@ async def test_dashboard_startup_warmup_primes_bounded_first_visit_reads(
 
 
 @pytest.mark.asyncio
+async def test_model_contribution_stats_cold_request_returns_while_single_refresh_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("model-contribution-stats")
+    release_refresh = asyncio.Event()
+    builds = {"count": 0}
+
+    async def fake_build(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        builds["count"] += 1
+        await release_refresh.wait()
+        return {
+            "status": "ready",
+            "mode": "paper",
+            "days": 7,
+            "total_positions": 1,
+            "lineage": {"reason": "ok"},
+            "stats": [{"label": "本地 ML 同向", "count": 1}],
+            "summary": "ready",
+        }
+
+    monkeypatch.setattr(dashboard, "_build_model_contribution_stats_payload", fake_build)
+
+    first = await dashboard.get_model_contribution_stats(
+        mode="paper",
+        days=7,
+        request=object(),
+    )
+    second = await dashboard.get_model_contribution_stats(
+        mode="paper",
+        days=7,
+        request=object(),
+    )
+    await asyncio.sleep(0)
+
+    assert first["status"] == "warming"
+    assert second["status"] == "warming"
+    assert builds["count"] == 1
+    assert len(dashboard._dashboard_model_contribution_stats_refresh_tasks) == 1
+
+    release_refresh.set()
+    task = next(iter(dashboard._dashboard_model_contribution_stats_refresh_tasks.values()))
+    await task
+    cached = await dashboard.get_model_contribution_stats(
+        mode="paper",
+        days=7,
+        request=object(),
+    )
+    assert cached["status"] == "ready"
+    assert cached["total_positions"] == 1
+    assert cached["cache"]["hit"] is True
+    assert builds["count"] == 1
+    dashboard._clear_dashboard_heavy_cache("model-contribution-stats")
+
+
+@pytest.mark.asyncio
+async def test_model_contribution_stats_returns_stale_cache_during_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("model-contribution-stats")
+    cache_key = dashboard._model_contribution_stats_cache_key("paper", 7, 2000)
+    dashboard._dashboard_heavy_cache[cache_key] = (
+        datetime.now(UTC)
+        - timedelta(seconds=dashboard._DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS + 1),
+        {
+            "status": "ready",
+            "mode": "paper",
+            "days": 7,
+            "total_positions": 3,
+            "lineage": {"reason": "ok"},
+            "stats": [],
+            "summary": "stale result",
+        },
+    )
+    release_refresh = asyncio.Event()
+
+    async def fake_build(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        await release_refresh.wait()
+        return {
+            "status": "ready",
+            "mode": "paper",
+            "days": 7,
+            "total_positions": 4,
+            "lineage": {"reason": "ok"},
+            "stats": [],
+            "summary": "fresh result",
+        }
+
+    monkeypatch.setattr(dashboard, "_build_model_contribution_stats_payload", fake_build)
+    stale = await dashboard.get_model_contribution_stats(
+        mode="paper",
+        days=7,
+        request=object(),
+    )
+
+    assert stale["total_positions"] == 3
+    assert stale["cache"]["stale"] is True
+    assert stale["cache"]["refresh_in_background"] is True
+
+    release_refresh.set()
+    task = next(iter(dashboard._dashboard_model_contribution_stats_refresh_tasks.values()))
+    await task
+    dashboard._clear_dashboard_heavy_cache("model-contribution-stats")
+
+
+@pytest.mark.asyncio
 async def test_strategy_learning_request_snapshot_skips_repeated_watermark_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

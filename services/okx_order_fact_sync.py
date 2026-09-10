@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isclose
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -1364,7 +1365,7 @@ class OkxOrderFactSyncService:
     async def _load_decisions_for_orders(
         self,
         orders: list[Order],
-    ) -> dict[int, AIDecision]:
+    ) -> dict[int, Any]:
         decision_ids = {
             int(decision_id)
             for order in orders
@@ -1374,9 +1375,20 @@ class OkxOrderFactSyncService:
             return {}
         async with get_session_ctx() as session:
             rows = await session.execute(
-                select(AIDecision).where(AIDecision.id.in_(sorted(decision_ids)))
+                # Submit-recovery only needs the immutable state-machine
+                # payload to recover an exchange order id. Avoid selecting
+                # feature/LLM columns that are not used by this read.
+                select(AIDecision.id, AIDecision.raw_llm_response).where(
+                    AIDecision.id.in_(sorted(decision_ids))
+                )
             )
-            return {int(decision.id): decision for decision in rows.scalars().all()}
+            return {
+                int(row.id): SimpleNamespace(
+                    id=int(row.id),
+                    raw_llm_response=row.raw_llm_response,
+                )
+                for row in rows.all()
+            }
 
     async def _load_stored_slippage_refresh_orders(
         self,

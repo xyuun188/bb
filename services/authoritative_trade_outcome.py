@@ -71,15 +71,21 @@ _DERIVED_OUTCOME_KEYS = {
     "learning_summary",
 }
 _COMPACT_OUTCOME_CACHE_TTL_SECONDS = 60.0
+_COMPACT_OUTCOME_MAX_HISTORY_ROWS = 500
+_COMPACT_OUTCOME_REFRESH_BATCH_ROWS = 120
+_COMPACT_OUTCOME_MAX_SHADOW_ROWS = 2000
+_COMPACT_OUTCOME_REFRESH_FAILURE_BACKOFF_SECONDS = 120.0
+_DECISION_PROJECTION_QUERY_BATCH_SIZE = 50
 _compact_outcome_cache: tuple[float, list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
+_compact_outcome_refresh_failed_until = 0.0
 logger = structlog.get_logger(__name__)
 
 
 def _compact_outcome_refresh_done(
     completed: asyncio.Task[list[dict[str, Any]]],
 ) -> None:
-    global _compact_outcome_refresh_task
+    global _compact_outcome_refresh_failed_until, _compact_outcome_refresh_task
 
     if _compact_outcome_refresh_task is completed:
         _compact_outcome_refresh_task = None
@@ -88,10 +94,37 @@ def _compact_outcome_refresh_done(
     try:
         completed.result()
     except Exception as exc:
+        _compact_outcome_refresh_failed_until = (
+            time.monotonic() + _COMPACT_OUTCOME_REFRESH_FAILURE_BACKOFF_SECONDS
+        )
         logger.warning(
             "compact authoritative outcome background refresh failed",
             error=f"{type(exc).__name__}: {exc}"[:240],
         )
+    else:
+        _compact_outcome_refresh_failed_until = 0.0
+
+
+def _merge_compact_outcomes(
+    previous: list[dict[str, Any]],
+    refreshed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge a small recent refresh without discarding older cached outcomes."""
+
+    merged: dict[str, dict[str, Any]] = {}
+    for outcome in [*previous, *refreshed]:
+        identity = str(
+            outcome.get("outcome_id")
+            or outcome.get("lifecycle_key")
+            or outcome.get("label_timestamp")
+            or ""
+        )
+        if identity:
+            merged[identity] = outcome
+    return sorted(
+        merged.values(),
+        key=lambda outcome: str(outcome.get("label_timestamp") or ""),
+    )
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -531,7 +564,6 @@ async def load_authoritative_trade_outcomes(
         compact
         and not include_training_features
         and not include_decision_evidence
-        and since is None
         and session_factory is get_read_session_ctx
         and str(settings.database_url or "").startswith("postgresql")
     )
@@ -546,7 +578,10 @@ async def load_authoritative_trade_outcomes(
                 limit=limit,
             )
         if not _force_compact_refresh:
-            if _compact_outcome_refresh_task is None or _compact_outcome_refresh_task.done():
+            if (
+                (_compact_outcome_refresh_task is None or _compact_outcome_refresh_task.done())
+                and time.monotonic() >= _compact_outcome_refresh_failed_until
+            ):
                 _compact_outcome_refresh_task = asyncio.create_task(
                     load_authoritative_trade_outcomes(
                         compact=True,
@@ -567,7 +602,13 @@ async def load_authoritative_trade_outcomes(
 
     async with session_factory() as session:
         requested_limit = (
-            max(int(requested_result_limit), 1) if requested_result_limit is not None else 5000
+            max(int(requested_result_limit), 1)
+            if requested_result_limit is not None
+            else (
+                _COMPACT_OUTCOME_REFRESH_BATCH_ROWS
+                if _force_compact_refresh
+                else _COMPACT_OUTCOME_MAX_HISTORY_ROWS
+            )
         )
         histories = await load_okx_position_history_records(
             session,
@@ -665,17 +706,31 @@ async def load_authoritative_trade_outcomes(
                 AIDecision.model_name,
                 AIDecision.stop_loss_pct,
                 AIDecision.take_profit_pct,
-                AIDecision.decision_learning_snapshot,
             ]
+            # The compact dashboard projection does not consume the large
+            # learning snapshot. Only training/evidence callers need it.
+            include_decision_payload = include_training_features or include_decision_evidence
+            if include_decision_payload:
+                decision_columns.append(AIDecision.decision_learning_snapshot)
             if include_training_features:
                 decision_columns.append(AIDecision.feature_snapshot)
-            decision_rows = list(
-                (
-                    await session.execute(
-                        select(*decision_columns).where(AIDecision.id.in_(decision_ids))
-                    )
-                ).all()
-            )
+            # PostgreSQL can spend minutes detoasting a single large IN query
+            # against ``ai_decisions``.  Keep each projection bounded so one
+            # slow/oversized decision payload cannot time out the whole
+            # authoritative outcome refresh.
+            ordered_decision_ids = sorted(decision_ids)
+            decision_rows: list[Any] = []
+            for offset in range(0, len(ordered_decision_ids), _DECISION_PROJECTION_QUERY_BATCH_SIZE):
+                decision_batch = ordered_decision_ids[
+                    offset : offset + _DECISION_PROJECTION_QUERY_BATCH_SIZE
+                ]
+                decision_rows.extend(
+                    (
+                        await session.execute(
+                            select(*decision_columns).where(AIDecision.id.in_(decision_batch))
+                        )
+                    ).all()
+                )
             decisions = [
                 SimpleNamespace(
                     id=row.id,
@@ -683,8 +738,16 @@ async def load_authoritative_trade_outcomes(
                     stop_loss_pct=row.stop_loss_pct,
                     take_profit_pct=row.take_profit_pct,
                     feature_snapshot=dict(row._mapping.get("feature_snapshot") or {}),
-                    decision_learning_snapshot=row.decision_learning_snapshot,
-                    raw_llm_response=dict(row.decision_learning_snapshot or {}),
+                    decision_learning_snapshot=(
+                        row._mapping.get("decision_learning_snapshot")
+                        if include_decision_payload
+                        else None
+                    ),
+                    raw_llm_response=(
+                        dict(row._mapping.get("decision_learning_snapshot") or {})
+                        if include_decision_payload
+                        else {}
+                    ),
                 )
                 for row in decision_rows
             ]
@@ -726,6 +789,11 @@ async def load_authoritative_trade_outcomes(
                     ShadowBacktest.long_return_pct,
                     ShadowBacktest.short_return_pct,
                     ShadowBacktest.best_action,
+                )
+            ).order_by(ShadowBacktest.created_at.desc()).limit(
+                min(
+                    _COMPACT_OUTCOME_MAX_SHADOW_ROWS,
+                    max(len(decision_ids) * 4, 100),
                 )
             )
         shadows = list((await session.execute(shadow_stmt)).scalars().all()) if decision_ids else []
@@ -808,9 +876,19 @@ async def load_authoritative_trade_outcomes(
         results.append(outcome)
     results.reverse()
     if cache_enabled:
-        _compact_outcome_cache = (time.monotonic(), results)
+        previous_outcomes = (
+            _compact_outcome_cache[1]
+            if _force_compact_refresh and _compact_outcome_cache is not None
+            else []
+        )
+        cached_results = (
+            _merge_compact_outcomes(previous_outcomes, results)
+            if previous_outcomes
+            else results
+        )
+        _compact_outcome_cache = (time.monotonic(), cached_results)
         return _filter_compact_outcomes(
-            results,
+            cached_results,
             mode=mode,
             since=since,
             limit=limit,

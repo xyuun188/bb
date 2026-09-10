@@ -68,6 +68,9 @@ class _FakeResult:
 class _FakeSession:
     def __init__(self) -> None:
         self.rollback_count = 0
+        self.expunge_count = 0
+        self.info: dict[str, object] = {}
+        self.statements: list[str] = []
 
     async def __aenter__(self):
         return self
@@ -77,6 +80,13 @@ class _FakeSession:
 
     async def rollback(self) -> None:
         self.rollback_count += 1
+
+    def expunge_all(self) -> None:
+        self.expunge_count += 1
+
+    async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        return _FakeResult([])
 
 
 class _FakeMaker:
@@ -111,7 +121,7 @@ class _FakeConnectionEngine:
 
 
 @pytest.mark.asyncio
-async def test_read_session_ctx_does_not_rollback_success(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_read_session_ctx_rolls_back_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_session = _FakeSession()
 
     async def fake_get_sessionmaker():
@@ -122,7 +132,8 @@ async def test_read_session_ctx_does_not_rollback_success(monkeypatch: pytest.Mo
     async with session_module.get_read_session_ctx() as session:
         assert session is fake_session
 
-    assert fake_session.rollback_count == 0
+    assert fake_session.rollback_count == 1
+    assert fake_session.expunge_count == 1
 
 
 @pytest.mark.asyncio
@@ -139,6 +150,106 @@ async def test_read_session_ctx_rolls_back_on_error(monkeypatch: pytest.MonkeyPa
             raise RuntimeError("boom")
 
     assert fake_session.rollback_count == 1
+    assert fake_session.expunge_count == 1
+
+
+@pytest.mark.asyncio
+async def test_read_session_ctx_sets_postgres_transaction_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_session = _FakeSession()
+
+    async def fake_get_sessionmaker():
+        return _FakeMaker(fake_session)
+
+    monkeypatch.setattr(session_module, "get_sessionmaker", fake_get_sessionmaker)
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+
+    async with session_module.get_read_session_ctx(
+        statement_timeout_ms=800,
+        idle_transaction_timeout_ms=1100,
+    ):
+        pass
+
+    assert fake_session.statements == [
+        "SELECT set_config('statement_timeout', :value, true)",
+        "SELECT set_config('idle_in_transaction_session_timeout', :value, true)",
+    ]
+    assert fake_session.rollback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_read_session_ctx_sets_isolation_before_transaction_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_session = _FakeSession()
+
+    async def fake_get_sessionmaker():
+        return _FakeMaker(fake_session)
+
+    monkeypatch.setattr(session_module, "get_sessionmaker", fake_get_sessionmaker)
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+
+    async with session_module.get_read_session_ctx(
+        transaction_isolation="REPEATABLE READ READ ONLY",
+    ):
+        pass
+
+    assert fake_session.statements == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "SELECT set_config('statement_timeout', :value, true)",
+        "SELECT set_config('idle_in_transaction_session_timeout', :value, true)",
+    ]
+    assert fake_session.info["bb_consistent_read_snapshot_started"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_session_ctx_rejects_untrusted_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_session = _FakeSession()
+
+    async def fake_get_sessionmaker():
+        return _FakeMaker(fake_session)
+
+    monkeypatch.setattr(session_module, "get_sessionmaker", fake_get_sessionmaker)
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+
+    with pytest.raises(ValueError, match="unsupported read transaction isolation"):
+        async with session_module.get_read_session_ctx(
+            transaction_isolation="READ COMMITTED; DROP TABLE orders",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_indexes_cover_dashboard_list_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_conn = _FakeConnection()
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql",
+    )
+
+    await session_module._ensure_runtime_audit_indexes(fake_conn)
+
+    assert any("idx_ai_decisions_mode_created" in statement for statement in fake_conn.statements)
+    assert any("idx_orders_mode_created" in statement for statement in fake_conn.statements)
+    assert any("idx_positions_mode_closed_created" in statement for statement in fake_conn.statements)
 
 
 @pytest.mark.asyncio

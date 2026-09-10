@@ -563,3 +563,6 @@ async def test_specialist_report_mode_filter_uses_only_selected_execution_mode(
     assert live["execution_mode"] == "live"
     assert paper["completed_count"] == 1
     assert live["completed_count"] == 1
+    assert paper["query_policy"]["ordered_by_training_index"] is True
+    assert "ordered_by_primary_key" not in paper["query_policy"]
+    assert paper["query_policy"]["training_feature_snapshot_column"] is True

@@ -39,6 +39,7 @@ def test_specialist_shadow_evaluation_timer_runs_periodically() -> None:
     assert "OnUnitActiveSec=15min" in timer
     assert "OnBootSec" not in timer
     assert "Persistent=true" in timer
+    assert "RandomizedDelaySec=300" in timer
 
 
 def test_specialist_shadow_evaluation_timer_default_stays_inside_report_freshness_window() -> None:

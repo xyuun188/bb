@@ -951,6 +951,59 @@ def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_ex
     assert aggregate.settlement_raw["canonical_position_id"] == 502
 
 
+def test_dedup_groups_float_rounding_duplicates_without_merging_partial_fragments() -> None:
+    now = datetime.now(UTC)
+    first = Position(
+        id=701,
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        quantity=1_000_000.0,
+        okx_inst_id="PEPE-USDT-SWAP",
+        okx_pos_id="pepe-pos",
+        entry_exchange_order_id="entry-pepe",
+        close_exchange_order_id="close-pepe",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    duplicate = Position(
+        id=702,
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        quantity=999_999.9999999998,
+        okx_inst_id="PEPE-USDT-SWAP",
+        okx_pos_id="pepe-pos",
+        entry_exchange_order_id="entry-pepe",
+        close_exchange_order_id="close-pepe",
+        settlement_status="settlement_quarantined",
+        settlement_raw={},
+    )
+    partial = Position(
+        id=703,
+        execution_mode="paper",
+        symbol="PEPE/USDT",
+        side="long",
+        quantity=900_000.0,
+        okx_inst_id="PEPE-USDT-SWAP",
+        okx_pos_id="pepe-pos",
+        entry_exchange_order_id="entry-pepe",
+        close_exchange_order_id="another-close-pepe",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+
+    retained, duplicates = _deduplicate_closed_lifecycle_rows(
+        [first, duplicate, partial],
+        now=now,
+    )
+
+    assert {item.id for item in retained} == {701, 703}
+    assert [item.id for item in duplicates] == [702]
+    assert duplicate.settlement_status == SUPERSEDED_POSITION_STATUS
+    assert duplicate.settlement_raw["canonical_position_id"] == 701
+
+
 def test_dedup_breaks_mutual_superseded_cycle_for_same_close_order() -> None:
     now = datetime.now(UTC)
     first = Position(

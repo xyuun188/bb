@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, or_, select, text
@@ -117,27 +118,92 @@ class OkxTradeFactIntegrityService:
         epoch_started_at = load_training_epoch_start()
         since = max(nominal_since, epoch_started_at)
         since_naive = since.replace(tzinfo=None)
-        async with get_read_session_ctx() as session:
+        async with get_read_session_ctx(
+            transaction_isolation="REPEATABLE READ READ ONLY"
+        ) as session:
             await _start_consistent_read_snapshot(session)
             order_rows = await session.execute(
-                select(Order)
+                select(
+                    Order.id,
+                    Order.model_name,
+                    Order.execution_mode,
+                    Order.symbol,
+                    Order.side,
+                    Order.quantity,
+                    Order.price,
+                    Order.status,
+                    Order.decision_id,
+                    Order.exchange_order_id,
+                    Order.filled_at,
+                    Order.created_at,
+                    Order.okx_inst_id,
+                    Order.okx_raw_fills,
+                )
                 .where(
                     or_(Order.created_at >= since_naive, Order.filled_at >= since_naive),
                     Order.status == "filled",
                 )
-                .order_by(Order.created_at.desc())
+                .order_by(Order.created_at.desc(), Order.id.desc())
                 .limit(self.limit)
             )
-            orders = list(order_rows.scalars().all())
+            orders = _namespace_rows(order_rows)
             decision_ids = {int(order.decision_id) for order in orders if order.decision_id}
-            decisions: dict[int, AIDecision] = {}
+            decisions: dict[int, Any] = {}
             if decision_ids:
                 decision_rows = await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                    select(
+                        AIDecision.id,
+                        AIDecision.symbol,
+                        AIDecision.action,
+                    ).where(AIDecision.id.in_(decision_ids))
                 )
-                decisions = {int(decision.id): decision for decision in decision_rows.scalars()}
+                decisions = {
+                    int(decision.id): decision for decision in _namespace_rows(decision_rows)
+                }
+                raw_decision_ids = {
+                    int(order.decision_id)
+                    for order in orders
+                    if order.decision_id and not _has_order_execution_facts(order)
+                }
+                if raw_decision_ids:
+                    raw_decision_rows = await session.execute(
+                        select(
+                            AIDecision.id,
+                            AIDecision.raw_llm_response["execution_result"].label(
+                                "execution_result"
+                            ),
+                        ).where(AIDecision.id.in_(raw_decision_ids))
+                    )
+                    for raw_decision in _namespace_rows(raw_decision_rows):
+                        decision = decisions.get(int(raw_decision.id))
+                        if decision is not None:
+                            execution_result = getattr(raw_decision, "execution_result", None)
+                            decision.raw_llm_response = (
+                                {"execution_result": execution_result}
+                                if isinstance(execution_result, dict)
+                                else {}
+                            )
             position_rows = await session.execute(
-                select(Position)
+                select(
+                    Position.id,
+                    Position.model_name,
+                    Position.execution_mode,
+                    Position.symbol,
+                    Position.side,
+                    Position.quantity,
+                    Position.entry_price,
+                    Position.current_price,
+                    Position.realized_pnl,
+                    Position.settlement_status,
+                    Position.settlement_raw,
+                    Position.is_open,
+                    Position.closed_at,
+                    Position.okx_inst_id,
+                    Position.okx_pos_id,
+                    Position.entry_exchange_order_id,
+                    Position.close_exchange_order_id,
+                    Position.created_at,
+                )
                 .where(
                     or_(
                         Position.created_at >= since_naive,
@@ -145,22 +211,32 @@ class OkxTradeFactIntegrityService:
                         Position.is_open.is_(True),
                     )
                 )
-                .order_by(Position.created_at.desc())
+                .order_by(Position.created_at.desc(), Position.id.desc())
                 .limit(self.limit)
             )
-            positions = list(position_rows.scalars().all())
+            positions = _namespace_rows(position_rows)
             history_rows = await session.execute(
-                select(OkxPositionHistory)
+                select(
+                    OkxPositionHistory.id,
+                    OkxPositionHistory.mode,
+                    OkxPositionHistory.symbol,
+                    OkxPositionHistory.pos_side,
+                    OkxPositionHistory.opened_at,
+                    OkxPositionHistory.updated_at_okx,
+                    OkxPositionHistory.entry_order_ids,
+                    OkxPositionHistory.close_order_ids,
+                    OkxPositionHistory.linked_order_ids,
+                )
                 .where(
                     or_(
                         OkxPositionHistory.opened_at >= since_naive,
                         OkxPositionHistory.updated_at_okx >= since_naive,
                     )
                 )
-                .order_by(OkxPositionHistory.updated_at_okx.desc())
+                .order_by(OkxPositionHistory.updated_at_okx.desc(), OkxPositionHistory.id.desc())
                 .limit(self.limit)
             )
-            authoritative_histories = list(history_rows.scalars().all())
+            authoritative_histories = _namespace_rows(history_rows)
             order_exchange_ids = {
                 exchange_order_id
                 for order in orders
@@ -168,7 +244,26 @@ class OkxTradeFactIntegrityService:
             }
             if order_exchange_ids:
                 directly_linked_position_rows = await session.execute(
-                    select(Position).where(
+                    select(
+                        Position.id,
+                        Position.model_name,
+                        Position.execution_mode,
+                        Position.symbol,
+                        Position.side,
+                        Position.quantity,
+                        Position.entry_price,
+                        Position.current_price,
+                        Position.realized_pnl,
+                        Position.settlement_status,
+                        Position.settlement_raw,
+                        Position.is_open,
+                        Position.closed_at,
+                        Position.okx_inst_id,
+                        Position.okx_pos_id,
+                        Position.entry_exchange_order_id,
+                        Position.close_exchange_order_id,
+                        Position.created_at,
+                    ).where(
                         or_(
                             Position.entry_exchange_order_id.in_(sorted(order_exchange_ids)),
                             Position.close_exchange_order_id.in_(sorted(order_exchange_ids)),
@@ -176,18 +271,32 @@ class OkxTradeFactIntegrityService:
                     )
                 )
                 positions = _dedupe_positions_by_id(
-                    [*positions, *directly_linked_position_rows.scalars().all()]
+                    [*positions, *_namespace_rows(directly_linked_position_rows)]
                 )
             linked_order_ids = _position_linked_order_ids(positions)
-            linked_orders: list[Order] = []
+            linked_orders: list[Any] = []
             if linked_order_ids:
                 linked_order_rows = await session.execute(
-                    select(Order).where(
+                    select(
+                        Order.id,
+                        Order.model_name,
+                        Order.execution_mode,
+                        Order.symbol,
+                        Order.side,
+                        Order.quantity,
+                        Order.price,
+                        Order.status,
+                        Order.decision_id,
+                        Order.exchange_order_id,
+                        Order.filled_at,
+                        Order.created_at,
+                        Order.okx_inst_id,
+                    ).where(
                         Order.exchange_order_id.in_(sorted(linked_order_ids)),
                         func.lower(Order.status).in_(("filled", "partial")),
                     )
                 )
-                linked_orders = list(linked_order_rows.scalars().all())
+                linked_orders = _namespace_rows(linked_order_rows)
 
         issues: list[TradeFactIssue] = []
         for order in orders:
@@ -701,6 +810,11 @@ async def _start_consistent_read_snapshot(session: Any) -> None:
     not support this transaction command, so they keep their existing behavior.
     """
 
+    session_info = getattr(session, "info", None)
+    if isinstance(session_info, dict) and session_info.get(
+        "bb_consistent_read_snapshot_started"
+    ):
+        return
     try:
         bind = session.get_bind()
         dialect_name = str(getattr(getattr(bind, "dialect", None), "name", "") or "")
@@ -708,6 +822,17 @@ async def _start_consistent_read_snapshot(session: Any) -> None:
         return
     if dialect_name == "postgresql":
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        if isinstance(session_info, dict):
+            session_info["bb_consistent_read_snapshot_started"] = True
+
+
+def _namespace_rows(result: Any) -> list[SimpleNamespace]:
+    return [SimpleNamespace(**dict(row)) for row in result.mappings().all()]
+
+
+def _has_order_execution_facts(order: Any) -> bool:
+    raw = getattr(order, "okx_raw_fills", None)
+    return isinstance(raw, dict) and bool(raw)
 
 
 def _execution_result_payload(decision: AIDecision | None) -> dict[str, Any]:

@@ -792,6 +792,10 @@ class ShadowBacktestService:
                                     symbol=symbol,
                                     reasons=reasons,
                                 )
+                                self._market_fact_retry_after[symbol] = (
+                                    asyncio.get_running_loop().time()
+                                    + SHADOW_RESULT_FACT_RETRY_COOLDOWN_SECONDS
+                                )
                                 return symbol, {}
                         prices = normalized.get("prices")
                         last_price = (

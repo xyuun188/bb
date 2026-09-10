@@ -109,7 +109,10 @@ class EntryStrategyModeContextPolicy:
                     _safe_float(history.get("profit_factor"), 0.0), 8
                 ),
                 "return_lcb_pct": history.get("return_lcb_pct", today.get("return_lcb_pct")),
-                "production_permission": True,
-                "reason": "Paper trading mode: allow entry for both directions.",
+                "production_permission": False,
+                "reason": (
+                    "Side performance is observation-only; entry permission and sizing "
+                    "are decided by the authoritative return contract."
+                ),
             }
         return result

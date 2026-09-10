@@ -136,6 +136,8 @@ _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
 _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
+_DASHBOARD_OPEN_POSITION_SNAPSHOT_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OPEN_POSITION_SNAPSHOT_STALE_TTL_SECONDS = 180.0
 # Keep a failed private read cached longer than the exchange timeout and
 # circuit-breaker probe window so dashboard polling cannot recreate a request
 # storm while OKX account APIs are recovering.
@@ -147,6 +149,9 @@ _DASHBOARD_OKX_PROTECTION_INITIAL_WAIT_SECONDS = 0.35
 _DASHBOARD_OKX_PROTECTION_READ_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS = 4.0
 _DASHBOARD_OPEN_POSITION_EVIDENCE_TIMEOUT_SECONDS = 15.0
+_DASHBOARD_OPEN_POSITION_EVIDENCE_INITIAL_WAIT_SECONDS = 0.35
+_DASHBOARD_OPEN_POSITION_EVIDENCE_CACHE_TTL_SECONDS = 20.0
+_DASHBOARD_OPEN_POSITION_EVIDENCE_STALE_TTL_SECONDS = 180.0
 _DASHBOARD_OPENING_FUNNEL_TIMEOUT_SECONDS = 15.0
 _DASHBOARD_OPENING_FUNNEL_DB_TIMEOUT_MILLISECONDS = 12_000
 _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT = 1_000
@@ -154,7 +159,13 @@ _DASHBOARD_OPENING_FUNNEL_MAX_ROWS = 50
 _DASHBOARD_OPENING_FUNNEL_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 _DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 18.0
+_DASHBOARD_LOCAL_AI_STATUS_STALE_MAX_AGE_SECONDS = 15 * 60.0
 _DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
+_DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS = 1.5
+_DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS = 4.0
+_DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS = 120.0
+_DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS = 15 * 60.0
+_DASHBOARD_MODEL_CONTRIBUTION_STATS_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
@@ -177,6 +188,15 @@ _dashboard_okx_position_cache: dict[str, tuple[datetime, list[dict[str, Any]], A
 _dashboard_okx_position_error_cache: dict[str, tuple[datetime, str, Any | None]] = {}
 _dashboard_okx_position_locks: dict[str, asyncio.Lock] = {}
 _dashboard_okx_position_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_dashboard_open_position_snapshot_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
+_dashboard_open_position_snapshot_locks: dict[str, asyncio.Lock] = {}
+_dashboard_open_position_snapshot_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_dashboard_open_position_evidence_cache: dict[
+    str, tuple[datetime, list[dict[str, Any]], dict[str, Any] | None]
+] = {}
+_dashboard_open_position_evidence_refresh_tasks: dict[
+    str, asyncio.Task[tuple[list[dict[str, Any]], dict[str, Any] | None]]
+] = {}
 _dashboard_okx_protection_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 _dashboard_okx_protection_locks: dict[str, asyncio.Lock] = {}
 _dashboard_okx_protection_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -205,6 +225,13 @@ _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 _model_observability_refresh_task: asyncio.Task[Any] | None = None
 _dashboard_summary_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
+_dashboard_model_contribution_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+_dashboard_model_contribution_stats_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
+_dashboard_model_training_registry_refresh_task: asyncio.Task[Any] | None = None
+
+
+def _dashboard_open_position_snapshot_key(selected_mode: str) -> str:
+    return f"{selected_mode}:{settings.database_url}"
 
 
 def _bounded_dashboard_payload(
@@ -372,6 +399,20 @@ def _dashboard_heavy_cache_set(key: tuple[Any, ...], payload: Any) -> Any:
     return payload
 
 
+def _dashboard_heavy_cache_peek(
+    key: tuple[Any, ...], *, max_age_seconds: float
+) -> Any | None:
+    """Return a bounded-age cached value without evicting it as stale."""
+
+    cached = _dashboard_heavy_cache.get(key)
+    if cached is None:
+        return None
+    cached_at, payload = cached
+    if (datetime.now(UTC) - cached_at).total_seconds() > max(float(max_age_seconds), 0.0):
+        return None
+    return copy.deepcopy(payload)
+
+
 def _strategy_learning_snapshot_path(*, mode: str, detail: str) -> Path:
     safe_mode = "live" if mode == "live" else "paper"
     safe_detail = "full" if detail == "full" else "summary"
@@ -505,6 +546,11 @@ def _clear_dashboard_heavy_cache(*names: str) -> None:
             if not task.done():
                 task.cancel()
             _dashboard_daily_pnl_refresh_tasks.pop(key, None)
+    if not wanted or "model-contribution-stats" in wanted:
+        for key, task in list(_dashboard_model_contribution_stats_refresh_tasks.items()):
+            if not task.done():
+                task.cancel()
+            _dashboard_model_contribution_stats_refresh_tasks.pop(key, None)
 
 
 def _log_dashboard_fallback(event: str, exc: Exception, **fields: Any) -> None:
@@ -1652,7 +1698,7 @@ async def _get_today_ai_decision_count(mode: str) -> int:
     """Count AI decisions for the current Beijing calendar day."""
     from sqlalchemy import func, select
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
 
     selected_mode = "live" if mode == "live" else "paper"
@@ -1662,7 +1708,7 @@ async def _get_today_ai_decision_count(mode: str) -> int:
     start_utc = start_local.astimezone(UTC).replace(tzinfo=None)
     end_utc = end_local.astimezone(UTC).replace(tzinfo=None)
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(AIDecision.id)).where(
                 AIDecision.is_paper.is_(selected_mode != "live"),
@@ -1677,12 +1723,12 @@ async def _recent_trading_activity_stats(hours: int = 6) -> dict[str, Any]:
     """Return recent DB activity as a heartbeat for split dashboard/trader deployments."""
     from sqlalchemy import func, select
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Order
 
     since = datetime.now(UTC) - timedelta(hours=hours)
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         decision_row = (
             await session.execute(
                 select(func.count(AIDecision.id), func.max(AIDecision.created_at)).where(
@@ -1905,10 +1951,10 @@ async def _phase3_equity_pnl_for_mode(
     current_equity: float | None,
 ) -> dict[str, Any]:
     try:
-        from db.session import get_session_ctx
+        from db.session import get_read_session_ctx
         from services.equity_baseline import phase3_equity_change_from_snapshots
 
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             return await phase3_equity_change_from_snapshots(
                 session,
                 mode=mode,
@@ -1934,8 +1980,9 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     and displayed account PnL must come from OKX snapshots only.
     """
     from sqlalchemy import case, func, select
+    from sqlalchemy.orm import load_only
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx, get_session_ctx
     from models.trade import Order, Position
     from services.trade_fact_trust import (
         closed_position_trade_fact_trusted_with_orders,
@@ -2010,13 +2057,31 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     )
 
     try:
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             filters = (
                 Position.execution_mode == selected_mode,
                 Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
             )
             all_result = await session.execute(
                 select(Position)
+                .options(
+                    load_only(
+                        Position.id,
+                        Position.symbol,
+                        Position.side,
+                        Position.quantity,
+                        Position.entry_price,
+                        Position.leverage,
+                        Position.unrealized_pnl,
+                        Position.realized_pnl,
+                        Position.is_open,
+                        Position.closed_at,
+                        Position.settlement_status,
+                        Position.settlement_raw,
+                        Position.entry_exchange_order_id,
+                        Position.close_exchange_order_id,
+                    )
+                )
                 .where(*filters)
                 .order_by(Position.created_at.asc(), Position.id.asc())
             )
@@ -2090,7 +2155,9 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                 linked_orders = list(
                     (
                         await session.execute(
-                            select(Order).where(
+                            select(Order)
+                            .options(load_only(Order.exchange_order_id, Order.okx_sync_status))
+                            .where(
                                 Order.execution_mode == selected_mode,
                                 Order.exchange_order_id.in_(sorted(linked_order_ids)),
                             )
@@ -2918,7 +2985,7 @@ async def _dashboard_open_position_risk_evidence(
 ) -> None:
     from sqlalchemy import select
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Order, Position
 
@@ -2941,7 +3008,7 @@ async def _dashboard_open_position_risk_evidence(
             )
         return
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         local_rows = list(
             (await session.execute(select(Position).where(Position.id.in_(position_ids))))
             .scalars()
@@ -3490,6 +3557,197 @@ async def _dashboard_open_position_evidence_bounded(
     return results["risk"], results["protection"]
 
 
+def _dashboard_open_position_evidence_key(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> str:
+    selected_mode = "live" if (mode or mode_manager.mode.value) == "live" else "paper"
+    identity = [
+        {
+            "symbol": _normalize_dashboard_symbol(str(item.get("symbol") or "")),
+            "side": str(item.get("side") or "").lower(),
+            "position_ids": sorted(
+                str(value)
+                for value in (
+                    _safe_list(item.get("local_position_ids"))
+                    or _safe_list(item.get("position_ids"))
+                    or [item.get("id")]
+                )
+                if value is not None
+            ),
+        }
+        for item in positions
+        if isinstance(item, dict)
+    ]
+    payload = json.dumps(
+        sorted(identity, key=lambda item: (item["symbol"], item["side"])),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+    providers = (
+        id(_dashboard_open_position_risk_evidence),
+        id(_dashboard_open_position_protection_evidence),
+    )
+    return f"{selected_mode}:{settings.database_url}:{fingerprint}:{providers[0]}:{providers[1]}"
+
+
+def _dashboard_pending_risk_evidence(positions: list[dict[str, Any]]) -> None:
+    for item in positions:
+        item["risk_contract"] = {
+            "available": False,
+            "pending": True,
+            "degraded": True,
+            "refresh_in_background": True,
+            "contracts": [],
+            "blockers": [],
+        }
+
+
+async def _build_dashboard_open_position_evidence_snapshot(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    enriched = copy.deepcopy(positions)
+    risk_result, protection_result = await _dashboard_open_position_evidence_bounded(
+        enriched,
+        mode=mode,
+    )
+    protection_inventory: dict[str, Any] | None
+    if isinstance(risk_result, BaseException):
+        blocker = f"position_risk_evidence_unavailable:{safe_error_text(risk_result, limit=120)}"
+        for item in enriched:
+            item["risk_contract"] = {
+                "available": False,
+                "contracts": [],
+                "blockers": [blocker],
+            }
+    if isinstance(protection_result, BaseException):
+        blocker = (
+            "okx_protection_evidence_unavailable:"
+            f"{safe_error_text(protection_result, limit=120)}"
+        )
+        for item in enriched:
+            item["protection_contract"] = {
+                "available": False,
+                "orders": [],
+                "blockers": [blocker],
+            }
+        protection_inventory = {
+            "available": False,
+            "blockers": [blocker],
+            "orphan_keys": [],
+            "split_coverage_keys": [],
+        }
+    else:
+        protection_inventory = protection_result
+    return enriched, protection_inventory
+
+
+async def _refresh_dashboard_open_position_evidence(
+    cache_key: str,
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    result = await _build_dashboard_open_position_evidence_snapshot(positions, mode=mode)
+    selected_mode = "live" if (mode or mode_manager.mode.value) == "live" else "paper"
+    cache_prefix = f"{selected_mode}:{settings.database_url}:"
+    for old_key in list(_dashboard_open_position_evidence_cache):
+        if old_key.startswith(cache_prefix) and old_key != cache_key:
+            _dashboard_open_position_evidence_cache.pop(old_key, None)
+    _dashboard_open_position_evidence_cache[cache_key] = (
+        datetime.now(UTC),
+        copy.deepcopy(result[0]),
+        copy.deepcopy(result[1]),
+    )
+    return result
+
+
+def _start_dashboard_open_position_evidence_refresh(
+    cache_key: str,
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> asyncio.Task[tuple[list[dict[str, Any]], dict[str, Any] | None]]:
+    task = _dashboard_open_position_evidence_refresh_tasks.get(cache_key)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(
+        _refresh_dashboard_open_position_evidence(
+            cache_key,
+            copy.deepcopy(positions),
+            mode=mode,
+        )
+    )
+    _dashboard_open_position_evidence_refresh_tasks[cache_key] = task
+    task.add_done_callback(
+        _consume_dashboard_refresh_task(
+            _dashboard_open_position_evidence_refresh_tasks,
+            cache_key,
+            label="open position evidence",
+        )
+    )
+    return task
+
+
+async def _get_dashboard_open_position_evidence_snapshot(
+    positions: list[dict[str, Any]],
+    *,
+    mode: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    if not positions:
+        return [], None
+    cache_key = _dashboard_open_position_evidence_key(positions, mode=mode)
+    cached = _dashboard_open_position_evidence_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_positions, cached_inventory = cached
+        age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+        if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached_positions), copy.deepcopy(cached_inventory)
+        if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_STALE_TTL_SECONDS:
+            _start_dashboard_open_position_evidence_refresh(
+                cache_key, positions, mode=mode
+            )
+            stale_positions = copy.deepcopy(cached_positions)
+            for item in stale_positions:
+                item["evidence_stale"] = True
+                item["evidence_refresh_in_background"] = True
+            stale_inventory = copy.deepcopy(cached_inventory)
+            if isinstance(stale_inventory, dict):
+                stale_inventory["stale"] = True
+                stale_inventory["refresh_in_background"] = True
+            return stale_positions, stale_inventory
+
+    task = _start_dashboard_open_position_evidence_refresh(
+        cache_key, positions, mode=mode
+    )
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=max(_DASHBOARD_OPEN_POSITION_EVIDENCE_INITIAL_WAIT_SECONDS, 0.01),
+    )
+    if task in done:
+        try:
+            return task.result()
+        except BaseException as exc:
+            _log_dashboard_fallback(
+                "open position evidence refresh fallback",
+                exc,
+                mode=mode,
+            )
+
+    pending_positions = copy.deepcopy(positions)
+    _dashboard_pending_risk_evidence(pending_positions)
+    pending_inventory = _dashboard_pending_protection_evidence(
+        pending_positions,
+        stale_reason="initial_refresh",
+    )
+    return pending_positions, pending_inventory
+
+
 async def _fetch_dashboard_okx_positions_uncached(
     selected_mode: str,
     executor: Any | None = None,
@@ -3760,16 +4018,13 @@ async def warm_dashboard_read_caches(mode: str | None = None) -> None:
     """Prime only bounded exchange reads needed by the first dashboard paint."""
 
     selected_mode = mode or mode_manager.mode.value
-    from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
-
     first_stage_results = await asyncio.gather(
         _refresh_dashboard_okx_position_cache(selected_mode),
         _refresh_dashboard_okx_balance_cache(selected_mode),
-        load_authoritative_trade_outcomes(compact=True),
         return_exceptions=True,
     )
     for label, result in zip(
-        ("position", "balance", "authoritative_outcomes"),
+        ("position", "balance"),
         first_stage_results,
         strict=True,
     ):
@@ -6603,14 +6858,14 @@ async def _get_open_position_symbols(mode: str | None = None) -> set[str]:
     """Return symbols that currently have open positions for the selected mode."""
     from sqlalchemy import select
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.trade import Position
 
     selected_mode = mode or mode_manager.mode.value
     symbols: set[str] = set()
 
     try:
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             result = await session.execute(
                 select(Position.symbol)
                 .where(
@@ -6882,13 +7137,13 @@ async def _get_display_open_position_symbols(mode: str | None = None) -> set[str
 async def _get_open_position_prices(mode: str | None = None) -> dict[str, float]:
     """Return last known prices from open persisted positions."""
     from db.repositories.trade_repo import TradeRepository
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
 
     selected_mode = mode or mode_manager.mode.value
     prices: dict[str, float] = {}
 
     try:
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             repo = TradeRepository(session)
             rows = await repo.get_position_records(execution_mode=selected_mode, limit=1000)
             for p in rows:
@@ -7045,13 +7300,13 @@ async def _build_open_position_market_snapshot(mode: str | None = None) -> dict[
     }
 
 
-async def _get_display_open_positions_snapshot(
+async def _build_display_open_positions_snapshot(
     mode: str | None = None,
     ticker_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return display-ready open positions without pagination for dashboard widgets."""
     from db.repositories.trade_repo import TradeRepository
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
 
     selected_mode = mode or mode_manager.mode.value
     exchange_mark_map = await _get_exchange_position_mark_map(selected_mode)
@@ -7067,7 +7322,7 @@ async def _get_display_open_positions_snapshot(
     local_by_key: dict[tuple[str, str], Any] = {}
     positions: list[dict[str, Any]] = []
     try:
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             repo = TradeRepository(session)
             rows = await repo.get_position_records(
                 execution_mode=selected_mode,
@@ -7200,6 +7455,9 @@ async def _get_display_open_positions_snapshot(
                         "leverage": p.leverage,
                         "stop_loss": p.stop_loss_price,
                         "take_profit": p.take_profit_price,
+                        "current_management_contract": _safe_dict(
+                            getattr(p, "current_management_contract", None)
+                        ),
                         "is_open": True,
                         "db_is_open": p.is_open,
                         "local_position_ids": [
@@ -7336,6 +7594,91 @@ async def _get_display_open_positions_snapshot(
         positions,
         exchange_mark_map,
         mode=selected_mode,
+    )
+
+
+def _apply_open_position_ticker_overrides(
+    positions: list[dict[str, Any]],
+    ticker_overrides: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Apply the current 24h change without rebuilding the position read model."""
+
+    if not ticker_overrides:
+        return copy.deepcopy(positions)
+    adjusted = copy.deepcopy(positions)
+    for position in adjusted:
+        symbol = _normalize_dashboard_symbol(str(position.get("symbol") or ""))
+        override = ticker_overrides.get(symbol) if symbol else None
+        if isinstance(override, dict):
+            position["change_24h"] = _ticker_change_24h(
+                override,
+                _safe_float(position.get("change_24h"), 0.0),
+            ) or 0.0
+    return adjusted
+
+
+async def _refresh_display_open_position_snapshot(selected_mode: str) -> None:
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    cache_key = _dashboard_open_position_snapshot_key(selected_mode)
+    lock = _dashboard_open_position_snapshot_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        snapshot = await _await_dashboard_operation_bounded(
+            _build_display_open_positions_snapshot(selected_mode),
+            timeout_seconds=6.0,
+            label="dashboard open position snapshot refresh",
+        )
+        _dashboard_open_position_snapshot_cache[cache_key] = (
+            datetime.now(UTC),
+            copy.deepcopy(snapshot),
+        )
+
+
+def _start_display_open_position_snapshot_refresh(selected_mode: str) -> None:
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    cache_key = _dashboard_open_position_snapshot_key(selected_mode)
+    task = _dashboard_open_position_snapshot_refresh_tasks.get(cache_key)
+    if task is not None and not task.done():
+        return
+    task = asyncio.create_task(_refresh_display_open_position_snapshot(selected_mode))
+    _dashboard_open_position_snapshot_refresh_tasks[cache_key] = task
+    task.add_done_callback(
+        _consume_dashboard_refresh_task(
+            _dashboard_open_position_snapshot_refresh_tasks,
+            cache_key,
+            label="open position snapshot",
+        )
+    )
+
+
+async def _get_display_open_positions_snapshot(
+    mode: str | None = None,
+    ticker_overrides: dict[str, Any] | None = None,
+    *,
+    background_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Return a cached display snapshot and isolate slow reconciliation from HTTP reads."""
+
+    selected_mode = "live" if (mode or mode_manager.mode.value) == "live" else "paper"
+    cache_key = _dashboard_open_position_snapshot_key(selected_mode)
+    cached = _dashboard_open_position_snapshot_cache.get(cache_key)
+    if cached:
+        cached_at, cached_positions = cached
+        age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+        if age_seconds <= _DASHBOARD_OPEN_POSITION_SNAPSHOT_CACHE_TTL_SECONDS:
+            return _apply_open_position_ticker_overrides(cached_positions, ticker_overrides)
+        if age_seconds <= _DASHBOARD_OPEN_POSITION_SNAPSHOT_STALE_TTL_SECONDS:
+            _start_display_open_position_snapshot_refresh(selected_mode)
+            return _apply_open_position_ticker_overrides(cached_positions, ticker_overrides)
+
+    if background_only:
+        _start_display_open_position_snapshot_refresh(selected_mode)
+        return []
+
+    await _refresh_display_open_position_snapshot(selected_mode)
+    refreshed = _dashboard_open_position_snapshot_cache.get(cache_key)
+    return _apply_open_position_ticker_overrides(
+        refreshed[1] if refreshed else [],
+        ticker_overrides,
     )
 
 
@@ -7618,7 +7961,11 @@ async def _build_ml_signal_status() -> dict[str, Any]:
         status.get("sample_count") or status.get("trained_sample_count"), 0
     )
     try:
-        completed_total = await _completed_ml_shadow_sample_count()
+        completed_total = await _await_dashboard_operation_bounded(
+            _completed_ml_shadow_sample_count(),
+            timeout_seconds=_DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS,
+            label="dashboard ML shadow sample count",
+        )
         completed_total = int(completed_total or 0)
         trained_cursor = _trained_shadow_cursor(status, completed_total)
         status["training_policy"] = "current_training_epoch_only"
@@ -7720,6 +8067,18 @@ async def get_local_ai_tools_status():
             timeout=_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS,
         )
     except TimeoutError:
+        stale_snapshot = getattr(local_ai_tools, "stale_status_snapshot", None)
+        if callable(stale_snapshot):
+            try:
+                stale = stale_snapshot(
+                    reason="local_ai_tools_status_timeout",
+                    max_age_seconds=_DASHBOARD_LOCAL_AI_STATUS_STALE_MAX_AGE_SECONDS,
+                )
+            except Exception as exc:
+                _log_dashboard_fallback("local ai tools stale status fallback", exc)
+                stale = None
+            if isinstance(stale, dict):
+                return stale
         return {
             "available": False,
             "service_available": False,
@@ -8330,7 +8689,7 @@ async def _refresh_model_observability_cache() -> None:
 
 
 async def shutdown_dashboard_observability_tasks() -> None:
-    global _model_observability_refresh_task
+    global _model_observability_refresh_task, _dashboard_model_training_registry_refresh_task
     task = _model_observability_refresh_task
     _model_observability_refresh_task = None
     tasks = [task] if task is not None else []
@@ -8344,6 +8703,51 @@ async def shutdown_dashboard_observability_tasks() -> None:
             await pending
         except asyncio.CancelledError:
             pass
+    for task in list(_dashboard_open_position_snapshot_refresh_tasks.values()):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _dashboard_open_position_snapshot_refresh_tasks.clear()
+    for task in list(_dashboard_open_position_evidence_refresh_tasks.values()):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _dashboard_open_position_evidence_refresh_tasks.clear()
+    _dashboard_open_position_evidence_cache.clear()
+    registry_task = _dashboard_model_training_registry_refresh_task
+    _dashboard_model_training_registry_refresh_task = None
+    if registry_task is not None and not registry_task.done():
+        registry_task.cancel()
+        try:
+            await registry_task
+        except asyncio.CancelledError:
+            pass
+    for task in list(_dashboard_model_contribution_refresh_tasks.values()):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _dashboard_model_contribution_refresh_tasks.clear()
+    for task in list(_dashboard_model_contribution_stats_refresh_tasks.values()):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _dashboard_model_contribution_stats_refresh_tasks.clear()
 
 
 def _warming_model_observability_payload() -> dict[str, Any]:
@@ -8662,14 +9066,34 @@ async def record_continuous_observation(metrics: dict[str, Any]) -> dict[str, An
     )
 
 
-@router.get("/model-training/registry")
-async def get_model_training_registry_status() -> dict[str, Any]:
-    """Return one truthful lifecycle view for trained and pretrained models."""
+async def _refresh_model_contribution_cache(selected_mode: str) -> None:
+    from services.model_contribution_performance import ModelContributionPerformanceService
 
-    cache_key = ("model-training-registry",)
-    cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
-    if cached is not None:
-        return sanitize_payload(cached)
+    cache_key = ("model-contribution-performance", selected_mode)
+    contribution = await asyncio.wait_for(
+        ModelContributionPerformanceService().recent(selected_mode),
+        timeout=_DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS,
+    )
+    _dashboard_heavy_cache_set(cache_key, contribution if isinstance(contribution, dict) else {})
+
+
+def _start_model_contribution_refresh(selected_mode: str) -> None:
+    task = _dashboard_model_contribution_refresh_tasks.get(selected_mode)
+    if task is not None and not task.done():
+        return
+    task = asyncio.create_task(_refresh_model_contribution_cache(selected_mode))
+    _dashboard_model_contribution_refresh_tasks[selected_mode] = task
+    task.add_done_callback(
+        _consume_dashboard_refresh_task(
+            _dashboard_model_contribution_refresh_tasks,
+            selected_mode,
+            label="model contribution",
+        )
+    )
+
+
+async def _build_model_training_registry_status() -> dict[str, Any]:
+    """Build the full registry off the request path."""
 
     observability = await get_model_observability_snapshot()
     observability_sections = observability.get("sections") if isinstance(observability, dict) else {}
@@ -8682,31 +9106,19 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     model_server_report = _load_model_training_report(
         "phase3_model_server_readiness_reports/latest.json"
     )
-    from services.model_contribution_performance import ModelContributionPerformanceService
-
-    contribution_status = {"state": "ready", "timeout_seconds": 8.0}
-    try:
-        contribution_performance = await asyncio.wait_for(
-            ModelContributionPerformanceService().recent(mode_manager.mode.value),
-            timeout=8.0,
-        )
-    except TimeoutError:
-        # Contribution attribution is diagnostic only. It must never hold the
-        # registry page hostage or compete with the trading loop.
+    selected_mode = "live" if mode_manager.mode.value == "live" else "paper"
+    contribution_key = ("model-contribution-performance", selected_mode)
+    contribution_performance = _dashboard_heavy_cache_get(
+        contribution_key,
+        ttl_seconds=_DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS,
+    )
+    contribution_status = {
+        "state": "ready" if isinstance(contribution_performance, dict) else "warming",
+        "timeout_seconds": _DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS,
+    }
+    if not isinstance(contribution_performance, dict):
         contribution_performance = {}
-        contribution_status = {
-            "state": "timeout",
-            "timeout_seconds": 8.0,
-            "reason": "model_contribution_query_timeout",
-        }
-    except Exception as exc:
-        _log_dashboard_fallback("model contribution performance fallback", exc)
-        contribution_performance = {}
-        contribution_status = {
-            "state": "error",
-            "timeout_seconds": 8.0,
-            "reason": "model_contribution_query_failed",
-        }
+        _start_model_contribution_refresh(selected_mode)
     registry = build_model_training_registry(
         local_ml_status=local_ml_status,
         local_tools_status=local_tools_status,
@@ -8717,7 +9129,47 @@ async def get_model_training_registry_status() -> dict[str, Any]:
     registry["contribution_performance_status"] = contribution_status
     registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
     registry["model_observability"] = observability
-    return sanitize_payload(_dashboard_heavy_cache_set(cache_key, registry))
+    return registry
+
+
+async def _refresh_model_training_registry_cache() -> None:
+    global _dashboard_model_training_registry_refresh_task
+    try:
+        payload = await _build_model_training_registry_status()
+        _dashboard_heavy_cache_set(("model-training-registry",), payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_dashboard_fallback("model training registry background refresh failed", exc)
+    finally:
+        _dashboard_model_training_registry_refresh_task = None
+
+
+@router.get("/model-training/registry")
+async def get_model_training_registry_status() -> dict[str, Any]:
+    """Return a cached lifecycle view without blocking the dashboard request."""
+
+    cache_key = ("model-training-registry",)
+    cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
+    if cached is not None:
+        return sanitize_payload(cached)
+
+    global _dashboard_model_training_registry_refresh_task
+    task = _dashboard_model_training_registry_refresh_task
+    if task is None or task.done():
+        task = asyncio.create_task(_refresh_model_training_registry_cache())
+        _dashboard_model_training_registry_refresh_task = task
+
+    observability = await get_model_observability_snapshot(request=object())
+    sections = observability.get("sections") if isinstance(observability, dict) else {}
+    sections = sections if isinstance(sections, dict) else {}
+    registry = build_model_training_registry(
+        local_ml_status=sections.get("local_ml") or {"status": "warming"},
+        local_tools_status=sections.get("local_ai_tools") or {"status": "warming"},
+    )
+    registry["model_observability"] = observability
+    registry["cache"] = {"hit": False, "refresh_in_background": True}
+    return sanitize_payload(registry)
 
 
 @router.get("/model-training/scheduler")
@@ -8853,7 +9305,7 @@ async def get_positions(
     from sqlalchemy import select
 
     from db.repositories.trade_repo import TradeRepository
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Order
 
@@ -8861,6 +9313,36 @@ async def get_positions(
     page_size = max(1, min(int(page_size or 20), 100))
     positions = []
     protection_inventory: dict[str, Any] | None = None
+    if open_only and not closed_only:
+        try:
+            open_rows = await _get_display_open_positions_snapshot(mode)
+            positions, protection_inventory = await _get_dashboard_open_position_evidence_snapshot(
+                open_rows,
+                mode=mode,
+            )
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "open positions cached read fallback",
+                exc,
+                mode=mode,
+            )
+            positions = []
+        display_total = len(positions)
+        display_total_pages = (
+            max(1, (display_total + page_size - 1) // page_size) if display_total else 1
+        )
+        page = min(page, display_total_pages)
+        start = (page - 1) * page_size
+        return {
+            "positions": positions[start : start + page_size],
+            "count": display_total,
+            "total": display_total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": display_total_pages,
+            "protection_inventory": protection_inventory,
+            "ledger_source": "okx_current_positions_snapshot",
+        }
     exchange_mark_map = {} if closed_only else await _get_exchange_position_mark_map(mode)
     exchange_temporarily_unavailable = bool(
         not closed_only
@@ -8897,7 +9379,7 @@ async def get_positions(
         closed_offset = max(start - open_count, 0)
         ledger_page_size = max(page_size * 2, 40)
         closed_page = closed_offset // ledger_page_size + 1
-        async with get_session_ctx() as session:
+        async with get_read_session_ctx() as session:
             repo = TradeRepository(session)
             # The combined view is ordered with current positions first and
             # settled history second.  Read only the closed page intersecting
@@ -8924,7 +9406,7 @@ async def get_positions(
             end = start + page_size
             closed_offset = max(start - open_count, 0)
             closed_page = closed_offset // ledger_page_size + 1
-            async with get_session_ctx() as session:
+            async with get_read_session_ctx() as session:
                 repo = TradeRepository(session)
                 closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
                     await _dashboard_closed_position_ledger_rows(
@@ -8955,7 +9437,7 @@ async def get_positions(
             "total_pages": display_total_pages,
             "ledger_source": f"okx_current_positions_plus_{closed_ledger_source}",
         }
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
         if closed_only:
@@ -9543,7 +10025,7 @@ async def get_decisions(
     from sqlalchemy import select
 
     from db.repositories.decision_repo import DecisionRepository
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.trade import Order
 
     effective_page_size = page_size if page_size is not None else limit
@@ -9557,7 +10039,7 @@ async def get_decisions(
     if action_filter not in allowed_actions:
         action_filter = None
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = DecisionRepository(session)
         rows = await repo.get_recent_decision_summaries(
             model_name=model_name,
@@ -9985,7 +10467,7 @@ async def _build_opening_funnel_payload(
     """Diagnose where new entries are filtered out before becoming positions."""
     from sqlalchemy import select, text
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Order
 
@@ -9995,7 +10477,9 @@ async def _build_opening_funnel_payload(
     capped_limit = max(50, min(int(limit or 500), _DASHBOARD_OPENING_FUNNEL_MAX_ROWS))
     since = max(datetime.now(UTC) - timedelta(hours=capped_hours), PHASE3_CLEAN_START_UTC)
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx(
+        statement_timeout_ms=_DASHBOARD_OPENING_FUNNEL_DB_TIMEOUT_MILLISECONDS,
+    ) as session:
         if "sqlite" not in str(settings.database_url).lower():
             # Bound the database side too; cancelling the Python coroutine alone
             # cannot interrupt a server-side query that is already executing.
@@ -10350,7 +10834,7 @@ async def get_analysis_records(
     from sqlalchemy import func, select
 
     from db.repositories.decision_repo import DecisionRepository
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Position
 
@@ -10368,7 +10852,7 @@ async def get_analysis_records(
     if normalized_analysis_type == "position" and decision_id is None:
         current_position_symbols = await _get_display_open_position_symbols(selected_mode)
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx() as session:
         repo = DecisionRepository(session)
         # Analysis lists only need the collaboration payload and scalar display
         # fields. Avoid hydrating feature snapshots, model-health blobs, and
@@ -11566,8 +12050,7 @@ async def get_profit_attribution(
     return sanitize_payload(_dashboard_heavy_cache_set(request_cache_key, dashboard_payload))
 
 
-@router.get("/model-contribution/stats")
-async def get_model_contribution_stats(
+async def _build_model_contribution_stats_payload(
     mode: str | None = None,
     days: int = 7,
     limit: int = 2000,
@@ -11575,13 +12058,15 @@ async def get_model_contribution_stats(
     """Estimate which model signals helped or hurt realized PnL."""
     from sqlalchemy import select
 
-    from db.session import get_session_ctx
+    from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Order, Position
     from services.model_contribution_performance import ModelContributionPerformanceService
+    from services.trade_fact_trust import split_exchange_order_ids
 
     selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
-    since = datetime.now(UTC) - timedelta(days=max(1, min(int(days or 7), 90)))
+    selected_days = max(1, min(int(days or 7), 90))
+    since = datetime.now(UTC) - timedelta(days=selected_days)
     max_rows = max(50, min(int(limit or 2000), 10000))
 
     buckets: dict[str, dict[str, Any]] = {
@@ -11618,11 +12103,28 @@ async def get_model_contribution_stats(
             bucket["losses"] += 1
             bucket["loss"] += abs(pnl)
 
-    async with get_session_ctx() as session:
+    async with get_read_session_ctx(
+        statement_timeout_ms=10_000,
+        idle_transaction_timeout_ms=12_000,
+    ) as session:
         from services.position_settlement import final_settlement_status_values
 
         position_result = await session.execute(
-            select(Position)
+            select(
+                Position.id,
+                Position.model_name,
+                Position.execution_mode,
+                Position.symbol,
+                Position.side,
+                Position.realized_pnl,
+                Position.is_open,
+                Position.created_at,
+                Position.closed_at,
+                Position.settlement_status,
+                Position.settlement_raw,
+                Position.entry_exchange_order_id,
+                Position.close_exchange_order_id,
+            )
             .where(
                 Position.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
                 Position.execution_mode == selected_mode,
@@ -11634,11 +12136,12 @@ async def get_model_contribution_stats(
             .order_by(Position.closed_at.desc())
             .limit(max_rows)
         )
-        positions = list(position_result.scalars().all())
+        positions = [SimpleNamespace(**dict(row._mapping)) for row in position_result.all()]
         if not positions:
             return {
+                "status": "ready",
                 "mode": selected_mode,
-                "days": days,
+                "days": selected_days,
                 "total_positions": 0,
                 "lineage": {
                     "total_closed_positions": 0,
@@ -11655,27 +12158,56 @@ async def get_model_contribution_stats(
                 "summary": "暂无已平仓样本，等新交易完成后会自动统计。",
             }
 
-        symbols = {p.symbol for p in positions if p.symbol}
-        symbol_variants = _dashboard_symbol_query_variants(symbols)
-        order_result = await session.execute(
-            select(Order)
-            .where(
-                Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
-                Order.execution_mode == selected_mode,
-                Order.status == "filled",
-                Order.symbol.in_(symbol_variants) if symbol_variants else Order.id == -1,
+        entry_order_ids = {
+            exchange_order_id
+            for position in positions
+            for exchange_order_id in split_exchange_order_ids(
+                getattr(position, "entry_exchange_order_id", None)
             )
-            .order_by(Order.filled_at.desc(), Order.created_at.desc())
-            .limit(min(max_rows * 2, _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS))
-        )
-        orders = list(order_result.scalars().all())
+        }
+        orders = []
+        if entry_order_ids:
+            order_result = await session.execute(
+                select(
+                    Order.id,
+                    Order.model_name,
+                    Order.execution_mode,
+                    Order.symbol,
+                    Order.side,
+                    Order.status,
+                    Order.decision_id,
+                    Order.exchange_order_id,
+                    Order.filled_at,
+                    Order.created_at,
+                )
+                .where(
+                    Order.model_name.in_(EXECUTION_LEDGER_MODEL_NAMES),
+                    Order.execution_mode == selected_mode,
+                    Order.status == "filled",
+                    Order.exchange_order_id.in_(entry_order_ids),
+                )
+                .order_by(Order.filled_at.desc(), Order.created_at.desc())
+                .limit(min(max_rows * 2, _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS))
+            )
+            orders = [SimpleNamespace(**dict(row._mapping)) for row in order_result.all()]
         decision_ids = list({int(o.decision_id) for o in orders if o.decision_id})
-        decisions: dict[int, AIDecision] = {}
+        decisions: dict[int, Any] = {}
         if decision_ids:
             decision_result = await session.execute(
-                select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                select(
+                    AIDecision.id,
+                    AIDecision.action,
+                    AIDecision.raw_llm_response,
+                ).where(AIDecision.id.in_(decision_ids))
             )
-            decisions = {d.id: d for d in decision_result.scalars().all()}
+            decisions = {
+                int(row.id): SimpleNamespace(
+                    id=int(row.id),
+                    action=row.action,
+                    raw_llm_response=row.raw_llm_response,
+                )
+                for row in decision_result.all()
+            }
 
     contribution_service = ModelContributionPerformanceService()
     lineage = contribution_service.build_lineage_diagnostics(positions, orders, decisions)
@@ -11772,13 +12304,193 @@ async def get_model_contribution_stats(
         result.append(item)
 
     return {
+        "status": "ready",
         "mode": selected_mode,
-        "days": days,
+        "days": selected_days,
         "total_positions": len(positions),
         "lineage": lineage,
         "stats": result,
         "summary": "按已平仓真实盈亏回看各模型同向信号贡献，用于后续自动降权/加权。",
     }
+
+
+def _model_contribution_stats_cache_key(
+    selected_mode: str,
+    selected_days: int,
+    max_rows: int,
+) -> tuple[Any, ...]:
+    return (
+        "model-contribution-stats",
+        selected_mode,
+        selected_days,
+        max_rows,
+        settings.database_url,
+    )
+
+
+async def _refresh_model_contribution_stats_cache(
+    cache_key: tuple[Any, ...],
+    *,
+    selected_mode: str,
+    selected_days: int,
+    max_rows: int,
+) -> None:
+    payload = await asyncio.wait_for(
+        _build_model_contribution_stats_payload(
+            mode=selected_mode,
+            days=selected_days,
+            limit=max_rows,
+        ),
+        timeout=_DASHBOARD_MODEL_CONTRIBUTION_STATS_TIMEOUT_SECONDS,
+    )
+    payload["cache"] = {
+        "hit": False,
+        "stale": False,
+        "refresh_in_background": False,
+    }
+    _dashboard_heavy_cache_set(cache_key, payload)
+
+
+def _start_model_contribution_stats_refresh(
+    cache_key: tuple[Any, ...],
+    *,
+    selected_mode: str,
+    selected_days: int,
+    max_rows: int,
+) -> asyncio.Task[Any]:
+    task = _dashboard_model_contribution_stats_refresh_tasks.get(cache_key)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(
+        _refresh_model_contribution_stats_cache(
+            cache_key,
+            selected_mode=selected_mode,
+            selected_days=selected_days,
+            max_rows=max_rows,
+        )
+    )
+    _dashboard_model_contribution_stats_refresh_tasks[cache_key] = task
+
+    def done(completed: asyncio.Task[Any]) -> None:
+        if _dashboard_model_contribution_stats_refresh_tasks.get(cache_key) is completed:
+            _dashboard_model_contribution_stats_refresh_tasks.pop(cache_key, None)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception as exc:
+            _log_dashboard_fallback(
+                "model contribution stats background refresh failed",
+                exc,
+                mode=selected_mode,
+                days=selected_days,
+            )
+
+    task.add_done_callback(done)
+    return task
+
+
+def _warming_model_contribution_stats_payload(
+    *,
+    selected_mode: str,
+    selected_days: int,
+) -> dict[str, Any]:
+    return {
+        "status": "warming",
+        "mode": selected_mode,
+        "days": selected_days,
+        "total_positions": 0,
+        "lineage": {
+            "total_closed_positions": 0,
+            "filled_order_count": 0,
+            "orders_with_decision_id": 0,
+            "orders_with_loaded_decision": 0,
+            "matched_position_count": 0,
+            "unmatched_position_count": 0,
+            "match_rate": 0.0,
+            "reason": "refresh_in_progress",
+            "ready_for_profit_learning": False,
+        },
+        "stats": [],
+        "summary": "模型贡献统计正在后台生成，页面其它数据不受影响。",
+        "cache": {
+            "hit": False,
+            "stale": False,
+            "refresh_in_background": True,
+            "reason": "initial_refresh_in_progress",
+        },
+    }
+
+
+@router.get("/model-contribution/stats")
+async def get_model_contribution_stats(
+    mode: str | None = None,
+    days: int = 7,
+    limit: int = 2000,
+    request: Request = None,
+):
+    """Serve cached contribution stats while the expensive refresh runs separately."""
+
+    selected_mode = "live" if str(mode or "").lower() == "live" else "paper"
+    selected_days = max(1, min(int(days or 7), 90))
+    max_rows = max(50, min(int(limit or 2000), 10000))
+    cache_key = _model_contribution_stats_cache_key(
+        selected_mode,
+        selected_days,
+        max_rows,
+    )
+
+    # Direct Python callers use this function as the computation contract in
+    # focused tests and maintenance commands. HTTP callers never wait on it.
+    if request is None:
+        return sanitize_payload(
+            await _build_model_contribution_stats_payload(
+                mode=selected_mode,
+                days=selected_days,
+                limit=max_rows,
+            )
+        )
+
+    cached = _dashboard_heavy_cache_peek(
+        cache_key,
+        max_age_seconds=_DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS,
+    )
+    if cached is not None:
+        cached["cache"] = {
+            "hit": True,
+            "stale": False,
+            "refresh_in_background": False,
+        }
+        return sanitize_payload(cached)
+
+    _start_model_contribution_stats_refresh(
+        cache_key,
+        selected_mode=selected_mode,
+        selected_days=selected_days,
+        max_rows=max_rows,
+    )
+    stale = _dashboard_heavy_cache_peek(
+        cache_key,
+        max_age_seconds=_DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS,
+    )
+    if stale is not None:
+        cached_at, _payload = _dashboard_heavy_cache[cache_key]
+        stale["cache"] = {
+            "hit": True,
+            "stale": True,
+            "refresh_in_background": True,
+            "age_seconds": round(
+                max((datetime.now(UTC) - cached_at).total_seconds(), 0.0),
+                3,
+            ),
+        }
+        return sanitize_payload(stale)
+    return sanitize_payload(
+        _warming_model_contribution_stats_payload(
+            selected_mode=selected_mode,
+            selected_days=selected_days,
+        )
+    )
 
 
 def _trade_reflection_authority_status(

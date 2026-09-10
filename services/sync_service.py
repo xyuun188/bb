@@ -4328,11 +4328,33 @@ class OkxSyncService:
                 decision_ids.update(decision_ids_by_entry_order.values())
                 decisions_by_id: dict[int, Any] = {}
                 if decision_ids:
+                    # Position context only needs the compact lifecycle
+                    # contract. Loading full raw_llm_response for every linked
+                    # decision can decompress hundreds of KB of JSON and
+                    # block the trading loop behind PostgreSQL statement
+                    # timeout.
                     decisions_result = await session.execute(
-                        select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                        select(
+                            AIDecision.id,
+                            AIDecision.symbol,
+                            AIDecision.action,
+                            AIDecision.is_paper,
+                            AIDecision.was_executed,
+                            AIDecision.executed_at,
+                            AIDecision.decision_learning_snapshot,
+                        ).where(AIDecision.id.in_(decision_ids))
                     )
                     decisions_by_id = {
-                        int(decision.id): decision for decision in decisions_result.scalars().all()
+                        int(row.id): SimpleNamespace(
+                            id=row.id,
+                            symbol=row.symbol,
+                            action=row.action,
+                            is_paper=row.is_paper,
+                            was_executed=row.was_executed,
+                            executed_at=row.executed_at,
+                            decision_learning_snapshot=row.decision_learning_snapshot,
+                        )
+                        for row in decisions_result.all()
                     }
                 for p in db_positions:
                     management_contract = _dict_value(

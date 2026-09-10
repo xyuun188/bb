@@ -1143,7 +1143,7 @@ class SpecialistShadowEvaluationService:
         authoritative_trade_samples: Sequence[Any] | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import func, select
+        from sqlalchemy import select
 
         from db.session import get_read_session_ctx
         from models.learning import ShadowBacktest
@@ -1165,51 +1165,12 @@ class SpecialistShadowEvaluationService:
             filters.append(ShadowBacktest.execution_mode == selected_mode)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
-            feature_snapshot = ShadowBacktest.feature_snapshot
-            bind = getattr(session, "bind", None)
-            dialect_name = str(getattr(getattr(bind, "dialect", None), "name", ""))
-            projection_fields = (
-                "symbol",
-                "market_regime",
-                "regime",
-                "market_state",
-                "spread_pct",
-                "bid",
-                "ask",
-                "orderbook_bid_depth",
-                "orderbook_ask_depth",
-                "orderbook_imbalance",
-                "planned_order_notional_usdt",
-                "planned_order_side",
-                "contract_value_base",
-                "orderbook_asks",
-                "orderbook_bids",
-                "round_trip_fee_pct",
-                "entry_fee_rate",
-                "exit_fee_rate",
-                "taker_fee_rate",
-                "fee_rate",
-                "funding_rate",
-                "funding_interval_minutes",
-                "funding_interval_hours",
-                "local_ai_tools_shadow",
+            # The compact training snapshot is maintained by the database
+            # trigger/ORM event and avoids materializing the large runtime JSON
+            # payload for every completed sample in this read-only report.
+            compact_feature_snapshot = ShadowBacktest.training_feature_snapshot.label(
+                "feature_snapshot"
             )
-            if dialect_name == "postgresql":
-                compact_feature_snapshot = func.jsonb_build_object(
-                    *sum(
-                        (
-                            [
-                                field,
-                                feature_snapshot[field],
-                            ]
-                            for field in projection_fields
-                        ),
-                        [],
-                    )
-                ).label("feature_snapshot")
-            else:
-                # SQLite test databases do not expose jsonb_build_object.
-                compact_feature_snapshot = feature_snapshot.label("feature_snapshot")
             result = await session.execute(
                 select(
                     ShadowBacktest.id,
@@ -1226,7 +1187,10 @@ class SpecialistShadowEvaluationService:
                     ShadowBacktest.updated_at,
                 )
                 .where(*filters)
-                .order_by(ShadowBacktest.id.desc())
+                .order_by(
+                    ShadowBacktest.created_at.desc(),
+                    ShadowBacktest.id.desc(),
+                )
             )
             rows = (
                 SimpleNamespace(**dict(row))
@@ -1241,15 +1205,14 @@ class SpecialistShadowEvaluationService:
         report["mode_filter_applied"] = selected_mode is not None
         report["query_policy"] = {
             "read_only": True,
-            "ordered_by_primary_key": True,
+            "ordered_by_training_index": True,
             "db_time_filter": True,
             "completed_cost_label_filter": True,
             "necessary_columns_only": True,
             "event_statistics_use_full_window": True,
             "event_evidence_rows_bounded": True,
             "row_limit": None,
-            "feature_snapshot_projection": dialect_name == "postgresql",
-            "feature_snapshot_projection_fields": list(projection_fields),
+            "training_feature_snapshot_column": True,
             "streamed_rows": True,
         }
         return report

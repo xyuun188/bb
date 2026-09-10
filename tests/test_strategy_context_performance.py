@@ -56,6 +56,6 @@ async def test_strategy_context_performance_uses_one_position_read_for_all_metri
         {
             "execution_mode": "paper",
             "model_name": "ensemble_trader",
-            "limit": 5000,
+            "limit": 500,
         }
     ]

@@ -210,25 +210,38 @@ class ModelArtifactRegistry:
         _write_json_atomic(self.candidate_path, pointer)
         return self.resolve_candidate(required=True)
 
-    def resolve_candidate(self, *, required: bool = False) -> ResolvedModelArtifact | None:
+    def resolve_candidate(
+        self,
+        *,
+        required: bool = False,
+        load_bundle: bool = True,
+    ) -> ResolvedModelArtifact | None:
         return self._resolve_pointer(
             self.candidate_path,
             expected_role="candidate",
             required=required,
+            load_bundle=load_bundle,
         )
 
-    def resolve_current(self) -> ResolvedModelArtifact | None:
+    def resolve_current(self, *, load_bundle: bool = True) -> ResolvedModelArtifact | None:
         return self._resolve_pointer(
             self.current_path,
             expected_role="current",
             required=False,
+            load_bundle=load_bundle,
         )
 
-    def resolve_challenger(self) -> ResolvedModelArtifact | None:
+    def resolve_current_metadata(self) -> ResolvedModelArtifact | None:
+        """Resolve the active artifact without deserializing the model bundle."""
+
+        return self.resolve_current(load_bundle=False)
+
+    def resolve_challenger(self, *, load_bundle: bool = True) -> ResolvedModelArtifact | None:
         return self._resolve_pointer(
             self.challenger_path,
             expected_role="challenger",
             required=False,
+            load_bundle=load_bundle,
         )
 
     def resolve_active(self) -> ResolvedModelArtifact | None:
@@ -236,11 +249,12 @@ class ModelArtifactRegistry:
 
         return self.resolve_current()
 
-    def resolve_rollback(self) -> ResolvedModelArtifact | None:
+    def resolve_rollback(self, *, load_bundle: bool = True) -> ResolvedModelArtifact | None:
         return self._resolve_pointer(
             self.rollback_path,
             expected_role="rollback",
             required=False,
+            load_bundle=load_bundle,
         )
 
     def promote_candidate(
@@ -692,6 +706,7 @@ class ModelArtifactRegistry:
         *,
         expected_role: str,
         required: bool,
+        load_bundle: bool = True,
     ) -> ResolvedModelArtifact | None:
         if not pointer_path.exists():
             if required:
@@ -731,8 +746,11 @@ class ModelArtifactRegistry:
         pointer_hash = _required_text(pointer, "sha256")
         if pointer_hash != _required_text(manifest, "artifact_sha256"):
             raise ValueError("artifact hash evidence mismatch")
-        actual_hash = _sha256(model_path)
-        if actual_hash != pointer_hash:
+        # Dashboard/status callers only need pointer and metadata integrity.
+        # Avoid reading a potentially very large joblib file on every poll; the
+        # full content hash is still verified before any bundle is deserialized.
+        actual_hash = _sha256(model_path) if load_bundle else pointer_hash
+        if load_bundle and actual_hash != pointer_hash:
             raise ValueError("artifact hash verification failed")
         pointer_metadata_hash = _required_text(pointer, "metadata_sha256")
         if pointer_metadata_hash != _required_text(manifest, "metadata_sha256"):
@@ -741,15 +759,16 @@ class ModelArtifactRegistry:
             raise ValueError("artifact metadata hash verification failed")
         metadata = _read_json(metadata_path)
         self._validate_metadata_identity(metadata, manifest, version, actual_hash)
-        bundle = load_trusted_joblib(
-            model_path,
-            trusted_root=version_root,
-            expected_type=dict,
-        )
-        embedded_metadata = bundle.get("metadata")
-        if not isinstance(embedded_metadata, dict):
-            raise ValueError("artifact bundle metadata is missing")
-        self._validate_embedded_identity(embedded_metadata, metadata)
+        if load_bundle:
+            bundle = load_trusted_joblib(
+                model_path,
+                trusted_root=version_root,
+                expected_type=dict,
+            )
+            embedded_metadata = bundle.get("metadata")
+            if not isinstance(embedded_metadata, dict):
+                raise ValueError("artifact bundle metadata is missing")
+            self._validate_embedded_identity(embedded_metadata, metadata)
 
         activation = None
         rejection = None
@@ -974,7 +993,42 @@ class ModelArtifactRegistry:
             ),
         }
 
-    def _pointer_status(self, role: str) -> dict[str, Any]:
+    def status_metadata(self) -> dict[str, Any]:
+        """Return registry status without loading any serialized model bundle."""
+
+        pointer_status = {
+            role: self._pointer_status(role, load_bundle=False)
+            for role in ("candidate", "challenger", "current", "rollback")
+        }
+        current = pointer_status["current"]
+        return {
+            "available": bool(current.get("available")),
+            "model_id": self.model_id,
+            "registry_version": ARTIFACT_REGISTRY_VERSION,
+            "candidate_pointer": str(self.candidate_path),
+            "challenger_pointer": str(self.challenger_path),
+            "current_pointer": str(self.current_path),
+            "active_pointer": str(self.active_path),
+            "rollback_pointer": str(self.rollback_path),
+            "pointers": pointer_status,
+            **(
+                {
+                    key: current.get(key)
+                    for key in (
+                        "version",
+                        "model_path",
+                        "manifest_path",
+                        "sha256",
+                        "manifest",
+                        "activation_manifest",
+                    )
+                }
+                if current.get("available")
+                else {"error": current.get("error")}
+            ),
+        }
+
+    def _pointer_status(self, role: str, *, load_bundle: bool = True) -> dict[str, Any]:
         resolver = {
             "candidate": self.resolve_candidate,
             "challenger": self.resolve_challenger,
@@ -982,7 +1036,15 @@ class ModelArtifactRegistry:
             "rollback": self.resolve_rollback,
         }[role]
         try:
-            resolved = resolver()
+            resolved = (
+                self.resolve_candidate(load_bundle=load_bundle)
+                if role == "candidate"
+                else self.resolve_challenger(load_bundle=load_bundle)
+                if role == "challenger"
+                else self.resolve_current(load_bundle=load_bundle)
+                if role == "current"
+                else self.resolve_rollback(load_bundle=load_bundle)
+            )
         except Exception as exc:
             return {"available": False, "role": role, "error": str(exc)}
         if resolved is None:

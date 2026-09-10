@@ -134,6 +134,55 @@ async def test_expert_memory_context_loads_all_experts_in_one_query(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_expert_memory_hit_telemetry_is_deduplicated(monkeypatch) -> None:
+    used_calls: list[list[int]] = []
+    memory = SimpleNamespace(
+        id=11,
+        expert_name="trend_expert",
+        expert_label="trend",
+        symbol="BTC/USDT",
+        side="long",
+        memory_type="authoritative_trade_outcome",
+        market_pattern="pattern",
+        lesson="lesson",
+        recommended_action="observation_only",
+        evidence_count=1,
+        success_count=1,
+        failure_count=0,
+        confidence_score=0.5,
+        extra={},
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    class FakeMemoryRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def get_relevant_memories_for_experts(self, *_args: Any, **_kwargs: Any):
+            return {"trend_expert": [memory]}
+
+        async def mark_memories_used(self, memory_ids: list[int]) -> None:
+            used_calls.append(memory_ids)
+
+    @asynccontextmanager
+    async def session_factory():
+        yield object()
+
+    monkeypatch.setattr(expert_memory_module, "MemoryRepository", FakeMemoryRepository)
+    service = ExpertMemoryService(
+        session_factory=session_factory,
+        memory_enabled_provider=lambda: True,
+        model_slots=[{"name": "trend_expert", "label": "trend"}],
+    )
+
+    await service.context("BTC/USDT")
+    await service.context("ETH/USDT")
+
+    assert used_calls == [[11]]
+
+
+@pytest.mark.asyncio
 async def test_local_close_records_reflection_without_expert_memory(monkeypatch) -> None:
     created_reflections: list[dict[str, Any]] = []
 

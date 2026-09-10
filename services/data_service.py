@@ -470,7 +470,15 @@ class DataService:
             self._rest_api_poll_task = asyncio.create_task(self._rest_api_ticker_poll_loop())
         
         self._start_kline_coverage_refresh()
-        await self.external_event_service.start_controller()
+        # Keep optional news/event scraping off the trading event loop unless
+        # this process explicitly opts in.
+        if settings.external_event_scraper_trading_process_enabled:
+            await self.external_event_service.start_controller()
+        else:
+            logger.info(
+                "external event scraper isolated from trading process",
+                reason="EXTERNAL_EVENT_SCRAPER_TRADING_PROCESS_ENABLED=false",
+            )
         logger.info("data service started")
 
 
@@ -521,7 +529,8 @@ class DataService:
         await self.rest_client.close()
         await self.news_fetcher.close()
         await self.sentiment_scraper.close()
-        await self.external_event_service.stop()
+        if settings.external_event_scraper_trading_process_enabled:
+            await self.external_event_service.stop()
         logger.info("data service stopped")
 
     async def _stop_ticker_persistence(self) -> None:

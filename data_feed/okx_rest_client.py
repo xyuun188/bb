@@ -1154,8 +1154,12 @@ class OKXRestClient:
             # it from a verified mark/index pair.
             ticker_task: asyncio.Task[Any] | None = None
             try:
+                # Reference prices only need a current last price for a
+                # mark/index fallback.  Do not require executable bid/ask
+                # fields here; the strict bid/ask contract remains enforced by
+                # the authoritative data-service path.
                 ticker_task = asyncio.create_task(
-                    self.fetch_ticker(symbol, wait_for_completion=True)
+                    self.fetch_ticker(symbol, wait_for_completion=False)
                 )
                 ticker_result = await asyncio.wait_for(
                     asyncio.shield(ticker_task),

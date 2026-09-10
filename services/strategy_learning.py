@@ -45,6 +45,11 @@ from services.training_epoch import load_training_epoch_start
 logger = structlog.get_logger(__name__)
 
 DEFAULT_LOOKBACK_HOURS = 168
+# Strategy feedback is a bounded control input, not a historical export. A
+# smaller window keeps the compact outcome loader from expanding thousands of
+# order/decision ids while the dashboard and reconciliation readers are active.
+STRATEGY_LEARNING_MAX_QUERY_SAMPLES = 200
+STRATEGY_LEARNING_READ_TIMEOUT_SECONDS = 7.0
 STRATEGY_SCHEDULER_VERSION = "2026-07-15.historical-return-prior-scheduler.v2"
 PRODUCTION_STRATEGY_ID = "dynamic_fee_after_return_execution"
 PRODUCTION_STRATEGY_VERSION = "2026-07-15.dynamic-profit-execution.v1"
@@ -54,6 +59,20 @@ EXECUTION_OWNERS = (
     "dynamic_position_capacity",
     "dynamic_exit_policy",
 )
+
+
+def _consume_background_outcome_task(task: asyncio.Task[Any]) -> None:
+    """Consume a shielded outcome read after the caller's budget expires."""
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        logger.debug(
+            "strategy learning outcome background read failed",
+            error=safe_error_text(exc, limit=160),
+        )
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -155,9 +174,7 @@ def _shadow_cost_evidence(
     )
     if outcome.get("cost_complete") is not True:
         reasons = [
-            str(value)
-            for value in _safe_list(outcome.get("incomplete_reasons"))
-            if value
+            str(value) for value in _safe_list(outcome.get("incomplete_reasons")) if value
         ] or ["shadow_cost_contract_incomplete"]
         return snapshot, long_gross, short_gross, outcome, reasons
     return snapshot, long_gross, short_gross, outcome, []
@@ -168,9 +185,7 @@ def _historical_replay_observation(
     *,
     epoch_start: datetime,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    replay_snapshot = _safe_dict(
-        getattr(row, "training_feature_snapshot", None)
-    )
+    replay_snapshot = _safe_dict(getattr(row, "training_feature_snapshot", None))
     snapshot, long_gross, short_gross, outcome, reasons = _shadow_cost_evidence(
         row,
         snapshot_override=replay_snapshot,
@@ -204,12 +219,8 @@ def _historical_replay_observation(
         ),
         "long_gross_return_pct": round(long_gross, 8),
         "short_gross_return_pct": round(short_gross, 8),
-        "long_net_return_after_all_cost_pct": outcome.get(
-            "long_net_return_after_all_cost_pct"
-        ),
-        "short_net_return_after_all_cost_pct": outcome.get(
-            "short_net_return_after_all_cost_pct"
-        ),
+        "long_net_return_after_all_cost_pct": outcome.get("long_net_return_after_all_cost_pct"),
+        "short_net_return_after_all_cost_pct": outcome.get("short_net_return_after_all_cost_pct"),
         "long_funding_return_pct": outcome.get("funding_return_long_pct"),
         "short_funding_return_pct": outcome.get("funding_return_short_pct"),
         "training_eligible": training_eligible,
@@ -290,9 +301,7 @@ def _runtime_prior_usage(decisions: list[Any]) -> dict[str, Any]:
                     "evaluation_status": (
                         "matched_historical_prior"
                         if matched
-                        else "not_matched"
-                        if side_evidence
-                        else "not_evaluated"
+                        else "not_matched" if side_evidence else "not_evaluated"
                     ),
                     "profile_id": prior.get("profile_id") if matched else None,
                     "profile_version": prior.get("profile_version") if matched else None,
@@ -416,9 +425,7 @@ def _current_production_strategy(
                 "owner": "dynamic_position_capacity",
             },
         },
-        "historical_prior_matching_enabled": bool(
-            runtime.get("historical_prior_context_enabled")
-        ),
+        "historical_prior_matching_enabled": bool(runtime.get("historical_prior_context_enabled")),
     }
 
 
@@ -468,9 +475,7 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
             values := [
                 float(value)
                 for sample in block
-                if (
-                    value := _optional_float(sample.get("net_return_after_all_cost_pct"))
-                )
+                if (value := _optional_float(sample.get("net_return_after_all_cost_pct")))
                 is not None
             ]
         )
@@ -480,16 +485,12 @@ def _return_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "sample_count": len(returns),
         "realized_net_pnl_usdt": round(sum(pnls), 8) if pnls else None,
         "average_net_pnl_usdt": round(sum(pnls) / len(pnls), 8) if pnls else None,
-        "average_net_return_pct": (
-            round(sum(returns) / len(returns), 8) if returns else None
-        ),
+        "average_net_return_pct": (round(sum(returns) / len(returns), 8) if returns else None),
         "return_lcb_pct": round(min(block_means), 8) if block_means else None,
         "gross_profit_usdt": round(gross_profit, 8),
         "gross_loss_usdt": round(gross_loss, 8),
         "profit_factor": round(gross_profit / gross_loss, 8) if gross_loss else None,
-        "profit_factor_above_break_even": bool(
-            gross_loss > 0 and gross_profit > gross_loss
-        ),
+        "profit_factor_above_break_even": bool(gross_loss > 0 and gross_profit > gross_loss),
         "max_drawdown": round(_max_drawdown(drawdown_values), 8),
         "tail_loss_pct": round(min(returns), 8) if returns else None,
         "negative_sample_count": sum(value < 0 for value in returns),
@@ -690,9 +691,7 @@ class StrategyFeedback:
                 usage["decision_records"] = decision_records
             payload[name] = _json_safe(usage)
         if include_samples:
-            payload["authoritative_return_samples"] = _json_safe(
-                self.authoritative_return_samples
-            )
+            payload["authoritative_return_samples"] = _json_safe(self.authoritative_return_samples)
             payload["shadow_return_samples"] = _json_safe(self.shadow_return_samples)
         return payload
 
@@ -726,9 +725,7 @@ class StrategyCandidateGenerator:
             regime = str(sample.get("market_regime") or "").lower()
             selectors = [{"scope": "side", "side": side}]
             if symbol:
-                selectors.append(
-                    {"scope": "symbol_side", "symbol": symbol, "side": side}
-                )
+                selectors.append({"scope": "symbol_side", "symbol": symbol, "side": side})
             if regime:
                 selectors.append(
                     {
@@ -763,9 +760,7 @@ class StrategyCandidateGenerator:
                 "generated_at": generated_at,
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
                 "fallback_reason": "",
-                "position_ids": sorted(
-                    _safe_int(sample.get("position_id")) for sample in samples
-                ),
+                "position_ids": sorted(_safe_int(sample.get("position_id")) for sample in samples),
             }
             profiles.append(
                 StrategyProfile(
@@ -784,9 +779,7 @@ class StrategyCandidateGenerator:
                     ),
                     params={
                         "selector": selector,
-                        "prediction_horizon_minutes": (
-                            horizons[0] if len(horizons) == 1 else None
-                        ),
+                        "prediction_horizon_minutes": (horizons[0] if len(horizons) == 1 else None),
                         "objective": "maximize_authoritative_fee_after_return_rate",
                         "historical_return_distribution": metrics,
                         "current_return_contract_required": True,
@@ -853,9 +846,7 @@ def _shadow_report(
                     "source_id": sample.get("source_id"),
                     "symbol": sample.get("symbol"),
                     "side": sample.get("side"),
-                    "net_return_after_all_cost_pct": sample.get(
-                        "net_return_after_all_cost_pct"
-                    ),
+                    "net_return_after_all_cost_pct": sample.get("net_return_after_all_cost_pct"),
                     "execution_cost_pct": sample.get("execution_cost_pct"),
                     "timestamp": sample.get("timestamp"),
                 }
@@ -913,15 +904,13 @@ def _rank_value(value: Any, *, descending: bool = True) -> float:
 def _candidate_rank_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     backtest = _safe_dict(candidate.get("backtest"))
     shadow = _safe_dict(candidate.get("shadow_validation"))
-    historical = _safe_dict(_safe_dict(candidate.get("params")).get("historical_return_distribution"))
+    historical = _safe_dict(
+        _safe_dict(candidate.get("params")).get("historical_return_distribution")
+    )
     backtest_metrics = _safe_dict(backtest.get("metrics"))
     shadow_metrics = _safe_dict(shadow.get("metrics"))
     return (
-        bool(
-            _safe_dict(candidate.get("promotion")).get(
-                "historical_prior_context_eligible"
-            )
-        ),
+        bool(_safe_dict(candidate.get("promotion")).get("historical_prior_context_eligible")),
         _rank_value(backtest_metrics.get("return_lcb_pct")),
         _rank_value(shadow_metrics.get("return_lcb_pct")),
         _rank_value(historical.get("realized_net_pnl_usdt")),
@@ -997,38 +986,32 @@ class StrategyLearningEngine:
                 for sample in (
                     replay_exam
                     if exact_replay
-                    else []
-                    if model_replay_required
-                    else feedback.shadow_return_samples
+                    else [] if model_replay_required else feedback.shadow_return_samples
                 )
                 if _selector_matches(selector, sample)
             ]
             backtest = _walk_forward_report(authoritative)
-            backtest["cross_symbol_generalization"] = _cross_symbol_generalization(
-                authoritative
-            )
+            backtest["cross_symbol_generalization"] = _cross_symbol_generalization(authoritative)
             backtest["evidence_mode"] = (
                 "exact_trained_model_historical_replay"
                 if exact_replay
                 else "authoritative_trade_outcomes"
             )
             backtest["evidence_partition"] = (
-                "strategy_development"
-                if exact_replay
-                else "authoritative_closed_positions"
+                "strategy_development" if exact_replay else "authoritative_closed_positions"
             )
             shadow = _shadow_report(shadows, include_rows=include_evidence_rows)
             shadow["cross_symbol_generalization"] = _cross_symbol_generalization(shadows)
             shadow["validation_method"] = (
                 replay.get("validation_method")
                 if exact_replay
-                else "model_historical_replay_required"
-                if model_replay_required
-                else "legacy_selector_matched_shadow"
+                else (
+                    "model_historical_replay_required"
+                    if model_replay_required
+                    else "legacy_selector_matched_shadow"
+                )
             )
-            shadow["evidence_partition"] = (
-                "strategy_exam" if exact_replay else "legacy_shadow"
-            )
+            shadow["evidence_partition"] = "strategy_exam" if exact_replay else "legacy_shadow"
             rejection_reasons = _candidate_rejections(
                 backtest,
                 shadow,
@@ -1047,20 +1030,14 @@ class StrategyLearningEngine:
             historical_prior_context_eligible = not rejection_reasons
             profile_payload = profile.to_dict()
             profile_payload["status"] = (
-                "governed"
-                if historical_prior_context_eligible
-                else "shadow_validation"
+                "governed" if historical_prior_context_eligible else "shadow_validation"
             )
             profile_payload["promotion"] = {
                 **_safe_dict(profile_payload.get("promotion")),
                 "evaluation_state": (
-                    "governed"
-                    if historical_prior_context_eligible
-                    else "blocked"
+                    "governed" if historical_prior_context_eligible else "blocked"
                 ),
-                "historical_prior_context_eligible": (
-                    historical_prior_context_eligible
-                ),
+                "historical_prior_context_eligible": (historical_prior_context_eligible),
                 "rejection_reasons": rejection_reasons,
                 "can_authorize_entry": False,
                 "can_change_size_or_leverage": False,
@@ -1072,9 +1049,7 @@ class StrategyLearningEngine:
             backtest_rows.append(
                 {"profile_id": profile.profile_id, "label": profile.label, **backtest}
             )
-            shadow_rows.append(
-                {"profile_id": profile.profile_id, "label": profile.label, **shadow}
-            )
+            shadow_rows.append({"profile_id": profile.profile_id, "label": profile.label, **shadow})
 
         candidates.sort(key=_candidate_rank_key, reverse=True)
         for rank, candidate in enumerate(candidates, start=1):
@@ -1082,9 +1057,7 @@ class StrategyLearningEngine:
         governed = [
             candidate
             for candidate in candidates
-            if _safe_dict(candidate.get("promotion")).get(
-                "historical_prior_context_eligible"
-            )
+            if _safe_dict(candidate.get("promotion")).get("historical_prior_context_eligible")
             is True
         ]
         context = _safe_dict(current_context)
@@ -1096,46 +1069,61 @@ class StrategyLearningEngine:
             update_state=update_strategy_state,
         )
         routed_side = str(
-            _safe_dict(continuous_routing.get("current_route")).get(
-                "recommended_side"
-            )
-            or ""
+            _safe_dict(continuous_routing.get("current_route")).get("recommended_side") or ""
         ).lower()
         leading = (candidates or [None])[0]
         historical_prior_context_enabled = bool(governed)
         scheduler_mode = (
             "governed_dynamic_return"
             if historical_prior_context_enabled
-            else "continuous_paper_strategy_routing"
-            if routed_side in {"long", "short"}
-            else "model_replay_no_fee_after_entries"
-            if model_replay_required
-            and replay.get("status") == "complete"
-            and not candidates
-            else "model_replay_incomplete"
-            if model_replay_required and not candidates
-            else "shadow_validation"
-            if candidates
-            else "insufficient_authoritative_evidence"
+            else (
+                "continuous_paper_strategy_routing"
+                if routed_side in {"long", "short"}
+                else (
+                    "model_replay_no_fee_after_entries"
+                    if model_replay_required
+                    and replay.get("status") == "complete"
+                    and not candidates
+                    else (
+                        "model_replay_incomplete"
+                        if model_replay_required and not candidates
+                        else (
+                            "shadow_validation"
+                            if candidates
+                            else "insufficient_authoritative_evidence"
+                        )
+                    )
+                )
+            )
         )
         reason = (
             "Governed fee-after return candidates are available from exact model replay; "
             "the current live return and dynamic risk contracts still own execution."
             if historical_prior_context_enabled and exact_replay
-            else "Governed fee-after return candidates are available as matching historical priors; "
-            "the current live return and dynamic risk contracts still own execution."
-            if historical_prior_context_enabled
-            else "Validated strategies remain continuously weighted for paper training; current return and risk contracts still own normal entries."
-            if routed_side in {"long", "short"}
-            else "Exact trained-model historical replay found no fee-after-positive entries; no model strategy candidate was created."
-            if model_replay_required
-            and replay.get("status") == "complete"
-            and not candidates
-            else "The trained-model historical replay is incomplete, so no model strategy candidate can be created."
-            if model_replay_required and not candidates
-            else "Candidates remain in shadow because exact model replay, walk-forward, or cost-complete exam evidence is incomplete."
-            if candidates
-            else "No trusted cost-complete return-rate samples are available for candidate generation."
+            else (
+                "Governed fee-after return candidates are available as matching historical priors; "
+                "the current live return and dynamic risk contracts still own execution."
+                if historical_prior_context_enabled
+                else (
+                    "Validated strategies remain continuously weighted for paper training; current return and risk contracts still own normal entries."
+                    if routed_side in {"long", "short"}
+                    else (
+                        "Exact trained-model historical replay found no fee-after-positive entries; no model strategy candidate was created."
+                        if model_replay_required
+                        and replay.get("status") == "complete"
+                        and not candidates
+                        else (
+                            "The trained-model historical replay is incomplete, so no model strategy candidate can be created."
+                            if model_replay_required and not candidates
+                            else (
+                                "Candidates remain in shadow because exact model replay, walk-forward, or cost-complete exam evidence is incomplete."
+                                if candidates
+                                else "No trusted cost-complete return-rate samples are available for candidate generation."
+                            )
+                        )
+                    )
+                )
+            )
         )
         governed_runtime_profiles = [
             {
@@ -1147,9 +1135,7 @@ class StrategyLearningEngine:
                     _safe_dict(candidate.get("params")).get("historical_return_distribution")
                 ),
                 "walk_forward": _safe_dict(candidate.get("backtest")).get("metrics"),
-                "shadow_validation": _safe_dict(candidate.get("shadow_validation")).get(
-                    "metrics"
-                ),
+                "shadow_validation": _safe_dict(candidate.get("shadow_validation")).get("metrics"),
                 "policy_provenance": _safe_dict(
                     _safe_dict(candidate.get("params")).get("policy_provenance")
                 ),
@@ -1185,9 +1171,7 @@ class StrategyLearningEngine:
                 ),
                 "generated_at": feedback.generated_at,
                 "strategy_version": STRATEGY_SCHEDULER_VERSION,
-                "fallback_reason": (
-                    "" if historical_prior_context_enabled else scheduler_mode
-                ),
+                "fallback_reason": ("" if historical_prior_context_enabled else scheduler_mode),
             },
         }
         production_strategy = _current_production_strategy(feedback, runtime)
@@ -1250,13 +1234,9 @@ class StrategyLearningEngine:
             "advisory_prior_only": True,
             "production_permission": False,
             "policy_provenance": runtime.get("policy_provenance"),
-            "current_production_strategy": _safe_dict(
-                schedule.get("current_production_strategy")
-            ),
+            "current_production_strategy": _safe_dict(schedule.get("current_production_strategy")),
             "paper_strategy_champion": champion,
-            "continuous_strategy_routing": _safe_dict(
-                schedule.get("continuous_strategy_routing")
-            ),
+            "continuous_strategy_routing": _safe_dict(schedule.get("continuous_strategy_routing")),
         }
         result["paper_strategy_champion"] = champion
         result["continuous_strategy_routing"] = _safe_dict(
@@ -1312,9 +1292,7 @@ class StrategyLearningService:
         include_historical_replay: bool = True,
     ) -> dict[str, Any]:
         blueprint, predictor = (
-            self._default_model_replay_context(mode)
-            if include_historical_replay
-            else ({}, None)
+            self._default_model_replay_context(mode) if include_historical_replay else ({}, None)
         )
         feedback = await self._feedback(
             mode=mode,
@@ -1411,9 +1389,7 @@ class StrategyLearningService:
             await self.champion_service.reconcile(
                 mode=mode,
                 blueprint=model_strategy_blueprint,
-                candidates=list(
-                    _safe_dict(payload.get("schedule")).get("candidates") or []
-                ),
+                candidates=list(_safe_dict(payload.get("schedule")).get("candidates") or []),
             )
             if replay_enabled
             else await self.champion_service.current(mode)
@@ -1437,30 +1413,57 @@ class StrategyLearningService:
     ) -> StrategyFeedback:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
         effective_hours = max(int(hours or 1), 1)
-        effective_limit = max(int(limit or 1), 1)
+        effective_limit = min(
+            max(int(limit or 1), 1),
+            STRATEGY_LEARNING_MAX_QUERY_SAMPLES,
+        )
         epoch_start = load_training_epoch_start()
         since = max(datetime.now(UTC) - timedelta(hours=effective_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
         epoch_start_naive = epoch_start.replace(tzinfo=None)
-        outcomes = await load_authoritative_trade_outcomes(
-            mode=selected_mode,
-            since=since,
-            limit=effective_limit,
-            compact=True,
+        outcome_task = asyncio.create_task(
+            load_authoritative_trade_outcomes(
+                mode=selected_mode,
+                since=since,
+                limit=effective_limit,
+                compact=True,
+            )
         )
+        try:
+            # Shield the database task so a caller timeout does not cancel an
+            # asyncpg operation midway through a statement. The completed
+            # task can still warm the compact cache for the next round.
+            outcomes = await asyncio.wait_for(
+                asyncio.shield(outcome_task),
+                timeout=STRATEGY_LEARNING_READ_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            outcome_task.add_done_callback(_consume_background_outcome_task)
+            logger.warning(
+                "strategy_learning_outcome_query_timeout",
+                timeout_seconds=STRATEGY_LEARNING_READ_TIMEOUT_SECONDS,
+                mode=selected_mode,
+            )
+            outcomes = []
+        except Exception as exc:
+            logger.warning(
+                "strategy_learning_outcome_query_failed",
+                mode=selected_mode,
+                error=safe_error_text(exc, limit=180),
+            )
+            outcomes = []
         async with get_read_session_ctx() as session:
-            open_rows = list(
-                (
+            open_rows = [
+                SimpleNamespace(id=row.id, unrealized_pnl=row.unrealized_pnl)
+                for row in (
                     await session.execute(
-                        select(Position).where(
+                        select(Position.id, Position.unrealized_pnl).where(
                             Position.execution_mode == selected_mode,
                             Position.is_open.is_(True),
                         )
                     )
-                )
-                .scalars()
-                .all()
-            )
+                ).all()
+            ]
             position_ids = sorted(
                 {
                     int(value)
@@ -1470,21 +1473,29 @@ class StrategyLearningService:
                 }
             )
             events = (
-                list(
-                    (
+                [
+                    SimpleNamespace(
+                        position_id=row.position_id,
+                        market_state=row.market_state,
+                    )
+                    for row in (
                         await session.execute(
-                            select(StrategyLearningEvent)
+                            select(
+                                StrategyLearningEvent.position_id,
+                                StrategyLearningEvent.market_state,
+                            )
                             .where(
                                 StrategyLearningEvent.execution_mode == selected_mode,
                                 StrategyLearningEvent.position_id.in_(position_ids),
                             )
-                            .order_by(StrategyLearningEvent.created_at.desc())
+                            .order_by(
+                                StrategyLearningEvent.created_at.desc(),
+                                StrategyLearningEvent.id.desc(),
+                            )
                             .limit(max(effective_limit * 4, 100))
                         )
-                    )
-                    .scalars()
-                    .all()
-                )
+                    ).all()
+                ]
                 if position_ids
                 else []
             )
@@ -1494,9 +1505,7 @@ class StrategyLearningService:
                         select(
                             ShadowBacktest.id,
                             ShadowBacktest.symbol,
-                            ShadowBacktest.training_feature_snapshot.label(
-                                "feature_snapshot"
-                            ),
+                            ShadowBacktest.training_feature_snapshot.label("feature_snapshot"),
                             ShadowBacktest.horizon_minutes,
                             ShadowBacktest.long_return_pct,
                             ShadowBacktest.short_return_pct,
@@ -1558,9 +1567,7 @@ class StrategyLearningService:
                     replay_query = replay_query.where(ShadowBacktest.id.in_(holdout_ids))
                 else:
                     replay_query = replay_query.limit(effective_limit)
-                replay_shadows = list(
-                    (await session.execute(replay_query)).scalars().all()
-                )
+                replay_shadows = list((await session.execute(replay_query)).scalars().all())
             replay_shadows.reverse()
             decisions = list(
                 (
@@ -1572,9 +1579,9 @@ class StrategyLearningService:
                             AIDecision.created_at,
                             AIDecision.was_executed,
                             AIDecision.execution_reason,
-                            AIDecision.decision_learning_snapshot[
+                            AIDecision.decision_learning_snapshot["entry_candidate_evidence"].label(
                                 "entry_candidate_evidence"
-                            ].label("entry_candidate_evidence"),
+                            ),
                         )
                         .where(
                             AIDecision.model_name == ENSEMBLE_TRADER_NAME,
@@ -1585,8 +1592,7 @@ class StrategyLearningService:
                         .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
                         .limit(effective_limit)
                     )
-                )
-                .all()
+                ).all()
             )
 
         regime_by_position: dict[int, str] = {}
@@ -1636,9 +1642,7 @@ class StrategyLearningService:
                     "net_return_after_all_cost_pct": round(net_return, 8),
                     "return_basis_source": "okx_positions_history.pnlRatio",
                     "timestamp": _timestamp_text(outcome.get("label_timestamp")),
-                    "cost_policy_provenance": _safe_dict(
-                        outcome.get("consumer_provenance")
-                    ),
+                    "cost_policy_provenance": _safe_dict(outcome.get("consumer_provenance")),
                     "attribution": _safe_dict(outcome.get("attribution")),
                 }
             )
@@ -1647,9 +1651,7 @@ class StrategyLearningService:
         shadow_replay_observations: list[dict[str, Any]] = []
         shadow_excluded: dict[str, int] = {}
         for row in shadows:
-            snapshot, long_gross, short_gross, outcome, reasons = (
-                _shadow_cost_evidence(row)
-            )
+            snapshot, long_gross, short_gross, outcome, reasons = _shadow_cost_evidence(row)
             if reasons or long_gross is None or short_gross is None:
                 for reason in reasons:
                     reason_text = str(reason)
@@ -1658,9 +1660,7 @@ class StrategyLearningService:
             execution_cost = _safe_dict(outcome.get("execution_cost"))
             for side in ("long", "short"):
                 gross_return = long_gross if side == "long" else short_gross
-                net_return = _optional_float(
-                    outcome.get(f"{side}_net_return_after_all_cost_pct")
-                )
+                net_return = _optional_float(outcome.get(f"{side}_net_return_after_all_cost_pct"))
                 shadow_samples.append(
                     {
                         "source": "completed_shadow_with_live_cost_snapshot",
@@ -1677,9 +1677,7 @@ class StrategyLearningService:
                             + _safe_float(outcome.get("slippage_return_pct")),
                             8,
                         ),
-                        "funding_return_pct": outcome.get(
-                            f"funding_return_{side}_pct"
-                        ),
+                        "funding_return_pct": outcome.get(f"funding_return_{side}_pct"),
                         "timestamp": _timestamp_text(getattr(row, "created_at", None)),
                         "cost_policy_provenance": _safe_dict(
                             execution_cost.get("policy_provenance")
@@ -1702,20 +1700,23 @@ class StrategyLearningService:
         observation = {
             **_legacy_observation_summary(authoritative_samples),
             "cost_complete_sample_count": len(authoritative_samples),
-            "excluded_incomplete_or_untrusted_count": len(outcomes)
-            - len(authoritative_samples),
+            "excluded_incomplete_or_untrusted_count": len(outcomes) - len(authoritative_samples),
         }
         generated_at = datetime.now(UTC).isoformat()
-        problems = [
-            {"code": code, "count": count, "kind": "authoritative_sample_excluded"}
-            for code, count in sorted(quarantine_reasons.items())
-        ] + [
-            {"code": code, "count": count, "kind": "shadow_sample_excluded"}
-            for code, count in sorted(shadow_excluded.items())
-        ] + [
-            {"code": code, "count": count, "kind": "historical_replay_excluded"}
-            for code, count in sorted(replay_excluded.items())
-        ]
+        problems = (
+            [
+                {"code": code, "count": count, "kind": "authoritative_sample_excluded"}
+                for code, count in sorted(quarantine_reasons.items())
+            ]
+            + [
+                {"code": code, "count": count, "kind": "shadow_sample_excluded"}
+                for code, count in sorted(shadow_excluded.items())
+            ]
+            + [
+                {"code": code, "count": count, "kind": "historical_replay_excluded"}
+                for code, count in sorted(replay_excluded.items())
+            ]
+        )
         return StrategyFeedback(
             mode=selected_mode,
             window_hours=effective_hours,
@@ -1733,12 +1734,9 @@ class StrategyLearningService:
             shadow_feedback={
                 "completed_row_count": len(shadows),
                 "cost_complete_direction_sample_count": len(shadow_samples),
-                "historical_replay_observation_count": len(
-                    shadow_replay_observations
-                ),
+                "historical_replay_observation_count": len(shadow_replay_observations),
                 "historical_replay_training_eligible_count": sum(
-                    row.get("training_eligible") is True
-                    for row in shadow_replay_observations
+                    row.get("training_eligible") is True for row in shadow_replay_observations
                 ),
                 "historical_replay_excluded_reason_counts": replay_excluded,
                 "excluded_reason_counts": shadow_excluded,
@@ -1802,19 +1800,11 @@ class StrategyLearningService:
         learning = _safe_dict(context.get("strategy_learning"))
         runtime = _safe_dict(learning.get("runtime"))
         response = _safe_dict(raw_response or getattr(decision, "raw_response", None))
-        decision_action = action or str(
-            getattr(getattr(decision, "action", None), "value", "")
-        )
+        decision_action = action or str(getattr(getattr(decision, "action", None), "value", ""))
         side = (
-            "long"
-            if "long" in decision_action
-            else "short"
-            if "short" in decision_action
-            else None
+            "long" if "long" in decision_action else "short" if "short" in decision_action else None
         )
-        side_evidence = _safe_dict(
-            _safe_dict(response.get("entry_candidate_evidence")).get(side)
-        )
+        side_evidence = _safe_dict(_safe_dict(response.get("entry_candidate_evidence")).get(side))
         matched_prior = _safe_dict(side_evidence.get("scheduled_return_prior"))
         if matched_prior.get("available") is not True:
             matched_prior = {}
