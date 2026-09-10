@@ -64,6 +64,7 @@ OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS = 30.0
 OKX_PRIVATE_API_CIRCUIT_PROBE_STALE_SECONDS = 30.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
+OKX_EXIT_INSTRUMENT_REJECTION_COOLDOWN_SECONDS = 900.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
@@ -138,6 +139,7 @@ class OKXExecutor(AbstractExecutor):
         self._markets_loaded = False
         self._leverage_cache: dict[tuple[str, str], tuple[float, float]] = {}
         self._contract_delivery_locks: dict[str, tuple[float, str]] = {}
+        self._exit_instrument_rejection_locks: dict[str, tuple[float, str]] = {}
         self._entry_instrument_availability_cache: dict[
             str, tuple[dict[str, Any], float, float]
         ] = {}
@@ -1767,24 +1769,76 @@ class OKXExecutor(AbstractExecutor):
                 if position_side:
                     params["positionSide"] = position_side
                 params["reduceOnly"] = True
-                full_close_result = await self._place_okx_native_full_close(
-                    ccxt=ccxt,
-                    decision=decision,
-                    okx_symbol=okx_symbol,
-                    market=market,
-                    side=side,
-                    params=params,
-                    price=price,
-                    contract_size=contract_size,
-                    pre_exit_contracts=pre_exit_contracts,
-                    target_side=target_side,
-                    position_side=position_side,
-                    requested_exit_fraction=requested_exit_fraction,
-                    requested_exit_contracts=requested_exit_contracts,
-                    exit_order_replace_note=exit_order_replace_note,
-                )
-                if full_close_result is not None:
-                    return full_close_result
+                # A full close must use OKX's native close-position endpoint.
+                # Sending a reduce-only order for the entire net position first
+                # is rejected by the demo account with 51001 even though the
+                # instrument itself is valid.  Partial exits still use the
+                # reduce-only market-order path below.
+                if requested_exit_fraction >= 0.999:
+                    full_close_result = await self._place_okx_native_full_close(
+                        ccxt=ccxt,
+                        decision=decision,
+                        okx_symbol=okx_symbol,
+                        market=market,
+                        side=side,
+                        params=params,
+                        price=price,
+                        contract_size=contract_size,
+                        pre_exit_contracts=pre_exit_contracts,
+                        target_side=target_side,
+                        position_side=position_side,
+                        requested_exit_fraction=requested_exit_fraction,
+                        requested_exit_contracts=requested_exit_contracts,
+                        exit_order_replace_note=exit_order_replace_note,
+                    )
+                    if full_close_result is not None:
+                        return full_close_result
+                    # Some OKX/CCXT clients do not expose the native
+                    # close-position endpoint. Reuse the native reduce-only
+                    # path before falling back to CCXT so delivery/instrument
+                    # rejections are handled once and do not become duplicate
+                    # submissions.
+                    native_reduce_result = await self._place_okx_native_reduce_market_order(
+                        ccxt=ccxt,
+                        decision=decision,
+                        okx_symbol=okx_symbol,
+                        side=side,
+                        market=market,
+                        params=params,
+                        price=price,
+                        contract_size=contract_size,
+                        pre_exit_contracts=pre_exit_contracts,
+                        target_side=target_side,
+                        position_side=position_side,
+                        position_snapshot=exit_position_snapshot or [],
+                        requested_exit_fraction=requested_exit_fraction,
+                        requested_exit_contracts=requested_exit_contracts,
+                        order_quantity=order_quantity,
+                        exit_order_replace_note=exit_order_replace_note,
+                    )
+                    if native_reduce_result is not None:
+                        return native_reduce_result
+                else:
+                    native_reduce_result = await self._place_okx_native_reduce_market_order(
+                        ccxt=ccxt,
+                        decision=decision,
+                        okx_symbol=okx_symbol,
+                        market=market,
+                        side=side,
+                        params=params,
+                        price=price,
+                        contract_size=contract_size,
+                        pre_exit_contracts=pre_exit_contracts,
+                        target_side=target_side,
+                        position_side=position_side,
+                        position_snapshot=exit_position_snapshot or [],
+                        requested_exit_fraction=requested_exit_fraction,
+                        requested_exit_contracts=requested_exit_contracts,
+                        order_quantity=order_quantity,
+                        exit_order_replace_note=exit_order_replace_note,
+                    )
+                    if native_reduce_result is not None:
+                        return native_reduce_result
                 split_exit_result = await self._place_split_exit_market_orders(
                     ccxt=ccxt,
                     decision=decision,
@@ -1803,26 +1857,6 @@ class OKXExecutor(AbstractExecutor):
                 )
                 if split_exit_result is not None:
                     return split_exit_result
-                native_reduce_result = await self._place_okx_native_reduce_market_order(
-                    ccxt=ccxt,
-                    decision=decision,
-                    okx_symbol=okx_symbol,
-                    market=market,
-                    side=side,
-                    params=params,
-                    price=price,
-                    contract_size=contract_size,
-                    pre_exit_contracts=pre_exit_contracts,
-                    target_side=target_side,
-                    position_side=position_side,
-                    position_snapshot=exit_position_snapshot or [],
-                    requested_exit_fraction=requested_exit_fraction,
-                    requested_exit_contracts=requested_exit_contracts,
-                    order_quantity=order_quantity,
-                    exit_order_replace_note=exit_order_replace_note,
-                )
-                if native_reduce_result is not None:
-                    return native_reduce_result
 
             # Place the market order
             logger.info(
@@ -2705,26 +2739,59 @@ class OKXExecutor(AbstractExecutor):
             return None
 
         request_params = {
-            "instId": str(
-                market.get("id") or okx_symbol.replace("/", "-").replace(":USDT", "-SWAP")
-            ),
+            "instId": self._native_inst_id_for_market(market, okx_symbol),
             "mgnMode": str(params.get("tdMode") or params.get("marginMode") or "cross"),
             "autoCxl": params.get("autoCxl", True),
         }
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
+        locked = self._exit_instrument_rejection_reason(str(request_params["instId"]))
+        if locked is not None:
+            reason, lock_hit = locked
+            return self._exit_instrument_rejected_result(
+                decision=decision,
+                side=side,
+                price=price,
+                request_params=request_params,
+                params=params,
+                okx_symbol=okx_symbol,
+                reason=reason,
+                lock_hit=lock_hit,
+            )
 
         submitted_at_ms = int(time.time() * 1000)
         try:
             response = await self._with_retry(close_position, request_params)
         except ExchangeAPIError as exc:
-            if is_okx_temporary_service_error(safe_error_text(exc)):
+            error_text = safe_error_text(exc)
+            if is_okx_temporary_service_error(error_text):
                 raise
+            if self._exchange_error_code(exc, error_text) == "51001":
+                # Some OKX accounts reject only the close-position endpoint
+                # while accepting a reduce-only market order. Let the caller
+                # make that one native reduce-only attempt; that path turns a
+                # second 51001 into a terminal result and never falls through
+                # to a duplicate CCXT order.
+                # Remember the rejection before returning so concurrent exit
+                # decisions cannot keep submitting the same invalid instrument.
+                self._remember_exit_instrument_rejection(
+                    str(request_params["instId"]),
+                    error_text,
+                )
+                logger.warning(
+                    "OKX native full close rejected; trying one native reduce-only close",
+                    symbol=okx_symbol,
+                    side=target_side,
+                    request_params=request_params,
+                    error=error_text,
+                )
+                return None
             logger.warning(
                 "OKX native full close failed; will use reduce-only market orders",
                 symbol=okx_symbol,
                 side=target_side,
-                error=safe_error_text(exc),
+                request_params=request_params,
+                error=error_text,
             )
             return None
 
@@ -3212,8 +3279,15 @@ class OKXExecutor(AbstractExecutor):
         order_quantity: float,
         exit_order_replace_note: str | None,
     ) -> ExecutionResult | None:
+        market_info = market.get("info") if isinstance(market.get("info"), dict) else {}
         native_required = bool(
-            market.get("synthetic_from_position") or str(okx_symbol).upper().endswith("-SWAP")
+            market.get("synthetic_from_position")
+            or str(okx_symbol).upper().endswith("-SWAP")
+            or str(market.get("type") or "").lower() == "swap"
+            or str(market.get("instType") or "").upper() == "SWAP"
+            or str(market_info.get("instType") or "").upper() == "SWAP"
+            or str(market_info.get("instId") or "").upper().endswith("-SWAP")
+            or str(market.get("id") or "").upper().endswith("-SWAP")
         )
         if not native_required:
             return None
@@ -3242,6 +3316,20 @@ class OKXExecutor(AbstractExecutor):
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
 
+        locked = self._exit_instrument_rejection_reason(inst_id)
+        if locked is not None:
+            reason, lock_hit = locked
+            return self._exit_instrument_rejected_result(
+                decision=decision,
+                side=side,
+                price=price,
+                request_params=request_params,
+                params=params,
+                okx_symbol=okx_symbol,
+                reason=reason,
+                lock_hit=lock_hit,
+            )
+
         lock_reason = self._contract_delivery_lock_reason(inst_id)
         if lock_reason:
             return self._contract_delivery_rejected_result(
@@ -3259,6 +3347,26 @@ class OKXExecutor(AbstractExecutor):
             response = await self._with_retry(place_order, request_params)
         except ExchangeAPIError as exc:
             error_text = safe_error_text(exc)
+            if self._exchange_error_code(exc, error_text) == "51001":
+                self._remember_exit_instrument_rejection(inst_id, error_text)
+                logger.warning(
+                    "OKX native reduce-only close rejected by instrument capability; "
+                    "suppressing duplicate unified split-close retry",
+                    symbol=okx_symbol,
+                    side=target_side,
+                    request_params=request_params,
+                    error=error_text,
+                )
+                return self._exit_instrument_rejected_result(
+                    decision=decision,
+                    side=side,
+                    price=price,
+                    request_params=request_params,
+                    params=params,
+                    okx_symbol=okx_symbol,
+                    reason=error_text,
+                    lock_hit=False,
+                )
             if self._is_no_position_error(error_text):
                 diagnostics = self._exit_position_mismatch_diagnostics(
                     position_snapshot or [],
@@ -3844,10 +3952,20 @@ class OKXExecutor(AbstractExecutor):
 
     def _native_inst_id_for_market(self, market: dict[str, Any], okx_symbol: str) -> str:
         info = market.get("info") if isinstance(market.get("info"), dict) else {}
-        inst_id = str(info.get("instId") or market.get("id") or "").strip()
-        if inst_id:
-            return inst_id
-        return str(okx_symbol or "").replace("/", "-").replace(":USDT", "-SWAP")
+        for candidate in (
+            info.get("instId"),
+            market.get("id"),
+        ):
+            value = str(candidate or "").strip()
+            # CCXT can expose the application symbol as ``id``/``instId`` for
+            # synthetic position markets.  Native OKX endpoints reject that
+            # form with 51001, so only accept an already-native identifier.
+            if value and "/" not in value and ":" not in value:
+                return value.upper()
+        native = okx_inst_id_from_symbol(okx_symbol)
+        if native:
+            return native
+        return str(okx_symbol or "").replace("/", "-").replace(":USDT", "-SWAP").upper()
 
     async def _fetch_native_ticker(self, symbol: str) -> dict[str, Any]:
         """Fetch OKX public ticker by native instId for execution sizing."""
@@ -4048,6 +4166,57 @@ class OKXExecutor(AbstractExecutor):
     def _is_contract_delivery_error(self, message: Any) -> bool:
         text = str(message or "").lower()
         return "51028" in text or "contract under delivery" in text
+
+    def _exit_instrument_rejection_reason(self, inst_id: str) -> tuple[str, bool] | None:
+        key = str(inst_id or "").strip().upper()
+        item = self._exit_instrument_rejection_locks.get(key)
+        if not key or item is None:
+            return None
+        locked_at, reason = item
+        if time.monotonic() - locked_at > OKX_EXIT_INSTRUMENT_REJECTION_COOLDOWN_SECONDS:
+            self._exit_instrument_rejection_locks.pop(key, None)
+            return None
+        return reason, True
+
+    def _remember_exit_instrument_rejection(self, inst_id: str, reason: str) -> None:
+        key = str(inst_id or "").strip().upper()
+        if key:
+            self._exit_instrument_rejection_locks[key] = (time.monotonic(), reason)
+
+    def _exit_instrument_rejected_result(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        request_params: dict[str, Any],
+        params: dict[str, Any],
+        okx_symbol: str,
+        reason: str,
+        lock_hit: bool,
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            order_id="okx_exit_instrument_rejected",
+            symbol=decision.symbol,
+            side=side,
+            order_type="market",
+            quantity=0.0,
+            price=price,
+            status=OrderStatus.REJECTED,
+            timestamp=datetime.now(UTC),
+            raw_response={
+                "error": reason,
+                "okx_native_reduce_market_order": True,
+                "okx_exit_instrument_rejected": True,
+                "okx_exit_instrument_rejection_cooldown": True,
+                "okx_exit_instrument_rejection_lock_hit": lock_hit,
+                "do_not_retry_unified_close": True,
+                "request_params": request_params,
+                "fallback_market_order_params": params,
+                "okx_symbol": okx_symbol,
+                "do_not_persist_order": True,
+            },
+        )
 
     def _contract_delivery_lock_reason(self, inst_id: str) -> str | None:
         key = str(inst_id or "").strip().upper()
@@ -6967,17 +7136,39 @@ class OKXExecutor(AbstractExecutor):
         cancel = getattr(ccxt, "privatePostTradeCancelAlgos", None)
         if not callable(cancel):
             raise ExchangeAPIError("OKX native cancel-algo API is unavailable")
-        return await self._with_retry(
-            cancel,
-            {
-                "algoIds": [
-                    {
-                        "instId": str(inst_id or "").upper(),
-                        "algoId": str(algo_id or ""),
-                    }
-                ]
-            },
-        )
+        payload = {
+            "algoIds": [
+                {
+                    "instId": str(inst_id or "").upper(),
+                    "algoId": str(algo_id or ""),
+                }
+            ]
+        }
+        try:
+            return await self._with_retry(cancel, payload)
+        except ExchangeAPIError as exc:
+            # A stale orphan can disappear between inventory read and cancel.
+            # OKX 51001 means the algo is already absent; treating it as an
+            # idempotent success lets the repair converge on a clean inventory.
+            error_text = safe_error_text(exc, limit=220)
+            if self._exchange_error_code(exc, error_text) == "51001":
+                logger.info(
+                    "OKX protection algo already absent during cancel",
+                    inst_id=str(inst_id or "").upper(),
+                    algo_id=str(algo_id or ""),
+                )
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "algoId": str(algo_id or ""),
+                            "sCode": "0",
+                            "sMsg": "already_absent",
+                        }
+                    ],
+                    "idempotent_absence": True,
+                }
+            raise
 
     async def fetch_account_fee_snapshot(self) -> dict[str, Any]:
         """Read the current account-level SWAP taker fee from OKX."""

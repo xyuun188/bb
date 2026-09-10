@@ -25,6 +25,18 @@ def test_okx_number_format_preserves_integer_trailing_zeroes(
     assert OKXExecutor._format_okx_number(value) == expected
 
 
+def test_native_inst_id_rejects_ccxt_symbol_aliases() -> None:
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+
+    assert executor._native_inst_id_for_market(
+        {
+            "id": "PEPE/USDT:USDT",
+            "info": {"instId": "PEPE/USDT:USDT"},
+        },
+        "PEPE/USDT:USDT",
+    ) == "PEPE-USDT-SWAP"
+
+
 class _FakeLogger:
     def __init__(self) -> None:
         self.events: list[tuple[str, str, dict[str, Any]]] = []
@@ -1184,6 +1196,23 @@ class _ExitMaxMarketSizeCcxt:
         }
 
 
+class _ExitInstrument51001Ccxt(_ExitMaxMarketSizeCcxt):
+    def __init__(self, position_contracts: float = 100.0) -> None:
+        super().__init__(position_contracts=position_contracts)
+        self.native_reduce_calls: list[dict[str, Any]] = []
+
+    async def privatePostTradeClosePosition(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.close_position_calls.append(dict(params))
+        raise ExchangeAPIError(
+            "OKX API error [51001]: Instrument ID, Instrument ID code, or Spread ID doesn't exist.",
+            code="51001",
+        )
+
+    async def privatePostTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.native_reduce_calls.append(dict(params))
+        raise AssertionError("native reduce-only close must be suppressed after 51001")
+
+
 class _ExitPositionDeltaWithoutFillCcxt(_ExitMaxMarketSizeCcxt):
     """Simulate OKX reducing a position while the order ack reports no fill."""
 
@@ -2198,6 +2227,41 @@ async def test_okx_instrument_capability_rejection_does_not_pollute_system_error
 
 
 @pytest.mark.asyncio
+async def test_cancel_missing_protection_algo_is_idempotent_success() -> None:
+    class CancelClient:
+        async def privatePostTradeCancelAlgos(self, _payload: dict[str, Any]) -> dict[str, Any]:
+            raise ExchangeAPIError(
+                "OKX API error [51001]: Instrument ID doesn't exist.",
+                code="51001",
+            )
+
+    executor = _executor(CancelClient())
+    result = await executor.cancel_position_protection_order(
+        inst_id="MAGIC-USDT-SWAP",
+        algo_id="stale-algo",
+    )
+
+    assert result["code"] == "0"
+    assert result["idempotent_absence"] is True
+    assert result["data"][0]["sCode"] == "0"
+
+
+def test_okx_swap_market_uses_native_reduce_close_even_without_synthetic_flag() -> None:
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    market = {
+        "id": "PEPE/USDT:USDT",
+        "type": "swap",
+        "info": {"instType": "SWAP", "instId": "PEPE-USDT-SWAP"},
+    }
+    info = market.get("info")
+    assert (
+        market.get("synthetic_from_position")
+        or str(market.get("type") or "").lower() == "swap"
+        or str((info or {}).get("instType") or "").upper() == "SWAP"
+    )
+
+
+@pytest.mark.asyncio
 async def test_okx_exit_position_lookup_failure_does_not_return_no_position() -> None:
     token, hidden_value, error_text = _secret_bearing_error()
     executor = _executor(_FailingPositionsForExitCcxt(error_text))
@@ -3073,3 +3137,23 @@ async def test_okx_exit_full_close_falls_back_to_split_when_native_close_fails()
     assert [call[3] for call in exchange.create_calls] == [10.0] * 10
     assert result.raw_response["split_exit_order"] is True
     assert result.raw_response["position_contracts_after"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_51001_cools_down_before_reduce_or_unified_retry() -> None:
+    exchange = _ExitInstrument51001Ccxt(position_contracts=100.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+
+    result = await executor.place_order(
+        decision,
+        account_id="ensemble_trader",
+    )
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["okx_exit_instrument_rejected"] is True
+    assert result.raw_response["do_not_retry_unified_close"] is True
+    assert len(exchange.close_position_calls) == 1
+    assert exchange.native_reduce_calls == []
+    assert exchange.create_calls == []
