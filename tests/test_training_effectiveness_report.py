@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from services.training_effectiveness_report import (
     TRAINING_EFFECTIVENESS_REPORT_VERSION,
+    AuthoritativeSamples,
     TrainingEffectivenessReportService,
     _aggregate_metrics,
     _build_observed_funnel,
@@ -46,7 +47,10 @@ def test_aggregate_metrics_exposes_cost_aware_quality_statistics():
 
 def test_observed_funnel_marks_unsettled_samples_as_loss():
     funnel = _build_observed_funnel(
-        [{"authority": "okx_realized"}, {"authority": "excluded"}]
+        [
+            {"authority": "okx_realized", "realized_net_pnl": 1.0},
+            {"authority": "excluded"},
+        ]
     )
     assert funnel["signals"] == 2
     assert funnel["settled"] == 1
@@ -61,7 +65,7 @@ def test_sample_authority_has_only_the_four_contract_values():
     assert classify_sample_authority({"excluded": True}) == "excluded"
 
 
-def test_service_returns_partial_without_realized_samples_and_no_side_effects():
+def test_service_surfaces_authoritative_provider_failure_without_faking_zero_samples():
     calls = []
 
     def registry():
@@ -73,9 +77,24 @@ def test_service_returns_partial_without_realized_samples_and_no_side_effects():
             filters={"to": "2026-08-25T00:00:00Z"}, run_id="fixed-run"
         )
     )
+    assert report["status"] == "generation_failed"
+    assert "sample_provider:query_failed" in report["conclusion"]["blocking_reasons"]
+    assert report["sample_quality"]["load_status"] == "generation_failed"
+    assert calls == ["registry"]
+
+
+def test_service_distinguishes_real_empty_result_from_provider_failure():
+    async def samples_provider(**_):
+        return AuthoritativeSamples(load_status="complete")
+
+    report = __import__("asyncio").run(
+        TrainingEffectivenessReportService(
+            registry_provider=lambda: {"models": [{"model_id": "active-v1", "lifecycle": "active"}]},
+            samples_provider=samples_provider,
+        ).build(run_id="empty-authoritative")
+    )
     assert report["status"] == "partial"
     assert "no_okx_realized_samples" in report["conclusion"]["blocking_reasons"]
-    assert calls == ["registry"]
 
 
 def test_service_infers_active_model_from_authoritative_samples_when_registry_has_no_active():
@@ -86,6 +105,7 @@ def test_service_infers_active_model_from_authoritative_samples_when_registry_ha
                 "authority": "okx_realized",
                 "model": "ensemble_trader",
                 "gross_pnl": 3,
+                "realized_net_pnl": 2.5,
             }
         ]
 
@@ -100,6 +120,23 @@ def test_service_infers_active_model_from_authoritative_samples_when_registry_ha
     assert report["metrics"]["active"]["sample_count"] == 1
     assert report["status"] == "complete"
     assert "active_version_inferred" in report["conclusion"]["blocking_reasons"]
+
+
+def test_authoritative_realized_net_pnl_is_not_charged_slippage_twice():
+    result = _aggregate_metrics(
+        [
+            {
+                "authority": "okx_realized",
+                "gross_pnl": 10,
+                "fee": 1,
+                "slippage": 7,
+                "funding_fee": 0,
+                "realized_net_pnl": 2,
+            }
+        ],
+        "__all__",
+    )
+    assert result["fee_after_net_pnl"] == 2.0
 
 
 def test_validate_report_rejects_future_cutoff_and_bad_costs():

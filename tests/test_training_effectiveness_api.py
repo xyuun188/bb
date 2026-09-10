@@ -47,6 +47,54 @@ def test_filters_only_change_display_filters(tmp_path):
     assert result["filters"]["side"] == "short"
 
 
+def test_filters_recompute_metrics_from_sample_index():
+    generated = datetime.now(UTC).isoformat()
+    source = _report(generated)
+    source.update(
+        {
+            "versions": {
+                "active": {"model_id": "active-v1"},
+                "challenger": {"model_id": "challenger-v1"},
+            },
+            "sample_index": [
+                {
+                    "id": "paper-long",
+                    "authority": "okx_realized",
+                    "model": "active-v1",
+                    "mode": "paper",
+                    "side": "long",
+                    "symbol": "BTC/USDT",
+                    "label_timestamp": generated,
+                    "realized_net_pnl": 3.0,
+                    "gross_pnl": 4.0,
+                    "fee": 1.0,
+                    "slippage": 1.0,
+                    "funding_fee": 0.0,
+                },
+                {
+                    "id": "paper-short",
+                    "authority": "okx_realized",
+                    "model": "active-v1",
+                    "mode": "paper",
+                    "side": "short",
+                    "symbol": "BTC/USDT",
+                    "label_timestamp": generated,
+                    "realized_net_pnl": -2.0,
+                    "gross_pnl": -1.0,
+                    "fee": 1.0,
+                    "slippage": 1.0,
+                    "funding_fee": 0.0,
+                },
+            ],
+        }
+    )
+    result = apply_report_filters(source, side="long")
+    assert result["metrics"]["observed"]["sample_count"] == 1
+    assert result["metrics"]["observed"]["fee_after_net_pnl"] == 3.0
+    assert result["cost_attribution"]["fee_after_net_pnl"] == 3.0
+    assert result["sample_quality"]["filtered_valid_sample_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_dashboard_route_reads_cache_without_building(monkeypatch, tmp_path):
     from web_dashboard.api import dashboard

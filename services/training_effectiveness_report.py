@@ -20,9 +20,15 @@ from typing import Any
 
 from config.settings import settings
 
-TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-08-28.v2"
+TRAINING_EFFECTIVENESS_REPORT_VERSION = "2026-09-11.v3"
 TRAINING_EFFECTIVENESS_REPORT_DIRNAME = "training_effectiveness_reports"
-TRAINING_EFFECTIVENESS_REPORT_STATUSES = {"complete", "partial", "invalid", "missing"}
+TRAINING_EFFECTIVENESS_REPORT_STATUSES = {
+    "complete",
+    "partial",
+    "invalid",
+    "missing",
+    "generation_failed",
+}
 SAMPLE_AUTHORITIES = {
     "shadow_opportunity",
     "counterfactual_cost",
@@ -30,6 +36,26 @@ SAMPLE_AUTHORITIES = {
     "excluded",
 }
 REPORT_STALE_AFTER_SECONDS = 24 * 60 * 60
+
+
+class AuthoritativeSamples(list[dict[str, Any]]):
+    """List-compatible provider result with an explicit load state.
+
+    Keeping this list-compatible preserves the injected provider contract while
+    allowing the report builder to distinguish a real empty result from a
+    database/query failure.
+    """
+
+    def __init__(
+        self,
+        values: list[dict[str, Any]] | None = None,
+        *,
+        load_status: str = "complete",
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(values or [])
+        self.load_status = load_status
+        self.error_code = error_code
 
 
 def _finite_float(value: Any, default: float = 0.0) -> float:
@@ -212,10 +238,25 @@ def validate_report(report: dict[str, Any]) -> list[str]:
         fee = _finite_float(costs.get("fee"))
         slippage = _finite_float(costs.get("slippage"))
         funding = _finite_float(costs.get("funding_fee"))
-        expected = calculate_fee_after_return(gross, fee, slippage, funding)
         actual = _finite_float(costs.get("fee_after_net_pnl"), math.nan)
-        if math.isnan(actual) or not math.isclose(actual, expected, abs_tol=1e-7):
-            errors.append("invalid:cost_attribution_equation")
+        if costs.get("net_basis") == "authoritative_realized":
+            expected = _finite_float(costs.get("realized_net_pnl"), math.nan)
+            if math.isnan(expected) or math.isnan(actual) or not math.isclose(
+                actual, expected, abs_tol=1e-7
+            ):
+                errors.append("invalid:authoritative_net_pnl_equation")
+        elif costs.get("net_basis") == "mixed_authoritative_and_estimated":
+            expected = _finite_float(costs.get("realized_net_pnl"), math.nan) + _finite_float(
+                costs.get("estimated_net_pnl"), math.nan
+            )
+            if math.isnan(expected) or math.isnan(actual) or not math.isclose(
+                actual, expected, abs_tol=1e-7
+            ):
+                errors.append("invalid:mixed_net_pnl_equation")
+        else:
+            expected = calculate_fee_after_return(gross, fee, slippage, funding)
+            if math.isnan(actual) or not math.isclose(actual, expected, abs_tol=1e-7):
+                errors.append("invalid:cost_attribution_equation")
     return list(dict.fromkeys(errors))
 
 
@@ -259,7 +300,7 @@ def load_cached_training_effectiveness_report(
     generated = _parse_datetime(payload.get("generated_at"))
     stale = generated is None or (datetime.now(UTC) - generated).total_seconds() > REPORT_STALE_AFTER_SECONDS
     freshness = dict(payload.get("freshness") or {})
-    freshness.setdefault("state", "stale" if stale else "fresh")
+    freshness["state"] = "stale" if stale else "fresh"
     freshness["is_stale"] = stale
     payload = dict(payload)
     payload["freshness"] = freshness
@@ -267,7 +308,7 @@ def load_cached_training_effectiveness_report(
 
 
 def apply_report_filters(report: dict[str, Any], **filters: Any) -> dict[str, Any]:
-    """Apply display filters without changing the cached input fingerprint."""
+    """Apply filters and recompute metrics from the cached sample projection."""
 
     if not isinstance(report, dict):
         return {"status": "invalid"}
@@ -277,7 +318,210 @@ def apply_report_filters(report: dict[str, Any], **filters: Any) -> dict[str, An
         if value is not None and str(value).strip():
             current[key] = value
     result["filters"] = current
+    sample_index = result.get("sample_index")
+    if not isinstance(sample_index, list):
+        return result
+
+    selected = [
+        row
+        for row in sample_index
+        if isinstance(row, dict) and _sample_matches_filters(row, current)
+    ]
+    authoritative = [row for row in selected if _is_realized_sample(row)]
+    versions = result.get("versions") if isinstance(result.get("versions"), dict) else {}
+    active_id = str((versions.get("active") or {}).get("model_id") or "active")
+    challenger_id = str((versions.get("challenger") or {}).get("model_id") or "challenger")
+    baseline = _aggregate_metrics(authoritative, "baseline")
+    active = _aggregate_metrics(authoritative, active_id)
+    challenger = _aggregate_metrics(authoritative, challenger_id)
+    result["metrics"] = {
+        "active": active,
+        "challenger": challenger,
+        "baseline": baseline,
+        "observed": _aggregate_metrics(authoritative, "__all__"),
+        "delta": calculate_metric_delta(
+            active.get("fee_after_net_pnl"),
+            challenger.get("fee_after_net_pnl"),
+            baseline.get("fee_after_net_pnl"),
+        ),
+    }
+    result["sample_quality"] = {
+        **dict(result.get("sample_quality") or {}),
+        "filtered_sample_count": len(selected),
+        "filtered_valid_sample_count": len(authoritative),
+    }
+    result["cost_attribution"] = _cost_attribution(authoritative)
     return result
+
+
+def _matches_report_filter(row: dict[str, Any], key: str, value: Any) -> bool:
+    normalized = str(value or "all").strip().lower()
+    if not normalized or normalized == "all":
+        return True
+    actual = str(row.get(key) or "").strip().lower()
+    return actual == normalized
+
+
+def _sample_matches_filters(sample: dict[str, Any], filters: dict[str, Any]) -> bool:
+    """Apply all report filters to the compact sample projection."""
+
+    for key in ("mode", "side", "symbol", "market_state"):
+        if not _matches_report_filter(sample, key, filters.get(key)):
+            return False
+    label_time = _parse_datetime(sample.get("label_timestamp"))
+    lower = _parse_datetime(filters.get("from"))
+    upper = _parse_datetime(filters.get("to"))
+    if lower is not None and (label_time is None or label_time < lower):
+        return False
+    if upper is not None and (label_time is None or label_time > upper):
+        return False
+    hold_filter = filters.get("hold_minutes")
+    if (
+        isinstance(hold_filter, dict)
+        and hold_filter
+        and any(
+            value not in (None, "", 0, "0", 0.0)
+            for value in (hold_filter.get("min"), hold_filter.get("max"))
+        )
+    ):
+        try:
+            hold = float(sample.get("hold_minutes"))
+        except (TypeError, ValueError):
+            return False
+        minimum = hold_filter.get("min")
+        maximum = hold_filter.get("max")
+        if minimum not in (None, "") and hold < float(minimum):
+            return False
+        if maximum not in (None, "", 0) and hold > float(maximum):
+            return False
+    return True
+
+
+def _sample_projection(sample: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fields required to reproduce report filters and metrics.
+
+    Authoritative outcomes may carry decision prompts, feature snapshots and
+    other large evidence payloads.  Persisting those in the dashboard cache
+    makes filtering expensive and risks turning a read-only report into a
+    second training-data store.  The projection is intentionally explicit.
+    """
+
+    keys = (
+        "id",
+        "authority",
+        "outcome_complete",
+        "model",
+        "model_id",
+        "execution_mode",
+        "mode",
+        "side",
+        "symbol",
+        "market_state",
+        "label_timestamp",
+        "hold_minutes",
+        "gross_pnl",
+        "fee",
+        "slippage",
+        "funding_fee",
+        "realized_net_pnl",
+        "realized_pnl",
+        "official_realized_net_pnl",
+        "excluded",
+    )
+    return {key: sample.get(key) for key in keys if key in sample}
+
+
+def _normalise_report_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    """Normalize provider rows into the report's stable filter/metric schema."""
+
+    result = dict(sample)
+    result["model"] = (
+        result.get("model")
+        or result.get("model_id")
+        or result.get("model_name")
+        or "active"
+    )
+    result["mode"] = result.get("mode") or result.get("execution_mode")
+    result["hold_minutes"] = result.get("hold_minutes")
+    if result["hold_minutes"] in (None, ""):
+        result["hold_minutes"] = result.get("holding_minutes")
+    result["label_timestamp"] = (
+        result.get("label_timestamp")
+        or result.get("closed_at")
+        or result.get("updated_at")
+        or result.get("decision_timestamp")
+    )
+    result["market_state"] = (
+        result.get("market_state")
+        or result.get("market_regime")
+        or result.get("current_market_regime")
+    )
+    return result
+
+
+def _sample_net_pnl(sample: dict[str, Any]) -> float:
+    """Use official realized net PnL when available; otherwise estimate costs."""
+
+    authority = classify_sample_authority(sample)
+    if authority == "okx_realized":
+        for key in ("realized_net_pnl", "realized_pnl", "official_realized_net_pnl"):
+            value = sample.get(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return round(number, 8)
+    return calculate_fee_after_return(
+        sample.get("gross_pnl"),
+        sample.get("fee"),
+        sample.get("slippage"),
+        sample.get("funding_fee"),
+    )
+
+
+def _authoritative_net_pnl(sample: dict[str, Any]) -> float | None:
+    """Return a finite official net PnL value, if the row carries one."""
+
+    if classify_sample_authority(sample) != "okx_realized":
+        return None
+    for key in ("realized_net_pnl", "realized_pnl", "official_realized_net_pnl"):
+        try:
+            value = float(sample.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return round(value, 8)
+    return None
+
+
+def _is_realized_sample(sample: dict[str, Any]) -> bool:
+    """Only a complete authority row with an official net result is realized."""
+
+    return _authoritative_net_pnl(sample) is not None
+
+
+def _cost_attribution(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    realized = [row for row in samples if _is_realized_sample(row)]
+    realized_ids = {id(row) for row in realized}
+    estimated = [row for row in samples if id(row) not in realized_ids]
+    realized_net = sum(_sample_net_pnl(row) for row in realized)
+    estimated_net = sum(_sample_net_pnl(row) for row in estimated)
+    return {
+        "gross_pnl": round(sum(_finite_float(row.get("gross_pnl")) for row in samples), 8),
+        "fee": round(sum(_finite_float(row.get("fee")) for row in samples), 8),
+        "slippage": round(sum(_finite_float(row.get("slippage")) for row in samples), 8),
+        "funding_fee": round(sum(_finite_float(row.get("funding_fee")) for row in samples), 8),
+        "realized_net_pnl": round(realized_net, 8),
+        "estimated_net_pnl": round(estimated_net, 8),
+        "fee_after_net_pnl": round(realized_net + estimated_net, 8),
+        "net_basis": (
+            "authoritative_realized"
+            if realized and len(realized) == len(samples)
+            else ("mixed_authoritative_and_estimated" if realized else "estimated_cost_model")
+        ),
+        "slippage_included_in_realized_gross": bool(realized),
+    }
 
 
 def _invoke(provider: Callable[..., Any], *args: Any, **kwargs: Any) -> Awaitable[Any]:
@@ -335,16 +579,8 @@ def _aggregate_metrics(samples: list[dict[str, Any]], model: str) -> dict[str, A
     fee = sum(_finite_float(row.get("fee")) for row in selected)
     slippage = sum(_finite_float(row.get("slippage")) for row in selected)
     funding = sum(_finite_float(row.get("funding_fee")) for row in selected)
-    net = calculate_fee_after_return(gross, fee, slippage, funding)
-    pnl_values = [
-        calculate_fee_after_return(
-            row.get("gross_pnl"),
-            row.get("fee"),
-            row.get("slippage"),
-            row.get("funding_fee"),
-        )
-        for row in selected
-    ]
+    net = round(sum(_sample_net_pnl(row) for row in selected), 8)
+    pnl_values = [_sample_net_pnl(row) for row in selected]
     wins = sum(1 for value in pnl_values if value > 0)
     gross_profit = sum(value for value in pnl_values if value > 0)
     gross_loss = abs(sum(value for value in pnl_values if value < 0))
@@ -419,7 +655,7 @@ def _build_observed_funnel(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Expose an honest settlement funnel derived from authoritative outcomes."""
 
     total = len(samples)
-    settled = sum(1 for row in samples if classify_sample_authority(row) == "okx_realized")
+    settled = sum(1 for row in samples if _is_realized_sample(row))
     stages = {
         "signals": total,
         "evidence_passed": total,
@@ -454,9 +690,12 @@ async def _load_authoritative_samples(*, filters: dict[str, Any]) -> list[dict[s
             since=since,
             limit=5000,
             compact=True,
+            include_decision_evidence=True,
         )
+    except TimeoutError:
+        return AuthoritativeSamples(load_status="generation_failed", error_code="query_timeout")
     except Exception:
-        return []
+        return AuthoritativeSamples(load_status="generation_failed", error_code="query_failed")
     samples: list[dict[str, Any]] = []
     for outcome in outcomes:
         if not isinstance(outcome, dict):
@@ -465,20 +704,33 @@ async def _load_authoritative_samples(*, filters: dict[str, Any]) -> list[dict[s
         components = outcome.get("realized_net_pnl_components") or {}
         entry_fee = _finite_float(outcome.get("entry_fee_usdt", outcome.get("entry_fee")))
         close_fee = _finite_float(outcome.get("close_fee_usdt", outcome.get("close_fee")))
+        label = outcome.get("training_label_contract") or {}
         samples.append(
             {
                 "id": outcome.get("outcome_id") or outcome.get("lifecycle_key"),
                 "authority": "okx_realized" if complete else "excluded",
                 "outcome_complete": complete,
                 "model": outcome.get("model_id") or outcome.get("model_name") or "active",
+                "execution_mode": outcome.get("execution_mode"),
+                "mode": outcome.get("execution_mode"),
+                "side": outcome.get("side"),
+                "symbol": outcome.get("symbol"),
+                "market_state": outcome.get("market_state") or outcome.get("market_regime"),
+                "label_timestamp": outcome.get("label_timestamp") or label.get("label_timestamp"),
                 "gross_pnl": outcome.get("gross_pnl_usdt", components.get("gross_pnl_usdt")),
                 "fee": entry_fee + close_fee,
-                "slippage": outcome.get("execution_slippage_usdt", components.get("slippage_usdt")),
+                "slippage": outcome.get(
+                    "execution_slippage_usdt",
+                    outcome.get("slippage_usdt", components.get("slippage_usdt")),
+                ),
                 "funding_fee": outcome.get("funding_fee_usdt", components.get("funding_fee_usdt")),
-                "realized_net_pnl": outcome.get("realized_net_pnl_usdt"),
+                "realized_net_pnl": outcome.get(
+                    "realized_net_pnl_usdt",
+                    outcome.get("realized_pnl", label.get("realized_net_pnl_usdt")),
+                ),
             }
         )
-    return samples
+    return AuthoritativeSamples(samples)
 
 
 async def _load_registry_snapshot() -> dict[str, Any]:
@@ -527,8 +779,36 @@ class TrainingEffectivenessReportService:
         }
         registry = await _invoke(self._registry_provider)
         registry = registry if isinstance(registry, dict) else {}
-        samples = await _invoke(self._samples_provider, filters=selected_filters)
-        samples = [row for row in (samples if isinstance(samples, list) else []) if isinstance(row, dict)]
+        try:
+            raw_samples = await _invoke(self._samples_provider, filters=selected_filters)
+        except TimeoutError:
+            raw_samples = AuthoritativeSamples(
+                load_status="generation_failed", error_code="query_timeout"
+            )
+        except Exception:
+            raw_samples = AuthoritativeSamples(
+                load_status="generation_failed", error_code="query_failed"
+            )
+        load_status = str(getattr(raw_samples, "load_status", "complete") or "complete")
+        load_error_code = getattr(raw_samples, "error_code", None)
+        if not isinstance(raw_samples, list):
+            raw_samples = AuthoritativeSamples(
+                load_status="generation_failed", error_code="invalid_provider_result"
+            )
+            load_status = raw_samples.load_status
+            load_error_code = raw_samples.error_code
+        samples = [
+            _normalise_report_sample(row)
+            for row in (raw_samples if isinstance(raw_samples, list) else [])
+            if isinstance(row, dict)
+        ]
+        # Providers may already apply mode/time bounds, but side, symbol,
+        # market-state and hold-time are report-level filters.  Apply the full
+        # contract before computing any totals and retain the projection for
+        # deterministic cache-side filtering later.
+        samples = [
+            row for row in samples if _sample_matches_filters(row, selected_filters)
+        ]
         execution = await _invoke(self._execution_provider, filters=selected_filters)
         experts = await _invoke(self._expert_provider, filters=selected_filters)
         generated = datetime.now(UTC).replace(microsecond=0)
@@ -539,10 +819,12 @@ class TrainingEffectivenessReportService:
                 "filters": selected_filters,
                 "registry": registry,
                 "sample_ids": [row.get("id") for row in samples],
+                "sample_load_status": load_status,
+                "sample_load_error": load_error_code,
             }
         )
         authorities = {name: sum(1 for row in samples if classify_sample_authority(row) == name) for name in SAMPLE_AUTHORITIES}
-        authoritative = [row for row in samples if classify_sample_authority(row) == "okx_realized"]
+        authoritative = [row for row in samples if _is_realized_sample(row)]
         if not experts and self._uses_default_expert_provider:
             experts = await _load_expert_contributions(filters=selected_filters)
         observed = _aggregate_metrics(authoritative, "__all__")
@@ -569,13 +851,7 @@ class TrainingEffectivenessReportService:
                 baseline.get("fee_after_net_pnl"),
             ),
         }
-        costs = {
-            "gross_pnl": sum(_finite_float(row.get("gross_pnl")) for row in authoritative),
-            "fee": sum(_finite_float(row.get("fee")) for row in authoritative),
-            "slippage": sum(_finite_float(row.get("slippage")) for row in authoritative),
-            "funding_fee": sum(_finite_float(row.get("funding_fee")) for row in authoritative),
-        }
-        costs["fee_after_net_pnl"] = calculate_fee_after_return(**costs)
+        costs = _cost_attribution(authoritative)
         report: dict[str, Any] = {
             "report_version": TRAINING_EFFECTIVENESS_REPORT_VERSION,
             "report_id": f"te-{(run_id or fingerprint[7:19])}",
@@ -587,15 +863,25 @@ class TrainingEffectivenessReportService:
             "versions": versions,
             "filters": selected_filters,
             "metrics": metrics,
-            "cost_attribution": {key: round(value, 8) for key, value in costs.items()},
+            "cost_attribution": costs,
             "expert_contributions": experts if isinstance(experts, list) else [],
             "execution_funnel": execution if isinstance(execution, dict) and execution else _build_observed_funnel(samples),
-            "sample_quality": {"authority_counts": authorities, "valid_sample_count": len(authoritative), "excluded_sample_count": authorities["excluded"]},
+            "sample_quality": {
+                "authority_counts": authorities,
+                "valid_sample_count": len(authoritative),
+                "excluded_sample_count": authorities["excluded"],
+                "provider_sample_count": len(samples),
+                "load_status": load_status,
+                "load_error_code": load_error_code,
+            },
+            "sample_index": [_sample_projection(row) for row in samples],
             "conclusion": {"promotion_eligible": False, "blocking_reasons": []},
             "freshness": {"state": "fresh", "is_stale": False},
         }
         blocking = validate_report(report)
-        if not authoritative:
+        if load_status != "complete":
+            blocking.append(f"sample_provider:{load_error_code or load_status}")
+        if not authoritative and load_status == "complete":
             blocking.append("no_okx_realized_samples")
         active_version = report["versions"]["active"]
         if not active_version.get("model_id"):
@@ -611,6 +897,10 @@ class TrainingEffectivenessReportService:
         report["status"] = (
             "invalid"
             if any(item.startswith("invalid:") for item in blocking)
-            else ("partial" if any(item in data_blockers for item in blocking) else "complete")
+            else (
+                "generation_failed"
+                if load_status != "complete"
+                else ("partial" if any(item in data_blockers for item in blocking) else "complete")
+            )
         )
         return report
