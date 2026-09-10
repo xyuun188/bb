@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.model_topology import ModelTopology, legacy_14b_topology, qwen27_candidate_topology
+
 PHASE3_DECISION_MODEL_ID = "qwen3-14b-trade"
 PHASE3_RISK_MODEL_ID = "deepseek-r1-14b-risk"
 PHASE3_EXPERT_MODEL_ID = "BB-FinQuant-Expert-14B"
@@ -34,3 +36,9 @@ PHASE3_APPROVED_RUNTIME_MODEL_PATHS = (
     "/data/trade_models/Qwen/Qwen3-14B-AWQ",
     "/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
 )
+
+# Compatibility exports remain for the legacy shadow/readiness code. New
+# deployment and promotion code should consume these declarative topologies
+# instead of adding another model identity constant.
+PHASE3_LEGACY_MODEL_TOPOLOGY: ModelTopology = legacy_14b_topology()
+PHASE3_TARGET_MODEL_TOPOLOGY: ModelTopology = qwen27_candidate_topology()

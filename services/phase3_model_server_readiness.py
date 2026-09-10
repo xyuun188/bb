@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.model_topology import qwen27_candidate_topology
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from services.model_server_config import (
@@ -106,6 +107,34 @@ def _warning(code: str, message: str, *, evidence: Any | None = None) -> dict[st
     if evidence is not None:
         item["evidence"] = evidence
     return item
+
+
+def _target_topology_report() -> dict[str, Any]:
+    """Expose the unverified one-model target without treating it as deployed."""
+
+    topology = qwen27_candidate_topology()
+    model = topology.models[0]
+    blockers = [] if model.identity_complete else ["candidate_model_identity_unverified"]
+    return {
+        "local_model_count_target": topology.local_model_count_target,
+        "model_id": model.model_id,
+        "role": model.role,
+        "port": model.port,
+        "endpoint": model.endpoint,
+        "repo_id": model.repo_id,
+        "revision": model.revision,
+        "path": model.path,
+        "context_length": model.context_length,
+        "max_concurrency": model.max_concurrency,
+        "gpu_memory_budget_gib": model.gpu_memory_budget_gib,
+        "stage": model.stage,
+        "live_routing_enabled": topology.live_routing_enabled,
+        "activation_blocked": bool(blockers),
+        "blockers": blockers,
+        "cloud_reviewer_required_for_high_risk_entry": (
+            topology.cloud_reviewer_required_for_high_risk_entry
+        ),
+    }
 
 
 def _manifest_payload(snapshot: dict[str, Any], key: str) -> dict[str, Any]:
@@ -765,6 +794,7 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "policy_id": PHASE3_MODEL_POLICY_ID,
         "phase3_root": PHASE3_ROOT,
         "deployment_contract": "evidence_driven_model_runtime",
+        "target_model_topology": _target_topology_report(),
         "expected_gpu_count": expected_gpu_count,
         "download_manifest_path": DOWNLOAD_MANIFEST_PATH,
         "validation_manifest_path": VALIDATION_MANIFEST_PATH,
