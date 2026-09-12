@@ -26,7 +26,7 @@ from core.model_candidate_manifest import (
 )
 
 TRAINING_BACKEND_MANIFEST_VERSION = "bb.model-training-backend.v2"
-TRAINING_BACKEND_ID = "qwen3_5_text_qlora"
+TRAINING_BACKEND_ID = "qwen3_8_27b_text_qlora"
 TRAINING_LOADER_CLASS = "AutoModelForMultimodalLM"
 TRAINING_QUANTIZATION = "bitsandbytes-nf4"
 TRAINING_COMPUTE_DTYPE = "bfloat16"

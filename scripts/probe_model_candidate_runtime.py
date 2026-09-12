@@ -200,6 +200,7 @@ def run_probe(args: argparse.Namespace) -> dict:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
             "max_tokens": 32,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         started = time.perf_counter()
         try:

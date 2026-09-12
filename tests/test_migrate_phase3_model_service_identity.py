@@ -94,6 +94,7 @@ def test_target_migration_is_transactional_and_conflicts_with_every_retired_serv
 
     assert "deploy_target" in rendered
     assert "target_model_candidate.json" in rendered
+    assert "qwen38-probe.pid" in rendered
     assert candidate.model_id in rendered
     assert TARGET_SERVICE in rendered
     assert "rm -rf" not in rendered

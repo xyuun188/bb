@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -28,6 +29,10 @@ WEIGHT_SUFFIXES = {".safetensors", ".bin", ".gguf", ".pt", ".pth"}
 SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$")
 TARGET_PYTHON = "/data/BB/envs/target-inference/bin/python"
 GPU_MEMORY_UTILIZATION = "0.85"
+ISOLATED_PROBE_PID_RELATIVE_PATH = Path("runtime/qwen38-probe.pid")
+ISOLATED_PROBE_PORT = "18000"
+ISOLATED_PROBE_MODEL_ID = "qwen3.8-27b"
+PROCESS_ROOT = Path("/proc")
 
 
 def hash_file(path: Path) -> str:
@@ -92,6 +97,75 @@ def _verify_available_storage(model: Path, candidate: dict) -> None:
     available_gib = shutil.disk_usage(model).free / (1024**3)
     if available_gib < candidate["storage_required_free_gib"]:
         raise ValueError("current model filesystem free space is below the required reserve")
+
+
+def _stop_isolated_probe(root: Path) -> bool:
+    """Release the known one-off validation process before loading production.
+
+    The probe is not a service and cannot safely coexist with the only A100's
+    production process.  A PID file alone is never sufficient authority to
+    terminate a process, so the exact runtime script, loopback port, and model
+    identity must all match before sending SIGTERM.
+    """
+
+    pid_file = root / ISOLATED_PROBE_PID_RELATIVE_PATH
+    if not pid_file.exists():
+        return False
+    try:
+        text = pid_file.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise RuntimeError("cannot read isolated validation probe PID file") from exc
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", text):
+        raise RuntimeError("isolated validation probe PID is invalid")
+
+    pid = int(text)
+    process_dir = PROCESS_ROOT / text
+    if not process_dir.is_dir():
+        pid_file.unlink(missing_ok=True)
+        return False
+    try:
+        arguments = [
+            item.decode("utf-8", errors="strict")
+            for item in (process_dir / "cmdline").read_bytes().split(b"\0")
+            if item
+        ]
+    except OSError as exc:
+        raise RuntimeError("cannot inspect isolated validation probe command") from exc
+
+    expected_script = str(root / "scripts" / "target_transformers_api.py")
+    try:
+        port_index = arguments.index("--port")
+        model_index = arguments.index("--model-id")
+        expected_process = (
+            expected_script in arguments
+            and arguments[port_index + 1] == ISOLATED_PROBE_PORT
+            and arguments[model_index + 1] == ISOLATED_PROBE_MODEL_ID
+        )
+    except (ValueError, IndexError):
+        expected_process = False
+    if not expected_process:
+        raise RuntimeError("isolated validation probe command does not match deployment contract")
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        return False
+    except PermissionError as exc:
+        raise RuntimeError("cannot terminate isolated validation probe") from exc
+
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if not process_dir.is_dir():
+            pid_file.unlink(missing_ok=True)
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pid_file.unlink(missing_ok=True)
+            return True
+        time.sleep(0.5)
+    raise RuntimeError("isolated validation probe did not exit after SIGTERM")
 
 
 def _safe_service_name(value: object, *, field: str) -> str:
@@ -296,6 +370,7 @@ def _deploy_locked(payload: dict, *, host, root: Path) -> dict:
     candidate = payload["candidate"]
     service = payload["target_service"]
     conflicts = payload["conflicting_services"]
+    isolated_probe_stopped = _stop_isolated_probe(root)
     states = {name: {"active": host.active(name), "enabled": host.enabled(name)}
               for name in [service, *conflicts]}
     backup = Path(tempfile.mkdtemp(prefix="model-switch-", dir=root / "runtime"))
@@ -321,6 +396,7 @@ def _deploy_locked(payload: dict, *, host, root: Path) -> dict:
     atomic_write(backup / "rollback.json", json.dumps({
         "service_states": states, "paths": [str(path) for path in files],
         "candidate_revision": candidate["revision"], "live_routing_enabled": False,
+        "isolated_probe_stopped": isolated_probe_stopped,
     }).encode())
     unit_changed = False
     try:
@@ -411,7 +487,8 @@ def _deploy_locked(payload: dict, *, host, root: Path) -> dict:
             raise RuntimeError(f"migration failed and rollback incomplete; see {backup}") from error
         raise
     result = {"status": "shadow", "live_routing_enabled": False, "backup": str(backup),
-              "model_id": candidate["model_id"], "revision": candidate["revision"]}
+              "model_id": candidate["model_id"], "revision": candidate["revision"],
+              "isolated_probe_stopped": isolated_probe_stopped}
     atomic_write(backup / "result.json", json.dumps(result).encode())
     return result
 

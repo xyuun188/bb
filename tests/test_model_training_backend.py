@@ -54,7 +54,7 @@ def _backend(**overrides) -> dict:
     value = {
         "manifest_version": "bb.model-training-backend.v2",
         "status": "verified",
-        "backend_id": "qwen3_5_text_qlora",
+        "backend_id": "qwen3_8_27b_text_qlora",
         "model_id": "qwen3.8-27b",
         "repo_id": "Qwen/Qwen3.8-27B",
         "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",

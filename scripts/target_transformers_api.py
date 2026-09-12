@@ -34,6 +34,7 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int = Field(default=256, ge=1, le=1024)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 def _text_content(content: str | list[dict[str, Any]]) -> str:
@@ -94,6 +95,12 @@ class Runtime:
             {"role": item.role, "content": _text_content(item.content)}
             for item in request.messages
         ]
+        enable_thinking = request.chat_template_kwargs.get("enable_thinking", False)
+        if not isinstance(enable_thinking, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="chat_template_kwargs.enable_thinking must be boolean",
+            )
         try:
             encoded = self.tokenizer.apply_chat_template(
                 messages,
@@ -101,6 +108,7 @@ class Runtime:
                 add_generation_prompt=True,
                 return_tensors="pt",
                 return_dict=True,
+                enable_thinking=enable_thinking,
             )
         except TypeError:
             encoded = self.tokenizer.apply_chat_template(
@@ -108,6 +116,7 @@ class Runtime:
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                enable_thinking=enable_thinking,
             )
         if not hasattr(encoded, "items"):
             encoded = {"input_ids": encoded}

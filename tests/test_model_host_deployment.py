@@ -203,6 +203,48 @@ def test_success_enables_target_and_disables_conflicts(prepared: Path) -> None:
     assert (prepared / "manifests/target_model_candidate.json").is_file()
 
 
+def test_target_deployment_stops_only_verified_isolated_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared: Path,
+) -> None:
+    pid = "431"
+    pid_file = prepared / "runtime/qwen38-probe.pid"
+    pid_file.write_text(f"{pid}\n", encoding="ascii")
+    process_root = prepared / "proc"
+    process = process_root / pid
+    process.mkdir(parents=True)
+    (process / "cmdline").write_bytes(
+        b"/data/BB/envs/target-inference/bin/python\0"
+        + str(prepared / "scripts/target_transformers_api.py").encode()
+        + b"\0--host\0"
+        + b"127.0.0.1\0--port\0"
+        + b"18000\0--model-id\0qwen3.8-27b\0"
+    )
+    monkeypatch.setattr(deployment, "PROCESS_ROOT", process_root)
+
+    def fake_kill(actual_pid: int, signal_number: int) -> None:
+        assert actual_pid == int(pid)
+        if signal_number == deployment.signal.SIGTERM:
+            (process / "cmdline").unlink()
+            process.rmdir()
+
+    monkeypatch.setattr(deployment.os, "kill", fake_kill)
+    result = deployment.deploy_target(_payload(), host=FakeHost(), root=prepared)
+
+    assert result["isolated_probe_stopped"] is True
+    assert not pid_file.exists()
+
+
+def test_target_deployment_rejects_untrusted_isolated_probe_pid(prepared: Path) -> None:
+    (prepared / "runtime/qwen38-probe.pid").write_text("not-a-pid", encoding="ascii")
+    host = FakeHost(active=set(CONFLICTS), enabled=set(CONFLICTS))
+
+    with pytest.raises(RuntimeError, match="probe PID is invalid"):
+        deployment.deploy_target(_payload(), host=host, root=prepared)
+
+    assert host.controls == []
+
+
 def test_transformers_target_start_script_does_not_use_vllm():
     candidate = _candidate()
     candidate["runtime"] = {
