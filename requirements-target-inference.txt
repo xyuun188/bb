@@ -1,0 +1,11 @@
+# Isolated model-host environment for the official Qwen/Qwen3.8-27B target.
+# This file is intentionally separate from the platform runtime requirements.
+torch==2.6.0
+transformers==5.8.1
+accelerate==1.14.0
+bitsandbytes==0.49.0
+peft==0.18.1
+datasets==4.8.5
+trl==0.29.1
+fastapi==0.141.1
+uvicorn==0.52.4
