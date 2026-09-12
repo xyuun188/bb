@@ -26,6 +26,7 @@ from services.okx_position_settlement_sync import (
     SettlementFailure,
     _claim_history_row_for_position,
     _deduplicate_closed_lifecycle_rows,
+    _deduplicate_exact_close_order_projections,
     _effective_official_lifecycle_contracts,
     _final_fragment_requires_quantity_repair,
     _group_candidates_by_lifecycle,
@@ -1043,6 +1044,99 @@ def test_dedup_breaks_mutual_superseded_cycle_for_same_close_order() -> None:
     assert first.settlement_status == "settling"
     assert second.settlement_status == SUPERSEDED_POSITION_STATUS
     assert second.settlement_raw["canonical_position_id"] == 601
+
+
+def test_exact_close_fill_quantity_retires_duplicate_projection_only() -> None:
+    now = datetime.now(UTC)
+    canonical = Position(
+        id=801,
+        execution_mode="paper",
+        symbol="ICP/USDT",
+        side="long",
+        quantity=3.512,
+        okx_inst_id="ICP-USDT-SWAP",
+        okx_pos_id="icp-pos",
+        entry_exchange_order_id="entry-icp",
+        close_exchange_order_id="close-icp",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    duplicate = Position(
+        id=802,
+        execution_mode="paper",
+        symbol="ICP/USDT",
+        side="long",
+        quantity=3.06,
+        okx_inst_id="ICP-USDT-SWAP",
+        okx_pos_id="icp-pos",
+        entry_exchange_order_id="entry-icp",
+        close_exchange_order_id="close-icp",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    duplicates = _deduplicate_exact_close_order_projections(
+        [canonical, duplicate],
+        {"close-icp": {"base_quantity": 3.512}},
+        now=now,
+    )
+    assert [item.id for item in duplicates] == [802]
+    assert duplicate.settlement_status == SUPERSEDED_POSITION_STATUS
+    assert duplicate.settlement_raw["reason"] == (
+        "duplicate_local_closed_position_for_same_okx_lifecycle_exact_projection"
+    )
+    assert duplicate.settlement_raw["canonical_position_id"] == 801
+
+
+def test_exact_close_fill_quantity_keeps_ambiguous_partial_fragments() -> None:
+    now = datetime.now(UTC)
+    first = Position(
+        id=811,
+        execution_mode="paper",
+        symbol="NEAR/USDT",
+        side="long",
+        quantity=20.0,
+        okx_inst_id="NEAR-USDT-SWAP",
+        okx_pos_id="near-pos",
+        entry_exchange_order_id="entry-near",
+        close_exchange_order_id="close-near",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    second = Position(
+        id=812,
+        execution_mode="paper",
+        symbol="NEAR/USDT",
+        side="long",
+        quantity=5.0,
+        okx_inst_id="NEAR-USDT-SWAP",
+        okx_pos_id="near-pos",
+        entry_exchange_order_id="entry-near",
+        close_exchange_order_id="close-near",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    third = Position(
+        id=813,
+        execution_mode="paper",
+        symbol="NEAR/USDT",
+        side="long",
+        quantity=20.0,
+        okx_inst_id="NEAR-USDT-SWAP",
+        okx_pos_id="near-pos-other",
+        entry_exchange_order_id="entry-near-other",
+        close_exchange_order_id="close-near",
+        settlement_status="settling",
+        settlement_raw={},
+    )
+    duplicates = _deduplicate_exact_close_order_projections(
+        [first, second, third],
+        {"close-near": {"base_quantity": 20.0}},
+        now=now,
+    )
+    assert duplicates == []
+    assert first.settlement_status == "settling"
+    assert second.settlement_status == "settling"
+    assert third.settlement_status == "settling"
 
 
 def test_single_lifecycle_prefers_authoritative_order_economics() -> None:

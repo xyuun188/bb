@@ -1029,12 +1029,6 @@ class ModelArtifactRegistry:
         }
 
     def _pointer_status(self, role: str, *, load_bundle: bool = True) -> dict[str, Any]:
-        resolver = {
-            "candidate": self.resolve_candidate,
-            "challenger": self.resolve_challenger,
-            "current": self.resolve_current,
-            "rollback": self.resolve_rollback,
-        }[role]
         try:
             resolved = (
                 self.resolve_candidate(load_bundle=load_bundle)

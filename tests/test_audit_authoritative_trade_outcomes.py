@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from scripts.audit_authoritative_trade_outcomes import (
     _compact_gap_summary,
     _gap_summary,
+    _promotion_gate,
     _realized_pnl_sign_counts,
     _slippage_integrity_summary,
     _slippage_storage_summary,
@@ -194,3 +195,16 @@ def test_slippage_storage_summary_classifies_version_upgrade_blockers() -> None:
         "fills_history:rows_available:public_spec": 1,
         "order_detail:rows_missing:public_spec_missing": 1,
     }
+
+
+def test_authoritative_audit_gate_contract_requires_complete_trainable_outcomes() -> None:
+    result = _promotion_gate(
+        [{"outcome_complete": False}],
+        trainable_count=0,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["blocked_reasons"] == [
+        "authoritative_outcomes_all_incomplete",
+        "authoritative_training_samples_missing",
+    ]

@@ -22,7 +22,7 @@ def test_consultation_messages_add_no_think_for_qwen3() -> None:
         HumanMessage(content='{"major_conflicts": []}'),
     ]
 
-    controlled = CrossValidator._consultation_messages_for_model(messages, "qwen3-32b-trade")
+    controlled = CrossValidator._consultation_messages_for_model(messages, "qwen3.8-27b")
 
     assert controlled is not messages
     assert controlled[0] is messages[0]
@@ -35,49 +35,31 @@ def test_consultation_messages_keep_plain_models_unchanged() -> None:
     messages = [HumanMessage(content="plain")]
 
     assert (
-        CrossValidator._consultation_messages_for_model(messages, "Qwen2.5-32B-Instruct")
+        CrossValidator._consultation_messages_for_model(messages, "some-unknown-model")
         is messages
     )
 
 
-def test_local_qwen3_trade_detection_excludes_review_alias() -> None:
-    assert _is_local_qwen3_trade_model("qwen3-32b-trade")
-    assert _is_local_qwen3_trade_model("BB-FinQuant-Expert-14B")
-    assert not _is_local_qwen3_trade_model("qwen3-32b-risk-review")
+def test_local_qwen3_trade_detection_accepts_only_target_carrier() -> None:
+    assert _is_local_qwen3_trade_model("qwen3.8-27b")
+    assert not _is_local_qwen3_trade_model("qwen3-max")
+    assert not _is_local_qwen3_trade_model("deepseek-reasoner")
 
 
-def test_keyless_loopback_prefers_decision_fallback_before_slow_review(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "high_risk_review_enabled", True)
-    monkeypatch.setattr(settings, "high_risk_review_api_base", "http://127.0.0.1:18002/v1")
-    monkeypatch.setattr(settings, "high_risk_review_api_key", "review-key")
-    monkeypatch.setattr(settings, "high_risk_review_model", "deepseek-r1-14b-risk")
-    monkeypatch.setattr(
-        CrossValidator,
-        "_fixed_model_cfg",
-        lambda self, name: {
-            "name": name,
-            "label": "decision",
-            "api_base": "https://decision.example.com/v1",
-            "api_key": "decision-key",
-            "model": "decision-model",
-        }
-        if name == "decision_maker"
-        else {},
-    )
-
+def test_consultation_candidates_are_single_canonical_local_route() -> None:
     candidates = CrossValidator()._consultation_candidates(
         {
-            "api_base": "http://127.0.0.1:18003/v1",
+            "api_base": "http://127.0.0.1:18000/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
         }
     )
 
-    assert candidates[0]["model"] == "BB-FinQuant-Expert-14B"
+    assert len(candidates) == 1
+    assert candidates[0]["name"] == "trend_expert"
+    assert candidates[0]["model"] == "qwen3.8-27b"
     assert candidates[0]["configuration_type"] == "keyless_loopback"
-    assert candidates[1]["model"] == "decision-model"
-    assert candidates[2]["model"] == "deepseek-r1-14b-risk"
-    assert not any(candidate["source"] == "backup" for candidate in candidates)
+    assert candidates[0]["source"] == "primary"
 
 
 def test_keyless_non_loopback_is_not_a_consultation_candidate(monkeypatch) -> None:
@@ -92,7 +74,7 @@ def test_keyless_non_loopback_is_not_a_consultation_candidate(monkeypatch) -> No
         {
             "api_base": "https://models.example.com/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
         }
     )
 
@@ -117,14 +99,14 @@ async def test_qwen3_consultation_uses_short_non_thinking_runtime_policy(monkeyp
         {
             "api_base": "http://127.0.0.1:8000/v1",
             "api_key": "test-key",
-            "model": "qwen3-32b-trade",
+            "model": "qwen3.8-27b",
         },
     )
 
     assert isinstance(response, AIMessage)
     assert content == '{"recommended_action":"hold"}'
     assert captured["kwargs"]["max_completion_tokens"] == completion_token_limit(
-        "consultation", 1400, floor=160
+        "consultation", 1400, floor=160, model="qwen3.8-27b"
     )
     assert captured["kwargs"]["max_completion_tokens"] == 700
     assert captured["kwargs"]["model_kwargs"] == {
@@ -151,7 +133,7 @@ async def test_consultation_request_timeout_is_capped(monkeypatch) -> None:
         {
             "api_base": "http://127.0.0.1:8000/v1",
             "api_key": "test-key",
-            "model": "qwen3-32b-trade",
+            "model": "qwen3.8-27b",
         },
         request_timeout=60.0,
     )
@@ -174,34 +156,25 @@ async def test_keyless_loopback_uses_process_local_placeholder(monkeypatch) -> N
     await CrossValidator()._invoke_consultation_model(
         [HumanMessage(content="payload")],
         {
-            "api_base": "http://127.0.0.1:18003/v1",
+            "api_base": "http://127.0.0.1:18000/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
         },
     )
 
-    assert captured["api_key"] == "local-loopback"
+    assert captured["api_key"] == "local"
 
 
-async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> None:
+async def test_failed_primary_consultation_never_authorizes_fallback(monkeypatch) -> None:
     validator = CrossValidator()
     candidates = [
         {
-            "name": "high_risk_review",
-            "label": "risk",
-            "api_base": "http://127.0.0.1:18002/v1",
-            "api_key": "review-key",
-            "model": "deepseek-r1-14b-risk",
-            "source": "high_risk_review",
-            "retries": 1,
-        },
-        {
-            "name": "decision_maker",
-            "label": "fallback",
-            "api_base": "http://127.0.0.1:18003/v1",
+            "name": "trend_expert",
+            "label": "trend",
+            "api_base": "http://127.0.0.1:18000/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
-            "source": "decision_maker",
+            "model": "qwen3.8-27b",
+            "source": "primary",
             "retries": 1,
         },
     ]
@@ -225,8 +198,8 @@ async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> No
                     "consultation_concurrency": 2,
                 }
             )
-        if candidate["model"] == "deepseek-r1-14b-risk":
-            raise TimeoutError("r1 timed out")
+        if candidate["model"] == "qwen3.8-27b":
+            raise TimeoutError("canonical local consultation timed out")
         await asyncio.sleep(0)
         return (
             AIMessage(content="ok"),
@@ -251,14 +224,11 @@ async def test_r1_failure_keeps_budget_for_completed_fallback(monkeypatch) -> No
     )
 
     assert result is not None
-    assert result["status"] == "completed"
-    assert result["resolution_status"] == "resolved"
-    assert result["resolved_action"] == "hold"
-    assert result["fallback_used"] is True
-    assert [item["status"] for item in result["consultation_attempts"]] == [
-        "timeout",
-        "completed",
-    ]
+    assert result["status"] == "failed"
+    assert result["resolution_status"] == "unresolved"
+    assert result["resolved_action"] == "unclear"
+    assert "fallback" not in result
+    assert [item["status"] for item in result["consultation_attempts"]] == ["timeout"]
 
 
 async def test_primary_consultation_uses_full_first_attempt_budget(monkeypatch) -> None:
@@ -267,9 +237,9 @@ async def test_primary_consultation_uses_full_first_attempt_budget(monkeypatch) 
         {
             "name": "trend_expert",
             "label": "trend",
-            "api_base": "http://127.0.0.1:18003/v1",
+            "api_base": "http://127.0.0.1:18000/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
             "source": "primary",
             "retries": 1,
         },
@@ -360,9 +330,9 @@ async def test_consultation_allows_two_inferences_without_queue_serialization(
     metrics = [{}, {}]
     validator = CrossValidator()
     candidate = {
-        "api_base": "http://127.0.0.1:18003/v1",
+        "api_base": "http://127.0.0.1:18000/v1",
         "api_key": "",
-        "model": "BB-FinQuant-Expert-14B",
+        "model": "qwen3.8-27b",
     }
 
     tasks = [
@@ -413,9 +383,9 @@ async def test_consultation_can_use_one_controlled_overflow_slot(
         response, content = await CrossValidator()._invoke_consultation_model(
             [HumanMessage(content="payload")],
             {
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
             },
             request_timeout=1.0,
             queue_timeout_seconds=0.05,
@@ -464,9 +434,9 @@ async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) ->
             {
                 "name": "trend_expert",
                 "label": "trend",
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
                 "source": "primary",
                 "retries": 1,
             }

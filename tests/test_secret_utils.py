@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,11 +14,7 @@ from core.secret_utils import (
     secret_fingerprint,
     secret_state,
 )
-from tests.model_endpoint_fixtures import (
-    DEEPSEEK_PUBLIC_TEST_BASE,
-    PUBLIC_MODEL_TEST_HOST,
-    QWEN_PUBLIC_TEST_BASE,
-)
+from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
 
 
 def test_redact_text_masks_common_secret_assignments() -> None:
@@ -139,9 +134,9 @@ def test_fixed_ai_models_allow_keyless_loopback_tunnels() -> None:
         ai_models=[
             {
                 "name": "trend_expert",
-                "api_base": "http://127.0.0.1:8000/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "",
-                "model": "qwen3-14b-trade",
+                "model": "qwen3.8-27b",
             }
         ],
     )
@@ -153,10 +148,10 @@ def test_fixed_ai_models_allow_keyless_loopback_tunnels() -> None:
     )
 
     assert trend["api_key"] == ""
-    assert trend["api_base"] == "http://127.0.0.1:8000/v1"
-    assert trend["model"] == "qwen3-14b-trade"
+    assert trend["api_base"] == LOCAL_QWEN_TEST_BASE.replace(":8000", ":18000")
+    assert trend["model"] == "qwen3.8-27b"
     assert trend["configured"] is True
-    assert trend["configuration_type"] == "keyless_loopback"
+    assert trend["configuration_type"] == "target_local"
     assert [
         item["name"] for item in cfg.get_fixed_ai_models(include_empty=False)
     ] == ["trend_expert"]
@@ -178,31 +173,11 @@ def test_fixed_ai_models_still_require_keys_for_non_loopback_endpoints() -> None
     assert cfg.get_fixed_ai_models(include_empty=False) == []
     trend = cfg.get_fixed_ai_models(include_empty=True)[0]
     assert trend["configured"] is False
-    assert trend["configuration_type"] == "missing"
+    assert trend["configuration_type"] == "invalid_target_local"
 
 
-def test_dual_14b_config_script_generates_fixed_slot_routing(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from scripts.configure_dual_14b_ai_models import build_dual_14b_ai_models, main
-
-    models = build_dual_14b_ai_models(host=PUBLIC_MODEL_TEST_HOST)
-    by_name = {item["name"]: item for item in models}
-
-    assert by_name["trend_expert"]["api_base"] == QWEN_PUBLIC_TEST_BASE
-    assert by_name["momentum_expert"]["model"] == "qwen3-14b-trade"
-    assert by_name["decision_maker"]["model"] == "qwen3-14b-trade"
-    assert by_name["sentiment_expert"]["api_base"] == DEEPSEEK_PUBLIC_TEST_BASE
-    assert by_name["position_expert"]["model"] == "deepseek-r1-14b-risk"
-    assert by_name["risk_expert"]["model"] == "deepseek-r1-14b-risk"
-    assert all(item["api_key"] == "" for item in models)
-
-    main(["--host", PUBLIC_MODEL_TEST_HOST])
-    out = capsys.readouterr().out.strip()
-    assert out.startswith("AI_MODELS=")
-    payload = json.loads(out.split("=", 1)[1])
-    assert payload == models
-    assert "shared-secret-key" not in out
+def test_dual_14b_config_script_is_removed() -> None:
+    assert not Path("scripts/configure_dual_14b_ai_models.py").exists()
 
 
 def test_dashboard_cors_defaults_are_local_and_explicit() -> None:
@@ -229,35 +204,6 @@ def test_dashboard_cors_origins_parse_from_env_strings() -> None:
         "http://localhost:8002",
     ]
     assert json_cfg.dashboard_allowed_origins() == ["https://dash.example.invalid"]
-
-
-def test_settings_parse_legacy_complex_env_values(tmp_path: Path) -> None:
-    env_path = tmp_path / ".env"
-    env_path.write_text(
-        "\n".join(
-            [
-                "SYMBOLS=[BTC/USDT, ETH/USDT]",
-                "EXECUTION_ACCOUNT_COOLDOWN_LOSS_PCT={'paper': 0.6, 'live': 0.7}",
-                "AI_MODELS=[{name: trend_expert, api_base: http://127.0.0.1:8000/v1, api_key: key, model: qwen3}]",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    cfg = Settings(_env_file=env_path)  # type: ignore[call-arg]
-
-    assert cfg.symbols == ["BTC/USDT", "ETH/USDT"]
-    assert not hasattr(cfg, "execution_account_max_loss_pct")
-    assert not hasattr(cfg, "execution_account_cooldown_loss_pct")
-    assert cfg.ai_models == [
-        {
-            "name": "trend_expert",
-            "api_base": "http://127.0.0.1:8000/v1",
-            "api_key": "key",
-            "model": "qwen3",
-        }
-    ]
 
 
 def test_update_env_file_ignores_masked_secret_and_rejects_invalid_values(tmp_path: Path) -> None:

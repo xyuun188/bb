@@ -148,8 +148,11 @@ class ExpertMemoryService:
                 if callable(rollback):
                     try:
                         await rollback()
-                    except Exception:
-                        pass
+                    except Exception as rollback_exc:
+                        logger.debug(
+                            "expert memory telemetry rollback skipped",
+                            error=safe_error_text(rollback_exc),
+                        )
                 logger.debug(
                     "expert memory hit telemetry skipped",
                     memory_count=len(fresh_ids),

@@ -7,9 +7,9 @@ server and forwards loopback-only ports to the model server's loopback services:
 - 127.0.0.1:18000 -> model server 127.0.0.1:8000 (single target model)
 - 127.0.0.1:18001 -> model server 127.0.0.1:8101 (phase3 quant API health)
 
-The explicit ``legacy_shadow`` profile additionally exposes the historical
-14B shadow endpoints for rollback/audit. The ``target_single_model`` profile
-never starts local risk/expert model tunnels; high-risk review is remote.
+Only the single local Qwen3.8-27B endpoint and the phase3 quant API are
+forwarded. High-risk review is cloud-only and is never part of this tunnel
+process.
 
 Model-server SSH credentials are loaded from encrypted secure settings on the
 platform. Secrets are never printed.
@@ -36,7 +36,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.model_topology import (  # noqa: E402
-    LEGACY_SHADOW_PROFILE,
+    DEFAULT_MODEL_TOPOLOGY_PROFILE,
     TARGET_SINGLE_MODEL_PROFILE,
     model_tunnel_routes,
 )
@@ -64,7 +64,6 @@ FORWARD_CHANNELS_PER_TRANSPORT = 5
 FORWARD_TRANSPORT_POOL_SIZES = {
     "target-single-model": 3,
     "phase3-quant-api": 2,
-    "BB-FinQuant-Expert-14B": 2,
 }
 FORWARD_DEFAULT_MAX_CONNECTION_SECONDS = 600.0
 FORWARD_QUANT_MAX_CONNECTION_SECONDS = 1_800.0
@@ -443,7 +442,11 @@ def build_default_tunnels(
 ) -> list[TunnelSpec]:
     """Return tunnels for the selected topology profile."""
 
-    selected = profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
+    selected = (
+        profile
+        if profile is not None
+        else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", DEFAULT_MODEL_TOPOLOGY_PROFILE)
+    )
     return [
         TunnelSpec(
             name=route.name,
@@ -641,22 +644,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--local-host", default="127.0.0.1")
     parser.add_argument(
         "--profile",
-        choices=(LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE),
-        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", LEGACY_SHADOW_PROFILE),
+        choices=(TARGET_SINGLE_MODEL_PROFILE,),
+        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", DEFAULT_MODEL_TOPOLOGY_PROFILE),
     )
     parser.add_argument("--qwen-local-port", type=parse_port, default=18_000)
     parser.add_argument("--quant-api-local-port", type=parse_port, default=18_001)
-    parser.add_argument("--deepseek-local-port", type=parse_port, default=18_002)
-    parser.add_argument("--expert-local-port", type=parse_port, default=18_003)
     args = parser.parse_args(argv)
 
     specs = build_default_tunnels(local_host=args.local_host, profile=args.profile)
     local_ports = {
         "target-single-model": args.qwen_local_port,
         "phase3-quant-api": args.quant_api_local_port,
-        "qwen3-14b-trade": args.qwen_local_port,
-        "deepseek-r1-14b-risk": args.deepseek_local_port,
-        "BB-FinQuant-Expert-14B": args.expert_local_port,
     }
     specs = [
         TunnelSpec(

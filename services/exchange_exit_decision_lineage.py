@@ -40,6 +40,87 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _relative_close_enough(left: float, right: float, tolerance_ratio: float) -> bool:
+    tolerance = max(abs(left), abs(right), 1e-12) * max(tolerance_ratio, 0.0)
+    return abs(left - right) <= tolerance
+
+
+def _close_fill_target_quantity(
+    raw_fill: dict[str, Any],
+    order: Any,
+) -> float:
+    """Return the authoritative base quantity available for close aggregation."""
+
+    for key in ("base_quantity", "filled_base_quantity"):
+        value = _safe_float(raw_fill.get(key), 0.0)
+        if value > 0:
+            return value
+    contracts = _safe_float(
+        raw_fill.get("contracts") or raw_fill.get("filled_contracts"),
+        0.0,
+    )
+    contract_size = _safe_float(
+        raw_fill.get("contract_size") or raw_fill.get("contractSize"),
+        0.0,
+    )
+    if contracts > 0 and contract_size > 0:
+        return contracts * contract_size
+    if contracts > 0:
+        return contracts
+    return _safe_float(getattr(order, "quantity", None), 0.0)
+
+
+def _close_position_lineage_key(position: Any) -> tuple[str, ...]:
+    """Identify a local lifecycle projection without using the close order id."""
+
+    return (
+        str(getattr(position, "execution_mode", "") or "").strip().lower(),
+        str(getattr(position, "symbol", "") or "").strip().upper(),
+        str(getattr(position, "side", "") or "").strip().lower(),
+        str(getattr(position, "okx_pos_id", "") or "").strip(),
+        str(getattr(position, "entry_exchange_order_id", "") or "").strip(),
+        f"{_safe_float(getattr(position, 'entry_price', None), 0.0):.12g}",
+    )
+
+
+def _can_aggregate_close_positions(
+    positions: list[Any],
+    *,
+    target_quantity: float,
+) -> bool:
+    """Allow one close fill to settle distinct local fragments only when exact.
+
+    A single exchange close order can cover several local fragments.  It is safe
+    to aggregate only when every fragment has a distinct lifecycle projection
+    and the authoritative fill quantity covers their sum.  Duplicate rows or
+    quantity mismatches remain ambiguous and therefore stay fail-closed.
+    """
+
+    if len(positions) <= 1 or target_quantity <= 0:
+        return len(positions) <= 1
+    lineage_keys = [_close_position_lineage_key(position) for position in positions]
+    if any(not key[3] and not key[4] for key in lineage_keys):
+        return False
+    if len(set(lineage_keys)) != len(lineage_keys):
+        return False
+    quantities = [
+        _safe_float(getattr(position, "quantity", None), 0.0)
+        for position in positions
+    ]
+    if any(quantity <= 0 for quantity in quantities):
+        return False
+    return _relative_close_enough(sum(quantities), target_quantity, 0.02)
+
+
 def _nested_order_ids(value: Any) -> set[str]:
     payload = _safe_dict(value)
     return {
@@ -267,14 +348,18 @@ async def recover_exit_decision_lineage_from_order_fact(
         if str(getattr(position, "close_exchange_order_id", "") or "").strip()
         == close_order_id
     ]
-    if len(exact_positions) > 1:
+    target_quantity = _close_fill_target_quantity(raw_fill, order)
+    candidate_positions = exact_positions or positions
+    if len(candidate_positions) > 1 and not _can_aggregate_close_positions(
+        candidate_positions,
+        target_quantity=target_quantity,
+    ):
+        qualifier = "claim" if exact_positions else "contain"
         raise ExitDecisionLineageAmbiguous(
-            f"Multiple closed positions claim OKX close order {close_order_id}"
-        )
-    if not exact_positions and len(positions) > 1:
-        raise ExitDecisionLineageAmbiguous(
-            "Multiple closed positions contain OKX close order "
-            f"{close_order_id} without one exact lifecycle slice"
+            f"aggregate_mismatch target={round(target_quantity, 8)} "
+            f"qty={[round(_safe_float(getattr(item, 'quantity', None), 0.0), 8) for item in candidate_positions]} "
+            f"order={close_order_id} ids={[int(getattr(item, 'id', 0) or 0) for item in candidate_positions]} "
+            f"kind={qualifier}"
         )
     settlement_positions = exact_positions or positions
     realized_pnl = (

@@ -18,11 +18,12 @@ def test_phase3_shadow_probe_rejects_thinking_tag_output() -> None:
 
 
 def test_phase3_shadow_probe_gives_reasoning_model_enough_json_headroom() -> None:
-    risk_probe = probe.DEFAULT_PROBES[1]
-    body = probe._request_body(risk_probe)
+    assert len(probe.DEFAULT_PROBES) == 1
+    target_probe = probe.DEFAULT_PROBES[0]
+    body = probe._request_body(target_probe)
 
-    assert risk_probe.allow_reasoning_prefix is True
-    assert body["max_tokens"] == probe.HIGH_RISK_REVIEW_TOKEN_CAP
+    assert target_probe.allow_reasoning_prefix is False
+    assert body["max_tokens"] == target_probe.max_tokens
 
 
 @pytest.mark.parametrize(

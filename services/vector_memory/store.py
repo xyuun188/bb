@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,7 +101,13 @@ def fields_to_hit(doc_id: str, score: float, fields: dict[str, Any]) -> VectorMe
 
 
 class JsonVectorMemoryStore:
-    """Small durable fallback store used when zvec is unavailable."""
+    """Durable JSONL store with a process-local immutable read snapshot.
+
+    The trading process may query memory many times per minute. Re-parsing the
+    complete JSONL file for every query creates avoidable allocation spikes, so
+    reads are refreshed only when the file signature changes. Writes replace
+    the file atomically and refresh the same snapshot before returning.
+    """
 
     backend_name = "jsonl"
 
@@ -109,9 +116,13 @@ class JsonVectorMemoryStore:
         self.dimension = max(int(dimension), 16)
         self.max_documents = max(int(max_documents), 100)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._rows: tuple[dict[str, Any], ...] = ()
+        self._file_signature: tuple[int, int] | None = None
+        self._snapshot_lock = threading.RLock()
 
     def upsert(self, documents: Iterable[VectorMemoryDocument]) -> int:
-        existing = {item["id"]: item for item in self._read_rows()}
+        with self._snapshot_lock:
+            existing = {item["id"]: item for item in self._load_rows()}
         accepted = 0
         for document in documents:
             if not document.text.strip():
@@ -125,6 +136,9 @@ class JsonVectorMemoryStore:
             accepted += 1
         rows = list(existing.values())[-self.max_documents :]
         self._write_rows(rows)
+        with self._snapshot_lock:
+            self._rows = tuple(rows)
+            self._file_signature = self._stat_signature()
         return accepted
 
     def search(
@@ -134,9 +148,10 @@ class JsonVectorMemoryStore:
         top_k: int = 8,
         filters: dict[str, str] | None = None,
     ) -> list[VectorMemoryHit]:
+        rows = self._load_rows()
         query_vector = deterministic_text_vector(query, dimension=self.dimension)
         hits: list[VectorMemoryHit] = []
-        for row in self._read_rows():
+        for row in rows:
             fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
             if not self._matches_filters(fields, filters):
                 continue
@@ -146,16 +161,29 @@ class JsonVectorMemoryStore:
         return hits[: max(int(top_k or 8), 1)]
 
     def stats(self) -> dict[str, Any]:
-        rows = self._read_rows()
+        rows = self._load_rows()
         return {"backend": self.backend_name, "document_count": len(rows), "path": str(self.path)}
 
     def clear(self) -> int:
-        rows = self._read_rows()
+        rows = self._load_rows()
         removed = len(rows)
         self._write_rows([])
+        with self._snapshot_lock:
+            self._rows = ()
+            self._file_signature = self._stat_signature()
         return removed
 
-    def _read_rows(self) -> list[dict[str, Any]]:
+    def _load_rows(self) -> tuple[dict[str, Any], ...]:
+        signature = self._stat_signature()
+        with self._snapshot_lock:
+            if signature == self._file_signature:
+                return self._rows
+            rows = self._read_rows_from_disk()
+            self._rows = tuple(rows)
+            self._file_signature = signature
+            return self._rows
+
+    def _read_rows_from_disk(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         rows: list[dict[str, Any]] = []
@@ -169,6 +197,13 @@ class JsonVectorMemoryStore:
             if isinstance(parsed, dict) and parsed.get("id"):
                 rows.append(parsed)
         return rows
+
+    def _stat_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
         payload = (

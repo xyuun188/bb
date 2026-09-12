@@ -72,6 +72,10 @@ class SentimentScraper:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(15.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=0,
+                    max_connections=4,
+                ),
                 headers={"User-Agent": "AI-Trading-Bot/1.0 (research)"},
             )
         return self._client

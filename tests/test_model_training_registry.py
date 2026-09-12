@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.model_topology import TARGET_SINGLE_MODEL_ID
 from services.model_training_registry import build_model_training_registry
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -13,7 +14,7 @@ def _by_id(payload: dict) -> dict[str, dict]:
     return {row["model_id"]: row for row in payload["models"]}
 
 
-def test_registry_ignores_legacy_endpoint_alias_without_current_slot_runtime() -> None:
+def test_registry_ignores_retired_model_inputs_without_target_slot_runtime() -> None:
     payload = build_model_training_registry(
         local_ml_status={"available": True, "status": "degraded"},
         local_tools_status={
@@ -45,39 +46,37 @@ def test_registry_ignores_legacy_endpoint_alias_without_current_slot_runtime() -
         },
     )
 
-    finquant = _by_id(payload)["bb_finquant_expert_14b"]
+    rows = _by_id(payload)
+    finquant = rows[TARGET_SINGLE_MODEL_ID]
 
     assert finquant["runtime_available"] is False
     assert finquant["artifact_available"] is False
-    assert finquant["alias_only"] is False
+    assert "alias_only" not in finquant
     assert finquant["lifecycle"] == "promotion_blocked"
-    assert payload["summary"]["alias_only_models"] == []
+    assert finquant["topology_profile"] == "target_single_model"
+    assert "qwen3_14b_trade_legacy" not in rows
+    assert "deepseek_r1_14b_risk_legacy" not in rows
+    assert "alias_only_models" not in payload["summary"]
 
 
 def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
     payload = build_model_training_registry(
         model_server_report={
-            "old_takeover_runtime": {
-                "required_endpoints": [
-                    {"served_model_name": "BB-FinQuant-Expert-14B", "ready": True}
-                ]
-            },
             "required_slots": [
                 {
-                    "slot": "llm_expert_pool",
-                    "base_model_carrier": "Qwen3-14B-AWQ",
+                    "slot": "llm_decision_and_expert_carrier",
+                    "base_model_carrier": "Qwen/Qwen3.8-27B",
                     "specialization_evidence_verified": True,
                     "specialization_evidence": {
                         "verification_status": "verified",
                         "identity_verified": True,
-                        "legacy_read_only": False,
                         "adapter_version": "20260712T010203Z-aaaaaaaaaaaa",
                         "adapter_path": "/data/BB/models/bb-finquant/adapter",
                         "specialization_manifest": "/data/BB/models/bb-finquant/manifest.json",
-                        "specialization_id": "BB-FinQuant-Expert-14B-20260712T010203Z-aaaaaaaaaaaa",
+                        "specialization_id": "qwen3.8-27b-20260712T010203Z-aaaaaaaaaaaa",
                         "dataset_version": "bb-finquant-sft-v2-aaaaaaaaaaaa-bbbbbbbb",
                         "source_code_version": "commit-sha",
-                        "base_model_repo": "Qwen/Qwen3-14B",
+                        "base_model_repo": "Qwen/Qwen3.8-27B",
                         "trained_at": "2026-07-11T00:00:00+00:00",
                         "objective_name": "maximize_expected_realized_net_return_after_cost",
                         "objective_version": "2026-07-12.v1",
@@ -102,7 +101,7 @@ def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
             ],
             "manifest_services": [
                 {
-                    "slot": "llm_expert_pool",
+                    "slot": "llm_decision_and_expert_carrier",
                     "service_active": True,
                     "endpoint_ready": True,
                 }
@@ -110,16 +109,16 @@ def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
         }
     )
 
-    finquant = _by_id(payload)["bb_finquant_expert_14b"]
+    finquant = _by_id(payload)[TARGET_SINGLE_MODEL_ID]
 
     assert finquant["artifact_available"] is True
     assert finquant["runtime_available"] is True
     assert finquant["identity_verified"] is True
-    assert finquant["alias_only"] is False
+    assert "alias_only" not in finquant
     assert finquant["lifecycle"] == "trained"
 
 
-def test_registry_joins_llm_artifact_and_runtime_rows_by_slot() -> None:
+def test_registry_does_not_publish_retired_llm_rows() -> None:
     payload = build_model_training_registry(
         model_server_report={
             "required_slots": [
@@ -145,10 +144,10 @@ def test_registry_joins_llm_artifact_and_runtime_rows_by_slot() -> None:
     )
 
     rows = _by_id(payload)
-    assert rows["qwen3_14b_trade"]["runtime_available"] is True
-    assert rows["qwen3_14b_trade"]["lifecycle"] == "inference_only"
-    assert rows["deepseek_r1_14b_risk"]["runtime_available"] is True
-    assert rows["deepseek_r1_14b_risk"]["lifecycle"] == "inference_only"
+    assert TARGET_SINGLE_MODEL_ID in rows
+    assert "online_reviewer_cloud" in rows
+    assert "qwen3_14b_trade_legacy" not in rows
+    assert "deepseek_r1_14b_risk_legacy" not in rows
 
 
 def test_registry_separates_pretrained_specialists_from_project_training() -> None:
@@ -314,7 +313,7 @@ def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() 
     assert payload["summary"]["identity_failure_count"] == 0
 
 
-def test_registry_evaluates_inference_only_llms_by_fee_after_contribution() -> None:
+def test_registry_evaluates_cloud_reviewer_by_high_risk_fee_after_contribution() -> None:
     payload = build_model_training_registry(
         model_server_report={
             "old_takeover_runtime": {
@@ -325,13 +324,6 @@ def test_registry_evaluates_inference_only_llms_by_fee_after_contribution() -> N
             }
         },
         contribution_performance={
-            "decision_llm": {
-                "count": 71,
-                "pnl": -12.47,
-                "avg_pnl": -0.175,
-                "profit_factor": 0.77,
-                "state": "degrade",
-            },
             "high_risk_review": {
                 "count": 67,
                 "pnl": -11.18,
@@ -343,23 +335,20 @@ def test_registry_evaluates_inference_only_llms_by_fee_after_contribution() -> N
     )
 
     rows = _by_id(payload)
-    qwen = rows["qwen3_14b_trade"]
-    risk = rows["deepseek_r1_14b_risk"]
-    decision = rows["deepseek_online_decision"]
+    reviewer = rows["online_reviewer_cloud"]
 
-    assert qwen["evaluation_mode"] == "not_evaluated"
-    assert qwen["blocking_reasons"] == ["model_specific_fee_after_attribution_missing"]
-    assert risk["evaluation_sample_count"] == 67
-    assert risk["profit_factor"] == 0.79
-    assert "realized_net_pnl_non_positive" in risk["blocking_reasons"]
-    assert decision["evaluation_sample_count"] == 71
-    assert decision["quality_state"] == "promotion_blocked"
+    assert "qwen3_14b_trade_legacy" not in rows
+    assert "deepseek_r1_14b_risk_legacy" not in rows
+    assert reviewer["evaluation_sample_count"] == 67
+    assert reviewer["profit_factor"] == 0.79
+    assert "realized_net_pnl_non_positive" in reviewer["blocking_reasons"]
+    assert reviewer["quality_state"] == "promotion_blocked"
 
 
 def test_registry_blocks_positive_pnl_when_profit_factor_is_undefined() -> None:
     payload = build_model_training_registry(
         contribution_performance={
-            "decision_llm": {
+            "high_risk_review": {
                 "count": 4,
                 "pnl": 9.5,
                 "avg_pnl": 2.375,
@@ -368,7 +357,7 @@ def test_registry_blocks_positive_pnl_when_profit_factor_is_undefined() -> None:
         }
     )
 
-    decision = _by_id(payload)["deepseek_online_decision"]
+    decision = _by_id(payload)["online_reviewer_cloud"]
     assert decision["realized_net_pnl_usdt"] == 9.5
     assert decision["profit_factor"] is None
     assert decision["quality_state"] == "promotion_blocked"
@@ -387,5 +376,5 @@ def test_dashboard_renders_model_cards_from_canonical_registry() -> None:
     assert "state.modelTrainingRegistry = registryData || null" in script
     assert "const registryModels = Array.isArray(registry.models)" in render_block
     assert "registryModels.map(model =>" in render_block
-    assert "alias_only" in render_block
+    assert "alias_only" not in render_block
     assert "const models = [" not in render_block

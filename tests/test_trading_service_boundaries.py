@@ -2217,6 +2217,40 @@ async def test_market_analysis_loop_keeps_stage_budget_separate_from_outer_watch
 
 
 @pytest.mark.asyncio
+async def test_analysis_loop_cancels_a_stuck_round_and_releases_scheduler(monkeypatch):
+    calls: list[str] = []
+    running = True
+    sleeps: list[float] = []
+    first_started = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(scope: str):
+        calls.append(scope)
+        first_started.set()
+        await asyncio.Event().wait()
+
+    service = MarketAnalysisService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        time_budget_provider=lambda: 0.01,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert first_started.is_set()
+    assert calls == ["market"]
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
+
+
+@pytest.mark.asyncio
 async def test_analysis_service_loop_continues_after_internal_round_cancellation(monkeypatch):
     calls: list[str] = []
     running = True

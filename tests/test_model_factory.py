@@ -22,9 +22,9 @@ def test_model_factory_builds_keyless_loopback_fixed_slot(monkeypatch) -> None:
                 "role": "trend_direction",
                 "label": "Trend",
                 "weight": 1.0,
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             }
         ],

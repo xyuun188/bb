@@ -35,7 +35,6 @@ from core.model_runtime import (
     completion_token_limit,
     ensure_no_think_text,
     is_openai_reasoning_model,
-    is_qwen3_model,
     non_thinking_extra_body,
     provider_non_thinking_extra_body,
     supports_batch_expert_json,
@@ -65,6 +64,7 @@ def _chat_openai_class() -> Any:
     from langchain_openai import ChatOpenAI as _ChatOpenAI
 
     return _ChatOpenAI
+
 
 if TYPE_CHECKING:
     from data_feed.feature_vector import FeatureVector
@@ -110,7 +110,13 @@ class _ScopedLLMCapacity:
         raw = str(context.get("_analysis_budget_scope") or "")
         if "consultation" in raw:
             return "consultation"
-        return "market" if raw.startswith("market") else "position" if raw.startswith("position") else "shared"
+        return (
+            "market"
+            if raw.startswith("market")
+            else "position"
+            if raw.startswith("position")
+            else "shared"
+        )
 
     async def acquire(self, context: dict[str, Any]) -> str:
         scope = self._scope(context)
@@ -135,19 +141,14 @@ class _ScopedLLMCapacity:
                     # ``_active`` but must not make the regular pool look
                     # full.  Otherwise a single deep consultation would
                     # temporarily reduce ordinary market/position capacity.
-                    regular_active = self._active - int(
-                        self._consultation_overflow_active
-                    )
+                    regular_active = self._active - int(self._consultation_overflow_active)
                     market_reserved = (
                         scope == "position"
                         and self._market_waiters > 0
                         and regular_active >= max(self._limit - 1, 1)
                         and not position_turn
                     )
-                    position_reserved = bool(
-                        scope == "market"
-                        and position_turn
-                    )
+                    position_reserved = bool(scope == "market" and position_turn)
                     regular_slot_available = regular_active < self._limit
                     consultation_overflow_available = bool(
                         scope == "consultation"
@@ -273,6 +274,7 @@ async def _bounded_llm_capacity_slot(context: dict[str, Any]):
         if getattr(slot, "_acquired", False):
             await slot.__aexit__(None, None, None)
 
+
 ROLE_TO_CROSS_TARGET = {
     "trend_direction": "trend",
     "profit_quality": "momentum",
@@ -350,10 +352,7 @@ def _format_local_ai_tools(tools: dict[str, Any]) -> str:
         "time_series",
     )
     trend = (
-        payload_side(ts)
-        or ts.get("trend")
-        or ts.get("direction")
-        or ts.get("forecast_direction")
+        payload_side(ts) or ts.get("trend") or ts.get("direction") or ts.get("forecast_direction")
     )
     if signal_paper_eligibility(ts, str(trend or "")).get("eligible") is True:
         distribution = signal_return_distribution(ts, str(trend or ""))
@@ -462,59 +461,16 @@ def _format_portfolio_profit_protection(context: dict[str, Any]) -> str:
     )
 
 
-def _strip_trailing_json_commas(text: str) -> str:
-    return re.sub(r",\s*([}\]])", r"\1", text)
-
-
-def _complete_json_tail(text: str) -> str | None:
-    stack: list[str] = []
-    in_string = False
-    escaped = False
-    for char in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            stack.append("}")
-        elif char == "[":
-            stack.append("]")
-        elif char in ("}", "]"):
-            if not stack or stack[-1] != char:
-                return None
-            stack.pop()
-    if in_string or not stack:
-        return None
-    trimmed = re.sub(r",\s*$", "", text.strip())
-    return f"{trimmed}{''.join(reversed(stack))}"
-
-
 def _parse_json_candidate(candidate: str) -> dict | None:
-    variants: list[str] = []
     base = candidate.strip()
-    if base:
-        variants.extend([base, _strip_trailing_json_commas(base)])
-        completed = _complete_json_tail(base)
-        if completed:
-            variants.extend([completed, _strip_trailing_json_commas(completed)])
-
-    seen: set[str] = set()
-    for variant in variants:
-        if not variant or variant in seen:
-            continue
-        seen.add(variant)
-        try:
-            parsed = json.loads(variant)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
+    if not base:
+        return None
+    try:
+        parsed = json.loads(base)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
     return None
 
 
@@ -565,7 +521,7 @@ def _extract_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s*```$", "", text).strip()
 
-    # Strategy 1: direct parse, plus conservative tail repair.
+    # Strategy 1: strict JSON parse.
     parsed = _parse_json_candidate(text)
     if parsed is not None:
         return parsed
@@ -596,44 +552,6 @@ def _extract_json(text: str) -> dict:
             return parsed
 
     raise LLMResponseParseError(f"Could not extract valid JSON from: {text[:300]}")
-
-
-def _extract_truncated_expert_diagnostic(text: str) -> dict[str, Any] | None:
-    """Recover only a completed minimal expert verdict from a truncated response."""
-
-    cleaned = _strip_qwen_thinking(text).strip()
-    action_match = re.search(
-        r'"action"\s*:\s*"(long|short|close_long|close_short|hold)"',
-        cleaned,
-        re.IGNORECASE,
-    )
-    confidence_match = re.search(
-        r'"confidence"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+))',
-        cleaned,
-    )
-    reasoning_match = re.search(r'"reasoning"\s*:\s*"((?:\\.|[^"\\])*)"', cleaned)
-    if action_match is None or confidence_match is None or reasoning_match is None:
-        return None
-    try:
-        reasoning = json.loads(f'"{reasoning_match.group(1)}"')
-    except json.JSONDecodeError:
-        return None
-    return {
-        "action": action_match.group(1).lower(),
-        "confidence": _bounded_number(confidence_match.group(1), maximum=1.0),
-        "reasoning": str(reasoning)[:150],
-        "position_size_pct": 0.0,
-        "suggested_leverage": 1.0,
-        "stop_loss_pct": 0.0,
-        "take_profit_pct": 0.0,
-        "suggested_holding_minutes": 0.0,
-        "maximum_holding_minutes": 0.0,
-        "suggested_close_fraction": 0.0,
-        "cross_check_for": None,
-        "truncated_diagnostic_recovery": True,
-        "production_eligible": False,
-        "production_permission": False,
-    }
 
 
 def _normalize_cross_check(value: Any, own_role: str) -> dict[str, str] | None:
@@ -681,21 +599,8 @@ def _is_reasoning_model(model: str | None) -> bool:
     return is_openai_reasoning_model(model)
 
 
-def _is_qwen3_model(model: str | None) -> bool:
-    return is_qwen3_model(model)
-
-
 def _uses_thinking_tags(model: str | None) -> bool:
     return uses_thinking_tags(model)
-
-
-def _backup_model_names(model: str | None) -> list[str]:
-    """Provider-compatible backups used only when the configured model fails."""
-    current = str(model or "").strip()
-    if _is_qwen3_model(current):
-        return []
-    candidates = ["qwen3-max", "deepseek-v3", "claude-opus-4-7"]
-    return [m for m in candidates if m and m != current][:2]
 
 
 def _messages_for_model(
@@ -759,21 +664,6 @@ def _provider_response_contract(response: Any) -> dict[str, Any]:
         "reasoning_tokens": output_token_details.get("reasoning")
         or completion_token_details.get("reasoning_tokens"),
     }
-
-
-def _exception_completion_content(error: BaseException) -> str:
-    """Extract provider completion text preserved by length-limit exceptions."""
-
-    completion = getattr(error, "completion", None)
-    if completion is None:
-        return ""
-    choices = getattr(completion, "choices", None)
-    if not isinstance(choices, (list, tuple)) or not choices:
-        return ""
-    message = getattr(choices[0], "message", None)
-    if message is None:
-        return ""
-    return _message_content_text(message)
 
 
 def _strip_qwen_thinking(text: str) -> str:
@@ -1122,7 +1012,7 @@ class LLMAgent(AbstractAIModel):
                 raise RuntimeError(f"{self.name} has an invalid model API base") from exc
             if hostname not in {"127.0.0.1", "localhost", "::1"}:
                 raise RuntimeError(f"{self.name} requires an API key for a non-loopback endpoint")
-            client_api_key = "local-loopback"
+            client_api_key = "local"
 
         kwargs: dict[str, Any] = {
             "base_url": self._base_url,
@@ -1287,153 +1177,89 @@ class LLMAgent(AbstractAIModel):
         if paper_mode and not fast_expert_mode:
             system_prompt = f"{system_prompt}\n{_PAPER_MULTIDIMENSIONAL_PLAN_PROMPT}"
 
-        # Retry configured model first. In expert mode, try provider-compatible
-        # backup AI models before falling back to conservative local rules.
-        models_to_try = [self._model_name]
-        if expert_mode and not decision_maker_mode:
-            models_to_try.extend(_backup_model_names(self._model_name))
-
+        # The configured model is the only local inference carrier. Explicit
+        # cloud review is routed by high_risk_review_service, never implicitly.
         last_error = ""
-        primary_model = self._model_name
-        for model_name in models_to_try:
-            llm = (
-                self._create_llm(model_name, fast_expert=True)
-                if fast_expert_mode
-                else (self._llm if model_name == primary_model else self._create_llm(model_name))
-            )
-            if llm is None:
-                raise RuntimeError(f"LLM client for {model_name} is not initialized")
-            # Fast experts must be one provider request. Backup providers are
-            # still available, but parse/transport retries are not nested.
-            attempt_limit = 1 if fast_expert_mode else self._max_retries + 1
-            for attempt in range(attempt_limit):
-                content = ""
-                response_contract: dict[str, Any] = {}
-                try:
-                    messages = _messages_for_model(system_prompt, user_prompt, model_name)
-                    async with _bounded_llm_capacity_slot(context):
-                        if _LLM_CALL_DELAY:
-                            await asyncio.sleep(_LLM_CALL_DELAY)
-                        request = llm.ainvoke(messages)
-                        try:
-                            deadline = float(context.get("_analysis_deadline_monotonic"))
-                        except (TypeError, ValueError):
-                            deadline = 0.0
-                        if deadline > 0:
-                            remaining = max(
-                                deadline - asyncio.get_running_loop().time() - 0.1,
-                                0.05,
-                            )
-                            response = await asyncio.wait_for(request, timeout=remaining)
-                        else:
-                            response = await request
-                    response_contract = _provider_response_contract(response)
-                    content = _message_content_text(response)
-                    if not content.strip():
-                        if response_contract["reasoning_only"]:
-                            raise LLMResponseParseError(
-                                f"模型 {model_name} 只返回推理内容，未返回最终 JSON"
-                            )
-                        raise LLMResponseParseError(f"模型 {model_name} 返回空内容")
-
-                    parsed = _extract_json(content)
-                    parsed["provider_model"] = model_name
-                    parsed["provider_response_contract"] = response_contract
-                    if model_name != primary_model:
-                        parsed["fallback_from"] = primary_model
-
-                    decision = self._decision_from_parsed(parsed, features, context)
-                    if model_name != primary_model:
-                        decision.reasoning += (
-                            f" [备用模型：{primary_model} 无有效输出，改用 {model_name}]"
+        model_name = self._model_name
+        llm = self._create_llm(model_name, fast_expert=True) if fast_expert_mode else self._llm
+        if llm is None:
+            raise RuntimeError(f"LLM client for {model_name} is not initialized")
+        attempt_limit = 1 if fast_expert_mode else self._max_retries + 1
+        for attempt in range(attempt_limit):
+            content = ""
+            response_contract: dict[str, Any] = {}
+            try:
+                messages = _messages_for_model(system_prompt, user_prompt, model_name)
+                async with _bounded_llm_capacity_slot(context):
+                    if _LLM_CALL_DELAY:
+                        await asyncio.sleep(_LLM_CALL_DELAY)
+                    request = llm.ainvoke(messages)
+                    try:
+                        deadline = float(context.get("_analysis_deadline_monotonic"))
+                    except (TypeError, ValueError):
+                        deadline = 0.0
+                    if deadline > 0:
+                        remaining = max(
+                            deadline - asyncio.get_running_loop().time() - 0.1,
+                            0.05,
                         )
-
-                    logger.info(
-                        "llm decision",
-                        name=self.name,
-                        provider_model=model_name,
-                        symbol=features.symbol,
-                        action=decision.action.value,
-                        confidence=decision.confidence,
-                    )
-                    return decision
-
-                except LLMResponseParseError as e:
-                    last_error = safe_error_text(e)
-                    if expert_mode and not decision_maker_mode:
-                        recovered = _extract_truncated_expert_diagnostic(content)
-                        if recovered is not None:
-                            recovered["provider_model"] = model_name
-                            recovered["provider_response_contract"] = response_contract
-                            recovered["parse_error"] = last_error
-                            decision = self._decision_from_parsed(
-                                recovered,
-                                features,
-                                context,
-                            )
-                            logger.warning(
-                                "truncated expert diagnostic recovered",
-                                name=self.name,
-                                model=model_name,
-                                attempt=attempt,
-                            )
-                            return decision
-                    logger.warning(
-                        "llm parse error",
-                        name=self.name,
-                        model=model_name,
-                        attempt=attempt,
-                        error=last_error,
-                    )
-                except Exception as e:
-                    exception_content = _exception_completion_content(e)
-                    if expert_mode and not decision_maker_mode and exception_content:
-                        recovered_payload = _first_balanced_json_object(
-                            _strip_qwen_thinking(exception_content)
+                        response = await asyncio.wait_for(request, timeout=remaining)
+                    else:
+                        response = await request
+                response_contract = _provider_response_contract(response)
+                content = _message_content_text(response)
+                if not content.strip():
+                    if response_contract["reasoning_only"]:
+                        raise LLMResponseParseError(
+                            f"模型 {model_name} 只返回推理内容，未返回最终 JSON"
                         )
-                        if recovered_payload is not None:
-                            recovered_payload = dict(recovered_payload)
-                            recovered_payload["provider_model"] = model_name
-                            recovered_payload["provider_truncated"] = True
-                            recovered_payload["production_eligible"] = False
-                            recovered_payload["production_permission"] = False
-                            recovered_payload["truncated_json_recovery"] = True
-                            recovered_payload["provider_response_contract"] = {
-                                **response_contract,
-                                "truncated": True,
-                                "truncated_json_recovery": True,
-                            }
-                            recovered_decision = self._decision_from_parsed(
-                                recovered_payload,
-                                features,
-                                context,
-                            )
-                            logger.warning(
-                                "truncated expert JSON recovered from provider completion",
-                                name=self.name,
-                                model=model_name,
-                                attempt=attempt,
-                            )
-                            return recovered_decision
-                    err_msg = safe_error_text(e)
-                    if (
-                        "model_dump" in err_msg
-                        or "JSONDecodeError" in err_msg
-                        or "Expecting value" in err_msg
-                    ):
-                        err_msg = f"API proxy returned empty or invalid response (模型名 '{model_name}' 可能不被该代理支持)"
-                    last_error = err_msg
-                    logger.error(
-                        "llm api error",
-                        name=self.name,
-                        model=model_name,
-                        attempt=attempt,
-                        error=err_msg,
-                    )
+                    raise LLMResponseParseError(f"模型 {model_name} 返回空内容")
 
-        if expert_mode and not decision_maker_mode:
-            logger.warning("expert local fallback used", name=self.name, error=last_error)
-        return self._local_expert_fallback(features, context, last_error)
+                parsed = _extract_json(content)
+                parsed["provider_model"] = model_name
+                parsed["provider_response_contract"] = response_contract
+                decision = self._decision_from_parsed(parsed, features, context)
+
+                logger.info(
+                    "llm decision",
+                    name=self.name,
+                    provider_model=model_name,
+                    symbol=features.symbol,
+                    action=decision.action.value,
+                    confidence=decision.confidence,
+                )
+                return decision
+
+            except LLMResponseParseError as e:
+                last_error = safe_error_text(e)
+                logger.warning(
+                    "llm parse error",
+                    name=self.name,
+                    model=model_name,
+                    attempt=attempt,
+                    error=last_error,
+                )
+            except Exception as e:
+                err_msg = safe_error_text(e)
+                if (
+                    "model_dump" in err_msg
+                    or "JSONDecodeError" in err_msg
+                    or "Expecting value" in err_msg
+                ):
+                    err_msg = f"API proxy returned empty or invalid response (模型名 '{model_name}' 可能不被该代理支持)"
+                last_error = err_msg
+                logger.error(
+                    "llm api error",
+                    name=self.name,
+                    model=model_name,
+                    attempt=attempt,
+                    error=err_msg,
+                )
+
+        raise ModelInferenceError(
+            f"expert model {self.name} unavailable after retries: "
+            f"{safe_error_text(last_error or 'no provider response', limit=240)}"
+        )
 
     async def decide_batch_experts(
         self,
@@ -1727,42 +1553,6 @@ class LLMAgent(AbstractAIModel):
             decision.maximum_holding_minutes = decision.suggested_holding_minutes
 
         return decision
-
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        del context
-        snapshot = features.to_dict()
-        return DecisionOutput(
-            model_name=self.name,
-            symbol=features.symbol,
-            action=Action.HOLD,
-            confidence=0.0,
-            reasoning="AI 模型没有返回可治理的收益判断，本轮只记录观察，不执行交易。",
-            position_size_pct=0.0,
-            suggested_leverage=1.0,
-            stop_loss_pct=0.0,
-            take_profit_pct=0.0,
-            cross_check_for=None,
-            raw_response={
-                "local_fallback": True,
-                "production_eligible": False,
-                "provider_model": self._model_name,
-                "fallback_reason": "model_output_unavailable",
-                "call_failure_status": (
-                    "timeout"
-                    if "timeout" in str(error or "").lower()
-                    or "timed out" in str(error or "").lower()
-                    or "瓒呮椂" in str(error or "")
-                    else "call_failed"
-                ),
-                "error": error,
-            },
-            feature_snapshot=snapshot,
-        )
 
     async def reinitialize(self) -> None:
         """Recreate the ChatOpenAI instance with current config."""

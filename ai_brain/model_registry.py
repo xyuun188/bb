@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
+from ai_brain.base_model import AbstractAIModel, DecisionOutput
 from ai_brain.expert_diversity_policy import (
     ExpertDiversityReview,
     review_batch_expert_consensus,
@@ -24,25 +24,10 @@ from data_feed.feature_vector import FeatureVector
 
 logger = structlog.get_logger(__name__)
 
-LocalExpertFallback = Callable[[FeatureVector, dict[str, Any], str], DecisionOutput]
 BatchExpertDecider = Callable[
     [FeatureVector, dict[str, Any], list[str]],
     Awaitable[dict[str, DecisionOutput]],
 ]
-
-
-class LocalExpertFallbackModel(Protocol):
-    """Protocol for LLM-style experts that expose a local deterministic fallback."""
-
-    name: str
-
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        """Return a deterministic fallback decision for this expert."""
 
 
 class BatchExpertModel(Protocol):
@@ -61,16 +46,8 @@ class BatchExpertModel(Protocol):
         """Return expert decisions keyed by expert name."""
 
 
-def _local_fallback_callable(model: AbstractAIModel) -> LocalExpertFallback | None:
-    method = getattr(model, "_local_expert_fallback", None)
-    return method if callable(method) else None
-
-
 def _batch_expert_decider(model: AbstractAIModel) -> BatchExpertDecider | None:
     if getattr(model, "_llm", None) is None:
-        return None
-    model_name = str(getattr(model, "_model_name", "") or "").lower()
-    if "deepseek" in model_name or "r1" in model_name:
         return None
     method = getattr(model, "decide_batch_experts", None)
     return method if callable(method) else None
@@ -190,10 +167,7 @@ def _bounded_analysis_timeout(
 def _analysis_budget_reason(snapshot: dict[str, Any] | None) -> str:
     scope = str((snapshot or {}).get("scope") or "analysis")
     remaining = float((snapshot or {}).get("remaining_seconds") or 0.0)
-    return (
-        f"{scope} 剩余分析预算仅 {remaining:.2f} 秒，已跳过慢模型调用并使用本地保守结果；"
-        "下一轮将使用最新行情重新分析。"
-    )
+    return f"{scope} 剩余分析预算仅 {remaining:.2f} 秒，未执行模型调用；本轮没有可用的专家决策。"
 
 
 def _attach_analysis_budget_timing(
@@ -347,7 +321,9 @@ class ModelRegistry:
         if analysis_budget is not None:
             context["_analysis_budget"] = dict(analysis_budget)
             if float(analysis_budget["remaining_seconds"] or 0.0) <= 0:
-                context.setdefault("_skip_llm_experts_reason", _analysis_budget_reason(analysis_budget))
+                context.setdefault(
+                    "_skip_llm_experts_reason", _analysis_budget_reason(analysis_budget)
+                )
                 context["_analysis_budget_deferred"] = True
 
         batchable_names = {
@@ -358,77 +334,35 @@ class ModelRegistry:
             "risk_expert",
         }
         skip_llm_reason = context.get("_skip_llm_experts_reason")
-        if (
-            skip_llm_reason
-            and active_models
-            and {model.name for model in active_models}.issubset(batchable_names)
-        ):
-            started_at = datetime.now(UTC)
-            fallback_decisions: dict[str, DecisionOutput] = {}
-            fallback_timings: list[dict[str, Any]] = []
+        if skip_llm_reason and active_models:
             reason = str(skip_llm_reason)[:240]
-            budget_deferred = bool(context.get("_analysis_budget_deferred"))
-            for model in active_models:
-                local_fallback = _local_fallback_callable(model)
-                if local_fallback is not None:
-                    decision = local_fallback(
-                        features,
-                        {**context, "expert_mode": True},
-                        reason,
-                    )
-                else:
-                    decision = DecisionOutput(
-                        model_name=model.name,
-                        symbol=features.symbol,
-                        action=Action.HOLD,
-                        confidence=0.0,
-                        reasoning="市场快筛未发现正期望机会，本轮跳过大模型专家，快速观望。",
-                        position_size_pct=0.0,
-                        suggested_leverage=1.0,
-                        stop_loss_pct=0.0,
-                        take_profit_pct=0.0,
-                        cross_check_for=None,
-                        raw_response={
-                            "market_fast_prefilter": True,
-                            "provider_model": "local_fast_prefilter",
-                            "reason": reason,
-                        },
-                        feature_snapshot=features.to_dict(),
-                    )
-                decision.model_name = model.name
-                decision.raw_response = {
-                    **(decision.raw_response or {}),
-                    "market_fast_prefilter": True,
-                    "provider_model": "local_fast_prefilter",
-                    "reason": reason,
-                }
-                if budget_deferred:
-                    decision.raw_response["analysis_budget_deferred"] = dict(
-                        context.get("_analysis_budget") or {}
-                    )
-                fallback_decisions[model.name] = decision
-                fallback_timings.append(
-                    _attach_analysis_budget_timing(
-                        {
+            context["_model_timings"] = [
+                _attach_analysis_budget_timing(
+                    {
                         "stage": "expert_initial",
                         "name": model.name,
-                        "status": (
-                            "analysis_budget_deferred" if budget_deferred else "fast_prefilter"
-                        ),
-                        "started_at": started_at.isoformat(),
+                        "status": "analysis_budget_deferred",
+                        "started_at": datetime.now(UTC).isoformat(),
                         "duration_sec": 0.0,
                         "batch_expert": False,
                         "shared_batch_call": False,
-                        "action": decision.action.value,
-                        "confidence": decision.confidence,
-                        "provider_model": "local_fast_prefilter",
+                        "provider_model": _provider_model_name(model),
                         "reason": reason,
-                        },
-                        context.get("_analysis_budget"),
-                    )
+                    },
+                    context.get("_analysis_budget"),
                 )
-            context["_model_timings"] = fallback_timings
-            return fallback_decisions
+                for model in active_models
+            ]
+            context["_model_failures"].extend(
+                {
+                    "expert_name": model.name,
+                    "provider_model": _provider_model_name(model),
+                    "reason": reason,
+                    "status": "analysis_budget_deferred",
+                }
+                for model in active_models
+            )
+            return {}
 
         if (
             settings.ai_batch_experts_enabled
@@ -454,18 +388,28 @@ class ModelRegistry:
                 all_decisions.update(group_decisions)
                 all_timings.extend(group_timings)
 
-            diversity_review = review_batch_expert_consensus(features, context, all_decisions)
-            context["_expert_diversity_policy"] = diversity_review.to_dict()
-            if diversity_review.should_retry:
-                retry_decisions, retry_timings = await self._retry_independent_experts(
-                    features=features,
-                    context=context,
-                    active_models=active_models,
-                    original_decisions=all_decisions,
-                    review=diversity_review,
+            if all_decisions:
+                diversity_review = review_batch_expert_consensus(
+                    features,
+                    context,
+                    all_decisions,
                 )
-                all_decisions.update(retry_decisions)
-                all_timings.extend(retry_timings)
+                context["_expert_diversity_policy"] = diversity_review.to_dict()
+                if diversity_review.should_retry:
+                    retry_decisions, retry_timings = await self._retry_independent_experts(
+                        features=features,
+                        context=context,
+                        active_models=active_models,
+                        original_decisions=all_decisions,
+                        review=diversity_review,
+                    )
+                    all_decisions.update(retry_decisions)
+                    all_timings.extend(retry_timings)
+            else:
+                context["_expert_diversity_policy"] = {
+                    "status": "no_valid_decisions",
+                    "should_retry": False,
+                }
             context["_model_timings"] = all_timings
             return all_decisions
 
@@ -477,37 +421,6 @@ class ModelRegistry:
             # causing vLLM queueing and truncated responses.
             context["_force_fast_independent_expert"] = True
             context["_provider_independent_expert_mode"] = True
-
-        def _timeout_fallback_decision(
-            model: AbstractAIModel,
-            duration: float,
-            timeout_seconds: float,
-        ) -> DecisionOutput:
-            provider_model = getattr(model, "_model_name", None)
-            reason = (
-                f"{model.name} 超过 {timeout_seconds:.0f} 秒未返回，本轮按中性处理，"
-                "不参与方向投票，避免行情信号过期。"
-            )
-            return DecisionOutput(
-                model_name=model.name,
-                symbol=features.symbol,
-                action=Action.HOLD,
-                confidence=0.0,
-                reasoning=reason,
-                position_size_pct=0.0,
-                suggested_leverage=1.0,
-                stop_loss_pct=0.0,
-                take_profit_pct=0.0,
-                cross_check_for=None,
-                raw_response={
-                    "timeout_fallback": True,
-                    "provider_model": provider_model,
-                    "timeout_seconds": timeout_seconds,
-                    "duration_sec": duration,
-                    "reason": reason,
-                },
-                feature_snapshot=features.to_dict(),
-            )
 
         async def _timed_decide(
             model: AbstractAIModel,
@@ -526,25 +439,20 @@ class ModelRegistry:
                 )
             except TimeoutError:
                 duration = round(time.perf_counter() - perf_started, 3)
-                result = _timeout_fallback_decision(model, duration, timeout_seconds)
                 return (
                     model,
-                    result,
+                    TimeoutError(
+                        f"expert model {model.name} timed out after {timeout_seconds:.1f}s"
+                    ),
                     {
                         "stage": "expert_initial",
                         "name": model.name,
-                        "status": "timeout_fallback",
+                        "status": "timeout",
                         "started_at": started_at.isoformat(),
                         "duration_sec": duration,
                         "timeout_seconds": timeout_seconds,
-                        "action": result.action.value,
-                        "confidence": result.confidence,
-                        "provider_model": (
-                            result.raw_response.get("provider_model")
-                            if result.raw_response
-                            else None
-                        ),
-                        "reason": result.reasoning,
+                        "provider_model": _provider_model_name(model),
+                        "reason": f"expert model timed out after {timeout_seconds:.1f}s",
                     },
                 )
             except Exception as exc:
@@ -571,34 +479,16 @@ class ModelRegistry:
                 "duration_sec": duration,
             }
             if isinstance(result, DecisionOutput):
-                fallback_status = ""
-                if isinstance(result.raw_response, dict) and result.raw_response.get(
-                    "local_fallback"
-                ):
-                    fallback_status = str(
-                        result.raw_response.get("call_failure_status") or "call_failed"
-                    )
                 timing.update(
                     {
                         "action": result.action.value,
                         "confidence": result.confidence,
-                        "status": fallback_status or timing["status"],
                     }
                 )
-                if fallback_status:
-                    timing["reason"] = str(
-                        result.raw_response.get("error") or result.reasoning or ""
-                    )[:240]
                 if isinstance(result.raw_response, dict):
                     provider_model = result.raw_response.get("provider_model")
-                    fallback_from = result.raw_response.get("fallback_from")
-                    local_fallback = bool(result.raw_response.get("local_fallback"))
                     if provider_model:
                         timing["provider_model"] = provider_model
-                    if fallback_from:
-                        timing["fallback_from"] = fallback_from
-                    if local_fallback:
-                        timing["local_fallback"] = True
             return model, result, timing
 
         tasks = [_timed_decide(model) for model in active_models]
@@ -667,8 +557,6 @@ class ModelRegistry:
                 retry_context,
                 provider_group,
                 batch_model,
-                started_at,
-                _positive_duration_seconds(perf_started),
                 reason,
                 status="batch_not_supported_independent",
             )
@@ -689,10 +577,8 @@ class ModelRegistry:
                 context,
                 provider_group,
                 batch_model,
-                started_at,
-                round(time.perf_counter() - perf_started, 3),
                 reason,
-                status="circuit_breaker_fallback",
+                status="circuit_breaker_independent",
             )
 
         try:
@@ -706,19 +592,34 @@ class ModelRegistry:
             )
             if batch_timeout <= 0:
                 reason = _analysis_budget_reason(budget_snapshot)
-                fallback, fallback_timings = self._batch_local_fallback_decisions(
-                    features,
-                    context,
-                    provider_group,
-                    batch_model,
-                    started_at,
-                    _positive_duration_seconds(perf_started),
-                    reason,
-                    status="analysis_budget_deferred",
+                timings = [
+                    _attach_analysis_budget_timing(
+                        {
+                            "stage": "expert_initial",
+                            "name": model.name,
+                            "status": "analysis_budget_deferred",
+                            "started_at": started_at.isoformat(),
+                            "duration_sec": 0.0,
+                            "batch_expert": True,
+                            "shared_batch_call": True,
+                            "batch_model_count": len(provider_group),
+                            "provider_model": _provider_model_name(batch_model),
+                            "reason": reason,
+                        },
+                        budget_snapshot,
+                    )
+                    for model in provider_group
+                ]
+                context["_model_failures"].extend(
+                    {
+                        "expert_name": model.name,
+                        "provider_model": _provider_model_name(model),
+                        "reason": reason,
+                        "status": "analysis_budget_deferred",
+                    }
+                    for model in provider_group
                 )
-                for timing in fallback_timings:
-                    _attach_analysis_budget_timing(timing, budget_snapshot)
-                return fallback, fallback_timings
+                return {}, timings
 
             result = await asyncio.wait_for(
                 batch_decider(features, context, expert_names),
@@ -797,10 +698,8 @@ class ModelRegistry:
                 context,
                 provider_group,
                 batch_model,
-                started_at,
-                duration,
                 f"batch expert failed: {error_text}",
-                status="batch_fallback",
+                status="batch_failed_independent",
             )
 
     async def _retry_provider_group_independently(
@@ -809,32 +708,48 @@ class ModelRegistry:
         context: dict[str, Any],
         active_models: list[AbstractAIModel],
         batch_model: AbstractAIModel,
-        started_at: datetime,
-        duration: float,
         reason: str,
         *,
         status: str,
     ) -> tuple[dict[str, DecisionOutput], list[dict[str, Any]]]:
-        """Retry each expert with a real LLM call before using synthetic batch fallback."""
+        """Retry each expert with a real provider call after batch failure."""
 
         retry_budget_timeout, retry_budget = _bounded_analysis_timeout(
             context,
             _independent_expert_timeout_seconds(len(active_models)),
         )
         if retry_budget is not None and retry_budget_timeout <= 0:
-            fallback, fallback_timings = self._batch_local_fallback_decisions(
-                features,
-                context,
-                active_models,
-                batch_model,
-                started_at,
-                duration,
-                _analysis_budget_reason(retry_budget),
-                status="analysis_budget_deferred",
+            reason = _analysis_budget_reason(retry_budget)
+            timings = [
+                _attach_analysis_budget_timing(
+                    {
+                        "stage": "expert_independent_provider",
+                        "name": model.name,
+                        "status": "analysis_budget_deferred",
+                        "started_at": datetime.now(UTC).isoformat(),
+                        "duration_sec": 0.0,
+                        "timeout_seconds": 0.0,
+                        "batch_expert": False,
+                        "shared_batch_call": False,
+                        "batch_failure_status": status,
+                        "provider_independent_expert_mode": True,
+                        "provider_model": _provider_model_name(model),
+                        "reason": reason,
+                    },
+                    retry_budget,
+                )
+                for model in active_models
+            ]
+            context["_model_failures"].extend(
+                {
+                    "expert_name": model.name,
+                    "provider_model": _provider_model_name(model),
+                    "reason": reason,
+                    "status": "analysis_budget_deferred",
+                }
+                for model in active_models
             )
-            for timing in fallback_timings:
-                _attach_analysis_budget_timing(timing, retry_budget)
-            return fallback, fallback_timings
+            return {}, timings
 
         retry_context = dict(context)
         retry_context["expert_mode"] = True
@@ -908,27 +823,25 @@ class ModelRegistry:
                     _provider_model_name(model) or _provider_model_name(batch_model),
                 )
                 result.raw_response = raw
-                local_fallback = bool(raw.get("local_fallback"))
                 return (
                     model,
                     result,
                     _attach_analysis_budget_timing(
                         {
-                        "stage": "expert_independent_provider",
-                        "name": model.name,
-                        "status": "completed",
-                        "started_at": retry_started_at.isoformat(),
-                        "duration_sec": retry_duration,
-                        "timeout_seconds": timeout_seconds,
-                        "batch_expert": False,
-                        "shared_batch_call": False,
-                        "batch_failure_status": status,
-                        "provider_independent_expert_mode": True,
-                        "local_fallback": local_fallback,
-                        "action": result.action.value,
-                        "confidence": result.confidence,
-                        "provider_model": raw.get("provider_model"),
-                        "reason": reason[:240],
+                            "stage": "expert_independent_provider",
+                            "name": model.name,
+                            "status": "completed",
+                            "started_at": retry_started_at.isoformat(),
+                            "duration_sec": retry_duration,
+                            "timeout_seconds": timeout_seconds,
+                            "batch_expert": False,
+                            "shared_batch_call": False,
+                            "batch_failure_status": status,
+                            "provider_independent_expert_mode": True,
+                            "action": result.action.value,
+                            "confidence": result.confidence,
+                            "provider_model": raw.get("provider_model"),
+                            "reason": reason[:240],
                         },
                         budget_snapshot,
                     ),
@@ -949,18 +862,18 @@ class ModelRegistry:
                     None,
                     _attach_analysis_budget_timing(
                         {
-                        "stage": "expert_independent_provider",
-                        "name": model.name,
-                        "status": "independent_provider_failed",
-                        "started_at": retry_started_at.isoformat(),
-                        "duration_sec": retry_duration,
-                        "timeout_seconds": timeout_seconds,
-                        "batch_expert": False,
-                        "shared_batch_call": False,
-                        "batch_failure_status": status,
-                        "provider_independent_expert_mode": True,
-                        "provider_model": _provider_model_name(model),
-                        "reason": error_text,
+                            "stage": "expert_independent_provider",
+                            "name": model.name,
+                            "status": "independent_provider_failed",
+                            "started_at": retry_started_at.isoformat(),
+                            "duration_sec": retry_duration,
+                            "timeout_seconds": timeout_seconds,
+                            "batch_expert": False,
+                            "shared_batch_call": False,
+                            "batch_failure_status": status,
+                            "provider_independent_expert_mode": True,
+                            "provider_model": _provider_model_name(model),
+                            "reason": error_text,
                         },
                         budget_snapshot if "budget_snapshot" in locals() else None,
                     ),
@@ -970,69 +883,13 @@ class ModelRegistry:
         results = await asyncio.gather(*[_retry_one(model) for model in active_models])
         retry_decisions: dict[str, DecisionOutput] = {}
         retry_timings: list[dict[str, Any]] = []
-        failed_models: list[AbstractAIModel] = []
-        failed_reasons: dict[str, str] = {}
-        for model, decision, timing, error_text in results:
+        for model, decision, timing, _error_text in results:
             if isinstance(decision, DecisionOutput) and isinstance(timing, dict):
                 retry_decisions[model.name] = decision
                 retry_timings.append(timing)
             else:
                 if isinstance(timing, dict):
                     retry_timings.append(timing)
-                failed_models.append(model)
-                failed_reasons[model.name] = error_text
-        if not failed_models:
-            return retry_decisions, retry_timings
-
-        fallback, fallback_timings = self._batch_local_fallback_decisions(
-            features,
-            context,
-            failed_models,
-            batch_model,
-            started_at,
-            duration,
-            reason,
-            status="independent_provider_fallback",
-        )
-        for row in fallback_timings:
-            name = str(row.get("name") or "")
-            row["independent_retry_failed"] = True
-            row["independent_retry_status"] = "independent_provider_failed"
-            try:
-                row["duration_sec"] = max(float(row.get("duration_sec") or 0.0), 0.001)
-            except (TypeError, ValueError):
-                row["duration_sec"] = 0.001
-            if failed_reasons.get(name):
-                row["independent_retry_error"] = failed_reasons[name][:240]
-                row["reason"] = failed_reasons[name][:240]
-        retry_decisions.update(fallback)
-        fallback_by_name = {
-            str(row.get("name") or ""): row
-            for row in fallback_timings
-            if isinstance(row, dict) and row.get("name")
-        }
-        merged_timings: list[dict[str, Any]] = []
-        replaced_names: set[str] = set()
-        for row in retry_timings:
-            name = str(row.get("name") or "")
-            if name and name in fallback_by_name:
-                fallback_row = fallback_by_name[name]
-                try:
-                    retry_duration = float(row.get("duration_sec") or 0.0)
-                except (TypeError, ValueError):
-                    retry_duration = 0.0
-                fallback_row["duration_sec"] = max(
-                    float(fallback_row.get("duration_sec") or 0.0),
-                    retry_duration,
-                )
-                merged_timings.append(fallback_row)
-                replaced_names.add(name)
-            else:
-                merged_timings.append(row)
-        for name, row in fallback_by_name.items():
-            if name not in replaced_names:
-                merged_timings.append(row)
-        retry_timings = merged_timings
         return retry_decisions, retry_timings
 
     async def _retry_independent_experts(
@@ -1141,20 +998,23 @@ class ModelRegistry:
                         "reasoning": original.reasoning,
                     }
                 result.raw_response = raw
-                timing: dict[str, Any] = _attach_analysis_budget_timing({
-                    "stage": "expert_independent_retry",
-                    "name": model.name,
-                    "status": "completed",
-                    "started_at": started_at.isoformat(),
-                    "duration_sec": duration,
-                    "timeout_seconds": timeout_seconds,
-                    "action": result.action.value,
-                    "confidence": result.confidence,
-                    "replaces_batch_decision": True,
-                    "objective_side": review.objective_evidence.side,
-                    "objective_score": review.objective_evidence.score,
-                    "provider_independent_expert_mode": True,
-                }, budget_snapshot)
+                timing: dict[str, Any] = _attach_analysis_budget_timing(
+                    {
+                        "stage": "expert_independent_retry",
+                        "name": model.name,
+                        "status": "completed",
+                        "started_at": started_at.isoformat(),
+                        "duration_sec": duration,
+                        "timeout_seconds": timeout_seconds,
+                        "action": result.action.value,
+                        "confidence": result.confidence,
+                        "replaces_batch_decision": True,
+                        "objective_side": review.objective_evidence.side,
+                        "objective_score": review.objective_evidence.score,
+                        "provider_independent_expert_mode": True,
+                    },
+                    budget_snapshot,
+                )
                 if isinstance(result.raw_response, dict) and result.raw_response.get(
                     "provider_model"
                 ):
@@ -1171,14 +1031,14 @@ class ModelRegistry:
                     None,
                     _attach_analysis_budget_timing(
                         {
-                        "stage": "expert_independent_retry",
-                        "name": model.name,
-                        "status": "failed",
-                        "started_at": started_at.isoformat(),
-                        "duration_sec": duration,
-                        "timeout_seconds": timeout_seconds,
-                        "reason": error_text,
-                        "replaces_batch_decision": False,
+                            "stage": "expert_independent_retry",
+                            "name": model.name,
+                            "status": "failed",
+                            "started_at": started_at.isoformat(),
+                            "duration_sec": duration,
+                            "timeout_seconds": timeout_seconds,
+                            "reason": error_text,
+                            "replaces_batch_decision": False,
                         },
                         budget_snapshot if "budget_snapshot" in locals() else None,
                     ),
@@ -1193,75 +1053,6 @@ class ModelRegistry:
                 retry_decisions[name] = decision
         return retry_decisions, retry_timings
 
-    def _batch_local_fallback_decisions(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        active_models: list[AbstractAIModel],
-        batch_model: AbstractAIModel,
-        started_at: datetime,
-        duration: float,
-        reason: str,
-        *,
-        status: str,
-    ) -> tuple[dict[str, DecisionOutput], list[dict[str, Any]]]:
-        fallback_decisions: dict[str, DecisionOutput] = {}
-        fallback_timings: list[dict[str, Any]] = []
-        for model in active_models:
-            local_fallback = _local_fallback_callable(model)
-            if local_fallback is not None:
-                decision = local_fallback(
-                    features,
-                    {**context, "expert_mode": True},
-                    reason[:160],
-                )
-            else:
-                decision = DecisionOutput(
-                    model_name=model.name,
-                    symbol=features.symbol,
-                    action=Action.HOLD,
-                    confidence=0.0,
-                    reasoning="批量专家暂不可用，使用快速本地观望兜底。",
-                    position_size_pct=0.0,
-                    suggested_leverage=1.0,
-                    stop_loss_pct=0.0,
-                    take_profit_pct=0.0,
-                    cross_check_for=None,
-                    raw_response={
-                        "batch_expert_fallback": True,
-                        "provider_model": _provider_model_name(batch_model),
-                        "reason": reason[:240],
-                    },
-                    feature_snapshot=features.to_dict(),
-                )
-            decision.model_name = model.name
-            decision.raw_response = {
-                **(decision.raw_response or {}),
-                "batch_expert": True,
-                "batch_expert_fallback": True,
-                "provider_model": _provider_model_name(batch_model),
-                "reason": reason[:240],
-            }
-            fallback_decisions[model.name] = decision
-            fallback_timings.append(
-                {
-                    "stage": "expert_initial",
-                    "name": model.name,
-                    "status": status,
-                    "started_at": started_at.isoformat(),
-                    "duration_sec": duration,
-                    "batch_expert": True,
-                    "shared_batch_call": True,
-                    "batch_model_count": len(active_models),
-                    "duration_kind": "shared_wall_time",
-                    "action": decision.action.value,
-                    "confidence": decision.confidence,
-                    "provider_model": _provider_model_name(batch_model),
-                    "reason": reason[:240],
-                }
-            )
-        return fallback_decisions, fallback_timings
-
     @staticmethod
     def _batch_timing_status(batch_decision: Any) -> str:
         if not isinstance(batch_decision, DecisionOutput):
@@ -1269,8 +1060,6 @@ class ModelRegistry:
         raw = batch_decision.raw_response
         if isinstance(raw, dict) and raw.get("batch_not_supported_independent"):
             return "completed"
-        if isinstance(raw, dict) and raw.get("batch_expert_fallback"):
-            return "partial_batch_fallback"
         return "completed"
 
     def get_state(self) -> dict:

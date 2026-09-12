@@ -22,10 +22,9 @@ def _decision(name: str, *, raw: dict | None = None, reasoning: str = "有效证
     )
 
 
-def test_quality_contract_does_not_count_fallback_as_success() -> None:
+def test_quality_contract_does_not_count_timeout_as_success() -> None:
     opinions = {
         "trend_expert": _decision("trend_expert"),
-        "risk_expert": _decision("risk_expert", raw={"timeout_fallback": True}),
     }
     contract = build_expert_call_contract(
         expected_names=("trend_expert", "risk_expert"),
@@ -33,13 +32,13 @@ def test_quality_contract_does_not_count_fallback_as_success() -> None:
         opinions=opinions,
         timings=[
             {"name": "trend_expert", "status": "completed"},
-            {"name": "risk_expert", "status": "timeout_fallback", "reason": "timeout"},
+            {"name": "risk_expert", "status": "timeout", "reason": "timeout"},
         ],
         failures=[],
     )
 
     assert contract["successful_expert_count"] == 1
-    assert contract["returned_expert_count"] == 2
+    assert contract["returned_expert_count"] == 1
     assert contract["status_counts"]["timeout"] == 1
     assert contract["expert_complete"] is False
     assert set(usable_expert_opinions(opinions, contract)) == {"trend_expert"}

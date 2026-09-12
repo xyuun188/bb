@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -489,43 +488,24 @@ async def test_dashboard_ai_model_api_base_is_normalized_before_persisting(
             "/api/settings/ai-models/trend_expert",
             json={
                 "name": "trend_expert",
-                "api_base": " https://model.example.invalid/v1/ ",
+                "api_base": " http://127.0.0.1:18000/v1/ ",
                 "api_key": "",
-                "model": "qwen3-32b-trade",
+                "model": "qwen3.8-27b",
             },
         )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["model"]["api_base"] == "https://model.example.invalid/v1"
+    assert body["model"]["api_base"] == "http://127.0.0.1:18000/v1"
     assert captured_updates
-    assert "https://model.example.invalid/v1" in captured_updates[-1]["AI_MODELS"]
+    assert "http://127.0.0.1:18000/v1" in captured_updates[-1]["AI_MODELS"]
 
 
 @pytest.mark.asyncio
-async def test_dashboard_ai_model_connection_error_is_redacted(
+async def test_dashboard_ai_model_connection_rejects_external_fixed_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
-
-    class FakeChatOpenAI:
-        def __init__(self, **kwargs: Any) -> None:
-            self.kwargs = kwargs
-
-        async def ainvoke(self, messages: list[Any]) -> object:
-            raise RuntimeError(f"Authorization: Bearer {leaked_value} is invalid")
-
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
-    monkeypatch.setitem(
-        sys.modules,
-        "langchain_core.messages",
-        SimpleNamespace(HumanMessage=_FakeHumanMessage),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "langchain_openai",
-        SimpleNamespace(ChatOpenAI=FakeChatOpenAI),
-    )
     app = create_app()
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
 
@@ -542,59 +522,53 @@ async def test_dashboard_ai_model_connection_error_is_redacted(
     assert response.status_code == 200
     body = response.json()
     assert body["success"] is False
-    assert leaked_value not in body["error"]
-    assert "Authorization: ***" in body["error"]
+    assert "qwen3.8-27b" in body["error"]
 
 
 @pytest.mark.asyncio
-async def test_dashboard_ai_model_connection_success_response_is_redacted(
+async def test_dashboard_ai_model_connection_success_verifies_target_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    leaked_value = "abcdefghijklmnopqrstuvwxyz123456"
-    captured_kwargs: dict[str, Any] = {}
-    captured_prompts: list[str] = []
+    original_async_client = httpx.AsyncClient
 
-    class FakeChatOpenAI:
-        def __init__(self, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
 
-        async def ainvoke(self, messages: list[Any]) -> object:
-            captured_prompts.extend(str(getattr(message, "content", "")) for message in messages)
-            return SimpleNamespace(content=f"Authorization: Bearer {leaked_value} accepted")
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "qwen3.8-27b"}]},
+                request=request,
+            )
 
     monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
-    monkeypatch.setitem(
-        sys.modules,
-        "langchain_core.messages",
-        SimpleNamespace(HumanMessage=_FakeHumanMessage),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "langchain_openai",
-        SimpleNamespace(ChatOpenAI=FakeChatOpenAI),
-    )
+    monkeypatch.setattr(settings_api_module.httpx, "AsyncClient", FakeAsyncClient)
     app = create_app()
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with original_async_client(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/api/settings/ai-models/test",
             json={
-                "api_base": "https://model.example.invalid/v1/",
-                "api_key": "test-model-key",
-                "model": "Qwen/Qwen3-32B-AWQ",
+                "api_base": "http://127.0.0.1:18000/v1/",
+                "api_key": "",
+                "model": "qwen3.8-27b",
             },
         )
 
     assert response.status_code == 200
     body = response.json()
     assert body["success"] is True
-    assert leaked_value not in body["message"]
-    assert "Authorization: ***" in body["message"]
-    assert captured_kwargs["base_url"] == "https://model.example.invalid/v1"
-    assert captured_kwargs["max_tokens"] == 10
-    assert captured_kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
-    assert any("/no_think" in prompt for prompt in captured_prompts)
+    assert body["model"] == "qwen3.8-27b"
+    assert "identity verified" in body["message"]
 
 
 @pytest.mark.asyncio

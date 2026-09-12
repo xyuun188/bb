@@ -756,41 +756,6 @@ def test_non_hard_risk_caution_is_observation_only() -> None:
     assert cautious.raw_response["authoritative_return_candidate"]["production_eligible"] is True
 
 
-def test_local_fallback_is_trace_only_and_has_zero_effective_weight() -> None:
-    opinions = _strong_long_opinions()
-    opinions["trend_expert"].raw_response = {
-        "local_fallback": True,
-        "production_eligible": False,
-    }
-
-    decision = _coordinator().combine(_features(), _return_context(), opinions)
-
-    trend = next(
-        item for item in decision.raw_response["opinions"] if item["model_name"] == "trend_expert"
-    )
-    assert decision.action == Action.LONG
-    assert trend["trace_only_fallback"] is True
-    assert trend["effective_weight"] == 0.0
-    assert trend["weight_policy"]["production_permission"] is False
-
-
-def test_local_fallback_risk_opinion_cannot_veto_authoritative_return_entry() -> None:
-    opinions = _strong_long_opinions(risk_action=Action.SHORT, risk_confidence=0.99)
-    opinions["risk_expert"].raw_response = {
-        "local_fallback": True,
-        "production_eligible": False,
-    }
-
-    decision = _coordinator().combine(_features(), _return_context(), opinions)
-
-    risk = next(
-        item for item in decision.raw_response["opinions"] if item["model_name"] == "risk_expert"
-    )
-    assert decision.action == Action.LONG
-    assert risk["effective_weight"] == 0.0
-    assert decision.raw_response["risk_expert_policy"]["hard_veto"] is False
-
-
 def test_same_provider_roles_share_one_total_weight_budget() -> None:
     opinions = _strong_long_opinions()
     for decision in opinions.values():

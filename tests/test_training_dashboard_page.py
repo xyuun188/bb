@@ -23,7 +23,8 @@ def test_training_page_is_independent_from_main_dashboard() -> None:
     assert "model.display_name" in script
     assert "model.blocking_reasons" in script
     assert "本地 ML 费后收益质量" in script
-    assert "线上 DeepSeek 最终决策" in script
+    assert "online_reviewer_cloud" in script
+    assert "云端高风险复核" in script
     assert "model.model_family" not in script
     assert "new AbortController()" in script
     assert "registry: 45_000" in script

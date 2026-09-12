@@ -24,17 +24,15 @@ import paramiko
 
 from config.settings import settings
 from core.model_topology import (
-    LEGACY_SHADOW_PROFILE,
+    DEFAULT_MODEL_TOPOLOGY_PROFILE,
     TARGET_SINGLE_MODEL_PROFILE,
-    model_tunnel_routes,
     normalize_topology_profile,
 )
 from core.phase3_model_contract import (
-    PHASE3_DECISION_MODEL_ID,
-    PHASE3_EXPERT_MODEL_ID,
     PHASE3_PLATFORM_ENDPOINTS,
     PHASE3_QUANT_API_ID,
-    PHASE3_RISK_MODEL_ID,
+    PHASE3_TARGET_MODEL_ENDPOINT,
+    PHASE3_TARGET_MODEL_ID,
     PHASE3_TARGET_MODEL_TOPOLOGY,
 )
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
@@ -74,34 +72,14 @@ PLATFORM_SERVICE_NAMES = (
 )
 ONLINE_PHASE3_QUANT_API_PLATFORM_BASE = PHASE3_PLATFORM_ENDPOINTS[PHASE3_QUANT_API_ID]
 ONLINE_LOCAL_AI_TOOLS_PLATFORM_BASE = ONLINE_PHASE3_QUANT_API_PLATFORM_BASE
-ONLINE_PHASE3_DEFAULT_AI_MODELS = (
-    {
-        "name": "phase3_decision_maker",
-        "label": "Phase 3 decision maker",
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_DECISION_MODEL_ID],
-        "model": PHASE3_DECISION_MODEL_ID,
-    },
-    {
-        "name": "phase3_high_risk_review",
-        "label": "Phase 3 high-risk review",
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_RISK_MODEL_ID],
-        "model": PHASE3_RISK_MODEL_ID,
-    },
-    {
-        "name": "phase3_finquant_expert",
-        "label": "Phase 3 FinQuant expert",
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_EXPERT_MODEL_ID],
-        "model": PHASE3_EXPERT_MODEL_ID,
-    },
-)
 ONLINE_PHASE3_TUNNEL_CONTRACTS = (
     {
-        "name": PHASE3_DECISION_MODEL_ID,
+        "name": "target-single-model",
         "role": "decision_maker",
-        "capability": "create_strategy",
+        "capability": "create_strategy_and_expert",
         "local_port": 18_000,
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_DECISION_MODEL_ID],
-        "model": PHASE3_DECISION_MODEL_ID,
+        "api_base": PHASE3_TARGET_MODEL_ENDPOINT,
+        "model": PHASE3_TARGET_MODEL_ID,
     },
     {
         "name": "phase3-quant-api",
@@ -111,62 +89,17 @@ ONLINE_PHASE3_TUNNEL_CONTRACTS = (
         "api_base": ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
         "model": "",
     },
-    {
-        "name": PHASE3_RISK_MODEL_ID,
-        "role": "risk_review",
-        "capability": "risk_review",
-        "local_port": 18_002,
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_RISK_MODEL_ID],
-        "model": PHASE3_RISK_MODEL_ID,
-    },
-    {
-        "name": PHASE3_EXPERT_MODEL_ID,
-        "role": "expert_pool",
-        "capability": "finquant_expert",
-        "local_port": 18_003,
-        "api_base": PHASE3_PLATFORM_ENDPOINTS[PHASE3_EXPERT_MODEL_ID],
-        "model": PHASE3_EXPERT_MODEL_ID,
-    },
 )
 
 
 def active_phase3_tunnel_contracts() -> tuple[dict[str, Any], ...]:
     """Return the monitor contract matching the configured deployment profile."""
 
-    profile = normalize_topology_profile(
-        str(getattr(settings, "model_topology_profile", LEGACY_SHADOW_PROFILE) or "")
-    )
-    legacy_by_name = {str(item["name"]): item for item in ONLINE_PHASE3_TUNNEL_CONTRACTS}
-    target_contract = {
-        "name": "target-single-model",
-        "role": "decision_maker",
-        "capability": "create_strategy_and_expert",
-        "model": "",
-        "api_base": "http://127.0.0.1:18000/v1",
-    }
-    contracts: list[dict[str, Any]] = []
-    for route in model_tunnel_routes(profile):
-        if profile == TARGET_SINGLE_MODEL_PROFILE and route.name == "target-single-model":
-            item = dict(target_contract)
-        elif route.name == "phase3-quant-api":
-            item = dict(legacy_by_name["phase3-quant-api"])
-        else:
-            item = dict(legacy_by_name[route.name])
-        item["local_port"] = route.local_port
-        contracts.append(item)
-    return tuple(contracts)
+    configured_profile = getattr(settings, "model_topology_profile", None)
+    normalize_topology_profile(str(configured_profile or DEFAULT_MODEL_TOPOLOGY_PROFILE))
+    return tuple(dict(item) for item in ONLINE_PHASE3_TUNNEL_CONTRACTS)
 
 
-def active_phase3_default_ai_models() -> tuple[dict[str, Any], ...]:
-    """Return fallback probe routes for the active profile only."""
-
-    if normalize_topology_profile(
-        str(getattr(settings, "model_topology_profile", LEGACY_SHADOW_PROFILE) or "")
-    ) == TARGET_SINGLE_MODEL_PROFILE:
-        # The actual model id must come from the verified runtime AI_MODELS route.
-        # Never probe the qwen3.8 placeholder from PHASE3_TARGET_MODEL_TOPOLOGY.
-        return ()
-    return ONLINE_PHASE3_DEFAULT_AI_MODELS
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 InfoLoader = Callable[[Path], Any]
@@ -909,9 +842,54 @@ def _decision_runtime_row(ai_rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not isinstance(row, dict):
             continue
         model = str(row.get("model") or "").strip().lower()
-        if model and ("qwen" in model or "deepseek" in model):
+        if model and ("qwen3.8" in model or "qwen3_8" in model):
             return row
     return {}
+
+
+def _runtime_topology_profile(platform_runtime: dict[str, Any]) -> str:
+    """Return the only supported runtime profile."""
+
+    del platform_runtime
+    return normalize_topology_profile(
+        str(getattr(settings, "model_topology_profile", DEFAULT_MODEL_TOPOLOGY_PROFILE) or "")
+    )
+
+
+def _runtime_target_topology(ai_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build an honest target topology view from the live decision row."""
+
+    row = _decision_runtime_row(ai_rows)
+    model_id = str(row.get("model") or "").strip()
+    api_base = str(row.get("api_base") or "").strip().rstrip("/")
+    endpoint = api_base or "http://127.0.0.1:18000/v1"
+    return {
+        "profile": TARGET_SINGLE_MODEL_PROFILE,
+        "models": [
+            {
+                "model_id": model_id,
+                "role": "decision_and_expert_carrier",
+                "repo_id": None,
+                "revision": None,
+                "path": None,
+                "endpoint": endpoint,
+                "port": 18000,
+                "stage": "runtime_observed" if model_id else "candidate_not_configured",
+                "identity_complete": False,
+                "live_routing_enabled": False,
+            }
+        ],
+        "runtime_model_id": model_id,
+        "runtime_api_base": api_base,
+        "runtime_available": bool(row.get("available")),
+        "runtime_endpoint_ok": bool(row.get("endpoint_ok")),
+        "local_model_count_target": 1,
+        "cloud_reviewer_enabled": True,
+        "cloud_reviewer_required_for_high_risk_entry": True,
+        "live_routing_enabled": False,
+        "activation_blocked": True,
+        "source": "platform_runtime_probe",
+    }
 
 
 def _platform_model_tunnel_summary(
@@ -942,9 +920,10 @@ def _platform_model_tunnel_summary(
             model = decision_model
         is_decision_tunnel = str(spec.get("role") or "") == "decision_maker"
         is_quant_tunnel = str(spec.get("name") or "") == "phase3-quant-api"
+        # The target model tunnel is always required. A cloud route may review
+        # high-risk decisions, but it can never replace the local Qwen carrier
+        # used by the decision and expert paths.
         required = True
-        if is_decision_tunnel and decision_uses_external_route:
-            required = False
         if model:
             probe = rows_by_model.get(model, {})
             available = bool(probe.get("available"))
@@ -974,9 +953,8 @@ def _platform_model_tunnel_summary(
                 "error": str(probe.get("error") or ""),
             }
             if is_decision_tunnel and decision_uses_external_route:
-                row["status"] = "standby" if endpoint_ok else "standby_unavailable"
-                row["active_decision_model"] = decision_model
-                row["active_decision_api_base"] = decision_api_base
+                row["status"] = "invalid_external_route"
+                row["error"] = "decision_route_must_use_platform_loopback_18000"
         elif is_quant_tunnel:
             health = local_tools.get("health") if isinstance(local_tools.get("health"), dict) else {}
             status_probe = (
@@ -1047,13 +1025,15 @@ def _platform_model_tunnel_summary(
         (spec for spec in active_contracts if spec.get("role") == "decision_maker"),
         {},
     )
-    decision_tunnel_name = str(decision_spec.get("name") or PHASE3_DECISION_MODEL_ID)
+    decision_tunnel_name = str(decision_spec.get("name") or "target-single-model")
     local_decision_available = bool(by_name.get(decision_tunnel_name, {}).get("available"))
-    can_call_decision = bool(decision_available or local_decision_available)
-    if str(getattr(settings, "model_topology_profile", "legacy_shadow") or "").strip().lower() == TARGET_SINGLE_MODEL_PROFILE:
-        can_call_expert = local_decision_available
-    else:
-        can_call_expert = bool(by_name.get(PHASE3_EXPERT_MODEL_ID, {}).get("available"))
+    target_route_valid = bool(
+        decision_model == PHASE3_TARGET_MODEL_ID
+        and _normalized_base_url(decision_api_base)
+        == _normalized_base_url(PHASE3_TARGET_MODEL_ENDPOINT)
+    )
+    can_call_decision = bool(local_decision_available and target_route_valid)
+    can_call_expert = bool(local_decision_available and target_route_valid)
     can_call_quant_tool = bool(by_name.get("phase3-quant-api", {}).get("available"))
     blocker_codes = [
         f"tunnel_port_{int(row['local_port'])}_{str(row['status'] or 'unavailable')}"
@@ -1083,7 +1063,8 @@ def _platform_model_tunnel_summary(
             "available": decision_available,
             "endpoint_ok": decision_endpoint_ok,
             "external": decision_uses_external_route,
-            "fallback_local_available": local_decision_available,
+            "target_route_valid": target_route_valid,
+            "local_carrier_available": local_decision_available,
         },
         "can_call_expert": can_call_expert,
         "can_call_quant_tool": can_call_quant_tool,
@@ -1151,13 +1132,20 @@ def _platform_runtime_to_model_runtime(platform_runtime: dict[str, Any]) -> dict
             (
                 row
                 for row in endpoint_rows
-                if row.get("provider_model") == PHASE3_DECISION_MODEL_ID
+                if row.get("provider_model") == PHASE3_TARGET_MODEL_ID
             ),
             endpoint_rows[0] if endpoint_rows else {},
         ),
     )
+    profile = _runtime_topology_profile(platform_runtime)
+    target_topology = (
+        _runtime_target_topology([item for item in rows if isinstance(item, dict)])
+        if profile == TARGET_SINGLE_MODEL_PROFILE
+        else None
+    )
     return {
-        "target_model_topology": PHASE3_TARGET_MODEL_TOPOLOGY.to_dict(),
+        "topology_profile": profile,
+        "target_model_topology": target_topology,
         "vllm": dict(primary),
         "vllm_endpoints": endpoint_rows,
         "local_ai_tools": {
@@ -1315,15 +1303,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         fixed_model_rows = [
             cfg for cfg in settings.get_fixed_ai_models(include_empty=False) if isinstance(cfg, dict)
         ]
-        default_models_enabled = not any(
-            str(cfg.get("api_base") or "").strip() and str(cfg.get("model") or "").strip()
-            for cfg in fixed_model_rows
-        )
-        model_configs = list(fixed_model_rows)
-        if default_models_enabled:
-            model_configs.extend(active_phase3_default_ai_models())
-
-        for cfg in model_configs:
+        for cfg in fixed_model_rows:
             if not isinstance(cfg, dict) or cfg.get("enabled") is False:
                 continue
             api_base = str(cfg.get("api_base") or "").strip().rstrip("/")
@@ -1593,7 +1573,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     "child_endpoints": child_endpoints,
                 }
             )
-        # 加入 high_risk_review 独立模型（如 deepseek-r1-14b-risk）
+        # Include the explicitly configured cloud high-risk reviewer when present.
         hr_base = str(getattr(settings, "high_risk_review_api_base", "") or "").strip().rstrip("/")
         hr_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
         if hr_base and hr_model:
@@ -1631,11 +1611,18 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         "error": result.get("error", ""),
                     }
                 )
+    configured_profile = getattr(settings, "model_topology_profile", None)
+    profile = normalize_topology_profile(str(configured_profile or DEFAULT_MODEL_TOPOLOGY_PROFILE))
     return {
         "ai_models": ai_rows,
         "local_ai_tools": local_tools,
         "model_tunnels": _platform_model_tunnel_summary(ai_rows, local_tools),
-        "target_model_topology": PHASE3_TARGET_MODEL_TOPOLOGY.to_dict(),
+        "topology_profile": profile,
+        "target_model_topology": (
+            _runtime_target_topology(ai_rows)
+            if profile == TARGET_SINGLE_MODEL_PROFILE
+            else None
+        ),
         "checked_at": datetime.now(UTC).isoformat(),
     }
 

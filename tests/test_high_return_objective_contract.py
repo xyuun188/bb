@@ -127,7 +127,14 @@ def test_live_entry_pipeline_cannot_read_retired_return_target(
 
 
 def test_finquant_uses_sft_then_trl_dpo_return_preferences() -> None:
-    source = _source("scripts/finquant_expert_lora_training.py")
+    from core.finquant_remote_trainer import REMOTE_TRAINER_CODE
+
+    source = "\n".join(
+        (
+            _source("scripts/finquant_expert_lora_training.py"),
+            REMOTE_TRAINER_CODE,
+        )
+    )
 
     assert "from trl import DPOConfig, DPOTrainer" in source
     assert "low_win_high_payoff_vs_high_win_negative_expectancy" in source

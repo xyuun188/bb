@@ -5,7 +5,6 @@ All modules import settings from here. Single source of truth.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import re
@@ -19,6 +18,7 @@ from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from core.model_topology import TARGET_SINGLE_MODEL_ID
 from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
 ENSEMBLE_TRADER_NAME = "ensemble_trader"
@@ -28,14 +28,27 @@ ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
 
 
-def _keyless_loopback_model_configured(api_base: str, model: str) -> bool:
-    """Allow local model tunnels without inventing or persisting a fake secret."""
+def _is_target_local_model_config(api_base: str, model: str, api_key: str = "") -> bool:
+    """Validate the only permitted fixed trading-model route.
 
+    Fixed expert and final-decision roles share the same local carrier. Cloud
+    models belong exclusively to the separately configured high-risk reviewer;
+    accepting them here would silently recreate an unsupported multi-model
+    routing topology.
+    """
+
+    if str(api_key or "").strip() or str(model or "").strip().lower() != TARGET_SINGLE_MODEL_ID:
+        return False
     try:
-        hostname = str(urlparse(api_base).hostname or "").lower()
+        parsed = urlparse(str(api_base or "").strip())
     except ValueError:
         return False
-    return bool(model and hostname in {"127.0.0.1", "localhost", "::1"})
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and str(parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
+        and parsed.port == 18000
+        and parsed.path.rstrip("/") == "/v1"
+    )
 
 FIXED_AI_MODEL_SLOTS: list[dict[str, Any]] = [
     {
@@ -106,184 +119,37 @@ def _format_env_value(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _split_top_level_commas(value: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    depth = 0
-    quote = ""
-    escape = False
-    for idx, char in enumerate(value):
-        if quote:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == quote:
-                quote = ""
-            continue
-        if char in {"'", '"'}:
-            quote = char
-        elif char in "[{(":
-            depth += 1
-        elif char in "]})":
-            depth = max(depth - 1, 0)
-        elif char == "," and depth == 0:
-            parts.append(value[start:idx].strip())
-            start = idx + 1
-    tail = value[start:].strip()
-    if tail:
-        parts.append(tail)
-    return parts
-
-
-def _split_legacy_key_value(value: str) -> tuple[str, str] | None:
-    quote = ""
-    escape = False
-    depth = 0
-    for idx, char in enumerate(value):
-        if quote:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == quote:
-                quote = ""
-            continue
-        if char in {"'", '"'}:
-            quote = char
-        elif char in "[{(":
-            depth += 1
-        elif char in "]})":
-            depth = max(depth - 1, 0)
-        elif char == ":" and depth == 0:
-            return value[:idx].strip(), value[idx + 1 :].strip()
-    return None
-
-
-def _parse_scalar_env_value(value: str) -> Any:
-    text = value.strip()
-    if not text:
-        return ""
-    if (text.startswith("{") and text.endswith("}")) or (
-        text.startswith("[") and text.endswith("]")
-    ):
-        parsed = _parse_complex_env_value(text)
-        if parsed is not text:
-            return parsed
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            return parser(text)
-        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
-            pass
-    lowered = text.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    if lowered in {"none", "null"}:
-        return None
-    try:
-        number = float(text)
-    except ValueError:
-        return text.strip("'\"")
-    if number.is_integer() and not re.search(r"[.eE]", text):
-        return int(number)
-    return number
-
-
-def _parse_legacy_mapping(text: str) -> dict[str, Any] | None:
-    inner = text.strip()[1:-1].strip()
-    if not inner:
-        return {}
-    result: dict[str, Any] = {}
-    for item in _split_top_level_commas(inner):
-        pair = _split_legacy_key_value(item)
-        if pair is None:
-            return None
-        key, raw_value = pair
-        key = str(_parse_scalar_env_value(key)).strip()
-        if not key:
-            return None
-        result[key] = _parse_scalar_env_value(raw_value)
-    return result
-
-
-def _parse_legacy_sequence(text: str) -> list[Any] | None:
-    inner = text.strip()[1:-1].strip()
-    if not inner:
-        return []
-    return [_parse_scalar_env_value(item) for item in _split_top_level_commas(inner)]
-
-
-def _parse_complex_env_value(value: Any) -> Any:
+def _parse_json_env_value(value: Any) -> Any:
+    """Parse structured environment values strictly as JSON."""
     if not isinstance(value, str):
         return value
     text = value.strip()
     if not text:
         return None
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            return parser(text)
-        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
-            pass
-    if text.startswith("{") and text.endswith("}"):
-        parsed_map = _parse_legacy_mapping(text)
-        if parsed_map is not None:
-            return parsed_map
-    if text.startswith("[") and text.endswith("]"):
-        parsed_list = _parse_legacy_sequence(text)
-        if parsed_list is not None:
-            return parsed_list
-    return text
-
-
-def _parse_maybe_escaped_complex_env_value(value: str) -> Any:
-    text = value.strip()
-    if '\\"' in text and text.startswith(("[", "{")):
-        unescaped = text
-        for _ in range(3):
-            unescaped = unescaped.replace('\\"', '"')
-            parsed = _parse_complex_env_value(unescaped)
-            if parsed is not unescaped:
-                return parsed
-    parsed = _parse_complex_env_value(value)
-    return parsed if parsed is not value else value
-
-
-def _wrapped_external_event_sources(value: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Recover a legacy write where the whole JSON source list was stored as one url."""
-    if set(value) - {"url"}:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
         return None
-    url_text = str(value.get("url") or "").strip()
-    if not url_text or not url_text.startswith(("[", "{")):
-        return None
-    parsed = _parse_maybe_escaped_complex_env_value(url_text)
-    if parsed is url_text:
-        return None
-    sources = parse_external_event_scraper_sources_value(parsed)
-    return sources or None
 
 
 def parse_external_event_scraper_sources_value(v: Any) -> list[dict[str, Any]]:
     if isinstance(v, str):
-        if not v.strip():
+        text = v.strip()
+        if not text:
             return []
-        parsed = _parse_maybe_escaped_complex_env_value(v)
-        if parsed is not v:
+        parsed = _parse_json_env_value(text) if text.startswith(("[", "{")) else None
+        if parsed is not None:
             return parse_external_event_scraper_sources_value(parsed)
-        return [{"url": item.strip()} for item in _split_top_level_commas(v) if item.strip()]
+        return [{"url": item.strip()} for item in text.split(",") if item.strip()]
     if isinstance(v, dict):
-        wrapped = _wrapped_external_event_sources(v)
-        return wrapped if wrapped is not None else [dict(v)]
+        return [dict(v)]
     if isinstance(v, list):
         sources: list[dict[str, Any]] = []
         for item in v:
             if isinstance(item, dict):
-                wrapped = _wrapped_external_event_sources(item)
-                if wrapped is not None:
-                    sources.extend(wrapped)
-                else:
-                    sources.append(dict(item))
+                sources.append(dict(item))
             elif str(item or "").strip():
-                sources.extend(parse_external_event_scraper_sources_value(str(item).strip()))
+                sources.append({"url": str(item).strip()})
         return sources
     return []
 
@@ -348,11 +214,15 @@ class Settings(BaseSettings):
     local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
     # Deployment profile is explicit so monitors and sync scripts cannot drift
     # into incompatible tunnel contracts.
-    model_topology_profile: str = "legacy_shadow"
+    model_topology_profile: str = Field(
+        default="target_single_model", validation_alias="BB_MODEL_TOPOLOGY_PROFILE"
+    )
     high_risk_review_enabled: bool = True
     high_risk_review_api_base: str = ""
     high_risk_review_api_key: str = ""
-    high_risk_review_model: str = "deepseek-reasoner"
+    # Cloud reviewer identity must be supplied explicitly by the deployment;
+    # no provider-specific model is a safe default.
+    high_risk_review_model: str = ""
     high_risk_review_model_revision: str = ""
     high_risk_review_timeout_seconds: float = 30.0
     high_risk_review_max_tokens: int = 480
@@ -428,6 +298,7 @@ class Settings(BaseSettings):
     vector_memory_news_index_limit: int = 1500
     vector_memory_auto_reindex_enabled: bool = True
     vector_memory_auto_reindex_interval_seconds: int = 1800
+    vector_memory_operation_timeout_seconds: float = 2.0
 
     # --- Risk Management ---
 
@@ -509,7 +380,7 @@ class Settings(BaseSettings):
     @classmethod
     def parse_symbols(cls, v: Any) -> list[str]:
         if isinstance(v, str):
-            parsed = _parse_complex_env_value(v)
+            parsed = _parse_json_env_value(v)
             if isinstance(parsed, list):
                 return [str(item).strip() for item in parsed if str(item).strip()]
             return [s.strip() for s in v.split(",") if s.strip()]
@@ -523,7 +394,7 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             if not v.strip():
                 return []
-            parsed = _parse_complex_env_value(v)
+            parsed = _parse_json_env_value(v)
             if isinstance(parsed, list):
                 return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in v.split(",") if item.strip()]
@@ -552,7 +423,7 @@ class Settings(BaseSettings):
     @classmethod
     def parse_model_balances(cls, v: Any) -> dict[str, float]:
         if isinstance(v, str):
-            parsed = _parse_complex_env_value(v)
+            parsed = _parse_json_env_value(v)
             if isinstance(parsed, dict):
                 return {str(k): float(val) for k, val in parsed.items() if val is not None}
             return {}
@@ -567,7 +438,7 @@ class Settings(BaseSettings):
     @classmethod
     def parse_execution_account_maps(cls, v: Any) -> dict[str, float]:
         if isinstance(v, str):
-            parsed = _parse_complex_env_value(v)
+            parsed = _parse_json_env_value(v)
             if not isinstance(parsed, dict):
                 return {}
             return {str(k): float(val) for k, val in parsed.items() if val is not None}
@@ -581,7 +452,7 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             if not v.strip():
                 return []
-            parsed = _parse_complex_env_value(v)
+            parsed = _parse_json_env_value(v)
             if isinstance(parsed, dict):
                 return [parsed]
             if isinstance(parsed, list):
@@ -612,21 +483,21 @@ class Settings(BaseSettings):
             }
             if "balance" in cfg:
                 merged["balance"] = cfg["balance"]
-            configured = bool(
-                merged.get("api_key")
-                or _keyless_loopback_model_configured(
-                    str(merged.get("api_base") or ""),
-                    str(merged.get("model") or ""),
-                )
-            )
+            api_base = str(merged.get("api_base") or "")
+            model = str(merged.get("model") or "")
+            api_key = str(merged.get("api_key") or "")
+            has_route = bool(api_base or model or api_key)
+            configured = _is_target_local_model_config(api_base, model, api_key)
             merged["configured"] = configured
             merged["configuration_type"] = (
-                "api_key"
-                if merged.get("api_key")
-                else "keyless_loopback"
+                "target_local"
                 if configured
+                else "invalid_target_local"
+                if has_route
                 else "missing"
             )
+            if has_route and not configured:
+                merged["config_error"] = "fixed_roles_require_qwen3.8-27b_platform_loopback"
             if include_empty or configured:
                 result.append(merged)
         return result
@@ -653,6 +524,13 @@ class Settings(BaseSettings):
             "model": str(updates.get("model", existing.get("model", "")) or "").strip(),
             "enabled": bool(updates.get("enabled", existing.get("enabled", True))),
         }
+        has_route = bool(updated["api_base"] or updated["model"] or updated["api_key"])
+        if has_route and not _is_target_local_model_config(
+            updated["api_base"],
+            updated["model"],
+            updated["api_key"],
+        ):
+            raise ValueError("fixed roles require qwen3.8-27b on platform loopback 18000")
         current[name] = updated
 
         ordered = []

@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 import services.strategy_signal_root_cause_audit as root_cause_module
+from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
 from services.trade_execution_contract import build_live_rules_canary_entry_contract
 from tests.paper_canary_fixtures import complete_paper_canary_raw

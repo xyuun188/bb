@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
+from ai_brain.base_model import AbstractAIModel, DecisionOutput
 from ai_brain.model_registry import ModelRegistry
 from data_feed.feature_vector import FeatureVector
 
@@ -24,39 +24,6 @@ class _FailingModel(AbstractAIModel):
         context: dict[str, Any],
     ) -> DecisionOutput:
         raise RuntimeError(self.error_text)
-
-    async def shutdown(self) -> None:
-        return None
-
-
-class _LocalFallbackModel(AbstractAIModel):
-    name = "trend_expert"
-
-    async def initialize(self) -> None:
-        return None
-
-    async def decide(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-    ) -> DecisionOutput:
-        raise AssertionError("fast prefilter should use the local fallback")
-
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        return DecisionOutput(
-            model_name=self.name,
-            symbol=features.symbol,
-            action=Action.HOLD,
-            confidence=0.11,
-            reasoning=f"local fallback used: {error}",
-            raw_response={"local_fallback_called": True},
-            feature_snapshot=features.to_dict(),
-        )
 
     async def shutdown(self) -> None:
         return None
@@ -88,16 +55,13 @@ async def test_model_failure_context_is_redacted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fast_prefilter_uses_local_fallback_callable() -> None:
+async def test_analysis_budget_returns_no_synthetic_expert_decision() -> None:
     registry = ModelRegistry()
-    registry.register(_LocalFallbackModel())
-    context: dict[str, Any] = {"_skip_llm_experts_reason": "fast prefilter"}
+    registry.register(_FailingModel("must not be called"))
+    context: dict[str, Any] = {"_skip_llm_experts_reason": "analysis budget exhausted"}
 
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
-    decision = decisions["trend_expert"]
-    assert decision.raw_response is not None
-    assert decision.raw_response["local_fallback_called"] is True
-    assert decision.raw_response["market_fast_prefilter"] is True
-    assert decision.raw_response["provider_model"] == "local_fast_prefilter"
-    assert context["_model_timings"][0]["status"] == "fast_prefilter"
+    assert decisions == {}
+    assert context["_model_timings"][0]["status"] == "analysis_budget_deferred"
+    assert context["_model_failures"][0]["status"] == "analysis_budget_deferred"

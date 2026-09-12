@@ -136,7 +136,12 @@ class EnsembleCoordinator:
         base_expert_context = self._base_expert_context(context)
         all_attempted: list[str] = []
         all_failures: list[dict[str, Any]] = []
-        returned_opinions, expert_context, expert_timing, model_timings = await self._run_expert_pass(
+        (
+            returned_opinions,
+            expert_context,
+            expert_timing,
+            model_timings,
+        ) = await self._run_expert_pass(
             features,
             base_expert_context,
             include_names=self._initial_expert_names(context),
@@ -157,15 +162,11 @@ class EnsembleCoordinator:
 
         # Step 2/3: requested cross-checks and trend-expert deep consultation.
         validation_timing: dict[str, Any] = {
-            "_analysis_budget_scope": str(
-                context.get("_analysis_budget_scope") or "shared"
-            ),
+            "_analysis_budget_scope": str(context.get("_analysis_budget_scope") or "shared"),
             "_analysis_deadline_monotonic": context.get("_analysis_deadline_monotonic"),
             "_analysis_budget_seconds": context.get("_analysis_budget_seconds"),
             "_consultation_reuse_key": context.get("_consultation_reuse_key"),
-            "_consultation_reuse_ttl_seconds": context.get(
-                "_consultation_reuse_ttl_seconds"
-            ),
+            "_consultation_reuse_ttl_seconds": context.get("_consultation_reuse_ttl_seconds"),
         }
         cross_validations, consultation = await self.cross_validator.validate_all(
             opinions, validation_timing
@@ -415,7 +416,6 @@ class EnsembleCoordinator:
         source_group_multiplier: float,
         review_positions: bool,
         current_side: str | None,
-        trace_only_fallback: bool,
     ) -> tuple[float, dict[str, Any]]:
         """Weight expert observations without granting production permission."""
 
@@ -432,15 +432,6 @@ class EnsembleCoordinator:
         }
         if source_group_multiplier != 1.0:
             policy["source_group_multiplier"] = round(source_group_multiplier, 8)
-        if trace_only_fallback:
-            policy.update(
-                {
-                    "mode": "trace_only_fallback",
-                    "effective_weight": 0.0,
-                    "excluded_reason": "fallback opinion is trace-only",
-                }
-            )
-            return 0.0, policy
         del name, review_positions, current_side
         policy["effective_weight"] = round(grouped_weight, 6)
         return grouped_weight, policy
@@ -468,19 +459,11 @@ class EnsembleCoordinator:
                 1.0,
             )
             multiplier = min(max(multiplier, 0.0), 2.0)
-            raw_decision = self._safe_dict(decision.raw_response)
-            trace_only = bool(
-                raw_decision.get("timeout_fallback")
-                or raw_decision.get("local_fallback")
-                or raw_decision.get("batch_expert_fallback")
-                or raw_decision.get("production_eligible") is False
-            )
             group = self._expert_source_group(name, decision)
             candidates[name] = {
                 "dynamic_multiplier": multiplier,
-                "raw_weight": 0.0 if trace_only else base_weight * multiplier,
+                "raw_weight": base_weight * multiplier,
                 "source_group": group,
-                "trace_only": trace_only,
             }
             groups.setdefault(group, []).append(name)
 
@@ -588,10 +571,6 @@ class EnsembleCoordinator:
 
     def _expert_source_group(self, name: str, decision: DecisionOutput | None) -> str:
         provider = self._decision_provider_model(name, decision)
-        if provider in {"local_fast_prefilter", "local_rules", ""}:
-            return f"local:{name}"
-        if name == "risk_expert" and "deepseek" in provider.lower():
-            return "llm:risk_review"
         return f"llm:{provider}"
 
     def _support_source_groups(
@@ -716,12 +695,7 @@ class EnsembleCoordinator:
                     or getattr(self.registry.get(name), "_model_name", "")
                     or name
                 )
-            if provider in {"local_fast_prefilter", "local_rules", ""}:
-                group = f"local:{name}"
-            elif name == "risk_expert" and "deepseek" in provider.lower():
-                group = "llm:risk_review"
-            else:
-                group = f"llm:{provider}"
+            group = f"llm:{provider}"
             row = groups.setdefault(
                 group,
                 {"experts": [], "provider_model": provider, "source_type": "llm"},
@@ -787,14 +761,6 @@ class EnsembleCoordinator:
                 allocation.get("source_group_multiplier"),
                 1.0,
             )
-            raw_decision = self._safe_dict(decision.raw_response)
-            timeout_fallback = bool(raw_decision.get("timeout_fallback"))
-            trace_only_fallback = bool(
-                timeout_fallback
-                or raw_decision.get("local_fallback")
-                or raw_decision.get("batch_expert_fallback")
-                or raw_decision.get("production_eligible") is False
-            )
             effective_weight, weight_policy = self._effective_expert_weight(
                 name=name,
                 base_weight=base_weight,
@@ -802,7 +768,6 @@ class EnsembleCoordinator:
                 source_group_multiplier=source_group_multiplier,
                 review_positions=review_positions,
                 current_side=str(current_side) if current_side else None,
-                trace_only_fallback=trace_only_fallback,
             )
             weight = base_weight * dynamic_multiplier
             score = ACTION_SCORE.get(decision.action, 0.0)
@@ -849,8 +814,6 @@ class EnsembleCoordinator:
                     "excluded_reason": weight_policy.get("excluded_reason"),
                     "reasoning": decision.reasoning,
                     "cross_check_for": decision.cross_check_for,
-                    "timeout_fallback": timeout_fallback,
-                    "trace_only_fallback": trace_only_fallback,
                     "independent_expert_retry": bool(
                         isinstance(decision.raw_response, dict)
                         and decision.raw_response.get("independent_expert_retry")
@@ -981,16 +944,12 @@ class EnsembleCoordinator:
                 )
             paper_selection = select_normal_paper_trade_side(support_by_side)
             selected_side = str(paper_selection.get("selected_side") or "neutral")
-            selected_support = self._safe_dict(
-                paper_selection.get("selected_support")
-            )
+            selected_support = self._safe_dict(paper_selection.get("selected_support"))
             normal_contract = (
                 build_normal_paper_trade_contract(
                     symbol=features.symbol,
                     side=selected_side,
-                    selection_reason=str(
-                        paper_selection.get("selection_reason") or ""
-                    ),
+                    selection_reason=str(paper_selection.get("selection_reason") or ""),
                     direction_support=selected_support,
                     decision_authority="ensemble",
                 )
@@ -1000,16 +959,17 @@ class EnsembleCoordinator:
             if normal_contract:
                 action = Action.LONG if selected_side == "long" else Action.SHORT
                 quality_observation = (
-                    normal_contract.get("selection_reason")
-                    == "paper_quality_observation"
+                    normal_contract.get("selection_reason") == "paper_quality_observation"
                 )
-                loss_probability = self._finite_or_none(
-                    selected_support.get("loss_probability")
+                loss_probability = self._finite_or_none(selected_support.get("loss_probability"))
+                confidence = (
+                    min(
+                        max(1.0 - loss_probability, 0.05),
+                        0.95,
+                    )
+                    if loss_probability is not None
+                    else 0.5
                 )
-                confidence = min(
-                    max(1.0 - loss_probability, 0.05),
-                    0.95,
-                ) if loss_probability is not None else 0.5
                 reason = self._reason(
                     (
                         "模型扣费后期望收益为正但稳健下界尚未转正，执行极小风险模拟盘质量观察做多"
@@ -1051,9 +1011,7 @@ class EnsembleCoordinator:
                     normalized_score,
                     4,
                 )
-                paper_raw["memory_feedback_observation"] = self._memory_feedback(
-                    context
-                )
+                paper_raw["memory_feedback_observation"] = self._memory_feedback(context)
                 paper_raw["ml_signal"] = context.get("ml_signal") or {}
                 paper_raw["local_ai_tools"] = context.get("local_ai_tools") or {}
                 return self._entry_decision(
@@ -1082,9 +1040,7 @@ class EnsembleCoordinator:
             }
             hold_raw["entry_permission"] = {
                 "granted": False,
-                "reason": str(
-                    paper_selection.get("selection_reason") or "no_direction"
-                ),
+                "reason": str(paper_selection.get("selection_reason") or "no_direction"),
                 "production_permission": False,
             }
             hold_raw["base_weighted_score_observation"] = round(
@@ -1101,9 +1057,7 @@ class EnsembleCoordinator:
             )
             return self._hold(features, reason, hold_raw)
 
-        preferred_side = str(
-            candidate_evidence.get("preferred_side_by_evidence") or ""
-        ).lower()
+        preferred_side = str(candidate_evidence.get("preferred_side_by_evidence") or "").lower()
         side_evidence = self._safe_dict(candidate_evidence.get(preferred_side))
         policy_provenance = self._safe_dict(side_evidence.get("policy_provenance"))
         governance_complete = all(
@@ -1119,11 +1073,9 @@ class EnsembleCoordinator:
         return_candidate_eligible = bool(
             preferred_side in {"long", "short"}
             and side_evidence.get("production_eligible") is True
-            and self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0)
-            > 0.0
+            and self._safe_float(side_evidence.get("expected_net_return_pct"), 0.0) > 0.0
             and self._safe_float(side_evidence.get("return_lcb_pct"), 0.0) > 0.0
-            and self._safe_float(side_evidence.get("production_source_count"), 0.0)
-            > 0.0
+            and self._safe_float(side_evidence.get("production_source_count"), 0.0) > 0.0
             and governance_complete
         )
         direction_support = assess_directional_entry_support(
@@ -1158,9 +1110,7 @@ class EnsembleCoordinator:
                 consultation,
             )
             self._attach_expert_diversity_policy(hold_raw, context)
-            hold_raw["authoritative_return_candidate"] = raw[
-                "authoritative_return_candidate"
-            ]
+            hold_raw["authoritative_return_candidate"] = raw["authoritative_return_candidate"]
             hold_raw["entry_candidate_evidence"] = candidate_evidence
             hold_raw["independent_direction_support"] = direction_support
             hold_raw["entry_permission"] = {
@@ -1457,10 +1407,7 @@ class EnsembleCoordinator:
         if side not in {"long", "short"}:
             return False
         prediction = self._local_timeseries_signal(context)
-        if (
-            not prediction
-            or signal_paper_eligibility(prediction, side).get("eligible") is not True
-        ):
+        if not prediction or signal_paper_eligibility(prediction, side).get("eligible") is not True:
             return False
         best_side = signal_payload_side(prediction)
         expected = self._local_expected_return(prediction, side)
@@ -1556,9 +1503,7 @@ class EnsembleCoordinator:
                     "weighted_direction_score": score,
                 },
                 "stronger_opportunity": stronger_opportunity,
-                "execution_mode": str(
-                    self._safe_dict(context).get("execution_mode") or ""
-                ).lower(),
+                "execution_mode": str(self._safe_dict(context).get("execution_mode") or "").lower(),
             },
             feature_snapshot=features.to_dict() if features is not None else {},
         )
@@ -1588,14 +1533,9 @@ class EnsembleCoordinator:
             },
             "rotate_to_stronger_opportunity": {
                 "evidence_available": bool(stronger_opportunity),
-                "eligible": (
-                    assessment.replacement_opportunity_eligible
-                    and assessment.eligible
-                ),
+                "eligible": (assessment.replacement_opportunity_eligible and assessment.eligible),
                 "candidate": (
-                    stronger_opportunity
-                    if assessment.replacement_opportunity_eligible
-                    else {}
+                    stronger_opportunity if assessment.replacement_opportunity_eligible else {}
                 ),
                 "replacement_pressure": assessment.replacement_pressure,
                 "creates_order": False,

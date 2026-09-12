@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from core.phase3_model_contract import (
-    PHASE3_DECISION_MODEL_ID,
-    PHASE3_DECISION_REPO_ID,
-    PHASE3_RISK_MODEL_ID,
-    PHASE3_RISK_REPO_ID,
+    PHASE3_TARGET_MODEL_ID,
+    PHASE3_TARGET_MODEL_PATH,
+    PHASE3_TARGET_MODEL_REPO_ID,
+    PHASE3_TARGET_SERVICE_NAME,
 )
 
 REMOTE_AI_ROOT = "/data/trade_ai"
@@ -24,7 +24,7 @@ REMOTE_RUNTIME_DIRS = (
     f"{REMOTE_AI_ROOT}/logs",
     f"{REMOTE_AI_ROOT}/hf_cache",
 )
-LEGACY_MAIN_LLM_SERVICES = (
+RETIRED_MAIN_LLM_SERVICES = (
     "deepseek-14b-main.service",
     "deepseek-32b-main.service",
     "qwen3-14b.service",
@@ -32,7 +32,7 @@ LEGACY_MAIN_LLM_SERVICES = (
     "qwen3-32b-main.service",
     "qwen3-32b-review.service",
 )
-LEGACY_LLM_SCRIPT_PATHS = (
+RETIRED_LLM_SCRIPT_PATHS = (
     f"{REMOTE_AI_ROOT}/scripts/start_deepseek_14b_main.sh",
     f"{REMOTE_AI_ROOT}/scripts/start_deepseek_32b_main.sh",
     f"{REMOTE_AI_ROOT}/scripts/start_qwen3_14b.sh",
@@ -454,64 +454,32 @@ class RemoteVllmServiceSpec:
         )
 
 
-QWEN3_14B_TRADE_SERVICE = RemoteVllmServiceSpec(
-    model_repo=PHASE3_DECISION_REPO_ID,
-    modelscope_model=PHASE3_DECISION_REPO_ID,
-    model_dir=f"{REMOTE_MODEL_ROOT}/Qwen/Qwen3-14B-AWQ",
-    served_model_name=PHASE3_DECISION_MODEL_ID,
-    service_name="bb-phase3-llm-decision.service",
-    description="Qwen3 14B AWQ vLLM trade experts API",
-    start_script_name="start_qwen3_14b_trade.sh",
-    download_script_name="download_qwen3_14b_awq.sh",
-    log_name="qwen3_14b_trade.log",
+QWEN3_8_27B_SERVICE = RemoteVllmServiceSpec(
+    model_repo=PHASE3_TARGET_MODEL_REPO_ID,
+    modelscope_model=PHASE3_TARGET_MODEL_REPO_ID,
+    model_dir=PHASE3_TARGET_MODEL_PATH,
+    served_model_name=PHASE3_TARGET_MODEL_ID,
+    service_name=PHASE3_TARGET_SERVICE_NAME,
+    description="Qwen3.8 27B single-carrier vLLM API",
+    start_script_name="start_qwen3_8_27b.sh",
+    download_script_name="download_qwen3_8_27b.sh",
+    log_name="qwen3_8_27b.log",
     port=8000,
-    max_model_len=8192,
-    gpu_memory_utilization=0.34,
-    max_num_seqs=2,
-    max_num_batched_tokens=8192,
-)
-
-DEEPSEEK_R1_14B_RISK_SERVICE = RemoteVllmServiceSpec(
-    model_repo=PHASE3_RISK_REPO_ID,
-    modelscope_model=PHASE3_RISK_REPO_ID,
-    model_dir=f"{REMOTE_MODEL_ROOT}/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
-    served_model_name=PHASE3_RISK_MODEL_ID,
-    service_name="bb-phase3-llm-risk-review.service",
-    description="DeepSeek R1 Distill Qwen 14B vLLM risk experts API",
-    start_script_name="start_deepseek_r1_14b_risk.sh",
-    download_script_name="download_deepseek_r1_14b.sh",
-    log_name="deepseek_r1_14b_risk.log",
-    port=8002,
     max_model_len=4096,
-    gpu_memory_utilization=0.62,
+    gpu_memory_utilization=0.80,
     quantization="awq_marlin",
-    enforce_eager=True,
-    max_num_seqs=2,
+    max_num_seqs=1,
     max_num_batched_tokens=4096,
-    use_modelscope=False,
-    download_max_workers=16,
-    hf_mirror_direct_files=(
-        ".gitattributes",
-        "README.md",
-        "config.json",
-        "generation_config.json",
-        "model.safetensors.index.json",
-        "special_tokens_map.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "model-00001-of-00002.safetensors",
-        "model-00002-of-00002.safetensors",
-    ),
 )
 
 
 def qwen3_main_cleanup_command() -> str:
     """Stop older LLM services and remove only known obsolete remote model paths."""
-    services = " ".join(shell_quote(service) for service in LEGACY_MAIN_LLM_SERVICES)
+    services = " ".join(shell_quote(service) for service in RETIRED_MAIN_LLM_SERVICES)
     service_files = " ".join(
-        f"/etc/systemd/system/{shell_quote(service)}" for service in LEGACY_MAIN_LLM_SERVICES
+        f"/etc/systemd/system/{shell_quote(service)}" for service in RETIRED_MAIN_LLM_SERVICES
     )
-    script_paths = " ".join(shell_quote(path) for path in LEGACY_LLM_SCRIPT_PATHS)
+    script_paths = " ".join(shell_quote(path) for path in RETIRED_LLM_SCRIPT_PATHS)
     model_paths = " ".join(shell_quote(path) for path in QWEN3_MAIN_REMOTE_MODEL_CLEANUP_PATHS)
     runtime_dirs = " ".join(
         shell_quote(path)

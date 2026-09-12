@@ -38,6 +38,9 @@ from web_dashboard.api.text_sanitize import sanitize_payload
 from web_dashboard.api.ws_endpoints import WebSocketManager
 
 logger = structlog.get_logger(__name__)
+_CONTINUOUS_OBSERVATION_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "run_continuous_observation.py"
+)
 PUBLIC_AUTH_PATHS = {
     "/login",
     "/api/auth/login",
@@ -114,11 +117,7 @@ async def _system_audit_history_loop() -> None:
 async def _continuous_observation_loop() -> None:
     """Run acceptance sampling outside the HTTP event loop."""
 
-    script_path = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "run_continuous_observation.py"
-    )
+    script_path = _CONTINUOUS_OBSERVATION_SCRIPT
     try:
         # The collector scans trade facts and can wait on remote probes.  A
         # child process prevents that work from stalling all HTTP requests.

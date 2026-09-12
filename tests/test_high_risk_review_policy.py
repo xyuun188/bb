@@ -9,7 +9,10 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.model_runtime import HIGH_RISK_REVIEW_TOKEN_CAP
-from services.entry_high_risk_review import EntryHighRiskReviewGatePolicy
+from services.entry_high_risk_review import (
+    EntryHighRiskReviewGatePolicy,
+    validate_cloud_reviewer_route,
+)
 from services.high_risk_review_service import (
     HighRiskReviewGatewayError,
     HighRiskReviewService,
@@ -22,10 +25,44 @@ def high_risk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "high_risk_review_api_base", "https://api.deepseek.com")
     monkeypatch.setattr(settings, "high_risk_review_api_key", "test-review-key")
     monkeypatch.setattr(settings, "high_risk_review_model", "deepseek-reasoner")
+    monkeypatch.setattr(settings, "high_risk_review_model_revision", "2026-08-01")
     monkeypatch.setattr(settings, "high_risk_review_timeout_seconds", 12.0)
     monkeypatch.setattr(settings, "high_risk_review_max_tokens", 420)
     monkeypatch.setattr(settings, "high_risk_review_circuit_breaker_failures", 1)
     monkeypatch.setattr(settings, "high_risk_review_circuit_breaker_cooldown_seconds", 60.0)
+
+
+@pytest.mark.parametrize(
+    ("api_base", "model", "revision", "api_key", "error"),
+    [
+        ("http://127.0.0.1:18002/v1", "review-model", "2026-08-01", "key", "cloud_reviewer_requires_https_without_credentials"),
+        ("https://127.0.0.1:18002/v1", "review-model", "2026-08-01", "key", "cloud_reviewer_must_not_use_loopback"),
+        ("https://review.example", "deepseek-r1-14b-risk", "2026-08-01", "key", "retired_local_reviewer_model"),
+        ("https://review.example", "review-model", "", "key", "cloud_reviewer_identity_incomplete"),
+        ("https://review.example", "review-model", "unknown", "key", "cloud_reviewer_identity_placeholder"),
+    ],
+)
+def test_cloud_reviewer_route_rejects_non_production_routes(
+    api_base: str,
+    model: str,
+    revision: str,
+    api_key: str,
+    error: str,
+) -> None:
+    valid, reason = validate_cloud_reviewer_route(api_base, model, revision, api_key)
+    assert valid is False
+    assert reason == error
+
+
+def test_cloud_reviewer_route_accepts_verified_public_https_identity() -> None:
+    valid, reason = validate_cloud_reviewer_route(
+        "https://review.example/v1",
+        "provider-risk-review-v2",
+        "2026-08-01",
+        "review-key",
+    )
+    assert valid is True
+    assert reason == ""
 
 
 class CapturingReviewer(HighRiskReviewService):
@@ -438,7 +475,7 @@ async def test_high_risk_review_call_model_enforces_runtime_controls(
     _, content, _ = await HighRiskReviewService().call_model(
         api_base="https://review.example.invalid/v1",
         api_key="test-" + "review-key",
-        model="qwen3-32b-awq",
+        model="deepseek-reasoner",
         messages=[{"role": "user", "content": "return json only"}],
         use_json_mode=True,
         max_tokens=HIGH_RISK_REVIEW_TOKEN_CAP + 500,
@@ -451,8 +488,7 @@ async def test_high_risk_review_call_model_enforces_runtime_controls(
     assert request["timeout"] == 9.0
     assert body["max_tokens"] == HIGH_RISK_REVIEW_TOKEN_CAP
     assert body["response_format"] == {"type": "json_object"}
-    assert body["chat_template_kwargs"]["enable_thinking"] is False
-    assert body["messages"][0]["content"].endswith("/no_think")
+    assert body["thinking"] == {"type": "disabled"}
 
 
 @pytest.mark.asyncio

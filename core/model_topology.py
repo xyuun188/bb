@@ -6,21 +6,22 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 TopologyStage = Literal[
-    "legacy_shadow",
     "candidate_not_configured",
     "candidate_validated",
     "paper",
     "live",
 ]
-TopologyProfile = Literal["legacy_shadow", "target_single_model"]
+TopologyProfile = Literal["target_single_model"]
 
-LEGACY_SHADOW_PROFILE: TopologyProfile = "legacy_shadow"
 TARGET_SINGLE_MODEL_PROFILE: TopologyProfile = "target_single_model"
+DEFAULT_MODEL_TOPOLOGY_PROFILE: TopologyProfile = TARGET_SINGLE_MODEL_PROFILE
+TARGET_SINGLE_MODEL_ID = "qwen3.8-27b"
+TARGET_SINGLE_MODEL_REPO = "Qwen/Qwen3.8-27B"
 
 
 def normalize_topology_profile(profile: str | None) -> TopologyProfile:
-    selected = LEGACY_SHADOW_PROFILE if profile is None else profile.strip().lower()
-    if selected not in {LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE}:
+    selected = (profile or DEFAULT_MODEL_TOPOLOGY_PROFILE).strip().lower()
+    if selected != TARGET_SINGLE_MODEL_PROFILE:
         raise ValueError(f"unsupported model topology profile: {profile!r}")
     return selected
 
@@ -36,17 +37,9 @@ class ModelTunnelRoute:
 def model_tunnel_routes(profile: str | None = None) -> tuple[ModelTunnelRoute, ...]:
     """Describe connectivity only; reachable ports never authorize trading."""
 
-    selected = normalize_topology_profile(profile)
+    normalize_topology_profile(profile)
     quant = ModelTunnelRoute("phase3-quant-api", 18001, 8101, "/health/live")
-    if selected == TARGET_SINGLE_MODEL_PROFILE:
-        return (ModelTunnelRoute("target-single-model", 18000, 8000, "/v1/models"), quant)
-    legacy = legacy_14b_topology()
-    models = sorted(legacy.models, key=lambda model: model.port)
-    routes = tuple(
-        ModelTunnelRoute(model.model_id, model.port + 10000, model.port, "/v1/models")
-        for model in models
-    )
-    return (routes[0], quant, *routes[1:])
+    return (ModelTunnelRoute("target-single-model", 18000, 8000, "/v1/models"), quant)
 
 
 @dataclass(frozen=True)
@@ -113,9 +106,7 @@ class ModelTopology:
     def profile(self) -> TopologyProfile:
         """Return the deployment profile represented by this topology."""
 
-        if len(self.models) == 1 and self.models[0].role == "decision_and_expert_carrier":
-            return TARGET_SINGLE_MODEL_PROFILE
-        return LEGACY_SHADOW_PROFILE
+        return TARGET_SINGLE_MODEL_PROFILE
 
     def by_role(self, role: str) -> ModelServiceSpec | None:
         return next((model for model in self.models if model.role == role), None)
@@ -162,46 +153,6 @@ class ModelTopology:
         return tuple(dict.fromkeys(errors))
 
 
-def legacy_14b_topology() -> ModelTopology:
-    """Describe the currently observed 14B shadow topology for audit only."""
-
-    return ModelTopology(
-        models=(
-            ModelServiceSpec(
-                model_id="qwen3-14b-trade",
-                role="decision_maker",
-                repo_id="Qwen/Qwen3-14B-AWQ",
-                revision="unknown",
-                path="/data/trade_models/Qwen/Qwen3-14B-AWQ",
-                endpoint="http://127.0.0.1:18000/v1",
-                port=8000,
-                stage="legacy_shadow",
-            ),
-            ModelServiceSpec(
-                model_id="BB-FinQuant-Expert-14B",
-                role="expert_pool",
-                repo_id="Qwen/Qwen3-14B-AWQ",
-                revision="20260712T094555Z-4f40bc0974e6",
-                path="/data/BB/models/finquant_lora/versions/20260712T094555Z-4f40bc0974e6",
-                endpoint="http://127.0.0.1:18003/v1",
-                port=8003,
-                stage="legacy_shadow",
-            ),
-            ModelServiceSpec(
-                model_id="deepseek-r1-14b-risk",
-                role="high_risk_review",
-                repo_id="casperhansen/deepseek-r1-distill-qwen-14b-awq",
-                revision="unknown",
-                path="/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
-                endpoint="http://127.0.0.1:18002/v1",
-                port=8002,
-                stage="legacy_shadow",
-            ),
-        ),
-        live_routing_enabled=False,
-    )
-
-
 def qwen27_candidate_topology(
     *,
     repo_id: str | None = None,
@@ -241,9 +192,8 @@ def target_topology_ready(topology: ModelTopology) -> bool:
         and model.stage in {"candidate_validated", "paper"}
         and topology.cloud_reviewer_enabled
         and topology.cloud_reviewer_required_for_high_risk_entry
-        and model.model_id.lower() not in {
-            legacy.model_id.lower() for legacy in legacy_14b_topology().models
-        }
+        and model.model_id == TARGET_SINGLE_MODEL_ID
+        and model.repo_id == TARGET_SINGLE_MODEL_REPO
         and not topology.live_routing_enabled
         and not model.live_routing_enabled
         and not topology.validate()
@@ -259,18 +209,9 @@ def topology_for_profile(
     path: str | None = None,
     stage: TopologyStage = "candidate_not_configured",
 ) -> ModelTopology:
-    """Build a deployment topology without silently guessing model identity.
+    """Build the single-model deployment topology without guessing identity."""
 
-    ``legacy_shadow`` is retained only for audit/rollback compatibility. The
-    target profile requires all identity fields and remains non-live by
-    construction.
-    """
-
-    selected = normalize_topology_profile(profile)
-    if selected == LEGACY_SHADOW_PROFILE:
-        return legacy_14b_topology()
-    if selected != TARGET_SINGLE_MODEL_PROFILE:
-        raise ValueError(f"unsupported model topology profile: {profile!r}")
+    normalize_topology_profile(profile)
     topology = qwen27_candidate_topology(stage=stage)
     values = (model_id, repo_id, revision, path)
     if all(isinstance(value, str) and value.strip() for value in values):

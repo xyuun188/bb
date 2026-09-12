@@ -12,9 +12,10 @@ from fastapi import APIRouter, Request
 from sqlalchemy import func, select
 
 from config.settings import DECISION_MAKER_NAME, FIXED_AI_MODEL_SLOTS, settings
+from core.model_topology import TARGET_SINGLE_MODEL_PROFILE
 from core.phase3_model_contract import (
-    PHASE3_DECISION_MODEL_ID,
     PHASE3_PLATFORM_ENDPOINTS,
+    PHASE3_TARGET_MODEL_ID,
 )
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
@@ -24,6 +25,7 @@ from models.decision import AIDecision
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from models.trade import Order
+from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.execution_result_classifier import UNTRADABLE_EXCHANGE_ERROR_MARKERS
 from services.external_event_service import (
     EXTERNAL_EVENT_SOURCE_HEALTH_VERSION,
@@ -45,10 +47,8 @@ router = APIRouter()
 
 EXPECTED_PLATFORM_ENDPOINTS = PHASE3_PLATFORM_ENDPOINTS
 MODEL_ACCESS_ENDPOINTS = {
-    PHASE3_DECISION_MODEL_ID: "platform loopback 18000 only",
+    PHASE3_TARGET_MODEL_ID: "platform loopback 18000 only",
     "phase3_quant_api": "platform loopback 18001 only",
-    "deepseek-r1-14b-risk": "platform loopback 18002 only",
-    "BB-FinQuant-Expert-14B": "platform loopback 18003 only",
 }
 EXPERT_MODEL_SLOT_NAMES = tuple(
     str(slot.get("name") or "")
@@ -629,6 +629,13 @@ def _configured_endpoint_items(
         else {}
     )
     model_configs = settings.get_fixed_ai_models(include_empty=False)
+    explicit_profile = str(
+        runtime.get("topology_profile")
+        or (monitor_status or {}).get("topology_profile")
+        or getattr(settings, "model_topology_profile", TARGET_SINGLE_MODEL_PROFILE)
+        or TARGET_SINGLE_MODEL_PROFILE
+    ).strip().lower()
+    target_profile = explicit_profile == TARGET_SINGLE_MODEL_PROFILE
     configured_by_name = {
         str(item.get("name") or "").strip(): item
         for item in model_configs
@@ -673,7 +680,7 @@ def _configured_endpoint_items(
                 item
                 for item in runtime_models
                 if isinstance(item, dict)
-                and str(item.get("model") or "").strip() == PHASE3_DECISION_MODEL_ID
+                and str(item.get("model") or "").strip() == PHASE3_TARGET_MODEL_ID
             ),
             None,
         )
@@ -691,10 +698,11 @@ def _configured_endpoint_items(
             )
         )
     else:
-        expected_decision_endpoint = EXPECTED_PLATFORM_ENDPOINTS.get(decision_model)
-        endpoint_matches = not expected_decision_endpoint or (
-            decision_api_base.rstrip("/") == expected_decision_endpoint.rstrip("/")
-        )
+        expected_decision_endpoint = "http://127.0.0.1:18000/v1"
+        if target_profile and decision_model != PHASE3_TARGET_MODEL_ID:
+            endpoint_matches = False
+        else:
+            endpoint_matches = decision_api_base.rstrip("/") == expected_decision_endpoint.rstrip("/")
         items.append(
             _check_item(
                 decision_key,
@@ -717,8 +725,12 @@ def _configured_endpoint_items(
                 },
             )
         )
-    for model, expected in EXPECTED_PLATFORM_ENDPOINTS.items():
-        if model == PHASE3_DECISION_MODEL_ID:
+    expected_models = {
+        PHASE3_TARGET_MODEL_ID: "http://127.0.0.1:18000/v1",
+        "phase3_quant_api": "http://127.0.0.1:18001",
+    }
+    for model, expected in expected_models.items():
+        if model == PHASE3_TARGET_MODEL_ID:
             continue
         actual = configured_by_model.get(model, "")
         if not actual:
@@ -755,13 +767,49 @@ def _configured_endpoint_items(
                     f"endpoint_{model}",
                     f"{model} 平台调用地址",
                     "ok",
-                    f"{model} 调用地址符合 18000/18001/18002/18003 隧道契约。",
+                    (
+                        f"{model} 调用地址符合 target_single_model 隧道契约。"
+                        if target_profile
+                        else f"{model} 调用地址符合 18000/18001 隧道契约。"
+                    ),
                     details={
                         "actual": actual,
                         "public_endpoint": MODEL_ACCESS_ENDPOINTS.get(model),
                     },
                 )
             )
+    if target_profile:
+        high_risk_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
+        high_risk_base = _mask_endpoint(getattr(settings, "high_risk_review_api_base", ""))
+        high_risk_revision = str(
+            getattr(settings, "high_risk_review_model_revision", "") or ""
+        ).strip()
+        reviewer_ok, reviewer_error = validate_cloud_reviewer_route(
+            getattr(settings, "high_risk_review_api_base", ""),
+            high_risk_model,
+            high_risk_revision,
+            getattr(settings, "high_risk_review_api_key", ""),
+        )
+        items.append(
+            _check_item(
+                "high_risk_reviewer_route",
+                "高风险交易云端复核路由",
+                "ok" if reviewer_ok else "warning",
+                (
+                    "高风险复核使用已固定身份的公共 HTTPS 云端路由；云端不可用时高风险入口必须拒绝。"
+                    if reviewer_ok
+                    else f"高风险复核路由不可用（{reviewer_error or 'configuration_invalid'}）；高风险交易保持 fail-closed。"
+                ),
+                details={
+                    "model": high_risk_model,
+                    "api_base": high_risk_base,
+                    "revision": high_risk_revision,
+                    "route_error": reviewer_error or None,
+                    "required_for_high_risk_entry": True,
+                    "fail_closed_when_unavailable": True,
+                },
+            )
+        )
     return items
 
 
@@ -774,6 +822,45 @@ def _expert_model_diversity_item(
         and isinstance(monitor_status.get("platform_runtime"), dict)
         else {}
     )
+    explicit_profile = str(
+        runtime.get("topology_profile")
+        or (monitor_status or {}).get("topology_profile")
+        or ""
+    ).strip().lower()
+    if explicit_profile == TARGET_SINGLE_MODEL_PROFILE:
+        runtime_models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
+        decision = next(
+            (
+                row for row in runtime_models
+                if isinstance(row, dict)
+                and str(row.get("name") or "").strip().lower() == "decision_maker"
+            ),
+            {},
+        )
+        model = str(decision.get("model") or "").strip()
+        api_base = _mask_endpoint(decision.get("api_base"))
+        ready = bool(decision.get("available"))
+        return _check_item(
+            "expert_model_diversity",
+            "Expert model diversity",
+            "ok" if ready else "warning",
+            (
+                "Target profile uses one Qwen3.8-27B carrier with role-scoped prompts; "
+                "output disagreement and shadow PnL evidence are the diversity controls."
+                if ready
+                else "Target carrier identity or endpoint is not currently available; keep routing in shadow mode."
+            ),
+            details={
+                "topology_profile": TARGET_SINGLE_MODEL_PROFILE,
+                "carrier_model": model,
+                "carrier_api_base": api_base,
+                "carrier_available": ready,
+                "role_scoped_prompts": True,
+                "shadow_evidence_required": True,
+                "dedicated_expert_pool": False,
+                "policy": "single_carrier_role_scoped_shadow_evidence",
+            },
+        )
     runtime_models = runtime.get("ai_models") if isinstance(runtime.get("ai_models"), list) else []
     runtime_by_name = {
         str(item.get("name") or "").strip(): item
@@ -814,7 +901,7 @@ def _expert_model_diversity_item(
     dedicated_expert_pool = bool(
         configured_count == len(EXPERT_MODEL_SLOT_NAMES)
         and unique_provider_count == 1
-        and all(row["model"] == "BB-FinQuant-Expert-14B" for row in expert_rows)
+        and all(row["model"] == PHASE3_TARGET_MODEL_ID for row in expert_rows)
     )
     same_provider_risk = shared_provider_layout and not dedicated_expert_pool
     status = "warning" if same_provider_risk else "ok"

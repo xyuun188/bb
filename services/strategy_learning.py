@@ -1008,10 +1008,10 @@ class StrategyLearningEngine:
                 else (
                     "model_historical_replay_required"
                     if model_replay_required
-                    else "legacy_selector_matched_shadow"
+                    else "selector_matched_closed_position_exam"
                 )
             )
-            shadow["evidence_partition"] = "strategy_exam" if exact_replay else "legacy_shadow"
+            shadow["evidence_partition"] = "strategy_exam" if exact_replay else "closed_position_exam"
             rejection_reasons = _candidate_rejections(
                 backtest,
                 shadow,

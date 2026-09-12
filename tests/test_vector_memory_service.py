@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,6 +128,111 @@ def test_json_vector_memory_store_filters_by_symbol(tmp_path) -> None:
     hits = store.search("强趋势突破", top_k=5, filters={"symbol": "ETH/USDT"})
 
     assert [hit.id for hit in hits] == ["decision:2"]
+
+
+def test_json_vector_memory_store_reuses_snapshot_until_file_changes(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "memory.jsonl"
+    store = JsonVectorMemoryStore(path, dimension=32, max_documents=20)
+    store.upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:1",
+                kind="decision",
+                text="BTC long snapshot",
+                symbol="BTC/USDT",
+            )
+        ]
+    )
+
+    reads = 0
+    original = store._read_rows_from_disk
+
+    def counted_read():
+        nonlocal reads
+        reads += 1
+        return original()
+
+    monkeypatch.setattr(store, "_read_rows_from_disk", counted_read)
+    store.search("BTC long")
+    store.search("BTC long")
+    assert reads == 0
+
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    store.search("BTC long")
+    assert reads == 1
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_search_runs_store_io_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._get_store().upsert(
+        [
+            VectorMemoryDocument(
+                id="decision:1",
+                kind="decision",
+                text="BTC long profitable sample",
+                symbol="BTC/USDT",
+            )
+        ]
+    )
+
+    called_in_thread = False
+    original = service._get_store().search
+
+    def tracked_search(*args, **kwargs):
+        nonlocal called_in_thread
+        try:
+            asyncio.current_task()
+        except RuntimeError:
+            called_in_thread = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service._get_store(), "search", tracked_search)
+    result = await service.search("BTC long", symbol="BTC/USDT")
+
+    assert result["status"] == "ok"
+    assert called_in_thread is True
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_store_timeout_does_not_block_following_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    class SlowStore:
+        backend_name = "jsonl"
+
+        def search(self, *_args, **_kwargs):
+            time.sleep(0.2)
+            return []
+
+        def stats(self):
+            return {"backend": self.backend_name, "document_count": 0}
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    monkeypatch.setattr(settings, "vector_memory_operation_timeout_seconds", 0.1)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._store = SlowStore()  # type: ignore[assignment]
+
+    started = time.perf_counter()
+    result = await service.search("BTC long")
+    elapsed = time.perf_counter() - started
+
+    assert result["status"] == "error"
+    assert elapsed < 0.18
+    await asyncio.sleep(0.2)
+    assert service._store_call_lock.locked() is False
 
 
 def test_vector_memory_settings_defaults_are_safe() -> None:

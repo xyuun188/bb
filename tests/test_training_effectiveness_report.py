@@ -73,8 +73,14 @@ def test_service_surfaces_authoritative_provider_failure_without_faking_zero_sam
         calls.append("registry")
         return {"models": [{"model_id": "active-v1", "lifecycle": "active"}]}
 
+    async def failing_samples_provider(**_):
+        raise RuntimeError("authoritative sample query failed")
+
     report = __import__("asyncio").run(
-        TrainingEffectivenessReportService(registry_provider=registry).build(
+        TrainingEffectivenessReportService(
+            registry_provider=registry,
+            samples_provider=failing_samples_provider,
+        ).build(
             filters={"to": "2026-08-25T00:00:00Z"}, run_id="fixed-run"
         )
     )

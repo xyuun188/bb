@@ -10,15 +10,13 @@ from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.llm_agent import (
     LLMAgent,
-    _extract_json,
-    _extract_truncated_expert_diagnostic,
 )
 from ai_brain.model_registry import ModelRegistry
 from ai_brain.prompts import build_batch_experts_user_prompt
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
-from tests.model_endpoint_fixtures import LOCAL_DEEPSEEK_TEST_BASE, LOCAL_QWEN_TEST_BASE
+from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
 
 
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
@@ -162,41 +160,6 @@ def test_batch_expert_prompt_can_scope_to_provider_group() -> None:
     assert "Do not include these omitted experts: trend_expert, momentum_expert." in prompt
 
 
-def test_extract_json_repairs_missing_batch_tail() -> None:
-    parsed = _extract_json("""
-        ```json
-        {"experts":{"trend_expert":{"action":"hold","confidence":0.5},
-        "momentum_expert":{"action":"hold","confidence":0.4},
-        ```
-        """)
-
-    assert parsed["experts"]["trend_expert"]["action"] == "hold"
-    assert parsed["experts"]["momentum_expert"]["confidence"] == 0.4
-
-
-def test_extract_truncated_expert_diagnostic_never_grants_execution() -> None:
-    parsed = _extract_truncated_expert_diagnostic(
-        '{"action":"short","confidence":0.71,"reasoning":"短线动量转弱",'
-        '"fee_after_cost_after_slippage_repeated_field":"unfinished'
-    )
-
-    assert parsed is not None
-    assert parsed["action"] == "short"
-    assert parsed["reasoning"] == "短线动量转弱"
-    assert parsed["position_size_pct"] == 0.0
-    assert parsed["production_permission"] is False
-    assert parsed["truncated_diagnostic_recovery"] is True
-
-
-def test_extract_truncated_expert_diagnostic_requires_complete_reasoning() -> None:
-    assert (
-        _extract_truncated_expert_diagnostic(
-            '{"action":"long","confidence":0.8,"reasoning":"unfinished'
-        )
-        is None
-    )
-
-
 def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
     coordinator = EnsembleCoordinator(ModelRegistry())
     summary = coordinator._latency_summary(
@@ -206,7 +169,7 @@ def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
                 "stage": "expert_initial",
                 "name": "trend_expert",
                 "started_at": "2026-06-14T01:00:00Z",
-                "provider_model": "qwen3-14b-trade",
+                "provider_model": "qwen3.8-27b",
                 "duration_kind": "shared_wall_time",
                 "duration_sec": 2.0,
                 "shared_batch_call": True,
@@ -215,7 +178,7 @@ def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
                 "stage": "expert_initial",
                 "name": "momentum_expert",
                 "started_at": "2026-06-14T01:00:00Z",
-                "provider_model": "qwen3-14b-trade",
+                "provider_model": "qwen3.8-27b",
                 "duration_kind": "shared_wall_time",
                 "duration_sec": 2.0,
                 "shared_batch_call": True,
@@ -224,7 +187,7 @@ def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
                 "stage": "expert_initial",
                 "name": "sentiment_expert",
                 "started_at": "2026-06-14T01:00:02Z",
-                "provider_model": "deepseek-r1-14b-risk",
+                "provider_model": "qwen3.8-27b",
                 "duration_kind": "shared_wall_time",
                 "duration_sec": 4.0,
                 "shared_batch_call": True,
@@ -233,7 +196,7 @@ def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
                 "stage": "expert_initial",
                 "name": "position_expert",
                 "started_at": "2026-06-14T01:00:02Z",
-                "provider_model": "deepseek-r1-14b-risk",
+                "provider_model": "qwen3.8-27b",
                 "duration_kind": "shared_wall_time",
                 "duration_sec": 4.0,
                 "shared_batch_call": True,
@@ -242,7 +205,7 @@ def test_latency_summary_deduplicates_shared_batch_wall_time() -> None:
                 "stage": "expert_initial",
                 "name": "risk_expert",
                 "started_at": "2026-06-14T01:00:02Z",
-                "provider_model": "deepseek-r1-14b-risk",
+                "provider_model": "qwen3.8-27b",
                 "duration_kind": "shared_wall_time",
                 "duration_sec": 4.0,
                 "shared_batch_call": True,
@@ -303,7 +266,7 @@ async def test_batch_expert_missing_provider_group_is_repaired(
         api_config={
             "api_base": LOCAL_QWEN_TEST_BASE,
             "api_key": "test-key",
-            "model": "qwen3-14b-trade",
+            "model": "qwen3.8-27b",
             "role": "short_timeseries",
         },
     )
@@ -326,7 +289,6 @@ async def test_batch_expert_missing_provider_group_is_repaired(
         for kwargs in captured_kwargs
     )
     assert decisions["risk_expert"].raw_response["batch_repair_retry"] is True
-    assert not decisions["risk_expert"].raw_response.get("batch_expert_fallback")
     assert decisions["risk_expert"].position_size_pct == 0.0
     assert decisions["risk_expert"].suggested_leverage == 1.0
     batch_kwargs = [kwargs for kwargs in captured_kwargs if kwargs.get("max_tokens") == 560]
@@ -361,7 +323,7 @@ async def test_paper_batch_parser_preserves_complete_model_plan(
         api_config={
             "api_base": LOCAL_QWEN_TEST_BASE,
             "api_key": "test-key",
-            "model": "qwen3-14b-trade",
+            "model": "qwen3.8-27b",
             "role": "trend_direction",
         },
     )
@@ -411,7 +373,7 @@ async def test_batch_expert_missing_after_repair_raises_for_independent_retry(
         api_config={
             "api_base": LOCAL_QWEN_TEST_BASE,
             "api_key": "test-key",
-            "model": "qwen3-14b-trade",
+            "model": "qwen3.8-27b",
             "role": "short_timeseries",
         },
     )
@@ -427,23 +389,6 @@ async def test_batch_expert_missing_after_repair_raises_for_independent_retry(
     assert len(calls) == 2
 
 
-@pytest.mark.asyncio
-async def test_deepseek_r1_batch_json_fails_fast() -> None:
-    agent = LLMAgent(
-        name="risk_expert",
-        api_config={"model": "deepseek-r1-14b-risk", "role": "risk_anomaly"},
-    )
-    agent._model_name = "deepseek-r1-14b-risk"
-    agent._llm = object()
-
-    with pytest.raises(LLMResponseParseError, match="batch expert JSON is disabled"):
-        await agent.decide_batch_experts(
-            FeatureVector(symbol="BTC/USDT"),
-            {},
-            ["risk_expert"],
-        )
-
-
 class _BatchFormatFailingExpert(AbstractAIModel):
     calls = 0
     individual_calls = 0
@@ -451,7 +396,7 @@ class _BatchFormatFailingExpert(AbstractAIModel):
     def __init__(self, name: str) -> None:
         self.name = name
         self._llm = object()
-        self._model_name = "qwen3-32b-trade"
+        self._model_name = "qwen3.8-27b"
 
     async def initialize(self) -> None:
         return None
@@ -484,22 +429,6 @@ class _BatchFormatFailingExpert(AbstractAIModel):
         type(self).calls += 1
         raise RuntimeError('Could not extract valid JSON from: {"experts":')
 
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        return DecisionOutput(
-            model_name=self.name,
-            symbol=features.symbol,
-            action=Action.HOLD,
-            confidence=0.1,
-            reasoning=f"local fallback: {error}",
-            raw_response={"local_fallback_called": True},
-            feature_snapshot=features.to_dict(),
-        )
-
     async def shutdown(self) -> None:
         return None
 
@@ -511,7 +440,7 @@ class _BatchFailingIndividualSuccessExpert(AbstractAIModel):
     def __init__(self, name: str) -> None:
         self.name = name
         self._llm = object()
-        self._model_name = "qwen3-14b-trade"
+        self._model_name = "qwen3.8-27b"
 
     async def initialize(self) -> None:
         return None
@@ -628,22 +557,6 @@ class _ProviderBatchExpert(AbstractAIModel):
         finally:
             type(self).running_batch_calls -= 1
 
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        return DecisionOutput(
-            model_name=self.name,
-            symbol=features.symbol,
-            action=Action.HOLD,
-            confidence=0.1,
-            reasoning=f"local fallback: {error}",
-            raw_response={"provider_model": self._model_name, "local_fallback_called": True},
-            feature_snapshot=features.to_dict(),
-        )
-
     async def shutdown(self) -> None:
         return None
 
@@ -656,7 +569,7 @@ class _BatchTimeoutExpert(AbstractAIModel):
     def __init__(self, name: str) -> None:
         self.name = name
         self._llm = object()
-        self._model_name = "qwen3-14b-trade"
+        self._model_name = "qwen3.8-27b"
 
     async def initialize(self) -> None:
         return None
@@ -690,22 +603,6 @@ class _BatchTimeoutExpert(AbstractAIModel):
         if type(self).batch_delay_seconds:
             await asyncio.sleep(type(self).batch_delay_seconds)
         raise TimeoutError()
-
-    def _local_expert_fallback(
-        self,
-        features: FeatureVector,
-        context: dict[str, Any],
-        error: str,
-    ) -> DecisionOutput:
-        return DecisionOutput(
-            model_name=self.name,
-            symbol=features.symbol,
-            action=Action.HOLD,
-            confidence=0.1,
-            reasoning=f"timeout local fallback: {error}",
-            raw_response={"provider_model": self._model_name, "local_fallback_called": True},
-            feature_snapshot=features.to_dict(),
-        )
 
     async def shutdown(self) -> None:
         return None
@@ -811,7 +708,7 @@ async def test_batch_failure_retries_real_individual_experts(
 
 
 @pytest.mark.asyncio
-async def test_batch_timeout_uses_bounded_independent_retry_before_fallback(
+async def test_batch_timeout_uses_bounded_independent_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
@@ -875,13 +772,7 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
     }
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
-    assert set(decisions) == {
-        "trend_expert",
-        "momentum_expert",
-        "sentiment_expert",
-        "position_expert",
-        "risk_expert",
-    }
+    assert decisions == {}
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
     assert {row["status"] for row in context["_model_timings"]} == {"analysis_budget_deferred"}
@@ -916,45 +807,6 @@ async def test_batch_timeout_activates_minimum_circuit_breaker_when_config_is_ze
 
 
 @pytest.mark.asyncio
-async def test_independent_provider_retry_uses_configured_expert_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
-    monkeypatch.setattr(settings, "ai_expert_timeout_seconds", 30.0)
-    _ProviderBatchExpert.batch_calls = []
-    _ProviderBatchExpert.individual_calls = []
-    registry = ModelRegistry()
-    for name in ("sentiment_expert", "position_expert", "risk_expert"):
-        registry.register(
-            _ProviderBatchExpert(
-                name,
-                base_url=LOCAL_DEEPSEEK_TEST_BASE,
-                model_name="deepseek-r1-14b-risk",
-                allow_individual=True,
-            )
-        )
-
-    context: dict[str, Any] = {}
-    await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
-
-    assert _ProviderBatchExpert.batch_calls == []
-    assert _ProviderBatchExpert.individual_calls == [
-        ("deepseek-r1-14b-risk", "sentiment_expert"),
-        ("deepseek-r1-14b-risk", "position_expert"),
-        ("deepseek-r1-14b-risk", "risk_expert"),
-    ]
-    timeout_by_name = {row["name"]: row["timeout_seconds"] for row in context["_model_timings"]}
-    assert timeout_by_name == {
-        "sentiment_expert": 60.0,
-        "position_expert": 60.0,
-        "risk_expert": 60.0,
-    }
-    assert all(
-        timeout >= settings.ai_expert_timeout_seconds for timeout in timeout_by_name.values()
-    )
-
-
-@pytest.mark.asyncio
 async def test_batch_experts_are_grouped_by_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -967,16 +819,15 @@ async def test_batch_experts_are_grouped_by_provider(
             _ProviderBatchExpert(
                 name,
                 base_url=LOCAL_QWEN_TEST_BASE,
-                model_name="qwen3-14b-trade",
+                model_name="qwen3.8-27b",
             )
         )
     for name in ("sentiment_expert", "position_expert", "risk_expert"):
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url=LOCAL_DEEPSEEK_TEST_BASE,
-                model_name="deepseek-r1-14b-risk",
-                allow_individual=True,
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3.8-27b",
             )
         )
 
@@ -992,29 +843,21 @@ async def test_batch_experts_are_grouped_by_provider(
     }
     assert _ProviderBatchExpert.batch_calls == [
         (
-            "qwen3-14b-trade",
-            (
-                "trend_expert",
-                "momentum_expert",
-            ),
-        ),
+            "qwen3.8-27b",
+            ("trend_expert", "momentum_expert", "sentiment_expert", "position_expert", "risk_expert"),
+        )
     ]
-    assert _ProviderBatchExpert.individual_calls == [
-        ("deepseek-r1-14b-risk", "sentiment_expert"),
-        ("deepseek-r1-14b-risk", "position_expert"),
-        ("deepseek-r1-14b-risk", "risk_expert"),
-    ]
+    assert _ProviderBatchExpert.individual_calls == []
     timings_by_name = {row["name"]: row for row in context["_model_timings"]}
-    assert timings_by_name["trend_expert"]["provider_model"] == "qwen3-14b-trade"
-    assert timings_by_name["trend_expert"]["batch_model_count"] == 2
-    assert timings_by_name["trend_expert"]["batch_provider_group_count"] == 2
-    assert timings_by_name["risk_expert"]["provider_model"] == "deepseek-r1-14b-risk"
-    assert timings_by_name["risk_expert"]["stage"] == "expert_independent_provider"
+    assert timings_by_name["trend_expert"]["provider_model"] == "qwen3.8-27b"
+    assert timings_by_name["trend_expert"]["batch_model_count"] == 5
+    assert timings_by_name["trend_expert"]["batch_provider_group_count"] == 1
+    assert timings_by_name["risk_expert"]["provider_model"] == "qwen3.8-27b"
+    assert timings_by_name["risk_expert"]["stage"] == "expert_initial"
     assert timings_by_name["risk_expert"]["status"] == "completed"
-    assert timings_by_name["risk_expert"]["batch_expert"] is False
-    assert timings_by_name["risk_expert"]["shared_batch_call"] is False
-    assert decisions["risk_expert"].raw_response["provider_independent_expert_mode"] is True
-    assert not decisions["risk_expert"].raw_response.get("batch_failure_independent_retry")
+    assert timings_by_name["risk_expert"]["batch_expert"] is True
+    assert timings_by_name["risk_expert"]["shared_batch_call"] is True
+    assert decisions["risk_expert"].raw_response["batch_expert"] is True
 
 
 @pytest.mark.asyncio
@@ -1027,11 +870,11 @@ async def test_independent_provider_groups_run_concurrently(
     _ProviderBatchExpert.peak_batch_calls = 0
     registry = ModelRegistry()
     provider_specs = {
-        "trend_expert": (LOCAL_QWEN_TEST_BASE, "qwen3-14b-trade"),
-        "momentum_expert": (LOCAL_QWEN_TEST_BASE, "qwen3-14b-trade"),
-        "sentiment_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
-        "position_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
-        "risk_expert": (LOCAL_DEEPSEEK_TEST_BASE, "qwen3-14b-risk"),
+        "trend_expert": (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b"),
+        "momentum_expert": (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b"),
+        "sentiment_expert": (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b"),
+        "position_expert": (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b"),
+        "risk_expert": (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b"),
     }
     for name, (base_url, model_name) in provider_specs.items():
         registry.register(
@@ -1047,8 +890,8 @@ async def test_independent_provider_groups_run_concurrently(
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
     assert set(decisions) == set(provider_specs)
-    assert _ProviderBatchExpert.peak_batch_calls == 2
-    assert all(row["provider_groups_concurrent"] for row in context["_model_timings"])
+    assert _ProviderBatchExpert.peak_batch_calls == 1
+    assert all(not row["provider_groups_concurrent"] for row in context["_model_timings"])
 
 
 @pytest.mark.asyncio
@@ -1064,7 +907,7 @@ async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
             _ProviderBatchExpert(
                 name,
                 base_url=LOCAL_QWEN_TEST_BASE,
-                model_name="qwen3-14b-trade",
+                model_name="qwen3.8-27b",
                 allow_individual=True,
             )
         )
@@ -1105,14 +948,14 @@ async def test_batch_expert_circuit_breaker_is_provider_scoped(
             _ProviderBatchExpert(
                 name,
                 base_url=LOCAL_QWEN_TEST_BASE,
-                model_name="qwen3-14b-trade",
+                model_name="qwen3.8-27b",
             )
         )
     registry.register(
         _ProviderBatchExpert(
             "sentiment_expert",
-            base_url=LOCAL_DEEPSEEK_TEST_BASE,
-            model_name="qwen2.5-risk-14b",
+            base_url=LOCAL_QWEN_TEST_BASE,
+            model_name="qwen3.8-27b",
             fail_batch=True,
         )
     )
@@ -1120,8 +963,8 @@ async def test_batch_expert_circuit_breaker_is_provider_scoped(
         registry.register(
             _ProviderBatchExpert(
                 name,
-                base_url=LOCAL_DEEPSEEK_TEST_BASE,
-                model_name="qwen2.5-risk-14b",
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3.8-27b",
             )
         )
 
@@ -1131,17 +974,15 @@ async def test_batch_expert_circuit_breaker_is_provider_scoped(
     await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
 
     assert _ProviderBatchExpert.batch_calls == [
-        ("qwen3-14b-trade", ("trend_expert", "momentum_expert")),
         (
-            "qwen2.5-risk-14b",
-            ("sentiment_expert", "position_expert", "risk_expert"),
+            "qwen3.8-27b",
+            ("trend_expert", "momentum_expert", "sentiment_expert", "position_expert", "risk_expert"),
         ),
-        ("qwen3-14b-trade", ("trend_expert", "momentum_expert")),
+        (
+            "qwen3.8-27b",
+            ("trend_expert", "momentum_expert", "sentiment_expert", "position_expert", "risk_expert"),
+        ),
     ]
     second_timings = {row["name"]: row for row in second_context["_model_timings"]}
     assert second_timings["trend_expert"]["status"] == "completed"
-    assert second_timings["sentiment_expert"]["status"] == "independent_provider_fallback"
-    assert second_timings["sentiment_expert"]["independent_retry_status"] == (
-        "independent_provider_failed"
-    )
-    assert second_timings["sentiment_expert"]["provider_model"] == "qwen2.5-risk-14b"
+    assert second_timings["sentiment_expert"]["status"] == "completed"

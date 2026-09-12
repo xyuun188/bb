@@ -17,14 +17,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.model_runtime import (  # noqa: E402
-    HIGH_RISK_REVIEW_TOKEN_CAP,
     apply_non_thinking_request_controls,
 )
 from core.phase3_model_contract import (  # noqa: E402
-    PHASE3_DECISION_MODEL_ID,
-    PHASE3_EXPERT_MODEL_ID,
     PHASE3_PLATFORM_ENDPOINTS,
-    PHASE3_RISK_MODEL_ID,
+    PHASE3_TARGET_MODEL_ID,
 )
 
 
@@ -41,23 +38,9 @@ class ProbeSpec:
 DEFAULT_PROBES = (
     ProbeSpec(
         name="decision_maker",
-        api_base=PHASE3_PLATFORM_ENDPOINTS[PHASE3_DECISION_MODEL_ID],
-        model=PHASE3_DECISION_MODEL_ID,
-        role="decision",
-    ),
-    ProbeSpec(
-        name="high_risk_review",
-        api_base=PHASE3_PLATFORM_ENDPOINTS[PHASE3_RISK_MODEL_ID],
-        model=PHASE3_RISK_MODEL_ID,
-        role="risk",
-        max_tokens=HIGH_RISK_REVIEW_TOKEN_CAP,
-        allow_reasoning_prefix=True,
-    ),
-    ProbeSpec(
-        name="expert_pool",
-        api_base=PHASE3_PLATFORM_ENDPOINTS[PHASE3_EXPERT_MODEL_ID],
-        model=PHASE3_EXPERT_MODEL_ID,
-        role="expert",
+        api_base=PHASE3_PLATFORM_ENDPOINTS[PHASE3_TARGET_MODEL_ID],
+        model=PHASE3_TARGET_MODEL_ID,
+        role="decision_and_expert",
     ),
 )
 

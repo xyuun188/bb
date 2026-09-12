@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import textwrap
 
-from core.phase3_model_contract import PHASE3_DECISION_MODEL_ID
+from core.phase3_model_contract import PHASE3_TARGET_MODEL_ID
 
 SERVER_MONITOR_REMOTE_COMMAND_TIMEOUT_SECONDS = 45
 
@@ -13,16 +13,13 @@ SERVER_MONITOR_REMOTE_COMMAND_TIMEOUT_SECONDS = 45
 def display_provider_model_name(model_id: str | None) -> str:
     """Return a short label for the configured primary provider model."""
     value = str(model_id or "").strip()
-    lowered = value.lower()
-    if "qwen3" in lowered and "32b" in lowered:
-        return "Qwen3-32B-AWQ" if "awq" in lowered else "Qwen3-32B"
-    if "qwen3" in lowered and "14b" in lowered:
-        return "Qwen3-14B-Instruct"
-    if "qwen2.5" in lowered and "32b" in lowered:
-        return "Qwen2.5-32B-Instruct"
-    if "deepseek" in lowered:
-        return value or "DeepSeek"
-    return value or "Local Model"
+    display_value = value.rsplit("/", 1)[-1]
+    lowered = display_value.lower()
+    if "qwen3.8" in lowered and "27b" in lowered:
+        return "Qwen3.8-27B"
+    if "qwen3" in lowered:
+        return display_value or "Qwen3"
+    return display_value or "Local Model"
 
 
 def render_python_here_doc(script: str) -> str:
@@ -52,9 +49,7 @@ def render_server_monitor_probe(
         PRIMARY_MODEL_ID = {json.dumps(primary_model_id, ensure_ascii=False)}
         PRIMARY_MODEL_LABEL = {json.dumps(primary_model_label, ensure_ascii=False)}
         LOCAL_AI_TOOLS_API_KEY = {json.dumps(local_ai_tools_api_key, ensure_ascii=False)}
-        LOCAL_DECISION_MODEL_ID = {json.dumps(PHASE3_DECISION_MODEL_ID)}
-        DEEPSEEK_R1_MODEL_ID = "deepseek-r1-14b-risk"
-        QWEN3_EXPERT_POOL_MODEL_ID = "BB-FinQuant-Expert-14B"
+        LOCAL_DECISION_MODEL_ID = {json.dumps(PHASE3_TARGET_MODEL_ID)}
         ERROR_TEXT_LIMIT = 240
         HTTP_BODY_READ_LIMIT = 512 * 1024
         MAX_MODEL_ROWS = 24
@@ -381,23 +376,6 @@ def render_server_monitor_probe(
             }}
 
 
-        def primary_model_available(model_ids):
-            return target_model_available(model_ids, PRIMARY_MODEL_ID)
-
-
-        def primary_model_is_local_decision_candidate():
-            value = (PRIMARY_MODEL_ID or "").lower()
-            return bool(
-                value
-                and (
-                    value == LOCAL_DECISION_MODEL_ID.lower()
-                    or "qwen3-32b" in value
-                    or "qwen3-14b" in value
-                    or value == QWEN3_EXPERT_POOL_MODEL_ID.lower()
-                )
-            )
-
-
         def target_model_available(model_ids, target_model_id):
             wanted = (target_model_id or "").lower()
             rows = [str(m or "") for m in (model_ids or []) if str(m or "")]
@@ -436,7 +414,7 @@ def render_server_monitor_probe(
                 "model_available": bool(target_ok),
                 "model_mismatch": model_mismatch,
                 "discovered_model_available": bool(model_ids),
-                "primary_model_available": bool(primary_model_available(model_ids)),
+                "primary_model_available": bool(target_ok),
                 "target_model_available": bool(target_ok),
                 "label": label,
                 "provider_model": target_model,
@@ -542,35 +520,12 @@ def render_server_monitor_probe(
 
 
         def model_runtime():
-            local_decision_target = (
-                PRIMARY_MODEL_ID
-                if primary_model_is_local_decision_candidate()
-                else ""
-            )
-            local_decision_label = (
-                PRIMARY_MODEL_LABEL or "本地决策模型"
-                if primary_model_is_local_decision_candidate()
-                else "本地决策备用池"
-            )
+            local_decision_target = LOCAL_DECISION_MODEL_ID
+            local_decision_label = PRIMARY_MODEL_LABEL or "Qwen3.8-27B"
             vllm_endpoints = [
                 vllm_endpoint_runtime(8000, local_decision_label, local_decision_target),
-                vllm_endpoint_runtime(8002, "DeepSeek R1 14B", DEEPSEEK_R1_MODEL_ID),
-                vllm_endpoint_runtime(8003, "BB-FinQuant Expert 14B", QWEN3_EXPERT_POOL_MODEL_ID),
             ]
-            vllm = next(
-                (
-                    item
-                    for item in vllm_endpoints
-                    if item.get("primary_model_available")
-                    or (
-                        primary_model_is_local_decision_candidate()
-                        and item.get("available")
-                        and str(item.get("provider_model") or "").lower()
-                        == str(PRIMARY_MODEL_ID or "").lower()
-                    )
-                ),
-                vllm_endpoints[0],
-            )
+            vllm = vllm_endpoints[0]
             return {{
                 "vllm": vllm,
                 "vllm_endpoints": vllm_endpoints,

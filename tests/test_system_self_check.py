@@ -26,21 +26,21 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
                 "name": "decision_maker",
                 "api_base": "http://127.0.0.1:8003/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-14b-trade",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             },
             {
                 "name": "trend_expert",
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             },
             {
                 "name": "sentiment_expert",
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             },
         ],
@@ -52,13 +52,10 @@ def test_self_check_endpoint_contract_flags_wrong_model_ports(
     items = system_health._configured_endpoint_items()
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "critical"
-    assert by_key["endpoint_qwen3-14b-trade"]["details"]["expected_platform_endpoint"] == (
-        "http://127.0.0.1:18000/v1"
-    )
+    assert by_key["endpoint_decision_maker"]["status"] == "critical"
+    assert by_key["endpoint_decision_maker"]["details"]["slot_name"] == "decision_maker"
     assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
-    assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
-    assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
+    assert by_key["high_risk_reviewer_route"]["status"] == "warning"
 
 
 def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
@@ -72,32 +69,26 @@ def test_self_check_endpoint_contract_uses_split_runtime_before_settings(
             "ai_models": [
                 {
                     "name": "decision_maker",
-                    "model": "qwen3-14b-trade",
+                    "model": "qwen3.8-27b",
                     "api_base": "http://127.0.0.1:18000/v1",
                 },
                 {
-                    "model": "deepseek-r1-14b-risk",
-                    "api_base": "http://127.0.0.1:18002/v1",
-                },
-                {
-                    "model": "BB-FinQuant-Expert-14B",
-                    "api_base": "http://127.0.0.1:18003/v1",
                 },
             ],
             "local_ai_tools": {"api_base": "http://127.0.0.1:18001"},
+            "topology_profile": "target_single_model",
         }
     }
 
     items = system_health._configured_endpoint_items(monitor_status)
     by_key = {item["key"]: item for item in items}
 
-    assert by_key["endpoint_qwen3-14b-trade"]["status"] == "ok"
+    assert by_key["endpoint_qwen3.8-27b"]["status"] == "ok"
     assert by_key["endpoint_phase3_quant_api"]["status"] == "ok"
-    assert by_key["endpoint_deepseek-r1-14b-risk"]["status"] == "ok"
-    assert by_key["endpoint_BB-FinQuant-Expert-14B"]["status"] == "ok"
+    assert by_key["high_risk_reviewer_route"]["status"] == "warning"
 
 
-def test_self_check_accepts_external_deepseek_final_decision_route(
+def test_self_check_rejects_external_deepseek_final_decision_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -127,9 +118,9 @@ def test_self_check_accepts_external_deepseek_final_decision_route(
     items = system_health._configured_endpoint_items()
     by_key = {item["key"]: item for item in items}
 
-    assert "endpoint_qwen3-14b-trade" not in by_key
-    assert by_key["endpoint_deepseek-v4-pro"]["status"] == "ok"
-    assert by_key["endpoint_deepseek-v4-pro"]["details"]["slot_name"] == (
+    assert "endpoint_qwen3.8-27b" not in by_key
+    assert by_key["endpoint_decision_maker"]["status"] == "critical"
+    assert by_key["endpoint_decision_maker"]["details"]["slot_name"] == (
         "decision_maker"
     )
 
@@ -177,8 +168,8 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
             {
                 "name": "trend_expert",
                 "api_base": "http://127.0.0.1:18000/v1",
-                "api_key": "unit-key",
-                "model": "qwen3-14b-trade",
+                "api_key": "",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             }
         ],
@@ -200,7 +191,7 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
                         "model_available": False,
                     },
                     {
-                        "model": "qwen3-14b-trade",
+                        "model": "qwen3.8-27b",
                         "api_base": "http://127.0.0.1:18000/v1",
                         "available": False,
                         "endpoint_ok": False,
@@ -215,8 +206,8 @@ def test_server_monitor_items_do_not_mark_extra_legacy_model_critical(
     by_key = {item["key"]: item for item in items}
     assert by_key["runtime_model_deepseek-v4-pro"]["status"] == "info"
     assert by_key["runtime_model_deepseek-v4-pro"]["details"]["required"] is False
-    assert by_key["runtime_model_qwen3-14b-trade"]["status"] == "critical"
-    assert by_key["runtime_model_qwen3-14b-trade"]["details"]["required"] is True
+    assert by_key["runtime_model_qwen3.8-27b"]["status"] == "critical"
+    assert by_key["runtime_model_qwen3.8-27b"]["details"]["required"] is True
 
 
 def test_expert_model_diversity_recognizes_dedicated_expert_pool() -> None:
@@ -224,19 +215,14 @@ def test_expert_model_diversity_recognizes_dedicated_expert_pool() -> None:
         "platform_runtime": {
             "ai_models": [
                 {
-                    "name": name,
-                    "label": name,
-                    "api_base": "http://127.0.0.1:18003/v1",
-                    "model": "BB-FinQuant-Expert-14B",
+                    "name": "decision_maker",
+                    "label": "Qwen3.8-27B",
+                    "api_base": "http://127.0.0.1:18000/v1",
+                    "model": "qwen3.8-27b",
+                    "available": True,
                 }
-                for name in (
-                    "trend_expert",
-                    "momentum_expert",
-                    "sentiment_expert",
-                    "position_expert",
-                    "risk_expert",
-                )
-            ]
+            ],
+            "topology_profile": "target_single_model",
         }
     }
 
@@ -244,12 +230,10 @@ def test_expert_model_diversity_recognizes_dedicated_expert_pool() -> None:
 
     assert item["status"] == "ok"
     assert item["key"] == "expert_model_diversity"
-    assert item["details"]["configured_expert_count"] == 5
-    assert item["details"]["unique_provider_count"] == 1
-    assert item["details"]["largest_shared_provider_count"] == 5
-    assert item["details"]["same_provider_risk"] is False
-    assert item["details"]["shared_provider_layout"] is True
-    assert item["details"]["dedicated_expert_pool"] is True
+    assert item["details"]["carrier_model"] == "qwen3.8-27b"
+    assert item["details"]["carrier_available"] is True
+    assert item["details"]["role_scoped_prompts"] is True
+    assert item["details"]["dedicated_expert_pool"] is False
 
 
 def test_expert_model_diversity_flags_shared_generic_provider() -> None:

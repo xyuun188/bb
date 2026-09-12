@@ -2811,15 +2811,15 @@ function analysisTimingStatusLabel(status) {
         failed: '失败',
         returned_but_governance_blocked: '已返回（治理不可交易）',
         invalid: '无效',
-        batch_fallback: '批量回退',
-        partial_batch_fallback: '批量缺失',
+        batch_fallback: '批量调用失败',
+        partial_batch_fallback: '批量调用不完整',
         independent_provider: '独立专家',
         batch_format_independent: '独立专家',
         batch_timeout_independent: '独立专家',
-        independent_provider_fallback: '独立调用失败，本地兜底',
+        independent_provider_fallback: '独立调用失败',
         independent_provider_failed: '独立调用失败',
-        circuit_breaker_fallback: '熔断兜底',
-        timeout_fallback: '超时兜底',
+        circuit_breaker_fallback: '熔断阻断',
+        timeout_fallback: '调用超时',
     };
     return labels[String(status || '')] || String(status || '-');
 }
@@ -8128,14 +8128,25 @@ function renderServerModelRuntime(data, container) {
     const toolsStatusLine = runtimeEndpointSummary(tools.status_health);
     const toolsHealthLine = runtimeEndpointSummary(tools.health);
     const platformModels = Array.isArray(platformRuntime.ai_models) ? platformRuntime.ai_models : [];
-    const MODEL_PUBLIC_ENDPOINTS = {
-        'qwen3-14b-trade': 'platform loopback 18000',
-        'deepseek-r1-14b-risk': 'platform loopback 18002',
-        'BB-FinQuant-Expert-14B': 'platform loopback 18003',
-        phase3_quant_api: 'platform loopback 18001',
-    };
+    const activeProfile = String(
+        platformRuntime.topology_profile || runtime.topology_profile || 'target_single_model'
+    ).toLowerCase();
+    const targetTopology = runtime.target_model_topology || platformRuntime.target_model_topology || {};
+    const targetRuntimeModel = String(
+        targetTopology.runtime_model_id
+        || (platformModels.find(item => item && String(item.name || '').toLowerCase() === 'decision_maker') || {}).model
+        || ''
+    ).trim();
+    const targetModelPublicEndpoint = targetRuntimeModel ? 'platform loopback 18000' : 'target carrier not configured';
     const platformModelPublicUrl = (modelId, fallbackPort = '') => {
-        return MODEL_PUBLIC_ENDPOINTS[modelId] || fallbackPort || 'platform loopback only';
+        const id = String(modelId || '').trim();
+        if (activeProfile === 'target_single_model') {
+            if (id === targetRuntimeModel) return targetModelPublicEndpoint;
+            if (id === 'phase3_quant_api') return 'platform loopback 18001';
+            if (id.toLowerCase().includes('review')) return 'external/cloud high-risk reviewer';
+            return fallbackPort || 'external/cloud route';
+        }
+        return fallbackPort || 'platform loopback only';
     };
     const configuredOrPublicModelEndpoint = (modelId, configuredBaseValue = '', fallbackPort = '') => {
         const configuredBase = String(configuredBaseValue || '').trim().replace(/\/$/, '');
@@ -8144,15 +8155,13 @@ function renderServerModelRuntime(data, container) {
             || configuredBase.includes('127.0.0.1')
             || configuredBase.includes('localhost')
             || configuredBase.includes(':18000')
-            || configuredBase.includes(':18002')
-            || configuredBase.includes(':18003')
         ) {
             return platformModelPublicUrl(modelId, fallbackPort);
         }
         return configuredBase;
     };
     const localToolsPublicUrl = () => {
-        return MODEL_PUBLIC_ENDPOINTS.phase3_quant_api;
+        return 'platform loopback 18001';
     };
     const vllmRows = vllmEndpoints.length ? vllmEndpoints : [vllm];
     const vllmInstanceCards = vllmRows.map(item => {
@@ -11466,7 +11475,7 @@ function renderTrainableModels() {
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
             { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
-            { label: '别名代理', value: model.alias_only ? '是' : '否' },
+            { label: '运行服务', value: model.runtime_available ? '可用' : '不可用' },
         ],
         note: Array.isArray(model.blocking_reasons) && model.blocking_reasons.length
             ? `阻塞原因：${model.blocking_reasons.join('、')}`
@@ -11483,7 +11492,6 @@ function renderTrainableModels() {
             ${mlMetricCard('模型总数', String(Number(summary.model_count || models.length)), `注册表版本 ${registry.version || '-'}`, 'good')}
             ${mlMetricCard('可训练模型', String(Number(summary.trainable_count || 0)), '只有这些模型允许产生项目训练产物', 'good')}
             ${mlMetricCard('仅推理/评估', String(Number(summary.inference_or_evaluation_only_count || 0)), '不会冒充持续训练', 'muted')}
-            ${mlMetricCard('别名代理', String(Number(summary.alias_only_count || 0)), summary.alias_only_models?.join('、') || '无', Number(summary.alias_only_count || 0) ? 'bad' : 'good')}
             ${mlMetricCard('身份异常', String(Number(summary.identity_failure_count || 0)), summary.identity_failure_models?.join('、') || '无', Number(summary.identity_failure_count || 0) ? 'bad' : 'good')}
         </div>
         <div class="ml-train-model-list ml-train-model-list-clear">

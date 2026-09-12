@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from core.phase3_model_contract import PHASE3_REQUIRED_LLM_MODEL_IDS
+from core.phase3_model_contract import PHASE3_TARGET_MODEL_ID
 from core.safe_output import safe_error_text
 from executor.okx_executor import OKXExecutor
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
@@ -120,52 +120,27 @@ def _target_model_identity(model_server: dict[str, Any]) -> str:
 def _platform_model_runtime_ready(
     runtime: dict[str, Any],
     *,
-    target_model_id: str = "",
+    target_model_id: str = PHASE3_TARGET_MODEL_ID,
 ) -> bool:
+    """Return true only when the single local target carrier is available."""
+
     rows = [
         item for item in _safe_list(runtime.get("ai_models")) if isinstance(item, dict)
     ]
-    required = PHASE3_REQUIRED_LLM_MODEL_IDS
-    available: set[str] = set()
-    decision_route_available = False
     for row in rows:
-        if not bool(row.get("available")):
+        if not bool(row.get("available")) or str(row.get("name") or "").strip().lower() != "decision_maker":
             continue
-        model = str(row.get("model") or "").strip().lower()
-        if model:
-            available.add(model)
-        if str(row.get("name") or "").strip().lower() == "decision_maker":
-            decision_route_available = True
-        for served in _safe_list(row.get("models")):
-            served_text = str(served or "").strip().lower()
-            if served_text:
-                available.add(served_text)
-    if target_model_id:
-        for row in rows:
-            if not bool(row.get("available")) or str(row.get("name") or "").strip().lower() != "decision_maker":
-                continue
-            candidates = {
-                str(row.get("model") or "").strip().lower(),
-                *{
-                    str(value or "").strip().lower()
-                    for value in _safe_list(row.get("models"))
-                    if str(value or "").strip()
-                },
-            }
-            if target_model_id in candidates:
-                return True
-        return False
-
-    if required.issubset(available):
-        return True
-
-    # The decision role may intentionally use an approved external route. In
-    # that case the canonical local Qwen model is not present in the probe,
-    # even though the active decision endpoint is healthy.
-    decision_model = PHASE3_REQUIRED_LLM_MODEL_IDS - {
-        "qwen3-14b-trade",
-    }
-    return decision_route_available and decision_model.issubset(available)
+        candidates = {
+            str(row.get("model") or "").strip().lower(),
+            *{
+                str(value or "").strip().lower()
+                for value in _safe_list(row.get("models"))
+                if str(value or "").strip()
+            },
+        }
+        if str(target_model_id or "").strip().lower() in candidates:
+            return True
+    return False
 
 
 def _account_equity_value(snapshot: dict[str, Any]) -> float:
@@ -346,17 +321,26 @@ def evaluate_phase3_paper_resume_preflight_inputs(
     else:
         passed.append("okx_account_equity_truth_available")
 
+    topology_profile = str(model_server.get("topology_profile") or "").strip().lower()
     target_topology = _target_model_topology(model_server)
     target_model_id = _target_model_identity(model_server)
     topology_blockers: list[dict[str, Any]] = []
-    if "target_model_topology" in model_server and not target_topology:
+    if topology_profile != "target_single_model":
+        topology_blockers.append(
+            _blocker(
+                "phase3_target_model_topology_profile_invalid",
+                "Paper resume requires the target_single_model topology profile.",
+                evidence={"topology_profile": topology_profile},
+            )
+        )
+    if not target_topology:
         topology_blockers.append(
             _blocker(
                 "phase3_target_model_topology_missing",
                 "The target one-model topology contract is missing from model-server readiness.",
             )
         )
-    elif target_topology:
+    else:
         topology_stage = str(target_topology.get("stage") or "").strip().lower()
         target_blockers = _safe_list(target_topology.get("blockers"))
         if bool(target_topology.get("activation_blocked")) or not target_model_id:
@@ -395,32 +379,39 @@ def evaluate_phase3_paper_resume_preflight_inputs(
         target_model_id=target_model_id,
     )
     if not bool(model_server.get("runtime_ready")):
-        if platform_model_runtime_ready:
-            warnings.append(
-                _warning(
-                    "phase3_model_server_remote_audit_unverified",
-                    "Remote model-server manifest audit is unavailable, but platform loopback model endpoints are healthy.",
-                    evidence={
-                        "status": model_server.get("status"),
-                        "blockers": _safe_list(model_server.get("blockers"))[:8],
-                    },
-                )
+        blockers.append(
+            _blocker(
+                "phase3_model_server_runtime_not_ready",
+                "Phase 3 quant model-server runtime must be ready before paper resumes.",
+                evidence={
+                    "status": model_server.get("status"),
+                    "artifact_ready": model_server.get("artifact_ready"),
+                    "runtime_ready": model_server.get("runtime_ready"),
+                    "blockers": _safe_list(model_server.get("blockers"))[:8],
+                    "warnings": _safe_list(model_server.get("warnings"))[:8],
+                },
             )
-            passed.append("phase3_model_server_platform_endpoints_ready")
-        else:
-            blockers.append(
-                _blocker(
-                    "phase3_model_server_runtime_not_ready",
-                    "Phase 3 quant model-server runtime must be ready before paper resumes.",
-                    evidence={
-                        "status": model_server.get("status"),
-                        "artifact_ready": model_server.get("artifact_ready"),
-                        "runtime_ready": model_server.get("runtime_ready"),
-                        "blockers": _safe_list(model_server.get("blockers"))[:8],
-                        "warnings": _safe_list(model_server.get("warnings"))[:8],
-                    },
-                )
+        )
+    elif not platform_model_runtime_ready:
+        blockers.append(
+            _blocker(
+                "phase3_target_model_runtime_route_not_ready",
+                "The target decision_maker runtime row must expose the verified target model id.",
+                evidence={
+                    "target_model_id": target_model_id,
+                    "ai_models": [
+                        {
+                            "name": row.get("name"),
+                            "model": row.get("model"),
+                            "available": row.get("available"),
+                            "models": row.get("models"),
+                        }
+                        for row in _safe_list(runtime.get("ai_models"))
+                        if isinstance(row, dict)
+                    ][:8],
+                },
             )
+        )
     elif bool(model_server.get("phase3_model_service_go_live_blocked")):
         blockers.append(
             _blocker(

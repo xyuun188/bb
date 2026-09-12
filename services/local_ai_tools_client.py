@@ -59,9 +59,8 @@ _HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
 _BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
 _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
 _MAX_CONCURRENT_INFERENCE_BATCHES = 2
-# Sentiment may use the heavyweight 14B shadow specialist. It is useful for
-# diagnostics, but it must not hold the profit/time-series evidence batch open
-# while position review is using the same model queue.
+# Sentiment is an optional shadow signal. It must not hold the
+# profit/time-series evidence batch open while position review uses the same queue.
 _OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS = 5.0
 
 

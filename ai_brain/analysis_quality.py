@@ -16,14 +16,6 @@ EXPERT_CALL_STATUSES = (
     "skipped",
 )
 
-_FALLBACK_MARKERS = (
-    "timeout_fallback",
-    "local_fallback",
-    "market_fast_prefilter",
-    "batch_expert_fallback",
-    "analysis_budget_deferred",
-)
-
 
 def _text_status(status: Any) -> str:
     return str(status or "").strip().lower()
@@ -38,13 +30,6 @@ def _failure_status(reason: Any) -> str:
     if any(token in text for token in ("empty", "空返回", "空响应")):
         return "empty"
     return "unavailable"
-
-
-def _decision_fallback(decision: DecisionOutput | None) -> bool:
-    if not isinstance(decision, DecisionOutput):
-        return False
-    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-    return any(bool(raw.get(marker)) for marker in _FALLBACK_MARKERS)
 
 
 def _normalized_status(
@@ -65,7 +50,6 @@ def _normalized_status(
         return "empty"
     if raw_status in {
         "analysis_budget_deferred",
-        "fast_prefilter",
         "pre_expert_skipped",
     }:
         return "skipped"
@@ -73,17 +57,10 @@ def _normalized_status(
         "failed",
         "independent_provider_failed",
         "unavailable",
-        "circuit_breaker_fallback",
-        "partial_batch_fallback",
+        "batch_failed_independent",
+        "circuit_breaker_independent",
     }:
         return _failure_status(reason)
-    if _decision_fallback(decision):
-        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-        if raw.get("timeout_fallback"):
-            return "timeout"
-        if raw.get("analysis_budget_deferred") or raw.get("market_fast_prefilter"):
-            return "skipped"
-        return "unavailable"
     if failure_reason:
         return _failure_status(failure_reason)
     if isinstance(decision, DecisionOutput):
@@ -102,8 +79,10 @@ def _timings_by_name(timings: list[dict[str, Any]] | None) -> dict[str, dict[str
         if not name:
             continue
         current = selected.get(name)
-        if current is None or row.get("replaces_batch_decision") or not current.get(
-            "replaces_batch_decision"
+        if (
+            current is None
+            or row.get("replaces_batch_decision")
+            or not current.get("replaces_batch_decision")
         ):
             selected[name] = row
     return selected
@@ -138,7 +117,11 @@ def build_expert_call_contract(
         reason = str(
             timing.get("reason")
             or failure_reason
-            or (decision.reasoning if isinstance(decision, DecisionOutput) and status != "completed" else "")
+            or (
+                decision.reasoning
+                if isinstance(decision, DecisionOutput) and status != "completed"
+                else ""
+            )
             or ""
         ).strip()
         slot = {
@@ -225,7 +208,9 @@ def finalize_analysis_quality(
                 major_conflict_pairs.add(normalized_pair)
         else:
             unavailable += 1
-    cross_complete = expected_pairs > 0 and len(completed_pairs) >= expected_pairs and unavailable == 0
+    cross_complete = (
+        expected_pairs > 0 and len(completed_pairs) >= expected_pairs and unavailable == 0
+    )
     consultation_payload = consultation if isinstance(consultation, dict) else {}
     resolution_status = str(consultation_payload.get("resolution_status") or "").lower()
     resolved_action = str(consultation_payload.get("resolved_action") or "").lower()
@@ -252,15 +237,15 @@ def finalize_analysis_quality(
         and str(final_action or "").lower() in {"long", "short"}
     )
     analysis_complete = (
-        bool(result.get("expert_complete"))
-        and cross_complete
-        and conflict_resolution_complete
+        bool(result.get("expert_complete")) and cross_complete and conflict_resolution_complete
     )
     result["cross_validation"] = {
         "expected_pair_count": expected_pairs,
         "completed_pair_count": len(completed_pairs),
         "unavailable_pair_count": unavailable,
-        "coverage_ratio": round(len(completed_pairs) / expected_pairs, 4) if expected_pairs else 0.0,
+        "coverage_ratio": round(len(completed_pairs) / expected_pairs, 4)
+        if expected_pairs
+        else 0.0,
         "major_conflict_count": len(major_conflict_pairs),
         "unresolved_major_conflict_count": len(unresolved_major_conflicts),
         "conflicts_resolved": conflict_resolution_complete,
@@ -274,9 +259,7 @@ def finalize_analysis_quality(
     result["decision_eligible"] = analysis_complete
     result["paper_observation_eligible"] = paper_observation_eligible
     result["paper_observation_mode"] = (
-        "model_led_conflict_observation"
-        if paper_observation_eligible
-        else None
+        "model_led_conflict_observation" if paper_observation_eligible else None
     )
     if analysis_complete:
         result["result"] = final_action if final_action in {"long", "short", "hold"} else "hold"
@@ -293,7 +276,5 @@ def finalize_analysis_quality(
             result["reason_code"] = "direction_conflict"
             result["reason"] = "交叉验证发现重大方向冲突，深度会诊未明确解决全部冲突。"
             if paper_observation_eligible:
-                result["reason"] = (
-                    "纸面市场分析保留模型主导观察；专家冲突已记录，生产权限仍关闭。"
-                )
+                result["reason"] = "纸面市场分析保留模型主导观察；专家冲突已记录，生产权限仍关闭。"
     return result

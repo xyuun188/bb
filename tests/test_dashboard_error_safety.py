@@ -2785,7 +2785,16 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
     requests: list[tuple[str, str]] = []
 
     fake_settings = SimpleNamespace(
-        get_fixed_ai_models=lambda include_empty=False: [],
+        get_fixed_ai_models=lambda include_empty=False: [
+            {
+                "name": "decision_maker",
+                "role": "decision_maker",
+                "api_base": "http://127.0.0.1:18000/v1",
+                "api_key": "",
+                "model": "qwen3.8-27b",
+                "enabled": True,
+            }
+        ],
         local_ai_tools_api_base="",
         local_ai_tools_api_key="",
     )
@@ -2813,7 +2822,7 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
             if url == "http://127.0.0.1:18000/v1/models":
                 return httpx.Response(
                     200,
-                    json={"data": [{"id": "qwen3-14b-trade"}]},
+                    json={"data": [{"id": "qwen3.8-27b"}]},
                     request=request,
                 )
             if url == "http://127.0.0.1:18002/v1/models":
@@ -2851,6 +2860,7 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
     assert ("GET", "http://127.0.0.1:18001/health/live") not in requests
     assert ("GET", "http://127.0.0.1:18001/models/status") in requests
     tunnels = result["model_tunnels"]
+    assert result["topology_profile"] == "target_single_model"
     assert tunnels["ready"] is True
     assert tunnels["can_call_expert"] is True
     assert tunnels["can_call_quant_tool"] is True
@@ -2906,7 +2916,7 @@ async def test_collect_platform_runtime_status_flags_wrong_local_ai_loopback_por
     assert quant_tunnel["status"] != "ok"
 
 
-async def test_collect_platform_runtime_status_uses_external_decision_route(
+async def test_collect_platform_runtime_status_rejects_external_decision_route(
     monkeypatch,
 ) -> None:
     fake_settings = SimpleNamespace(
@@ -2992,12 +3002,12 @@ async def test_collect_platform_runtime_status_uses_external_decision_route(
     tunnels = result["model_tunnels"]
     assert tunnels["decision_route"]["external"] is True
     assert tunnels["decision_route"]["available"] is True
-    assert tunnels["can_call_decision_maker"] is True
-    assert tunnels["can_create_strategy"] is True
-    assert 18000 not in tunnels["unavailable_ports"]
+    assert tunnels["can_call_decision_maker"] is False
+    assert tunnels["can_create_strategy"] is False
+    assert 18000 in tunnels["unavailable_ports"]
     qwen_tunnel = next(row for row in tunnels["tunnels"] if row["local_port"] == 18000)
-    assert qwen_tunnel["required"] is False
-    assert qwen_tunnel["status"].startswith("standby")
+    assert qwen_tunnel["required"] is True
+    assert qwen_tunnel["status"] == "invalid_external_route"
 
 
 async def test_symbols_available_error_response_is_redacted(

@@ -11,19 +11,18 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config.settings import ENSEMBLE_TRADER_NAME, settings
+from config.settings import ENSEMBLE_TRADER_NAME, _is_target_local_model_config, settings
 from core.model_runtime import (
     HIGH_RISK_REVIEW_TOKEN_CAP,
     HIGH_RISK_REVIEW_TOKEN_FLOOR,
-    ensure_no_think_text,
-    non_thinking_extra_body,
-    uses_thinking_tags,
 )
-from core.safe_output import redact_output, safe_error_text
+from core.phase3_model_contract import PHASE3_TARGET_MODEL_ID
+from core.safe_output import safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
 from services.model_server_config import (
@@ -924,7 +923,7 @@ async def update_ai_model_fixed(name: str, req: AIModelRequest):
             await set_runtime_secret(secure_ai_model_key(name), req.api_key.strip())
         updated = settings.set_fixed_ai_model(name, updates)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=safe_error_text(e)) from e
+        raise HTTPException(status_code=400, detail=safe_error_text(e)) from e
 
     settings.update_env_file(
         {"AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)}
@@ -941,111 +940,11 @@ async def delete_ai_model_fixed(name: str):
     )
 
 
-@router.post("/settings/ai-models")
-async def add_ai_model(req: AIModelRequest):
-    """Add a new AI model configuration (paper or live)."""
-    if not req.name or not req.name.strip():
-        raise HTTPException(status_code=400, detail="Model name is required")
-
-    # Check for duplicate name
-    for m in settings.ai_models:
-        if m.get("name") == req.name.strip():
-            raise HTTPException(status_code=400, detail=f"Model '{req.name}' already exists")
-
-    mode = req.execution_mode or "paper"
-
-    new_model: dict[str, Any] = {
-        "name": req.name.strip(),
-        "api_base": _normalize_api_base_or_400(
-            req.api_base,
-            field_name="AI model API base",
-        ),
-        "api_key": (req.api_key or "").strip(),
-        "model": (req.model or "gpt-4").strip(),
-        "execution_mode": mode,
-    }
-    if new_model["api_key"]:
-        await set_runtime_secret(secure_ai_model_key(new_model["name"]), new_model["api_key"])
-
-    settings.ai_models.append(new_model)
-    env_updates = {
-        "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
-    }
-    env_updates = strip_secret_env_updates(env_updates)
-    settings.update_env_file(env_updates)
-
-    await _sync_models_to_running_services()
-
-    return {"status": "ok", "message": f"Model '{req.name}' added.", "model": _masked(new_model)}
-
-
-@router.put("/settings/ai-models/{name}")
-async def update_ai_model(name: str, req: AIModelRequest):
-    """Update an existing AI model configuration."""
-    for i, m in enumerate(settings.ai_models):
-        if m.get("name") == name:
-            updated = dict(m)
-            if req.name and req.name.strip() and req.name.strip() != name:
-                updated["name"] = req.name.strip()
-            if req.api_base is not None:
-                updated["api_base"] = _normalize_api_base_or_400(
-                    req.api_base,
-                    field_name="AI model API base",
-                )
-            if (
-                req.api_key is not None
-                and req.api_key.strip()
-                and not _is_masked_secret(req.api_key)
-            ):
-                updated["api_key"] = req.api_key.strip()
-                await set_runtime_secret(
-                    secure_ai_model_key(updated.get("name", name)), req.api_key.strip()
-                )
-            if req.model is not None and req.model.strip():
-                updated["model"] = req.model.strip()
-            if req.execution_mode:
-                updated["execution_mode"] = req.execution_mode
-            updated.pop("balance", None)
-            settings.ai_models[i] = updated
-            env_updates = {
-                "AI_MODELS": json.dumps(scrub_ai_model_env(settings.ai_models), ensure_ascii=False)
-            }
-            env_updates = strip_secret_env_updates(env_updates)
-            settings.update_env_file(env_updates)
-            await _sync_models_to_running_services()
-            return {
-                "status": "ok",
-                "message": f"Model '{name}' updated.",
-                "model": _masked(updated),
-            }
-
-    raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
-
-
-@router.delete("/settings/ai-models/{name}")
-async def delete_ai_model(name: str):
-    """Delete an AI model configuration."""
-    # Check configured models first
-    for i, m in enumerate(settings.ai_models):
-        if m.get("name") == name:
-            settings.ai_models.pop(i)
-            settings.update_env_file(
-                {
-                    "AI_MODELS": json.dumps(
-                        scrub_ai_model_env(settings.ai_models), ensure_ascii=False
-                    )
-                }
-            )
-            await _sync_models_to_running_services()
-            return {"status": "ok", "message": f"Model '{name}' deleted."}
-
-    raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
-
-
 @router.post("/settings/ai-models/test")
 async def test_ai_model_connection(req: AIModelTestRequest):
-    """Test an AI model's API connection by making a simple ChatOpenAI call."""
-    # Resolve only the named expert config or explicit request fields.
+    """Verify the only permitted fixed-model route without generating a completion."""
+    # Fixed roles must use the local Qwen carrier. Cloud providers are isolated
+    # to high-risk review and cannot be probed as an alternate decision route.
     api_base = req.api_base
     api_key = req.api_key
     model = req.model
@@ -1066,37 +965,30 @@ async def test_ai_model_connection(req: AIModelTestRequest):
     except ValueError as exc:
         return {"success": False, "error": _connection_error_text(exc), "model": model}
 
-    if not api_key:
-        return {"success": False, "error": "No API key configured"}
+    if not _is_target_local_model_config(api_base, str(model or ""), str(api_key or "")):
+        return {
+            "success": False,
+            "error": "Fixed roles require qwen3.8-27b on platform loopback 18000",
+            "model": model,
+        }
 
     try:
-        from langchain_core.messages import HumanMessage
-        from langchain_openai import ChatOpenAI
-
-        llm_kwargs: dict[str, Any] = {
-            "base_url": api_base,
-            "api_key": api_key,
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 10,
-            "timeout": 15,
-            "max_retries": 0,
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{api_base}/models")
+        if not response.is_success:
+            raise RuntimeError(f"model endpoint returned HTTP {response.status_code}")
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        model_ids = {
+            str(item.get("id") or item.get("root") or "").strip()
+            for item in rows
+            if isinstance(item, dict)
         }
-        if uses_thinking_tags(model):
-            llm_kwargs["extra_body"] = non_thinking_extra_body()
-            prompt = ensure_no_think_text("Hi")
-        else:
-            prompt = "Hi"
-
-        llm = ChatOpenAI(
-            **llm_kwargs,
-        )
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        content = response.content if hasattr(response, "content") else str(response)
-        safe_content = redact_output(content)[:100]
+        if PHASE3_TARGET_MODEL_ID not in model_ids:
+            raise RuntimeError("target model identity was not returned by /models")
         return {
             "success": True,
-            "message": f"Connection OK. Response: {safe_content}",
+            "message": "Connection OK. Target model identity verified.",
             "model": model,
         }
     except Exception as exc:

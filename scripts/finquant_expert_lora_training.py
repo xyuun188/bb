@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Export BB-FinQuant SFT data and run model-server LoRA specialization.
-
-This script deliberately treats BB-FinQuant-Expert-14B specialization as a real
-artifact-producing training job. A renamed Qwen endpoint is not considered
-trained unless an adapter directory and specialization manifest are produced.
-"""
+"""Export authoritative BB-FinQuant data and train the Qwen3.8-27B adapter."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import os
 import posixpath
-import re
 import subprocess
 import sys
 import textwrap
@@ -32,8 +27,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import settings  # noqa: E402
+from core import finquant_training_contract as training_contract  # noqa: E402
+from core import model_host_deployment  # noqa: E402
+from core.finquant_adapter_registry import REMOTE_REGISTRY_TOOL_CODE  # noqa: E402
+from core.finquant_remote_trainer import REMOTE_TRAINER_CODE  # noqa: E402
 from core.model_candidate_manifest import ModelCandidateManifest  # noqa: E402
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
+from core.model_training_backend import ModelTrainingBackendManifest  # noqa: E402
+from core.model_training_service_lease import (  # noqa: E402
+    capture_service_states_command,
+    parse_service_states,
+    restore_services_command,
+    service_states_match,
+    stop_services_command,
+    wrap_command_with_restore,
+)
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_error_text, safe_print  # noqa: E402
 from core.training_contracts import is_authoritative_expert_memory_extra  # noqa: E402
@@ -53,23 +61,27 @@ REMOTE_DATASET_VERSIONS_DIR = f"{REMOTE_TRAINING_DIR}/versions"
 REMOTE_DATASET_CURRENT = f"{REMOTE_TRAINING_DIR}/current.json"
 REMOTE_TRAINER = f"{REMOTE_SERVICE_DIR}/train_finquant_lora.py"
 REMOTE_REGISTRY_TOOL = f"{REMOTE_SERVICE_DIR}/finquant_registry.py"
-REMOTE_ADAPTER_ROOT = f"{REMOTE_ROOT}/models/finquant_lora"
+REMOTE_ADAPTER_ROOT = f"{REMOTE_ROOT}/models/finquant_target_27b"
 REMOTE_ADAPTER_VERSIONS_DIR = f"{REMOTE_ADAPTER_ROOT}/versions"
 REMOTE_ADAPTER_CURRENT = f"{REMOTE_ADAPTER_ROOT}/current.json"
 REMOTE_ADAPTER_ROLLBACK = f"{REMOTE_ADAPTER_ROOT}/rollback.json"
-REMOTE_LEGACY_ADAPTER_DIR = f"{REMOTE_ADAPTER_ROOT}/BB-FinQuant-Expert-14B-v1"
-REMOTE_LEGACY_SPECIALIZATION_MANIFEST = f"{REMOTE_LEGACY_ADAPTER_DIR}/specialization_manifest.json"
-REMOTE_INFERENCE_BASE_MODEL = "/data/trade_models/Qwen/Qwen3-14B-AWQ"
-REMOTE_TRAIN_BASE_REPO = "Qwen/Qwen3-14B"
-REMOTE_TRAIN_BASE_MODEL = f"{REMOTE_ROOT}/models/trainable/Qwen3-14B"
-REMOTE_QWEN_START_SCRIPT = "/data/trade_ai/scripts/start_qwen3_14b_trade.sh"
-REMOTE_QWEN_SERVICE = "bb-phase3-llm-decision.service"
-REMOTE_RISK_SERVICE = "bb-phase3-llm-risk-review.service"
-REMOTE_GATEWAY_DIR = f"{REMOTE_ROOT}/services/finquant_expert_gateway"
-REMOTE_GATEWAY_SCRIPT = f"{REMOTE_GATEWAY_DIR}/gateway.py"
-REMOTE_GATEWAY_SERVICE = "bb-phase3-llm-expert.service"
-REMOTE_GATEWAY_SERVICE_PATH = f"/etc/systemd/system/{REMOTE_GATEWAY_SERVICE}"
-REMOTE_LEGACY_ALIAS_SERVICE = "bb-finquant-expert-alias.service"
+TARGET_MODEL_REPO = training_contract.TARGET_MODEL_REPO
+TARGET_MODEL_TYPE = training_contract.TARGET_MODEL_TYPE
+TARGET_MODEL_ARCHITECTURE = training_contract.TARGET_MODEL_ARCHITECTURE
+TARGET_MODEL_ID = training_contract.TARGET_MODEL_ID
+REMOTE_INFERENCE_BASE_MODEL = os.environ.get(
+    "BB_TARGET_INFERENCE_MODEL_PATH", "/home/linux/trade_models/qwen3.8-27b"
+).strip()
+REMOTE_TRAIN_BASE_REPO = TARGET_MODEL_REPO
+REMOTE_TRAIN_BASE_MODEL = os.environ.get(
+    "BB_TARGET_TRAINING_MODEL_PATH", REMOTE_INFERENCE_BASE_MODEL
+).strip()
+REMOTE_QWEN_START_SCRIPT = "/data/BB/scripts/start_target_single_model.sh"
+REMOTE_TARGET_MODEL_SERVICE = "bb-phase3-llm-target.service"
+REMOTE_TRAINING_CONFLICT_SERVICES = (
+    REMOTE_TARGET_MODEL_SERVICE,
+    "bb-phase3-quant-api.service",
+)
 REMOTE_TRAIN_LOG_DIR = f"{REMOTE_TRAINING_DIR}/logs"
 REMOTE_DOWNLOAD_MANIFEST = f"{REMOTE_ROOT}/manifests/phase3_model_download_manifest.json"
 REMOTE_VALIDATION_MANIFEST = f"{REMOTE_ROOT}/manifests/phase3_model_validation.json"
@@ -78,17 +90,24 @@ REMOTE_PLATFORM_APP_DIR = "/data/bb/app"
 REMOTE_PLATFORM_SCRIPT = f"{REMOTE_PLATFORM_APP_DIR}/scripts/finquant_expert_lora_training.py"
 REMOTE_PLATFORM_EXPORT_DIR = f"{REMOTE_PLATFORM_APP_DIR}/data/finquant_expert_training"
 REMOTE_PLATFORM_EXPORT_WRAPPER = f"{REMOTE_PLATFORM_EXPORT_DIR}/export_wrapper.py"
-MODEL_NAME = os.environ.get("BB_TARGET_MODEL_ID", "BB-FinQuant-Expert-14B").strip()
-BASE_MODEL_NAME = "qwen3-14b-trade"
-FINQUANT_GATEWAY_RUNTIME_VERSION = "4.0"
-FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE = 128
-DATASET_SCHEMA_VERSION = "bb_finquant_expert_sft.v2"
-RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
-RETURN_OBJECTIVE_VERSION = "2026-07-12.v1"
-PREFERENCE_CONTRACT_VERSION = "bb_finquant_return_preference.v1"
-ADAPTER_REGISTRY_VERSION = "bb_finquant_lora.v2"
-DATASET_VERSION_PATTERN = re.compile(r"^bb-finquant-sft-v2-[0-9a-f]{12}-[0-9a-f]{8}$")
-ADAPTER_VERSION_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
+MODEL_NAME = TARGET_MODEL_ID
+BASE_MODEL_NAME = os.environ.get("BB_TARGET_BASE_MODEL_NAME", "qwen3.8-27b-base").strip()
+DATASET_SCHEMA_VERSION = training_contract.DATASET_SCHEMA_VERSION
+DATASET_POLICY = training_contract.DATASET_POLICY
+TRAINING_INHERITANCE_CONTRACT = {
+    "authoritative_samples": "inherited",
+    "preference_pairs": "inherited",
+    "task_and_label_contracts": "inherited",
+    "evaluation_workflow": "inherited",
+    "legacy_adapter_weights": "forbidden",
+    "legacy_optimizer_state": "forbidden",
+}
+RETURN_OBJECTIVE_NAME = training_contract.RETURN_OBJECTIVE_NAME
+RETURN_OBJECTIVE_VERSION = training_contract.RETURN_OBJECTIVE_VERSION
+PREFERENCE_CONTRACT_VERSION = training_contract.PREFERENCE_CONTRACT_VERSION
+ADAPTER_REGISTRY_VERSION = "bb_finquant_target_27b.v1"
+DATASET_VERSION_PATTERN = training_contract.DATASET_VERSION_PATTERN
+ADAPTER_VERSION_PATTERN = training_contract.ADAPTER_VERSION_PATTERN
 REQUIRED_TRAINING_TABLES = (
     "trade_reflections",
     "positions",
@@ -96,13 +115,17 @@ REQUIRED_TRAINING_TABLES = (
     "shadow_backtests",
     "expert_memories",
 )
+TARGET_TRAINING_BACKEND_MANIFEST_ENV = "BB_TARGET_TRAINING_BACKEND_MANIFEST"
+LIVE_SWITCH_GATE_ENV = "BB_FINQUANT_LIVE_SWITCH_GATE"
+REMOTE_TRAINING_TIMEOUT_SECONDS = 6900
+REMOTE_TRAINING_SSH_TIMEOUT_SECONDS = 7200
 
 
 def _verified_training_candidate() -> ModelCandidateManifest:
     """Load the exact candidate used for a new training run.
 
-    Historical dataset exports retain the old 14B identity for reproducibility,
-    but a new adapter must never be trained against that base implicitly. The
+    Historical dataset exports retain lineage, but a new adapter must never be
+    trained against an old base implicitly. The
     caller provides a model-host-generated manifest through
     ``BB_TARGET_MODEL_MANIFEST``; without it training is refused closed.
     """
@@ -119,864 +142,28 @@ def _verified_training_candidate() -> ModelCandidateManifest:
     return candidate
 
 
-REMOTE_TRAINER_CODE = r"""
-from __future__ import annotations
+def _verified_training_backend(candidate: ModelCandidateManifest) -> ModelTrainingBackendManifest:
+    """Require independent Qwen3.5 training evidence before any remote mutation."""
 
-import argparse
-import hashlib
-import json
-import os
-import shutil
-from datetime import datetime, timezone
-from pathlib import Path
-
-import torch
-from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def canonical_row_hash(row: dict) -> str:
-    payload = json.dumps(
-        row,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def load_rows(path: Path) -> list[dict]:
-    rows = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if isinstance(row, dict):
-                messages = row.get("messages")
-                if not isinstance(messages, list) or len(messages) < 3:
-                    raise SystemExit("invalid SFT message contract")
-                for message in messages:
-                    if not isinstance(message, dict):
-                        raise SystemExit("invalid SFT message row")
-                    if message.get("role") in {"user", "assistant"}:
-                        try:
-                            parsed_content = json.loads(str(message.get("content") or ""))
-                        except json.JSONDecodeError as exc:
-                            raise SystemExit(
-                                "SFT user/assistant content is not valid JSON"
-                            ) from exc
-                        if not isinstance(parsed_content, dict):
-                            raise SystemExit(
-                                "SFT user/assistant JSON content must be an object"
-                            )
-                rows.append(row)
-    return rows
-
-
-def row_to_text(tokenizer, row: dict) -> str:
-    messages = row.get("messages")
-    if isinstance(messages, list) and hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        except Exception:
-            pass
-    parts = []
-    for item in messages or []:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role", "user")
-        content = item.get("content", "")
-        parts.append(f"<|{role}|>\n{content}")
-    return "\n".join(parts)
-
-
-def split_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    if len(rows) < 10:
-        return rows, []
-    ranked = sorted((canonical_row_hash(row), index) for index, row in enumerate(rows))
-    eval_count = min(max(len(rows) // 10, 1), 64)
-    eval_indices = {item[1] for item in ranked[:eval_count]}
-    train_rows = [row for index, row in enumerate(rows) if index not in eval_indices]
-    eval_rows = [row for index, row in enumerate(rows) if index in eval_indices]
-    return train_rows, eval_rows
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--dataset-manifest", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--base-model", required=True)
-    parser.add_argument("--base-model-repo", required=True)
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--inference-base-model", default="")
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--version-id", required=True)
-    parser.add_argument("--max-steps", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    args = parser.parse_args()
-
-    dataset_path = Path(args.dataset)
-    dataset_manifest_path = Path(args.dataset_manifest)
-    output_dir = Path(args.output_dir)
-    manifest_path = Path(args.manifest)
-    if output_dir.exists():
-        raise SystemExit(f"refusing to overwrite adapter version: {output_dir}")
-    if manifest_path.parent != output_dir:
-        raise SystemExit("specialization manifest must be stored inside its adapter version")
-    dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
-    dataset_sha256 = sha256_file(dataset_path)
-    if dataset_manifest.get("dataset_sha256") != dataset_sha256:
-        raise SystemExit("dataset SHA-256 does not match its manifest")
-    if dataset_manifest.get("dataset_schema_version") != "bb_finquant_expert_sft.v2":
-        raise SystemExit("unsupported BB-FinQuant dataset schema")
-    if dataset_manifest.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
-        raise SystemExit("dataset return objective mismatch")
-    if dataset_manifest.get("objective_version") != "2026-07-12.v1":
-        raise SystemExit("dataset return objective version mismatch")
-    base_identity = dataset_manifest.get("base_model_identity")
-    if not isinstance(base_identity, dict) or base_identity.get("training_repo") != args.base_model_repo:
-        raise SystemExit("dataset and trainer base-model identities do not match")
-    for key in ("dataset_lineage_sha256", "source_script_sha256"):
-        value = str(dataset_manifest.get(key) or "")
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
-            raise SystemExit(f"dataset manifest has no valid {key}")
-    rows = load_rows(dataset_path)
-    if not rows:
-        raise SystemExit("empty training dataset")
-    train_rows, eval_rows = split_rows(rows)
-    preference_rows = []
-    for row in train_rows:
-        preference = row.get("preference")
-        if not isinstance(preference, dict):
-            continue
-        if preference.get("contract_version") != "bb_finquant_return_preference.v1":
-            raise SystemExit("unsupported return preference contract")
-        if preference.get("objective") != "maximize_expected_realized_net_return_after_cost":
-            raise SystemExit("return preference objective mismatch")
-        preference_rows.append({
-            "prompt": str(preference.get("prompt") or ""),
-            "chosen": str(preference.get("chosen") or ""),
-            "rejected": str(preference.get("rejected") or ""),
-        })
-    if not preference_rows:
-        raise SystemExit("no return-preference rows available for DPO")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        low_cpu_mem_usage=True,
-    )
-    model.config.use_cache = False
-    try:
-        model.gradient_checkpointing_enable()
-    except Exception:
-        pass
-
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if trainable <= 0:
-        raise SystemExit("no trainable LoRA parameters")
-
-    def encode_rows(source_rows):
-        encoded_rows = []
-        for row in source_rows:
-            text = row_to_text(tokenizer, row)
-            tokens = tokenizer(
-                text,
-                truncation=True,
-                max_length=args.max_length,
-                padding=False,
-                return_tensors=None,
-            )
-            ids = tokens.get("input_ids") or []
-            if len(ids) < 16:
-                continue
-            encoded_rows.append(torch.tensor(ids, dtype=torch.long))
-        return encoded_rows
-
-    encoded = encode_rows(train_rows)
-    eval_encoded = encode_rows(eval_rows)
-    if not encoded:
-        raise SystemExit("no tokenized training samples")
-
-    def collate(batch):
-        max_len = max(item.numel() for item in batch)
-        input_ids = torch.full((len(batch), max_len), tokenizer.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
-        for idx, item in enumerate(batch):
-            input_ids[idx, : item.numel()] = item
-            attention_mask[idx, : item.numel()] = 1
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-    loader = DataLoader(encoded, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-    )
-    step = 0
-    accum = max(int(args.grad_accum), 1)
-    max_steps = max(int(args.max_steps), 1)
-    last_loss = None
-    optimizer.zero_grad(set_to_none=True)
-    pending_accumulation = 0
-    optimizer_steps = 0
-    while step < max_steps:
-        for batch in loader:
-            batch = {k: v.to(model.device) for k, v in batch.items()}
-            output = model(**batch)
-            loss = output.loss / accum
-            loss.backward()
-            last_loss = float(loss.detach().cpu()) * accum
-            pending_accumulation += 1
-            if pending_accumulation >= accum:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                optimizer_steps += 1
-                pending_accumulation = 0
-            step += 1
-            if step >= max_steps:
-                break
-    if pending_accumulation:
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        optimizer_steps += 1
-
-    eval_loss = None
-    if eval_encoded:
-        model.eval()
-        eval_loader = DataLoader(
-            eval_encoded,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate,
+    manifest_path = str(os.environ.get(TARGET_TRAINING_BACKEND_MANIFEST_ENV) or "").strip()
+    if not manifest_path:
+        raise RuntimeError(
+            "Qwen3.5 target training backend is not independently verified; "
+            f"set {TARGET_TRAINING_BACKEND_MANIFEST_ENV} to a verified capability manifest"
         )
-        eval_losses = []
-        with torch.no_grad():
-            for batch in eval_loader:
-                batch = {k: v.to(model.device) for k, v in batch.items()}
-                eval_losses.append(float(model(**batch).loss.detach().cpu()))
-        if eval_losses:
-            eval_loss = sum(eval_losses) / len(eval_losses)
-
-    try:
-        from datasets import Dataset
-        from trl import DPOConfig, DPOTrainer
-    except Exception as exc:
-        raise SystemExit(f"TRL DPO runtime unavailable: {type(exc).__name__}: {exc}") from exc
-
-    dpo_output_dir = output_dir.parent / f".{output_dir.name}.dpo-work"
-    dpo_config = DPOConfig(
-        output_dir=str(dpo_output_dir),
-        per_device_train_batch_size=max(int(args.batch_size), 1),
-        gradient_accumulation_steps=max(int(args.grad_accum), 1),
-        max_steps=max(min(max_steps // 2, 40), 10),
-        learning_rate=float(args.learning_rate) * 0.5,
-        beta=0.10,
-        logging_steps=1,
-        save_strategy="no",
-        report_to="none",
-        remove_unused_columns=False,
-    )
-    dpo_kwargs = {
-        "model": model,
-        "args": dpo_config,
-        "train_dataset": Dataset.from_list(preference_rows),
-        "processing_class": tokenizer,
-    }
-    try:
-        dpo_trainer = DPOTrainer(**dpo_kwargs)
-    except TypeError:
-        dpo_kwargs["tokenizer"] = dpo_kwargs.pop("processing_class")
-        dpo_trainer = DPOTrainer(**dpo_kwargs)
-    dpo_result = dpo_trainer.train()
-    dpo_train_loss = float(getattr(dpo_result, "training_loss", 0.0) or 0.0)
-    preference_selection_accuracy = None
-    for log_row in reversed(list(getattr(dpo_trainer.state, "log_history", []) or [])):
-        for key in ("rewards/accuracies", "eval_rewards/accuracies"):
-            if key in log_row:
-                preference_selection_accuracy = float(log_row[key])
-                break
-        if preference_selection_accuracy is not None:
-            break
-    shutil.rmtree(dpo_output_dir, ignore_errors=True)
-
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = output_dir.with_name(f".{output_dir.name}.staging.{os.getpid()}")
-    if staging_dir.exists():
-        raise SystemExit(f"adapter staging directory already exists: {staging_dir}")
-    staging_dir.mkdir(parents=False, exist_ok=False)
-    model.save_pretrained(staging_dir)
-    tokenizer.save_pretrained(staging_dir)
-    evaluation_path = staging_dir / "evaluation_report.json"
-    evaluation = {
-        "status": "shadow_only_not_promotion_evidence",
-        "training_micro_steps": step,
-        "optimizer_steps": optimizer_steps,
-        "train_sample_count": len(train_rows),
-        "tokenized_train_sample_count": len(encoded),
-        "eval_sample_count": len(eval_rows),
-        "tokenized_eval_sample_count": len(eval_encoded),
-        "last_train_loss": last_loss,
-        "held_out_eval_loss": eval_loss,
-        "held_out_eval_loss_role": "format_and_language_fit_only_not_profit_evidence",
-        "preference_contract_version": "bb_finquant_return_preference.v1",
-        "preference_train_count": len(preference_rows),
-        "dpo_train_loss": dpo_train_loss,
-        "preference_selection_accuracy": preference_selection_accuracy,
-        "return_objective": "maximize_expected_realized_net_return_after_cost",
-        "training_stages": ["sft_format_domain", "trl_dpo_return_preference"],
-    }
-    evaluation_path.write_text(
-        json.dumps(evaluation, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    adapter_files = []
-    for path in sorted(staging_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        adapter_files.append({
-            "path": path.relative_to(staging_dir).as_posix(),
-            "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        })
-    adapter_digest_payload = json.dumps(
-        adapter_files,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    adapter_sha256 = hashlib.sha256(adapter_digest_payload).hexdigest()
-    base_config_path = Path(args.base_model) / "config.json"
-    inference_config_path = Path(args.inference_base_model) / "config.json"
-    manifest = {
-        "registry_version": "bb_finquant_lora.v2",
-        "model_name": args.model_name,
-        "adapter_version": args.version_id,
-        "base_model": args.base_model,
-        "base_model_repo": args.base_model_repo,
-        "base_model_config_sha256": (
-            sha256_file(base_config_path) if base_config_path.exists() else None
-        ),
-        "inference_base_model": args.inference_base_model,
-        "inference_base_model_config_sha256": (
-            sha256_file(inference_config_path) if inference_config_path.exists() else None
-        ),
-        "adapter_path": str(output_dir),
-        "lora_adapter": str(output_dir),
-        "specialization_id": f"{args.model_name}-{args.version_id}",
-        "specialization_status": "trained_shadow_not_live",
-        "training_artifact": str(output_dir),
-        "dataset": str(dataset_path),
-        "dataset_manifest": str(dataset_manifest_path),
-        "dataset_schema_version": dataset_manifest.get("dataset_schema_version"),
-        "dataset_version": dataset_manifest.get("dataset_version"),
-        "dataset_sha256": dataset_sha256,
-        "dataset_lineage_sha256": dataset_manifest.get("dataset_lineage_sha256"),
-        "dataset_manifest_sha256": sha256_file(dataset_manifest_path),
-        "source_code_version": dataset_manifest.get("source_code_version"),
-        "source_script_sha256": dataset_manifest.get("source_script_sha256"),
-        "trainer_code_sha256": sha256_file(Path(__file__)),
-        "sample_count": len(rows),
-        "train_sample_count": len(train_rows),
-        "eval_sample_count": len(eval_rows),
-        "tokenized_sample_count": len(encoded),
-        "max_steps": max_steps,
-        "optimizer_steps": optimizer_steps,
-        "trainable_parameters": int(trainable),
-        "last_loss": last_loss,
-        "held_out_eval_loss": eval_loss,
-        "held_out_eval_loss_role": "format_and_language_fit_only_not_profit_evidence",
-        "preference_contract_version": "bb_finquant_return_preference.v1",
-        "preference_train_count": len(preference_rows),
-        "dpo_train_loss": dpo_train_loss,
-        "preference_selection_accuracy": preference_selection_accuracy,
-        "objective_name": "maximize_expected_realized_net_return_after_cost",
-        "objective_version": "2026-07-12.v1",
-        "training_stages": ["sft_format_domain", "trl_dpo_return_preference"],
-        "evaluation_report": str(output_dir / evaluation_path.name),
-        "training_config": {
-            "lora_r": 8,
-            "lora_alpha": 16,
-            "lora_dropout": 0.05,
-            "target_modules": [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            "batch_size": args.batch_size,
-            "gradient_accumulation": accum,
-            "max_length": args.max_length,
-            "learning_rate": args.learning_rate,
-            "torch_dtype": "float16",
-            "gradient_checkpointing": True,
-        },
-        "adapter_files": adapter_files,
-        "adapter_sha256": adapter_sha256,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-    }
-    staging_manifest_path = staging_dir / manifest_path.name
-    staging_manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(staging_dir, output_dir)
-    print(json.dumps(manifest, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()
-"""
-
-
-REMOTE_REGISTRY_TOOL_CODE = r"""
-from __future__ import annotations
-
-import argparse
-import hashlib
-import json
-import os
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-
-MODEL_NAME = "BB-FinQuant-Expert-14B"
-REGISTRY_VERSION = "bb_finquant_lora.v2"
-ROOT = Path("/data/BB/models/finquant_lora")
-VERSIONS = ROOT / "versions"
-CURRENT = ROOT / "current.json"
-ROLLBACK = ROOT / "rollback.json"
-RETIRED = ROOT / "retired"
-LEGACY = ROOT / "BB-FinQuant-Expert-14B-v1"
-LEGACY_MANIFEST = LEGACY / "specialization_manifest.json"
-DOWNLOAD_MANIFEST = Path("/data/BB/manifests/phase3_model_download_manifest.json")
-VALIDATION_MANIFEST = Path("/data/BB/manifests/phase3_model_validation.json")
-INFERENCE_BASE = os.environ.get(
-    "BB_TARGET_INFERENCE_MODEL_PATH", "/data/trade_models/Qwen/Qwen3-14B-AWQ"
-).strip()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def atomic_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-
-
-def inside(path: Path, root: Path) -> Path:
-    resolved = path.resolve(strict=True)
-    resolved.relative_to(root.resolve(strict=True))
-    return resolved
-
-
-def read_json(path: Path) -> dict:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON object required: {path}")
-    return value
-
-
-def adapter_digest(files: list[dict]) -> str:
-    payload = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def validate_pointer(pointer: dict) -> tuple[dict, Path]:
-    if pointer.get("registry_version") != REGISTRY_VERSION:
-        raise ValueError("unsupported FinQuant pointer registry version")
-    if pointer.get("model_name") != MODEL_NAME:
-        raise ValueError("FinQuant pointer model identity mismatch")
-    adapter_path = inside(Path(str(pointer.get("adapter_path") or "")), ROOT)
-    manifest_path = inside(Path(str(pointer.get("manifest_path") or "")), ROOT)
-    if sha256_file(manifest_path) != pointer.get("manifest_sha256"):
-        raise ValueError("FinQuant specialization manifest hash mismatch")
-    manifest = read_json(manifest_path)
-    if manifest.get("model_name") != MODEL_NAME:
-        raise ValueError("FinQuant specialization manifest model mismatch")
-    if pointer.get("legacy_read_only"):
-        primary = inside(Path(str(pointer.get("primary_adapter_path") or "")), adapter_path)
-        if sha256_file(primary) != pointer.get("adapter_sha256"):
-            raise ValueError("legacy FinQuant adapter hash mismatch")
-        return manifest, adapter_path
-    if manifest.get("registry_version") != REGISTRY_VERSION:
-        raise ValueError("FinQuant adapter manifest registry mismatch")
-    if manifest.get("adapter_version") != pointer.get("adapter_version"):
-        raise ValueError("FinQuant adapter version mismatch")
-    if manifest.get("dataset_schema_version") != "bb_finquant_expert_sft.v2":
-        raise ValueError("FinQuant adapter dataset schema mismatch")
-    if manifest.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
-        raise ValueError("FinQuant adapter return objective mismatch")
-    if manifest.get("objective_version") != "2026-07-12.v1":
-        raise ValueError("FinQuant adapter return objective version mismatch")
-    if manifest.get("preference_contract_version") != "bb_finquant_return_preference.v1":
-        raise ValueError("FinQuant adapter preference contract mismatch")
-    if manifest.get("base_model_repo") != "Qwen/Qwen3-14B":
-        raise ValueError("FinQuant adapter base-model identity mismatch")
-    for key in (
-        "dataset_sha256",
-        "dataset_lineage_sha256",
-        "dataset_manifest_sha256",
-        "source_script_sha256",
-        "trainer_code_sha256",
-        "base_model_config_sha256",
-        "inference_base_model_config_sha256",
-    ):
-        value = str(manifest.get(key) or "")
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
-            raise ValueError(f"FinQuant adapter manifest has no valid {key}")
-    if not isinstance(manifest.get("training_config"), dict):
-        raise ValueError("FinQuant adapter training configuration is missing")
-    files = manifest.get("adapter_files")
-    if not isinstance(files, list) or not files:
-        raise ValueError("FinQuant adapter file manifest is empty")
-    verified_files = []
-    for row in files:
-        if not isinstance(row, dict):
-            raise ValueError("invalid FinQuant adapter file row")
-        relative = str(row.get("path") or "")
-        path = inside(adapter_path / relative, adapter_path)
-        verified = {
-            "path": relative,
-            "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        }
-        if verified != row:
-            raise ValueError(f"FinQuant adapter file verification failed: {relative}")
-        verified_files.append(verified)
-    if not any(row["path"] in {"adapter_model.safetensors", "adapter_model.bin"} for row in verified_files):
-        raise ValueError("FinQuant adapter weights are missing")
-    digest = adapter_digest(verified_files)
-    if digest != manifest.get("adapter_sha256") or digest != pointer.get("adapter_sha256"):
-        raise ValueError("FinQuant aggregate adapter hash mismatch")
-    return manifest, adapter_path
-
-
-def pointer_for_manifest(manifest_path: Path) -> dict:
-    manifest_path = inside(manifest_path, VERSIONS)
-    manifest = read_json(manifest_path)
-    adapter_path = manifest_path.parent
-    pointer = {
-        "registry_version": REGISTRY_VERSION,
-        "model_name": MODEL_NAME,
-        "adapter_version": manifest.get("adapter_version"),
-        "specialization_id": manifest.get("specialization_id"),
-        "adapter_path": str(adapter_path),
-        "manifest_path": str(manifest_path),
-        "manifest_sha256": sha256_file(manifest_path),
-        "adapter_sha256": manifest.get("adapter_sha256"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "legacy_read_only": False,
-    }
-    validate_pointer(pointer)
-    return pointer
-
-
-def legacy_pointer() -> dict | None:
-    if not LEGACY_MANIFEST.exists():
-        return None
-    manifest = read_json(LEGACY_MANIFEST)
-    if manifest.get("model_name") != MODEL_NAME:
-        raise ValueError("legacy FinQuant manifest model identity mismatch")
-    candidates = [LEGACY / "adapter_model.safetensors", LEGACY / "adapter_model.bin"]
-    primary = next((path for path in candidates if path.is_file()), None)
-    if primary is None:
-        raise ValueError("legacy FinQuant adapter weights are missing")
-    pointer = {
-        "registry_version": REGISTRY_VERSION,
-        "model_name": MODEL_NAME,
-        "adapter_version": "legacy-v1-read-only",
-        "specialization_id": manifest.get("specialization_id") or "BB-FinQuant-Expert-14B-v1",
-        "adapter_path": str(LEGACY),
-        "manifest_path": str(LEGACY_MANIFEST),
-        "manifest_sha256": sha256_file(LEGACY_MANIFEST),
-        "adapter_sha256": sha256_file(primary),
-        "primary_adapter_path": str(primary),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "legacy_read_only": True,
-    }
-    validate_pointer(pointer)
-    return pointer
-
-
-def promote(manifest_path: Path) -> dict:
-    new_pointer = pointer_for_manifest(manifest_path)
-    previous = None
-    retired_previous = None
-    retired_rollback = None
-    if CURRENT.exists():
-        candidate = read_json(CURRENT)
-        try:
-            validate_pointer(candidate)
-        except ValueError as exc:
-            retired_previous = {
-                "retired_at": datetime.now(timezone.utc).isoformat(),
-                "reason": str(exc),
-                "can_influence_live": False,
-                "pointer": candidate,
-            }
-            retired_path = RETIRED / (
-                "incompatible-current-"
-                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                + f"-{time.time_ns()}"
-                + ".json"
-            )
-            atomic_json(retired_path, retired_previous)
-            retired_previous["audit_path"] = str(retired_path)
-        else:
-            previous = candidate
-    if previous and previous.get("adapter_path") == new_pointer.get("adapter_path"):
-        previous = None
-    if ROLLBACK.exists():
-        rollback_candidate = read_json(ROLLBACK)
-        try:
-            validate_pointer(rollback_candidate)
-        except ValueError as exc:
-            retired_rollback = {
-                "retired_at": datetime.now(timezone.utc).isoformat(),
-                "reason": str(exc),
-                "can_influence_live": False,
-                "pointer": rollback_candidate,
-            }
-            retired_path = RETIRED / (
-                "incompatible-rollback-"
-                + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                + f"-{time.time_ns()}"
-                + ".json"
-            )
-            atomic_json(retired_path, retired_rollback)
-            retired_rollback["audit_path"] = str(retired_path)
-            ROLLBACK.unlink()
-    if previous and previous.get("adapter_path") != new_pointer.get("adapter_path"):
-        atomic_json(ROLLBACK, previous)
-    atomic_json(CURRENT, new_pointer)
-    return {
-        "current": new_pointer,
-        "rollback": previous,
-        "retired_incompatible_previous": retired_previous,
-        "retired_incompatible_rollback": retired_rollback,
-    }
-
-
-def validate_current(*, required: bool = True) -> dict | None:
-    if not CURRENT.exists():
-        if required:
-            raise ValueError("FinQuant current adapter pointer is missing")
-        return None
-    pointer = read_json(CURRENT)
-    validate_pointer(pointer)
-    return pointer
-
-
-def rollback() -> dict:
-    current = validate_current(required=True)
-    if not ROLLBACK.exists():
-        raise ValueError("FinQuant rollback pointer is missing")
-    target = read_json(ROLLBACK)
-    validate_pointer(target)
-    if target.get("adapter_path") == current.get("adapter_path"):
-        raise ValueError("FinQuant rollback target equals current adapter")
-    timestamp = datetime.now(timezone.utc).isoformat()
-    target["updated_at"] = timestamp
-    current["updated_at"] = timestamp
-    atomic_json(CURRENT, target)
-    atomic_json(ROLLBACK, current)
-    return {"current": target, "rollback": current}
-
-
-def status() -> dict:
-    current = validate_current(required=True)
-    current_manifest, current_path = validate_pointer(current)
-    rollback_pointer = read_json(ROLLBACK) if ROLLBACK.exists() else None
-    rollback_manifest = None
-    rollback_path = None
-    if rollback_pointer is not None:
-        rollback_manifest, rollback_path = validate_pointer(rollback_pointer)
-    return {
-        "registry_version": REGISTRY_VERSION,
-        "current_verified": True,
-        "current": current,
-        "current_manifest": current_manifest,
-        "current_adapter_path": str(current_path),
-        "rollback_present": rollback_pointer is not None,
-        "rollback_verified": rollback_pointer is not None,
-        "rollback": rollback_pointer,
-        "rollback_manifest": rollback_manifest,
-        "rollback_adapter_path": str(rollback_path) if rollback_path else None,
-    }
-
-
-def sync_evidence() -> dict:
-    pointer = validate_current(required=True)
-    manifest, _adapter_path = validate_pointer(pointer)
-    legacy = bool(pointer.get("legacy_read_only"))
-    verification_status = "verified_legacy_rollback" if legacy else "verified"
-    specialization_status = (
-        "legacy_rollback_only" if legacy else manifest.get("specialization_status")
-    )
-    specialization = {
-        "verification_status": verification_status,
-        "identity_verified": not legacy,
-        "legacy_read_only": legacy,
-        "adapter_version": pointer.get("adapter_version"),
-        "adapter_path": pointer.get("adapter_path"),
-        "lora_adapter": pointer.get("adapter_path"),
-        "specialization_manifest": pointer.get("manifest_path"),
-        "specialization_id": pointer.get("specialization_id"),
-        "training_artifact": pointer.get("adapter_path"),
-        "manifest_sha256": pointer.get("manifest_sha256"),
-        "adapter_sha256": pointer.get("adapter_sha256"),
-        "dataset_version": manifest.get("dataset_version"),
-        "dataset_sha256": manifest.get("dataset_sha256"),
-        "dataset_lineage_sha256": manifest.get("dataset_lineage_sha256"),
-        "dataset_manifest_sha256": manifest.get("dataset_manifest_sha256"),
-        "source_code_version": manifest.get("source_code_version"),
-        "source_script_sha256": manifest.get("source_script_sha256"),
-        "trainer_code_sha256": manifest.get("trainer_code_sha256"),
-        "base_model_repo": manifest.get("base_model_repo"),
-        "base_model_config_sha256": manifest.get("base_model_config_sha256"),
-        "inference_base_model_config_sha256": manifest.get("inference_base_model_config_sha256"),
-        "evaluation_report": manifest.get("evaluation_report"),
-        "held_out_eval_loss": manifest.get("held_out_eval_loss"),
-        "objective_name": manifest.get("objective_name"),
-        "objective_version": manifest.get("objective_version"),
-        "preference_contract_version": manifest.get("preference_contract_version"),
-        "preference_selection_accuracy": manifest.get("preference_selection_accuracy"),
-        "training_stages": manifest.get("training_stages"),
-        "trained_at": manifest.get("trained_at"),
-        "sample_count": manifest.get("sample_count"),
-        "max_steps": manifest.get("max_steps"),
-    }
-    evidence = {
-        "served_model_name": MODEL_NAME,
-        "specialization_required": True,
-        "specialization_target": MODEL_NAME,
-        "specialization_status": specialization_status,
-        "base_model_carrier": INFERENCE_BASE,
-        **{key: value for key, value in specialization.items() if value is not None},
-        "specialization_evidence": {
-            key: value for key, value in specialization.items() if value is not None
-        },
-    }
-    updated = []
-    for path in (DOWNLOAD_MANIFEST, VALIDATION_MANIFEST):
-        data = read_json(path) if path.exists() else {"models": []}
-        models = data.setdefault("models", [])
-        target = next(
-            (
-                row
-                for row in models
-                if isinstance(row, dict)
-                and (row.get("slot") == "llm_expert_pool" or row.get("served_model_name") == MODEL_NAME)
-            ),
-            None,
+    backend = ModelTrainingBackendManifest.load(manifest_path)
+    trainer_sha256 = _sha256_bytes(REMOTE_TRAINER_CODE)
+    errors = backend.validate_for_candidate(candidate, trainer_sha256=trainer_sha256)
+    if errors:
+        raise RuntimeError(
+            "Qwen3.5 target training backend evidence invalid: " + ", ".join(errors)
         )
-        if target is None:
-            target = {
-                "slot": "llm_expert_pool",
-                "repo_id": "Qwen/Qwen3-14B-AWQ",
-                "path": INFERENCE_BASE,
-                "target": INFERENCE_BASE,
-                "role": "expert_pool",
-                "status": "ready",
-                "exists": True,
-            }
-            models.append(target)
-        target.update(evidence)
-        data["checked_at"] = datetime.now(timezone.utc).isoformat()
-        atomic_json(path, data)
-        updated.append(str(path))
-    return {"updated": updated, "evidence": evidence, "pointer": pointer}
+    return backend
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    promote_parser = subparsers.add_parser("promote")
-    promote_parser.add_argument("--manifest", type=Path, required=True)
-    subparsers.add_parser("verify")
-    subparsers.add_parser("status")
-    subparsers.add_parser("rollback")
-    subparsers.add_parser("sync-evidence")
-    args = parser.parse_args()
-    if args.command == "promote":
-        result = promote(args.manifest)
-    elif args.command == "verify":
-        pointer = validate_current(required=True)
-        manifest, adapter_path = validate_pointer(pointer)
-        result = {"verified": True, "pointer": pointer, "manifest": manifest, "adapter_path": str(adapter_path)}
-    elif args.command == "rollback":
-        result = rollback()
-    elif args.command == "status":
-        result = status()
-    else:
-        result = sync_evidence()
-    print(json.dumps(result, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
-"""
+def _verified_training_context() -> tuple[ModelCandidateManifest, ModelTrainingBackendManifest]:
+    candidate = _verified_training_candidate()
+    return candidate, _verified_training_backend(candidate)
 
 
 def sh(value: str | Path) -> str:
@@ -1029,132 +216,25 @@ def _finalize_dataset_contract(
     dataset_jsonl: str,
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    dataset_sha256 = _sha256_bytes(dataset_jsonl)
-    source_code_version = _source_code_version()
-    source_script_sha256 = _sha256_file(Path(__file__))
-    lineage_payload = json.dumps(
-        {
-            "created_at": manifest.get("created_at"),
-            "source": manifest.get("source"),
-            "source_transport": manifest.get("source_transport"),
-            "source_code_version": source_code_version,
-            "source_script_sha256": source_script_sha256,
-            "training_repo": REMOTE_TRAIN_BASE_REPO,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    return training_contract.finalize_dataset_contract(
+        dataset_jsonl,
+        manifest,
+        source_code_version=_source_code_version(),
+        source_script_sha256=_sha256_file(Path(__file__)),
+        inheritance_contract=TRAINING_INHERITANCE_CONTRACT,
     )
-    lineage_sha256 = _sha256_bytes(lineage_payload)
-    dataset_version = f"bb-finquant-sft-v2-{dataset_sha256[:12]}-{lineage_sha256[:8]}"
-    finalized = dict(manifest)
-    finalized.update(
-        {
-            "dataset_schema_version": DATASET_SCHEMA_VERSION,
-            "dataset_policy": "bb_finquant_expert_sft_v2",
-            "dataset_version": dataset_version,
-            "dataset_sha256": dataset_sha256,
-            "dataset_lineage_sha256": lineage_sha256,
-            "source_code_version": source_code_version,
-            "source_script_sha256": source_script_sha256,
-            "base_model_identity": {
-                "training_repo": REMOTE_TRAIN_BASE_REPO,
-                "training_path": REMOTE_TRAIN_BASE_MODEL,
-                "inference_path": REMOTE_INFERENCE_BASE_MODEL,
-                "served_base_model": BASE_MODEL_NAME,
-            },
-            "example_count": sum(1 for line in dataset_jsonl.splitlines() if line.strip()),
-        }
-    )
-    return finalized
 
 
 def _validate_dataset_contract(dataset_jsonl: str, manifest: dict[str, Any]) -> None:
-    if manifest.get("dataset_schema_version") != DATASET_SCHEMA_VERSION:
-        raise ValueError("unsupported BB-FinQuant dataset schema")
-    version = str(manifest.get("dataset_version") or "")
-    if not DATASET_VERSION_PATTERN.fullmatch(version):
-        raise ValueError("invalid BB-FinQuant dataset version")
-    actual_hash = _sha256_bytes(dataset_jsonl)
-    if manifest.get("dataset_sha256") != actual_hash:
-        raise ValueError("BB-FinQuant dataset SHA-256 mismatch")
-    lineage_hash = str(manifest.get("dataset_lineage_sha256") or "")
-    if not re.fullmatch(r"[0-9a-f]{64}", lineage_hash):
-        raise ValueError("BB-FinQuant dataset lineage hash is invalid")
-    expected_version = f"bb-finquant-sft-v2-{actual_hash[:12]}-{lineage_hash[:8]}"
-    if version != expected_version:
-        raise ValueError("BB-FinQuant dataset version does not match its content and lineage")
-    expected_count = sum(1 for line in dataset_jsonl.splitlines() if line.strip())
-    if int(manifest.get("example_count") or 0) != expected_count:
-        raise ValueError("BB-FinQuant dataset example count mismatch")
-    if manifest.get("objective_name") != RETURN_OBJECTIVE_NAME:
-        raise ValueError("BB-FinQuant dataset return objective mismatch")
-    if manifest.get("objective_version") != RETURN_OBJECTIVE_VERSION:
-        raise ValueError("BB-FinQuant dataset return objective version mismatch")
-    preference_count = 0
-    for line_number, line in enumerate(dataset_jsonl.splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"BB-FinQuant dataset row {line_number} is not valid JSON") from exc
-        messages = row.get("messages") if isinstance(row, dict) else None
-        if not isinstance(messages, list) or len(messages) < 3:
-            raise ValueError(f"BB-FinQuant dataset row {line_number} has invalid messages")
-        for message in messages:
-            if not isinstance(message, dict):
-                raise ValueError(f"BB-FinQuant dataset row {line_number} has invalid message")
-            if message.get("role") not in {"user", "assistant"}:
-                continue
-            try:
-                content = json.loads(str(message.get("content") or ""))
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"BB-FinQuant dataset row {line_number} has invalid JSON message content"
-                ) from exc
-            if not isinstance(content, dict):
-                raise ValueError(
-                    f"BB-FinQuant dataset row {line_number} JSON message must be an object"
-                )
-        preference = row.get("preference") if isinstance(row, dict) else None
-        if preference is not None:
-            if not isinstance(preference, dict):
-                raise ValueError(
-                    f"BB-FinQuant dataset row {line_number} has invalid preference"
-                )
-            if preference.get("contract_version") != PREFERENCE_CONTRACT_VERSION:
-                raise ValueError(
-                    f"BB-FinQuant dataset row {line_number} preference version mismatch"
-                )
-            if preference.get("objective") != RETURN_OBJECTIVE_NAME:
-                raise ValueError(
-                    f"BB-FinQuant dataset row {line_number} preference objective mismatch"
-                )
-            for key in ("prompt", "chosen", "rejected"):
-                if not str(preference.get(key) or "").strip():
-                    raise ValueError(
-                        f"BB-FinQuant dataset row {line_number} preference missing {key}"
-                    )
-            preference_count += 1
-    if preference_count <= 0 or int(manifest.get("preference_example_count") or 0) != preference_count:
-        raise ValueError("BB-FinQuant dataset has no valid return-preference examples")
-    base_identity = _safe_dict(manifest.get("base_model_identity"))
-    if base_identity.get("training_repo") != REMOTE_TRAIN_BASE_REPO:
-        raise ValueError("BB-FinQuant training base-model identity mismatch")
-    if not str(manifest.get("source_code_version") or "").strip():
-        raise ValueError("BB-FinQuant dataset has no source code version")
-    script_hash = str(manifest.get("source_script_sha256") or "")
-    if not re.fullmatch(r"[0-9a-f]{64}", script_hash):
-        raise ValueError("BB-FinQuant dataset has no valid source script hash")
+    training_contract.validate_dataset_contract(
+        dataset_jsonl,
+        manifest,
+        inheritance_contract=TRAINING_INHERITANCE_CONTRACT,
+    )
 
 
 def _new_adapter_version(dataset_manifest: dict[str, Any], *, now: datetime | None = None) -> str:
-    dataset_hash = str(dataset_manifest.get("dataset_sha256") or "")
-    if not re.fullmatch(r"[0-9a-f]{64}", dataset_hash):
-        raise ValueError("cannot version adapter without a valid dataset hash")
-    timestamp = (now or datetime.now(UTC)).astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"{timestamp}-{dataset_hash[:12]}"
+    return training_contract.new_adapter_version(dataset_manifest, now=now)
 
 
 def _remote_dataset_paths(dataset_version: str) -> tuple[str, str]:
@@ -1329,7 +409,7 @@ def _messages(
     preference_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     system = (
-        "You are BB-FinQuant-Expert-14B, a cryptocurrency futures expert. "
+        "You are BB-FinQuant-Qwen3.8-27B, a cryptocurrency futures expert. "
         "Learn from audited after-fee outcomes. Reply only as compact JSON with "
         "verdict, side or best_side, lesson, and risk_guidance."
     )
@@ -1534,7 +614,7 @@ async def _assert_training_data_source_ready() -> None:
     if ready:
         return
     raise RuntimeError(
-        "BB-FinQuant-Expert-14B training data source is not ready: "
+        "BB-FinQuant-Qwen3.8-27B training data source is not ready: "
         f"missing tables {missing}. Use --source platform or run this script on "
         "the online platform server where the trading PostgreSQL database is configured."
     )
@@ -1800,313 +880,109 @@ runpy.run_path("scripts/finquant_expert_lora_training.py", run_name="__main__")
         ssh.close()
 
 
-def _render_finquant_gateway_script() -> str:
-    return f"""from __future__ import annotations
-
-import json
-import sys
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-HOST = "127.0.0.1"
-PORT = 8003
-UPSTREAM = "http://127.0.0.1:8000"
-GATEWAY_MODEL = "{MODEL_NAME}"
-UPSTREAM_MODEL = "{MODEL_NAME}"
-RUNTIME_VERSION = "{FINQUANT_GATEWAY_RUNTIME_VERSION}"
-REQUEST_QUEUE_SIZE = {FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE}
-
-
-class GatewayHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    block_on_close = False
-    allow_reuse_address = True
-    request_queue_size = REQUEST_QUEUE_SIZE
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "BBFinQuantVerifiedGateway/{FINQUANT_GATEWAY_RUNTIME_VERSION}"
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("%s - %s\\n" % (self.address_string(), fmt % args))
-
-    def _write_json(self, status: int, payload: dict) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(data)))
-        self.send_header("connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_GET(self) -> None:
-        if self.path.rstrip("/") == "/health/live":
-            self._write_json(200, {{
-                "ok": True,
-                "service": "bb_finquant_verified_gateway",
-                "runtime_version": RUNTIME_VERSION,
-                "request_queue_size": REQUEST_QUEUE_SIZE,
-            }})
-            return
-        if self.path.rstrip("/") == "/v1/models":
-            try:
-                with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=10) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except Exception as exc:
-                self._write_json(503, {{"error": "finquant_upstream_models_unavailable", "detail": str(exc)[:200]}})
-                return
-            rows = [
-                row for row in payload.get("data", [])
-                if isinstance(row, dict) and row.get("id") == GATEWAY_MODEL
-            ] if isinstance(payload, dict) else []
-            if not rows:
-                self._write_json(503, {{"error": "finquant_adapter_not_loaded"}})
-                return
-            self._write_json(200, {{"object": "list", "data": rows}})
-            return
-        self._proxy()
-
-    def do_POST(self) -> None:
-        self._proxy()
-
-    def _proxy(self) -> None:
-        body = self.rfile.read(int(self.headers.get("content-length") or 0))
-        headers = {{key: value for key, value in self.headers.items() if key.lower() not in {{"host", "content-length", "connection"}}}}
-        if self.path.startswith("/v1/") and body:
-            try:
-                payload = json.loads(body.decode("utf-8"))
-            except Exception:
-                self._write_json(400, {{"error": "invalid_json_request"}})
-                return
-            if isinstance(payload, dict) and payload.get("model") != UPSTREAM_MODEL:
-                self._write_json(400, {{"error": "finquant_model_identity_required"}})
-                return
-        request = urllib.request.Request(UPSTREAM + self.path, data=body if self.command != "GET" else None, headers=headers, method=self.command)
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                data = response.read()
-                self.send_response(response.status)
-                for key, value in response.headers.items():
-                    if key.lower() in {{"transfer-encoding", "connection", "content-length"}}:
-                        continue
-                    self.send_header(key, value)
-                self.send_header("content-length", str(len(data)))
-                self.send_header("connection", "close")
-                self.end_headers()
-                self.wfile.write(data)
-        except urllib.error.HTTPError as exc:
-            data = exc.read()
-            self.send_response(exc.code)
-            self.send_header("content-type", exc.headers.get("content-type", "application/json"))
-            self.send_header("content-length", str(len(data)))
-            self.send_header("connection", "close")
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception as exc:
-            self._write_json(502, {{"error": "finquant_gateway_upstream_failed", "detail": str(exc)[:200]}})
-
-
-if __name__ == "__main__":
-    GatewayHTTPServer((HOST, PORT), Handler).serve_forever()
-"""
-
-
-def _render_finquant_gateway_service() -> str:
-    return f"""[Unit]
-Description=BB FinQuant verified adapter gateway
-After=network-online.target {REMOTE_QWEN_SERVICE}
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=linux
-WorkingDirectory={REMOTE_GATEWAY_DIR}
-ExecStart=/usr/bin/python3 {REMOTE_GATEWAY_SCRIPT}
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def deploy_finquant_gateway_runtime_only() -> dict[str, Any]:
-    """Update the verified gateway without restarting the underlying vLLM model."""
-
-    info = load_model_server_info_from_platform(ROOT)
-    ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
-    gateway_script = _render_finquant_gateway_script()
-    gateway_service = _render_finquant_gateway_service()
-    gateway_service_upload = f"{REMOTE_SERVICE_DIR}/{REMOTE_GATEWAY_SERVICE}"
-    backup_path = f"{REMOTE_GATEWAY_SCRIPT}.bak.{int(time.time())}"
-    try:
-        run_remote_text(
-            ssh,
-            f"if [ -f {sh(REMOTE_GATEWAY_SCRIPT)} ]; then "
-            f"cp --preserve=mode {sh(REMOTE_GATEWAY_SCRIPT)} {sh(backup_path)}; fi",
-            timeout=30,
-            check=True,
-        )
-        _upload_text_atomic(
-            ssh,
-            REMOTE_GATEWAY_SCRIPT,
-            gateway_script,
-            mode=0o755,
-        )
-        _upload_text_atomic(
-            ssh,
-            gateway_service_upload,
-            gateway_service,
-            mode=0o644,
-        )
-        run_remote_text(
-            ssh,
-            textwrap.dedent(
-                f"""
-                set -euo pipefail
-                /usr/bin/python3 -m py_compile {sh(REMOTE_GATEWAY_SCRIPT)}
-                sudo -n install -m 0644 {sh(gateway_service_upload)} {sh(REMOTE_GATEWAY_SERVICE_PATH)}
-                sudo -n systemctl daemon-reload
-                sudo -n systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}
-                for _attempt in $(seq 1 30); do
-                  if curl -fsS --max-time 3 http://127.0.0.1:8003/health/live >/dev/null; then
-                    exit 0
-                  fi
-                  sleep 1
-                done
-                exit 1
-                """
-            ).strip(),
-            timeout=60,
-            check=True,
-        )
-        concurrency_probe = textwrap.dedent(
-            """
-            import concurrent.futures
-            import json
-            import urllib.request
-
-            URL = "http://127.0.0.1:8003/health/live"
-
-            def fetch(_index):
-                with urllib.request.urlopen(URL, timeout=5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                    return int(response.status), payload
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-                rows = list(executor.map(fetch, range(64)))
-
-            statuses = [status for status, _payload in rows]
-            payloads = [payload for _status, payload in rows]
-            print(json.dumps({
-                "request_count": len(rows),
-                "success_count": sum(status == 200 for status in statuses),
-                "runtime_versions": sorted({str(item.get("runtime_version") or "") for item in payloads}),
-                "request_queue_sizes": sorted({int(item.get("request_queue_size") or 0) for item in payloads}),
-            }, sort_keys=True))
-            """
-        ).strip()
-        raw_probe = run_remote_text(
-            ssh,
-            f"/usr/bin/python3 -c {sh(concurrency_probe)}",
-            timeout=45,
-            check=True,
-        )
-        probe = _json_object_from_remote_output(raw_probe)
-        model_probe = run_remote_text(
-            ssh,
-            "curl -fsS --max-time 15 http://127.0.0.1:8003/v1/models",
-            timeout=20,
-            check=True,
-        )
-        if int(probe.get("success_count") or 0) != int(probe.get("request_count") or 0):
-            raise RuntimeError(f"FinQuant gateway concurrency probe failed: {probe}")
-        if probe.get("runtime_versions") != [FINQUANT_GATEWAY_RUNTIME_VERSION]:
-            raise RuntimeError(f"FinQuant gateway runtime version mismatch: {probe}")
-        if probe.get("request_queue_sizes") != [FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE]:
-            raise RuntimeError(f"FinQuant gateway request queue mismatch: {probe}")
-        if MODEL_NAME not in model_probe:
-            raise RuntimeError("FinQuant gateway model identity probe failed")
-        service_state = run_remote_text(
-            ssh,
-            f"systemctl show {sh(REMOTE_GATEWAY_SERVICE)} "
-            "--property=ActiveState --property=SubState --property=NRestarts "
-            "--property=ActiveEnterTimestamp",
-            timeout=20,
-            check=True,
-        )
-        return {
-            "deployed": True,
-            "runtime_version": FINQUANT_GATEWAY_RUNTIME_VERSION,
-            "request_queue_size": FINQUANT_GATEWAY_REQUEST_QUEUE_SIZE,
-            "concurrency_probe": probe,
-            "model_identity_verified": True,
-            "underlying_model_restarted": False,
-            "backup_path": backup_path,
-            "service_state": service_state.strip(),
-        }
-    finally:
-        ssh.close()
-
-
-def _remote_service_update_script(*, adapter_path: str) -> str:
+def _adapter_deployment_payload(
+    *,
+    adapter_path: str,
+    candidate: ModelCandidateManifest,
+) -> dict[str, Any]:
     if not str(adapter_path or "").startswith(f"{REMOTE_ADAPTER_ROOT}/"):
-        raise ValueError("8003 cannot start without a verified BB-FinQuant adapter")
-    lora_args = "  --enable-lora \\\n" f"  --lora-modules {MODEL_NAME}={adapter_path} \\\n"
-    qwen_script = f"""#!/usr/bin/env bash
-set -euo pipefail
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate trade_vllm
-export CUDA_VISIBLE_DEVICES=0
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_USE_V1=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/data/trade_ai/hf_cache
-export HF_HUB_CACHE=/data/trade_ai/hf_cache/hub
-export TRANSFORMERS_CACHE=/data/trade_ai/hf_cache/transformers
-LOG=/data/trade_ai/logs/finquant_expert_14b.log
-exec python -m vllm.entrypoints.openai.api_server \\
-  --host 0.0.0.0 \\
-  --port 8000 \\
-  --model {REMOTE_INFERENCE_BASE_MODEL} \\
-  --served-model-name {BASE_MODEL_NAME} \\
-  --trust-remote-code \\
-  --max-model-len 4096 \\
-  --gpu-memory-utilization 0.72 \\
-  --dtype half \\
-  --quantization awq_marlin \\
-  --max-num-seqs 2 \\
-  --max-num-batched-tokens 4096 \\
-{lora_args}  --enable-prefix-caching \\
-  --enable-chunked-prefill > "$LOG" 2>&1
-"""
-    gateway_script = _render_finquant_gateway_script()
-    gateway_service = _render_finquant_gateway_service()
-    gateway_service_upload = f"{REMOTE_SERVICE_DIR}/{REMOTE_GATEWAY_SERVICE}"
-    return textwrap.dedent(f"""
-        set -euo pipefail
-        cp {sh(REMOTE_QWEN_START_SCRIPT)} {sh(REMOTE_QWEN_START_SCRIPT + '.bak.' + str(int(time.time())))}
-        cat > {sh(REMOTE_QWEN_START_SCRIPT)} <<'SH'
-{qwen_script.rstrip()}
-SH
-        chmod +x {sh(REMOTE_QWEN_START_SCRIPT)}
-        mkdir -p {sh(REMOTE_GATEWAY_DIR)} {sh(REMOTE_SERVICE_DIR)}
-        cat > {sh(REMOTE_GATEWAY_SCRIPT)} <<'PY'
-{gateway_script.rstrip()}
-PY
-        chmod +x {sh(REMOTE_GATEWAY_SCRIPT)}
-        cat > {sh(gateway_service_upload)} <<'UNIT'
-{gateway_service.rstrip()}
-UNIT
-        sudo -n install -m 0644 {sh(gateway_service_upload)} {sh(REMOTE_GATEWAY_SERVICE_PATH)}
-        sudo -n systemctl disable --now {sh(REMOTE_LEGACY_ALIAS_SERVICE)} || true
-        sudo -n systemctl daemon-reload
-        sudo -n systemctl restart {sh(REMOTE_QWEN_SERVICE)}
-        sudo -n systemctl enable --now {sh(REMOTE_GATEWAY_SERVICE)}
-        sudo -n systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}
-        """).strip()
+        raise ValueError("target model service cannot start without a verified FinQuant 27B adapter")
+    candidate.to_topology()
+    qwen_script = model_host_deployment.target_start_script(
+        candidate.to_dict(),
+        adapter_path=adapter_path,
+        base_model_name=BASE_MODEL_NAME,
+    )
+    return {
+        "candidate": candidate.to_dict(),
+        "adapter_path": adapter_path,
+        "target_service": REMOTE_TARGET_MODEL_SERVICE,
+        "conflicting_services": list(REMOTE_TRAINING_CONFLICT_SERVICES[1:]),
+        "start_script": qwen_script,
+        "unit": (
+            "[Unit]\n"
+            "Description=BB target Qwen3.8-27B model service\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "User=linux\n"
+            "WorkingDirectory=/data/BB\n"
+            "ExecStart=/data/BB/scripts/start_target_single_model.sh\n"
+            "Restart=always\n"
+            "RestartSec=5\n"
+            "LimitNOFILE=65535\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        ),
+        "service_manifest": {
+            "manifest_version": "bb.phase3.model-service.v2",
+            "topology_profile": "target_single_model",
+            "services": [
+                {
+                    "name": REMOTE_TARGET_MODEL_SERVICE,
+                    "role": "target_single_model",
+                    "model_id": candidate.model_id,
+                    "port": 8000,
+                    "enabled": True,
+                },
+                {
+                    "name": "bb-phase3-quant-api.service",
+                    "role": "quant_api",
+                    "port": 8101,
+                    "enabled": True,
+                },
+            ],
+        },
+    }
+
+
+def _remote_adapter_deploy_command(payload: dict[str, Any]) -> str:
+    code = inspect.getsource(model_host_deployment)
+    return (
+        "python3 - <<'BB_TARGET_ADAPTER_DEPLOY_PY'\n"
+        + code
+        + "\n"
+        + f"print(json.dumps(deploy_target_adapter(json.loads({json.dumps(payload)!r}))))\n"
+        + "BB_TARGET_ADAPTER_DEPLOY_PY\n"
+    )
+
+
+def _remote_adapter_rollback_command(backup_path: str) -> str:
+    code = inspect.getsource(model_host_deployment)
+    return (
+        "python3 - <<'BB_TARGET_ADAPTER_ROLLBACK_PY'\n"
+        + code
+        + "\n"
+        + f"print(json.dumps(rollback_target_adapter({backup_path!r})))\n"
+        + "BB_TARGET_ADAPTER_ROLLBACK_PY\n"
+    )
+
+
+def _attempt_adapter_deployment_rollback(ssh, backup_path: str) -> dict[str, Any]:
+    try:
+        raw = run_remote_text(
+            ssh,
+            _remote_adapter_rollback_command(backup_path),
+            timeout=300,
+            check=False,
+        )
+        state = _json_object_from_remote_output(raw)
+    except Exception as exc:
+        return {
+            "status": "rollback_failed",
+            "errors": [safe_error_text(exc, limit=800)],
+            "backup": backup_path,
+        }
+    errors = state.get("errors")
+    if state.get("status") != "rolled_back" or not isinstance(errors, list) or errors:
+        return {
+            "status": "rollback_failed",
+            "errors": errors if isinstance(errors, list) and errors else ["invalid rollback status"],
+            "backup": backup_path,
+            "remote_status": state.get("status"),
+        }
+    return state
 
 
 def _switch_verified_adapter(ssh, *, rollback_service: bool) -> dict[str, Any]:
@@ -2130,68 +1006,70 @@ def _switch_verified_adapter(ssh, *, rollback_service: bool) -> dict[str, Any]:
     adapter = str(verified_state.get("adapter_path") or "")
     if not adapter:
         raise RuntimeError("verified FinQuant adapter state did not include an adapter path")
-    run_remote_text(
+    try:
+        candidate_payload = json.loads(_download_text(ssh, REMOTE_TARGET_MODEL_MANIFEST))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("target model candidate manifest is not valid JSON") from exc
+    candidate = ModelCandidateManifest.from_dict(candidate_payload)
+    candidate_errors = candidate.validate_evidence()
+    if candidate_errors:
+        raise RuntimeError(
+            "target model candidate evidence is invalid: " + ", ".join(candidate_errors)
+        )
+    if verified_state.get("model_name") != candidate.model_id or candidate.model_id != MODEL_NAME:
+        raise RuntimeError("FinQuant adapter and target candidate model identities differ")
+    deployment_payload = _adapter_deployment_payload(
+        adapter_path=adapter,
+        candidate=candidate,
+    )
+    deployed = run_remote_text(
         ssh,
-        _remote_service_update_script(adapter_path=adapter),
-        timeout=180,
+        _remote_adapter_deploy_command(deployment_payload),
+        timeout=720,
         check=True,
     )
-    inference_request = json.dumps(
-        {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": 'Return compact JSON: {"status":"ok"}.'}],
-            "temperature": 0,
-            "max_tokens": 16,
-        },
-        separators=(",", ":"),
-    )
-    probe = run_remote_text(
-        ssh,
-        "set +e; "
-        "gateway_payload=''; "
-        "upstream_payload=''; "
-        "for i in $(seq 1 120); do "
-        "  upstream_payload=$(curl -fsS --max-time 5 http://127.0.0.1:8000/v1/models 2>&1); "
-        "  rc=$?; "
-        '  if [ "$rc" -eq 0 ]; then break; fi; '
-        "  sleep 3; "
-        "done; "
-        "gateway_payload=$(curl -fsS --max-time 10 http://127.0.0.1:8003/v1/models 2>&1); "
-        f"inference_payload=$(curl -fsS --max-time 180 -H 'content-type: application/json' -d {sh(inference_request)} http://127.0.0.1:8003/v1/chat/completions 2>&1); "
-        f"process_payload=$(ps -eo args | grep -F -- {sh('--lora-modules ' + MODEL_NAME + '=' + adapter)} | grep -v grep | head -1); "
-        'printf \'%s\\n---8000---\\n%s\\n---INFERENCE---\\n%s\\n---PROCESS---\\n%s\\n\' "$gateway_payload" "$upstream_payload" "$inference_payload" "$process_payload"',
-        timeout=600,
-        check=False,
-    )
-    gateway_probe, _separator, remainder = probe.partition("---8000---")
-    upstream_probe, _separator, remainder = remainder.partition("---INFERENCE---")
-    inference_probe, _separator, process_probe = remainder.partition("---PROCESS---")
-    if MODEL_NAME not in gateway_probe or BASE_MODEL_NAME not in upstream_probe:
+    deployment_state = _json_object_from_remote_output(deployed)
+    backup_path = str(deployment_state.get("backup") or "")
+    if not backup_path:
+        raise RuntimeError("target adapter deployment did not return rollback evidence")
+    if (
+        deployment_state.get("status") != "shadow"
+        or deployment_state.get("live_routing_enabled") is not False
+        or deployment_state.get("model_id") != candidate.model_id
+        or deployment_state.get("adapter_path") != adapter
+    ):
+        rollback_state = _attempt_adapter_deployment_rollback(ssh, backup_path)
         raise RuntimeError(
-            "BB-FinQuant service switch did not verify both gateway and upstream "
-            f"models. Probe excerpt:\n{probe[:5000]}"
+            "target adapter deployment returned inconsistent evidence; "
+            f"rollback: {_json_compact(rollback_state, limit=1200)}"
         )
-    if MODEL_NAME not in upstream_probe:
+    try:
+        synced = run_remote_text(
+            ssh,
+            f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_REGISTRY_TOOL)} sync-evidence",
+            timeout=180,
+            check=True,
+        )
+    except Exception as exc:
+        rollback_state = _attempt_adapter_deployment_rollback(ssh, backup_path)
+        rolled_back = rollback_state.get("status") == "rolled_back" and not rollback_state.get(
+            "errors"
+        )
+        rollback_message = (
+            "deployment was rolled back"
+            if rolled_back
+            else "deployment rollback failed; manual intervention required"
+        )
         raise RuntimeError(
-            "BB-FinQuant adapter was not exposed by upstream vLLM. "
-            f"Probe excerpt:\n{probe[:5000]}"
-        )
-    if '"choices"' not in inference_probe or adapter not in process_probe:
-        raise RuntimeError(
-            "BB-FinQuant service did not prove real adapter inference and process identity. "
-            f"Probe excerpt:\n{probe[:5000]}"
-        )
-    synced = run_remote_text(
-        ssh,
-        f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_REGISTRY_TOOL)} sync-evidence",
-        timeout=180,
-        check=True,
-    )
+            "target adapter runtime passed but registry evidence sync failed; "
+            f"{rollback_message}. Error: {safe_error_text(exc, limit=800)}; "
+            f"rollback: {_json_compact(rollback_state, limit=1200)}"
+        ) from None
     result.update(
         {
             "service_switched": True,
             "adapter_state": verified_state,
-            "probe": probe[:5000],
+            "deployment": deployment_state,
             "specialization_evidence": _json_object_from_remote_output(synced),
         }
     )
@@ -2239,6 +1117,17 @@ def sync_remote_registry_evidence() -> dict[str, Any]:
         ssh.close()
 
 
+def _capture_remote_training_service_states(ssh):
+    services = tuple(dict.fromkeys(REMOTE_TRAINING_CONFLICT_SERVICES))
+    raw = run_remote_text(
+        ssh,
+        capture_service_states_command(services),
+        timeout=60,
+        check=True,
+    )
+    return services, parse_service_states(raw, services)
+
+
 def deploy_and_optionally_train(
     *,
     dataset_jsonl: str,
@@ -2260,9 +1149,17 @@ def deploy_and_optionally_train(
     remote_dataset, remote_dataset_manifest = _remote_dataset_paths(dataset_version)
     if train and not stop_inference_for_training:
         raise ValueError(
-            "LoRA training requires stopping all conflicting 14B services/model services"
+            "LoRA training requires an explicit stop-inference-for-training acknowledgement"
         )
-    candidate = _verified_training_candidate() if train else None
+    backend = None
+    candidate = None
+    if train:
+        # This is deliberately before platform credentials, SSH, uploads, or service mutation.
+        candidate, backend = _verified_training_context()
+    if train and switch_service:
+        raise ValueError("training produces a shadow artifact only; service switching is a separate gated operation")
+    if switch_service and os.environ.get(LIVE_SWITCH_GATE_ENV) != "1":
+        raise ValueError(f"service switching requires {LIVE_SWITCH_GATE_ENV}=1")
     info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
     try:
@@ -2309,28 +1206,22 @@ def deploy_and_optionally_train(
         }
         if train:
             assert candidate is not None
+            assert backend is not None
             selected_version = adapter_version or _new_adapter_version(dataset_manifest)
             adapter_dir, specialization_manifest, train_log = _remote_adapter_paths(
                 selected_version
             )
-            pre = (
-                f"sudo -n systemctl stop {REMOTE_GATEWAY_SERVICE} "
-                f"{REMOTE_LEGACY_ALIAS_SERVICE} {REMOTE_QWEN_SERVICE} "
-                f"{REMOTE_RISK_SERVICE} bb-phase3-quant-api.service || true; "
-            )
-            post = (
-                f"sudo -n systemctl start {REMOTE_QWEN_SERVICE} "
-                f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} "
-                f"bb-phase3-quant-api.service || true; "
-            )
-            train_cmd = (
-                "set -euo pipefail; "
+            training_services, service_states = _capture_remote_training_service_states(ssh)
+            restore_services = restore_services_command(service_states)
+            stop_services = stop_services_command(service_states)
+            train_body = (
                 f"mkdir -p {sh(REMOTE_TRAINING_DIR)} {sh(REMOTE_ADAPTER_VERSIONS_DIR)} "
                 f"{sh(REMOTE_TRAIN_LOG_DIR)}; "
                 f"{_remote_train_base_prepare_command(repo_id=candidate.repo_id, model_path=candidate.model_path)}; "
                 "/data/BB/envs/phase3-quant/bin/python -c "
                 "'import datasets, trl; print(trl.__version__)'; "
-                f"{pre}"
+                f"{stop_services}; "
+                f"timeout --signal=TERM --kill-after=60s {REMOTE_TRAINING_TIMEOUT_SECONDS}s "
                 f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_TRAINER)} "
                 f"--dataset {sh(remote_dataset)} "
                 f"--dataset-manifest {sh(remote_dataset_manifest)} "
@@ -2343,38 +1234,59 @@ def deploy_and_optionally_train(
                 f"--version-id {sh(selected_version)} "
                 f"--max-steps {int(max_steps)} "
                 f"> {sh(train_log)} 2>&1; "
-                f"{post}"
                 f"cat {sh(specialization_manifest)}"
             )
+            train_cmd = wrap_command_with_restore(train_body, restore_services)
             try:
-                raw = run_remote_text(ssh, train_cmd, timeout=7200, check=True)
+                raw = run_remote_text(
+                    ssh,
+                    train_cmd,
+                    timeout=REMOTE_TRAINING_SSH_TIMEOUT_SECONDS,
+                    check=True,
+                )
             except Exception as exc:
                 tail = run_remote_text(
                     ssh,
-                    f"tail -n 160 {sh(train_log)} 2>/dev/null || true; "
-                    f"sudo -n systemctl start {REMOTE_QWEN_SERVICE} "
-                    f"{REMOTE_GATEWAY_SERVICE} {REMOTE_RISK_SERVICE} || true",
+                    f"tail -n 160 {sh(train_log)} 2>/dev/null || true",
                     timeout=120,
                     check=False,
                 )
+                restore_evidence = "unavailable"
+                try:
+                    _actual_services, actual_states = _capture_remote_training_service_states(ssh)
+                    restore_evidence = (
+                        "verified" if service_states_match(service_states, actual_states)
+                        else "mismatch"
+                    )
+                except Exception as state_exc:
+                    restore_evidence = safe_error_text(state_exc, limit=300)
                 raise RuntimeError(
                     "remote LoRA training failed. "
                     f"Command error: {safe_error_text(exc, limit=1400)}\n"
+                    f"Service restore: {restore_evidence}\n"
                     f"Train log tail:\n{tail}"
                 ) from None
+            _actual_services, actual_states = _capture_remote_training_service_states(ssh)
+            if not service_states_match(service_states, actual_states):
+                raise RuntimeError(
+                    "remote LoRA training completed but the pre-training service state was not restored"
+                )
             result["trained"] = True
             result["adapter_version"] = selected_version
             result["specialization_manifest"] = _json_object_from_remote_output(raw)
-            promoted = run_remote_text(
+            shadowed = run_remote_text(
                 ssh,
                 f"BB_TARGET_MODEL_ID={sh(candidate.model_id)} "
                 f"BB_TARGET_INFERENCE_MODEL_PATH={sh(candidate.model_path)} "
                 f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_REGISTRY_TOOL)} "
-                f"promote --manifest {sh(specialization_manifest)}",
+                f"register-shadow --manifest {sh(specialization_manifest)}",
                 timeout=180,
                 check=True,
             )
-            result["artifact_registry"] = _json_object_from_remote_output(promoted)
+            result["artifact_registry"] = _json_object_from_remote_output(shadowed)
+            result["training_backend"] = backend.to_dict()
+            result["service_restore"] = "verified"
+            result["live_routing_enabled"] = False
         if switch_service:
             result.update(_switch_verified_adapter(ssh, rollback_service=False))
         return result
@@ -2431,32 +1343,16 @@ async def _main() -> None:
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--switch-service", action="store_true")
     parser.add_argument("--rollback-service", action="store_true")
-    parser.add_argument(
-        "--refresh-gateway",
-        action="store_true",
-        help="Deploy only the concurrent FinQuant gateway runtime; do not restart vLLM.",
-    )
     parser.add_argument("--registry-status", action="store_true")
     parser.add_argument("--sync-registry-evidence", action="store_true")
     parser.add_argument("--stop-inference-for-training", action="store_true")
     args = parser.parse_args()
 
-    if args.refresh_gateway:
-        if any(
-            bool(getattr(args, name))
-            for name in (
-                "train",
-                "switch_service",
-                "rollback_service",
-                "export_only",
-                "registry_status",
-                "sync_registry_evidence",
-                "stop_inference_for_training",
-            )
-        ):
-            raise SystemExit("--refresh-gateway cannot be combined with other operations")
-        safe_print(json.dumps(deploy_finquant_gateway_runtime_only(), ensure_ascii=False, indent=2))
-        return
+    # Training contract validation is intentionally the first operation for a
+    # training request.  It must fail before DB access, platform export, SSH,
+    # uploads, downloads, or any systemd mutation can occur.
+    if args.train:
+        _verified_training_context()
 
     if args.registry_status:
         if (

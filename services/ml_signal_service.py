@@ -5290,7 +5290,10 @@ async def load_authoritative_trade_training_samples() -> list[dict[str, Any]]:
     from scripts.train_local_ai_tools_models import _load_trade_samples
 
     annotated = annotate_samples(
-        await _load_trade_samples(),
+        # Training/health callers only consume the bounded realized-trade
+        # projection. Loading full decision evidence here detoasts large JSON
+        # snapshots and can exceed the online database statement timeout.
+        await _load_trade_samples(compact=True),
         "trade",
     )
     return [sample for sample in annotated if not sample.get("exclude_from_training")]

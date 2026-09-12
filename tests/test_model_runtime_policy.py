@@ -14,23 +14,22 @@ from core.model_runtime import (
 )
 
 
-def test_uses_thinking_tags_for_qwen3_and_deepseek_r1() -> None:
-    assert uses_thinking_tags("qwen3-32b-trade")
-    assert uses_thinking_tags("BB-FinQuant-Expert-14B")
-    assert uses_thinking_tags("DeepSeek-R1-Distill-Qwen-32B")
+def test_uses_thinking_tags_for_target_qwen3_and_cloud_reasoning() -> None:
+    assert uses_thinking_tags("qwen3.8-27b")
+    assert uses_thinking_tags("o3-mini")
+    assert not uses_thinking_tags("deepseek-reasoner")
     assert not uses_thinking_tags("Qwen2.5-32B-Instruct")
 
 
 def test_provider_thinking_disable_targets_non_r1_deepseek_routes() -> None:
     assert supports_provider_thinking_disable("deepseek-v4-pro")
-    assert not supports_provider_thinking_disable("deepseek-r1-14b-risk")
-    assert not supports_provider_thinking_disable("qwen3-14b-trade")
+    assert not supports_provider_thinking_disable("o3-mini")
+    assert not supports_provider_thinking_disable("qwen3.8-27b")
 
 
-def test_batch_expert_json_support_excludes_deepseek_r1() -> None:
-    assert supports_batch_expert_json("qwen3-14b-trade")
-    assert not supports_batch_expert_json("deepseek-r1-14b-risk")
-    assert not supports_batch_expert_json("DeepSeek-R1-Distill-Qwen-14B-AWQ")
+def test_batch_expert_json_support_keeps_target_and_cloud_models_available() -> None:
+    assert supports_batch_expert_json("qwen3.8-27b")
+    assert supports_batch_expert_json("deepseek-v3")
 
 
 def test_ensure_no_think_text_is_idempotent() -> None:
@@ -45,12 +44,12 @@ def test_ensure_no_think_text_is_idempotent() -> None:
 
 def test_apply_non_thinking_request_controls_copies_messages() -> None:
     body: dict[str, Any] = {
-        "model": "qwen3-32b-trade",
+        "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": "只输出 OK"}],
         "max_tokens": 900,
     }
 
-    controlled = apply_non_thinking_request_controls("qwen3-32b-trade", body)
+    controlled = apply_non_thinking_request_controls("qwen3.8-27b", body)
 
     assert controlled is not body
     assert controlled["messages"] is not body["messages"]
@@ -93,23 +92,12 @@ def test_cap_completion_tokens() -> None:
 def test_completion_token_limit_enforces_stage_caps() -> None:
     assert completion_token_limit("expert", 999, floor=180) == 360
     assert completion_token_limit("fast_expert", 999, floor=180) == 700
-    assert (
-        completion_token_limit(
-            "fast_expert",
-            999,
-            floor=180,
-            model="deepseek-r1-14b-risk",
-        )
-        == 640
-    )
+    assert completion_token_limit("fast_expert", 999, floor=180, model="qwen3.8-27b") == 700
     assert completion_token_limit("decision_maker", 999, floor=180) == 320
     assert completion_token_limit("batch_expert", 999, floor=180) == 560
     assert completion_token_limit("paper_batch_expert", 999, floor=180) == 960
     assert completion_token_limit("paper_batch_expert", 2000, floor=180) == 960
-    assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3-14b-trade") == 560
-    assert (
-        completion_token_limit("batch_expert", 999, floor=180, model="deepseek-r1-14b-risk") == 999
-    )
+    assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3.8-27b") == 560
     assert (
         completion_token_limit(
             "high_risk_review",

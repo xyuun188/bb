@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 from config.settings import FIXED_AI_MODEL_SLOTS  # noqa: E402
 from core.model_candidate_manifest import ModelCandidateManifest  # noqa: E402
 from core.model_topology import (  # noqa: E402
-    LEGACY_SHADOW_PROFILE,
+    DEFAULT_MODEL_TOPOLOGY_PROFILE,
     TARGET_SINGLE_MODEL_PROFILE,
     ModelTopology,
     model_tunnel_routes,
@@ -288,23 +288,13 @@ def _online_tunnel_ai_models_json(
     *,
     topology: ModelTopology | None = None,
 ) -> str:
-    """Render fixed slots from an explicit model topology.
-
-    Legacy shadow remains available for rollback/audit only. The target
-    profile refuses to render until the candidate identity is fully verified,
-    preventing an unverified or guessed 27B model from entering paper/live.
-
-    """
+    """Render fixed slots from the verified single-model topology."""
 
     selected_profile = normalize_topology_profile(
         profile if profile is not None else os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
     )
-    resolved = topology or (
-        topology_for_profile(LEGACY_SHADOW_PROFILE)
-        if selected_profile == LEGACY_SHADOW_PROFILE
-        else _target_topology_from_environment()
-    )
-    if selected_profile == TARGET_SINGLE_MODEL_PROFILE and not target_topology_ready(resolved):
+    resolved = topology or _target_topology_from_environment()
+    if not target_topology_ready(resolved):
         raise RuntimeError(
             "target_single_model requires a verified candidate identity and non-live topology"
         )
@@ -317,12 +307,7 @@ def _online_tunnel_ai_models_json(
     rows = []
     for slot in FIXED_AI_MODEL_SLOTS:
         name = str(slot["name"])
-        if selected_profile == TARGET_SINGLE_MODEL_PROFILE:
-            selected_model = carrier
-        elif name == "decision_maker":
-            selected_model = resolved.by_role("decision_maker")
-        else:
-            selected_model = resolved.by_role("expert_pool")
+        selected_model = carrier
         rows.append(
             {
                 "name": name,
@@ -349,10 +334,12 @@ def _runtime_env_update_script(
     model_topology_profile: str | None = None,
 ) -> str:
     local_ai_tools_key_path = local_ai_tools_key_file if local_ai_tools_key_file else ""
+    # Internal callers follow the same target-single default as the CLI. Legacy
+    # topology rendering must be requested explicitly for audit/rollback only.
     topology_profile = str(
         model_topology_profile
         or os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
-        or LEGACY_SHADOW_PROFILE
+        or DEFAULT_MODEL_TOPOLOGY_PROFILE
     ).strip().lower()
     online_ai_models = _online_tunnel_ai_models_json(topology_profile)
     return f"""from pathlib import Path
@@ -381,7 +368,11 @@ app_env_ai_route_keys = {{
     'HIGH_RISK_REVIEW_MODEL',
     'HIGH_RISK_REVIEW_MODEL_REVISION',
 }}
-app_env_ai_route_prefixes = ('MODEL_SERVER_',)
+app_env_ai_route_prefixes = (
+    'MODEL_SERVER_',
+    'ONLINE_DECISION_MAKER_',
+    'CLOUD_DECISION_MAKER_',
+)
 
 def parse_env(path):
     values = {{}}
@@ -460,7 +451,12 @@ if topology_profile == 'target_single_model':
 current_runtime_text = runtime_path.read_text(encoding='utf-8') if runtime_path.exists() else ''
 values = parse_env(runtime_path)
 for runtime_key in tuple(values):
-    if runtime_key.upper().startswith('MODEL_SERVER_'):
+    normalized_runtime_key = runtime_key.upper()
+    if (
+        normalized_runtime_key.startswith('MODEL_SERVER_')
+        or normalized_runtime_key.startswith('ONLINE_DECISION_MAKER_')
+        or normalized_runtime_key.startswith('CLOUD_DECISION_MAKER_')
+    ):
         values.pop(runtime_key, None)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
 app_env_values = parse_env(app_env_path)
@@ -472,78 +468,6 @@ def first_non_empty(*items):
             return text
     return ''
 
-
-def is_loopback_api_base(value):
-    try:
-        host = (urlparse(str(value or '')).hostname or '').strip().lower()
-    except Exception:
-        return False
-    return host in ('127.0.0.1', 'localhost', '::1')
-
-
-def current_external_decision_route(raw_ai_models):
-    try:
-        configured_rows = json.loads(str(raw_ai_models or '[]'))
-    except Exception:
-        return {{}}
-    if not isinstance(configured_rows, list):
-        return {{}}
-    for configured_row in configured_rows:
-        if not isinstance(configured_row, dict):
-            continue
-        if str(configured_row.get('name') or '').strip() != 'decision_maker':
-            continue
-        api_base = str(configured_row.get('api_base') or '').strip().rstrip('/')
-        model = str(configured_row.get('model') or '').strip()
-        if api_base and model and not is_loopback_api_base(api_base):
-            return {{
-                'api_base': api_base,
-                'api_key': str(configured_row.get('api_key') or '').strip(),
-                'model': model,
-                'route_mode': str(configured_row.get('route_mode') or 'online_slow_brain').strip(),
-            }}
-    return {{}}
-
-
-current_decision_route = current_external_decision_route(values.get('AI_MODELS'))
-decision_api_base = first_non_empty(
-    values.get('ONLINE_DECISION_MAKER_API_BASE'),
-    app_env_values.get('ONLINE_DECISION_MAKER_API_BASE'),
-    values.get('QWEN32B_ONLINE_API_BASE'),
-    app_env_values.get('QWEN32B_ONLINE_API_BASE'),
-    values.get('AI_DECISION_MAKER_API_BASE'),
-    app_env_values.get('AI_DECISION_MAKER_API_BASE'),
-    current_decision_route.get('api_base'),
-)
-decision_api_key = first_non_empty(
-    values.get('ONLINE_DECISION_MAKER_API_KEY'),
-    app_env_values.get('ONLINE_DECISION_MAKER_API_KEY'),
-    values.get('QWEN32B_ONLINE_API_KEY'),
-    app_env_values.get('QWEN32B_ONLINE_API_KEY'),
-    values.get('AI_DECISION_MAKER_API_KEY'),
-    app_env_values.get('AI_DECISION_MAKER_API_KEY'),
-    current_decision_route.get('api_key'),
-)
-decision_model = first_non_empty(
-    values.get('ONLINE_DECISION_MAKER_MODEL'),
-    app_env_values.get('ONLINE_DECISION_MAKER_MODEL'),
-    values.get('QWEN32B_ONLINE_MODEL'),
-    app_env_values.get('QWEN32B_ONLINE_MODEL'),
-    values.get('AI_DECISION_MAKER_MODEL'),
-    app_env_values.get('AI_DECISION_MAKER_MODEL'),
-    current_decision_route.get('model'),
-)
-if decision_api_base and topology_profile == 'legacy_shadow':
-    for row in rows:
-        if row.get('name') == 'decision_maker':
-            row['api_base'] = decision_api_base.rstrip('/')
-            if decision_api_key:
-                row['api_key'] = decision_api_key
-            if decision_model:
-                row['model'] = decision_model
-            row['route_mode'] = current_decision_route.get('route_mode') or 'online_slow_brain'
-            break
-    online_ai_models = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
 
 if local_ai_tools_api_key:
     values['LOCAL_AI_TOOLS_API_KEY'] = local_ai_tools_api_key
@@ -642,7 +566,9 @@ if emit_summary:
         'backup': backup_path,
         'app_env_ai_route_cleanup': app_env_cleanup,
         'ai_models': [(row.get('name'), row.get('api_base'), row.get('model')) for row in rows],
-        'old_name_remaining': 'qwen3-14b-expert-pool' in runtime_path.read_text(encoding='utf-8'),
+        'target_model_route_present': any(
+            str(row.get('model') or '').strip() == 'qwen3.8-27b' for row in rows
+        ),
         'starts_trading_service': False,
         'submits_orders': False,
     }}, ensure_ascii=False))
@@ -684,7 +610,7 @@ def _install_split_service_command(
     selected_profile = str(
         model_topology_profile
         or os.environ.get("BB_MODEL_TOPOLOGY_PROFILE")
-        or LEGACY_SHADOW_PROFILE
+        or DEFAULT_MODEL_TOPOLOGY_PROFILE
     ).strip().lower()
     model_tunnel_unit = _render_model_tunnel_service(
         remote_app_dir,
@@ -993,8 +919,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--owner", default=REMOTE_OWNER)
     parser.add_argument(
         "--model-topology-profile",
-        choices=(LEGACY_SHADOW_PROFILE, TARGET_SINGLE_MODEL_PROFILE),
-        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", LEGACY_SHADOW_PROFILE),
+        choices=(TARGET_SINGLE_MODEL_PROFILE,),
+        default=os.environ.get("BB_MODEL_TOPOLOGY_PROFILE", DEFAULT_MODEL_TOPOLOGY_PROFILE),
         help="Select legacy audit tunnels or the verified one-local-model target profile.",
     )
     parser.add_argument("--include-tests", action="store_true")

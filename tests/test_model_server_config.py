@@ -132,7 +132,7 @@ async def test_server_monitor_keeps_platform_runtime_when_remote_config_fails(
         return {
             "ai_models": [
                 {
-                    "model": "qwen3-14b-trade",
+                    "model": "qwen3.8-27b",
                     "api_base": "http://127.0.0.1:18000/v1",
                     "available": True,
                 }
@@ -158,8 +158,8 @@ async def test_server_monitor_keeps_platform_runtime_when_remote_config_fails(
     assert result["remote_monitor_available"] is False
     assert result["status"] == "platform_runtime_ok_remote_monitor_unavailable"
     assert result["remote_monitor_status"] == "model_server_config_error"
-    assert result["platform_runtime"]["ai_models"][0]["model"] == "qwen3-14b-trade"
-    assert result["model_runtime"]["vllm_endpoints"][0]["provider_model"] == "qwen3-14b-trade"
+    assert result["platform_runtime"]["ai_models"][0]["model"] == "qwen3.8-27b"
+    assert result["model_runtime"]["vllm_endpoints"][0]["provider_model"] == "qwen3.8-27b"
     assert result["model_runtime"]["local_ai_tools"]["available"] is True
 
 

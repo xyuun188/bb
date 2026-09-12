@@ -21,11 +21,9 @@ COMPLETION_TOKEN_CAPS = {
     "high_risk_review": HIGH_RISK_REVIEW_TOKEN_CAP,
     "proxy": 700,
 }
-# Reasoning/thinking models (e.g. deepseek-r1 distill, qwen3 thinking) emit a
-# chunk of chain-of-thought before the final JSON even when thinking is nominally
-# disabled. The standard caps truncate that output right at the JSON boundary,
-# which forces an expensive repair retry and roughly doubles latency. DeepSeek-R1
-# keeps extra headroom on non-batch paths; strict batch JSON is disabled for it.
+# Reasoning/thinking models can emit a hidden reasoning prefix even when
+# thinking is nominally disabled. Keep a bounded headroom policy for those
+# calls, while the local target remains a single non-thinking carrier.
 THINKING_COMPLETION_TOKEN_CAPS = {
     "expert": 640,
     "fast_expert": 640,
@@ -48,13 +46,13 @@ def is_openai_reasoning_model(model: str | None) -> bool:
 def is_qwen3_model(model: str | None) -> bool:
     """Return True for Qwen3 model identifiers."""
     name = str(model or "").lower()
-    return "qwen3" in name or name == "bb-finquant-expert-14b"
+    return name == "qwen3.8-27b"
 
 
 def uses_thinking_tags(model: str | None) -> bool:
     """Return True for models that may emit explicit thinking tags."""
     name = str(model or "").lower()
-    return is_qwen3_model(name) or "deepseek-r1" in name
+    return is_qwen3_model(name) or is_openai_reasoning_model(name)
 
 
 def supports_provider_thinking_disable(model: str | None) -> bool:
@@ -71,9 +69,8 @@ def supports_provider_thinking_disable(model: str | None) -> bool:
 
 
 def batch_expert_json_unreliable_model(model: str | None) -> bool:
-    """Return True when a model is unsafe for strict multi-expert JSON batching."""
-    name = str(model or "").lower()
-    return "deepseek-r1" in name
+    """Return True when a provider is unsafe for strict multi-expert JSON batching."""
+    return False
 
 
 def supports_batch_expert_json(model: str | None) -> bool:
@@ -187,14 +184,14 @@ def completion_token_limit(
 ) -> int:
     """Return the centrally enforced output-token limit for a model call stage.
 
-    When ``model`` is a thinking/reasoning model, a larger cap is applied so the
-    chain-of-thought plus the final JSON can complete in one call instead of
-    being truncated and repaired.
+    Only cloud reasoning models receive the larger cap. The local Qwen carrier
+    is always called with thinking disabled, so its bounded normal cap protects
+    the single-GPU trading queue from long completions.
     """
     stage_key = str(stage or "").strip()
     caps = COMPLETION_TOKEN_CAPS
     model_name = str(model or "").lower()
-    if model is not None and "deepseek-r1" in model_name:
+    if model is not None and is_openai_reasoning_model(model_name):
         caps = {**COMPLETION_TOKEN_CAPS, **THINKING_COMPLETION_TOKEN_CAPS}
     cap = caps.get(stage_key, caps["proxy"])
     return cap_completion_tokens(requested, floor=floor, cap=cap)

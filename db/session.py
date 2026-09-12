@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -25,6 +26,7 @@ from models.base import Base
 
 _engine = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+logger = structlog.get_logger(__name__)
 
 
 async def get_engine():
@@ -154,10 +156,13 @@ async def get_read_session_ctx(
                 expunge_all()
             try:
                 await session.rollback()
-            except Exception:
+            except Exception as exc:
                 # A dropped connection is already unusable; do not mask the
                 # original request error while returning it to the pool.
-                pass
+                logger.debug(
+                    "database session rollback skipped",
+                    error=type(exc).__name__,
+                )
 
 
 async def init_db(*, migrate_schema: bool = True) -> None:

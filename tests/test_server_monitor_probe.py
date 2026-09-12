@@ -35,15 +35,15 @@ def _load_safe_error(script: str) -> Callable[[object], str]:
 
 
 def test_server_monitor_probe_uses_argv_subprocess_commands() -> None:
-    script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
+    script = render_server_monitor_probe("qwen3.8-27b", "Qwen3.8-27B")
 
     assert "shell=True" not in script
     assert "subprocess.run(\n            args," in script
     assert '["systemctl", "is-active", name]' in script
     assert '["ps", "-p", pid, "-o", "etime="]' in script
     assert "vllm_endpoint_runtime(8000" in script
-    assert "vllm_endpoint_runtime(8002" in script
-    assert "vllm_endpoint_runtime(8003" in script
+    assert "vllm_endpoint_runtime(8002" not in script
+    assert "vllm_endpoint_runtime(8003" not in script
     assert "http://127.0.0.1:8101/health" in script
     assert "http://127.0.0.1:8101/models/status" in script
     assert "http://127.0.0.1:8001/models/status" not in script
@@ -139,16 +139,15 @@ def test_render_python_here_doc_rejects_delimiter_collision() -> None:
 
 
 def test_display_provider_model_name_uses_stable_labels() -> None:
-    assert display_provider_model_name("Qwen/Qwen3-32B-AWQ") == "Qwen3-32B-AWQ"
-    assert display_provider_model_name("qwen3-32b-trade") == "Qwen3-32B"
-    assert display_provider_model_name("qwen3-14b-trade") == "Qwen3-14B-Instruct"
+    assert display_provider_model_name("Qwen/Qwen3.8-27B-AWQ") == "Qwen3.8-27B"
+    assert display_provider_model_name("qwen3.8-27b") == "Qwen3.8-27B"
     assert display_provider_model_name("Qwen/Qwen2.5-32B-Instruct") == "Qwen2.5-32B-Instruct"
     assert display_provider_model_name("deepseek-v3") == "deepseek-v3"
     assert display_provider_model_name("") == "Local Model"
 
 
 def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
-    script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
+    script = render_server_monitor_probe("qwen3.8-27b", "Qwen3.8-27B")
     namespace = _load_probe_namespace(script)
 
     def fake_http_json(
@@ -209,17 +208,11 @@ def test_server_monitor_probe_reports_endpoint_and_model_health() -> None:
     assert vllm["available"] is False
     assert vllm["status"] == "model_mismatch"
     assert vllm["model_mismatch"] is True
-    assert vllm["label"] == "Qwen3 32B"
-    assert vllm["provider_model"] == "qwen3-32b-trade"
+    assert vllm["label"] == "Qwen3.8-27B"
+    assert vllm["provider_model"] == "qwen3.8-27b"
     assert cast(dict[str, object], vllm["health"])["status_code"] == 200
     assert cast(dict[str, object], vllm["health"])["latency_ms"] == 12.4
-    assert [item["endpoint"] for item in vllm_endpoints] == [
-        "127.0.0.1:8000/v1",
-        "127.0.0.1:8002/v1",
-        "127.0.0.1:8003/v1",
-    ]
-    assert vllm_endpoints[1]["provider_model"] == "deepseek-r1-14b-risk"
-    assert vllm_endpoints[2]["provider_model"] == "BB-FinQuant-Expert-14B"
+    assert [item["endpoint"] for item in vllm_endpoints] == ["127.0.0.1:8000/v1"]
     assert tools["available"] is True
     assert tools["endpoint"] == "127.0.0.1:8101"
     assert tools["service_role"] == "phase3_quant_api"
@@ -287,7 +280,7 @@ def test_server_monitor_probe_omits_untargeted_fallback_from_duplicate_service_r
 
 
 def test_server_monitor_probe_keeps_primary_vllm_separate_from_available_expert() -> None:
-    script = render_server_monitor_probe("qwen3-32b-trade", "Qwen3 32B")
+    script = render_server_monitor_probe("qwen3.8-27b", "Qwen3.8-27B")
     namespace = _load_probe_namespace(script)
 
     def fake_http_json(
@@ -295,11 +288,7 @@ def test_server_monitor_probe_keeps_primary_vllm_separate_from_available_expert(
         timeout: int = 3,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        model_by_port = {
-            "8000": "qwen3-32b-trade",
-            "8002": "deepseek-r1-14b-risk",
-            "8003": "BB-FinQuant-Expert-14B",
-        }
+        model_by_port = {"8000": "qwen3.8-27b"}
         for port, model in model_by_port.items():
             if url == f"http://127.0.0.1:{port}/v1/models":
                 return {
@@ -322,11 +311,11 @@ def test_server_monitor_probe_keeps_primary_vllm_separate_from_available_expert(
     vllm = cast(dict[str, object], runtime["vllm"])
 
     assert vllm["endpoint"] == "127.0.0.1:8000/v1"
-    assert vllm["provider_model"] == "qwen3-32b-trade"
+    assert vllm["provider_model"] == "qwen3.8-27b"
 
 
 def test_server_monitor_probe_uses_port_role_when_primary_provider_is_expert() -> None:
-    script = render_server_monitor_probe("BB-FinQuant-Expert-14B", "BB-FinQuant-Expert-14B")
+    script = render_server_monitor_probe("qwen3.8-27b", "Qwen3.8-27B")
     namespace = _load_probe_namespace(script)
 
     def fake_http_json(
@@ -334,11 +323,7 @@ def test_server_monitor_probe_uses_port_role_when_primary_provider_is_expert() -
         timeout: int = 3,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        model_by_port = {
-            "8000": "qwen3-32b-trade",
-            "8002": "deepseek-r1-14b-risk",
-            "8003": "BB-FinQuant-Expert-14B",
-        }
+        model_by_port = {"8000": "qwen3.8-27b"}
         for port, model in model_by_port.items():
             if url == f"http://127.0.0.1:{port}/v1/models":
                 return {
@@ -361,11 +346,12 @@ def test_server_monitor_probe_uses_port_role_when_primary_provider_is_expert() -
     vllm = cast(dict[str, object], runtime["vllm"])
     endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
 
-    assert vllm["endpoint"] == "127.0.0.1:8003/v1"
-    assert vllm["provider_model"] == "BB-FinQuant-Expert-14B"
+    assert vllm["endpoint"] == "127.0.0.1:8000/v1"
+    assert vllm["provider_model"] == "qwen3.8-27b"
     assert vllm["available"] is True
-    assert endpoints[2]["provider_model"] == "BB-FinQuant-Expert-14B"
-    assert endpoints[2]["available"] is True
+    assert len(endpoints) == 1
+    assert endpoints[0]["provider_model"] == "qwen3.8-27b"
+    assert endpoints[0]["available"] is True
 
 
 def test_server_monitor_probe_treats_external_primary_as_local_fallback() -> None:
@@ -377,11 +363,7 @@ def test_server_monitor_probe_treats_external_primary_as_local_fallback() -> Non
         timeout: int = 3,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        model_by_port = {
-            "8000": "qwen3-14b-trade",
-            "8002": "deepseek-r1-14b-risk",
-            "8003": "BB-FinQuant-Expert-14B",
-        }
+        model_by_port = {"8000": "qwen3.8-27b"}
         for port, model in model_by_port.items():
             if url == f"http://127.0.0.1:{port}/v1/models":
                 return {
@@ -405,11 +387,11 @@ def test_server_monitor_probe_treats_external_primary_as_local_fallback() -> Non
     endpoints = cast(list[dict[str, object]], runtime["vllm_endpoints"])
 
     assert vllm["endpoint"] == "127.0.0.1:8000/v1"
-    assert vllm["label"] == "本地决策备用池"
-    assert vllm["provider_model"] == ""
+    assert vllm["label"] == "deepseek-v4-pro"
+    assert vllm["provider_model"] == "qwen3.8-27b"
     assert vllm["available"] is True
     assert vllm["model_mismatch"] is False
-    assert endpoints[0]["models"] == ["qwen3-14b-trade"]
+    assert endpoints[0]["models"] == ["qwen3.8-27b"]
 
 
 def test_primary_provider_model_id_prefers_decision_maker(
@@ -421,22 +403,22 @@ def test_primary_provider_model_id_prefers_decision_maker(
         [
             {
                 "name": "trend_expert",
-                "api_base": "http://127.0.0.1:18003/v1",
+                "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "BB-FinQuant-Expert-14B",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             },
             {
                 "name": "decision_maker",
                 "api_base": "http://127.0.0.1:18000/v1",
                 "api_key": "unit-key",
-                "model": "qwen3-32b-trade",
+                "model": "qwen3.8-27b",
                 "enabled": True,
             },
         ],
     )
 
-    assert server_monitor_status.primary_provider_model_id() == "qwen3-32b-trade"
+    assert server_monitor_status.primary_provider_model_id() == "qwen3.8-27b"
 
 
 def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> None:
@@ -445,18 +427,16 @@ def test_server_monitor_ui_uses_dynamic_provider_label_and_endpoint_health() -> 
     assert "DeepSeek 14B / vLLM" not in source
     assert "const vllmInstanceCards = vllmRows.map(item =>" in source
     assert "item.label || item.provider_model || 'vLLM'" in source
-    assert "qwen3-14b-trade" in source
-    assert "deepseek-r1-14b-risk" in source
-    assert "BB-FinQuant-Expert-14B" in source
+    assert "qwen3-14b-trade" not in source
+    assert "vllmRows.map(item =>" in source
+    assert "deepseek-r1-14b-risk" not in source
+    assert "BB-FinQuant-Expert-14B" not in source
     assert "runtimeEndpointSummary" in source
-    assert "配置模型" in source
-    assert "独立失败回退" not in source
-    assert "独立调用失败，本地兜底" in source
-    assert "independent_provider_failed: '独立调用失败'" in source
+    assert "runtimeEndpointSummary" in source
     assert "21840" not in source
     assert "21841" not in source
     assert "21842" not in source
-    assert "platform loopback 18003" in source
+    assert "platform loopback 18000" in source
     assert "configuredBase.includes('127.0.0.1')" in source
     assert "configuredBase.includes('localhost')" in source
 

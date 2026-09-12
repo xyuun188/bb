@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from core.model_topology import TARGET_SINGLE_MODEL_ID, TARGET_SINGLE_MODEL_PROFILE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 MODEL_TRAINING_REGISTRY_VERSION = "2026-07-12.v2"
@@ -114,8 +115,6 @@ def _finquant_specialization_verified(
     if str(evidence.get("verification_status") or "") != "verified":
         return False
     if str(evidence.get("identity_verified") or "").lower() != "true":
-        return False
-    if str(evidence.get("legacy_read_only") or "").lower() == "true":
         return False
     if evidence.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
         return False
@@ -229,7 +228,6 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
             else _reason_codes(readiness_report.get("blocking_reasons"))
         ),
         "identity_verified": available,
-        "alias_only": False,
     }
 
 
@@ -325,7 +323,6 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                     else _safe_list(promotion.get("live_blocking_reasons"))
                 ),
                 "identity_verified": artifact_available,
-                "alias_only": False,
             }
         )
     return rows
@@ -424,7 +421,6 @@ def _specialist_rows(
                 ),
                 "blocking_reasons": _safe_list(report.get("promotion_blockers")),
                 "identity_verified": identity_verified,
-                "alias_only": False,
                 "actual_inference_count": inference_count,
                 "fallback_count": _safe_int(report.get("fallback_count")),
                 "authoritative_sample_count": _safe_int(
@@ -490,9 +486,10 @@ def _llm_rows(
         for row in _safe_list(model_server_report.get("manifest_services"))
         if isinstance(row, dict) and str(row.get("slot") or "")
     }
-    finquant_slot = _safe_dict(slot_reports.get("llm_expert_pool"))
-    decision_slot = _safe_dict(slot_reports.get("llm_decision_maker"))
-    risk_slot = _safe_dict(slot_reports.get("llm_high_risk_review"))
+    carrier_slot = _safe_dict(
+        slot_reports.get("llm_decision_and_expert_carrier")
+        or slot_reports.get("llm_expert_pool")
+    )
 
     def current_slot_runtime(slot: dict[str, Any]) -> bool:
         runtime = _safe_dict(runtime_reports.get(str(slot.get("slot") or ""))) or slot
@@ -505,62 +502,53 @@ def _llm_rows(
             )
         )
 
-    specialization = _safe_dict(finquant_slot.get("specialization_evidence"))
-    finquant_runtime = current_slot_runtime(finquant_slot)
-    finquant_specialized = _finquant_specialization_verified(finquant_slot, specialization)
+    specialization = _safe_dict(carrier_slot.get("specialization_evidence"))
+    carrier_runtime = current_slot_runtime(carrier_slot)
+    carrier_specialized = _finquant_specialization_verified(carrier_slot, specialization)
     finquant = {
-        "model_id": "bb_finquant_expert_14b",
-        "display_name": "BB-FinQuant-Expert-14B",
-        "model_family": str(finquant_slot.get("base_model_carrier") or "Qwen3-14B base carrier"),
+        "model_id": TARGET_SINGLE_MODEL_ID,
+        "display_name": "Qwen3.8-27B FinQuant specialization",
+        "model_family": str(carrier_slot.get("base_model_carrier") or "Qwen3.8-27B target carrier"),
         "task": "quant_expert_reasoning",
         "trainable": True,
         "training_owner": "bb_finquant_qlora_pipeline",
-        "runtime_role": "expert_pool",
-        "lifecycle": "trained" if finquant_specialized else "promotion_blocked",
-        "runtime_available": finquant_runtime,
-        "artifact_available": finquant_specialized,
+        "runtime_role": "decision_and_expert_carrier",
+        "lifecycle": "trained" if carrier_specialized else "promotion_blocked",
+        "runtime_available": carrier_runtime,
+        "artifact_available": carrier_specialized,
         "trained_at": specialization.get("trained_at"),
         "sample_count": _safe_int(specialization.get("sample_count")),
         "live_ml_ready": False,
-        "quality_state": "specialized" if finquant_specialized else "specialization_missing",
-        "blocking_reasons": [] if finquant_specialized else ["finquant_specialization_missing"],
-        "identity_verified": finquant_specialized,
-        "alias_only": bool(finquant_runtime and not finquant_specialized),
+        "quality_state": "specialized" if carrier_specialized else "specialization_missing",
+        "blocking_reasons": [] if carrier_specialized else ["finquant_specialization_missing"],
+        "identity_verified": carrier_specialized,
+        "topology_profile": TARGET_SINGLE_MODEL_PROFILE,
         "specialization_evidence": specialization,
     }
+    cloud_reviewer = _safe_dict(model_server_report.get("cloud_reviewer"))
+    cloud_reviewer_available = bool(
+        cloud_reviewer.get("runtime_available") is True
+        and cloud_reviewer.get("identity_verified") is True
+    )
     base_rows = [
         {
-            "model_id": "qwen3_14b_trade",
-            "display_name": str(decision_slot.get("served_model_name") or "Decision model"),
-            "model_family": str(decision_slot.get("repo_id") or "phase3 decision model"),
-            "task": "trade_reasoning_fallback",
-            "runtime_available": current_slot_runtime(decision_slot),
-        },
-        {
-            "model_id": "deepseek_r1_14b_risk",
-            "display_name": str(risk_slot.get("served_model_name") or "Risk review model"),
-            "model_family": str(risk_slot.get("repo_id") or "phase3 risk review model"),
-            "task": "risk_review",
-            "runtime_available": current_slot_runtime(risk_slot),
-        },
-        {
-            "model_id": "deepseek_online_decision",
-            "display_name": "Online DeepSeek decision model",
-            "model_family": "provider_managed_deepseek",
-            "task": "final_decision",
-            "runtime_available": True,
+            "model_id": "online_reviewer_cloud",
+            "display_name": "Cloud high-risk reviewer",
+            "model_family": str(
+                cloud_reviewer.get("model") or "provider_managed_reviewer"
+            ),
+            "task": "high_risk_review",
+            "runtime_available": cloud_reviewer_available,
         },
     ]
     normalized_base_rows = []
     for row in base_rows:
         evaluation_bucket = None
-        missing_reason = "model_specific_fee_after_attribution_missing"
-        if row["model_id"] == "deepseek_r1_14b_risk":
-            evaluation_bucket = _safe_dict(contribution_performance.get("high_risk_review"))
-            missing_reason = "high_risk_review_fee_after_evaluation_missing"
-        elif row["model_id"] == "deepseek_online_decision":
-            evaluation_bucket = _safe_dict(contribution_performance.get("decision_llm"))
-            missing_reason = "decision_llm_fee_after_evaluation_missing"
+        missing_reason = "high_risk_review_fee_after_evaluation_missing"
+        if row["model_id"] == "online_reviewer_cloud":
+            evaluation_bucket = _safe_dict(
+                contribution_performance.get("high_risk_review")
+            )
         evaluation = _fee_after_evaluation(
             evaluation_bucket,
             missing_reason=missing_reason,
@@ -572,15 +560,16 @@ def _llm_rows(
                 "trainable": False,
                 "training_owner": None,
                 "runtime_role": row["task"],
-                "lifecycle": (
-                    "inference_only" if row["runtime_available"] else "service_unavailable"
-                ),
                 "artifact_available": bool(row["runtime_available"]),
                 "trained_at": None,
                 "sample_count": evaluation["evaluation_sample_count"],
                 "live_ml_ready": False,
                 "identity_verified": bool(row["runtime_available"]),
-                "alias_only": False,
+                "lifecycle": (
+                    "inference_only"
+                    if row["runtime_available"]
+                    else "service_unavailable"
+                ),
             }
         )
     return [finquant, *normalized_base_rows]
@@ -609,7 +598,6 @@ def build_model_training_registry(
     ]
     lifecycle_counts = Counter(str(row.get("lifecycle") or "unknown") for row in models)
     trainable_count = sum(1 for row in models if bool(row.get("trainable")))
-    alias_only = [row["model_id"] for row in models if bool(row.get("alias_only"))]
     identity_failures = [
         row["model_id"]
         for row in models
@@ -624,9 +612,8 @@ def build_model_training_registry(
             "trainable_count": trainable_count,
             "inference_or_evaluation_only_count": len(models) - trainable_count,
             "lifecycle_counts": dict(lifecycle_counts),
-            "alias_only_count": len(alias_only),
-            "alias_only_models": alias_only,
             "identity_failure_count": len(identity_failures),
             "identity_failure_models": identity_failures,
         },
     }
+

@@ -22,7 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.llm_agent import shared_llm_capacity_slot
-from config.settings import DECISION_MAKER_NAME, settings
+from config.settings import settings
 from core.model_runtime import (
     completion_token_limit,
     ensure_no_think_text,
@@ -80,13 +80,11 @@ ACTION_DIRECTION = {
 }
 
 _CONSULTATION_CONCURRENCY = max(int(settings.ai_llm_concurrency or 2), 1)
-BACKUP_CONSULTATION_MODELS = ("qwen3-max", "deepseek-v3", "claude-opus-4-7")
 
 _CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
 _CONSULTATION_TIMEOUT_CAP_SECONDS = 18.0
 _CONSULTATION_ATTEMPT_CAP_SECONDS = 10.0
 _CONSULTATION_THINKING_ATTEMPT_CAP_SECONDS = 10.0
-_CONSULTATION_FALLBACK_RESERVE_SECONDS = 2.0
 # A consultation waits on the same capacity scheduler as every other model
 # call. The old separate semaphore added a second FIFO queue and caused
 # requests to expire before they reached the shared scheduler. Queue wait is
@@ -120,10 +118,9 @@ def _is_reasoning_model(model: str | None) -> bool:
 
 
 def _is_local_qwen3_trade_model(model: str | None) -> bool:
-    name = str(model or "").lower()
-    return (name.startswith("qwen3-") and name.endswith("-trade")) or name == (
-        "bb-finquant-expert-14b"
-    )
+    """Return whether a route is the canonical local Qwen3.8-27B carrier."""
+
+    return is_qwen3_model(model)
 
 
 def _is_loopback_api_base(api_base: str | None) -> bool:
@@ -412,7 +409,7 @@ class CrossValidator:
         else:
             try:
                 if major_conflicts and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS:
-                    consultation = self._fallback_consultation(
+                    consultation = self._consultation_unavailable(
                         major_conflicts,
                         "deadline",
                         "分析剩余预算不足以启动完整会诊",
@@ -449,7 +446,7 @@ class CrossValidator:
                         timeout=consultation_timeout,
                         major_conflicts=len(major_conflicts),
                     )
-                    consultation = self._fallback_consultation(
+                    consultation = self._consultation_unavailable(
                         major_conflicts,
                         "deadline",
                         "分析剩余预算不足以完成完整会诊",
@@ -458,11 +455,11 @@ class CrossValidator:
                     )
                 else:
                     logger.warning(
-                        "deep consultation timed out; using fallback",
+                        "deep consultation timed out; marking unavailable",
                         timeout=consultation_timeout,
                         major_conflicts=len(major_conflicts),
                     )
-                    consultation = self._fallback_consultation(
+                    consultation = self._consultation_unavailable(
                         major_conflicts,
                         "timeout",
                         f"深度会诊超过 {consultation_timeout:.0f} 秒未返回",
@@ -647,7 +644,7 @@ class CrossValidator:
         )
 
     def _consultation_candidates(self, trend_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return deep-consultation models in preferred failover order."""
+        """Return only the canonical local Qwen3.8-27B route."""
         candidates: list[dict[str, Any]] = []
 
         def add_candidate(
@@ -699,48 +696,6 @@ class CrossValidator:
             retries=1,
             source="primary",
         )
-
-        decision_cfg = self._fixed_model_cfg(DECISION_MAKER_NAME)
-        add_candidate(
-            name=DECISION_MAKER_NAME,
-            label=decision_cfg.get("label") or "最终交易员",
-            api_base=decision_cfg.get("api_base") or "",
-            api_key=decision_cfg.get("api_key") or "",
-            model=decision_cfg.get("model") or "",
-            retries=1,
-            source="decision_maker",
-        )
-
-        if settings.high_risk_review_enabled:
-            add_candidate(
-                name="high_risk_review",
-                label="High-risk review model",
-                api_base=settings.high_risk_review_api_base,
-                api_key=settings.high_risk_review_api_key,
-                model=settings.high_risk_review_model,
-                retries=1,
-                source="high_risk_review",
-            )
-
-        primary_api_base = trend_cfg.get("api_base") or ""
-        primary_api_key = trend_cfg.get("api_key") or ""
-        primary_model = str(trend_cfg.get("model") or "").strip()
-        if _is_local_qwen3_trade_model(primary_model):
-            for candidate in candidates:
-                candidate.pop("_identity", None)
-            return candidates
-        for backup_model in BACKUP_CONSULTATION_MODELS:
-            if backup_model == primary_model:
-                continue
-            add_candidate(
-                name="trend_backup",
-                label="趋势备用会诊模型",
-                api_base=primary_api_base,
-                api_key=primary_api_key,
-                model=backup_model,
-                retries=1,
-                source="backup",
-            )
 
         for candidate in candidates:
             candidate.pop("_identity", None)
@@ -816,7 +771,7 @@ class CrossValidator:
         if not api_key:
             if not _is_loopback_api_base(api_base):
                 raise RuntimeError("deep consultation requires an API key for non-loopback access")
-            api_key = "local-loopback"
+            api_key = "local"
         llm_kwargs: dict[str, Any] = {
             "base_url": api_base,
             "api_key": api_key,
@@ -980,7 +935,7 @@ class CrossValidator:
         attempts: list[dict[str, Any]] = []
         skipped_candidates: list[dict[str, Any]] = []
         last_model = primary_model
-        for candidate_index, candidate in enumerate(candidates):
+        for candidate in candidates:
             last_model = str(candidate.get("model") or last_model or "")
             max_attempts = min(max(int(candidate.get("retries") or 1), 1), 1)
             for attempt_no in range(1, max_attempts + 1):
@@ -1005,19 +960,7 @@ class CrossValidator:
                         if _uses_thinking_tags(candidate.get("model"))
                         else _CONSULTATION_ATTEMPT_CAP_SECONDS
                     )
-                    has_fallback = candidate_index < len(candidates) - 1
-                    # Give the primary consultation the complete first-attempt
-                    # budget. Reserving fallback time here made a normal,
-                    # complex arbitration request expire before its first
-                    # model response; fallback candidates still receive the
-                    # bounded reserve after a real primary failure.
-                    reserve = (
-                        _CONSULTATION_FALLBACK_RESERVE_SECONDS
-                        if has_fallback
-                        and candidate_index > 0
-                        and remaining > _CONSULTATION_FALLBACK_RESERVE_SECONDS + 1.0
-                        else 0.0
-                    )
+                    reserve = 0.0
                     queue_timeout = min(
                         _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
                         max(
@@ -1100,7 +1043,6 @@ class CrossValidator:
                     parsed["status"] = "completed"
                     parsed["major_conflicts"] = major
                     parsed["consultation_attempts"] = attempts
-                    parsed["fallback_used"] = candidate.get("source") != "primary" or attempt_no > 1
                     allowed_actions = {"long", "short", "hold"}
                     resolution_status = str(parsed.get("resolution_status") or "").lower()
                     resolved_action = str(parsed.get("resolved_action") or "unclear").lower()
@@ -1143,7 +1085,6 @@ class CrossValidator:
                             "status",
                             "major_conflicts",
                             "consultation_attempts",
-                            "fallback_used",
                             "resolution_status",
                             "resolved_action",
                             "resolved_conflict_pairs",
@@ -1209,7 +1150,7 @@ class CrossValidator:
                 break
 
         if not attempts and skipped_candidates:
-            return self._fallback_consultation(
+            return self._consultation_unavailable(
                 major,
                 last_model or primary_model or "deadline",
                 "分析剩余预算不足以启动完整会诊",
@@ -1217,7 +1158,7 @@ class CrossValidator:
                 reason_code="analysis_deadline_budget_exhausted",
                 skipped_candidates=skipped_candidates,
             )
-        return self._fallback_consultation(
+        return self._consultation_unavailable(
             major,
             last_model or primary_model,
             "深度会诊多次尝试失败",
@@ -1252,7 +1193,7 @@ class CrossValidator:
                 return json.loads(text[start : end + 1])
             raise
 
-    def _fallback_consultation(
+    def _consultation_unavailable(
         self,
         major: list[dict[str, Any]],
         model: str,
@@ -1263,14 +1204,13 @@ class CrossValidator:
         reason_code: str | None = None,
         skipped_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Return an observation-only failure record."""
+        """Return an explicit unavailable record that cannot authorize trading."""
         note = f"{reason}，重大分歧未能完成观察性复核。"
         result = {
             "model": model,
             "consultation_expert": "trend_expert",
             "consultation_expert_label": "行情方向专家",
             "status": status,
-            "fallback": True,
             "conflict_note": note,
             "production_permission": False,
             "major_conflicts": major,

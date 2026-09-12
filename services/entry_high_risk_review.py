@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import time
@@ -21,6 +22,8 @@ _DEFAULT_TAIL_RISK_THRESHOLD = 0.65
 _DEFAULT_LEVERAGE_THRESHOLD = 8.0
 _DEFAULT_POSITION_SIZE_THRESHOLD = 0.12
 _DEFAULT_MIN_APPROVAL_CONFIDENCE = 0.5
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_RETIRED_REVIEWER_MARKERS = ("deepseek-r1-14b-risk", "14b", "finquant-expert")
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -42,6 +45,48 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _review_provider(api_base: str) -> str:
     parsed = urlsplit(api_base)
     return parsed.netloc or parsed.path.split("/", 1)[0] or "configured_reviewer"
+
+
+def validate_cloud_reviewer_route(
+    api_base: str,
+    model: str,
+    revision: str,
+    api_key: str,
+) -> tuple[bool, str]:
+    """Validate the only route allowed for hard high-risk entry reviews.
+
+    The reviewer is an independent cloud service. A missing identity, local
+    endpoint, or retired local model must never silently become an approval
+    path. This check is deliberately shared by runtime and health reporting.
+    """
+
+    base = str(api_base or "").strip().rstrip("/")
+    model_id = str(model or "").strip()
+    model_revision = str(revision or "").strip()
+    key = str(api_key or "").strip()
+    if not base or not model_id or not model_revision or not key:
+        return False, "cloud_reviewer_identity_incomplete"
+    lowered_model = model_id.lower()
+    if any(marker in lowered_model for marker in _RETIRED_REVIEWER_MARKERS):
+        return False, "retired_local_reviewer_model"
+    if any(value in {"unknown", "unverified", "pending"} for value in (model_id.lower(), model_revision.lower())):
+        return False, "cloud_reviewer_identity_placeholder"
+    try:
+        parsed = urlsplit(base)
+        host = str(parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+            return False, "cloud_reviewer_requires_https_without_credentials"
+        if host in _LOOPBACK_HOSTS:
+            return False, "cloud_reviewer_must_not_use_loopback"
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and (address.is_loopback or address.is_private or address.is_link_local):
+            return False, "cloud_reviewer_must_use_public_endpoint"
+    except ValueError:
+        return False, "cloud_reviewer_invalid_endpoint"
+    return True, ""
 
 
 def _fingerprint(payload: dict[str, Any]) -> str:
@@ -226,6 +271,7 @@ class EntryHighRiskReviewGatePolicy:
         api_base = str(getattr(self.config, "high_risk_review_api_base", "") or "").strip()
         api_key = str(getattr(self.config, "high_risk_review_api_key", "") or "").strip()
         model = str(getattr(self.config, "high_risk_review_model", "") or "").strip()
+        revision = str(getattr(self.config, "high_risk_review_model_revision", "") or "").strip()
         base_review["provider"] = _review_provider(api_base)
         if not bool(getattr(self.config, "high_risk_review_enabled", False)):
             payload = {**base_review, "status": "config_disabled", "approved": False}
@@ -235,12 +281,19 @@ class EntryHighRiskReviewGatePolicy:
                 "高风险开仓复核未启用，系统按失败关闭处理，未提交订单。",
                 {"high_risk_review": payload},
             )
-        if self.reviewer is None or not api_base or not api_key or not model:
+        route_valid, route_error = validate_cloud_reviewer_route(
+            api_base,
+            model,
+            revision,
+            api_key,
+        )
+        if self.reviewer is None or not route_valid:
             payload = {
                 **base_review,
                 "status": "config_missing",
                 "approved": False,
                 "error_code": "reviewer_configuration_missing",
+                "route_error": route_error or "reviewer_service_missing",
             }
             self._annotate(decision, payload)
             return PolicyGateResult.block(

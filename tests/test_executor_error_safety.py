@@ -2247,7 +2247,7 @@ async def test_cancel_missing_protection_algo_is_idempotent_success() -> None:
 
 
 def test_okx_swap_market_uses_native_reduce_close_even_without_synthetic_flag() -> None:
-    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    OKXExecutor(mode="paper", load_markets_on_initialize=False)
     market = {
         "id": "PEPE/USDT:USDT",
         "type": "swap",

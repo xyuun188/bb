@@ -154,7 +154,7 @@ def test_phase3_server_migration_accepts_current_carriers_but_requires_control_e
     assert report["phase3_go_live_blocked"] is True
     assert "old_takeover" not in report
     assert report["legacy_process_count"] == 0
-    assert report["phase3_allowed_process_count"] == 3
+    assert report["phase3_allowed_process_count"] == 1
     assert "resource_release_marker_missing" in blocker_codes
     assert "migration_manifest_missing" in blocker_codes
     assert "phase3_required_roots_missing" in blocker_codes
@@ -175,7 +175,7 @@ def test_phase3_server_migration_legacy_topology_also_blocks_32b_process() -> No
     assert report["phase3_go_live_blocked"] is True
     assert "legacy_processes_running" in blocker_codes
     assert report["legacy_process_count"] == 1
-    assert report["phase3_allowed_process_count"] == 3
+    assert report["phase3_allowed_process_count"] == 1
 
 
 def test_phase3_server_migration_blocks_obsolete_32b_even_under_data_bb() -> None:

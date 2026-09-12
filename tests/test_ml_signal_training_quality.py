@@ -39,6 +39,7 @@ from services.ml_signal_service import (
     build_training_frame,
     count_shadow_training_rows,
     decision_group_partition,
+    load_authoritative_trade_training_samples,
     load_shadow_training_rows,
     persist_cached_training_candidate,
     select_shadow_training_rows,
@@ -114,6 +115,31 @@ def test_local_ml_training_uses_bounded_parallelism(
     )
     assert classifier.named_steps["model"].n_jobs == 1
     assert regressor.named_steps["model"].n_jobs == 1
+
+
+@pytest.mark.asyncio
+async def test_authoritative_training_samples_use_compact_trade_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.train_local_ai_tools_models as training_script
+
+    calls: list[bool] = []
+
+    async def fake_loader(*, compact: bool = False) -> list[dict[str, object]]:
+        calls.append(compact)
+        return [{"outcome_id": "trade-1"}]
+
+    monkeypatch.setattr(training_script, "_load_trade_samples", fake_loader)
+    monkeypatch.setattr(
+        ml_signal_module,
+        "annotate_samples",
+        lambda samples, _kind: samples,
+    )
+
+    samples = await load_authoritative_trade_training_samples()
+
+    assert samples == [{"outcome_id": "trade-1"}]
+    assert calls == [True]
 
 
 def test_local_ml_training_cadence_scales_and_enforces_cooldown() -> None:

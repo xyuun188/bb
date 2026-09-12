@@ -53,17 +53,54 @@ def test_dataset_contract_is_content_addressed_and_tamper_evident(
 
     training._validate_dataset_contract(dataset, manifest)
 
-    assert manifest["dataset_schema_version"] == "bb_finquant_expert_sft.v2"
+    assert manifest["dataset_schema_version"] == "bb_finquant_expert_sft.v3"
     assert manifest["dataset_version"].startswith(
-        f"bb-finquant-sft-v2-{manifest['dataset_sha256'][:12]}-"
+        f"bb-finquant-sft-v3-{manifest['dataset_sha256'][:12]}-"
     )
     assert manifest["dataset_version"].endswith(manifest["dataset_lineage_sha256"][:8])
     assert manifest["source_code_version"] == "commit-123"
-    assert manifest["base_model_identity"]["training_repo"] == "Qwen/Qwen3-14B"
+    assert manifest["training_target_contract"]["repo_id"] == "Qwen/Qwen3.8-27B"
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         training._validate_dataset_contract(dataset + "{}\n", manifest)
 
 
+def _target_candidate() -> training.ModelCandidateManifest:
+    return training.ModelCandidateManifest.from_dict(
+        {
+            "manifest_version": "bb.model-candidate.v2",
+            "status": "verified",
+            "model_id": "qwen3.8-27b",
+            "repo_id": "Qwen/Qwen3.8-27B",
+            "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "model_path": "/home/linux/trade_models/qwen3.8-27b-awq",
+            "tokenizer_path": "/home/linux/trade_models/qwen3.8-27b-awq",
+            "license": "apache-2.0",
+            "quantization": "awq-int4",
+            "architecture": "Qwen3_5ForConditionalGeneration",
+            "model_type": "qwen3_5",
+            "language_model_only": False,
+            "text_inference_verified": True,
+            "runtime": {
+                "engine": "vllm",
+                "engine_version": "0.17.1",
+                "transformers_version": "5.8.0",
+                "probe_sha256": "e" * 64,
+            },
+            "context_length": 8192,
+            "config_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "weight_files": [
+                {"path": "model.safetensors", "size_bytes": 1, "sha256": "c" * 64}
+            ],
+            "gpu_memory_peak_gib": 32.0,
+            "inference_p95_ms": 1800.0,
+            "max_concurrency": 1,
+            "storage_available_gib": 80.0,
+            "storage_required_free_gib": 20.0,
+            "validated_at": datetime.now(UTC).isoformat(),
+            "validator_version": "test.v1",
+        }
+    )
 def test_dataset_bytes_round_trip_without_platform_newline_translation(tmp_path) -> None:
     dataset = '{"row":1}\n{"row":2}\n'
     path = tmp_path / "dataset.jsonl"
@@ -279,50 +316,71 @@ def test_remote_json_parser_returns_root_object_instead_of_last_nested_object() 
     assert parsed["manifest"]["training_config"] == {"rank": 8}
 
 
-def test_8003_gateway_requires_a_real_adapter_and_does_not_rename_base_model() -> None:
-    with pytest.raises(ValueError, match="verified BB-FinQuant adapter"):
-        training._remote_service_update_script(adapter_path="")
+def test_target_adapter_payload_requires_real_adapter_and_single_target_service() -> None:
+    with pytest.raises(ValueError, match="verified FinQuant 27B adapter"):
+        training._adapter_deployment_payload(adapter_path="", candidate=_target_candidate())
 
-    rendered = training._remote_service_update_script(
-        adapter_path="/data/BB/models/finquant_lora/versions/20260712T010203Z-aaaaaaaaaaaa"
+    payload = training._adapter_deployment_payload(
+        adapter_path="/data/BB/models/finquant_target_27b/versions/20260712T010203Z-aaaaaaaaaaaa",
+        candidate=_target_candidate(),
     )
+    rendered = payload["start_script"]
 
     assert "--enable-lora" in rendered
-    assert "--lora-modules BB-FinQuant-Expert-14B=" in rendered
-    assert 'UPSTREAM_MODEL = "BB-FinQuant-Expert-14B"' in rendered
-    assert 'payload["model"] = UPSTREAM_MODEL' not in rendered
-    assert '"parent": FALLBACK_MODEL' not in rendered
-    assert "finquant_adapter_not_loaded" in rendered
-    assert "bb-phase3-llm-expert.service" in rendered
-    assert "bb-phase3-llm-decision.service" in rendered
-    assert "systemctl disable --now 'bb-finquant-expert-alias.service'" in rendered
+    assert "--lora-modules qwen3.8-27b=" in rendered
+    assert "/data/BB/envs/target-inference/bin/python" in rendered
+    assert "conda activate trade_vllm" not in rendered
+    assert "--max-num-seqs 1" in rendered
+    assert "--gpu-memory-utilization 0.85" in rendered
+    assert payload["target_service"] == "bb-phase3-llm-target.service"
+    assert payload["conflicting_services"]
+    assert "bb-phase3-llm-target.service" not in payload["conflicting_services"]
+    assert payload["service_manifest"]["topology_profile"] == "target_single_model"
 
 
-def test_finquant_gateway_runtime_is_threaded_and_has_backlog_health_probe() -> None:
-    rendered = training._render_finquant_gateway_script()
-
-    compile(rendered, "remote_finquant_gateway.py", "exec")
-    assert "class GatewayHTTPServer(ThreadingHTTPServer)" in rendered
-    assert "daemon_threads = True" in rendered
-    assert "request_queue_size = REQUEST_QUEUE_SIZE" in rendered
-    assert 'RUNTIME_VERSION = "4.0"' in rendered
-    assert 'self.path.rstrip("/") == "/health/live"' in rendered
-    assert '"request_queue_size": REQUEST_QUEUE_SIZE' in rendered
-    assert "content-length\", \"connection\"" in rendered
-
-
-def test_gateway_runtime_only_deploy_is_explicitly_non_vllm_mutating() -> None:
+def test_training_script_has_no_retired_gateway_entrypoints() -> None:
     source = (training.ROOT / "scripts" / "finquant_expert_lora_training.py").read_text(
         encoding="utf-8"
     )
 
-    assert "--refresh-gateway" in source
-    refresh_start = source.index("def deploy_finquant_gateway_runtime_only")
-    refresh_end = source.index("def _remote_service_update_script", refresh_start)
-    refresh_source = source[refresh_start:refresh_end]
-    assert "underlying_model_restarted\": False" in refresh_source
-    assert "systemctl restart {sh(REMOTE_GATEWAY_SERVICE)}" in refresh_source
-    assert "systemctl restart {sh(REMOTE_QWEN_SERVICE)}" not in refresh_source
+    assert "refresh-gateway" not in source
+    assert "REMOTE_GATEWAY" not in source
+    assert "REMOTE_LEGACY_ALIAS" not in source
+    assert "8003" not in source
+
+
+def test_adapter_rollback_result_is_not_assumed_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        training,
+        "run_remote_text",
+        lambda *_args, **_kwargs: json.dumps(
+            {"status": "rollback_failed", "errors": ["ServiceActiveStateMismatch"]}
+        ),
+    )
+
+    state = training._attempt_adapter_deployment_rollback(object(), "/data/BB/runtime/backup")
+
+    assert state["status"] == "rollback_failed"
+    assert state["errors"] == ["ServiceActiveStateMismatch"]
+
+
+def test_adapter_rollback_requires_explicit_clean_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        training,
+        "run_remote_text",
+        lambda *_args, **_kwargs: json.dumps(
+            {"status": "rolled_back", "errors": [], "backup": "/data/BB/runtime/backup"}
+        ),
+    )
+
+    state = training._attempt_adapter_deployment_rollback(object(), "/data/BB/runtime/backup")
+
+    assert state["status"] == "rolled_back"
+    assert state["errors"] == []
 
 
 def test_remote_trainer_and_registry_enforce_hashes_atomic_pointers_and_rollback() -> None:
@@ -359,6 +417,7 @@ def test_remote_trainer_and_registry_enforce_hashes_atomic_pointers_and_rollback
     )
     assert "ROLLBACK.unlink()" in training.REMOTE_REGISTRY_TOOL_CODE
     assert 'subparsers.add_parser("status")' in training.REMOTE_REGISTRY_TOOL_CODE
+    assert '"registry_version": "bb_finquant_target_27b.v1"' in training.REMOTE_TRAINER_CODE
     assert "validate_pointer(target)" in training.REMOTE_REGISTRY_TOOL_CODE
     assert '"verification_status": verification_status' in training.REMOTE_REGISTRY_TOOL_CODE
     assert '"objective_name": manifest.get("objective_name")' in training.REMOTE_REGISTRY_TOOL_CODE
@@ -376,7 +435,7 @@ def test_training_refuses_to_run_while_conflicting_14b_services_remain_active(
 ) -> None:
     dataset, manifest = _dataset_contract(monkeypatch)
 
-    with pytest.raises(ValueError, match="stopping all conflicting 14B services"):
+    with pytest.raises(ValueError, match="explicit stop-inference-for-training acknowledgement"):
         training.deploy_and_optionally_train(
             dataset_jsonl=dataset,
             manifest_json=json.dumps(manifest),
@@ -385,6 +444,44 @@ def test_training_refuses_to_run_while_conflicting_14b_services_remain_active(
             stop_inference_for_training=False,
             max_steps=1,
         )
+
+
+def test_training_candidate_or_backend_failure_happens_before_ssh_or_service_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, manifest = _dataset_contract(monkeypatch)
+    calls: list[str] = []
+
+    monkeypatch.setattr(training, "_verified_training_context", lambda: (_ for _ in ()).throw(
+        RuntimeError("candidate/backend evidence missing")
+    ))
+    monkeypatch.setattr(
+        training,
+        "load_model_server_info_from_platform",
+        lambda _root: calls.append("load-server-info"),
+    )
+    monkeypatch.setattr(
+        training,
+        "connect_remote_ssh",
+        lambda *_args, **_kwargs: calls.append("ssh"),
+    )
+    monkeypatch.setattr(
+        training,
+        "_upload_text_atomic",
+        lambda *_args, **_kwargs: calls.append("upload"),
+    )
+
+    with pytest.raises(RuntimeError, match="candidate/backend evidence missing"):
+        training.deploy_and_optionally_train(
+            dataset_jsonl=dataset,
+            manifest_json=json.dumps(manifest),
+            train=True,
+            switch_service=False,
+            stop_inference_for_training=True,
+            max_steps=1,
+        )
+
+    assert calls == []
 
 
 def test_rollback_switch_uses_existing_remote_registry_without_dataset_export(

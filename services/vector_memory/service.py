@@ -65,6 +65,8 @@ class VectorMemoryService:
         self._next_reindex_retry_at: datetime | None = None
         self._auto_reindex_task: asyncio.Task | None = None
         self._auto_reindex_started_at: datetime | None = None
+        self._cached_document_count: int | None = None
+        self._store_call_lock = asyncio.Lock()
 
     @property
     def _base_data_dir(self) -> Path:
@@ -128,6 +130,41 @@ class VectorMemoryService:
             self._last_error = ""
             self._last_reindex_at = None
             self._next_reindex_retry_at = None
+            self._cached_document_count = None
+
+    async def _store_call(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run blocking vector-store work away from the trading event loop."""
+
+        # Serialize store calls so a timed-out filesystem operation cannot race
+        # a later writer. The worker is shielded and releases the gate only
+        # after it actually finishes.
+        await self._store_call_lock.acquire()
+        worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        timeout = max(float(settings.vector_memory_operation_timeout_seconds or 2.0), 0.1)
+
+        def release_gate(_task: asyncio.Task[Any]) -> None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                _task.exception()
+            if self._store_call_lock.locked():
+                self._store_call_lock.release()
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+        finally:
+            if worker.done():
+                release_gate(worker)
+            else:
+                worker.add_done_callback(release_gate)
+
+    async def _store_stats(self) -> dict[str, Any]:
+        stats = await self._store_call(self._get_store().stats)
+        if isinstance(stats, dict):
+            try:
+                self._cached_document_count = int(stats.get("document_count") or 0)
+            except (TypeError, ValueError):
+                self._cached_document_count = None
+            return stats
+        return {"backend": self._get_store().backend_name, "document_count": 0}
 
     async def clear_index(self, *, reason: str = "training_derived_state_reset") -> dict[str, Any]:
         """Clear vector documents before rebuilding from the current training epoch."""
@@ -136,7 +173,8 @@ class VectorMemoryService:
         async with self._lock:
             try:
                 reset_at = self._load_reset_at()
-                removed = self._get_store().clear()
+                removed = await self._store_call(self._get_store().clear)
+                self._cached_document_count = 0
                 self._last_error = ""
                 self._last_reindex_at = None
                 self._next_reindex_retry_at = None
@@ -148,7 +186,7 @@ class VectorMemoryService:
                     "removed": removed,
                     "document_count": 0,
                     "training_epoch_policy": "exclude_documents_before_training_epoch",
-                    "store": self._get_store().stats(),
+                    "store": await self._store_stats(),
                 }
             except Exception as exc:
                 self._last_error = safe_error_text(exc, limit=240)
@@ -199,9 +237,9 @@ class VectorMemoryService:
                 "auto_reindex_running": self._auto_reindex_running(),
             }
         try:
-            self.ensure_fresh_index(reason="status")
-            stats = self._get_store().stats()
+            stats = await self._store_stats()
             document_count = int(stats.get("document_count") or 0)
+            self.ensure_fresh_index(reason="status", document_count=document_count)
             auto_state = self._auto_reindex_state(document_count)
             return {
                 "enabled": True,
@@ -220,8 +258,9 @@ class VectorMemoryService:
         except Exception as exc:
             if self._discard_store_after_recoverable_error(exc):
                 try:
-                    stats = self._get_store().stats()
+                    stats = await self._store_stats()
                     document_count = int(stats.get("document_count") or 0)
+                    self.ensure_fresh_index(reason="status", document_count=document_count)
                     auto_state = self._auto_reindex_state(document_count)
                     self._last_error = ""
                     return {
@@ -267,7 +306,8 @@ class VectorMemoryService:
             try:
                 reset_at = self._load_reset_at()
                 documents = await self._load_recent_documents(since=reset_at)
-                indexed = self._get_store().upsert(documents)
+                indexed = await self._store_call(self._get_store().upsert, documents)
+                store_stats = await self._store_stats()
                 self._last_reindex_at = datetime.now(UTC)
                 self._last_error = ""
                 self._next_reindex_retry_at = None
@@ -278,7 +318,7 @@ class VectorMemoryService:
                     "reset_at": _iso(reset_at),
                     "source_filter": "training_epoch_or_later",
                     "last_reindex_at": _iso(self._last_reindex_at),
-                    "store": self._get_store().stats(),
+                    "store": store_stats,
                     "auto_reindex_enabled": bool(settings.vector_memory_auto_reindex_enabled),
                     "auto_reindex_due": False,
                     "auto_reindex_running": False,
@@ -288,7 +328,8 @@ class VectorMemoryService:
                     try:
                         reset_at = self._load_reset_at()
                         documents = await self._load_recent_documents(since=reset_at)
-                        indexed = self._get_store().upsert(documents)
+                        indexed = await self._store_call(self._get_store().upsert, documents)
+                        store_stats = await self._store_stats()
                         self._last_reindex_at = datetime.now(UTC)
                         self._last_error = ""
                         self._next_reindex_retry_at = None
@@ -301,7 +342,7 @@ class VectorMemoryService:
                                 "training_epoch_or_later"
                             ),
                             "last_reindex_at": _iso(self._last_reindex_at),
-                            "store": self._get_store().stats(),
+                            "store": store_stats,
                             "auto_reindex_enabled": bool(
                                 settings.vector_memory_auto_reindex_enabled
                             ),
@@ -356,11 +397,21 @@ class VectorMemoryService:
             if value
         }
         try:
-            hits = self._get_store().search(text, top_k=top_k, filters=filters)
+                hits = await self._store_call(
+                    self._get_store().search,
+                    text,
+                    top_k=top_k,
+                    filters=filters,
+                )
         except Exception as exc:
             if self._discard_store_after_recoverable_error(exc):
                 try:
-                    hits = self._get_store().search(text, top_k=top_k, filters=filters)
+                    hits = await self._store_call(
+                        self._get_store().search,
+                        text,
+                        top_k=top_k,
+                        filters=filters,
+                    )
                 except Exception as retry_exc:
                     exc = retry_exc
                 else:
@@ -387,21 +438,22 @@ class VectorMemoryService:
             "selection_policy": "similarity_ranked_top_k_without_fixed_score_gate",
         }
 
-    def ensure_fresh_index(self, *, reason: str = "") -> None:
+    def ensure_fresh_index(
+        self,
+        *,
+        reason: str = "",
+        document_count: int | None = None,
+    ) -> None:
         """Schedule a non-blocking reindex when the index is empty or stale."""
 
         if not self.enabled or not bool(settings.vector_memory_auto_reindex_enabled):
             return
         if self._auto_reindex_running():
             return
-        try:
-            stats = self._get_store().stats()
-            document_count = int(stats.get("document_count") or 0)
-        except Exception as exc:
-            self._last_error = safe_error_text(exc, limit=180)
-            logger.warning("vector memory stats failed", error=self._last_error)
-            return
-        if not self._auto_reindex_due(document_count):
+        if document_count is not None:
+            self._cached_document_count = document_count
+        known_count = self._cached_document_count
+        if not self._auto_reindex_due(known_count if known_count is not None else 0):
             return
         try:
             loop = asyncio.get_running_loop()

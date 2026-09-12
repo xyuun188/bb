@@ -289,21 +289,68 @@ def _slippage_storage_summary(orders: list[Any]) -> dict[str, Any]:
     }
 
 
+def _promotion_gate(
+    outcomes: list[dict[str, Any]],
+    *,
+    trainable_count: int,
+) -> dict[str, Any]:
+    """Separate structural audit health from training/promotion readiness."""
+
+    complete_count = sum(
+        outcome.get("outcome_complete") is True for outcome in outcomes
+    )
+    blockers: list[str] = []
+    if not outcomes:
+        blockers.append("authoritative_outcomes_missing")
+    if complete_count <= 0:
+        blockers.append("authoritative_outcomes_all_incomplete")
+    if int(trainable_count or 0) <= 0:
+        blockers.append("authoritative_training_samples_missing")
+    return {
+        "status": "blocked" if blockers else "ready_for_review",
+        "production_permission": False,
+        "training_refresh_allowed": not blockers,
+        "blocked_reasons": blockers,
+        "complete_outcome_count": complete_count,
+        "trainable_outcome_count": max(int(trainable_count or 0), 0),
+    }
+
+
 async def audit(
     *,
     mode: str,
     position_id: int | None = None,
     summary_only: bool = False,
 ) -> dict[str, Any]:
-    outcomes = await load_authoritative_trade_outcomes(mode=mode)
+    # Summary audits must stay within the online statement-timeout budget. The
+    # compact loader keeps the authoritative label contract while avoiding
+    # detoasting large decision/evidence JSON payloads.
+    outcome_limit = 500
+    outcomes = await load_authoritative_trade_outcomes(
+        mode=mode,
+        compact=True,
+        # Promotion/training auditing needs the exact entry decision payload;
+        # the compact projection remains bounded but must not omit authority
+        # and strategy-contract fields from the decision learning snapshot.
+        include_decision_evidence=True,
+        limit=outcome_limit,
+    )
+    exchange_order_ids = {
+        str(order_id).strip()
+        for outcome in outcomes
+        for order_id in [
+            *(outcome.get("entry_order_ids") or []),
+            *(outcome.get("close_order_ids") or []),
+        ]
+        if str(order_id or "").strip()
+    }
     async with get_read_session_ctx() as session:
-        order_rows = list(
-            (
-                await session.execute(
-                    select(Order).where(Order.execution_mode == mode)
-                )
-            ).scalars().all()
-        )
+        order_stmt = select(Order).where(Order.execution_mode == mode)
+        if exchange_order_ids:
+            order_stmt = order_stmt.where(
+                Order.exchange_order_id.in_(exchange_order_ids)
+            )
+        order_rows = list((await session.execute(order_stmt)).scalars().all())
     annotated = annotate_training_payload(
         shadow_samples=[],
         trade_samples=outcomes,
@@ -345,6 +392,11 @@ async def audit(
     training_records = [
         row for row in manifest["records"] if str(row.get("outcome_id") or "") in selected_ids
     ]
+    complete_count = sum(
+        outcome.get("outcome_complete") is True for outcome in outcomes
+    )
+    trainable_count = len(annotated["trade_samples"])
+    promotion_gate = _promotion_gate(outcomes, trainable_count=trainable_count)
     violations: list[str] = []
     lifecycle_keys = [str(item.get("lifecycle_key") or "") for item in outcomes]
     outcome_ids = [str(item.get("outcome_id") or "") for item in outcomes]
@@ -377,8 +429,11 @@ async def audit(
         "mode": mode,
         "contract_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "outcome_count": len(outcomes),
-        "complete_count": sum(item.get("outcome_complete") is True for item in outcomes),
+        "outcome_limit": outcome_limit,
+        "outcome_window_bounded": True,
+        "complete_count": complete_count,
         "incomplete_count": sum(item.get("outcome_complete") is not True for item in outcomes),
+        "promotion_gate": promotion_gate,
         "training_integrity": {
             "trainable_count": len(trainable),
             "trainable_realized_pnl_sign_counts": _realized_pnl_sign_counts(trainable),

@@ -29,6 +29,7 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checked_at = datetime.now(UTC) - timedelta(seconds=15)
+    checked_at = datetime.now(UTC) - timedelta(seconds=15)
     monkeypatch.setattr(
         system_audit,
         "_load_canonical_audit_snapshot",
@@ -59,7 +60,6 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
 def test_required_audit_card_does_not_reuse_deferred_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checked_at = datetime.now(UTC)
     monkeypatch.setattr(
         system_audit,
         "_load_canonical_audit_snapshot",
@@ -1652,7 +1652,7 @@ async def test_model_training_audit_does_not_run_full_self_check(
         return {
             "ai_models": [
                 {
-                    "model": "qwen3-14b-trade",
+                    "model": "qwen3.8-27b",
                     "available": True,
                     "endpoint_ok": True,
                     "model_available": True,
@@ -1874,7 +1874,7 @@ async def test_model_training_audit_reports_retired_artifacts_as_rebuild_gate(
 
     async def fake_runtime_status() -> dict[str, Any]:
         return {
-            "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
+            "ai_models": [{"model": "qwen3.8-27b", "available": True}],
             "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
         }
 
@@ -2742,8 +2742,7 @@ async def test_model_training_optional_sources_are_observing_not_unresolved(
     async def fake_runtime_status() -> dict[str, Any]:
         return {
             "ai_models": [
-                {"model": "qwen3-14b-trade", "available": True},
-                {"model": "deepseek-r1-14b-risk", "available": True},
+                {"model": "qwen3.8-27b", "available": True},
             ],
             "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
         }
@@ -2801,8 +2800,7 @@ async def test_model_training_ready_tools_optional_sources_summary_is_specific(
     async def fake_runtime_status() -> dict[str, Any]:
         return {
             "ai_models": [
-                {"model": "qwen3-14b-trade", "available": True},
-                {"model": "deepseek-r1-14b-risk", "available": True},
+                {"model": "qwen3.8-27b", "available": True},
             ],
             "local_ai_tools": {"available": True, "api_base": "http://127.0.0.1:18001"},
         }
@@ -2906,7 +2904,7 @@ async def test_model_training_auth_failure_remains_unresolved(
         nonlocal runtime_calls
         runtime_calls += 1
         return {
-            "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
+            "ai_models": [{"model": "qwen3.8-27b", "available": True}],
             "local_ai_tools": {
                 "available": False,
                 "api_base": "http://127.0.0.1:18001",
@@ -3092,7 +3090,7 @@ async def test_model_training_status_section_error_is_observing_when_runtime_too
 
     async def fake_runtime_status() -> dict[str, Any]:
         return {
-            "ai_models": [{"model": "qwen3-14b-trade", "available": True}],
+            "ai_models": [{"model": "qwen3.8-27b", "available": True}],
             "local_ai_tools": {
                 "available": True,
                 "configured": True,

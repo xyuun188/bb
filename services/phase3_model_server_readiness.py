@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from core.model_candidate_manifest import ModelCandidateManifest
 from core.model_topology import qwen27_candidate_topology
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
@@ -27,29 +28,21 @@ PHASE3_ROOT = "/data/BB"
 DOWNLOAD_MANIFEST_PATH = "/data/BB/manifests/phase3_model_download_manifest.json"
 VALIDATION_MANIFEST_PATH = "/data/BB/manifests/phase3_model_validation.json"
 SERVICE_MANIFEST_PATH = "/data/BB/manifests/phase3_model_service_manifest.json"
+TARGET_CANDIDATE_MANIFEST_PATH = "/data/BB/manifests/target_model_candidate.json"
 PHASE3_MODEL_POLICY_ID = "phase3_quant_model_server_shadow_first_2026_06_27"
 MINIMUM_RUNTIME_GPU_COUNT = 1
-FINQUANT_EXPERT_SLOT = "llm_expert_pool"
-FINQUANT_EXPERT_SERVED_MODEL_NAME = "BB-FinQuant-Expert-14B"
-
-REQUIRED_ARTIFACT_SLOTS = (
-    "timeseries_primary",
-    "timeseries_challenger",
-    "sentiment_primary",
-    "llm_expert_pool",
+TARGET_SERVICE_NAME = "bb-phase3-llm-target.service"
+TARGET_SERVICE_SLOT = "llm_decision_and_expert_carrier"
+TARGET_MODEL_PORT = 8000
+TARGET_MODEL_ID = "qwen3.8-27b"
+REQUIRED_ARTIFACT_SLOTS = ("target_single_model",)
+RETIRED_SERVICE_MARKERS = (
+    "bb-phase3-llm-decision.service",
+    "bb-phase3-llm-expert.service",
+    "bb-phase3-llm-risk-review.service",
+    "qwen3-14b-trade.service",
+    "deepseek-r1-14b-risk.service",
 )
-
-SHADOW_FIRST_LLM_SLOTS = (
-    "llm_decision_maker",
-    "llm_expert_pool",
-    "llm_high_risk_review",
-)
-
-LLM_ROLE_DIVERSITY_REQUIRED_PAIRS: tuple[tuple[str, str], ...] = ()
-
-LLM_POLICY_CANDIDATE_SLOT_MAP = {
-    "expert_pool": "llm_expert_pool",
-}
 
 LLM_SPECIALIZATION_KEYS = (
     "adapter_path",
@@ -65,7 +58,7 @@ LLM_SPECIALIZATION_KEYS = (
     "training_stages",
 )
 
-MODEL_RUNTIME_PORTS = tuple(range(8000, 8011))
+MODEL_RUNTIME_PORTS = (TARGET_MODEL_PORT,)
 PROBED_RUNTIME_PORTS = MODEL_RUNTIME_PORTS
 
 RemoteProbe = Callable[[], dict[str, Any]]
@@ -109,31 +102,75 @@ def _warning(code: str, message: str, *, evidence: Any | None = None) -> dict[st
     return item
 
 
-def _target_topology_report() -> dict[str, Any]:
-    """Expose the unverified one-model target without treating it as deployed."""
+def _target_topology_report(
+    candidate: ModelCandidateManifest | None = None,
+    *,
+    service_ready: bool = False,
+    endpoint_ready: bool = False,
+) -> dict[str, Any]:
+    """Expose the target contract without inventing an identity.
+
+    A placeholder model id is deliberately not returned as a production
+    identity.  This keeps dashboards and paper preflight from mistaking the
+    unconfigured candidate topology for a deployed model.
+    """
 
     topology = qwen27_candidate_topology()
-    model = topology.models[0]
-    blockers = [] if model.identity_complete else ["candidate_model_identity_unverified"]
+    if candidate is None:
+        model = topology.models[0]
+        return {
+            "profile": topology.profile,
+            "local_model_count_target": topology.local_model_count_target,
+            "model_id": "",
+            "role": model.role,
+            "port": model.port,
+            "endpoint": model.endpoint,
+            "repo_id": "",
+            "revision": "",
+            "path": "",
+            "identity_complete": False,
+            "context_length": model.context_length,
+            "max_concurrency": model.max_concurrency,
+            "gpu_memory_budget_gib": model.gpu_memory_budget_gib,
+            "stage": "candidate_not_configured",
+            "runtime": {},
+            "service_ready": False,
+            "endpoint_ready": False,
+            "live_routing_enabled": False,
+            "activation_blocked": True,
+            "blockers": ["target_candidate_manifest_missing"],
+            "cloud_reviewer_required_for_high_risk_entry": (
+                topology.cloud_reviewer_required_for_high_risk_entry
+            ),
+        }
+    target = candidate.to_topology(stage="paper")
+    model = target.models[0]
     return {
-        "local_model_count_target": topology.local_model_count_target,
-        "model_id": model.model_id,
+        "profile": target.profile,
+        "local_model_count_target": target.local_model_count_target,
+        "model_id": candidate.model_id,
         "role": model.role,
         "port": model.port,
         "endpoint": model.endpoint,
-        "repo_id": model.repo_id,
-        "revision": model.revision,
-        "path": model.path,
-        "identity_complete": model.identity_complete,
-        "context_length": model.context_length,
-        "max_concurrency": model.max_concurrency,
-        "gpu_memory_budget_gib": model.gpu_memory_budget_gib,
-        "stage": model.stage,
-        "live_routing_enabled": topology.live_routing_enabled,
-        "activation_blocked": bool(blockers),
-        "blockers": blockers,
+        "repo_id": candidate.repo_id,
+        "revision": candidate.revision,
+        "path": candidate.model_path,
+        "tokenizer_path": candidate.tokenizer_path,
+        "architecture": candidate.architecture,
+        "model_type": candidate.model_type,
+        "runtime": candidate.runtime.to_dict(),
+        "identity_complete": True,
+        "context_length": candidate.context_length,
+        "max_concurrency": candidate.max_concurrency,
+        "gpu_memory_budget_gib": candidate.gpu_memory_peak_gib,
+        "stage": "paper",
+        "service_ready": service_ready,
+        "endpoint_ready": endpoint_ready,
+        "live_routing_enabled": False,
+        "activation_blocked": not (service_ready and endpoint_ready),
+        "blockers": [] if service_ready and endpoint_ready else ["target_runtime_not_ready"],
         "cloud_reviewer_required_for_high_risk_entry": (
-            topology.cloud_reviewer_required_for_high_risk_entry
+            target.cloud_reviewer_required_for_high_risk_entry
         ),
     }
 
@@ -145,293 +182,6 @@ def _manifest_payload(snapshot: dict[str, Any], key: str) -> dict[str, Any]:
 
 def _manifest_present(snapshot: dict[str, Any], key: str) -> bool:
     return bool(_safe_dict(snapshot.get(key)).get("present"))
-
-
-def _model_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = data.get("models")
-    return [_safe_dict(item) for item in _safe_list(rows)]
-
-
-def _slot_map(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        slot = str(row.get("slot") or "").strip()
-        if slot and slot not in result:
-            result[slot] = row
-    return result
-
-
-def _nested_validation(download_manifest: dict[str, Any]) -> dict[str, Any]:
-    return _safe_dict(download_manifest.get("validation"))
-
-
-def _required_missing(row: dict[str, Any]) -> list[Any]:
-    return _safe_list(row.get("required_missing")) + _safe_list(row.get("incomplete_cache_files"))
-
-
-def _slot_ok(download_row: dict[str, Any], validation_row: dict[str, Any]) -> bool:
-    row = validation_row or download_row
-    if not row:
-        return False
-    status = str(row.get("status") or download_row.get("status") or "").strip().lower()
-    exists = bool(row.get("exists", True))
-    required_any_ok = bool(row.get("required_any_ok", True))
-    return bool(
-        exists
-        and status in {"ok", "ready", "validated"}
-        and required_any_ok
-        and not _required_missing(row)
-        and not _required_missing(download_row)
-    )
-
-
-def _normalize_model_identity(value: Any) -> str:
-    text = str(value or "").strip().lower().replace("\\", "/")
-    text = text.replace("--", "/")
-    return "".join(ch for ch in text if ch not in {" ", "\t", "\r", "\n"})
-
-
-def _slot_artifact_identity(row: dict[str, Any]) -> str:
-    repo_id = _normalize_model_identity(row.get("repo_id"))
-    if repo_id:
-        return repo_id
-    path = str(row.get("path") or row.get("target") or "").strip().replace("\\", "/")
-    if not path:
-        return ""
-    return _normalize_model_identity(path.rstrip("/").rsplit("/", 1)[-1])
-
-
-def _slot_candidate_identities(row: dict[str, Any]) -> set[str]:
-    identities = {
-        _normalize_model_identity(row.get("served_model_name")),
-        _normalize_model_identity(row.get("specialization_target")),
-        _normalize_model_identity(row.get("repo_id")),
-        _normalize_model_identity(row.get("base_model_carrier")),
-    }
-    path = str(row.get("path") or row.get("target") or "").strip().replace("\\", "/")
-    if path:
-        identities.add(_normalize_model_identity(path.rstrip("/").rsplit("/", 1)[-1]))
-    return {item for item in identities if item}
-
-
-def _slot_specialization_evidence(row: dict[str, Any]) -> dict[str, str]:
-    evidence: dict[str, str] = {}
-    nested = row.get("specialization_evidence")
-    if isinstance(nested, dict):
-        for key, value in nested.items():
-            text = str(value or "").strip()
-            if text:
-                evidence[str(key)] = text
-    for key in LLM_SPECIALIZATION_KEYS:
-        value = str(row.get(key) or "").strip()
-        if value:
-            evidence[key] = value
-    return evidence
-
-
-def _finquant_specialization_evidence_verified(evidence: dict[str, str]) -> bool:
-    required_sha256 = (
-        "adapter_sha256",
-        "manifest_sha256",
-        "dataset_sha256",
-        "dataset_lineage_sha256",
-        "dataset_manifest_sha256",
-        "source_script_sha256",
-        "trainer_code_sha256",
-        "base_model_config_sha256",
-        "inference_base_model_config_sha256",
-    )
-    if evidence.get("verification_status") != "verified":
-        return False
-    if evidence.get("identity_verified", "").lower() != "true":
-        return False
-    if evidence.get("legacy_read_only", "").lower() == "true":
-        return False
-    if evidence.get("objective_name") != "maximize_expected_realized_net_return_after_cost":
-        return False
-    if evidence.get("objective_version") != "2026-07-12.v1":
-        return False
-    if evidence.get("preference_contract_version") != "bb_finquant_return_preference.v1":
-        return False
-    if "trl_dpo_return_preference" not in evidence.get("training_stages", ""):
-        return False
-    required_text = (
-        "adapter_version",
-        "adapter_path",
-        "specialization_manifest",
-        "specialization_id",
-        "dataset_version",
-        "source_code_version",
-        "base_model_repo",
-        "trained_at",
-        "objective_name",
-        "objective_version",
-        "preference_contract_version",
-        "training_stages",
-    )
-    if any(not evidence.get(key) for key in required_text):
-        return False
-    return all(
-        len(evidence.get(key, "")) == 64
-        and all(character in "0123456789abcdef" for character in evidence[key].lower())
-        for key in required_sha256
-    )
-
-
-def _llm_role_diversity_blockers(
-    reports_by_slot: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    blockers: list[dict[str, Any]] = []
-    for left_slot, right_slot in LLM_ROLE_DIVERSITY_REQUIRED_PAIRS:
-        left = reports_by_slot.get(left_slot, {})
-        right = reports_by_slot.get(right_slot, {})
-        if not left or not right:
-            continue
-        left_identity = _slot_artifact_identity(left)
-        right_identity = _slot_artifact_identity(right)
-        if not left_identity or left_identity != right_identity:
-            continue
-        left_specialization = _slot_specialization_evidence(left)
-        right_specialization = _slot_specialization_evidence(right)
-        if left_specialization or right_specialization:
-            continue
-        blockers.append(
-            _blocker(
-                "llm_role_diversity_missing",
-                (
-                    "Decision maker and expert pool cannot use the same base LLM "
-                    "without audited fine-tune/adapter specialization; duplicate "
-                    "Qwen slots are allowed only for temporary shadow bootstrap, "
-                    "not canary/live promotion."
-                ),
-                evidence={
-                    "left_slot": left_slot,
-                    "right_slot": right_slot,
-                    "model_identity": left_identity,
-                    "left": left,
-                    "right": right,
-                },
-            )
-        )
-    return blockers
-
-
-def _finquant_specialization_warnings(
-    reports_by_slot: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    expert = reports_by_slot.get(FINQUANT_EXPERT_SLOT, {})
-    if not expert:
-        return []
-    evidence = _slot_specialization_evidence(expert)
-    if _finquant_specialization_evidence_verified(evidence):
-        return []
-    return [
-        _warning(
-            "finquant_expert_specialization_pending",
-            (
-                "Expert-pool LLM is still a base model without audited BB quant "
-                "LoRA/fine-tune/RAG specialization evidence. It may run in shadow, "
-                "but final promotion requires BB-FinQuant-Expert specialization."
-            ),
-            evidence=expert,
-        )
-    ]
-
-
-def _finquant_service_manifest_blockers(
-    manifest_service_reports: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    expert_services = [
-        item
-        for item in manifest_service_reports
-        if str(item.get("slot") or "") == FINQUANT_EXPERT_SLOT
-    ]
-    if not expert_services:
-        return [
-            _blocker(
-                "finquant_expert_service_missing",
-                "The expert-pool service must be declared as BB-FinQuant-Expert-14B.",
-                evidence={"slot": FINQUANT_EXPERT_SLOT},
-            )
-        ]
-    blockers: list[dict[str, Any]] = []
-    for service in expert_services:
-        served_model = str(service.get("served_model_name") or "").strip()
-        if served_model == FINQUANT_EXPERT_SERVED_MODEL_NAME:
-            continue
-        blockers.append(
-            _blocker(
-                "finquant_expert_service_name_mismatch",
-                (
-                    "The expert-pool runtime must be exposed as "
-                    "BB-FinQuant-Expert-14B, even when the current carrier is "
-                    "a Qwen3-14B base model waiting for audited specialization."
-                ),
-                evidence={
-                    "expected_served_model_name": FINQUANT_EXPERT_SERVED_MODEL_NAME,
-                    "actual_served_model_name": served_model,
-                    "service": service,
-                },
-            )
-        )
-    return blockers
-
-
-def _llm_policy_candidate_blockers(
-    policy: dict[str, Any],
-    reports_by_slot: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    llm_candidates = _safe_dict(policy.get("llm_candidates"))
-    if not llm_candidates:
-        return []
-    blockers: list[dict[str, Any]] = []
-    for policy_key, slot in LLM_POLICY_CANDIDATE_SLOT_MAP.items():
-        expected = _normalize_model_identity(llm_candidates.get(policy_key))
-        if not expected:
-            continue
-        report = reports_by_slot.get(slot, {})
-        actual_identities = _slot_candidate_identities(report)
-        if not actual_identities or expected in actual_identities:
-            continue
-        blockers.append(
-            _blocker(
-                "llm_candidate_policy_mismatch",
-                (
-                    "Phase 3 LLM policy candidate does not match the validated "
-                    "model slot. Inventory and runtime contracts must use one "
-                    "authoritative model identity."
-                ),
-                evidence={
-                    "policy_key": policy_key,
-                    "slot": slot,
-                    "policy_candidate": llm_candidates.get(policy_key),
-                    "accepted_identities": sorted(actual_identities),
-                    "validated_repo_id": report.get("repo_id"),
-                    "served_model_name": report.get("served_model_name"),
-                    "specialization_target": report.get("specialization_target"),
-                    "validated_path": report.get("path"),
-                },
-            )
-        )
-    return blockers
-
-
-def _merge_slot_service_identity(
-    slot_reports: list[dict[str, Any]],
-    service_reports: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    reports_by_slot = {str(item.get("slot") or ""): dict(item) for item in slot_reports}
-    for service in service_reports:
-        slot = str(service.get("slot") or "").strip()
-        if not slot:
-            continue
-        report = reports_by_slot.setdefault(slot, {"slot": slot})
-        served_model = str(service.get("served_model_name") or "").strip()
-        if served_model and not str(report.get("served_model_name") or "").strip():
-            report["served_model_name"] = served_model
-        if service.get("ready"):
-            report["service_ready"] = True
-    return reports_by_slot
 
 
 def _gpu_rows(snapshot: dict[str, Any]) -> list[str]:
@@ -489,346 +239,259 @@ def _endpoint_ready(service: dict[str, Any], active_endpoints: list[dict[str, An
     return False
 
 
-def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate model artifacts and runtime service readiness without mutation."""
+def _endpoint_models(endpoint: dict[str, Any]) -> set[str]:
+    """Extract exact model ids from an OpenAI-compatible models response."""
 
-    download_manifest = _manifest_payload(snapshot, "download_manifest")
-    validation_manifest = _manifest_payload(snapshot, "validation_manifest")
-    nested_validation = _nested_validation(download_manifest)
-    validation_source = validation_manifest or nested_validation
+    response = str(endpoint.get("response") or "")
+    try:
+        payload = json.loads(response)
+    except (TypeError, ValueError):
+        return set()
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    return {
+        str(row.get("id") or "").strip()
+        for row in _safe_list(rows)
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+
+
+def _target_endpoint_ready(
+    active_endpoints: list[dict[str, Any]],
+    *,
+    model_id: str,
+) -> bool:
+    expected = str(model_id or "").strip()
+    if not expected:
+        return False
+    return any(
+        int(endpoint.get("port") or 0) == TARGET_MODEL_PORT
+        and str(endpoint.get("path") or "") == "/v1/models"
+        and expected in _endpoint_models(endpoint)
+        for endpoint in active_endpoints
+    )
+
+
+def _target_profile_name(snapshot: dict[str, Any]) -> str:
     service_manifest = _manifest_payload(snapshot, "service_manifest")
-    manifest_services = _service_manifest_services(service_manifest)
-    policy = _safe_dict(download_manifest.get("policy"))
+    download_manifest = _manifest_payload(snapshot, "download_manifest")
+    return str(
+        snapshot.get("topology_profile")
+        or service_manifest.get("topology_profile")
+        or download_manifest.get("topology_profile")
+        or ""
+    ).strip().lower()
 
-    download_rows = _model_rows(download_manifest)
-    validation_rows = _model_rows(validation_source)
-    download_by_slot = _slot_map(download_rows)
-    validation_by_slot = _slot_map(validation_rows)
-    torch_info = _safe_dict(validation_source.get("torch"))
+
+def _target_candidate(snapshot: dict[str, Any]) -> tuple[ModelCandidateManifest | None, list[str]]:
+    wrapper = _safe_dict(snapshot.get("target_candidate_manifest"))
+    if not bool(wrapper.get("present")):
+        return None, ["target_candidate_manifest_missing"]
+    data = _safe_dict(wrapper.get("data"))
+    try:
+        candidate = ModelCandidateManifest.from_dict(data)
+    except (TypeError, ValueError) as exc:
+        return None, [f"target_candidate_manifest_invalid:{safe_error_text(exc, limit=180)}"]
+    evidence_errors = list(candidate.validate_evidence())
+    if evidence_errors:
+        return None, [f"target_candidate_evidence_invalid:{item}" for item in evidence_errors]
+    return candidate, []
+
+
+def _evaluate_target_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate the single local Qwen3.8-27B runtime contract."""
+
+    service_manifest = _manifest_payload(snapshot, "service_manifest")
+    service_present = _manifest_present(snapshot, "service_manifest")
+    manifest_services = _service_manifest_services(service_manifest)
     active_services = _active_service_lines(snapshot)
     active_endpoints = _active_endpoints(snapshot)
     gpu_rows = _gpu_rows(snapshot)
     gpu_processes = [
         str(item).strip() for item in _safe_list(snapshot.get("gpu_processes")) if str(item).strip()
     ]
-    validation_gpu_count = int(torch_info.get("device_count") or 0)
-    observed_gpu_count = max(len(gpu_rows), validation_gpu_count)
-    expected_gpu_count = MINIMUM_RUNTIME_GPU_COUNT
-    required_artifact_slots = REQUIRED_ARTIFACT_SLOTS
-    reported_artifact_slots = tuple(
-        dict.fromkeys((*required_artifact_slots, *SHADOW_FIRST_LLM_SLOTS))
-    )
-
-    slot_reports: list[dict[str, Any]] = []
+    torch_info = _safe_dict(_manifest_payload(snapshot, "validation_manifest").get("torch"))
+    candidate, candidate_errors = _target_candidate(snapshot)
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    profile = _target_profile_name(snapshot)
 
-    download_present = _manifest_present(snapshot, "download_manifest")
-    validation_present = _manifest_present(snapshot, "validation_manifest") or bool(
-        nested_validation
-    )
-    service_present = _manifest_present(snapshot, "service_manifest")
-
-    if not download_present:
+    if profile != "target_single_model":
         blockers.append(
             _blocker(
-                "model_download_manifest_missing",
-                "Phase 3 model download manifest is missing.",
-                evidence=DOWNLOAD_MANIFEST_PATH,
+                "target_topology_profile_missing_or_mismatched",
+                "Target readiness requires an explicit target_single_model profile.",
+                evidence={"profile": profile},
             )
         )
-    if not validation_present:
+    for error in candidate_errors:
+        error_code = str(error).split(":", 1)[0] or "target_candidate_manifest_invalid"
         blockers.append(
             _blocker(
-                "model_validation_manifest_missing",
-                "Phase 3 model validation manifest is missing.",
-                evidence=VALIDATION_MANIFEST_PATH,
+                error_code,
+                "The verified Qwen3.8-27B candidate manifest is missing or invalid.",
+                evidence=error,
             )
         )
 
-    if policy and policy.get("quant_server_only") is not True:
-        blockers.append(
-            _blocker(
-                "model_server_not_quant_only",
-                "New model server must be reserved for the Phase 3 crypto-quant plan.",
-                evidence=policy,
-            )
-        )
-
-    runtime_gpu_available = bool(observed_gpu_count > 0 and gpu_processes)
-    cuda_available = bool(torch_info.get("cuda_available") or runtime_gpu_available)
-    tiny_cuda_ok = bool(
-        torch_info.get("tiny_cuda_tensor_ok", torch_info.get("cuda_available"))
-        or runtime_gpu_available
-    )
-    if validation_present and not cuda_available:
-        blockers.append(
-            _blocker(
-                "cuda_unavailable",
-                "Neither validation nor an active model process proves CUDA availability.",
-                evidence=torch_info,
-            )
-        )
-    if validation_present and not tiny_cuda_ok:
-        blockers.append(
-            _blocker(
-                "cuda_tensor_probe_failed",
-                "Neither a tiny tensor probe nor an active model process proves CUDA runtime.",
-                evidence=torch_info.get("tiny_cuda_tensor_error") or torch_info,
-            )
-        )
-    if observed_gpu_count < expected_gpu_count:
-        blockers.append(
-            _blocker(
-                "gpu_count_below_phase3_plan",
-                "No GPU is available for the active model-serving contract.",
-                evidence={
-                    "deployment_contract": "evidence_driven_model_runtime",
-                    "expected": expected_gpu_count,
-                    "observed": observed_gpu_count,
-                },
-            )
-        )
-
-    for slot in reported_artifact_slots:
-        required_slot = slot in required_artifact_slots
-        download_row = download_by_slot.get(slot, {})
-        validation_row = validation_by_slot.get(slot, {})
-        validation_slot_missing = bool(
-            required_slot and validation_present and not validation_row
-        )
-        ok = _slot_ok(download_row, validation_row) and not validation_slot_missing
-        live_routing_enabled = bool(
-            validation_row.get("live_routing_enabled", download_row.get("live_routing_enabled"))
-        )
-        report = {
-            "slot": slot,
-            "ok": ok,
-            "validation_slot_missing": validation_slot_missing,
-            "repo_id": validation_row.get("repo_id") or download_row.get("repo_id") or "",
-            "served_model_name": validation_row.get("served_model_name")
-            or download_row.get("served_model_name")
-            or "",
-            "path": validation_row.get("path") or download_row.get("target") or "",
-            "stage": validation_row.get("stage") or download_row.get("stage") or "",
-            "status": validation_row.get("status") or download_row.get("status") or "",
-            "specialization_required": bool(
-                validation_row.get(
-                    "specialization_required",
-                    download_row.get("specialization_required", False),
-                )
-            ),
-            "specialization_target": validation_row.get("specialization_target")
-            or download_row.get("specialization_target")
-            or "",
-            "specialization_status": validation_row.get("specialization_status")
-            or download_row.get("specialization_status")
-            or "",
-            "base_model_carrier": validation_row.get("base_model_carrier")
-            or download_row.get("base_model_carrier")
-            or "",
-            "required_missing": _required_missing(validation_row)
-            or _required_missing(download_row),
-            "live_routing_enabled": live_routing_enabled,
-            "specialization_evidence": _slot_specialization_evidence(validation_row)
-            or _slot_specialization_evidence(download_row),
-        }
-        if slot == FINQUANT_EXPERT_SLOT:
-            report["specialization_evidence_verified"] = _finquant_specialization_evidence_verified(
-                _safe_dict(report["specialization_evidence"])
-            )
-        slot_reports.append(report)
-        if required_slot and not ok:
-            blockers.append(
-                _blocker(
-                    "required_model_slot_not_ready",
-                    f"Required Phase 3 model slot is not ready: {slot}",
-                    evidence=report,
-                )
-            )
-        if slot in SHADOW_FIRST_LLM_SLOTS and live_routing_enabled:
-            blockers.append(
-                _blocker(
-                    "llm_live_routing_enabled_before_shadow_gate",
-                    "LLM candidates must remain shadow/candidate until Phase 3 service and promotion gates pass.",
-                    evidence=report,
-                )
-            )
-
-    optional_bad = [
-        {
-            "slot": row.get("slot"),
-            "status": row.get("status"),
-            "path": row.get("path") or row.get("target"),
-            "required_missing": _required_missing(row),
-        }
-        for row in validation_rows
-        if str(row.get("slot") or "") not in required_artifact_slots and not _slot_ok(row, row)
-    ]
-    if optional_bad:
-        warnings.append(
-            _warning(
-                "optional_model_slot_not_ready",
-                "Optional challenger/fallback model slots have validation warnings.",
-                evidence=optional_bad[:8],
-            )
-        )
-
-    manifest_service_reports: list[dict[str, Any]] = []
-    for service in manifest_services:
-        service_name = str(service.get("service_name") or "").strip()
-        report = {
-            "slot": service.get("slot"),
-            "role": service.get("role"),
-            "service_name": service_name,
-            "port": service.get("port"),
-            "served_model_name": service.get("served_model_name"),
-            "shadow_only": bool(service.get("shadow_only", True)),
-            "live_routing_enabled": bool(service.get("live_routing_enabled")),
-            "service_active": _service_name_active(service_name, active_services),
-            "endpoint_ready": _endpoint_ready(service, active_endpoints),
-        }
-        report["ready"] = bool(report["service_active"] and report["endpoint_ready"])
-        manifest_service_reports.append(report)
-        if report["live_routing_enabled"]:
-            blockers.append(
-                _blocker(
-                    "model_service_live_routing_enabled_before_shadow_gate",
-                    "Phase 3 model services must remain shadow-only until promotion gates pass.",
-                    evidence=report,
-                )
-            )
+    topology = _target_topology_report(candidate) if candidate else _target_topology_report()
+    expected_model_id = candidate.model_id if candidate else ""
     if not service_present:
-        warnings.append(
-            _warning(
-                "model_service_manifest_missing",
-                (
-                    "Model service manifest is missing; runtime services "
-                    "cannot be promoted from an audited contract."
-                ),
-                evidence=SERVICE_MANIFEST_PATH,
-            )
-        )
-    elif not manifest_services:
         blockers.append(
             _blocker(
-                "model_service_manifest_empty",
-                "Model service manifest is present but declares no Phase 3 model services.",
+                "target_service_manifest_missing",
+                "Target profile requires a service manifest for the single local carrier.",
                 evidence=SERVICE_MANIFEST_PATH,
             )
         )
-    if not active_services:
-        warnings.append(
-            _warning(
-                "model_services_not_running",
-                "No Phase 3 model-serving systemd services are active yet.",
+    elif str(service_manifest.get("topology_profile") or "").strip().lower() != "target_single_model":
+        blockers.append(
+            _blocker(
+                "target_service_manifest_profile_mismatch",
+                "The service manifest does not declare target_single_model.",
+                evidence=service_manifest.get("topology_profile"),
             )
         )
-    missing_manifest_services = [
-        item for item in manifest_service_reports if not bool(item.get("service_active"))
+    if len(manifest_services) != 1:
+        blockers.append(
+            _blocker(
+                "target_service_manifest_count_invalid",
+                "Target profile must declare exactly one local model service.",
+                evidence={"service_count": len(manifest_services)},
+            )
+        )
+    target_service = manifest_services[0] if len(manifest_services) == 1 else {}
+    expected_service_fields = {
+        "service_name": TARGET_SERVICE_NAME,
+        "slot": TARGET_SERVICE_SLOT,
+        "port": TARGET_MODEL_PORT,
+    }
+    for field, expected in expected_service_fields.items():
+        actual = target_service.get(field)
+        if actual != expected:
+            blockers.append(
+                _blocker(
+                    "target_service_contract_mismatch",
+                    f"Target service field {field} does not match the single-model contract.",
+                    evidence={"field": field, "expected": expected, "actual": actual},
+                )
+            )
+    if target_service.get("live_routing_enabled") is not False or target_service.get("shadow_only") is not True:
+        blockers.append(
+            _blocker(
+                "target_service_live_policy_invalid",
+                "The target service must remain shadow-only with live routing disabled.",
+                evidence=target_service,
+            )
+        )
+    if expected_model_id and str(target_service.get("served_model_name") or "") != expected_model_id:
+        blockers.append(
+            _blocker(
+                "target_service_model_identity_mismatch",
+                "Target service served_model_name must equal the verified candidate model id.",
+                evidence={"expected": expected_model_id, "actual": target_service.get("served_model_name")},
+            )
+        )
+
+    service_ready = _service_name_active(TARGET_SERVICE_NAME, active_services)
+    endpoint_ready = _target_endpoint_ready(active_endpoints, model_id=expected_model_id)
+    target_report = dict(topology)
+    target_report["service_ready"] = service_ready
+    target_report["endpoint_ready"] = endpoint_ready
+    if not service_ready:
+        blockers.append(
+            _blocker(
+                "target_service_inactive",
+                "bb-phase3-llm-target.service is not active.",
+                evidence=TARGET_SERVICE_NAME,
+            )
+        )
+    if not endpoint_ready:
+        blockers.append(
+            _blocker(
+                "target_endpoint_not_ready",
+                "Port 8000 /v1/models did not return the verified candidate model id.",
+                evidence={"port": TARGET_MODEL_PORT, "model_id": expected_model_id},
+            )
+        )
+    legacy_active = [
+        line for line in active_services
+        if any(marker.lower() in line.lower() for marker in RETIRED_SERVICE_MARKERS)
     ]
-    missing_manifest_endpoints = [
-        item for item in manifest_service_reports if not bool(item.get("endpoint_ready"))
-    ]
-    if missing_manifest_services:
-        warnings.append(
-            _warning(
-                "manifest_model_services_not_active",
-                "Some Phase 3 model services declared in the service manifest are not active.",
-                evidence=missing_manifest_services[:8],
+    if legacy_active:
+        blockers.append(
+            _blocker(
+                "legacy_model_services_active",
+                "Retired 14B model services must be inactive under target_single_model.",
+                evidence=legacy_active[:12],
             )
         )
-    if missing_manifest_endpoints:
-        warnings.append(
-            _warning(
-                "manifest_model_endpoints_not_ready",
-                "Some Phase 3 model endpoints declared in the service manifest did not return their served model.",
-                evidence=missing_manifest_endpoints[:8],
-            )
-        )
-    if service_present and manifest_services:
-        blockers.extend(_finquant_service_manifest_blockers(manifest_service_reports))
-    slot_reports_by_slot = _merge_slot_service_identity(slot_reports, manifest_service_reports)
-    blockers.extend(_llm_policy_candidate_blockers(policy, slot_reports_by_slot))
-    blockers.extend(_llm_role_diversity_blockers(slot_reports_by_slot))
-    warnings.extend(_finquant_specialization_warnings(slot_reports_by_slot))
-    if not active_endpoints:
-        warnings.append(
-            _warning(
-                "model_endpoints_unavailable",
-                "No local model endpoint responded on the approved runtime port range.",
-                evidence=list(PROBED_RUNTIME_PORTS),
+    observed_gpu_count = max(len(gpu_rows), int(torch_info.get("device_count") or 0))
+    if observed_gpu_count < MINIMUM_RUNTIME_GPU_COUNT:
+        blockers.append(
+            _blocker(
+                "gpu_count_below_target_contract",
+                "At least one GPU must be visible for the target carrier.",
+                evidence={"observed": observed_gpu_count},
             )
         )
     if not gpu_processes:
         warnings.append(
             _warning(
-                "gpu_runtime_idle",
-                "GPU compute is idle; artifacts are present but no model runtime is serving them.",
+                "gpu_runtime_process_evidence_missing",
+                "No GPU process listing was returned; endpoint evidence is still required.",
             )
         )
 
-    artifact_ready = not blockers
-    full_runtime_ready = bool(
-        service_present
-        and manifest_services
-        and manifest_service_reports
-        and all(bool(item.get("ready")) for item in manifest_service_reports)
-    )
-    runtime_ready = full_runtime_ready
-    service_go_live_blocked = bool(blockers or not runtime_ready)
-    status = (
-        "blocked" if blockers else ("ready" if runtime_ready else "artifact_ready_service_pending")
-    )
-
+    target_report["activation_blocked"] = bool(blockers or not (service_ready and endpoint_ready))
+    # Keep the topology contract machine-readable.  Evidence can be a nested
+    # object or a path string, but downstream gates need stable blocker codes
+    # rather than Python's representation of arbitrary evidence.
+    target_report["blockers"] = [
+        str(item.get("code") or "unknown_target_blocker") for item in blockers
+    ]
+    runtime_ready = not blockers
+    manifest_report = {
+        "slot": target_service.get("slot") or TARGET_SERVICE_SLOT,
+        "role": target_service.get("role") or "decision_and_expert_carrier",
+        "service_name": TARGET_SERVICE_NAME,
+        "port": TARGET_MODEL_PORT,
+        "served_model_name": target_service.get("served_model_name") or expected_model_id,
+        "shadow_only": target_service.get("shadow_only") is True,
+        "live_routing_enabled": target_service.get("live_routing_enabled") is True,
+        "service_active": service_ready,
+        "endpoint_ready": endpoint_ready,
+        "ready": service_ready and endpoint_ready and not blockers,
+    }
     return {
-        "status": status,
+        "status": "ready" if runtime_ready else "blocked",
         "read_only": True,
         "audit_only": True,
         "can_mutate_remote": False,
         "can_start_services": False,
         "can_change_live_routing": False,
         "live_routing_enabled": False,
-        "artifact_ready": artifact_ready,
+        "topology_profile": "target_single_model",
+        "artifact_ready": bool(candidate and not candidate_errors),
         "runtime_ready": runtime_ready,
-        "phase3_model_service_go_live_blocked": service_go_live_blocked,
-        "policy_id": PHASE3_MODEL_POLICY_ID,
+        "phase3_model_service_go_live_blocked": not runtime_ready,
+        "policy_id": "phase3_target_single_model.v1",
         "phase3_root": PHASE3_ROOT,
-        "deployment_contract": "evidence_driven_model_runtime",
-        "target_model_topology": _target_topology_report(),
-        "expected_gpu_count": expected_gpu_count,
-        "download_manifest_path": DOWNLOAD_MANIFEST_PATH,
-        "validation_manifest_path": VALIDATION_MANIFEST_PATH,
-        "service_manifest_path": SERVICE_MANIFEST_PATH,
-        "download_manifest": {
-            "present": download_present,
-            "model_count": len(download_rows),
-            "policy": policy,
-            "created_at": download_manifest.get("created_at"),
+        "deployment_contract": "evidence_driven_target_single_model_runtime",
+        "target_model_topology": target_report,
+        "target_candidate_manifest": {
+            "present": _manifest_present(snapshot, "target_candidate_manifest"),
+            "path": TARGET_CANDIDATE_MANIFEST_PATH,
+            "status": candidate.status if candidate else "invalid",
+            "model_id": candidate.model_id if candidate else "",
+            "repo_id": candidate.repo_id if candidate else "",
+            "revision": candidate.revision if candidate else "",
+            "architecture": candidate.architecture if candidate else "",
+            "model_type": candidate.model_type if candidate else "",
+            "runtime": candidate.runtime.to_dict() if candidate else {},
+            "validated_at": candidate.validated_at if candidate else "",
+            "errors": candidate_errors,
         },
-        "validation_manifest": {
-            "present": validation_present,
-            "model_count": len(validation_rows),
-            "checked_at": validation_source.get("checked_at"),
-            "torch": torch_info,
-        },
-        "service_manifest": {
-            "present": service_present,
-            "service_count": len(manifest_services),
-            "data": service_manifest,
-        },
-        "manifest_service_count": len(manifest_service_reports),
-        "manifest_service_ready_count": sum(
-            1 for item in manifest_service_reports if bool(item.get("ready"))
-        ),
-        "manifest_services": manifest_service_reports,
-        "required_slots": slot_reports,
-        "required_slot_count": len(required_artifact_slots),
-        "required_slot_ready_count": sum(
-            1
-            for item in slot_reports
-            if item.get("slot") in required_artifact_slots and item.get("ok")
-        ),
+        "expected_gpu_count": MINIMUM_RUNTIME_GPU_COUNT,
         "gpu_count": observed_gpu_count,
         "gpu_rows": gpu_rows[:16],
         "gpu_process_count": len(gpu_processes),
@@ -837,6 +500,18 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "active_model_services": active_services[:40],
         "active_endpoint_count": len(active_endpoints),
         "active_endpoints": active_endpoints[:16],
+        "service_manifest_path": SERVICE_MANIFEST_PATH,
+        "service_manifest": {"present": service_present, "service_count": len(manifest_services), "data": service_manifest},
+        "manifest_service_count": 1 if target_service else 0,
+        "manifest_service_ready_count": 1 if manifest_report["ready"] else 0,
+        "manifest_services": [manifest_report] if target_service else [],
+        "required_slots": [],
+        "required_slot_count": 0,
+        "required_slot_ready_count": 0,
+        "download_manifest_path": DOWNLOAD_MANIFEST_PATH,
+        "validation_manifest_path": VALIDATION_MANIFEST_PATH,
+        "download_manifest": {"present": _manifest_present(snapshot, "download_manifest")},
+        "validation_manifest": {"present": _manifest_present(snapshot, "validation_manifest"), "torch": torch_info},
         "listening_ports": _safe_list(snapshot.get("listening_ports"))[:80],
         "model_paths": _safe_list(snapshot.get("model_paths"))[:120],
         "manifest_files": _safe_list(snapshot.get("manifest_files"))[:80],
@@ -845,6 +520,13 @@ def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str,
         "checked_at": _now_iso(),
     }
 
+
+def evaluate_phase3_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate model artifacts and runtime service readiness without mutation."""
+    # There is one executable topology.  A missing or unknown profile is a
+    # blocker inside the same target evaluator; no legacy evaluator is used as
+    # a fallback and no old endpoint can unlock readiness.
+    return _evaluate_target_model_server_snapshot(snapshot)
 
 def render_phase3_model_server_probe() -> str:
     """Render the read-only remote probe executed on the model server."""
@@ -857,6 +539,7 @@ def render_phase3_model_server_probe() -> str:
         DOWNLOAD_MANIFEST_PATH = {json.dumps(DOWNLOAD_MANIFEST_PATH)}
         VALIDATION_MANIFEST_PATH = {json.dumps(VALIDATION_MANIFEST_PATH)}
         SERVICE_MANIFEST_PATH = {json.dumps(SERVICE_MANIFEST_PATH)}
+        TARGET_CANDIDATE_MANIFEST_PATH = {json.dumps(TARGET_CANDIDATE_MANIFEST_PATH)}
         PROBED_RUNTIME_PORTS = {json.dumps(PROBED_RUNTIME_PORTS)}
 
         def run(command, timeout=8):
@@ -887,6 +570,33 @@ def render_phase3_model_server_probe() -> str:
             except Exception as exc:
                 return {{"present": True, "data": {{}}, "error": str(exc)[:180]}}
             return {{"present": True, "data": compact_manifest(data)}}
+
+        def read_candidate_json(path):
+            if not os.path.exists(path):
+                return {{"present": False, "data": {{}}}}
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception as exc:
+                return {{"present": True, "data": {{}}, "error": str(exc)[:180]}}
+            if not isinstance(data, dict):
+                return {{"present": True, "data": {{}}, "error": "candidate manifest is not an object"}}
+            keys = (
+                "manifest_version", "status", "model_id", "repo_id", "revision",
+                "model_path", "tokenizer_path", "license", "quantization",
+                "architecture", "model_type", "language_model_only",
+                "text_inference_verified", "context_length", "config_sha256",
+                "tokenizer_sha256", "gpu_memory_peak_gib", "inference_p95_ms",
+                "max_concurrency", "storage_available_gib", "storage_required_free_gib",
+                "validated_at", "validator_version", "runtime",
+            )
+            compact = {{key: data.get(key) for key in keys if key in data}}
+            compact["weight_files"] = [
+                {{key: item.get(key) for key in ("path", "size_bytes", "sha256") if key in item}}
+                for item in data.get("weight_files", [])
+                if isinstance(item, dict)
+            ]
+            return {{"present": True, "data": compact}}
 
         def compact_model(row):
             if not isinstance(row, dict):
@@ -977,21 +687,29 @@ def render_phase3_model_server_probe() -> str:
             }}
 
         payload = {{
+            # The target single-model profile is the default contract.  An
+            # explicit legacy audit remains available through the dedicated
+            # status script, but readiness must not infer legacy production
+            # semantics merely because old manifests omit a profile field.
+            "topology_profile": os.environ.get(
+                "BB_MODEL_TOPOLOGY_PROFILE", "target_single_model"
+            ).strip().lower(),
             "download_manifest": read_json(DOWNLOAD_MANIFEST_PATH),
             "validation_manifest": read_json(VALIDATION_MANIFEST_PATH),
             "service_manifest": read_json(SERVICE_MANIFEST_PATH),
+            "target_candidate_manifest": read_candidate_json(TARGET_CANDIDATE_MANIFEST_PATH),
             "services": lines(run(
                 "systemctl list-units --type=service --all --no-pager "
-                "| grep -Ei 'bb|qwen|deepseek|glm|chronos|timesfm|vllm|ollama|model|local-ai|trade-ai|phase3|quant' || true",
+                "| grep -Ei 'bb-phase3-llm-target|phase3|quant|local-ai|redis' || true",
                 timeout=10,
             )["stdout"], 120),
             "unit_files": lines(run(
                 "systemctl list-unit-files --type=service --no-pager "
-                "| grep -Ei 'bb|qwen|deepseek|glm|chronos|timesfm|vllm|ollama|model|local-ai|trade-ai|phase3|quant' || true",
+                "| grep -Ei 'bb-phase3-llm-target|phase3|quant|local-ai|redis' || true",
                 timeout=10,
             )["stdout"], 120),
             "listening_ports": lines(run(
-                "ss -ltnp 2>/dev/null | grep -E ':(8000|8001|8002|8003|8004|8005|8006|8007|8008|8009|8010|8101|18000|18001|18002|18003)\\\\b' || true",
+                "ss -ltnp 2>/dev/null | grep -E ':(8000|8101|18000|18001)\\\\b' || true",
                 timeout=5,
             )["stdout"], 80),
             "gpu": lines(run(
@@ -1196,3 +914,4 @@ def _should_fallback_to_platform_bridge(exc: Exception) -> bool:
         or "Could not find server info file" in text
         or "Could not find model server info file" in text
     )
+

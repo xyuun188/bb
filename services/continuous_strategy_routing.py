@@ -173,10 +173,7 @@ def _time_separated(candidate: dict[str, Any]) -> bool:
             exam_partition == "strategy_exam"
             and exam.get("validation_method") == "exact_current_model_on_immutable_shadow_snapshot"
         )
-    return bool(
-        development_partition == "authoritative_closed_positions"
-        and exam_partition == "legacy_shadow"
-    )
+    return False
 
 
 class ContinuousStrategyRoutingPolicy:

@@ -766,10 +766,11 @@ def test_system_audit_displays_issue_ledger() -> None:
     assert ".server-monitor-self-check-actions" in style
     assert ".server-monitor-panel.active" in style
     assert "MODEL_PUBLIC_HOST" not in script
-    assert "'qwen3-14b-trade': 'platform loopback 18000'" in script
-    assert "'deepseek-r1-14b-risk': 'platform loopback 18002'" in script
-    assert "'BB-FinQuant-Expert-14B': 'platform loopback 18003'" in script
-    assert "phase3_quant_api: 'platform loopback 18001'" in script
+    assert "'qwen3-14b-trade': 'platform loopback 18000'" not in script
+    assert "'deepseek-r1-14b-risk': 'platform loopback 18002'" not in script
+    assert "'BB-FinQuant-Expert-14B': 'platform loopback 18003'" not in script
+    assert "qwen3.8-27b" not in script
+    assert "phase3_quant_api: 'platform loopback 18001'" not in script
     assert "21840" not in script and "21841" not in script and "21842" not in script
     assert "data.model_access_host" not in script
 

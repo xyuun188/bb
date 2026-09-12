@@ -441,7 +441,7 @@ BB 应保留现有 AI 决策、回测、paper/live 权限、OKX 执行与权威�
 - Local AI Tools 运行 `0152e6b957154437bb7b507af08c00a6` 随后自然结束，6 个模型状态全部一致落成 `succeeded`、`active_run_id=null`、`last_error=null`、`retry_count=0`，产物已持久化。
 - 两类训练的最终原因均为 `trained_challenger_rejected`：训练已完成，但 challenger 没有通过收益质量晋升门禁，系统正确保留当前 champion，该结果不是训练异常。
 - 从 Local ML 启动至 Local AI Tools 结束的线上日志审计中，服务错误、Traceback、专家 JSON 截断、市场轮次超时、特征向量超时和单币种模型 deadline 均为 0。仍有 22 次 OKX 衍生品 partial 告警：`funding/open_interest` 在 6 秒窗口内未返回，而 orderbook/reference prices 正常返回；系统显式降级且未阻塞分析，因此不将其误报为“零告警”。
-- 公开 Dashboard 地址 `http://38.246.249.80:8002/` 经一次登录跳转后返回 HTTP 200，整体响应约 0.10 秒。
+- 公开 Dashboard 地址 `http://<platform-host>:8002/` 经一次登录跳转后返回 HTTP 200，整体响应约 0.10 秒。
 - 线上训练超时状态机探针通过：超时会记录 `state=failed`、`reason=timeout`、清空 active run 并增加重试计数。
 
 ### 15.3 尚未完成或仍被门禁阻止

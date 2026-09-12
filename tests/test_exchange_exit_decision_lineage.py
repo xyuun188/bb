@@ -6,6 +6,7 @@ import pytest
 from services.exchange_exit_decision_lineage import (
     ExitDecisionLineageAmbiguous,
     ExitDecisionLineageResolution,
+    _can_aggregate_close_positions,
     apply_exit_decision_lineage,
     choose_exit_decision_lineage,
     recover_exit_decision_lineage_from_order_fact,
@@ -91,6 +92,61 @@ def test_multiple_production_decisions_for_one_order_fail_closed() -> None:
             [first, second],
             close_order_id="same-order",
         )
+
+
+def test_distinct_close_fragments_can_aggregate_against_authoritative_quantity() -> None:
+    positions = [
+        SimpleNamespace(
+            id=101,
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            side="long",
+            okx_pos_id="pos-a",
+            entry_exchange_order_id="entry-a",
+            entry_price=100.0,
+            quantity=2.0,
+        ),
+        SimpleNamespace(
+            id=102,
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            side="long",
+            okx_pos_id="pos-b",
+            entry_exchange_order_id="entry-b",
+            entry_price=101.0,
+            quantity=3.0,
+        ),
+    ]
+
+    assert _can_aggregate_close_positions(positions, target_quantity=5.0) is True
+
+
+def test_duplicate_close_projection_or_quantity_mismatch_stays_ambiguous() -> None:
+    duplicate = SimpleNamespace(
+        id=101,
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="long",
+        okx_pos_id="pos-a",
+        entry_exchange_order_id="entry-a",
+        entry_price=100.0,
+        quantity=2.0,
+    )
+    same_projection = SimpleNamespace(
+        **{**duplicate.__dict__, "id": 102}
+    )
+
+    assert _can_aggregate_close_positions([duplicate, same_projection], target_quantity=4.0) is False
+    assert _can_aggregate_close_positions([duplicate], target_quantity=3.0) is True
+    assert _can_aggregate_close_positions(
+        [
+            duplicate,
+            SimpleNamespace(
+                **{**duplicate.__dict__, "id": 103, "entry_exchange_order_id": "entry-b"}
+            ),
+        ],
+        target_quantity=9.0,
+    ) is False
 
 
 @pytest.mark.asyncio

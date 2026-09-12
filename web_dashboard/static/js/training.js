@@ -9,9 +9,7 @@
     data: 45_000, strategy: 20_000, decisions: 30_000,
   });
   const urls = {
-    // One read-only snapshot replaces the old ML -> registry -> scheduler
-    // cascade.  Legacy URLs remain documented for older deployments but are
-    // intentionally not fetched by this page.
+    // One read-only snapshot replaces the ML -> registry -> scheduler cascade.
     observability: '/api/model-observability/snapshot',
     ml: '/api/ml-signal/status',
     registry: '/api/model-training/registry',
@@ -104,10 +102,8 @@
     chronos_2: ['Chronos-2 时序挑战模型', '预训练时序基础模型'],
     finbert: ['FinBERT 财经情绪', '预训练财经情绪模型'],
     finbert_tone: ['FinBERT Tone 情绪挑战模型', '预训练财经情绪模型'],
-    bb_finquant_expert_14b: ['BB 量化专家 14B', '项目专用量化推理模型'],
-    qwen3_14b_trade: ['Qwen3 交易决策 14B', '交易推理后备模型'],
-    deepseek_r1_14b_risk: ['DeepSeek 风险复核 14B', '高风险交易复核模型'],
-    deepseek_online_decision: ['线上 DeepSeek 最终决策', '托管式最终决策模型'],
+    'qwen3.8-27b': ['Qwen3.8-27B 量化模型', '本地决策与专家推理模型'],
+    online_reviewer_cloud: ['云端高风险复核', '低频独立复核模型'],
   });
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({

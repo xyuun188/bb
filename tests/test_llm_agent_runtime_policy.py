@@ -8,13 +8,12 @@ import pytest
 
 from ai_brain.llm_agent import (
     LLMAgent,
-    _backup_model_names,
     _extract_json,
     _format_local_ai_tools,
     _provider_response_contract,
     _ScopedLLMCapacity,
 )
-from core.exceptions import LLMResponseParseError
+from core.exceptions import LLMResponseParseError, ModelInferenceError
 from data_feed.feature_vector import FeatureVector
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import standardized_return_distribution
@@ -261,26 +260,22 @@ async def test_keyless_loopback_model_uses_process_local_client_placeholder(
     agent = LLMAgent(
         name="trend_expert",
         api_config={
-            "api_base": "http://127.0.0.1:18003/v1",
+            "api_base": "http://127.0.0.1:18000/v1",
             "api_key": "",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
             "role": "trend_direction",
         },
     )
 
     await agent.initialize()
 
-    assert captured["api_key"] == "local-loopback"
+    assert captured["api_key"] == "local"
     assert captured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert agent._api_key == ""
 
 
-def test_finquant_loopback_does_not_try_unsupported_provider_model_names() -> None:
-    assert _backup_model_names("BB-FinQuant-Expert-14B") == []
-
-
 @pytest.mark.asyncio
-async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
+async def test_configured_model_is_the_only_inference_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_calls: list[dict[str, Any]] = []
@@ -298,8 +293,6 @@ async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
                     "messages": messages,
                 }
             )
-            if self.model == "plain-primary":
-                return SimpleNamespace(content="not-json")
             return SimpleNamespace(
                 content=(
                     '{"action":"hold","confidence":0.55,"reasoning":"backup ok",'
@@ -313,7 +306,7 @@ async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
         api_config={
             "api_base": "http://llm.test/v1",
             "api_key": "test-key",
-            "model": "plain-primary",
+            "model": "qwen3.8-27b",
             "role": "technical_trend",
         },
     )
@@ -324,17 +317,11 @@ async def test_backup_qwen3_model_gets_model_specific_no_think_controls(
         {"expert_mode": True},
     )
 
-    primary_calls = [call for call in captured_calls if call["model"] == "plain-primary"]
-    qwen_calls = [call for call in captured_calls if call["model"] == "qwen3-max"]
-
-    assert len(primary_calls) == 2
-    assert qwen_calls
-    assert all("/no_think" not in str(call["messages"][1].content) for call in primary_calls)
-    assert str(qwen_calls[0]["messages"][1].content).endswith("/no_think")
-    assert qwen_calls[0]["kwargs"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["model"] == "qwen3.8-27b"
+    assert "/no_think" in str(captured_calls[0]["messages"][1].content)
     assert decision.raw_response
-    assert decision.raw_response["provider_model"] == "qwen3-max"
-    assert decision.raw_response["fallback_from"] == "plain-primary"
+    assert decision.raw_response["provider_model"] == "qwen3.8-27b"
 
 
 @pytest.mark.asyncio
@@ -361,9 +348,9 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     agent = LLMAgent(
         name="risk_expert",
         api_config={
-            "api_base": "http://llm.test/v1",
-            "api_key": "test-key",
-            "model": "deepseek-r1-14b-risk",
+            "api_base": "http://127.0.0.1:18000/v1",
+            "api_key": "",
+            "model": "qwen3.8-27b",
             "role": "risk_anomaly",
         },
     )
@@ -382,7 +369,7 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     assert captured_calls
     kwargs = captured_calls[-1]["kwargs"]
     assert kwargs["timeout"] <= 18.0
-    assert kwargs["max_tokens"] == 640
+    assert kwargs["max_tokens"] == 700
     # Fast independent experts must use the raw completion path.  OpenAI's
     # parse helper raises before exposing a length-limited completion, while
     # LLMAgent's own extractor can retain diagnostics and deny execution.
@@ -393,6 +380,7 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     assert "suggested_holding_minutes" in system_prompt
     assert "PAPER_MULTIDIMENSIONAL_PLAN_V1" not in system_prompt
     prompt_text = str(captured_calls[-1]["messages"][1].content)
+    assert prompt_text.endswith("/no_think")
     assert "FAST_EXPERT_JSON_V1" not in prompt_text
     assert "Return JSON only" in prompt_text
     assert len(prompt_text) < 1400
@@ -458,55 +446,7 @@ def test_provider_response_contract_distinguishes_reasoning_only_from_final_json
 
 
 @pytest.mark.asyncio
-async def test_length_limited_expert_recovers_complete_provider_completion_without_execution_permission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeLengthError(Exception):
-        def __init__(self) -> None:
-            self.completion = SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            content=(
-                                '{"action":"hold","confidence":0.62,'
-                                '"reasoning":"provider ended after complete JSON"}'
-                            )
-                        )
-                    )
-                ]
-            )
-
-    class FakeChatOpenAI:
-        def __init__(self, **_kwargs: Any) -> None:
-            pass
-
-        async def ainvoke(self, _messages: list[Any]) -> Any:
-            raise FakeLengthError()
-
-    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
-    agent = LLMAgent(
-        name="trend_expert",
-        api_config={
-            "api_base": "http://llm.test/v1",
-            "api_key": "test-key",
-            "model": "BB-FinQuant-Expert-14B",
-            "role": "trend_direction",
-        },
-    )
-    await agent.initialize()
-
-    decision = await agent.decide(
-        FeatureVector(symbol="BTC/USDT", current_price=100.0),
-        {"expert_mode": True},
-    )
-
-    assert decision.raw_response["truncated_json_recovery"] is True
-    assert decision.raw_response["production_permission"] is False
-    assert decision.raw_response["provider_response_contract"]["truncated"] is True
-
-
-@pytest.mark.asyncio
-async def test_length_limited_expert_with_incomplete_provider_completion_uses_fallback(
+async def test_length_limited_expert_with_incomplete_provider_completion_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeLengthError(Exception):
@@ -532,21 +472,19 @@ async def test_length_limited_expert_with_incomplete_provider_completion_uses_fa
     agent = LLMAgent(
         name="trend_expert",
         api_config={
-            "api_base": "http://llm.test/v1",
-            "api_key": "test-key",
-            "model": "BB-FinQuant-Expert-14B",
+            "api_base": "http://127.0.0.1:18000/v1",
+            "api_key": "",
+            "model": "qwen3.8-27b",
             "role": "trend_direction",
         },
     )
     await agent.initialize()
 
-    decision = await agent.decide(
-        FeatureVector(symbol="BTC/USDT", current_price=100.0),
-        {"expert_mode": True},
-    )
-
-    assert decision.raw_response["local_fallback"] is True
-    assert decision.raw_response["production_eligible"] is False
+    with pytest.raises(ModelInferenceError):
+        await agent.decide(
+            FeatureVector(symbol="BTC/USDT", current_price=100.0),
+            {"expert_mode": True},
+        )
 
 
 def test_invalid_final_json_is_reported_as_a_parse_error() -> None:

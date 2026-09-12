@@ -1,44 +1,28 @@
-"""Canonical Phase 3 model-service identities and endpoints."""
+"""Canonical single-model contract for the Phase 3 runtime."""
 
 from __future__ import annotations
 
-from core.model_topology import ModelTopology, legacy_14b_topology, qwen27_candidate_topology
+from core.model_topology import ModelTopology, qwen27_candidate_topology
 
-PHASE3_DECISION_MODEL_ID = "qwen3-14b-trade"
-PHASE3_RISK_MODEL_ID = "deepseek-r1-14b-risk"
-PHASE3_EXPERT_MODEL_ID = "BB-FinQuant-Expert-14B"
+PHASE3_TARGET_MODEL_ID = "qwen3.8-27b"
+PHASE3_TARGET_MODEL_REPO_ID = "Qwen/Qwen3.8-27B"
+PHASE3_TARGET_MODEL_ENDPOINT = "http://127.0.0.1:18000/v1"
+PHASE3_TARGET_MODEL_PORT = 8000
+PHASE3_TARGET_SERVICE_NAME = "bb-phase3-llm-target.service"
+PHASE3_TARGET_MODEL_PATH = "/data/BB/models/qwen3.8-27b"
 PHASE3_QUANT_API_ID = "phase3_quant_api"
-PHASE3_DECISION_REPO_ID = "Qwen/Qwen3-14B-AWQ"
-PHASE3_RISK_REPO_ID = "casperhansen/deepseek-r1-distill-qwen-14b-awq"
 
 PHASE3_PLATFORM_ENDPOINTS = {
-    PHASE3_DECISION_MODEL_ID: "http://127.0.0.1:18000/v1",
+    PHASE3_TARGET_MODEL_ID: PHASE3_TARGET_MODEL_ENDPOINT,
     PHASE3_QUANT_API_ID: "http://127.0.0.1:18001",
-    PHASE3_RISK_MODEL_ID: "http://127.0.0.1:18002/v1",
-    PHASE3_EXPERT_MODEL_ID: "http://127.0.0.1:18003/v1",
 }
-
 PHASE3_MODEL_SERVER_SERVICES = (
-    ("bb-phase3-llm-decision.service", PHASE3_DECISION_MODEL_ID, 8000),
-    ("bb-phase3-llm-risk-review.service", PHASE3_RISK_MODEL_ID, 8002),
-    ("bb-phase3-llm-expert.service", PHASE3_EXPERT_MODEL_ID, 8003),
+    (PHASE3_TARGET_SERVICE_NAME, PHASE3_TARGET_MODEL_ID, PHASE3_TARGET_MODEL_PORT),
 )
+PHASE3_REQUIRED_LLM_MODEL_IDS = frozenset({PHASE3_TARGET_MODEL_ID})
+PHASE3_APPROVED_RUNTIME_MODEL_PATHS = (PHASE3_TARGET_MODEL_PATH,)
 
-PHASE3_REQUIRED_LLM_MODEL_IDS = frozenset(
-    {
-        PHASE3_DECISION_MODEL_ID.lower(),
-        PHASE3_RISK_MODEL_ID.lower(),
-        PHASE3_EXPERT_MODEL_ID.lower(),
-    }
+PHASE3_TARGET_MODEL_TOPOLOGY: ModelTopology = qwen27_candidate_topology(
+    repo_id=PHASE3_TARGET_MODEL_REPO_ID,
+    path=PHASE3_TARGET_MODEL_PATH,
 )
-
-PHASE3_APPROVED_RUNTIME_MODEL_PATHS = (
-    "/data/trade_models/Qwen/Qwen3-14B-AWQ",
-    "/data/trade_models/DeepSeek/deepseek-r1-distill-qwen-14b-awq",
-)
-
-# Compatibility exports remain for the legacy shadow/readiness code. New
-# deployment and promotion code should consume these declarative topologies
-# instead of adding another model identity constant.
-PHASE3_LEGACY_MODEL_TOPOLOGY: ModelTopology = legacy_14b_topology()
-PHASE3_TARGET_MODEL_TOPOLOGY: ModelTopology = qwen27_candidate_topology()

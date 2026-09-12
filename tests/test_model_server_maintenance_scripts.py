@@ -8,16 +8,51 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+@pytest.fixture
+def verified_target_topology(monkeypatch):
+    """Provide explicit candidate evidence for runtime-env rendering tests."""
+    from core.model_topology import topology_for_profile
+    from scripts import sync_to_online_server as sync
+
+    topology = topology_for_profile(
+        "target_single_model",
+        model_id="qwen3.8-27b",
+        repo_id="Qwen/Qwen3.8-27B",
+        revision="verified-test-revision",
+        path="/data/BB/models/qwen3.8-27b",
+        stage="candidate_validated",
+    )
+    monkeypatch.setattr(sync, "_target_topology_from_environment", lambda: topology)
+    return topology
+
+
+@pytest.fixture(autouse=True)
+def _verified_target_topology(monkeypatch, request):
+    """Give sync rendering tests an explicit candidate-validated identity."""
+
+    from core.model_topology import topology_for_profile
+    from scripts import sync_to_online_server as sync
+
+    topology = topology_for_profile(
+        "target_single_model",
+        model_id="qwen3.8-27b",
+        repo_id="Qwen/Qwen3.8-27B",
+        revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        path="/home/linux/trade_models/qwen3.8-27b-awq",
+        stage="candidate_validated",
+    )
+    if request.node.name != "test_sync_to_online_server_requires_verified_candidate_manifest":
+        monkeypatch.setattr(sync, "_target_topology_from_environment", lambda: topology)
+
 MODEL_SERVER_SCRIPTS = [
     "scripts/check_local_ai_tools_server.py",
     "scripts/restart_local_ai_tools_server.py",
     "scripts/check_server_model_status.py",
     "scripts/inspect_server_ai_services.py",
-    "scripts/inspect_deepseek_deploy_status.py",
     "scripts/deploy_local_ai_tools_service.py",
-    "scripts/deploy_dual_14b_llm_services.py",
     "scripts/install_sentiment_transformer_models.py",
-    "scripts/start_dual_14b_llm_tunnel.py",
+    "scripts/sync_phase3_model_inventory.py",
 ]
 
 
@@ -77,12 +112,6 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert 'REMOTE_MODEL_TUNNEL_SERVICE_NAME = "bb-model-tunnels.service"' in source
     assert "scripts/start_online_model_tunnels.py" in source
     assert "systemctl restart {_remote_quote(REMOTE_MODEL_TUNNEL_SERVICE_NAME)}" in source
-    assert sync._model_tunnel_endpoint_pairs("legacy_shadow") == (
-        (18000, "/v1/models"),
-        (18001, "/health/live"),
-        (18002, "/v1/models"),
-        (18003, "/v1/models"),
-    )
     assert sync._model_tunnel_endpoint_pairs("target_single_model") == (
         (18000, "/v1/models"),
         (18001, "/health/live"),
@@ -178,22 +207,22 @@ def test_sync_to_online_server_requires_okx_network_route() -> None:
     assert "exit 9" in command
 
 
-def test_sync_to_online_server_runtime_env_uses_tunnel_ports() -> None:
+def test_sync_to_online_server_runtime_env_uses_tunnel_ports(verified_target_topology) -> None:
     from scripts import sync_to_online_server as sync
 
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 
-    legacy_json = sync._online_tunnel_ai_models_json("legacy_shadow")
-    assert "http://127.0.0.1:18000/v1" in legacy_json
-    assert "http://127.0.0.1:18003/v1" in legacy_json
-    assert "BB-FinQuant-Expert-14B" in legacy_json
+    target_json = sync._online_tunnel_ai_models_json("target_single_model")
+    assert "http://127.0.0.1:18000/v1" in target_json
+    assert "qwen3.8-27b" in target_json
     assert "http://127.0.0.1:18001" in source
     assert "values['LOCAL_AI_TOOLS_ENABLED'] = 'true'" in source
     assert "values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'" in source
     assert "LOCAL_AI_TOOLS_ROUND_TRIP_COST_PCT" not in source
     assert "LOCAL_AI_TOOLS_TAIL_LOSS_THRESHOLD_PCT" not in source
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" not in source
-    assert "qwen3-14b-trade" in legacy_json
+    assert "deepseek" not in target_json.lower()
+    assert "14b" not in target_json.lower()
     assert "ONLINE_HIGH_RISK_REVIEW_API_BASE" in source
     assert "CLOUD_HIGH_RISK_REVIEW_MODEL" in source
     assert "values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'" not in source
@@ -204,7 +233,7 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
     from scripts import sync_to_online_server as sync
 
     monkeypatch.setenv("BB_TARGET_MODEL_ID", "fake-model-from-env")
-    monkeypatch.delenv("BB_TARGET_MODEL_MANIFEST", raising=False)
+    monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", "")
     with pytest.raises(RuntimeError, match="verified candidate identity"):
         sync._online_tunnel_ai_models_json("target_single_model")
 
@@ -214,13 +243,23 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
             {
                 "manifest_version": MANIFEST_VERSION,
                 "status": "verified",
-                "model_id": "qwen3.8-27b-awq",
-                "repo_id": "verified/qwen3.8-27b-awq",
-                "revision": "sha256:" + "d" * 64,
-                "model_path": "/data/trade_models/verified/qwen3.8-27b-awq",
-                "tokenizer_path": "/data/trade_models/verified/qwen3.8-27b-awq",
+                "model_id": "qwen3.8-27b",
+                "repo_id": "Qwen/Qwen3.8-27B",
+                "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+                "model_path": "/home/linux/trade_models/qwen3.8-27b-awq",
+                "tokenizer_path": "/home/linux/trade_models/qwen3.8-27b-awq",
                 "license": "apache-2.0",
                 "quantization": "awq-int4",
+                "architecture": "Qwen3_5ForConditionalGeneration",
+                "model_type": "qwen3_5",
+                "language_model_only": False,
+                "text_inference_verified": True,
+                "runtime": {
+                    "engine": "vllm",
+                    "engine_version": "0.17.1",
+                    "transformers_version": "5.8.0",
+                    "probe_sha256": "e" * 64,
+                },
                 "context_length": 8192,
                 "config_sha256": "a" * 64,
                 "tokenizer_sha256": "b" * 64,
@@ -230,6 +269,8 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
                 "gpu_memory_peak_gib": 33.5,
                 "inference_p95_ms": 1800,
                 "max_concurrency": 1,
+                "storage_available_gib": 85.0,
+                "storage_required_free_gib": 20.0,
                 "validated_at": "2026-09-10T08:00:00Z",
                 "validator_version": "bb-model-validator.v1",
             }
@@ -239,13 +280,14 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
     monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", str(manifest_path))
 
     rendered = sync._online_tunnel_ai_models_json("target_single_model")
-    assert rendered.count("qwen3.8-27b-awq") == 6
+    assert rendered.count("qwen3.8-27b") >= 6
     assert "deepseek" not in rendered.lower()
 
 
 def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     monkeypatch,
     tmp_path,
+    verified_target_topology,
 ) -> None:
     from scripts import sync_to_online_server as sync
 
@@ -275,6 +317,7 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
         remote_app_dir=str(app_dir),
         backup_runtime_env=False,
         emit_summary=False,
+        model_topology_profile="target_single_model",
     )
     exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
@@ -293,13 +336,14 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     runtime_text = runtime_env.read_text(encoding="utf-8")
     assert "AI_MODELS=" in runtime_text
     assert "http://127.0.0.1:18000/v1" in runtime_text
-    assert "http://127.0.0.1:18003/v1" in runtime_text
-    assert "BB-FinQuant-Expert-14B" in runtime_text
+    assert "qwen3.8-27b" in runtime_text
+    assert "deepseek" not in runtime_text.lower()
 
 
 def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(
     monkeypatch,
     tmp_path,
+    verified_target_topology,
 ) -> None:
     from scripts import sync_to_online_server as sync
 
@@ -321,20 +365,22 @@ def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(
         remote_app_dir=str(app_dir),
         backup_runtime_env=False,
         emit_summary=False,
+        model_topology_profile="target_single_model",
     )
     exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
     runtime_text = runtime_env.read_text(encoding="utf-8")
-    assert "https://online-llm.example/v1" in runtime_text
-    assert "deepseek-reasoner" in runtime_text
-    assert 'route_mode":"online_slow_brain' in runtime_text
-    assert "http://127.0.0.1:18003/v1" in runtime_text
-    assert "BB-FinQuant-Expert-14B" in runtime_text
+    assert "https://online-llm.example/v1" not in runtime_text
+    assert "deepseek-reasoner" not in runtime_text
+    assert "ONLINE_DECISION_MAKER_" not in runtime_text
+    assert "http://127.0.0.1:18000/v1" in runtime_text
+    assert "qwen3.8-27b" in runtime_text
 
 
 def test_sync_to_online_server_runtime_env_preserves_existing_external_ai_models_decision(
     monkeypatch,
     tmp_path,
+    verified_target_topology,
 ) -> None:
     from scripts import sync_to_online_server as sync
 
@@ -358,20 +404,23 @@ def test_sync_to_online_server_runtime_env_preserves_existing_external_ai_models
         remote_app_dir=str(app_dir),
         backup_runtime_env=False,
         emit_summary=False,
+        model_topology_profile="target_single_model",
     )
     exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
     runtime_text = runtime_env.read_text(encoding="utf-8")
-    assert "https://api.deepseek.com/v1" in runtime_text
-    assert "deepseek-v4-pro" in runtime_text
-    assert "unit-test-key" in runtime_text
-    assert '"route_mode":"online_slow_brain"' in runtime_text
-    assert '"model":"qwen3-32b-trade"' not in runtime_text
+    assert "https://api.deepseek.com/v1" not in runtime_text
+    assert "deepseek-v4-pro" not in runtime_text
+    assert "unit-test-key" not in runtime_text
+    assert "ONLINE_DECISION_MAKER_" not in runtime_text
+    assert '"route_mode":"online_slow_brain"' not in runtime_text
+    assert '"model":"qwen3.8-27b"' in runtime_text
 
 
 def test_sync_to_online_server_ignores_removed_old_profile_route(
     monkeypatch,
     tmp_path,
+    verified_target_topology,
 ) -> None:
     from scripts import sync_to_online_server as sync
 
@@ -391,6 +440,7 @@ def test_sync_to_online_server_ignores_removed_old_profile_route(
         remote_app_dir=str(app_dir),
         backup_runtime_env=False,
         emit_summary=False,
+        model_topology_profile="target_single_model",
     )
     exec(script, {})  # noqa: S102 - the generated maintenance script is the test target.
 
@@ -547,13 +597,9 @@ def test_sync_to_online_server_only_filter_rejects_unsafe_paths() -> None:
 def test_start_online_model_tunnels_use_approved_internal_ports() -> None:
     from scripts import start_online_model_tunnels as tunnels
 
-    legacy = {spec.name: spec for spec in tunnels.build_default_tunnels(profile="legacy_shadow")}
-    assert (legacy["qwen3-14b-trade"].local_port, legacy["qwen3-14b-trade"].remote_port) == (18000, 8000)
-    assert (legacy["phase3-quant-api"].local_port, legacy["phase3-quant-api"].remote_port) == (18001, 8101)
-    assert (legacy["deepseek-r1-14b-risk"].local_port, legacy["deepseek-r1-14b-risk"].remote_port) == (18002, 8002)
-    assert (legacy["BB-FinQuant-Expert-14B"].local_port, legacy["BB-FinQuant-Expert-14B"].remote_port) == (18003, 8003)
     target = tunnels.build_default_tunnels(profile="target_single_model")
     assert [(spec.local_port, spec.remote_port) for spec in target] == [(18000, 8000), (18001, 8101)]
+    assert tunnels.build_default_tunnels() == target
     assert "21840" not in (ROOT / "scripts" / "start_online_model_tunnels.py").read_text(encoding="utf-8")
 
 
@@ -567,7 +613,7 @@ def test_start_online_model_tunnels_preserve_long_quant_training_requests() -> N
         == tunnels.FORWARD_QUANT_MAX_CONNECTION_SECONDS
     )
     assert specs["phase3-quant-api"].max_connection_seconds >= 1_800
-    assert specs["qwen3-14b-trade"].max_connection_seconds >= 600
+    assert specs["target-single-model"].max_connection_seconds >= 600
     assert "server.spec.max_connection_seconds" in (
         ROOT / "scripts" / "start_online_model_tunnels.py"
     ).read_text(encoding="utf-8")
@@ -745,7 +791,7 @@ def test_start_online_model_tunnels_cli_preserves_connection_limits(monkeypatch)
         == tunnels.FORWARD_QUANT_MAX_CONNECTION_SECONDS
     )
     assert (
-        specs["qwen3-14b-trade"].max_connection_seconds
+        specs["target-single-model"].max_connection_seconds
         == tunnels.FORWARD_DEFAULT_MAX_CONNECTION_SECONDS
     )
 
@@ -787,17 +833,15 @@ def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch
     opened_clients, transport_pools = tunnels.open_dedicated_transports(specs, object())
 
     assert opened_clients == clients
-    assert len(transport_pools) == len(specs) == 4
-    assert len(clients) == 6
+    assert len(transport_pools) == len(specs) == 2
+    assert len(clients) == 5
     transports = [transport for pool in transport_pools for transport in pool]
     assert len({id(transport) for transport in transports}) == len(transports)
     assert all(
         transport.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS for transport in transports
     )
-    assert len(transport_pools[0]) == 1
+    assert len(transport_pools[0]) == 3
     assert len(transport_pools[1]) == 2
-    assert len(transport_pools[2]) == 1
-    assert len(transport_pools[3]) == 2
 
 
 def test_start_online_model_tunnel_pool_replaces_only_failed_transport() -> None:
@@ -972,30 +1016,28 @@ def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
     assert "safe_error_text" in source
 
 
-def test_model_server_status_scripts_use_dual_14b_contract() -> None:
+def test_model_server_status_scripts_default_to_target_and_label_legacy_as_deprecated() -> None:
     check_source = (ROOT / "scripts" / "check_server_model_status.py").read_text(encoding="utf-8")
     contract_source = (ROOT / "core" / "phase3_model_contract.py").read_text(encoding="utf-8")
     inspect_source = (ROOT / "scripts" / "inspect_server_ai_services.py").read_text(
         encoding="utf-8"
     )
 
-    for source in (check_source, inspect_source):
-        assert "bb-phase3-llm-decision.service" in source or "qwen3-14b-trade.service" in source
-        assert (
-            "bb-phase3-llm-risk-review.service" in source
-            or "deepseek-r1-14b-risk.service" in source
-        )
-        assert "qwen3-32b-main.service" in source
-        assert "deprecated service" in source.lower()
+    assert "bb-phase3-llm-target.service" in inspect_source
+    assert "qwen3-14b-trade.service" in check_source
+    assert "deepseek-r1-14b-risk.service" in check_source
+    assert "retired" in check_source.lower()
 
     assert "VLLM_SERVICES = PHASE3_MODEL_SERVER_SERVICES" in check_source
-    assert '("bb-phase3-llm-decision.service", PHASE3_DECISION_MODEL_ID, 8000)' in contract_source
-    assert '("bb-phase3-llm-risk-review.service", PHASE3_RISK_MODEL_ID, 8002)' in contract_source
-    assert '("bb-phase3-llm-expert.service", PHASE3_EXPERT_MODEL_ID, 8003)' in contract_source
-    assert "/data/trade_models/" in contract_source
+    assert 'default=DEFAULT_MODEL_TOPOLOGY_PROFILE' in check_source
+    assert '"target_single_model"' in check_source
+    assert "legacy audit profile" in check_source
+    assert 'PHASE3_MODEL_SERVER_SERVICES = (' in contract_source
+    assert 'PHASE3_TARGET_MODEL_ID = "qwen3.8-27b"' in contract_source
+    assert "/data/BB/models/qwen3.8-27b" in contract_source
     assert "PHASE3_QUANT_API_PORT = 8101" in check_source
     assert "http://127.0.0.1:{PHASE3_QUANT_API_PORT}/health" in check_source
     assert "http://127.0.0.1:{port}/v1/models" in check_source
-    assert "Qwen3-14B-AWQ" in contract_source
+    assert "Qwen3.8-27B" in check_source
     assert "qwen3_32b_main.log" not in check_source
     assert "start_qwen3_32b_main.sh" not in inspect_source

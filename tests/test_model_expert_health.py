@@ -67,7 +67,7 @@ def test_model_expert_health_report_marks_detractors_without_mutating_weights() 
             {
                 "name": "trend_expert",
                 "status": "completed",
-                "provider_model": "qwen3-14b-trade",
+                "provider_model": "qwen3.8-27b",
                 "duration_sec": 2.0,
                 "action": "long",
                 "confidence": 0.72,
@@ -75,7 +75,7 @@ def test_model_expert_health_report_marks_detractors_without_mutating_weights() 
             {
                 "name": "risk_expert",
                 "status": "completed",
-                "provider_model": "deepseek-r1-14b-risk",
+                "provider_model": "qwen3.8-27b",
                 "duration_sec": 5.0,
                 "action": "hold",
                 "confidence": 0.64,
@@ -91,7 +91,7 @@ def test_model_expert_health_report_marks_detractors_without_mutating_weights() 
             {
                 "name": "trend_expert",
                 "status": "completed",
-                "provider_model": "qwen3-14b-trade",
+                "provider_model": "qwen3.8-27b",
                 "duration_sec": 2.8,
                 "action": "short",
                 "confidence": 0.69,
@@ -99,7 +99,7 @@ def test_model_expert_health_report_marks_detractors_without_mutating_weights() 
             {
                 "name": "risk_expert",
                 "status": "failed",
-                "provider_model": "deepseek-r1-14b-risk",
+                "provider_model": "qwen3.8-27b",
                 "duration_sec": 18.0,
                 "reason": "Could not extract valid JSON from response",
             },
@@ -181,7 +181,7 @@ def test_model_expert_health_does_not_count_successful_independent_retry_as_json
             "name": name,
             "status": "completed",
             "stage": "expert_independent_provider",
-            "provider_model": "deepseek-r1-14b-risk",
+            "provider_model": "qwen3.8-27b",
             "provider_independent_expert_mode": True,
             "batch_expert": False,
             "shared_batch_call": False,

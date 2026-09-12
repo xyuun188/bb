@@ -566,6 +566,20 @@ class OkxPositionSettlementSyncService:
                         exchange_id = str(order.exchange_order_id)
                         order_contracts[exchange_id] = contracts
                         order_facts[exchange_id] = {
+                            "contracts": contracts,
+                            "base_quantity": (
+                                _safe_float(
+                                    raw_order.get("base_quantity")
+                                    or raw_order.get("filled_base_quantity"),
+                                    0.0,
+                                )
+                                or contracts
+                                * _safe_float(
+                                    raw_order.get("contract_size")
+                                    or raw_order.get("ctVal"),
+                                    0.0,
+                                )
+                            ),
                             "fee": abs(_safe_float(getattr(order, "fee", None), 0.0)),
                             "fill_pnl": (
                                 _safe_float(getattr(order, "okx_fill_pnl", None), 0.0)
@@ -573,8 +587,23 @@ class OkxPositionSettlementSyncService:
                                 else None
                             ),
                         }
+            exact_projection_duplicates = _deduplicate_exact_close_order_projections(
+                rows,
+                order_facts,
+                now=now,
+            )
+            if exact_projection_duplicates:
+                duplicate_ids = {
+                    int(getattr(row, "id", 0) or 0)
+                    for row in exact_projection_duplicates
+                }
+                rows = [
+                    row
+                    for row in rows
+                    if int(getattr(row, "id", 0) or 0) not in duplicate_ids
+                ]
             candidates: list[SettlementCandidate] = []
-            restored_superseded = bool(duplicate_rows)
+            restored_superseded = bool(duplicate_rows or exact_projection_duplicates)
             # A shared OKX posId is one settlement unit.  Select due lifecycle
             # keys first, then include every local fragment in each selected
             # lifecycle.  The previous row-by-row limit selected only the
@@ -1252,6 +1281,101 @@ def _deduplicate_closed_lifecycle_rows(
         reverse=True,
     )
     return retained, duplicates
+
+
+def _deduplicate_exact_close_order_projections(
+    rows: list[Position],
+    order_facts: dict[str, dict[str, float | None]],
+    *,
+    now: datetime,
+) -> list[Position]:
+    """Retire duplicate rows when one close fill proves the canonical quantity.
+
+    Historical sync races created rows that share the exact OKX lifecycle and
+    close order but carry different local quantities.  They cannot be treated
+    as partial-close fragments: there is only one close order and OKX gives a
+    single authoritative base quantity.  Retire extras only when exactly one
+    row matches that quantity and every extra row has the same lifecycle key.
+    Ambiguous groups remain untouched and therefore fail closed.
+    """
+
+    duplicates: list[Position] = []
+    for close_order_id, facts in order_facts.items():
+        target = _safe_float(facts.get("base_quantity"), 0.0)
+        if target <= 0:
+            continue
+        candidates = [
+            row
+            for row in rows
+            if tuple(
+                sorted(_split_exchange_order_ids(getattr(row, "close_exchange_order_id", None)))
+            )
+            == (str(close_order_id),)
+            and not _has_superseded_position_metadata(
+                row,
+                _safe_dict(getattr(row, "settlement_raw", None)),
+            )
+        ]
+        if len(candidates) < 2:
+            continue
+        exact = [
+            row
+            for row in candidates
+            if _quantities_close(_safe_float(getattr(row, "quantity", None), 0.0), target)
+        ]
+        if len(exact) != 1:
+            continue
+        canonical = exact[0]
+        lifecycle_key = (
+            str(getattr(canonical, "execution_mode", "") or "").lower(),
+            normalize_trading_symbol(str(getattr(canonical, "symbol", "") or "")),
+            str(getattr(canonical, "side", "") or "").lower(),
+            str(getattr(canonical, "okx_inst_id", "") or "").upper(),
+            str(getattr(canonical, "okx_pos_id", "") or "").strip(),
+            tuple(sorted(_split_exchange_order_ids(getattr(canonical, "entry_exchange_order_id", None)))),
+        )
+        if not lifecycle_key[1] or not lifecycle_key[4] or not lifecycle_key[5]:
+            continue
+        extras = []
+        for row in candidates:
+            if row is canonical:
+                continue
+            row_key = (
+                str(getattr(row, "execution_mode", "") or "").lower(),
+                normalize_trading_symbol(str(getattr(row, "symbol", "") or "")),
+                str(getattr(row, "side", "") or "").lower(),
+                str(getattr(row, "okx_inst_id", "") or "").upper(),
+                str(getattr(row, "okx_pos_id", "") or "").strip(),
+                tuple(sorted(_split_exchange_order_ids(getattr(row, "entry_exchange_order_id", None)))),
+            )
+            if row_key != lifecycle_key:
+                extras = []
+                break
+            extras.append(row)
+        if not extras:
+            continue
+        for duplicate in extras:
+            _mark_closed_position_superseded(
+                duplicate,
+                canonical=canonical,
+                reason=DUPLICATE_EXACT_LIFECYCLE_PROJECTION_REASON,
+                now=now,
+            )
+            raw = _safe_dict(getattr(duplicate, "settlement_raw", None))
+            duplicate.settlement_raw = {
+                **raw,
+                "authoritative_close_order_id": str(close_order_id),
+                "authoritative_base_quantity": target,
+                "duplicate_projection_quantity": _safe_float(
+                    getattr(duplicate, "quantity", None), 0.0
+                ),
+                "canonical_projection_quantity": _safe_float(
+                    getattr(canonical, "quantity", None), 0.0
+                ),
+                "deduplication_evidence": "unique_exact_okx_close_fill_quantity",
+            }
+            duplicates.append(duplicate)
+    return duplicates
 
 
 def _mark_closed_position_superseded(

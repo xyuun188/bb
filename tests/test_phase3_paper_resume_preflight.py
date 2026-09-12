@@ -44,6 +44,15 @@ def _model_server_ready() -> dict[str, Any]:
         "artifact_ready": True,
         "runtime_ready": True,
         "phase3_model_service_go_live_blocked": False,
+        "topology_profile": "target_single_model",
+        "target_model_topology": {
+            "model_id": "qwen3.8-27b",
+            "stage": "paper",
+            "activation_blocked": False,
+            "identity_complete": True,
+            "local_model_count_target": 1,
+            "blockers": [],
+        },
     }
 
 
@@ -61,7 +70,14 @@ def _platform_runtime_ready() -> dict[str, Any]:
                 "exit_advice": {"available": True},
             },
         },
-        "ai_models": [],
+        "ai_models": [
+            {
+                "name": "decision_maker",
+                "model": "qwen3.8-27b",
+                "available": True,
+                "models": ["qwen3.8-27b"],
+            }
+        ],
     }
 
 
@@ -69,20 +85,11 @@ def _platform_runtime_ready_with_models() -> dict[str, Any]:
     runtime = _platform_runtime_ready()
     runtime["ai_models"] = [
         {
-            "model": "qwen3-14b-trade",
+            "name": "decision_maker",
+            "model": "qwen3.8-27b",
             "available": True,
-            "models": ["qwen3-14b-trade"],
-        },
-        {
-            "model": "deepseek-r1-14b-risk",
-            "available": True,
-            "models": ["deepseek-r1-14b-risk"],
-        },
-        {
-            "model": "BB-FinQuant-Expert-14B",
-            "available": True,
-            "models": ["BB-FinQuant-Expert-14B"],
-        },
+            "models": ["qwen3.8-27b"],
+        }
     ]
     return runtime
 
@@ -254,7 +261,7 @@ def test_phase3_paper_resume_preflight_blocks_if_paper_already_running() -> None
     assert "paper_trading_already_active" in {item["code"] for item in report["blockers"]}
 
 
-def test_phase3_paper_resume_preflight_allows_platform_model_endpoints_when_remote_audit_unverified() -> None:
+def test_phase3_paper_resume_preflight_blocks_when_model_server_runtime_is_unverified() -> None:
     model_server = {
         "status": "unverified",
         "runtime_ready": False,
@@ -272,21 +279,20 @@ def test_phase3_paper_resume_preflight_allows_platform_model_endpoints_when_remo
 
     warning_codes = {item["code"] for item in report["warnings"]}
     blocker_codes = {item["code"] for item in report["blockers"]}
-    assert report["status"] == "ready_with_warnings"
-    assert report["can_resume_paper"] is True
-    assert "phase3_model_server_remote_audit_unverified" in warning_codes
-    assert "phase3_model_server_runtime_not_ready" not in blocker_codes
-    assert "phase3_model_server_platform_endpoints_ready" in report["passed_checks"]
+    assert report["status"] == "blocked"
+    assert report["can_resume_paper"] is False
+    assert "phase3_model_server_runtime_not_ready" in blocker_codes
+    assert "phase3_model_server_remote_audit_unverified" not in warning_codes
 
 
-def test_phase3_paper_resume_preflight_accepts_healthy_external_decision_route() -> None:
+def test_phase3_paper_resume_preflight_rejects_external_decision_route() -> None:
     runtime = _platform_runtime_ready()
     runtime["ai_models"] = [
         {
             "name": "trend_expert",
-            "model": "BB-FinQuant-Expert-14B",
+            "model": "qwen3.8-27b",
             "available": True,
-            "models": ["BB-FinQuant-Expert-14B"],
+            "models": ["qwen3.8-27b"],
         },
         {
             "name": "decision_maker",
@@ -296,9 +302,9 @@ def test_phase3_paper_resume_preflight_accepts_healthy_external_decision_route()
         },
         {
             "name": "high_risk_review",
-            "model": "deepseek-r1-14b-risk",
+            "model": "deepseek-reasoner",
             "available": True,
-            "models": ["deepseek-r1-14b-risk"],
+            "models": ["deepseek-reasoner"],
         },
     ]
     model_server = {
@@ -316,10 +322,10 @@ def test_phase3_paper_resume_preflight_accepts_healthy_external_decision_route()
         )
     )
 
-    assert report["status"] == "ready_with_warnings"
-    assert report["can_resume_paper"] is True
-    assert "phase3_model_server_remote_audit_unverified" in {
-        item["code"] for item in report["warnings"]
+    assert report["status"] == "blocked"
+    assert report["can_resume_paper"] is False
+    assert "phase3_model_server_runtime_not_ready" in {
+        item["code"] for item in report["blockers"]
     }
 
 
@@ -349,7 +355,7 @@ def test_phase3_paper_resume_preflight_blocks_unverified_target_topology_even_if
 def test_phase3_paper_resume_preflight_accepts_verified_paper_target_only_when_endpoint_matches() -> None:
     model_server = _model_server_ready()
     model_server["target_model_topology"] = {
-        "model_id": "qwen3.8-27b-awq",
+        "model_id": "qwen3.8-27b",
         "stage": "paper",
         "activation_blocked": False,
         "identity_complete": True,
@@ -360,9 +366,9 @@ def test_phase3_paper_resume_preflight_accepts_verified_paper_target_only_when_e
     runtime["ai_models"] = [
         {
             "name": "decision_maker",
-            "model": "qwen3.8-27b-awq",
+            "model": "qwen3.8-27b",
             "available": True,
-            "models": ["qwen3.8-27b-awq"],
+            "models": ["qwen3.8-27b"],
         }
     ]
     report = evaluate_phase3_paper_resume_preflight_inputs(

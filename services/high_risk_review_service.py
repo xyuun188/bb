@@ -20,6 +20,8 @@ from core.model_runtime import (
     apply_non_thinking_request_controls,
     cap_completion_tokens,
     completion_token_limit,
+    provider_non_thinking_extra_body,
+    supports_provider_thinking_disable,
 )
 from core.safe_output import safe_error_text, safe_response_error_text
 from core.url_safety import normalize_http_base_url
@@ -303,6 +305,8 @@ class HighRiskReviewService:
             "stream": False,
         }
         request_body = apply_non_thinking_request_controls(model, request_body)
+        if supports_provider_thinking_disable(model):
+            request_body = provider_non_thinking_extra_body(request_body)
         if use_json_mode:
             request_body["response_format"] = {"type": "json_object"}
         try:
