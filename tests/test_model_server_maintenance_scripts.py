@@ -1014,6 +1014,9 @@ def test_model_server_bridge_cannot_read_legacy_remote_api_key() -> None:
     assert "_REMOTE_LOCAL_AI_TOOLS_KEY_COMMAND" not in source
     assert "/data/trade_ai/local_ai_tools.env" not in source
     assert "safe_error_text" in source
+    assert "DATABASE_URL missing on platform server" in source
+    assert "DATABASE_URL=" in source
+    assert "database_line#DATABASE_URL=" in source
 
 
 def test_model_server_status_scripts_default_to_target_and_label_legacy_as_deprecated() -> None:
