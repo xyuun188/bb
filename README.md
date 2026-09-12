@@ -13,6 +13,10 @@ OKX authoritative fills/fees/funding -> settlement -> training evidence
 ```
 
 - One local LLM service: `qwen3.8-27b` on model-host port `8000`.
+- The artifact is the official `Qwen/Qwen3.8-27B` repository at a pinned
+  revision. Its upstream Transformers config intentionally names the internal
+  class/model type `Qwen3_5ForConditionalGeneration`/`qwen3_5`; that is an
+  implementation identifier, not a Qwen3.5 download.
 - Platform tunnel: `127.0.0.1:18000 -> model-host:8000`.
 - Quant API: `127.0.0.1:18001 -> model-host:8101`.
 - The five expert roles are prompt-scoped views of the same carrier, not five

@@ -203,6 +203,35 @@ def test_success_enables_target_and_disables_conflicts(prepared: Path) -> None:
     assert (prepared / "manifests/target_model_candidate.json").is_file()
 
 
+def test_transformers_target_start_script_does_not_use_vllm():
+    candidate = _candidate()
+    candidate["runtime"] = {
+        "engine": "transformers",
+        "engine_version": "5.8.1",
+        "transformers_version": "5.8.1",
+    }
+    script = deployment.target_start_script(candidate)
+    assert "/data/BB/scripts/target_transformers_api.py" in script
+    assert "vllm.entrypoints" not in script
+    assert "VLLM_WORKER" not in script
+
+
+def test_transformers_target_start_script_loads_verified_adapter():
+    candidate = _candidate()
+    candidate["runtime"] = {
+        "engine": "transformers",
+        "engine_version": "5.8.1",
+        "transformers_version": "5.8.1",
+    }
+    script = deployment.target_start_script(
+        candidate,
+        adapter_path="/data/BB/models/finquant_target_27b/versions/v1",
+        base_model_name="qwen3.8-27b-base",
+    )
+    assert "--adapter-path" in script
+    assert "/data/BB/models/finquant_target_27b/versions/v1" in script
+
+
 def test_rollback_failure_preserves_failure_evidence(prepared: Path) -> None:
     host = FakeHost(active=set(CONFLICTS), enabled=set(CONFLICTS))
     host.fail_ready = True

@@ -26,6 +26,7 @@ from services.phase3_server_migration_audit import FORBIDDEN_LEGACY_SERVICE_NAME
 
 TARGET_SERVICE = "bb-phase3-llm-target.service"
 TARGET_START_SCRIPT = "/data/BB/scripts/start_target_single_model.sh"
+TARGET_RUNTIME_SCRIPT = ROOT / "scripts" / "target_transformers_api.py"
 RETIRED_MODEL_SERVICES = tuple(
     dict.fromkeys(
         (
@@ -115,6 +116,7 @@ def render_target_migration(candidate: ModelCandidateManifest) -> str:
         "target_service": TARGET_SERVICE,
         "conflicting_services": list(RETIRED_MODEL_SERVICES),
         "start_script": model_host_deployment.target_start_script(candidate.to_dict()),
+        "runtime_script": TARGET_RUNTIME_SCRIPT.read_text(encoding="utf-8"),
         "unit": _unit(description="BB verified single model", exec_start=TARGET_START_SCRIPT),
     }
     code = inspect.getsource(model_host_deployment)

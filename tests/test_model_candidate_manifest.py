@@ -96,3 +96,17 @@ def test_manifest_rejects_incomplete_resource_evidence():
 def test_manifest_rejects_runtime_too_old_for_qwen38(runtime):
     with pytest.raises(ValueError, match="too old"):
         ModelCandidateManifest.from_dict(_manifest(runtime=runtime))
+
+
+def test_manifest_accepts_verified_transformers_runtime_for_qwen38():
+    manifest = ModelCandidateManifest.from_dict(
+        _manifest(
+            runtime={
+                "engine": "transformers",
+                "engine_version": "5.8.1",
+                "transformers_version": "5.8.1",
+                "probe_sha256": "e" * 64,
+            }
+        )
+    )
+    assert manifest.runtime.engine == "transformers"

@@ -143,12 +143,12 @@ def _verified_training_candidate() -> ModelCandidateManifest:
 
 
 def _verified_training_backend(candidate: ModelCandidateManifest) -> ModelTrainingBackendManifest:
-    """Require independent Qwen3.5 training evidence before any remote mutation."""
+    """Require independent Qwen3.8-27B training evidence before any remote mutation."""
 
     manifest_path = str(os.environ.get(TARGET_TRAINING_BACKEND_MANIFEST_ENV) or "").strip()
     if not manifest_path:
         raise RuntimeError(
-            "Qwen3.5 target training backend is not independently verified; "
+            "Qwen3.8-27B target training backend is not independently verified; "
             f"set {TARGET_TRAINING_BACKEND_MANIFEST_ENV} to a verified capability manifest"
         )
     backend = ModelTrainingBackendManifest.load(manifest_path)
@@ -156,7 +156,7 @@ def _verified_training_backend(candidate: ModelCandidateManifest) -> ModelTraini
     errors = backend.validate_for_candidate(candidate, trainer_sha256=trainer_sha256)
     if errors:
         raise RuntimeError(
-            "Qwen3.5 target training backend evidence invalid: " + ", ".join(errors)
+            "Qwen3.8-27B target training backend evidence invalid: " + ", ".join(errors)
         )
     return backend
 
@@ -893,12 +893,16 @@ def _adapter_deployment_payload(
         adapter_path=adapter_path,
         base_model_name=BASE_MODEL_NAME,
     )
+    runtime_script = (ROOT / "scripts" / "target_transformers_api.py").read_text(
+        encoding="utf-8"
+    )
     return {
         "candidate": candidate.to_dict(),
         "adapter_path": adapter_path,
         "target_service": REMOTE_TARGET_MODEL_SERVICE,
         "conflicting_services": list(REMOTE_TRAINING_CONFLICT_SERVICES[1:]),
         "start_script": qwen_script,
+        "runtime_script": runtime_script,
         "unit": (
             "[Unit]\n"
             "Description=BB target Qwen3.8-27B model service\n"
@@ -1218,11 +1222,11 @@ def deploy_and_optionally_train(
                 f"mkdir -p {sh(REMOTE_TRAINING_DIR)} {sh(REMOTE_ADAPTER_VERSIONS_DIR)} "
                 f"{sh(REMOTE_TRAIN_LOG_DIR)}; "
                 f"{_remote_train_base_prepare_command(repo_id=candidate.repo_id, model_path=candidate.model_path)}; "
-                "/data/BB/envs/phase3-quant/bin/python -c "
+                "/data/BB/envs/target-inference/bin/python -c "
                 "'import datasets, trl; print(trl.__version__)'; "
                 f"{stop_services}; "
                 f"timeout --signal=TERM --kill-after=60s {REMOTE_TRAINING_TIMEOUT_SECONDS}s "
-                f"/data/BB/envs/phase3-quant/bin/python {sh(REMOTE_TRAINER)} "
+                f"/data/BB/envs/target-inference/bin/python {sh(REMOTE_TRAINER)} "
                 f"--dataset {sh(remote_dataset)} "
                 f"--dataset-manifest {sh(remote_dataset_manifest)} "
                 f"--output-dir {sh(adapter_dir)} "
@@ -1300,7 +1304,7 @@ def _remote_train_base_prepare_command(*, repo_id: str, model_path: str) -> str:
           echo train-base-ready
         else
           mkdir -p {sh(model_path)}
-          /data/BB/envs/phase3-quant/bin/python - <<'PY'
+          /data/BB/envs/target-inference/bin/python - <<'PY'
 import os
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")

@@ -207,25 +207,28 @@ class LinuxHost:
             raise RuntimeError("target adapter inference response has no choices")
 
     def verify_runtime(self, candidate: dict) -> None:
-        if candidate["runtime"]["engine"] != "vllm":
-            raise ValueError("target service currently supports only a verified vLLM runtime")
+        engine = candidate["runtime"]["engine"]
+        if engine not in {"transformers", "vllm", "sglang"}:
+            raise ValueError("target service runtime engine is unsupported")
         probe = (
             "import importlib.metadata as metadata, json, sys; "
             "from transformers import AutoConfig; "
             "config = AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=False); "
-            "print(json.dumps({'vllm': metadata.version('vllm'), "
+            "print(json.dumps({'engine': sys.argv[2], "
+            "'engine_version': (metadata.version('transformers') if sys.argv[2] == 'transformers' "
+            "else metadata.version(sys.argv[2])), "
             "'transformers': metadata.version('transformers'), "
             "'model_type': config.model_type, "
             "'architectures': getattr(config, 'architectures', None)}))"
         )
-        result = self.run(TARGET_PYTHON, "-c", probe, candidate["model_path"])
+        result = self.run(TARGET_PYTHON, "-c", probe, candidate["model_path"], engine)
         try:
             measured = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("target runtime probe emitted invalid JSON") from exc
         expected = candidate["runtime"]
-        if measured.get("vllm") != expected["engine_version"]:
-            raise RuntimeError("target vLLM version differs from the verified candidate")
+        if measured.get("engine_version") != expected["engine_version"]:
+            raise RuntimeError("target inference engine version differs from the verified candidate")
         if measured.get("transformers") != expected["transformers_version"]:
             raise RuntimeError("target Transformers version differs from the verified candidate")
         if measured.get("model_type") != candidate["model_type"]:
@@ -304,6 +307,12 @@ def _deploy_locked(payload: dict, *, host, root: Path) -> dict:
         root / "manifests/target_model_candidate.json": (json.dumps(candidate).encode(), 0o644),
         root / "manifests/phase3_model_service_manifest.json": (json.dumps(payload["service_manifest"]).encode(), 0o644),
     }
+    runtime_script = payload.get("runtime_script")
+    if runtime_script:
+        files[root / "scripts/target_transformers_api.py"] = (
+            runtime_script.encode(),
+            0o755,
+        )
     originals = {path: (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
                  for path in files}
     for index, (_path, value) in enumerate(originals.items()):
@@ -456,21 +465,41 @@ def target_start_script(
             "--max-lora-rank",
             "8",
         ]
-    args = [
-        TARGET_PYTHON, "-m", "vllm.entrypoints.openai.api_server",
-        "--host", "127.0.0.1", "--port", "8000", "--model", candidate["model_path"],
-        "--served-model-name", served_model_name, "--tokenizer", candidate["tokenizer_path"],
-        "--max-model-len", str(candidate["context_length"]), "--gpu-memory-utilization", GPU_MEMORY_UTILIZATION,
-        "--max-num-seqs", str(candidate["max_concurrency"]), "--tensor-parallel-size", "1",
-        *adapter_args,
-    ]
+    engine = str(candidate.get("runtime", {}).get("engine", "")).lower()
+    if engine == "transformers":
+        args = [
+            TARGET_PYTHON, "/data/BB/scripts/target_transformers_api.py",
+            "--host", "127.0.0.1", "--port", "8000",
+            "--model", candidate["model_path"], "--tokenizer", candidate["tokenizer_path"],
+            "--model-id", candidate["model_id"],
+            "--context-length", str(candidate["context_length"]),
+            "--max-concurrency", str(candidate["max_concurrency"]),
+        ]
+        if adapter_path is not None:
+            args.extend(["--adapter-path", normalized_adapter])
+    elif engine == "vllm":
+        args = [
+            TARGET_PYTHON, "-m", "vllm.entrypoints.openai.api_server",
+            "--host", "127.0.0.1", "--port", "8000", "--model", candidate["model_path"],
+            "--served-model-name", served_model_name, "--tokenizer", candidate["tokenizer_path"],
+            "--max-model-len", str(candidate["context_length"]), "--gpu-memory-utilization", GPU_MEMORY_UTILIZATION,
+            "--max-num-seqs", str(candidate["max_concurrency"]), "--tensor-parallel-size", "1",
+            *adapter_args,
+        ]
+    else:
+        raise ValueError(f"target start script does not support runtime engine: {engine}")
+    environment = (
+        "export VLLM_WORKER_MULTIPROC_METHOD=spawn\n"
+        if engine != "transformers"
+        else ""
+    )
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "if [[ -f /data/BB/env/phase3.env ]]; then source /data/BB/env/phase3.env; fi\n"
         "export CUDA_VISIBLE_DEVICES=0\n"
-        "export VLLM_WORKER_MULTIPROC_METHOD=spawn\n"
-        "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\n"
+        + environment
+        + "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\n"
         "exec " + shlex.join(args) + "\n"
     )
 
@@ -538,6 +567,12 @@ def _deploy_target_adapter_locked(payload: dict, *, host, root: Path) -> dict:
             0o755,
         ),
     }
+    runtime_script = payload.get("runtime_script")
+    if runtime_script:
+        files[root / "scripts/target_transformers_api.py"] = (
+            runtime_script.encode(),
+            0o755,
+        )
     originals = {
         path: (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
         for path in files

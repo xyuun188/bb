@@ -50,7 +50,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--quantization", required=True)
     parser.add_argument("--context-length", required=True, type=int)
     parser.add_argument("--max-concurrency", default=1, type=int)
-    parser.add_argument("--runtime-engine", default="vllm", choices=("vllm",))
+    parser.add_argument(
+        "--runtime-engine",
+        default="transformers",
+        choices=("transformers", "vllm", "sglang"),
+    )
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000")
     parser.add_argument("--request-count", default=MIN_RUNTIME_PROBE_REQUESTS, type=int)
     parser.add_argument("--request-timeout-seconds", default=180.0, type=float)
@@ -226,7 +230,11 @@ def run_probe(args: argparse.Namespace) -> dict:
         peak_gpu_gib = max(peak_gpu_gib, _gpu_memory_used_gib())
 
     transformers_version = metadata.version("transformers")
-    engine_version = metadata.version(args.runtime_engine)
+    engine_version = (
+        transformers_version
+        if args.runtime_engine == "transformers"
+        else metadata.version(args.runtime_engine)
+    )
     verified = (
         successful == request_count
         and oom_count == 0

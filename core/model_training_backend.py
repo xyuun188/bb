@@ -104,13 +104,13 @@ class ModelTrainingBackendManifest:
             raise ValueError("training backend status must be 'verified'")
         backend_id = _text(value.get("backend_id"), field="backend_id")
         if backend_id != TRAINING_BACKEND_ID:
-            raise ValueError("training backend does not identify the approved Qwen3.5 QLoRA path")
+            raise ValueError("training backend does not identify the approved Qwen3.8-27B QLoRA path")
         revision = _text(value.get("revision"), field="revision")
         if not _REVISION_PATTERN.fullmatch(revision):
             raise ValueError("training backend revision is not immutable")
         loader_class = _text(value.get("loader_class"), field="loader_class")
         if loader_class != TRAINING_LOADER_CLASS:
-            raise ValueError("training backend loader is not Qwen3.5 conditional-generation capable")
+            raise ValueError("training backend loader is not Qwen3.8-27B conditional-generation capable")
         quantization = _text(value.get("quantization"), field="quantization")
         if quantization != TRAINING_QUANTIZATION:
             raise ValueError("training backend quantization must be bitsandbytes NF4 QLoRA")

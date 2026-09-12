@@ -61,7 +61,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Set only after the isolated runtime completed a text-only inference probe.",
     )
-    parser.add_argument("--runtime-engine", required=True, choices=("vllm", "sglang"))
+    parser.add_argument(
+        "--runtime-engine",
+        required=True,
+        choices=("transformers", "vllm", "sglang"),
+    )
     parser.add_argument("--runtime-engine-version", required=True)
     parser.add_argument("--transformers-version", required=True)
     parser.add_argument(

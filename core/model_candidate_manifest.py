@@ -54,7 +54,7 @@ class CandidateRuntime:
         if not isinstance(value, dict):
             raise ValueError("candidate manifest runtime must be an object")
         engine = _clean_text(value.get("engine"), field="runtime.engine").lower()
-        if engine not in {"vllm", "sglang"}:
+        if engine not in {"transformers", "vllm", "sglang"}:
             raise ValueError("candidate manifest runtime.engine is unsupported")
         engine_version = _clean_text(value.get("engine_version"), field="runtime.engine_version")
         transformers_version = _clean_text(
@@ -65,6 +65,8 @@ class CandidateRuntime:
         if transformers_version.lower() in {"unknown", "unverified", "pending"}:
             raise ValueError("candidate manifest runtime.transformers_version is not verified")
         if version_triplet(transformers_version) < MIN_TRANSFORMERS_VERSION:
+            raise ValueError("candidate Transformers runtime is too old for Qwen3.8-27B")
+        if engine == "transformers" and version_triplet(engine_version) < MIN_TRANSFORMERS_VERSION:
             raise ValueError("candidate Transformers runtime is too old for Qwen3.8-27B")
         if engine == "vllm" and version_triplet(engine_version) < MIN_VLLM_VERSION:
             raise ValueError("candidate vLLM runtime is too old for Qwen3.8-27B")
