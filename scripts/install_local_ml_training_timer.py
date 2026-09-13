@@ -23,7 +23,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+User=bb
+Group=bb
 WorkingDirectory={app_root}
+EnvironmentFile=-{app_root / '.env'}
 EnvironmentFile=-/etc/bb/bb-runtime.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart={python} {app_root / 'scripts' / 'run_local_ml_auto_train.py'}
