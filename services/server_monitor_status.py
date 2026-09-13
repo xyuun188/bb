@@ -1292,7 +1292,11 @@ def _local_ai_tools_child_endpoint_contracts(
 async def collect_platform_runtime_status() -> dict[str, Any]:
     """Probe the endpoints the platform actually calls, without returning secrets."""
     ai_rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    # Probe each endpoint/model pair once, but retain one runtime row per
+    # configured fixed slot.  The preflight contract resolves the required
+    # ``decision_maker`` slot by name; collapsing duplicate routes would make
+    # a healthy six-slot topology appear to have only the first expert.
+    probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
     async with httpx.AsyncClient(
         timeout=PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
         limits=httpx.Limits(
@@ -1311,14 +1315,14 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             if not api_base or not model:
                 continue
             key = (api_base, model)
-            if key in seen:
-                continue
-            seen.add(key)
-            result = await _probe_platform_json(
-                client,
-                f"{api_base}/models",
-                api_key=str(cfg.get("api_key") or ""),
-            )
+            result = probe_cache.get(key)
+            if result is None:
+                result = await _probe_platform_json(
+                    client,
+                    f"{api_base}/models",
+                    api_key=str(cfg.get("api_key") or ""),
+                )
+                probe_cache[key] = result
             models = _model_ids_from_models_response(result.get("data"))
             lowered = model.lower()
             model_available = bool(
@@ -1578,13 +1582,13 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
         hr_model = str(getattr(settings, "high_risk_review_model", "") or "").strip()
         if hr_base and hr_model:
             hr_key = (hr_base, hr_model)
-            if hr_key not in seen:
-                seen.add(hr_key)
+            if hr_key not in probe_cache:
                 result = await _probe_platform_json(
                     client,
                     f"{hr_base}/models",
                     api_key=str(getattr(settings, "high_risk_review_api_key", "") or ""),
                 )
+                probe_cache[hr_key] = result
                 models = _model_ids_from_models_response(result.get("data"))
                 lowered = hr_model.lower()
                 model_available = bool(

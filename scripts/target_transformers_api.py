@@ -50,6 +50,9 @@ def _text_content(content: str | list[dict[str, Any]]) -> str:
 class Runtime:
     def __init__(self, args: argparse.Namespace):
         self.model_id = args.model_id
+        self.adapter_path = str(args.adapter_path or "").strip()
+        if args.require_adapter and not self.adapter_path:
+            raise RuntimeError("Qwen3.8-27B target service requires a verified FinQuant adapter")
         self.context_length = args.context_length
         self.tokenizer = AutoTokenizer.from_pretrained(
             args.tokenizer,
@@ -75,12 +78,12 @@ class Runtime:
         )
         if self.model.__class__.__name__ != "Qwen3_5ForConditionalGeneration":
             raise RuntimeError("loaded model class is not the official Qwen3.8 architecture")
-        if args.adapter_path:
+        if self.adapter_path:
             from peft import PeftModel
 
             self.model = PeftModel.from_pretrained(
                 self.model,
-                args.adapter_path,
+                self.adapter_path,
                 is_trainable=False,
             )
         self.model.eval()
@@ -152,7 +155,12 @@ def build_app(runtime: Runtime) -> FastAPI:
 
     @app.get("/health/ready")
     def health_ready() -> dict[str, Any]:
-        return {"status": "ready", "model_id": runtime.model_id}
+        return {
+            "status": "ready",
+            "model_id": runtime.model_id,
+            "adapter_loaded": bool(runtime.adapter_path),
+            "adapter_path": runtime.adapter_path or None,
+        }
 
     @app.get("/v1/models")
     def models() -> dict[str, Any]:
@@ -208,6 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--adapter-path", default="")
+    parser.add_argument("--require-adapter", action="store_true")
     args = parser.parse_args()
     if args.max_concurrency != 1:
         parser.error("target Transformers service only permits max-concurrency=1")

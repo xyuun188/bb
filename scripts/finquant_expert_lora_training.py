@@ -805,6 +805,15 @@ def export_dataset_from_platform() -> tuple[str, str, dict[str, Any]]:
             Path(__file__).read_text(encoding="utf-8"),
             mode=0o755,
         )
+        # The platform export imports its own application modules.  Keep the
+        # read-session timeout contract identical to this checkout so the
+        # opt-in training timeout is actually applied remotely.
+        _upload_text(
+            ssh,
+            f"{REMOTE_PLATFORM_APP_DIR}/db/session.py",
+            (ROOT / "db" / "session.py").read_text(encoding="utf-8"),
+            mode=0o644,
+        )
         wrapper = f"""
 import os
 import runpy
@@ -829,6 +838,10 @@ def load_env(path: Path) -> None:
 os.chdir(ROOT)
 load_env(ROOT / ".env")
 load_env(Path("/etc/bb/bb-runtime.env"))
+# The export is read-only and may scan the immutable training view.  Keep the
+# normal API timeout unchanged; this opt-in applies only to this wrapper.
+os.environ["BB_TRAINING_READ_STATEMENT_TIMEOUT_MS"] = "600000"
+os.environ["BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS"] = "600000"
 sys.argv = [
     "scripts/finquant_expert_lora_training.py",
     "--source",
@@ -1233,6 +1246,9 @@ def deploy_and_optionally_train(
                 f"--base-model {sh(candidate.model_path)} "
                 f"--base-model-repo {sh(candidate.repo_id)} "
                 f"--model-name {sh(candidate.model_id)} "
+                f"--architecture {sh(candidate.architecture)} "
+                f"--model-type {sh(candidate.model_type)} "
+                f"--backend-id {sh(backend.backend_id)} "
                 f"--inference-base-model {sh(candidate.model_path)} "
                 f"--manifest {sh(specialization_manifest)} "
                 f"--version-id {sh(selected_version)} "

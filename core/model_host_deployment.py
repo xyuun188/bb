@@ -380,7 +380,18 @@ def _deploy_locked(payload: dict, *, host, root: Path) -> dict:
     files = {
         root / "scripts/start_target_single_model.sh": (payload["start_script"].encode(), 0o755),
         root / "manifests/target_model_candidate.json": (json.dumps(candidate).encode(), 0o644),
-        root / "manifests/phase3_model_service_manifest.json": (json.dumps(payload["service_manifest"]).encode(), 0o644),
+        root / "manifests/phase3_model_service_manifest.json": (
+            json.dumps(
+                {
+                    **payload["service_manifest"],
+                    # Keep the topology contract at the manifest root.  The
+                    # readiness audit reads this field before inspecting the
+                    # individual service rows.
+                    "topology_profile": "target_single_model",
+                }
+            ).encode(),
+            0o644,
+        ),
     }
     runtime_script = payload.get("runtime_script")
     if runtime_script:
@@ -551,6 +562,7 @@ def target_start_script(
             "--model-id", candidate["model_id"],
             "--context-length", str(candidate["context_length"]),
             "--max-concurrency", str(candidate["max_concurrency"]),
+            "--require-adapter",
         ]
         if adapter_path is not None:
             args.extend(["--adapter-path", normalized_adapter])

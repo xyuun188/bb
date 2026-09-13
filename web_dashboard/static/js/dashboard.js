@@ -92,44 +92,6 @@ const EXPERT_MEMORY_PAGE_SIZE = 10;
 const RISK_ALERT_PAGE_SIZE = 10;
 const ML_SIGNAL_PAGE_SIZE = 10;
 const PROFIT_ATTRIBUTION_RECORD_PAGE_SIZE = 10;
-const FIXED_AI_EXPERT_FALLBACKS = [
-    {
-        name: 'trend_expert',
-        label: '行情方向专家',
-        role: 'trend_direction',
-        description: '判断当前交易对更适合做多、做空、震荡观望或方向不确定，不直接决定仓位。',
-    },
-    {
-        name: 'momentum_expert',
-        label: '盈利质量专家',
-        role: 'profit_quality',
-        description: '判断预期净收益、亏损概率、盈亏比、手续费覆盖和小赚大亏风险。',
-    },
-    {
-        name: 'sentiment_expert',
-        label: '短线时序专家',
-        role: 'short_timeseries',
-        description: '判断未来 1/5/10/30 分钟路径、动量延续、反转、假突破和事件冲击。',
-    },
-    {
-        name: 'position_expert',
-        label: '持仓退出专家',
-        role: 'position_exit',
-        description: '只看已有仓位，判断继续拿、锁盈、减仓、全平、亏损修复或加仓条件。',
-    },
-    {
-        name: 'risk_expert',
-        label: '异常风控专家',
-        role: 'risk_anomaly',
-        description: '检查异常插针、流动性、极端波动、保证金、交易所限制和硬风险。',
-    },
-    {
-        name: 'decision_maker',
-        label: '最终交易员',
-        role: 'final_decision',
-        description: '读取专家协作结果后，以真实盈利最大化为目标做最终开仓、平仓或观望裁决。',
-    },
-];
 let recentDecisionsRefreshTimer = null;
 let dataCollectionWarmupTimer = null;
 const closingPositionIds = new Set();
@@ -2483,8 +2445,8 @@ function analysisExpertDisplayName(name, experts = []) {
         decision: 'decision_maker',
     }; 
     const normalized = alias[name] || name; 
-    const fallback = (FIXED_AI_EXPERT_FALLBACKS || []).find(e => e.name === normalized); 
-    return fallback ? fallback.label : (name || '-'); 
+    const configured = (experts || []).find(e => e.expert_name === normalized);
+    return configured ? (configured.expert_label || normalized) : (name || '-');
 } 
 
 function analysisConsistencyLabel(value) { 
@@ -3572,9 +3534,7 @@ function renderAnalysisNewsContext(news) {
 }
 
 function analysisExpertConfig(name) {
-    const models = Array.isArray(state.aiExpertModels) && state.aiExpertModels.length
-        ? state.aiExpertModels
-        : FIXED_AI_EXPERT_FALLBACKS;
+    const models = Array.isArray(state.aiExpertModels) ? state.aiExpertModels : [];
     return models.find(item => item.name === name) || null;
 }
 
@@ -8641,7 +8601,7 @@ function updateAutoStatus(stats) {
 
     const modelCountEl = document.getElementById('status-model-count');
     if (modelCountEl) {
-        const expertCount = state.aiExpertModels.length || FIXED_AI_EXPERT_FALLBACKS.length;
+        const expertCount = Array.isArray(state.aiExpertModels) ? state.aiExpertModels.length : 0;
         modelCountEl.textContent = `${expertCount} / 1`;
     }
 
@@ -9227,30 +9187,17 @@ async function testModelByName(name) {
     }
 }
 
-// Fixed expert model UI overrides. The older CRUD handlers remain above for
-// compatibility, but these definitions are the active ones.
+// Model configuration is read from the live API only.
 async function fetchAIModels() {
-    const cached = localStorage.getItem('aiExpertModelsCache');
-    if (cached && !state.aiExpertModels.length) {
-        try {
-            const cachedModels = JSON.parse(cached);
-            if (Array.isArray(cachedModels) && cachedModels.length) {
-                state.aiExpertModels = cachedModels;
-                renderModelList(cachedModels);
-            }
-        } catch (_) {}
-    }
-
-    if (!state.aiExpertModels.length) {
-        renderModelList(FIXED_AI_EXPERT_FALLBACKS.map(m => ({ ...m, loading: true })));
-    }
-
     const data = await fetchJSON('/api/settings/ai-models');
-    if (!data) return;
+    if (!data) {
+        state.aiExpertModels = [];
+        renderModelList([]);
+        return;
+    }
 
     const models = data.models || [];
     state.aiExpertModels = models;
-    localStorage.setItem('aiExpertModelsCache', JSON.stringify(models));
     state.modelModeMap = {};
     models.forEach(m => { state.modelModeMap[m.name] = state.mode || 'paper'; });
     renderModelList(models);

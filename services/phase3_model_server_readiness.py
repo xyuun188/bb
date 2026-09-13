@@ -644,6 +644,7 @@ def render_phase3_model_server_probe() -> str:
                 "checked_at",
                 "storage_root",
                 "root",
+                "topology_profile",
                 "policy",
                 "package_install",
                 "torch",

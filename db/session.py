@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -109,6 +110,24 @@ async def get_read_session_ctx(
     transaction_isolation: str | None = None,
 ) -> AsyncGenerator[AsyncSession, None]:
     """Open a bounded read-only transaction and always release it promptly."""
+
+    # Long-running, read-only training exports may scan the immutable history
+    # view.  They opt in through an environment variable so ordinary API and
+    # dashboard reads keep the strict 12-second cancellation budget.
+    if statement_timeout_ms == 12_000:
+        try:
+            statement_timeout_ms = int(
+                os.environ.get("BB_TRAINING_READ_STATEMENT_TIMEOUT_MS", "12000")
+            )
+        except (TypeError, ValueError):
+            statement_timeout_ms = 12_000
+    if idle_transaction_timeout_ms == 15_000:
+        try:
+            idle_transaction_timeout_ms = int(
+                os.environ.get("BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS", "15000")
+            )
+        except (TypeError, ValueError):
+            idle_transaction_timeout_ms = 15_000
 
     maker = await get_sessionmaker()
     async with maker() as session:
