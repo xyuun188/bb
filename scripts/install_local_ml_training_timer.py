@@ -29,9 +29,15 @@ WorkingDirectory={app_root}
 EnvironmentFile=-{app_root / '.env'}
 EnvironmentFile=-/etc/bb/bb-runtime.env
 Environment=PYTHONUNBUFFERED=1
+Environment=LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=8589934592
 ExecStart={python} {app_root / 'scripts' / 'run_local_ml_auto_train.py'}
 Nice=10
 IOSchedulingClass=best-effort
+MemoryHigh=6G
+MemoryMax=8G
+CPUQuota=150%
+TasksMax=128
+OOMPolicy=kill
 """
     timer = """[Unit]
 Description=Run BB local ML auto-training periodically
