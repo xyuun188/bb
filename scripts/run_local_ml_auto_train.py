@@ -74,6 +74,11 @@ async def _main() -> int:
         LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX
         + json.dumps(result, ensure_ascii=False, sort_keys=True)
     )
+    # A scheduler must retry real failures, while a deliberate no-op (cooldown,
+    # insufficient data, or a disabled optional path) is a healthy check.
+    reason = str(result.get("reason", "")).strip().lower()
+    if reason in {"error", "invalid_training_response"}:
+        return 2
     return 0
 
 

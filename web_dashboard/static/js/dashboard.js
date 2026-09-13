@@ -9160,30 +9160,34 @@ async function testOKXConnection(mode) {
 // ========== AI Model CRUD ==========
 let currentModelMode = 'paper';
 
-async function testModelByName(name) {
-    const btn = event && event.target;
+async function testModelByName(name, sourceButton = null) {
+    const btn = sourceButton && sourceButton.tagName === 'BUTTON' ? sourceButton : null;
     if (btn && btn.tagName === 'BUTTON') {
         btn.disabled = true;
-        btn.textContent = '...';
+        btn.dataset.originalText = btn.textContent;
+        btn.textContent = '测试中...';
     }
-
-    const res = await fetchWithAuth('/api/settings/ai-models/test', dashboardWriteOptions({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
-    }));
-    const data = await res.json().catch(() => ({}));
-    if (data && !data.error) data.error = apiErrorText(data);
-
-    if (btn && btn.tagName === 'BUTTON') {
-        btn.disabled = false;
-        btn.textContent = '🔍';
-    }
-
-    if (data.success) {
-        alert('连接成功: ' + data.message);
-    } else {
-        alert('连接失败: ' + (data.error || '未知错误'));
+    try {
+        const res = await fetchWithAuth('/api/settings/ai-models/test', dashboardWriteOptions({
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+        }));
+        const data = await res.json().catch(() => ({}));
+        if (data && !data.error) data.error = apiErrorText(data);
+        if (data.success) {
+            alert('连接成功: ' + data.message);
+        } else {
+            alert('连接失败: ' + (data.error || '未知错误'));
+        }
+    } catch (error) {
+        alert('连接测试失败: ' + (error.message || error));
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = btn.dataset.originalText || '测试';
+            delete btn.dataset.originalText;
+        }
     }
 }
 
@@ -9219,7 +9223,7 @@ function renderModelList(models) {
     if (!tbody) return;
 
     if (!models.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">固定专家模型加载中...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">固定专家模型加载中...</td></tr>';
         return;
     }
 
@@ -9229,10 +9233,13 @@ function renderModelList(models) {
         const keyState = configured
             ? `<span style="color:var(--green);font-size:11px;">${m.configuration_type === 'keyless_loopback' ? '已设置（本地免 Key）' : '已设置'}</span>`
             : `<span style="color:var(--text-muted);font-size:11px;">${loading ? '加载中' : '未设置'}</span>`;
+        const route = m.route_type === 'cloud'
+            ? '<span class="status-badge status-paused">云端</span>'
+            : '<span class="status-badge status-live">本地</span>';
         const actionButtons = loading
-            ? '<button class="btn btn-sm" disabled title="配置加载中">编辑</button><button class="btn btn-sm" disabled title="配置加载中">测试</button>'
-            : `<button class="btn btn-sm" onclick="editModel(${jsStringAttr(m.name)})" title="编辑">编辑</button>
-                <button class="btn btn-sm" onclick="testModelByName(${jsStringAttr(m.name)})" title="测试连接">测试</button>`;
+            ? '<button type="button" class="btn btn-sm" disabled title="配置加载中">编辑</button><button type="button" class="btn btn-sm" disabled title="配置加载中">测试</button>'
+            : `<button type="button" class="btn btn-sm" data-model-action="edit" data-model-name="${escHtml(String(m.name || ''))}" title="编辑">编辑</button>
+                <button type="button" class="btn btn-sm" data-model-action="test" data-model-name="${escHtml(String(m.name || ''))}" title="测试连接">测试</button>`;
         return `
         <tr>
             <td>
@@ -9242,10 +9249,26 @@ function renderModelList(models) {
             <td style="font-size:11px;color:var(--text-muted);max-width:260px;">${escHtml(m.description || m.role || '-')}</td>
             <td style="font-size:11px;color:var(--text-muted);">${loading ? '读取中...' : escHtml(m.api_base || '-')}</td>
             <td>${loading ? '读取中...' : escHtml(m.model || '-')}</td>
+            <td>${loading ? '读取中...' : `${route}<div style="font-size:10px;color:var(--text-muted);margin-top:3px;">${escHtml(m.route_endpoint || '未登记')}</div>`}</td>
             <td>${keyState}</td>
             <td>${actionButtons}</td>
         </tr>
     `}).join('');
+}
+
+// Delegated handlers keep controls working across browser shells and avoid the
+// deprecated global `event` used by the old inline test handler.
+if (!window.__bbModelConfigActionsBound) {
+    document.addEventListener('click', (clickEvent) => {
+        const button = clickEvent.target?.closest?.('[data-model-action]');
+        if (!button) return;
+        clickEvent.preventDefault();
+        const action = button.dataset.modelAction;
+        const name = button.dataset.modelName || '';
+        if (action === 'edit') editModel(name);
+        if (action === 'test') testModelByName(name, button);
+    });
+    window.__bbModelConfigActionsBound = true;
 }
 
 function showAddModelForm() {
@@ -10897,7 +10920,15 @@ async function fetchTradingParams() {
 
 function renderHighRiskReviewerStatus(data) {
     const el = document.getElementById('cloud-reviewer-test-status');
-    if (!el || !data) return;
+    const routeSummary = document.getElementById('ai-model-route-summary');
+    if (!data) return;
+    if (routeSummary) {
+        const stateText = data.route_valid
+            ? `云端 reviewer：${data.provider || '云端'} / ${data.model || '-'}（独立高风险复核路由）`
+            : '云端 reviewer：未配置或未通过校验（高风险新开仓继续 fail-closed）';
+        routeSummary.textContent = `本地专家：6 个固定槽位统一走本地 Qwen3.8-27B；${stateText}。`;
+    }
+    if (!el) return;
     if (data.route_valid === false) {
         el.textContent = `未就绪：${data.route_error || '配置不完整'}`;
         el.style.color = 'var(--danger, #ef4444)';
@@ -11090,6 +11121,10 @@ window.showAnalysisReason = showAnalysisReason;
 window.changeAnalysisPage = changeAnalysisPage;
 window.fetchAnalysisRecords = fetchAnalysisRecords;
 window.testHighRiskReviewer = testHighRiskReviewer;
+window.editModel = editModel;
+window.testModelByName = testModelByName;
+window.closeModelModal = closeModelModal;
+window.saveModelConfig = saveModelConfig;
 
 // Cleaner Local ML page rendering. Keep the raw model names in small technical
 // text, but lead with trading-purpose language so the page is readable.

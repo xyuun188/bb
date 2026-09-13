@@ -936,6 +936,14 @@ async def get_ai_models():
         mc = dict(m)
         mc["api_key"] = mask_secret(mc.get("api_key", ""))
         mc["execution_mode"] = "analysis"
+        # Fixed expert slots are pinned to the local Qwen carrier. Cloud
+        # routing is isolated to the independent high-risk reviewer.
+        mc["route_type"] = "local"
+        mc["route_label"] = "本地模型服务器"
+        mc["route_endpoint"] = "platform loopback:18000/v1"
+        mc["provider"] = "BB target inference"
+        mc["editable"] = True
+        mc["testable"] = True
         models.append(mc)
 
     execution_accounts = {
