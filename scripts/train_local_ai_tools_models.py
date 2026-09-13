@@ -60,10 +60,11 @@ from services.training_epoch import (
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 _REMOTE_TRAINING_TRANSPORT_VERSION = "2026-08-14.bounded-training-transport.v1"
-_REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 5_000
-_REMOTE_TRAINING_MAX_TRADE_SAMPLES = 2_048
+_REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 2_048
+_REMOTE_TRAINING_MAX_TRADE_SAMPLES = 512
+_REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 128
 _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 256
-_REMOTE_TRAINING_MAX_TEXT_SAMPLES = 2_000
+_REMOTE_TRAINING_MAX_TEXT_SAMPLES = 512
 _SEQUENCE_ROWS_PER_SERIES_LIMIT = _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
@@ -503,7 +504,9 @@ def _build_training_transport_views(
         ],
         "sequence": [
             _transport_sample(row, kind="sequence")
-            for row in source_rows["sequence"]
+            for row in _evenly_spaced_rows(
+                source_rows["sequence"], _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES
+            )
         ],
         "text_sentiment": [
             {
@@ -537,6 +540,7 @@ def _build_training_transport_views(
         "limits": {
             "shadow_samples": _REMOTE_TRAINING_MAX_SHADOW_SAMPLES,
             "trade_samples": _REMOTE_TRAINING_MAX_TRADE_SAMPLES,
+            "sequence_samples": _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES,
             "sequence_length": _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH,
             "text_sentiment_samples": _REMOTE_TRAINING_MAX_TEXT_SAMPLES,
         },

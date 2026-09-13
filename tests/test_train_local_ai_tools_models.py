@@ -389,6 +389,36 @@ def test_remote_training_transport_bounds_rows_and_drops_audit_payloads() -> Non
     }
 
 
+def test_remote_training_transport_bounds_sequence_sample_count() -> None:
+    rows = [
+        {
+            "symbol": f"S{index}/USDT",
+            "timeframe": "1m",
+            "sequence_format": train_script.COMPACT_SEQUENCE_SERIES_FORMAT,
+            "close_sequence": list(range(40)),
+            "volume_sequence": list(range(40)),
+            "observation_count": 9,
+            "label_name": "gross_market_move_pct",
+            "label_version": "test-v1",
+        }
+        for index in range(train_script._REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES + 25)
+    ]
+
+    views, report = train_script._build_training_transport_views(
+        {
+            "shadow_samples": [],
+            "trade_samples": [],
+            "sequence_samples": rows,
+            "text_sentiment_samples": [],
+        }
+    )
+
+    assert len(views["sequence"]) == train_script._REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES
+    assert report["sent_sample_counts"]["sequence"] == (
+        train_script._REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES
+    )
+
+
 def test_local_ai_tools_training_headers_use_bearer_token() -> None:
     assert _build_auth_headers("  local-secret-token  ") == {
         "Authorization": "Bearer local-secret-token"
