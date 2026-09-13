@@ -10847,6 +10847,7 @@ async function fetchTradingParams() {
     const highRiskBaseInput = document.getElementById('cfg-high-risk-review-api-base');
     const highRiskKeyInput = document.getElementById('cfg-high-risk-review-api-key');
     const highRiskModelInput = document.getElementById('cfg-high-risk-review-model');
+    const highRiskRevisionInput = document.getElementById('cfg-high-risk-review-model-revision');
     const highRiskTimeoutInput = document.getElementById('cfg-high-risk-review-timeout');
     const highRiskMaxTokensInput = document.getElementById('cfg-high-risk-review-max-tokens');
     const highRiskBreakerFailuresInput = document.getElementById('cfg-high-risk-review-breaker-failures');
@@ -10871,6 +10872,7 @@ async function fetchTradingParams() {
             : '线上模型密钥';
     }
     if (highRiskModelInput) highRiskModelInput.value = data.high_risk_review_model || '';
+    if (highRiskRevisionInput) highRiskRevisionInput.value = data.high_risk_review_model_revision || '';
     if (highRiskTimeoutInput) highRiskTimeoutInput.value = data.high_risk_review_timeout_seconds ?? 30;
     if (highRiskMaxTokensInput) {
         const tokenFloor = Number(data.high_risk_review_token_floor);
@@ -10889,7 +10891,77 @@ async function fetchTradingParams() {
     if (highRiskBreakerCooldownInput) {
         highRiskBreakerCooldownInput.value = data.high_risk_review_circuit_breaker_cooldown_seconds ?? 120;
     }
+    await fetchHighRiskReviewerSettings();
     await fetchThresholdCatalog();
+}
+
+function renderHighRiskReviewerStatus(data) {
+    const el = document.getElementById('cloud-reviewer-test-status');
+    if (!el || !data) return;
+    if (data.route_valid === false) {
+        el.textContent = `未就绪：${data.route_error || '配置不完整'}`;
+        el.style.color = 'var(--danger, #ef4444)';
+        return;
+    }
+    el.textContent = data.route_valid ? `已配置：${data.provider || '云端'} / ${data.model || '-'}` : '尚未配置';
+    el.style.color = data.route_valid ? 'var(--success, #22c55e)' : 'var(--text-muted)';
+}
+
+async function fetchHighRiskReviewerSettings() {
+    try {
+        const data = await fetchJSON('/api/settings/high-risk-review');
+        const enabled = document.getElementById('cfg-high-risk-review-enabled');
+        const base = document.getElementById('cfg-high-risk-review-api-base');
+        const key = document.getElementById('cfg-high-risk-review-api-key');
+        const model = document.getElementById('cfg-high-risk-review-model');
+        const revision = document.getElementById('cfg-high-risk-review-model-revision');
+        if (enabled) enabled.checked = Boolean(data.enabled);
+        if (base) base.value = data.api_base || '';
+        if (key) {
+            key.value = '';
+            key.placeholder = data.has_api_key ? '已有密钥（已隐藏），留空不变' : '线上模型密钥';
+        }
+        if (model) model.value = data.model || '';
+        if (revision) revision.value = data.revision || '';
+        renderHighRiskReviewerStatus(data);
+    } catch (err) {
+        const el = document.getElementById('cloud-reviewer-test-status');
+        if (el) {
+            el.textContent = `读取失败：${err.message || err}`;
+            el.style.color = 'var(--danger, #ef4444)';
+        }
+    }
+}
+
+async function testHighRiskReviewer() {
+    const button = document.getElementById('cloud-reviewer-test-btn');
+    const status = document.getElementById('cloud-reviewer-test-status');
+    const body = {
+        api_base: document.getElementById('cfg-high-risk-review-api-base')?.value.trim() || '',
+        model: document.getElementById('cfg-high-risk-review-model')?.value.trim() || '',
+        revision: document.getElementById('cfg-high-risk-review-model-revision')?.value.trim() || '',
+    };
+    const key = document.getElementById('cfg-high-risk-review-api-key')?.value.trim() || '';
+    if (key && !key.startsWith('****')) body.api_key = key;
+    if (button) { button.disabled = true; button.textContent = '测试中...'; }
+    if (status) { status.textContent = '正在真实请求云端 /models'; status.style.color = 'var(--text-muted)'; }
+    try {
+        const res = await fetchWithAuth('/api/settings/high-risk-review/test', dashboardWriteOptions({
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        }));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(apiErrorText(data));
+        if (status) {
+            status.textContent = data.success
+                ? `连接成功：${data.provider || '云端'} / ${data.model} / ${data.revision} · ${data.latency_ms ?? '-'} ms`
+                : `连接失败：${data.error || data.status || '未知错误'}`;
+            status.style.color = data.success ? 'var(--success, #22c55e)' : 'var(--danger, #ef4444)';
+        }
+    } catch (err) {
+        if (status) { status.textContent = `测试失败：${err.message || err}`; status.style.color = 'var(--danger, #ef4444)'; }
+    } finally {
+        if (button) { button.disabled = false; button.textContent = '测试云端连接'; }
+    }
 }
 
 async function saveTradingParams() {
@@ -10903,6 +10975,7 @@ async function saveTradingParams() {
     const highRiskBaseInput = document.getElementById('cfg-high-risk-review-api-base');
     const highRiskKeyInput = document.getElementById('cfg-high-risk-review-api-key');
     const highRiskModelInput = document.getElementById('cfg-high-risk-review-model');
+    const highRiskRevisionInput = document.getElementById('cfg-high-risk-review-model-revision');
     const highRiskTimeoutInput = document.getElementById('cfg-high-risk-review-timeout');
     const highRiskMaxTokensInput = document.getElementById('cfg-high-risk-review-max-tokens');
     const highRiskBreakerFailuresInput = document.getElementById('cfg-high-risk-review-breaker-failures');
@@ -10942,17 +11015,14 @@ async function saveTradingParams() {
         }
         body.local_ai_tools_circuit_breaker_cooldown_seconds = cooldown;
     }
-    if (highRiskEnabledInput) {
-        body.high_risk_review_enabled = Boolean(highRiskEnabledInput.checked);
-    }
-    if (highRiskBaseInput) {
-        body.high_risk_review_api_base = highRiskBaseInput.value.trim();
-    }
+    const reviewerBody = {
+        enabled: Boolean(highRiskEnabledInput?.checked),
+        api_base: highRiskBaseInput?.value.trim() || '',
+        model: highRiskModelInput?.value.trim() || '',
+        revision: highRiskRevisionInput?.value.trim() || '',
+    };
     if (highRiskKeyInput && highRiskKeyInput.value.trim() && !highRiskKeyInput.value.trim().startsWith('****')) {
-        body.high_risk_review_api_key = highRiskKeyInput.value.trim();
-    }
-    if (highRiskModelInput) {
-        body.high_risk_review_model = highRiskModelInput.value.trim();
+        reviewerBody.api_key = highRiskKeyInput.value.trim();
     }
     if (highRiskTimeoutInput && highRiskTimeoutInput.value !== '') {
         const timeout = parseFloat(highRiskTimeoutInput.value);
@@ -10988,6 +11058,14 @@ async function saveTradingParams() {
         }
         body.high_risk_review_circuit_breaker_cooldown_seconds = cooldown;
     }
+    const reviewerRes = await fetchWithAuth('/api/settings/high-risk-review', dashboardWriteOptions({
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reviewerBody),
+    }));
+    if (!reviewerRes.ok) {
+        const err = await reviewerRes.json().catch(() => ({}));
+        alert('云端 reviewer 保存失败: ' + apiErrorText(err));
+        return;
+    }
     const res = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -11002,6 +11080,7 @@ async function saveTradingParams() {
 
     const data = await res.json();
     state.decisionInterval = data.decision_interval;
+    await fetchHighRiskReviewerSettings();
     await fetchThresholdCatalog();
     alert('参数已保存，立即生效');
 }
@@ -11010,6 +11089,7 @@ async function saveTradingParams() {
 window.showAnalysisReason = showAnalysisReason;
 window.changeAnalysisPage = changeAnalysisPage;
 window.fetchAnalysisRecords = fetchAnalysisRecords;
+window.testHighRiskReviewer = testHighRiskReviewer;
 
 // Cleaner Local ML page rendering. Keep the raw model names in small technical
 // text, but lead with trading-purpose language so the page is readable.

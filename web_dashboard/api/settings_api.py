@@ -10,6 +10,7 @@ import json
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -25,6 +26,7 @@ from core.phase3_model_contract import PHASE3_TARGET_MODEL_ID
 from core.safe_output import safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
+from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.model_server_config import (
     ModelServerConfigError,
     ModelServerConfigNotConfigured,
@@ -96,6 +98,21 @@ class ModelServerSettingsRequest(BaseModel):
     password: str | None = None
 
 
+class CloudReviewerSettingsRequest(BaseModel):
+    enabled: bool = True
+    api_base: str = ""
+    api_key: str | None = None
+    model: str = ""
+    revision: str = ""
+
+
+class CloudReviewerTestRequest(BaseModel):
+    api_base: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    revision: str | None = None
+
+
 # ── Helpers ──
 
 
@@ -132,6 +149,48 @@ def _connection_error_text(value: Any) -> str:
 
 def _model_server_error(exc: Exception) -> str:
     return safe_error_text(exc, limit=500)
+
+
+def _cloud_reviewer_payload() -> dict[str, Any]:
+    base = str(settings.high_risk_review_api_base or "").strip()
+    model = str(settings.high_risk_review_model or "").strip()
+    revision = str(getattr(settings, "high_risk_review_model_revision", "") or "").strip()
+    valid, reason = validate_cloud_reviewer_route(
+        base,
+        model,
+        revision,
+        settings.high_risk_review_api_key,
+    )
+    parsed = urlsplit(base) if base else None
+    return {
+        "enabled": bool(settings.high_risk_review_enabled),
+        "api_base": base,
+        "api_key": mask_secret(settings.high_risk_review_api_key),
+        "has_api_key": bool(settings.high_risk_review_api_key),
+        "model": model,
+        "revision": revision,
+        "route_valid": valid,
+        "route_error": reason or None,
+        "provider": parsed.netloc if parsed and parsed.netloc else None,
+    }
+
+
+def _cloud_reviewer_candidate(req: CloudReviewerSettingsRequest | CloudReviewerTestRequest) -> tuple[str, str, str, str]:
+    base = req.api_base if req.api_base is not None else settings.high_risk_review_api_base
+    api_base = _normalize_api_base_or_400(base, field_name="High-risk review API base")
+    supplied_key = req.api_key.strip() if req.api_key is not None else ""
+    api_key = (
+        settings.high_risk_review_api_key
+        if not supplied_key or _is_masked_secret(supplied_key)
+        else supplied_key
+    )
+    model = (req.model if req.model is not None else settings.high_risk_review_model).strip()
+    revision = (
+        req.revision
+        if req.revision is not None
+        else getattr(settings, "high_risk_review_model_revision", "")
+    ).strip()
+    return api_base, api_key, model, revision
 
 
 def _okx_mode_label(mode: str) -> str:
@@ -995,6 +1054,138 @@ async def test_ai_model_connection(req: AIModelTestRequest):
         return {"success": False, "error": _connection_error_text(exc), "model": model}
 
 
+@router.get("/settings/high-risk-review")
+async def get_high_risk_review_settings():
+    """Return the cloud reviewer identity without exposing its secret."""
+    settings.refresh_runtime_env(force=True)
+    return _cloud_reviewer_payload()
+
+
+@router.post("/settings/high-risk-review")
+async def update_high_risk_review_settings(req: CloudReviewerSettingsRequest):
+    """Atomically save and validate the independent cloud reviewer route."""
+    api_base, api_key, model, revision = _cloud_reviewer_candidate(req)
+    valid, reason = validate_cloud_reviewer_route(api_base, model, revision, api_key)
+    if req.enabled and not valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": reason,
+                "message": "云端 reviewer 配置不完整或不安全，已拒绝保存",
+            },
+        )
+    if any((api_base, model, revision, api_key)) and not valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": reason,
+                "message": "云端 reviewer 配置校验失败，已拒绝保存",
+            },
+        )
+
+    updates = {
+        "HIGH_RISK_REVIEW_ENABLED": "true" if req.enabled else "false",
+        "HIGH_RISK_REVIEW_API_BASE": api_base,
+        "HIGH_RISK_REVIEW_MODEL": model,
+        "HIGH_RISK_REVIEW_MODEL_REVISION": revision,
+    }
+    settings.high_risk_review_enabled = bool(req.enabled)
+    settings.high_risk_review_api_base = api_base
+    settings.high_risk_review_model = model
+    settings.high_risk_review_model_revision = revision
+    if req.api_key is not None and req.api_key.strip() and not _is_masked_secret(req.api_key):
+        settings.high_risk_review_api_key = api_key
+        await set_runtime_secret("high_risk_review.api_key", api_key)
+    env_updates = strip_secret_env_updates(updates)
+    if env_updates:
+        settings.update_env_file(env_updates)
+    return {"status": "ok", "message": "云端 reviewer 配置已原子保存", **_cloud_reviewer_payload()}
+
+
+@router.post("/settings/high-risk-review/test")
+async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
+    """Probe the configured public reviewer and verify the requested model identity."""
+    started = time.perf_counter()
+    try:
+        api_base, api_key, model, revision = _cloud_reviewer_candidate(req)
+    except HTTPException as exc:
+        return {"success": False, "status": "invalid_config", "error": str(exc.detail)}
+    valid, reason = validate_cloud_reviewer_route(api_base, model, revision, api_key)
+    if not valid:
+        return {
+            "success": False,
+            "status": "invalid_config",
+            "error": reason,
+            "provider": urlsplit(api_base).netloc if api_base else None,
+            "model": model,
+            "revision": revision,
+        }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{api_base}/models", headers=headers)
+        latency_ms = round((time.perf_counter() - started) * 1000, 1)
+        if not response.is_success:
+            return {
+                "success": False,
+                "status": "http_error",
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "error": f"cloud reviewer returned HTTP {response.status_code}",
+                "provider": urlsplit(api_base).netloc,
+                "model": model,
+                "revision": revision,
+            }
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        model_ids = {
+            str(item.get("id") or item.get("root") or "").strip()
+            for item in rows
+            if isinstance(item, dict)
+        }
+        if model not in model_ids:
+            return {
+                "success": False,
+                "status": "model_not_found",
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "error": "cloud reviewer model identity was not returned by /models",
+                "provider": urlsplit(api_base).netloc,
+                "model": model,
+                "revision": revision,
+            }
+        return {
+            "success": True,
+            "status": "ready",
+            "status_code": response.status_code,
+            "latency_ms": latency_ms,
+            "provider": urlsplit(api_base).netloc,
+            "model": model,
+            "revision": revision,
+            "message": "云端 reviewer 连接成功，模型身份已验证",
+        }
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "status": "timeout",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "error": "cloud reviewer connection timed out",
+            "provider": urlsplit(api_base).netloc,
+            "model": model,
+            "revision": revision,
+        }
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return {
+            "success": False,
+            "status": "connection_error",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "error": _connection_error_text(exc),
+            "provider": urlsplit(api_base).netloc,
+            "model": model,
+            "revision": revision,
+        }
+
+
 class IntervalRequest(BaseModel):
     interval_seconds: int
 
@@ -1010,6 +1201,7 @@ class ThresholdsRequest(BaseModel):
     high_risk_review_api_base: str | None = None
     high_risk_review_api_key: str | None = None
     high_risk_review_model: str | None = None
+    high_risk_review_model_revision: str | None = None
     high_risk_review_timeout_seconds: float | None = None
     high_risk_review_max_tokens: int | None = None
     high_risk_review_circuit_breaker_failures: int | None = None
@@ -1195,6 +1387,7 @@ async def get_thresholds():
         "high_risk_review_api_key": mask_secret(settings.high_risk_review_api_key),
         "high_risk_review_has_api_key": bool(settings.high_risk_review_api_key),
         "high_risk_review_model": settings.high_risk_review_model,
+        "high_risk_review_model_revision": getattr(settings, "high_risk_review_model_revision", ""),
         "high_risk_review_timeout_seconds": settings.high_risk_review_timeout_seconds,
         "high_risk_review_max_tokens": settings.high_risk_review_max_tokens,
         "high_risk_review_token_floor": HIGH_RISK_REVIEW_TOKEN_FLOOR,
@@ -1293,6 +1486,10 @@ async def update_thresholds(req: ThresholdsRequest):
         settings.high_risk_review_model = req.high_risk_review_model.strip()
         updates["HIGH_RISK_REVIEW_MODEL"] = settings.high_risk_review_model
 
+    if req.high_risk_review_model_revision is not None:
+        settings.high_risk_review_model_revision = req.high_risk_review_model_revision.strip()
+        updates["HIGH_RISK_REVIEW_MODEL_REVISION"] = settings.high_risk_review_model_revision
+
     if req.high_risk_review_timeout_seconds is not None:
         timeout_seconds = float(req.high_risk_review_timeout_seconds)
         if timeout_seconds < 5 or timeout_seconds > 120:
@@ -1355,6 +1552,7 @@ async def update_thresholds(req: ThresholdsRequest):
         "high_risk_review_api_key": mask_secret(settings.high_risk_review_api_key),
         "high_risk_review_has_api_key": bool(settings.high_risk_review_api_key),
         "high_risk_review_model": settings.high_risk_review_model,
+        "high_risk_review_model_revision": getattr(settings, "high_risk_review_model_revision", ""),
         "high_risk_review_timeout_seconds": settings.high_risk_review_timeout_seconds,
         "high_risk_review_max_tokens": settings.high_risk_review_max_tokens,
         "high_risk_review_token_floor": HIGH_RISK_REVIEW_TOKEN_FLOOR,
