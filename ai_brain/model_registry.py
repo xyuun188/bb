@@ -325,6 +325,14 @@ class ModelRegistry:
         context["_model_timings"] = []
         ensure_llm_call_budget(context)
 
+        # A Qwen3.8-27B group is served by one single-worker carrier.  Enforce
+        # the one-request contract at the registry boundary as well as in the
+        # deployment environment, so an omitted/stale .env cannot re-enable a
+        # repair or consultation call that queues behind the hot-path request.
+        if any(_is_target_qwen_provider(model) for model in active_models):
+            budget = ensure_llm_call_budget(context)
+            budget["max_calls"] = 1
+
         analysis_budget = _analysis_budget_snapshot(context)
         if analysis_budget is not None:
             context["_analysis_budget"] = dict(analysis_budget)

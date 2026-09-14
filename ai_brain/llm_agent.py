@@ -1261,7 +1261,16 @@ class LLMAgent(AbstractAIModel):
         llm = self._create_llm(model_name, fast_expert=True) if fast_expert_mode else self._llm
         if llm is None:
             raise RuntimeError(f"LLM client for {model_name} is not initialized")
-        attempt_limit = 1 if fast_expert_mode else self._max_retries + 1
+        # The target carrier is a single-worker service. A malformed/failed
+        # Qwen response must fail closed rather than enqueueing a second
+        # request behind a potentially draining generation. Non-target
+        # providers retain the bounded historical retry.
+        target_qwen = str(model_name or "").strip().lower() == "qwen3.8-27b"
+        attempt_limit = (
+            1
+            if fast_expert_mode or target_qwen
+            else self._max_retries + 1
+        )
         for attempt in range(attempt_limit):
             content = ""
             response_contract: dict[str, Any] = {}
@@ -1269,7 +1278,7 @@ class LLMAgent(AbstractAIModel):
                 messages = _messages_for_model(system_prompt, user_prompt, model_name)
                 _claim_llm_call(context, "expert" if expert_mode else "decision")
                 async with _bounded_llm_capacity_slot(context):
-                    if _LLM_CALL_DELAY:
+                    if _LLM_CALL_DELAY and not target_qwen:
                         await asyncio.sleep(_LLM_CALL_DELAY)
                     request = llm.ainvoke(messages)
                     try:
@@ -1365,7 +1374,7 @@ class LLMAgent(AbstractAIModel):
                 "batch_expert_repair" if repair else "batch_expert",
             )
             async with _bounded_llm_capacity_slot(context):
-                if _LLM_CALL_DELAY:
+                if _LLM_CALL_DELAY and not target_single_call:
                     await asyncio.sleep(_LLM_CALL_DELAY)
                 batch_llm = self._create_llm(
                     self._model_name,

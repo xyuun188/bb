@@ -287,11 +287,16 @@ class Settings(BaseSettings):
     position_analysis_watchdog_seconds: int = 180
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
+    # Generic callers retain the historical capacity; the online runtime
+    # environment pins this to one for the single-worker Qwen carrier.
     ai_llm_concurrency: int = 2
     # Bound provider calls per symbol analysis so repair/fallback/consultation
     # cannot turn one local-model round into a multi-minute queue.
+    # Generic callers keep the historical two-call budget; the model registry
+    # clamps target Qwen3.8-27B analyses to one call when it detects the
+    # single-worker production carrier.
     ai_llm_max_calls_per_analysis: int = 2
-    ai_llm_call_delay_seconds: float = 0.15
+    ai_llm_call_delay_seconds: float = 0.0
     ai_expert_timeout_seconds: float = 30.0
     ai_decision_maker_timeout_seconds: float = 20.0
     ai_expert_max_completion_tokens: int = 360
