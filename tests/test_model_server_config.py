@@ -38,7 +38,15 @@ def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: epoch_start,
     )
     monkeypatch.setattr(
+        "services.ml_signal_service.load_training_data_start",
+        lambda: epoch_start,
+    )
+    monkeypatch.setattr(
         "scripts.train_local_ai_tools_models.load_training_epoch_start",
+        lambda: epoch_start,
+    )
+    monkeypatch.setattr(
+        "scripts.train_local_ai_tools_models.load_training_data_start",
         lambda: epoch_start,
     )
 

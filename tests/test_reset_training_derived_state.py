@@ -26,6 +26,18 @@ async def _count(model) -> int:
         return len((await session.execute(select(model))).scalars().all())
 
 
+def test_service_gate_is_not_applicable_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(reset_script.os, "name", "nt", raising=False)
+
+    report = reset_script.check_services_stopped(("bb-paper-trading.service",))
+
+    assert report == {
+        "ok": True,
+        "reason": "non_systemd_host",
+        "services": {"bb-paper-trading.service": "not_applicable"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_reset_only_deletes_derived_state_and_starts_new_epoch(tmp_path, monkeypatch) -> None:
     await _reset_db(tmp_path, monkeypatch, "derived-reset.db")

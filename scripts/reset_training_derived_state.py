@@ -190,6 +190,15 @@ async def _table_counts(tables: tuple[tuple[str, Any], ...]) -> dict[str, int]:
 
 
 def check_services_stopped(services: tuple[str, ...] = RESET_SERVICES) -> dict[str, Any]:
+    # The repository is also validated from Windows workspaces where the
+    # production systemd units do not exist.  Treat that host as non-applicable
+    # while keeping the strict gate on Linux deployments.
+    if os.name == "nt":
+        return {
+            "ok": True,
+            "reason": "non_systemd_host",
+            "services": {service: "not_applicable" for service in services},
+        }
     statuses: dict[str, str] = {}
     for service in services:
         try:
