@@ -44,7 +44,9 @@ import json, sys, time, urllib.request
 
 payload = json.loads(sys.argv[1])
 runs = max(int(sys.argv[2]), 1)
-for tokens in (32, 128, 256, 512):
+# Keep probes inside the target API contract (max_tokens <= 256). A 512-token
+# request is a client-side validation error, not a model-latency measurement.
+for tokens in (32, 64, 128, 256):
     values = []
     for index in range(runs):
         body = dict(payload)
