@@ -51,16 +51,29 @@ class PositionCapacityReleaseAuditService:
                 .all()
             )
             decisions = list(
-                (
+                SimpleNamespace(
+                    id=row.id,
+                    symbol=row.symbol,
+                    action=row.action,
+                    raw_llm_response=dict(row.raw_llm_response or {}),
+                    created_at=row.created_at,
+                    was_executed=bool(row.was_executed),
+                )
+                for row in (
                     await session.execute(
-                        select(AIDecision)
+                        select(
+                            AIDecision.id,
+                            AIDecision.symbol,
+                            AIDecision.action,
+                            AIDecision.raw_llm_response,
+                            AIDecision.created_at,
+                            AIDecision.was_executed,
+                        )
                         .where(AIDecision.created_at >= since_naive)
                         .order_by(AIDecision.created_at.desc())
                         .limit(self.limit)
                     )
-                )
-                .scalars()
-                .all()
+                ).all()
             )
             decision_ids = [
                 int(decision.id)

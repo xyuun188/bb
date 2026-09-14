@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import sys
 from datetime import UTC, datetime
@@ -38,7 +39,7 @@ from services.model_promotion_policy import (
 from services.phase3_rebuild_readiness import Phase3RebuildReadinessService
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import annotate_training_payload
-from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY, training_data_scope
 
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 DEFAULT_HISTORICAL_AUDIT_DAYS = 180
@@ -151,6 +152,7 @@ def _training_payload_unavailable(error: Exception) -> dict[str, Any]:
 
 async def _collect_training_payload() -> dict[str, Any]:
     from scripts.train_local_ai_tools_models import (
+        _REMOTE_TRAINING_MAX_SHADOW_SAMPLES,
         _completed_shadow_sample_count,
         _completed_trade_sample_count,
         _load_sequence_samples,
@@ -159,8 +161,18 @@ async def _collect_training_payload() -> dict[str, Any]:
         _load_trade_samples,
     )
 
-    shadow_samples = await _load_shadow_samples()
-    trade_samples = await _load_trade_samples()
+    shadow_loader = _load_shadow_samples
+    shadow_samples = (
+        await shadow_loader(sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES)
+        if "sample_budget" in inspect.signature(shadow_loader).parameters
+        else await shadow_loader()
+    )
+    trade_loader = _load_trade_samples
+    trade_samples = (
+        await trade_loader(compact=True)
+        if "compact" in inspect.signature(trade_loader).parameters
+        else await trade_loader()
+    )
     sequence_samples = await _load_sequence_samples()
     text_sentiment_samples = await _load_text_sentiment_samples()
     payload = annotate_training_payload(
@@ -261,8 +273,7 @@ async def collect_phase3_rebuild_preflight(
     local_ai_tools = {
         "available": True,
         "status": "preflight_ready",
-        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
-        "pre_epoch_data_training_allowed": False,
+        **training_data_scope(),
         "training_shadow_sample_count": training["training_shadow_sample_count"],
         "training_trade_sample_count": training["training_trade_sample_count"],
         "sequence_sample_count": training["sequence_sample_count"],

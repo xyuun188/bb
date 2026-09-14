@@ -1,5 +1,7 @@
 """Train the server-side local quant tools from local trading history."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -19,27 +21,36 @@ from typing import Any, TextIO
 import httpx
 from sqlalchemy import func, select
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from config.settings import settings
-from core.safe_output import safe_error_text, safe_print, safe_response_error_text
-from core.url_safety import normalize_http_base_url
-from db.session import get_read_session_ctx, get_session_ctx
-from models.learning import ShadowBacktest
-from models.market_data import Kline
-from models.news import NewsArticle, SocialPost
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
+
+from config.settings import settings  # noqa: E402
+from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
+from core.url_safety import normalize_http_base_url  # noqa: E402
+from db.session import get_read_session_ctx, get_session_ctx  # noqa: E402
+from models.learning import ShadowBacktest  # noqa: E402
+from models.market_data import Kline  # noqa: E402
+from models.news import NewsArticle, SocialPost  # noqa: E402
 from scripts.run_phase3_paper_resume_observation import (
     DEFAULT_REPORT_DIR as PAPER_OBSERVATION_REPORT_DIR,
-)
+)  # noqa: E402
 from scripts.run_phase3_paper_resume_observation import (
     collect_phase3_paper_resume_observation,
 )
 from scripts.run_phase3_paper_resume_observation import (
     write_report as write_paper_observation_report,
 )
-from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
-from services.execution_cost_model import round_trip_fee_pct
-from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
+from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
+from services.execution_cost_model import round_trip_fee_pct  # noqa: E402
+from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX  # noqa: E402
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
@@ -54,8 +65,13 @@ from services.training_data_quality import (
 )
 from services.training_epoch import (
     CURRENT_TRAINING_EPOCH_POLICY,
-    load_training_epoch_start,
+    load_training_data_start,
 )
+
+# Public compatibility entry point used by dashboard/status probes.  Training
+# itself uses the canonical data-start policy; exposing the alias keeps all
+# callers on the same epoch marker without maintaining a second implementation.
+load_training_epoch_start = load_training_data_start
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
@@ -286,6 +302,13 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
         number = _compact_numeric(features.get(key))
         if number is not None:
             compact[key] = number
+    if features.get("historical_market_path_only") is True:
+        compact["historical_market_path_only"] = True
+    historical_rebuild_version = str(
+        features.get("historical_shadow_rebuild_version") or ""
+    ).strip()
+    if historical_rebuild_version:
+        compact["historical_shadow_rebuild_version"] = historical_rebuild_version[:160]
     for key in _LOCAL_AI_TOOLS_SEQUENCE_KEYS:
         sequence = _compact_sequence(features.get(key))
         if sequence:
@@ -381,6 +404,13 @@ def _training_transport_features(features: Any) -> dict[str, Any]:
         number = _compact_numeric(value)
         if number is not None:
             compact[key] = number
+    if features.get("historical_market_path_only") is True:
+        compact["historical_market_path_only"] = True
+    historical_rebuild_version = str(
+        features.get("historical_shadow_rebuild_version") or ""
+    ).strip()
+    if historical_rebuild_version:
+        compact["historical_shadow_rebuild_version"] = historical_rebuild_version[:160]
     return compact
 
 
@@ -763,7 +793,7 @@ async def _load_shadow_samples(
 ) -> list[dict[str, Any]]:
     before_id: int | None = None
     samples: list[dict[str, Any]] = []
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
 
     def append_sample(row: Mapping[str, Any]) -> None:
         features = _snapshot(row.get("features"))
@@ -878,7 +908,7 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
     """Load the only trainable realized-trade source."""
 
     samples = await load_authoritative_trade_outcomes(
-        since=load_training_epoch_start(),
+        since=load_training_data_start(),
         compact=compact,
         include_training_features=compact,
     )
@@ -891,7 +921,7 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
 
 
 async def _completed_shadow_sample_count() -> int:
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     async with get_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
@@ -967,7 +997,7 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
         last_open_time = None
 
     async with get_read_session_ctx() as session:
-        epoch_start = load_training_epoch_start()
+        epoch_start = load_training_data_start()
         ranked = (
             select(
                 Kline.symbol,
@@ -1058,7 +1088,7 @@ def _symbols_from_json(value: Any) -> list[str]:
 
 
 async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     async with get_session_ctx() as session:
         news_stmt = select(NewsArticle).order_by(
             NewsArticle.published_at.desc().nullslast(), NewsArticle.id.desc()

@@ -20,7 +20,7 @@ from db.session import get_session_ctx
 from models.learning import ShadowBacktest
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import SampleQualityAssessment, assess_shadow_sample
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import load_training_data_start
 
 QUARANTINE_STATUS = "quarantined"
 TRAINING_QUARANTINE_MARKER = "[training_quarantine]"
@@ -123,6 +123,7 @@ async def quarantine_dirty_shadow_samples(
     dry_run: bool = False,
     newest_first: bool = True,
     only_newer_than_id: int | None = None,
+    training_start_override: datetime | None = None,
 ) -> dict[str, Any]:
     """Scan completed shadow samples and quarantine dirty training rows.
 
@@ -141,7 +142,7 @@ async def quarantine_dirty_shadow_samples(
     cursor_id: int | None = None
     reason_counts: Counter[str] = Counter()
     source_status_counts: Counter[str] = Counter()
-    epoch_start = load_training_epoch_start()
+    epoch_start = training_start_override or load_training_data_start()
 
     async with get_session_ctx() as session:
         audited_statuses = ("completed", "quarantined") if dry_run else ("completed",)

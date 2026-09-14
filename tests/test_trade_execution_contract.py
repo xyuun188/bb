@@ -71,8 +71,12 @@ async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
     )
 
     assert report["summary"]["decision_count"] == 0
-    assert statements
-    assert "anon_1" in statements[0]
+    assert len(statements) == 3
+    assert "SELECT ai_decisions.id" in statements[0]
+    assert " LIMIT " in statements[0]
+    assert "raw_llm_response" not in statements[0]
+    assert "SELECT orders.id" in statements[1]
+    assert "SELECT positions.id" in statements[2]
     assert "LIMIT" in statements[0]
 
 

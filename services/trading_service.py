@@ -1339,6 +1339,8 @@ class TradingService:
     def _independent_expert_window_seconds(self) -> float:
         """Cover every expert queue batch admitted by the global LLM semaphore."""
 
+        if self._target_qwen_single_call_route():
+            return 0.0
         expert_count = self._ensemble_expert_count()
         concurrency = max(int(settings.ai_llm_concurrency or expert_count), 1)
         queue_batches = max(math.ceil(expert_count / concurrency), 1)
@@ -1346,6 +1348,24 @@ class TradingService:
             float(settings.ai_expert_timeout_seconds or 0.0),
             MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
         ) * queue_batches
+
+    @staticmethod
+    def _target_qwen_single_call_route() -> bool:
+        """Return whether all enabled expert slots share the fixed local carrier."""
+
+        if not bool(settings.ai_batch_experts_enabled):
+            return False
+        expert_rows = [
+            row
+            for row in settings.get_fixed_ai_models(include_empty=True)
+            if isinstance(row, dict)
+            and row.get("name") != DECISION_MAKER_NAME
+            and row.get("enabled", True)
+        ]
+        return bool(expert_rows) and all(
+            str(row.get("model") or "").strip().lower() == "qwen3.8-27b"
+            for row in expert_rows
+        )
 
     def market_round_time_budget_seconds(
         self,
@@ -1560,9 +1580,9 @@ class TradingService:
     def market_model_inference_timeout_seconds(self) -> float:
         """Return enough time for the configured expert execution strategy.
 
-        The fixed expert slots share one local Qwen3.8-27B carrier. The normal
-        path therefore uses one batch request in both paper and live modes;
-        independent calls remain only as a bounded provider-format fallback.
+        The fixed expert slots share one local Qwen3.8-27B carrier. That route
+        gets one batch request only; malformed or timed-out output fails closed
+        instead of consuming an independent retry window.
         """
 
         settings.refresh_runtime_env()
@@ -1573,6 +1593,17 @@ class TradingService:
                 float(settings.ai_batch_expert_timeout_seconds or 0.0),
                 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
             )
+            # The target topology has one local Qwen3.8-27B carrier.  The
+            # generic 35-second batch setting is for cloud/multi-provider
+            # callers and makes a stale response look like a healthy model
+            # that is merely "slow".  Keep the outer market budget aligned
+            # with the carrier's hard 18-second generation boundary.
+            target_qwen_configured = self._target_qwen_single_call_route()
+            if target_qwen_configured:
+                batch_window = min(
+                    batch_window,
+                    max(float(settings.ai_target_qwen_timeout_seconds or 18.0), 8.0),
+                )
         if batch_window > 0.0:
             independent_window = 0.0
         decision_timeout = max(

@@ -79,6 +79,8 @@ DERIVED_FILES = (
     "local_ai_tools_training.lock",
     "strategy_learning_state.json",
     "system_audit_latest.json",
+    "training_data_migration.json",
+    "training_data_migration_quality.json",
 )
 
 PRESERVED_TABLES = (

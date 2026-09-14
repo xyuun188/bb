@@ -632,10 +632,18 @@ class ModelRegistry:
             )
 
         try:
-            requested_batch_timeout = max(
-                float(settings.ai_batch_expert_timeout_seconds or 18.0),
-                8.0,
+            requested_batch_timeout = float(
+                settings.ai_batch_expert_timeout_seconds or 18.0
             )
+            if _is_target_qwen_provider(batch_model):
+                # Do not inherit a generic/cloud batch timeout.  The target
+                # service fails a slow local generation at 18 seconds and a
+                # longer caller timeout merely turns it into queue drain.
+                requested_batch_timeout = min(
+                    requested_batch_timeout,
+                    float(settings.ai_target_qwen_timeout_seconds or 18.0),
+                )
+            requested_batch_timeout = max(requested_batch_timeout, 8.0)
             batch_timeout, budget_snapshot = _bounded_analysis_timeout(
                 context,
                 requested_batch_timeout,

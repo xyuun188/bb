@@ -6865,6 +6865,20 @@ def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(
         lambda _self, force=False: True,
     )
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "get_fixed_ai_models",
+        lambda _self, include_empty=True: [
+            {"name": name, "model": "generic-cloud-model", "enabled": True}
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        ],
+    )
 
     shared = service.market_symbol_analysis_timeout_seconds(
         remaining_round_seconds=1000.0,
@@ -6882,7 +6896,10 @@ def test_market_symbol_analysis_timeout_is_capped_by_remaining_round_budget(
     assert shared == service.market_model_inference_timeout_seconds()
     assert last == pytest.approx(27.0)
     assert after_soft_deadline == 0.0
-    assert shared >= 40.0
+    # The target Qwen3.8-27B route is intentionally bounded to one batch call
+    # plus the decision stage; it must not inherit the retired multi-expert
+    # retry window.
+    assert shared < 40.0
 
 
 def test_market_model_start_defers_after_context_depletes_viable_window() -> None:
@@ -6925,6 +6942,20 @@ def test_market_symbol_context_and_model_budgets_are_independent(
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
     monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "get_fixed_ai_models",
+        lambda _self, include_empty=True: [
+            {"name": name, "model": "generic-cloud-model", "enabled": True}
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        ],
+    )
 
     assert service.market_symbol_context_timeout_seconds() == pytest.approx(10.25)
     assert service.market_model_inference_timeout_seconds() == pytest.approx(50.0)
@@ -7001,9 +7032,50 @@ def test_market_model_budget_covers_live_batch_failure_and_independent_retry(
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
     monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
     monkeypatch.setattr(trading_service.settings, "trading_mode", "live")
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "get_fixed_ai_models",
+        lambda _self, include_empty=True: [
+            {"name": name, "model": "generic-cloud-model", "enabled": True}
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        ],
+    )
 
     assert service._independent_expert_window_seconds() == pytest.approx(90.0)
     assert service.market_model_inference_timeout_seconds() == pytest.approx(50.0)
+
+
+def test_target_qwen_market_budget_has_no_independent_retry_window(monkeypatch) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
+    monkeypatch.setattr(trading_service.settings, "ai_target_qwen_timeout_seconds", 12.0)
+    monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
+    monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "get_fixed_ai_models",
+        lambda _self, include_empty=True: [
+            {"name": name, "model": "Qwen3.8-27B", "enabled": True}
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        ],
+    )
+
+    assert service._target_qwen_single_call_route() is True
+    assert service._independent_expert_window_seconds() == 0.0
+    assert service.market_model_inference_timeout_seconds() < 30.0
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
@@ -7679,6 +7751,20 @@ def test_position_round_watchdog_follows_position_review_cadence(
     monkeypatch.setattr(trading_service.settings, "local_ai_tools_timeout_seconds", 8.0)
     monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "get_fixed_ai_models",
+        lambda _self, include_empty=True: [
+            {"name": name, "model": "generic-cloud-model", "enabled": True}
+            for name in (
+                "trend_expert",
+                "momentum_expert",
+                "sentiment_expert",
+                "position_expert",
+                "risk_expert",
+            )
+        ],
+    )
 
     assert service.position_review_stage_timeout_seconds() == 58.0
     assert service.position_loop_interval_seconds() == pytest.approx(30.0)

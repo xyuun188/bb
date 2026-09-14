@@ -45,9 +45,27 @@ def _cards() -> list[dict]:
         {
             "key": "model_training",
             "status": "ok",
-            "details": {"optimization_target": PROFIT_TRAINING_TARGET},
+            "details": {
+                "optimization_target": PROFIT_TRAINING_TARGET,
+                "live_ml_ready": True,
+                "model_critical_items": [],
+                "local_ai_tools": {
+                    "profit_factor": 1.25,
+                    "return_lcb_pct": 0.04,
+                    "mean_fee_after_return_pct": 0.08,
+                },
+            },
         },
         {"key": "phase3_model_server_readiness", "status": "ok", "details": {}},
+        {
+            "key": "phase3_paper_resume_preflight",
+            "status": "ok",
+            "details": {
+                "status": "ready",
+                "can_resume_paper": True,
+                "blockers": [],
+            },
+        },
     ]
 
 
@@ -165,6 +183,66 @@ def test_phase3_go_no_go_rejects_non_return_training_objective() -> None:
     report = evaluate_phase3_go_no_go_cards(cards)
 
     assert "model_training_objective_mismatch" in report["blocker_codes"]
+
+
+def test_phase3_go_no_go_rejects_local_ml_without_production_readiness() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["live_ml_ready"] = False
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["status"] == "no_go"
+    assert "local_ml_not_live_ready" in report["blocker_codes"]
+
+
+def test_phase3_go_no_go_rejects_training_resource_failures() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["model_critical_items"] = [
+        {"model_id": "profit", "error": "MemoryError"}
+    ]
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert "model_training_resource_failure" in report["blocker_codes"]
+
+
+def test_phase3_go_no_go_rejects_unprofitable_model_metrics() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["local_ai_tools"] = {
+        "profit_factor": 0.32,
+        "return_lcb_pct": -0.13,
+        "mean_fee_after_return_pct": -0.54,
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert {
+        "model_profit_factor_below_unity",
+        "model_return_lcb_not_positive",
+        "model_fee_after_return_not_positive",
+    }.issubset(report["blocker_codes"])
+
+
+def test_phase3_go_no_go_rejects_paper_resume_without_operator_safe_preflight() -> None:
+    cards = deepcopy(_cards())
+    preflight = next(
+        card for card in cards if card["key"] == "phase3_paper_resume_preflight"
+    )
+    preflight["status"] = "warning"
+    preflight["details"] = {
+        "status": "blocked",
+        "can_resume_paper": False,
+        "blockers": [{"code": "okx_authoritative_sync_not_clean"}],
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is False
+    assert report["status"] == "no_go"
+    assert "paper_resume_preflight_not_ready" in report["blocker_codes"]
 
 
 def test_phase3_go_no_go_keeps_warning_observable_without_hard_threshold() -> None:

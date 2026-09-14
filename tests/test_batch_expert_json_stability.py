@@ -285,7 +285,10 @@ async def test_batch_expert_missing_provider_group_is_repaired(
         api_config={
             "api_base": LOCAL_QWEN_TEST_BASE,
             "api_key": "test-key",
-            "model": "qwen3.8-27b",
+            # Exercise the generic provider repair contract. The
+            # production Qwen3.8-27B carrier intentionally fail-closes
+            # instead of queueing a second repair request.
+            "model": "local-batch-test",
             "role": "short_timeseries",
         },
     )
@@ -303,10 +306,9 @@ async def test_batch_expert_missing_provider_group_is_repaired(
     # a length-limited completion and OpenAI's parse helper would raise before
     # LLMAgent can classify that output safely.
     assert all("response_format" not in kwargs.get("model_kwargs", {}) for kwargs in captured_kwargs)
-    assert all(
-        kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
-        for kwargs in captured_kwargs
-    )
+    # The generic provider path must not receive Qwen-specific template
+    # controls; those are injected only for the production Qwen carrier.
+    assert all("extra_body" not in kwargs for kwargs in captured_kwargs)
     assert decisions["risk_expert"].raw_response["batch_repair_retry"] is True
     assert decisions["risk_expert"].position_size_pct == 0.0
     assert decisions["risk_expert"].suggested_leverage == 1.0
@@ -392,7 +394,7 @@ async def test_batch_expert_missing_after_repair_raises_for_independent_retry(
         api_config={
             "api_base": LOCAL_QWEN_TEST_BASE,
             "api_key": "test-key",
-            "model": "qwen3.8-27b",
+            "model": "local-batch-test",
             "role": "short_timeseries",
         },
     )

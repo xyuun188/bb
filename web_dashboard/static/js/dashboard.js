@@ -1811,6 +1811,11 @@ function activateSettingsTab(name = 'okx') {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
     if (selected === 'trading') fetchTradingParams();
+    if (selected === 'models') {
+        fetchAIModels();
+        fetchTradingParams();
+        fetchHighRiskReviewerSettings();
+    }
     if (selected === 'external-events') fetchDataCollectionSettings({ silent: true });
     if (selected === 'vector-memory') refreshVectorMemoryStatus({ silent: true });
 }
@@ -9234,8 +9239,8 @@ function renderModelList(models) {
             ? `<span style="color:var(--green);font-size:11px;">${m.configuration_type === 'keyless_loopback' ? '已设置（本地免 Key）' : '已设置'}</span>`
             : `<span style="color:var(--text-muted);font-size:11px;">${loading ? '加载中' : '未设置'}</span>`;
         const route = m.route_type === 'cloud'
-            ? '<span class="status-badge status-paused">云端</span>'
-            : '<span class="status-badge status-live">本地</span>';
+            ? '<span class="status-badge status-paused">云端低频</span>'
+            : '<span class="status-badge status-live">本地实时</span>';
         const actionButtons = loading
             ? '<button type="button" class="btn btn-sm" disabled title="配置加载中">编辑</button><button type="button" class="btn btn-sm" disabled title="配置加载中">测试</button>'
             : `<button type="button" class="btn btn-sm" data-model-action="edit" data-model-name="${escHtml(String(m.name || ''))}" title="编辑">编辑</button>
@@ -11006,6 +11011,78 @@ async function testHighRiskReviewer() {
     }
 }
 
+function collectHighRiskReviewerIdentity() {
+    const body = {
+        enabled: Boolean(document.getElementById('cfg-high-risk-review-enabled')?.checked),
+        api_base: document.getElementById('cfg-high-risk-review-api-base')?.value.trim() || '',
+        model: document.getElementById('cfg-high-risk-review-model')?.value.trim() || '',
+        revision: document.getElementById('cfg-high-risk-review-model-revision')?.value.trim() || '',
+    };
+    const key = document.getElementById('cfg-high-risk-review-api-key')?.value.trim() || '';
+    if (key && !key.startsWith('****')) body.api_key = key;
+    return body;
+}
+
+function collectHighRiskReviewerRuntime() {
+    const readNumber = (id, minimum, maximum, label, integer = false) => {
+        const input = document.getElementById(id);
+        if (!input || input.value === '') return undefined;
+        const value = integer ? parseInt(input.value, 10) : parseFloat(input.value);
+        if (!Number.isFinite(value) || value < minimum || value > maximum) {
+            throw new Error(`${label}必须在 ${minimum} 到 ${maximum} 之间`);
+        }
+        return value;
+    };
+    const tokenInput = document.getElementById('cfg-high-risk-review-max-tokens');
+    return {
+        high_risk_review_timeout_seconds: readNumber('cfg-high-risk-review-timeout', 5, 120, '审核超时'),
+        high_risk_review_max_tokens: readNumber(
+            'cfg-high-risk-review-max-tokens',
+            finiteInputNumberAttr(tokenInput, 'min', 160),
+            finiteInputNumberAttr(tokenInput, 'max', 600),
+            '审核 Token',
+            true,
+        ),
+        high_risk_review_circuit_breaker_failures: readNumber('cfg-high-risk-review-breaker-failures', 1, 20, '熔断失败次数', true),
+        high_risk_review_circuit_breaker_cooldown_seconds: readNumber('cfg-high-risk-review-breaker-cooldown', 5, 3600, '熔断冷却时间'),
+    };
+}
+
+async function saveHighRiskReviewerSettings() {
+    const button = document.getElementById('cloud-reviewer-save-btn');
+    const status = document.getElementById('cloud-reviewer-test-status');
+    if (button) { button.disabled = true; button.textContent = '保存中...'; }
+    try {
+        const reviewerRes = await fetchWithAuth('/api/settings/high-risk-review', dashboardWriteOptions({
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(collectHighRiskReviewerIdentity()),
+        }));
+        const reviewerData = await reviewerRes.json().catch(() => ({}));
+        if (!reviewerRes.ok) throw new Error(apiErrorText(reviewerData));
+
+        const runtimeRes = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(collectHighRiskReviewerRuntime()),
+        }));
+        const runtimeData = await runtimeRes.json().catch(() => ({}));
+        if (!runtimeRes.ok) throw new Error(apiErrorText(runtimeData));
+        await fetchHighRiskReviewerSettings();
+        if (status) {
+            status.textContent = '配置已保存；启用前仍需连接测试通过';
+            status.style.color = 'var(--success, #22c55e)';
+        }
+    } catch (err) {
+        if (status) {
+            status.textContent = `保存失败：${err.message || err}`;
+            status.style.color = 'var(--danger, #ef4444)';
+        }
+    } finally {
+        if (button) { button.disabled = false; button.textContent = '保存云端配置'; }
+    }
+}
+
 async function saveTradingParams() {
     const intervalInput = document.getElementById('cfg-decision-interval');
     const localToolsEnabledInput = document.getElementById('cfg-local-ai-tools-enabled');
@@ -11013,15 +11090,6 @@ async function saveTradingParams() {
     const localToolsTimeoutInput = document.getElementById('cfg-local-ai-tools-timeout');
     const localToolsBreakerFailuresInput = document.getElementById('cfg-local-ai-tools-breaker-failures');
     const localToolsBreakerCooldownInput = document.getElementById('cfg-local-ai-tools-breaker-cooldown');
-    const highRiskEnabledInput = document.getElementById('cfg-high-risk-review-enabled');
-    const highRiskBaseInput = document.getElementById('cfg-high-risk-review-api-base');
-    const highRiskKeyInput = document.getElementById('cfg-high-risk-review-api-key');
-    const highRiskModelInput = document.getElementById('cfg-high-risk-review-model');
-    const highRiskRevisionInput = document.getElementById('cfg-high-risk-review-model-revision');
-    const highRiskTimeoutInput = document.getElementById('cfg-high-risk-review-timeout');
-    const highRiskMaxTokensInput = document.getElementById('cfg-high-risk-review-max-tokens');
-    const highRiskBreakerFailuresInput = document.getElementById('cfg-high-risk-review-breaker-failures');
-    const highRiskBreakerCooldownInput = document.getElementById('cfg-high-risk-review-breaker-cooldown');
 
     const body = {};
     if (intervalInput && intervalInput.value) {
@@ -11057,57 +11125,6 @@ async function saveTradingParams() {
         }
         body.local_ai_tools_circuit_breaker_cooldown_seconds = cooldown;
     }
-    const reviewerBody = {
-        enabled: Boolean(highRiskEnabledInput?.checked),
-        api_base: highRiskBaseInput?.value.trim() || '',
-        model: highRiskModelInput?.value.trim() || '',
-        revision: highRiskRevisionInput?.value.trim() || '',
-    };
-    if (highRiskKeyInput && highRiskKeyInput.value.trim() && !highRiskKeyInput.value.trim().startsWith('****')) {
-        reviewerBody.api_key = highRiskKeyInput.value.trim();
-    }
-    if (highRiskTimeoutInput && highRiskTimeoutInput.value !== '') {
-        const timeout = parseFloat(highRiskTimeoutInput.value);
-        if (!Number.isFinite(timeout) || timeout < 5 || timeout > 120) {
-            alert('保存失败: 高风险复核超时必须在 5 到 120 秒之间');
-            return;
-        }
-        body.high_risk_review_timeout_seconds = timeout;
-    }
-    if (highRiskMaxTokensInput && highRiskMaxTokensInput.value !== '') {
-        const maxTokens = parseInt(highRiskMaxTokensInput.value, 10);
-        const tokenFloor = finiteInputNumberAttr(highRiskMaxTokensInput, 'min', 1);
-        const tokenCap = finiteInputNumberAttr(highRiskMaxTokensInput, 'max', Number.MAX_SAFE_INTEGER);
-        if (!Number.isFinite(maxTokens) || maxTokens < tokenFloor || maxTokens > tokenCap) {
-            alert(`保存失败: 高风险复核最大输出 Token 必须在 ${tokenFloor} 到 ${tokenCap} 之间`);
-            return;
-        }
-        body.high_risk_review_max_tokens = maxTokens;
-    }
-    if (highRiskBreakerFailuresInput && highRiskBreakerFailuresInput.value !== '') {
-        const failures = parseInt(highRiskBreakerFailuresInput.value, 10);
-        if (!Number.isFinite(failures) || failures < 1 || failures > 20) {
-            alert('保存失败: 高风险复核熔断失败次数必须在 1 到 20 之间');
-            return;
-        }
-        body.high_risk_review_circuit_breaker_failures = failures;
-    }
-    if (highRiskBreakerCooldownInput && highRiskBreakerCooldownInput.value !== '') {
-        const cooldown = parseFloat(highRiskBreakerCooldownInput.value);
-        if (!Number.isFinite(cooldown) || cooldown < 5 || cooldown > 3600) {
-            alert('保存失败: 高风险复核熔断冷却时间必须在 5 到 3600 秒之间');
-            return;
-        }
-        body.high_risk_review_circuit_breaker_cooldown_seconds = cooldown;
-    }
-    const reviewerRes = await fetchWithAuth('/api/settings/high-risk-review', dashboardWriteOptions({
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reviewerBody),
-    }));
-    if (!reviewerRes.ok) {
-        const err = await reviewerRes.json().catch(() => ({}));
-        alert('云端 reviewer 保存失败: ' + apiErrorText(err));
-        return;
-    }
     const res = await fetchWithAuth('/api/settings/thresholds', dashboardWriteOptions({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -11122,7 +11139,6 @@ async function saveTradingParams() {
 
     const data = await res.json();
     state.decisionInterval = data.decision_interval;
-    await fetchHighRiskReviewerSettings();
     await fetchThresholdCatalog();
     alert('参数已保存，立即生效');
 }
@@ -11132,6 +11148,7 @@ window.showAnalysisReason = showAnalysisReason;
 window.changeAnalysisPage = changeAnalysisPage;
 window.fetchAnalysisRecords = fetchAnalysisRecords;
 window.testHighRiskReviewer = testHighRiskReviewer;
+window.saveHighRiskReviewerSettings = saveHighRiskReviewerSettings;
 window.editModel = editModel;
 window.testModelByName = testModelByName;
 window.closeModelModal = closeModelModal;
@@ -11535,12 +11552,22 @@ function renderTrainableModels() {
         canary: '小资金验证', live: '已介入实盘', not_trained: '未训练',
         service_unavailable: '服务不可用',
     };
+    const executionPlaneLabels = {
+        local: '本地服务器',
+        cloud: '云端模型',
+    };
     const models = registryModels.map(model => ({
         title: model.display_name || model.model_id || '-',
         type: model.model_family || '-',
         ready: Boolean(model.runtime_available && model.identity_verified),
-        statusLabel: lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
-        description: `任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
+        statusLabel: model.lifecycle === 'service_unavailable' && model.availability_scope === 'optional_enhancement'
+            ? '可选增强未启用'
+            : model.runtime_available && model.runtime_role === 'decision_and_expert_carrier' && model.specialization_evidence_verified !== true
+                ? '运行可用，FinQuant/盈利证据未达标'
+                : model.lifecycle === 'service_unavailable' && model.execution_plane === 'cloud'
+                    ? '云端未配置'
+                    : lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
+        description: `${executionPlaneLabels[model.execution_plane] || '运行位置未说明'}；任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
         samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
         trainedAt: model.trained_at ? toBeijingTime(model.trained_at) : '-',
         usage: model.live_ml_ready ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
@@ -11548,7 +11575,7 @@ function renderTrainableModels() {
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
             { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
-            { label: '运行服务', value: model.runtime_available ? '可用' : '不可用' },
+            { label: '运行服务', value: model.runtime_available ? '可用' : (model.availability_scope === 'optional_enhancement' ? '未启用（可选）' : '不可用') },
         ],
         note: Array.isArray(model.blocking_reasons) && model.blocking_reasons.length
             ? `阻塞原因：${model.blocking_reasons.join('、')}`

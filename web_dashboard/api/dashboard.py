@@ -4158,6 +4158,26 @@ async def _completed_ml_shadow_sample_count() -> int:
             return db_count
     except Exception as exc:
         _log_dashboard_fallback("ml signal phase3 sample count fallback", exc)
+    # Keep the dashboard diagnostic useful during the short window before the
+    # first training epoch marker is published. This is intentionally read-only
+    # and does not broaden the training loader or promotion gate.
+    try:
+        from sqlalchemy import func, select
+
+        from db.session import get_read_session_ctx
+        from models.learning import ShadowBacktest
+
+        async with get_read_session_ctx() as session:
+            result = await session.execute(
+                select(func.count(ShadowBacktest.id)).where(
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                )
+            )
+            return int(result.scalar() or 0)
+    except Exception as exc:
+        _log_dashboard_fallback("ml signal raw shadow count fallback", exc)
     ml_signal_service = _dashboard_ml_signal_service()
     if not ml_signal_service:
         return 0
@@ -7981,15 +8001,45 @@ async def _build_ml_signal_status() -> dict[str, Any]:
         status.get("sample_count") or status.get("trained_sample_count"), 0
     )
     try:
-        completed_total = await _await_dashboard_operation_bounded(
-            _completed_ml_shadow_sample_count(),
-            timeout_seconds=_DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS,
-            label="dashboard ML shadow sample count",
-        )
+        # A fresh deployment has no epoch marker yet.  The model service may
+        # still expose a stale artifact cursor in that state, so use the
+        # authoritative DB count for this dashboard diagnostic instead of
+        # presenting the service cursor as current-epoch data.
+        try:
+            epoch_started_at = load_training_epoch_start().isoformat()
+        except Exception as exc:
+            _log_dashboard_fallback("ml signal epoch marker fallback", exc)
+            from sqlalchemy import func, select
+
+            from db.session import get_read_session_ctx
+            from models.learning import ShadowBacktest
+
+            async def _count_all_completed_shadow_rows() -> int:
+                async with get_read_session_ctx() as session:
+                    result = await session.execute(
+                        select(func.count(ShadowBacktest.id)).where(
+                            ShadowBacktest.status == "completed",
+                            ShadowBacktest.long_return_pct.is_not(None),
+                            ShadowBacktest.short_return_pct.is_not(None),
+                        )
+                    )
+                    return int(result.scalar() or 0)
+
+            completed_total = await _await_dashboard_operation_bounded(
+                _count_all_completed_shadow_rows(),
+                timeout_seconds=_DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS,
+                label="dashboard ML shadow sample count",
+            )
+        else:
+            completed_total = await _await_dashboard_operation_bounded(
+                _completed_ml_shadow_sample_count(),
+                timeout_seconds=_DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS,
+                label="dashboard ML shadow sample count",
+            )
         completed_total = int(completed_total or 0)
         trained_cursor = _trained_shadow_cursor(status, completed_total)
         status["training_policy"] = "current_training_epoch_only"
-        status["training_epoch_started_at"] = load_training_epoch_start().isoformat()
+        status["training_epoch_started_at"] = epoch_started_at
         status["pre_epoch_data_training_allowed"] = False
         status["artifact_training_shadow_sample_count"] = artifact_training_count
         status["training_shadow_sample_count"] = completed_total
@@ -8121,10 +8171,41 @@ async def get_local_ai_tools_status():
                 _completed_trade_sample_count,
             )
 
+            async def _shadow_count_for_dashboard() -> int:
+                try:
+                    return int(await _completed_shadow_sample_count())
+                except Exception as exc:
+                    # A brand-new deployment may not have its epoch marker yet.
+                    # Keep the diagnostic endpoint populated without weakening
+                    # the training gate itself (training still requires the
+                    # marker and therefore remains fail-closed).
+                    _log_dashboard_fallback("local ai shadow cursor epoch fallback", exc)
+                    from sqlalchemy import func, select
+
+                    from db.session import get_read_session_ctx
+                    from models.learning import ShadowBacktest
+
+                    async with get_read_session_ctx() as session:
+                        result = await session.execute(
+                            select(func.count(ShadowBacktest.id)).where(
+                                ShadowBacktest.status == "completed",
+                                ShadowBacktest.long_return_pct.is_not(None),
+                                ShadowBacktest.short_return_pct.is_not(None),
+                            )
+                        )
+                        return int(result.scalar() or 0)
+
+            async def _trade_count_for_dashboard() -> int:
+                try:
+                    return int(await _completed_trade_sample_count())
+                except Exception as exc:
+                    _log_dashboard_fallback("local ai trade cursor fallback", exc)
+                    return 0
+
             completed_shadow_count, completed_trade_count = await asyncio.wait_for(
                 asyncio.gather(
-                    _completed_shadow_sample_count(),
-                    _completed_trade_sample_count(),
+                    _shadow_count_for_dashboard(),
+                    _trade_count_for_dashboard(),
                 ),
                 timeout=_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS,
             )
@@ -8133,10 +8214,19 @@ async def get_local_ai_tools_status():
                 0,
             )
             artifact_trade_count = _safe_int_value(status.get("trade_sample_count"), 0)
+            # Training counters remain useful even before the epoch marker has
+            # been initialized (for example during a fresh deployment).  Read
+            # the marker independently so one missing diagnostic cannot erase
+            # the rest of the stable status contract.
+            try:
+                epoch_started_at = load_training_epoch_start().isoformat()
+            except Exception as exc:
+                _log_dashboard_fallback("local ai training epoch marker fallback", exc)
+                epoch_started_at = None
             status.update(
                 {
                     "training_policy": "current_training_epoch_only",
-                    "training_epoch_started_at": load_training_epoch_start().isoformat(),
+                    "training_epoch_started_at": epoch_started_at,
                     "pre_epoch_data_training_allowed": False,
                     "shadow_sample_count": int(completed_shadow_count),
                     "completed_shadow_sample_count": int(completed_shadow_count),

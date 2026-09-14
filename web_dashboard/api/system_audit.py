@@ -1225,9 +1225,20 @@ def _phase3_dynamic_return_gate_status() -> dict[str, Any]:
         and go_no_go_details.get("ready") is True
         and can_resume_paper
     )
+    controlled_no_go = bool(
+        go_no_go_fresh
+        and preflight_fresh
+        and not ready
+        and (
+            go_status == "no_go"
+            or not can_resume_paper
+            or bool(go_no_go_details.get("blockers"))
+        )
+    )
     return {
         "ready": ready,
         "status": "go" if ready else "no_go",
+        "controlled_no_go": controlled_no_go,
         "go_no_go_status": go_status or "missing",
         "go_no_go_fresh": go_no_go_fresh,
         "preflight_fresh": preflight_fresh,
@@ -1686,8 +1697,10 @@ async def _trade_loop_audit() -> dict[str, Any]:
     dynamic_return_gate = (
         _phase3_dynamic_return_gate_status() if not runtime_running else {"ready": False}
     )
+    controlled_no_go = bool(dynamic_return_gate.get("controlled_no_go"))
     stalled = (
         not bool(dynamic_return_gate.get("ready"))
+        and not controlled_no_go
         and not market_analysis_paused
         and not cold_start
         and (recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600))
@@ -1706,6 +1719,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
         critical=stalled,
         warning=(
             bool(dynamic_return_gate.get("ready"))
+            or controlled_no_go
             or market_analysis_paused
             or cold_start_no_orders
             or orderless_observation
@@ -1734,6 +1748,11 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "The dynamic return gate is ready, but the trading service is stopped; "
             "this card remains an observation and grants no production permission."
         )
+    elif controlled_no_go:
+        summary = (
+            "Trading is intentionally stopped by a fresh Phase 3 No-Go/preflight gate; "
+            "this is a controlled fail-closed state, not a stalled analysis loop."
+        )
     return _audit_card(
         "trade_loop",
         "交易闭环",
@@ -1751,6 +1770,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "orderless_observation": orderless_observation,
             "market_analysis_paused": market_analysis_paused,
             "dynamic_return_gate_ready": bool(dynamic_return_gate.get("ready")),
+            "controlled_no_go": controlled_no_go,
             "dynamic_return_gate": dynamic_return_gate,
             "stale_runtime_heartbeat": stale_runtime_heartbeat,
             "runtime_heartbeat_fresh": runtime_heartbeat_fresh,
@@ -5613,6 +5633,8 @@ def _issue_ledger_state(
         and bool(details.get("dynamic_return_gate_ready"))
     ):
         return "observing", "观察项 / 收益门已就绪但交易服务当前停止"
+    if key == "trade_loop" and status == "warning" and bool(details.get("controlled_no_go")):
+        return "observing", "观察项 / 新鲜 No-Go 门禁下受控停机"
     if key == "trade_loop" and status == "warning" and bool(details.get("cold_start")):
         return "observing", "观察项 / 服务冷启动"
     if key == "trade_loop" and status == "warning" and bool(details.get("market_analysis_paused")):

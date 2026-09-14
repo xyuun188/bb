@@ -16,6 +16,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=PROJECT_ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=PROJECT_ROOT)
+
 from config.settings import settings  # noqa: E402
 from services.training_effectiveness_report import (  # noqa: E402
     TRAINING_EFFECTIVENESS_REPORT_VERSION,

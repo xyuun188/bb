@@ -122,6 +122,42 @@ def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
         assert [event["event"] for event in row["history"]] == ["started", "succeeded"]
 
 
+def test_external_training_result_updates_scheduler_state_and_cursor(tmp_path) -> None:
+    now = [datetime(2026, 9, 15, 1, 0, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+
+    store.record_external_result(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id="external-20260915",
+        result={
+            "trained": True,
+            "reason": "trained",
+            "artifact_persisted": True,
+            "last_trained_completed_shadow_sample_count": 2048,
+            "last_trained_completed_trade_sample_count": 512,
+            "last_trained_completed_training_decision_group_count": 128,
+        },
+        next_check_at=now[0] + timedelta(hours=6),
+    )
+
+    persisted = store.read()
+    for model_id in LOCAL_AI_TOOL_MODEL_IDS:
+        row = persisted["models"][model_id]
+        assert row["state"] == "succeeded"
+        assert row["last_run_id"] == "external-20260915"
+        assert row["last_successful_training_at"] == now[0].isoformat()
+        assert row["sample_cursor"] == {
+            "shadow": 2048,
+            "trade": 512,
+            "decision_group": 128,
+        }
+        assert row["history"][-1]["event"] == "external_succeeded"
+
+
 def test_resource_failures_backoff_and_open_circuit_until_input_changes(tmp_path) -> None:
     now = [datetime(2026, 8, 28, 1, 0, tzinfo=UTC)]
     store = ModelTrainingStateStore(

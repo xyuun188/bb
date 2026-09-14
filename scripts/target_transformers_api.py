@@ -67,7 +67,7 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     # The target carrier is reserved for the compact trading-diagnostic
     # contract. Larger legacy completions create long single-worker drains.
-    max_tokens: int = Field(default=128, ge=1, le=256)
+    max_tokens: int = Field(default=96, ge=1, le=256)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
 
@@ -117,9 +117,17 @@ class Runtime:
             "max_memory": {0: "34GiB", "cpu": "64GiB"},
             "low_cpu_mem_usage": True,
         }
-        requested_attention = str(
-            os.environ.get("BB_TARGET_ATTN_IMPLEMENTATION", "sdpa")
-        ).strip()
+        configured_attention = os.environ.get("BB_TARGET_ATTN_IMPLEMENTATION")
+        if configured_attention is None:
+            # FlashAttention-2 is materially faster on the A100 when the
+            # installed wheel is available.  Keep SDPA as the deterministic
+            # fallback for a clean target-inference environment.
+            configured_attention = (
+                "flash_attention_2"
+                if importlib.util.find_spec("flash_attn")
+                else "sdpa"
+            )
+        requested_attention = str(configured_attention).strip()
         if requested_attention:
             model_kwargs["attn_implementation"] = requested_attention
         try:
@@ -169,13 +177,17 @@ class Runtime:
         # A timed-out generation is isolated from the HTTP request; the process
         # is not killed and restarted for one slow prompt.
         self.max_queue_wait_seconds = _env_float(
-            "BB_TARGET_QUEUE_WAIT_SECONDS", 3.0, minimum=0.5, maximum=30.0
+            "BB_TARGET_QUEUE_WAIT_SECONDS", 2.0, minimum=0.5, maximum=30.0
         )
         self.generation_timeout_seconds = _env_float(
-            "BB_TARGET_GENERATION_TIMEOUT_SECONDS", 18.0, minimum=8.0, maximum=120.0
+            "BB_TARGET_GENERATION_TIMEOUT_SECONDS", 12.0, minimum=8.0, maximum=120.0
         )
+        # Keep the runtime contract identical to the generation boundary.
+        # Older unit files may still export 128/256; accepting those values
+        # makes readiness report a limit the carrier will never honor and
+        # encourages callers to enqueue unnecessarily long generations.
         self.max_new_tokens = _env_int(
-            "BB_TARGET_MAX_NEW_TOKENS", 128, minimum=64, maximum=256
+            "BB_TARGET_MAX_NEW_TOKENS", 96, minimum=64, maximum=96
         )
         self.warmup_timeout_seconds = 1800.0
         self.warmup_complete = False
@@ -379,8 +391,8 @@ class Runtime:
         # GPU when an older caller still sends max_tokens=320/1024.
         max_new_tokens = min(
             max(int(request.max_tokens), 1),
-            int(getattr(self, "max_new_tokens", 128) or 128),
-            128,
+            int(getattr(self, "max_new_tokens", 96) or 96),
+            96,
         )
         self._last_prompt_tokens = int(input_ids.shape[-1])
         generation_kwargs = {
@@ -415,15 +427,16 @@ def build_app(runtime: Runtime) -> FastAPI:
         return {"status": "ok", "model_id": runtime.model_id, "uptime_seconds": time.time() - started_at}
 
     @app.get("/health/ready")
-    def health_ready() -> dict[str, Any]:
-        return {
-            "status": (
-                "warming_up"
-                if not runtime.warmup_complete and not runtime.warmup_error
-                else "ready"
-                if runtime.warmup_complete and runtime.fast_path["enabled"]
-                else "degraded"
-            ),
+    def health_ready() -> JSONResponse:
+        status = (
+            "warming_up"
+            if not runtime.warmup_complete and not runtime.warmup_error
+            else "ready"
+            if runtime.warmup_complete and runtime.fast_path["enabled"]
+            else "degraded"
+        )
+        payload = {
+            "status": status,
             "model_id": runtime.model_id,
             "adapter_loaded": bool(runtime.adapter_path),
             "adapter_path": runtime.adapter_path or None,
@@ -449,6 +462,7 @@ def build_app(runtime: Runtime) -> FastAPI:
                 "cache_hits": runtime._response_cache_hits,
             },
         }
+        return JSONResponse(status_code=200 if status == "ready" else 503, content=payload)
 
     @app.get("/v1/models")
     def models() -> dict[str, Any]:

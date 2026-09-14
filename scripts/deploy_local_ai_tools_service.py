@@ -92,7 +92,7 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
     PHASE3_ROOT / "reports" / "inventory" / "phase3_model_download_manifest_latest.json"
 )
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
-CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"
+CURRENT_TRAINING_EPOCH_POLICY = "current_epoch_plus_approved_historical_rebuild"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
 TRAIN_REQUEST_TIMEOUT_SECONDS = min(
     max(

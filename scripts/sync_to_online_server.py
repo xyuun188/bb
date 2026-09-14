@@ -491,6 +491,15 @@ values['AI_MODELS'] = online_ai_models
 values['BB_MODEL_TOPOLOGY_PROFILE'] = topology_profile
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
+# Keep all platform processes aligned with the single-worker Qwen3.8-27B
+# carrier. These overwrite stale historical values during every deployment.
+values['AI_LLM_CONCURRENCY'] = '1'
+values['AI_LLM_MAX_CALLS_PER_ANALYSIS'] = '1'
+values['AI_EXPERT_TIMEOUT_SECONDS'] = '18'
+values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '18'
+values['AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS'] = '96'
+values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '18'
+values['AI_DECISION_MAKER_MAX_COMPLETION_TOKENS'] = '96'
 cloud_reviewer_api_base = first_non_empty(
     values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
     app_env_values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
@@ -882,27 +891,38 @@ def _split_services_restart_command(
     model_tunnel_restart: str,
     model_tunnel_active_check: str,
     model_readiness_refresh: str,
+    keep_trading_stopped: bool = False,
 ) -> str:
     quoted_trading = _remote_quote(trading_service)
     quoted_dashboard = _remote_quote(dashboard_service)
+    resume_command = (
+        f"systemctl start {quoted_dashboard} >/dev/null 2>&1 || true; "
+        f"systemctl stop {quoted_trading} >/dev/null 2>&1 || true; "
+        if keep_trading_stopped
+        else f"systemctl start {quoted_trading} {quoted_dashboard} >/dev/null 2>&1 || true; "
+    )
     maintenance_window = (
         "set -e; "
         "resume_platform_services() { "
-        f"systemctl start {quoted_trading} {quoted_dashboard} >/dev/null 2>&1 || true; "
-        "}; "
-        "trap resume_platform_services EXIT; "
+        + resume_command
+        + "}; "
+        + "trap resume_platform_services EXIT; "
         f"systemctl stop {quoted_trading} {quoted_dashboard}; "
     )
-    service_start = (
-        f"systemctl start {quoted_trading} {quoted_dashboard} && "
-    )
+    if keep_trading_stopped:
+        service_start = (
+            f"systemctl start {quoted_dashboard} && "
+            f"systemctl stop {quoted_trading} >/dev/null 2>&1 || true; "
+        )
+    else:
+        service_start = f"systemctl start {quoted_trading} {quoted_dashboard} && "
     return maintenance_window + model_tunnel_restart + (
         f"{model_readiness_refresh}"
         f"{model_tunnel_active_check}"
         f"{_okx_network_probe_command()}"
         f"{service_start}"
-        f"systemctl is-active {quoted_trading} && "
-        f"systemctl is-active {quoted_dashboard} && "
+        + ("systemctl is-active " + quoted_trading + " && " if not keep_trading_stopped else "")
+        + f"systemctl is-active {quoted_dashboard} && "
         "for i in $(seq 1 30); do "
         "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
         'case "$code" in 200|302|401) trap - EXIT; echo dashboard-ok:$code; exit 0;; esac; '
@@ -933,6 +953,11 @@ def parse_args() -> argparse.Namespace:
         "--require-model-tunnels",
         action="store_true",
         help="Fail the sync if loopback model tunnels do not become reachable.",
+    )
+    parser.add_argument(
+        "--keep-trading-stopped",
+        action="store_true",
+        help="Install/restart model tunnels and Dashboard while explicitly keeping the paper-trading service stopped.",
     )
     parser.add_argument(
         "--runtime-env-only",
@@ -1128,6 +1153,7 @@ def main() -> None:
                 model_tunnel_restart=model_tunnel_restart,
                 model_tunnel_active_check=model_tunnel_active_check,
                 model_readiness_refresh=model_readiness_refresh,
+                keep_trading_stopped=bool(args.keep_trading_stopped),
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return

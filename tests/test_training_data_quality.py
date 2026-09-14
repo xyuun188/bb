@@ -423,7 +423,7 @@ def test_training_payload_returns_trainable_samples_and_quality_report() -> None
     assert "include_score_threshold" not in report["policy"]
     governance = payload["governance_report"]
     assert governance["cleanup_mode"] == "quarantine_not_delete"
-    assert governance["training_policy"] == "current_training_epoch_only"
+    assert governance["training_policy"] == "current_epoch_plus_approved_historical_rebuild"
     assert governance["raw_records_preserved"] is True
     assert governance["quarantine_applied"] is True
     assert governance["requires_artifact_refresh"] is True

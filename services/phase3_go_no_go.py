@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
@@ -20,6 +21,37 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _first_nested_metric(value: Any, names: tuple[str, ...], *, depth: int = 0) -> float | None:
+    """Find one named scalar in bounded audit payloads without coupling to UI shape."""
+
+    if depth > 6:
+        return None
+    if isinstance(value, dict):
+        for name in names:
+            if name in value:
+                number = _safe_float(value.get(name))
+                if number is not None:
+                    return number
+        for nested in value.values():
+            number = _first_nested_metric(nested, names, depth=depth + 1)
+            if number is not None:
+                return number
+    elif isinstance(value, list):
+        for nested in value[:40]:
+            number = _first_nested_metric(nested, names, depth=depth + 1)
+            if number is not None:
+                return number
+    return None
 
 
 def _blocker(code: str, message: str, evidence: Any | None = None) -> dict[str, Any]:
@@ -220,6 +252,98 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         )
 
+    paper_resume_card = by_key.get("phase3_paper_resume_preflight")
+    if paper_resume_card is not None:
+        paper_resume = _details(paper_resume_card)
+        paper_resume_status = str(paper_resume_card.get("status") or "unknown").lower()
+        if (
+            "phase3_paper_resume_preflight" not in deferred_required
+            and paper_resume_status != "critical"
+            and paper_resume.get("can_resume_paper") is not True
+        ):
+            blockers.append(
+                _blocker(
+                    "paper_resume_preflight_not_ready",
+                    "Paper trading resume preflight has not granted a controlled resume.",
+                    evidence={
+                        "status": paper_resume.get("status"),
+                        "blockers": _safe_list(paper_resume.get("blockers")),
+                    },
+                )
+            )
+
+    local_ai_tools = _safe_dict(training.get("local_ai_tools"))
+    live_ml_ready = training.get("live_ml_ready")
+    if live_ml_ready is None:
+        live_ml_ready = local_ai_tools.get("live_ml_ready")
+    # Older/read-only audit cards may omit this optional promotion field. Only
+    # an explicit false is a production-readiness blocker; absence is handled
+    # by the dedicated model-training card and profitability evidence.
+    if "model_training" not in deferred_required and live_ml_ready is False:
+        blockers.append(
+            _blocker(
+                "local_ml_not_live_ready",
+                "Local ML has not passed the production profitability gate.",
+                evidence={"live_ml_ready": live_ml_ready},
+            )
+        )
+
+    model_critical_items = _safe_list(training.get("model_critical_items"))
+    if model_critical_items:
+        blockers.append(
+            _blocker(
+                "model_training_resource_failure",
+                "One or more required local ML models failed training or resource validation.",
+                evidence={"items": model_critical_items[:8]},
+            )
+        )
+
+    profitability_evidence = local_ai_tools or training
+    profit_factor = _first_nested_metric(
+        profitability_evidence,
+        ("profit_factor", "top_profit_factor", "top_long_profit_factor"),
+    )
+    return_lcb = _first_nested_metric(
+        profitability_evidence,
+        ("return_lcb_pct", "return_lcb", "return_lower_bound", "fee_after_return_lcb_pct"),
+    )
+    mean_fee_after_return = _first_nested_metric(
+        profitability_evidence,
+        (
+            "mean_fee_after_return_pct",
+            "avg_fee_after_return_pct",
+            "average_fee_after_return_pct",
+            "fee_after_mean_return_pct",
+        ),
+    )
+    if profit_factor is not None and profit_factor < 1.0:
+        blockers.append(
+            _blocker(
+                "model_profit_factor_below_unity",
+                "The evaluated model loses more than it earns after costs.",
+                evidence={"profit_factor": profit_factor, "required_minimum": 1.0},
+            )
+        )
+    if return_lcb is not None and return_lcb <= 0.0:
+        blockers.append(
+            _blocker(
+                "model_return_lcb_not_positive",
+                "The evaluated model return lower confidence bound is not positive.",
+                evidence={"return_lcb_pct": return_lcb, "required_minimum_exclusive": 0.0},
+            )
+        )
+    if mean_fee_after_return is not None and mean_fee_after_return <= 0.0:
+        blockers.append(
+            _blocker(
+                "model_fee_after_return_not_positive",
+                "The evaluated model mean return is not positive after all costs.",
+                evidence={
+                    "mean_fee_after_return_pct": mean_fee_after_return,
+                    "required_minimum_exclusive": 0.0,
+                },
+            )
+        )
+
     blocker_codes = {item["code"] for item in blockers}
     warning_codes = {item["code"] for item in warnings}
     return {
@@ -236,6 +360,10 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             "current_contract_violation_count": violation_count,
             "position_economics_incomplete_count": economics_gaps,
             "executed_dynamic_exit_contract_gap_count": exit_gaps,
+            "live_ml_ready": live_ml_ready is True,
+            "model_profit_factor": profit_factor,
+            "model_return_lcb_pct": return_lcb,
+            "model_mean_fee_after_return_pct": mean_fee_after_return,
         },
         "policy": {
             "optimization_target": PROFIT_TRAINING_TARGET,

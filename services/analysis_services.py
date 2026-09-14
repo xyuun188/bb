@@ -78,8 +78,6 @@ class _ScopedAnalysisService:
 
     async def loop(self, interval_seconds: float | IntervalProvider) -> None:
         await asyncio.sleep(self.initial_delay_seconds)
-        loop = asyncio.get_running_loop()
-        next_round_at = loop.time()
         while self.is_running():
             try:
                 await self._run_loop_round()
@@ -106,17 +104,11 @@ class _ScopedAnalysisService:
             if not self.is_running():
                 break
             interval = self._resolve_interval(interval_seconds)
-            next_round_at += interval
-            now = loop.time()
-            if next_round_at <= now:
-                # A slow round must not trigger a tight catch-up loop.  The
-                # previous scheduler reset to ``now`` when a round overran
-                # its interval, which immediately started another round and
-                # could drive the trading process to 100% CPU while the
-                # database/exchange work was still under pressure.  Drop the
-                # missed tick and schedule one full interval after completion.
-                next_round_at = now + interval
-            await asyncio.sleep(max(next_round_at - now, 0.0))
+            # Schedule from completion, not from the original wall-clock
+            # tick.  A timed-out or slow round must always release the
+            # scheduler for one complete interval; retaining the old tick
+            # shortened the wait and could create back-to-back pressure.
+            await asyncio.sleep(interval)
 
     async def _run_loop_round(self) -> None:
         time_budget = self._time_budget_seconds()

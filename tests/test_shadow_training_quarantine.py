@@ -29,7 +29,7 @@ from services.training_data_quality import assess_shadow_sample
 @pytest.fixture(autouse=True)
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "services.shadow_training_quarantine.load_training_epoch_start",
+        "services.shadow_training_quarantine.load_training_data_start",
         lambda: datetime(2026, 1, 1, tzinfo=UTC),
     )
 

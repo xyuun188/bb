@@ -1484,59 +1484,6 @@
                             </div>
                         </div>
                     </div>
-                    <div class="settings-panel">
-                        <div class="settings-panel-title">高风险复核模型</div>
-                        <div class="form-group" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-                            <div>
-                                <label class="form-label" style="margin-bottom:2px;">重大冲突时复核</label>
-                                <div style="font-size:10px;color:var(--text-muted);line-height:1.5;">只在专家方向严重冲突时调用，失败后回退主模型</div>
-                            </div>
-                            <label class="toggle" title="开启 32B 高风险复核">
-                                <input type="checkbox" id="cfg-high-risk-review-enabled">
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">复核接口地址</label>
-                            <input type="text" class="form-input" id="cfg-high-risk-review-api-base" placeholder="线上模型接口地址">
-                        </div>
-                        <div class="form-group" style="margin-top:10px;">
-                            <label class="form-label">复核密钥</label>
-                            <input type="password" class="form-input" id="cfg-high-risk-review-api-key" placeholder="线上模型密钥，留空不变">
-                        </div>
-                        <div class="form-group" style="margin-top:10px;">
-                            <label class="form-label">复核模型名</label>
-                            <input type="text" class="form-input" id="cfg-high-risk-review-model" placeholder="线上审核模型 ID">
-                        </div>
-                        <div class="form-group" style="margin-top:10px;">
-                            <label class="form-label">模型版本 / Revision</label>
-                            <input type="text" class="form-input" id="cfg-high-risk-review-model-revision" placeholder="线上模型固定版本或 revision">
-                        </div>
-                        <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
-                            <button type="button" class="btn btn-outline btn-sm" id="cloud-reviewer-test-btn" onclick="testHighRiskReviewer()">测试云端连接</button>
-                            <span id="cloud-reviewer-test-status" style="font-size:11px;color:var(--text-muted);">尚未测试</span>
-                        </div>
-                        <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:10px;">
-                            <div class="form-group">
-                                <label class="form-label">复核超时秒数</label>
-                                <input type="number" class="form-input" id="cfg-high-risk-review-timeout" min="5" max="120" step="1" placeholder="30">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">最大输出 Token</label>
-                                <input type="number" class="form-input" id="cfg-high-risk-review-max-tokens" min="160" max="600" step="20" placeholder="480">
-                            </div>
-                        </div>
-                        <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:10px;">
-                            <div class="form-group">
-                                <label class="form-label">熔断失败次数</label>
-                                <input type="number" class="form-input" id="cfg-high-risk-review-breaker-failures" min="1" max="20" step="1" placeholder="2">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">熔断冷却秒数</label>
-                                <input type="number" class="form-input" id="cfg-high-risk-review-breaker-cooldown" min="5" max="3600" step="5" placeholder="120">
-                            </div>
-                        </div>
-                    </div>
                 </div>
                 <div style="padding:8px 12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;">
                     <button class="btn btn-accent btn-sm" onclick="saveTradingParams()">保存参数</button>
@@ -1582,7 +1529,59 @@
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">AI 专家模型配置</span>
-                    <span class="card-subtitle">固定专家槽位；编辑和测试直接作用于本地模型路由</span>
+                    <span class="card-subtitle">本地实时推理与云端低频复核分开配置</span>
+                </div>
+                <div class="settings-panel" style="margin:0 12px 12px;">
+                    <div class="settings-panel-title">云端低频高风险复核</div>
+                    <div class="form-group" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                        <div>
+                            <label class="form-label" style="margin-bottom:2px;">仅在重大冲突时复核</label>
+                            <div style="font-size:10px;color:var(--text-muted);line-height:1.5;">不参与常规扫描；配置不完整、超时或失败时，高风险新开仓保持 fail-closed</div>
+                        </div>
+                        <label class="toggle" title="开启云端高风险复核">
+                            <input type="checkbox" id="cfg-high-risk-review-enabled">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="settings-form-grid">
+                        <div class="form-group">
+                            <label class="form-label">HTTPS API Base</label>
+                            <input type="text" class="form-input" id="cfg-high-risk-review-api-base" placeholder="https://provider.example/v1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Key</label>
+                            <input type="password" class="form-input" id="cfg-high-risk-review-api-key" placeholder="线上模型密钥，留空不变">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">模型 ID</label>
+                            <input type="text" class="form-input" id="cfg-high-risk-review-model" placeholder="固定模型 ID">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Revision</label>
+                            <input type="text" class="form-input" id="cfg-high-risk-review-model-revision" placeholder="固定版本或 revision">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">超时秒数</label>
+                            <input type="number" class="form-input" id="cfg-high-risk-review-timeout" min="5" max="120" step="1" placeholder="30">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">最大输出 Token</label>
+                            <input type="number" class="form-input" id="cfg-high-risk-review-max-tokens" min="160" max="600" step="20" placeholder="480">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">熔断失败次数</label>
+                            <input type="number" class="form-input" id="cfg-high-risk-review-breaker-failures" min="1" max="20" step="1" placeholder="2">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">熔断冷却秒数</label>
+                            <input type="number" class="form-input" id="cfg-high-risk-review-breaker-cooldown" min="5" max="3600" step="5" placeholder="120">
+                        </div>
+                    </div>
+                    <div class="settings-actions">
+                        <button type="button" class="btn btn-accent btn-sm" id="cloud-reviewer-save-btn" onclick="saveHighRiskReviewerSettings()">保存云端配置</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="cloud-reviewer-test-btn" onclick="testHighRiskReviewer()">测试云端连接</button>
+                        <span id="cloud-reviewer-test-status" class="settings-inline-status">尚未测试</span>
+                    </div>
                 </div>
                 <div id="ai-model-route-summary" class="settings-readonly-note" style="margin:0 12px 10px;">
                     本地实时专家统一走本地 Qwen3.8-27B；低频云端能力单独列出：高风险开仓复核可走云端，重大分歧会诊当前本地回退，新闻/事件复核只进入采集与训练，不直接下单。

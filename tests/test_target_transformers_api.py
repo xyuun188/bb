@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from scripts.target_transformers_api import ChatRequest, Runtime
+from scripts.target_transformers_api import ChatRequest, Runtime, build_app
 
 
 class _FakeInputIds:
@@ -110,4 +110,34 @@ def test_generate_caps_legacy_large_completion_request(
     )
 
     assert instance.generate(request) == '{"status":"ok"}'
-    assert instance.model.kwargs["max_new_tokens"] == 128
+    assert instance.model.kwargs["max_new_tokens"] == 96
+
+
+def test_health_ready_rejects_traffic_until_warmup_completes() -> None:
+    instance = object.__new__(Runtime)
+    instance.model_id = "qwen3.8-27b"
+    instance.adapter_path = "/data/adapter"
+    instance.fast_path = {"enabled": True}
+    instance.attention_implementation = "sdpa"
+    instance.warmup_complete = False
+    instance.warmup_error = None
+    instance.warmup_started_at = 1.0
+    instance.warmup_finished_at = None
+    instance.max_queue_wait_seconds = 2.0
+    instance.generation_timeout_seconds = 12.0
+    instance.max_new_tokens = 96
+    instance._generation_timeouts = 0
+    instance._last_generation_seconds = None
+    instance._last_prompt_tokens = 0
+    instance._last_generation_tokens = 0
+    instance._response_cache_ttl_seconds = 2.0
+    instance._response_cache_hits = 0
+    instance.generation_busy = lambda: True
+
+    route = next(
+        route for route in build_app(instance).routes if route.path == "/health/ready"
+    )
+    response = route.endpoint()
+
+    assert response.status_code == 503
+    assert b'"status":"warming_up"' in response.body

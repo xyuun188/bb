@@ -118,6 +118,57 @@ def test_registry_marks_verified_finquant_specialization_as_trained() -> None:
     assert finquant["lifecycle"] == "trained"
 
 
+def test_registry_uses_manifest_service_when_required_slots_are_empty() -> None:
+    payload = build_model_training_registry(
+        model_server_report={
+            "target_model_topology": {
+                "model_id": "qwen3.8-27b",
+                "service_ready": True,
+                "endpoint_ready": True,
+                "runtime_ready": True,
+            },
+            "required_slots": [],
+            "manifest_services": [
+                {
+                    "slot": "llm_decision_and_expert_carrier",
+                    "served_model_name": "qwen3.8-27b",
+                    "service_active": True,
+                    "endpoint_ready": True,
+                }
+            ],
+        }
+    )
+
+    finquant = _by_id(payload)[TARGET_SINGLE_MODEL_ID]
+    assert finquant["runtime_available"] is True
+    assert finquant["execution_plane"] == "local"
+    assert finquant["availability_scope"] == "core_local"
+    assert finquant["runtime_evidence"] == "manifest_service"
+    assert finquant["artifact_available"] is False
+    assert finquant["lifecycle"] == "promotion_blocked"
+
+
+def test_registry_marks_optional_specialists_without_calling_them_core_failures() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={
+            "transformers_sentiment_backend": {"available": False},
+        },
+        specialist_report={},
+    )
+    rows = _by_id(payload)
+    assert rows["timesfm_2_5"]["availability_scope"] == "optional_enhancement"
+    assert rows["timesfm_2_5"]["execution_plane"] == "local"
+    assert rows["timesfm_2_5"]["lifecycle"] == "service_unavailable"
+
+
+def test_dashboard_distinguishes_local_cloud_and_optional_model_states() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    assert "可选增强未启用" in script
+    assert "云端未配置" in script
+    assert "本地服务器" in script
+    assert "云端模型" in script
+
+
 def test_registry_does_not_publish_retired_llm_rows() -> None:
     payload = build_model_training_registry(
         model_server_report={

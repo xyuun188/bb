@@ -23,6 +23,7 @@ from core.secret_utils import is_masked_secret, is_sensitive_key, redact_mapping
 
 ENSEMBLE_TRADER_NAME = "ensemble_trader"
 DECISION_MAKER_NAME = "decision_maker"
+TARGET_LOCAL_AI_API_BASE = "http://127.0.0.1:18000/v1"
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 ENV_SIMPLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@,+-]*$")
 RUNTIME_ENV_REFRESH_MIN_SECONDS = 2.0
@@ -287,9 +288,9 @@ class Settings(BaseSettings):
     position_analysis_watchdog_seconds: int = 180
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
-    # Generic callers retain the historical capacity; the online runtime
-    # environment pins this to one for the single-worker Qwen carrier.
-    ai_llm_concurrency: int = 2
+    # The verified Qwen3.8-27B carrier has one worker. Extra client-side
+    # concurrency only creates a queue and makes a fast request look slow.
+    ai_llm_concurrency: int = 1
     # Bound provider calls per symbol analysis so repair/fallback/consultation
     # cannot turn one local-model round into a multi-minute queue.
     # Generic callers keep the historical two-call budget; the model registry
@@ -297,15 +298,22 @@ class Settings(BaseSettings):
     # single-worker production carrier.
     ai_llm_max_calls_per_analysis: int = 2
     ai_llm_call_delay_seconds: float = 0.0
-    ai_expert_timeout_seconds: float = 30.0
-    ai_decision_maker_timeout_seconds: float = 20.0
+    ai_expert_timeout_seconds: float = 15.0
+    ai_decision_maker_timeout_seconds: float = 12.0
     ai_expert_max_completion_tokens: int = 360
     # Fast independent experts need enough room to finish their JSON contract.
     ai_fast_expert_max_completion_tokens: int = 700
     ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
     ai_batch_expert_max_completion_tokens: int = 560
-    ai_batch_expert_timeout_seconds: float = 35.0
+    ai_batch_expert_timeout_seconds: float = 15.0
+    # The local Qwen3.8-27B carrier is deliberately stricter than generic
+    # batch providers.  Keep this contract separate: cloud reviewers can use
+    # their own longer low-frequency budget without allowing the single A100
+    # hot path to regress to a 35-second request.
+    ai_target_qwen_max_completion_tokens: int = 96
+    ai_target_qwen_timeout_seconds: float = 12.0
+    ai_target_qwen_queue_wait_seconds: float = 2.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
     strategy_learning_llm_candidates_enabled: bool = True
@@ -501,20 +509,33 @@ class Settings(BaseSettings):
         return []
 
     def get_fixed_ai_models(self, include_empty: bool = True) -> list[dict[str, Any]]:
-        """Return AI model configs merged into the fixed expert slots."""
+        """Return every fixed trading role on the canonical local Qwen route.
+
+        Fixed roles are deployment topology, not provider slots.  They must not
+        disappear just because ``AI_MODELS`` is absent from one runtime process.
+        """
         configured_by_name = {
             str(m.get("name", "")): dict(m)
             for m in self.ai_models
             if isinstance(m, dict) and m.get("name")
         }
         result: list[dict[str, Any]] = []
+        # An empty AI_MODELS value means the canonical target topology should
+        # still be advertised for every fixed role. Once any explicit rows are
+        # present, include_empty=False becomes a true configured-row filter.
+        implicit_topology = not configured_by_name
         for slot in FIXED_AI_MODEL_SLOTS:
             cfg = dict(configured_by_name.get(slot["name"], {}))
+            has_cfg = bool(cfg) or implicit_topology
             merged = {
                 **slot,
-                "api_base": str(cfg.get("api_base") or "").strip(),
-                "api_key": str(cfg.get("api_key") or "").strip(),
-                "model": str(cfg.get("model") or "").strip(),
+                # Keep an unconfigured slot visible in the admin catalog, but
+                # do not claim it is configured until its route is explicitly
+                # persisted. Explicit values are preserved so invalid remote
+                # routes are diagnosable instead of being silently replaced.
+                "api_base": str(cfg.get("api_base") or TARGET_LOCAL_AI_API_BASE),
+                "api_key": str(cfg.get("api_key") or ""),
+                "model": str(cfg.get("model") or TARGET_SINGLE_MODEL_ID),
                 "enabled": bool(cfg.get("enabled", True)),
             }
             if "balance" in cfg:
@@ -522,18 +543,11 @@ class Settings(BaseSettings):
             api_base = str(merged.get("api_base") or "")
             model = str(merged.get("model") or "")
             api_key = str(merged.get("api_key") or "")
-            has_route = bool(api_base or model or api_key)
-            configured = _is_target_local_model_config(api_base, model, api_key)
+            configured = has_cfg and _is_target_local_model_config(api_base, model, api_key)
             merged["configured"] = configured
             merged["configuration_type"] = (
-                "target_local"
-                if configured
-                else "invalid_target_local"
-                if has_route
-                else "missing"
+                "target_local" if configured else "invalid_target_local" if has_cfg else "unconfigured"
             )
-            if has_route and not configured:
-                merged["config_error"] = "fixed_roles_require_qwen3.8-27b_platform_loopback"
             if include_empty or configured:
                 result.append(merged)
         return result
@@ -553,18 +567,18 @@ class Settings(BaseSettings):
             "role": slot["role"],
             "label": slot["label"],
             "weight": slot["weight"],
-            "api_base": str(
-                updates.get("api_base", existing.get("api_base", "")) or ""
-            ).strip(),
-            "api_key": str(updates.get("api_key", existing.get("api_key", "")) or "").strip(),
-            "model": str(updates.get("model", existing.get("model", "")) or "").strip(),
+            "api_base": TARGET_LOCAL_AI_API_BASE,
+            "api_key": "",
+            "model": TARGET_SINGLE_MODEL_ID,
             "enabled": bool(updates.get("enabled", existing.get("enabled", True))),
         }
-        has_route = bool(updated["api_base"] or updated["model"] or updated["api_key"])
-        if has_route and not _is_target_local_model_config(
-            updated["api_base"],
-            updated["model"],
-            updated["api_key"],
+        requested_api_base = str(updates.get("api_base") or TARGET_LOCAL_AI_API_BASE).strip()
+        requested_model = str(updates.get("model") or TARGET_SINGLE_MODEL_ID).strip()
+        requested_api_key = str(updates.get("api_key") or "").strip()
+        if not _is_target_local_model_config(
+            requested_api_base,
+            requested_model,
+            requested_api_key,
         ):
             raise ValueError("fixed roles require qwen3.8-27b on platform loopback 18000")
         current[name] = updated

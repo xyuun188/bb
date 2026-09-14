@@ -5,7 +5,14 @@ import hashlib
 import json
 import os
 import time
-from datetime import UTC, datetime
+from datetime import datetime
+
+try:
+    from datetime import UTC
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    from datetime import timezone
+
+    UTC = timezone.utc  # noqa: UP017
 from pathlib import Path
 
 MODEL_NAME = "qwen3.8-27b"
@@ -153,6 +160,58 @@ def register_shadow(manifest_path: Path) -> dict:
     return {
         "shadow": pointer,
         "shadow_path": str(shadow_path),
+        "live_routing_enabled": False,
+    }
+
+
+def activate_shadow(shadow_pointer_path: Path) -> dict:
+    """Make one verified shadow adapter the current non-live inference adapter."""
+    shadow_root = (ROOT / "shadow").resolve()
+    resolved = shadow_pointer_path.resolve()
+    try:
+        resolved.relative_to(shadow_root)
+    except ValueError as exc:
+        raise ValueError("shadow pointer must be inside the registry shadow directory") from exc
+    if resolved.suffix.lower() != ".json" or not resolved.is_file():
+        raise ValueError(f"FinQuant shadow pointer is missing: {resolved}")
+
+    pointer = read_json(resolved)
+    validate_pointer(pointer)
+    if pointer.get("routing_state") != "shadow_only":
+        raise ValueError("FinQuant shadow pointer must use routing_state=shadow_only")
+    if pointer.get("can_influence_live") is not False:
+        raise ValueError("FinQuant shadow pointer must forbid live influence")
+
+    activated = dict(pointer)
+    activated.update(
+        {
+            "routing_state": "shadow_only",
+            "can_influence_live": False,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    previous = None
+    if CURRENT.exists():
+        candidate = read_json(CURRENT)
+        validate_pointer(candidate)
+        if candidate.get("adapter_path") != activated.get("adapter_path"):
+            previous = dict(candidate)
+            previous.update(
+                {
+                    "routing_state": "shadow_only",
+                    "can_influence_live": False,
+                    "updated_at": activated["updated_at"],
+                }
+            )
+            atomic_json(ROLLBACK, previous)
+    atomic_json(CURRENT, activated)
+    return {
+        "current": activated,
+        "current_path": str(CURRENT),
+        "source_shadow_path": str(resolved),
+        "rollback": previous,
+        "routing_state": "shadow_only",
+        "can_influence_live": False,
         "live_routing_enabled": False,
     }
 
@@ -344,6 +403,8 @@ def main() -> None:
     promote_parser.add_argument("--manifest", type=Path, required=True)
     shadow_parser = subparsers.add_parser("register-shadow")
     shadow_parser.add_argument("--manifest", type=Path, required=True)
+    activate_shadow_parser = subparsers.add_parser("activate-shadow")
+    activate_shadow_parser.add_argument("--shadow-pointer", type=Path, required=True)
     subparsers.add_parser("verify")
     subparsers.add_parser("status")
     subparsers.add_parser("rollback")
@@ -353,6 +414,8 @@ def main() -> None:
         result = promote(args.manifest)
     elif args.command == "register-shadow":
         result = register_shadow(args.manifest)
+    elif args.command == "activate-shadow":
+        result = activate_shadow(args.shadow_pointer)
     elif args.command == "verify":
         pointer = validate_current(required=True)
         manifest, adapter_path = validate_pointer(pointer)

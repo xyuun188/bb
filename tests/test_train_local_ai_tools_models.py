@@ -22,11 +22,30 @@ from scripts.train_local_ai_tools_models import (
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC
 
 
+def test_historical_shadow_governance_survives_training_compaction() -> None:
+    features = {
+        "symbol": "BTC/USDT",
+        "current_price": 65000.0,
+        "historical_market_path_only": True,
+        "historical_shadow_rebuild_version": "2026-09-14.historical-shadow.v1",
+    }
+
+    compact = train_script._compact_local_ai_tools_features(features)
+    transported = train_script._training_transport_features(compact)
+
+    assert compact["historical_market_path_only"] is True
+    assert transported["historical_market_path_only"] is True
+    assert (
+        transported["historical_shadow_rebuild_version"]
+        == "2026-09-14.historical-shadow.v1"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         train_script,
-        "load_training_epoch_start",
+        "load_training_data_start",
         lambda: PHASE3_CLEAN_START_UTC,
     )
 

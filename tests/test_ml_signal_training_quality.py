@@ -80,8 +80,22 @@ from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ml_signal_module,
-        "load_training_epoch_start",
+        "load_training_data_start",
         lambda: PHASE3_CLEAN_START_UTC,
+    )
+    monkeypatch.setattr(
+        ml_signal_module,
+        "training_data_scope",
+        lambda: {
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+            "training_epoch_started_at": PHASE3_CLEAN_START_UTC.isoformat(),
+            "training_epoch_reset_id": "test-reset",
+            "training_data_started_at": PHASE3_CLEAN_START_UTC.isoformat(),
+            "pre_epoch_data_training_allowed": False,
+            "historical_migration_status": "absent",
+            "approved_sample_counts": {},
+            "approved_sample_count_total": 0,
+        },
     )
 
 

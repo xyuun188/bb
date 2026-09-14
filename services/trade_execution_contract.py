@@ -125,62 +125,59 @@ class TradeExecutionContractService:
             # PostgreSQL otherwise has to decompress every eligible decision in
             # the time window before applying the LIMIT, which made this
             # read-only audit exceed its deadline during a busy analysis day.
-            recent_decision_ids = (
-                select(AIDecision.id)
-                .where(
-                    AIDecision.created_at >= since_naive,
-                    AIDecision.decision_learning_snapshot_version >= 1,
-                )
-                .order_by(AIDecision.id.desc())
-                .limit(capped_limit)
-                .subquery()
-            )
-            decisions = [
-                _decision_report_projection(row)
+            # Materialize the bounded id set in a separate round trip. PostgreSQL
+            # may inline a LIMIT subquery and decompress JSON for every eligible
+            # row before limiting it, which caused large-window audits to time out.
+            decision_ids = [
+                row["id"]
                 for row in (
                     await session.execute(
-                        select(
-                            AIDecision.id,
-                            AIDecision.symbol,
-                            AIDecision.action,
-                            AIDecision.was_executed,
-                            AIDecision.decision_learning_snapshot.label(
-                                "raw_llm_response"
-                            ),
-                            AIDecision.raw_llm_response["profit_risk_sizing"][
-                                "execution_reconciliations"
-                            ].label("execution_reconciliations"),
-                        )
-                        .join(
-                            recent_decision_ids,
-                            recent_decision_ids.c.id == AIDecision.id,
+                        select(AIDecision.id)
+                        .where(
+                            AIDecision.created_at >= since_naive,
+                            AIDecision.decision_learning_snapshot_version >= 1,
                         )
                         .order_by(AIDecision.id.desc())
+                        .limit(capped_limit)
                     )
                 )
                 .mappings()
                 .all()
             ]
+            decisions = []
+            if decision_ids:
+                decisions = [
+                    _decision_report_projection(row)
+                    for row in (
+                        await session.execute(
+                            select(
+                                AIDecision.id,
+                                AIDecision.symbol,
+                                AIDecision.action,
+                                AIDecision.was_executed,
+                                AIDecision.decision_learning_snapshot.label(
+                                    "raw_llm_response"
+                                ),
+                                AIDecision.raw_llm_response["profit_risk_sizing"][
+                                    "execution_reconciliations"
+                                ].label("execution_reconciliations"),
+                            )
+                            .where(AIDecision.id.in_(decision_ids))
+                            .order_by(AIDecision.id.desc())
+                        )
+                    )
+                    .mappings()
+                    .all()
+                ]
             # The contract validator only needs a narrow, immutable projection.
             # Loading full ORM rows (especially JSON blobs) made this read-only
             # audit contend with the trading loop and occasionally exceed its
             # section deadline.
-            orders = [
-                dict(row)
+            order_ids = [
+                row["id"]
                 for row in (
                     await session.execute(
-                        select(
-                            Order.decision_id,
-                            Order.status,
-                            Order.quantity,
-                            Order.price,
-                            Order.exchange_order_id,
-                            Order.filled_at,
-                            Order.created_at,
-                            Order.okx_fill_contracts,
-                            Order.okx_sync_status,
-                            Order.okx_raw_fills,
-                        )
+                        select(Order.id)
                         .where(Order.created_at >= since_naive)
                         .order_by(Order.id.desc())
                         .limit(capped_limit)
@@ -189,15 +186,36 @@ class TradeExecutionContractService:
                 .mappings()
                 .all()
             ]
-            positions = [
-                dict(row)
+            orders = []
+            if order_ids:
+                orders = [
+                    dict(row)
+                    for row in (
+                        await session.execute(
+                            select(
+                                Order.decision_id,
+                                Order.status,
+                                Order.quantity,
+                                Order.price,
+                                Order.exchange_order_id,
+                                Order.filled_at,
+                                Order.created_at,
+                                Order.okx_fill_contracts,
+                                Order.okx_sync_status,
+                                Order.okx_raw_fills,
+                            )
+                            .where(Order.id.in_(order_ids))
+                            .order_by(Order.id.desc())
+                        )
+                    )
+                    .mappings()
+                    .all()
+                ]
+            position_ids = [
+                row["id"]
                 for row in (
                     await session.execute(
-                        select(
-                            Position.side,
-                            Position.realized_pnl,
-                            Position.closed_at,
-                        )
+                        select(Position.id)
                         .where(
                             or_(
                                 Position.created_at >= since_naive,
@@ -211,6 +229,24 @@ class TradeExecutionContractService:
                 .mappings()
                 .all()
             ]
+            positions = []
+            if position_ids:
+                positions = [
+                    dict(row)
+                    for row in (
+                        await session.execute(
+                            select(
+                                Position.side,
+                                Position.realized_pnl,
+                                Position.closed_at,
+                            )
+                            .where(Position.id.in_(position_ids))
+                            .order_by(Position.id.desc())
+                        )
+                    )
+                    .mappings()
+                    .all()
+                ]
         report = summarize_trade_execution_contract(
             decisions,
             orders=orders,

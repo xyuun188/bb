@@ -83,7 +83,12 @@ ACTION_DIRECTION = {
     Action.HOLD: 0,
 }
 
-_CONSULTATION_CONCURRENCY = max(int(settings.ai_llm_concurrency or 2), 1)
+# Conflict resolution is a low-frequency path with one dedicated overflow
+# slot in ``_ScopedLLMCapacity``.  Keep its advertised capacity at two even
+# when the hot Qwen carrier is configured for one regular inference, so
+# runtime metrics describe the actual consultation pool rather than the
+# single-worker trading path.
+_CONSULTATION_CONCURRENCY = max(int(settings.ai_llm_concurrency or 2), 2)
 
 _CONSULTATION_TIMEOUT_FLOOR_SECONDS = 6.0
 _CONSULTATION_TIMEOUT_CAP_SECONDS = 18.0

@@ -34,10 +34,12 @@ from core.safe_output import safe_error_text  # noqa: E402
 from services.okx_integrity_gate import (  # noqa: E402
     okx_integrity_has_current_blocking_issue,
 )
-from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY  # noqa: E402
 from web_dashboard.api import system_audit  # noqa: E402
 
 DEFAULT_REPORT_DIR = "okx_daily_reconciliation_reports"
+# The reconciliation gate is intentionally stricter than the general training
+# scope: until OKX facts are clean, only the current clean epoch may be used.
+OPERATIONAL_GATE_TRAINING_POLICY = "current_training_epoch_only"
 
 
 async def _full_okx_reconciliation_audit() -> dict[str, Any]:
@@ -362,7 +364,7 @@ def _operational_gates_from_cards(
         "requires_attention": requires_attention,
         "can_apply_repair": False,
         "can_write_database": False,
-        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "training_policy": OPERATIONAL_GATE_TRAINING_POLICY,
         "entry_blockers": entry_blockers,
         "training_blockers": training_blockers,
         "attention_items": attention_items,

@@ -572,13 +572,12 @@ def build_batch_experts_user_prompt(
     # this call only supplies five short diagnostic direction labels.
     if compact_qwen_batch:
         compact_data = {
-            name: _short_text(market_by_expert.get(name, ""), 72)
+            # The target carrier only emits one action code per role. Keep a
+            # short high-signal prefix so long feature tails cannot push the
+            # single-worker prefill back into the multi-second knee.
+            name: _short_text(market_by_expert.get(name, ""), 48)
             for name in requested_experts
         }
-        compact_roles = ",".join(
-            f"{name}={role_contract_by_expert[name].split('.')[0][:18]}"
-            for name in requested_experts
-        )
         compact_schema = ",".join(
             f'"{name}":"l|s|h|cl|cs"' for name in requested_experts
         )
@@ -587,7 +586,6 @@ def build_batch_experts_user_prompt(
             "Production Qwen compact mode. JSON only; no markdown/thinking. "
             f"Return exactly {{\"experts\":{{{compact_schema}}}}}. "
             'Action-code reference: {"a":"l|s|h|cl|cs","c":0-1,"r":"中文4-8字"}.\n'
-            f"Roles: {compact_roles}.\n"
             f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
             "Each expert value is one action code only: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
             "No invented data; position_expert=hold without a position."

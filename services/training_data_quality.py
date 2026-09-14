@@ -15,6 +15,8 @@ from core.market_facts import (
 )
 from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
+    HISTORICAL_SHADOW_REBUILD_VERSION,
+    HISTORICAL_SHADOW_SOURCE,
     SHADOW_LABEL_VERSION,
     shadow_label_contract_reasons,
 )
@@ -43,6 +45,7 @@ DATA_QUALITY_VERSION = "2026-07-21.authoritative-trade-integrity.v5"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
+    "historical_market_path_only",
     "hold_missed_opportunity_downweighted",
     "very_low_decision_confidence",
 }
@@ -149,6 +152,39 @@ def _shadow_market_fact_contract(features: dict[str, Any]) -> dict[str, Any]:
     return compact or _safe_dict(features.get("market_fact_contract"))
 
 
+def _historical_market_path_reasons(features: dict[str, Any]) -> list[str]:
+    contract = _shadow_market_fact_contract(features)
+    assertions = _safe_dict(contract.get("assertions")) or contract
+    reasons: list[str] = []
+    if features.get("historical_shadow_rebuild_version") != HISTORICAL_SHADOW_REBUILD_VERSION:
+        reasons.append("historical_shadow_rebuild_version_missing_or_stale")
+    if contract.get("version") != MARKET_FACT_CONTRACT_VERSION:
+        reasons.append("historical_market_fact_contract_missing_or_stale")
+    if contract.get("status") != "historical_ohlcv_only":
+        reasons.append("historical_market_fact_contract_status_invalid")
+    if contract.get("source") != HISTORICAL_SHADOW_SOURCE:
+        reasons.append("historical_market_fact_source_invalid")
+    if assertions.get("native_instrument_identity_verified") is not True:
+        reasons.append("historical_market_identity_not_verified")
+    if assertions.get("same_contract_price_path_verified") is not True:
+        reasons.append("historical_market_path_not_verified")
+    if assertions.get("executable_market_fact_verified") is not False:
+        reasons.append("historical_market_fact_must_not_claim_executable_quote")
+    if contract.get("path_status") != "clean":
+        reasons.append("historical_market_path_not_clean")
+    if not _safe_str(contract.get("path_fingerprint")):
+        reasons.append("historical_market_path_fingerprint_missing")
+    if not _safe_str(contract.get("data_fingerprint")):
+        reasons.append("historical_market_data_fingerprint_missing")
+    return reasons
+
+
+def _shadow_market_fact_reasons(features: dict[str, Any]) -> list[str]:
+    if features.get("historical_market_path_only") is True:
+        return _historical_market_path_reasons(features)
+    return market_fact_contract_reasons(_shadow_market_fact_contract(features))
+
+
 def _iter_text_values(value: Any) -> Any:
     if isinstance(value, str):
         yield value
@@ -190,8 +226,12 @@ def _is_benign_downweighted_sample(kind: str, sample: dict[str, Any]) -> bool:
         if _safe_str(reason)
     }
     return bool(
-        "hold_missed_opportunity_downweighted" in reasons
+        reasons
         and reasons.issubset(_SHADOW_BENIGN_DOWNWEIGHT_REASONS)
+        and (
+            "hold_missed_opportunity_downweighted" in reasons
+            or "historical_market_path_only" in reasons
+        )
     )
 
 
@@ -391,13 +431,16 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             exclude=True,
         )
 
-    cost_reasons = _shadow_cost_completeness_reasons(features)
-    if cost_reasons:
-        return _final_assessment(0.0, cost_reasons, exclude=True)
+    historical_market_only = features.get("historical_market_path_only") is True
+    if historical_market_only:
+        reasons.append("historical_market_path_only")
+        score = min(score, 0.7)
+    else:
+        cost_reasons = _shadow_cost_completeness_reasons(features)
+        if cost_reasons:
+            return _final_assessment(0.0, cost_reasons, exclude=True)
 
-    fact_contract_reasons = market_fact_contract_reasons(
-        _shadow_market_fact_contract(features)
-    )
+    fact_contract_reasons = _shadow_market_fact_reasons(features)
     if fact_contract_reasons:
         return _final_assessment(
             0.0,
@@ -1245,7 +1288,11 @@ def _aggregate_market_fact_contract(
     contracts = [
         _shadow_market_fact_contract(_features(sample)) for sample in trainable
     ]
-    reasons = [reason for contract in contracts for reason in market_fact_contract_reasons(contract)]
+    reasons = [
+        reason
+        for sample in trainable
+        for reason in _shadow_market_fact_reasons(_features(sample))
+    ]
     clean = bool(contracts) and not reasons
     assertions = (
         {

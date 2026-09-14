@@ -72,7 +72,12 @@ if TYPE_CHECKING:
 # Global semaphore limits active LLM calls. A single local 32B model cannot
 # reliably answer five expert prompts at once, so the default is intentionally
 # lower than the number of experts.
-_LLM_CONCURRENCY = max(int(settings.ai_llm_concurrency or 5), 1)
+# Keep two client-side scheduler slots for fairness and low-frequency
+# consultation overflow.  The target Qwen route still limits each analysis to
+# one provider call and its server remains single-worker; a capacity floor of
+# two prevents the shared scheduler from deadlocking when a test or a cloud
+# review temporarily occupies both regular slots.
+_LLM_CONCURRENCY = max(int(settings.ai_llm_concurrency or 5), 2)
 
 
 class LLMCallBudgetExceeded(ModelInferenceError):
@@ -976,6 +981,10 @@ def _build_fast_expert_user_prompt(
 BATCH_EXPERT_SYSTEM_PROMPT = """Return only the requested minified JSON object. No markdown, no prose, no <think>.
 Use 8-20 Chinese chars per reasoning. Set cross_check_for to null. Actions are role-scoped diagnostic labels, not execution permission. Use hold only under that role's explicit contract. Never add keys, duplicate fields, or trailing commentary. Finish the complete JSON object before stopping."""
 
+_QWEN_FINAL_DECISION_SYSTEM_PROMPT = """QWEN_FINAL_DECISION_JSON_V1. Return exactly one JSON object and no prose.
+Schema: {"action":"long|short|close_long|close_short|hold","confidence":0-1,"reasoning":"简体中文12-36字","position_size_pct":0-1,"suggested_leverage":1-20,"stop_loss_pct":0-1,"take_profit_pct":0-1,"cross_check_for":null}.
+Use only current-symbol evidence. Fee-after return, risk, and execution gates remain authoritative; incomplete evidence means hold. No markdown, no <think>, no extra keys."""
+
 
 class LLMAgent(AbstractAIModel):
     """Trading agent backed by an LLM via OpenAI-compatible API.
@@ -1036,7 +1045,17 @@ class LLMAgent(AbstractAIModel):
             configured_timeout_value = float(configured_timeout or 0.0)
         except (TypeError, ValueError):
             configured_timeout_value = 0.0
-        if fast_expert:
+        target_qwen = str(model or "").strip().lower() == "qwen3.8-27b"
+        if target_qwen:
+            # The production carrier is one A100 worker.  Keep the HTTP
+            # deadline aligned with the registry budget so a stale generic
+            # 26-30s timeout cannot turn one slow generation into a long
+            # queue stall.
+            request_timeout = min(
+                max(float(getattr(settings, "ai_target_qwen_timeout_seconds", 18.0) or 18.0), 8.0),
+                18.0,
+            )
+        elif fast_expert:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 18.0)
         elif max_completion_tokens_override is not None:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 26.0)
@@ -1065,15 +1084,15 @@ class LLMAgent(AbstractAIModel):
             )
         else:
             requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
-        # The production Qwen batch contract is intentionally tiny: four
-        # diagnostic objects use short keys and do not carry sizing/exit
-        # fields.  Do not let the generic 180-token floor silently turn the
-        # requested 128-token budget back into a longer generation.
+        # The production Qwen batch contract is intentionally tiny: diagnostic
+        # objects use short keys and do not carry sizing/exit fields.  Keep
+        # this model-specific cap unconditional so a stale environment value
+        # (for example the historical 560-token setting) cannot reintroduce a
+        # long generation on the single-worker production carrier.
         compact_qwen_batch = (
             str(model or "").strip().lower() == "qwen3.8-27b"
             and token_stage in {"batch_expert", "paper_batch_expert"}
             and max_completion_tokens_override is not None
-            and int(max_completion_tokens_override or 0) <= 128
         )
         max_completion_tokens = completion_token_limit(
             token_stage,
@@ -1103,7 +1122,9 @@ class LLMAgent(AbstractAIModel):
             kwargs["reasoning_effort"] = "low"
             kwargs["max_completion_tokens"] = max_completion_tokens
         else:
-            kwargs["temperature"] = 0.2 if self._role else 0.3
+            # Deterministic compact JSON avoids malformed variants that would
+            # otherwise trigger parsing/repair work on the hot path.
+            kwargs["temperature"] = 0.0 if target_qwen else (0.2 if self._role else 0.3)
             kwargs["max_tokens"] = max_completion_tokens
         extra_body: dict[str, Any] = {}
         if _uses_thinking_tags(model):
@@ -1234,8 +1255,11 @@ class LLMAgent(AbstractAIModel):
         else:
             user_prompt = build_user_prompt(feature_text, positions_text)
 
+        is_target_qwen = str(self._model_name or "").strip().lower() == "qwen3.8-27b"
         system_prompt = (
-            DECISION_MAKER_SYSTEM_PROMPT
+            _QWEN_FINAL_DECISION_SYSTEM_PROMPT
+            if decision_maker_mode and is_target_qwen
+            else DECISION_MAKER_SYSTEM_PROMPT
             if decision_maker_mode
             else (
                 _FAST_EXPERT_SYSTEM_PROMPT
@@ -1251,6 +1275,10 @@ class LLMAgent(AbstractAIModel):
                 )
             )
         )
+        if decision_maker_mode and is_target_qwen:
+            # Deterministic gates already carry the full audit payload. Keep
+            # the model-facing payload short to avoid the prefill latency knee.
+            user_prompt = str(user_prompt or "")[:1800]
         if paper_mode and not fast_expert_mode:
             system_prompt = f"{system_prompt}\n{_PAPER_MULTIDIMENSIONAL_PLAN_PROMPT}"
 
@@ -1358,14 +1386,22 @@ class LLMAgent(AbstractAIModel):
         # fixed expert call must therefore use the compact wire contract;
         # allowing a context-dependent fallback silently reintroduces the
         # 1k+ token prompt that stalls the carrier and drains its queue.
-        target_single_call = (
-            self._model_name.strip().lower() == "qwen3.8-27b"
-            and isinstance(context.get("_llm_call_budget"), dict)
-        )
+        # Qwen3.8-27B is a single-worker carrier. Decide this from the
+        # provider identity, not from whether a caller created a budget
+        # object first; direct batch callers must not fall back to the long
+        # generic prompt/token path.
+        target_single_call = self._model_name.strip().lower() == "qwen3.8-27b"
 
         async def _invoke_batch(prompt: str, *, repair: bool = False) -> dict[str, Any]:
+            system_prompt = (
+                "QWEN_TARGET_BATCH_SYSTEM_V2. Output one minified JSON object only. "
+                "No markdown, prose, or thinking. Use only the requested expert keys "
+                "and action codes l,s,h,cl,cs."
+                if target_single_call
+                else BATCH_EXPERT_SYSTEM_PROMPT
+            )
             messages = _messages_for_model(
-                BATCH_EXPERT_SYSTEM_PROMPT,
+                system_prompt,
                 prompt,
                 self._model_name,
             )
@@ -1379,7 +1415,13 @@ class LLMAgent(AbstractAIModel):
                 batch_llm = self._create_llm(
                     self._model_name,
                     max_completion_tokens_override=(
-                        128
+                        max(
+                            min(
+                                int(settings.ai_target_qwen_max_completion_tokens or 96),
+                                96,
+                            ),
+                            64,
+                        )
                         if target_single_call
                         else settings.ai_batch_expert_max_completion_tokens
                     ),

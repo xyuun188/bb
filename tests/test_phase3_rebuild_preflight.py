@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from scripts import run_phase3_rebuild_preflight as preflight
+from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 
 def test_phase3_rebuild_preflight_imports_online_runtime_bootstrap() -> None:
@@ -61,7 +62,7 @@ async def _fake_historical_report(**_kwargs: Any) -> dict[str, Any]:
     return {
         "status": "clean",
         "read_only": True,
-        "training_policy": "current_training_epoch_only",
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "trainable_closed_positions": 80,
         "quarantined_closed_positions": 0,
     }
@@ -87,6 +88,20 @@ def _patch_preflight_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(preflight, "_historical_trade_fact_report", _fake_historical_report)
     monkeypatch.setattr(preflight, "_artifact_retirement_report", _fake_artifact_report)
     monkeypatch.setattr(preflight, "_runtime_probe_report", _fake_runtime_report)
+    monkeypatch.setattr(
+        preflight,
+        "training_data_scope",
+        lambda: {
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+            "training_epoch_started_at": "2026-06-27T00:00:00+00:00",
+            "training_epoch_reset_id": "test-reset",
+            "training_data_started_at": "2026-06-27T00:00:00+00:00",
+            "pre_epoch_data_training_allowed": False,
+            "historical_migration_status": "absent",
+            "approved_sample_counts": {},
+            "approved_sample_count_total": 0,
+        },
+    )
     monkeypatch.setattr(
         preflight,
         "load_latest_paper_observation_report",
@@ -215,6 +230,20 @@ async def test_phase3_rebuild_preflight_returns_structured_blocked_report_on_col
     monkeypatch.setattr(preflight, "_historical_trade_fact_report", fail_historical_report)
     monkeypatch.setattr(preflight, "_artifact_retirement_report", fail_artifact_report)
     monkeypatch.setattr(preflight, "_runtime_probe_report", _fake_runtime_report)
+    monkeypatch.setattr(
+        preflight,
+        "training_data_scope",
+        lambda: {
+            "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+            "training_epoch_started_at": "2026-06-27T00:00:00+00:00",
+            "training_epoch_reset_id": "test-reset",
+            "training_data_started_at": "2026-06-27T00:00:00+00:00",
+            "pre_epoch_data_training_allowed": False,
+            "historical_migration_status": "absent",
+            "approved_sample_counts": {},
+            "approved_sample_count_total": 0,
+        },
+    )
 
     report = await preflight.collect_phase3_rebuild_preflight()
 

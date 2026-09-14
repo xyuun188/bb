@@ -108,7 +108,11 @@ async def test_qwen3_consultation_uses_short_non_thinking_runtime_policy(monkeyp
     assert captured["kwargs"]["max_completion_tokens"] == completion_token_limit(
         "consultation", 1400, floor=160, model="qwen3.8-27b"
     )
-    assert captured["kwargs"]["max_completion_tokens"] == 700
+    # The local Qwen3.8-27B carrier is single-worker and caps every
+    # generation, including optional consultation, at the production 96-token
+    # boundary.  Consultation is skipped on the hot path, but this direct
+    # policy test still verifies the hard provider contract.
+    assert captured["kwargs"]["max_completion_tokens"] == 96
     assert captured["kwargs"]["model_kwargs"] == {
         "response_format": {"type": "json_object"}
     }

@@ -194,6 +194,8 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         "trainable": True,
         "training_owner": "platform_paper_runtime",
         "runtime_role": "entry_filter_and_ranking",
+        "execution_plane": "local",
+        "availability_scope": "core_local",
         "lifecycle": lifecycle,
         "runtime_available": available,
         "artifact_available": available,
@@ -306,6 +308,8 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                 "trainable": True,
                 "training_owner": "phase3_quant_api",
                 "runtime_role": model_key,
+                "execution_plane": "local",
+                "availability_scope": "core_local",
                 "lifecycle": lifecycle,
                 "runtime_available": runtime_available,
                 "artifact_available": artifact_available,
@@ -406,6 +410,8 @@ def _specialist_rows(
                 "project_adapter_available": False,
                 "training_owner": None,
                 "runtime_role": "specialist_evidence",
+                "execution_plane": "local",
+                "availability_scope": "optional_enhancement",
                 "lifecycle": lifecycle,
                 "runtime_available": runtime_available,
                 "artifact_available": runtime_available,
@@ -486,10 +492,45 @@ def _llm_rows(
         for row in _safe_list(model_server_report.get("manifest_services"))
         if isinstance(row, dict) and str(row.get("slot") or "")
     }
-    carrier_slot = _safe_dict(
+    target_topology = _safe_dict(model_server_report.get("target_model_topology"))
+    target_model_id = str(
+        target_topology.get("model_id")
+        or target_topology.get("served_model_name")
+        or ""
+    ).strip()
+    target_runtime = _safe_dict(
+        runtime_reports.get("llm_decision_and_expert_carrier")
+        or runtime_reports.get("llm_expert_pool")
+    )
+    if not target_runtime and target_model_id:
+        target_runtime = next(
+            (
+                row
+                for row in runtime_reports.values()
+                if str(row.get("served_model_name") or "").strip() == target_model_id
+            ),
+            {},
+        )
+    # The current readiness contract intentionally leaves required_slots empty:
+    # manifest_services and target_model_topology are the authoritative runtime
+    # evidence. Keep older required_slots support, but never require it.
+    slot_carrier = _safe_dict(
         slot_reports.get("llm_decision_and_expert_carrier")
         or slot_reports.get("llm_expert_pool")
     )
+    # Runtime manifest wins for endpoint identity; slot evidence is retained
+    # for adapter/specialization metadata when the readiness report omits it.
+    carrier_slot = {**slot_carrier, **target_runtime}
+    if not carrier_slot and target_model_id == TARGET_SINGLE_MODEL_ID:
+        carrier_slot = {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": target_model_id,
+            "base_model_carrier": target_topology.get("repo_id")
+            or target_topology.get("base_model_repo")
+            or TARGET_SINGLE_MODEL_PROFILE,
+            "service_active": target_topology.get("service_ready") is True,
+            "endpoint_ready": target_topology.get("endpoint_ready") is True,
+        }
 
     def current_slot_runtime(slot: dict[str, Any]) -> bool:
         runtime = _safe_dict(runtime_reports.get(str(slot.get("slot") or ""))) or slot
@@ -504,7 +545,23 @@ def _llm_rows(
 
     specialization = _safe_dict(carrier_slot.get("specialization_evidence"))
     carrier_runtime = current_slot_runtime(carrier_slot)
+    if not carrier_runtime:
+        carrier_runtime = bool(
+            target_model_id == TARGET_SINGLE_MODEL_ID
+            and (
+                target_topology.get("runtime_ready") is True
+                or target_topology.get("service_ready") is True
+                and target_topology.get("endpoint_ready") is True
+            )
+        )
     carrier_specialized = _finquant_specialization_verified(carrier_slot, specialization)
+    runtime_model_id = str(
+        carrier_slot.get("served_model_name")
+        or carrier_slot.get("model_id")
+        or target_model_id
+        or ""
+    ).strip().lower()
+    runtime_identity_verified = runtime_model_id == TARGET_SINGLE_MODEL_ID.lower()
     finquant = {
         "model_id": TARGET_SINGLE_MODEL_ID,
         "display_name": "Qwen3.8-27B FinQuant specialization",
@@ -513,6 +570,8 @@ def _llm_rows(
         "trainable": True,
         "training_owner": "bb_finquant_qlora_pipeline",
         "runtime_role": "decision_and_expert_carrier",
+        "execution_plane": "local",
+        "availability_scope": "core_local",
         "lifecycle": "trained" if carrier_specialized else "promotion_blocked",
         "runtime_available": carrier_runtime,
         "artifact_available": carrier_specialized,
@@ -521,8 +580,17 @@ def _llm_rows(
         "live_ml_ready": False,
         "quality_state": "specialized" if carrier_specialized else "specialization_missing",
         "blocking_reasons": [] if carrier_specialized else ["finquant_specialization_missing"],
-        "identity_verified": carrier_specialized,
+        "identity_verified": runtime_identity_verified or carrier_specialized,
+        "runtime_identity_verified": runtime_identity_verified,
+        "specialization_evidence_verified": carrier_specialized,
         "topology_profile": TARGET_SINGLE_MODEL_PROFILE,
+        "runtime_evidence": (
+            "manifest_service"
+            if target_runtime
+            else "target_model_topology"
+            if target_model_id == TARGET_SINGLE_MODEL_ID
+            else "none"
+        ),
         "specialization_evidence": specialization,
     }
     cloud_reviewer = _safe_dict(model_server_report.get("cloud_reviewer"))
@@ -560,6 +628,8 @@ def _llm_rows(
                 "trainable": False,
                 "training_owner": None,
                 "runtime_role": row["task"],
+                "execution_plane": "cloud",
+                "availability_scope": "conditional_cloud",
                 "artifact_available": bool(row["runtime_available"]),
                 "trained_at": None,
                 "sample_count": evaluation["evaluation_sample_count"],

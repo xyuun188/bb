@@ -1046,7 +1046,7 @@ async def test_ai_model_connection(req: AIModelTestRequest):
     api_key = req.api_key
     model = req.model
 
-    if req.name and (not api_base or not api_key or not model):
+    if req.name and (not api_base or not model):
         for m in settings.get_fixed_ai_models(include_empty=True):
             if m.get("name") == req.name:
                 api_base = api_base or m.get("api_base")

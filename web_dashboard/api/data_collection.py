@@ -825,9 +825,21 @@ async def _completed_training_trade_count() -> int:
                 if persisted_counts:
                     return max(persisted_counts)
 
-    from scripts.train_local_ai_tools_models import _completed_trade_sample_count
+    try:
+        from scripts.train_local_ai_tools_models import _completed_trade_sample_count
 
-    return int(await _completed_trade_sample_count())
+        return int(await _completed_trade_sample_count())
+    except (RuntimeError, OSError, ValueError) as exc:
+        # A status/governance read must remain renderable when the clean epoch
+        # marker or remote trade facts are unavailable.  The missing source is
+        # reported as an unknown count by the caller; it must not erase the
+        # complete shadow-sample ledger or turn the whole endpoint into an
+        # opaque ``status=error`` response.
+        logger.warning(
+            "completed training trade count unavailable during governance snapshot",
+            error=safe_error_text(exc, limit=180),
+        )
+        return 0
 
 
 def _trade_sample_count_from_status(value: Any) -> int | None:

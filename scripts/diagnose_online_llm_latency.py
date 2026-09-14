@@ -44,13 +44,17 @@ import json, sys, time, urllib.request
 
 payload = json.loads(sys.argv[1])
 runs = max(int(sys.argv[2]), 1)
-# Keep probes inside the target API contract (max_tokens <= 256). A 512-token
-# request is a client-side validation error, not a model-latency measurement.
-for tokens in (32, 64, 128, 256):
+# Keep probes inside the target API contract (max_tokens <= 96). Larger values
+# are clamped by the carrier and would hide stale caller configuration.
+# Every sample gets a unique nonce so the two-second response cache cannot
+# hide the actual prefill+decode latency of a real analysis request.
+for tokens in (32, 64, 96):
     values = []
     for index in range(runs):
         body = dict(payload)
         body["max_tokens"] = tokens
+        body["messages"] = [dict(payload["messages"][0])]
+        body["messages"][0]["content"] += "\\nnonce=%d-%d-%d" % (tokens, index, time.time_ns())
         request = urllib.request.Request(
             "http://127.0.0.1:8000/v1/chat/completions",
             data=json.dumps(body).encode(),

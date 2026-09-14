@@ -731,6 +731,81 @@ class ModelTrainingStateStore:
 
         self._mutate(mutate)
 
+    def record_external_result(
+        self,
+        *,
+        scheduler_id: str,
+        model_ids: Iterable[str],
+        run_id: str,
+        result: dict[str, Any],
+        next_check_at: datetime,
+    ) -> None:
+        """Persist a completed training run executed outside the scheduler process."""
+
+        summary = _result_summary(result)
+        reason = str(summary.get("reason") or "external_training")
+        trained = bool(summary.get("trained"))
+        error = str(summary.get("error") or "")
+        failed = bool(error or reason in {"error", "load_samples_error", "timeout", "resource_blocked"})
+        state = "succeeded" if trained else "failed" if failed else "skipped"
+        input_fingerprint = next(
+            (
+                str(summary.get(key)).strip()
+                for key in ("training_input_fingerprint", "input_fingerprint", "data_fingerprint")
+                if str(summary.get(key) or "").strip()
+            ),
+            None,
+        )
+
+        def mutate(payload: dict[str, Any], now: datetime) -> None:
+            for model_id in model_ids:
+                row = self._model_row(payload, model_id)
+                row.update(
+                    {
+                        "scheduler_id": scheduler_id,
+                        "state": state,
+                        "triggered": bool(trained),
+                        "trigger_reason": reason,
+                        "last_finished_at": _iso(now),
+                        "last_run_id": str(run_id),
+                        "last_result": summary,
+                        "last_error": error or None,
+                        "next_check_at": _iso(next_check_at),
+                        "active_run_id": None,
+                        "active_sample_cursor": None,
+                        "retry_count": 0 if trained else int(row.get("retry_count") or 0),
+                        "resource_error_class": None if trained else classify_training_failure(summary),
+                        "resource_failure_count": 0 if trained else int(row.get("resource_failure_count") or 0),
+                        "resource_failure_fingerprint": input_fingerprint if not trained else None,
+                        "resource_circuit_open_until": None if trained else row.get("resource_circuit_open_until"),
+                    }
+                )
+                if trained:
+                    row["last_successful_training_at"] = _iso(now)
+                    cursor = {
+                        "shadow": summary.get("last_trained_completed_shadow_sample_count")
+                        or summary.get("completed_shadow_sample_count"),
+                        "trade": summary.get("last_trained_completed_trade_sample_count")
+                        or summary.get("completed_trade_sample_count"),
+                        "decision_group": summary.get("last_trained_completed_training_decision_group_count")
+                        or summary.get("completed_training_decision_group_count"),
+                    }
+                    row["sample_cursor"] = {
+                        key: int(value) for key, value in cursor.items() if value is not None
+                    }
+                self._append_history(
+                    row,
+                    {
+                        "at": _iso(now),
+                        "event": f"external_{state}",
+                        "run_id": str(run_id),
+                        "reason": reason,
+                        "error": error or None,
+                    },
+                )
+
+        self._mutate(mutate)
+
     def record_exception(
         self,
         *,

@@ -94,7 +94,9 @@ from services.training_data_quality import (
 )
 from services.training_epoch import (
     CURRENT_TRAINING_EPOCH_POLICY,
-    load_training_epoch_start,
+    load_training_data_start,
+    load_training_epoch_start,  # noqa: F401
+    training_data_scope,
 )
 
 logger = structlog.get_logger(__name__)
@@ -2807,13 +2809,13 @@ def train_from_frame(
         **frame_quality_report,
         "profit_supervision": supervision_report,
     }
+    data_scope = training_data_scope()
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "phase": "phase3_model_factory",
         "version": now,
         "trained_at": now,
-        "training_epoch_started_at": load_training_epoch_start().isoformat(),
-        "pre_epoch_data_training_allowed": False,
+        **data_scope,
         "sample_count": int(len(train)),
         "completed_shadow_sample_count": completed_count,
         "last_trained_completed_shadow_sample_count": completed_count,
@@ -3318,14 +3320,24 @@ class MLSignalService:
         trained_cursor = self._trained_cursor_from_metadata(metadata, completed_count)
         new_count = max(completed_count - trained_cursor, 0)
         return {
-            "training_policy": "current_training_epoch_only",
+            "training_policy": metadata.get(
+                "training_policy", CURRENT_TRAINING_EPOCH_POLICY
+            ),
             "training_epoch_started_at": metadata.get("training_epoch_started_at"),
-            "pre_epoch_data_training_allowed": False,
+            "training_data_started_at": metadata.get("training_data_started_at"),
+            "pre_epoch_data_training_allowed": bool(
+                metadata.get("pre_epoch_data_training_allowed")
+            ),
+            "historical_migration_status": metadata.get(
+                "historical_migration_status", "absent"
+            ),
             "completed_shadow_sample_count": completed_count,
             "training_shadow_sample_count": completed_count,
             "last_trained_completed_shadow_sample_count": trained_cursor,
             "new_shadow_sample_count": new_count,
-            "sample_cursor_policy": "current_training_epoch_only",
+            "sample_cursor_policy": metadata.get(
+                "training_policy", CURRENT_TRAINING_EPOCH_POLICY
+            ),
         }
 
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
@@ -5193,7 +5205,7 @@ async def load_shadow_training_rows() -> list[Any]:
     service while retaining coverage across the full current training epoch.
     """
 
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     base_filters = _shadow_training_candidate_filters(epoch_start)
     columns = _shadow_training_columns()
     selected_ids: list[int] = []
@@ -5256,7 +5268,7 @@ def _shadow_training_candidate_filters(epoch_start: datetime) -> tuple[Any, ...]
 
 
 async def count_shadow_training_rows() -> int:
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
@@ -5272,7 +5284,7 @@ async def count_shadow_training_rows() -> int:
 async def count_shadow_training_decision_groups() -> int:
     """Count candidate decision groups without loading feature snapshots."""
 
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(

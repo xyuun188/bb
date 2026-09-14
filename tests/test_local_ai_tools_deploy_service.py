@@ -2648,7 +2648,10 @@ def test_local_ai_tools_generated_service_persists_training_cursors() -> None:
 
 def test_local_ai_tools_generated_service_persists_phase3_artifact_policy() -> None:
     assert 'PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"' in SERVICE_CODE
-    assert 'CURRENT_TRAINING_EPOCH_POLICY = "current_training_epoch_only"' in SERVICE_CODE
+    assert (
+        'CURRENT_TRAINING_EPOCH_POLICY = "current_epoch_plus_approved_historical_rebuild"'
+        in SERVICE_CODE
+    )
     assert '"artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID' in SERVICE_CODE
     assert '"phase": "phase3_model_factory"' in SERVICE_CODE
     assert '"training_policy": CURRENT_TRAINING_EPOCH_POLICY' in SERVICE_CODE

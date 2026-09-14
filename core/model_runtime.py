@@ -8,6 +8,8 @@ from typing import Any
 NO_THINK_DIRECTIVE = "/no_think"
 HIGH_RISK_REVIEW_TOKEN_FLOOR = 160
 HIGH_RISK_REVIEW_TOKEN_CAP = 600
+TARGET_QWEN_MODEL_ID = "qwen3.8-27b"
+TARGET_QWEN_MAX_COMPLETION_TOKENS = 96
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
     "fast_expert": 700,
@@ -46,7 +48,7 @@ def is_openai_reasoning_model(model: str | None) -> bool:
 def is_qwen3_model(model: str | None) -> bool:
     """Return True for Qwen3 model identifiers."""
     name = str(model or "").lower()
-    return name == "qwen3.8-27b"
+    return name == TARGET_QWEN_MODEL_ID
 
 
 def uses_thinking_tags(model: str | None) -> bool:
@@ -189,6 +191,13 @@ def completion_token_limit(
     the single-GPU trading queue from long completions.
     """
     stage_key = str(stage or "").strip()
+    # The 27B production carrier has one A100 worker and enforces a hard
+    # 96-token generation budget at the HTTP boundary.  Apply the same cap
+    # before the request is sent so callers, telemetry and timeout budgeting
+    # cannot advertise a 320/560-token request that the carrier will reject.
+    if is_qwen3_model(model):
+        return TARGET_QWEN_MAX_COMPLETION_TOKENS
+
     caps = COMPLETION_TOKEN_CAPS
     model_name = str(model or "").lower()
     if model is not None and is_openai_reasoning_model(model_name):
