@@ -109,3 +109,67 @@ async def test_history_reconciliation_apply_uses_filter_and_backup(
 
     assert result == 0
     assert calls == ["backup", "apply"]
+
+
+def _position(position_id: int, close_exchange_order_id: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=position_id,
+        close_exchange_order_id=close_exchange_order_id,
+        closed_at=datetime(2026, 7, 12, 13, 0, tzinfo=UTC),
+        quantity=1.0,
+        current_price=1.0,
+    )
+
+
+def _order(exchange_order_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        exchange_order_id=exchange_order_id,
+        filled_at=datetime(2026, 7, 12, 13, 0, tzinfo=UTC),
+        created_at=datetime(2026, 7, 12, 13, 0, tzinfo=UTC),
+        quantity=1.0,
+        price=1.0,
+    )
+
+
+def test_repair_skips_lifecycle_bound_to_different_close_order() -> None:
+    order = _order("close-current")
+    linked_elsewhere = _position(1, "close-other")
+    unlinked = _position(2, None)
+
+    selected = repair_script._select_positions_for_order(
+        order=order,
+        candidates=[linked_elsewhere, unlinked],
+        already_selected=set(),
+        window=repair_script.timedelta(seconds=60),
+    )
+
+    assert [position.id for position in selected] == [2]
+
+
+def test_repair_accepts_matching_comma_separated_close_order() -> None:
+    order = _order("close-current")
+    linked = _position(3, "close-old, close-current")
+
+    assert repair_script._position_can_follow_close_order(linked, order)
+
+
+def test_repair_anchors_missing_close_order_link() -> None:
+    assert repair_script._anchor_close_order_link(None, "close-current") == "close-current"
+    assert (
+        repair_script._anchor_close_order_link("close-existing", "close-current")
+        == "close-existing"
+    )
+
+
+def test_repair_rejects_shared_close_order_guess() -> None:
+    order = _order("close-current")
+    order.quantity = 2.0
+
+    selected = repair_script._select_positions_for_order(
+        order=order,
+        candidates=[_position(4, None), _position(5, None)],
+        already_selected=set(),
+        window=repair_script.timedelta(seconds=60),
+    )
+
+    assert selected == []

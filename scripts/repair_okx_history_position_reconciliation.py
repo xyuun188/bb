@@ -96,6 +96,34 @@ def _order_key(order: Order) -> tuple[str, str, str]:
     )
 
 
+def _split_exchange_order_ids(value: Any) -> set[str]:
+    """Return normalized order ids from a position's comma-separated link."""
+    if value is None:
+        return set()
+    return {
+        part.strip()
+        for part in str(value).split(",")
+        if part and part.strip()
+    }
+
+
+def _position_can_follow_close_order(position: Position, order: Order) -> bool:
+    """Avoid rewriting a lifecycle already bound to a different close order."""
+    exchange_order_id = str(order.exchange_order_id or "").strip()
+    if not exchange_order_id:
+        return False
+    linked_ids = _split_exchange_order_ids(position.close_exchange_order_id)
+    return not linked_ids or exchange_order_id in linked_ids
+
+
+def _anchor_close_order_link(current_value: Any, exchange_order_id: Any) -> str | None:
+    """Persist the first authoritative close link without overwriting another one."""
+    if _split_exchange_order_ids(current_value):
+        return str(current_value)
+    order_id = str(exchange_order_id or "").strip()
+    return order_id or None
+
+
 def _gross_pnl(position: Position, exit_price: float) -> float:
     quantity = _safe_float(position.quantity)
     entry_price = _safe_float(position.entry_price)
@@ -165,6 +193,8 @@ def _select_positions_for_order(
     for position in candidates:
         if position.id in already_selected:
             continue
+        if not _position_can_follow_close_order(position, order):
+            continue
         closed_at = _aware(position.closed_at)
         if closed_at is None:
             continue
@@ -191,6 +221,10 @@ def _select_positions_for_order(
         if order_quantity <= 0 or selected_quantity >= order_quantity * 0.98:
             break
 
+    # Shared close orders require the dedicated native/shared lifecycle
+    # repairer.  The generic repairer must never guess across lifecycles.
+    if len(selected) != 1:
+        return []
     if order_quantity > 0 and selected_quantity < order_quantity * MIN_QUANTITY_COVERAGE:
         return []
     return selected
@@ -347,6 +381,10 @@ async def apply_repairs(repairs: list[RepairItem]) -> None:
             position.current_price = item.new_price
             position.realized_pnl = item.new_realized_pnl
             position.unrealized_pnl = 0.0
+            position.close_exchange_order_id = _anchor_close_order_link(
+                position.close_exchange_order_id,
+                item.order.exchange_order_id,
+            )
         await session.flush()
 
 
