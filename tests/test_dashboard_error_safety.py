@@ -2660,6 +2660,7 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
     limits = client_options["limits"]
     assert limits.max_keepalive_connections == 0
     assert limits.max_connections == 4
+    assert client_options["trust_env"] is False
 
 
 async def test_collect_platform_runtime_status_falls_back_to_liveness_when_status_fails(

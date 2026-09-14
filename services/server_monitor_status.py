@@ -1299,6 +1299,13 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
     probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
     async with httpx.AsyncClient(
         timeout=PLATFORM_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        # Runtime model and quant endpoints are platform-local loopback
+        # tunnels.  Never send these probes through HTTP(S)_PROXY: proxy
+        # sidecars can return a misleading 401 (for example
+        # ``invalid_sidecar_session``) even while the actual tunnel is
+        # healthy.  Business traffic already uses the configured endpoint
+        # clients; this flag only makes the health probe authoritative.
+        trust_env=False,
         limits=httpx.Limits(
             max_keepalive_connections=0,
             max_connections=4,
