@@ -386,6 +386,28 @@ def _normalize_compact_batch_value(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_compact_batch_vector(
+    value: Any,
+    expert_names: list[str] | tuple[str, ...],
+) -> dict[str, dict[str, Any]] | None:
+    """Map the target Qwen action vector to stable per-expert payloads."""
+
+    raw_values: Any = value
+    if isinstance(value, dict):
+        raw_values = value.get("a", value.get("actions"))
+    if isinstance(raw_values, str):
+        raw_values = [item.strip() for item in raw_values.split(",") if item.strip()]
+    if not isinstance(raw_values, list) or len(raw_values) != len(expert_names):
+        return None
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, item in zip(expert_names, raw_values, strict=True):
+        payload = _normalize_compact_batch_value(item)
+        if payload is None:
+            return None
+        normalized[name] = payload
+    return normalized
+
+
 def _format_local_ai_tools(tools: dict[str, Any]) -> str:
     if not isinstance(tools, dict) or not tools or not tools.get("enabled"):
         return ""
@@ -1418,9 +1440,9 @@ class LLMAgent(AbstractAIModel):
                         max(
                             min(
                                 int(settings.ai_target_qwen_max_completion_tokens or 96),
-                                96,
+                                32,
                             ),
-                            64,
+                            8,
                         )
                         if target_single_call
                         else settings.ai_batch_expert_max_completion_tokens
@@ -1446,6 +1468,10 @@ class LLMAgent(AbstractAIModel):
                 else:
                     response = await request
             parsed = _extract_json(_message_content_text(response))
+            if target_single_call:
+                vector = _normalize_compact_batch_vector(parsed, expert_names)
+                if vector is not None:
+                    return vector
             experts = parsed.get("experts") if isinstance(parsed, dict) else None
             if not isinstance(experts, dict) and target_single_call and isinstance(parsed, dict):
                 # Accept compact Qwen output that omits only the outer wrapper.

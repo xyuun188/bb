@@ -10,6 +10,7 @@ HIGH_RISK_REVIEW_TOKEN_FLOOR = 160
 HIGH_RISK_REVIEW_TOKEN_CAP = 600
 TARGET_QWEN_MODEL_ID = "qwen3.8-27b"
 TARGET_QWEN_MAX_COMPLETION_TOKENS = 96
+TARGET_QWEN_BATCH_MAX_COMPLETION_TOKENS = 32
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
     "fast_expert": 700,
@@ -191,11 +192,17 @@ def completion_token_limit(
     the single-GPU trading queue from long completions.
     """
     stage_key = str(stage or "").strip()
-    # The 27B production carrier has one A100 worker and enforces a hard
-    # 96-token generation budget at the HTTP boundary.  Apply the same cap
-    # before the request is sent so callers, telemetry and timeout budgeting
-    # cannot advertise a 320/560-token request that the carrier will reject.
+    # The 27B production carrier has one A100 worker. Batch expert calls use
+    # an action-code vector, so keep their decode budget separate from the
+    # general 96-token carrier cap. This prevents verbose explanations from
+    # turning one shared expert request into an 8-30 second queue stall.
     if is_qwen3_model(model):
+        if stage_key in {"batch_expert", "paper_batch_expert"}:
+            return cap_completion_tokens(
+                requested,
+                floor=8,
+                cap=TARGET_QWEN_BATCH_MAX_COMPLETION_TOKENS,
+            )
         return TARGET_QWEN_MAX_COMPLETION_TOKENS
 
     caps = COMPLETION_TOKEN_CAPS

@@ -97,7 +97,7 @@ def test_completion_token_limit_enforces_stage_caps() -> None:
     assert completion_token_limit("batch_expert", 999, floor=180) == 560
     assert completion_token_limit("paper_batch_expert", 999, floor=180) == 960
     assert completion_token_limit("paper_batch_expert", 2000, floor=180) == 960
-    assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3.8-27b") == 96
+    assert completion_token_limit("batch_expert", 999, floor=180, model="qwen3.8-27b") == 32
     assert (
         completion_token_limit(
             "high_risk_review",

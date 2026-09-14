@@ -80,10 +80,8 @@ def test_qwen_production_batch_prompt_uses_compact_wire_schema() -> None:
         ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
     )
 
-    assert '"a":"l|s|h|cl|cs"' in prompt
-    assert '"c":0-1' in prompt
-    assert '"r":"中文4-8字"' in prompt
-    assert "Production Qwen compact mode" in prompt
+    assert '"a":["l|s|h|cl|cs",...]' in prompt
+    assert "Production Qwen ultra-compact mode" in prompt
     assert "position_size_pct" not in prompt
     assert len(prompt) < 4_000
 

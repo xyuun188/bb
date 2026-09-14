@@ -24,7 +24,7 @@ def _normalize_script(text: str) -> str:
     """Keep the bounded target contract even when phase3.env is stale."""
 
     patterns = {
-        "BB_TARGET_MAX_NEW_TOKENS": 96,
+        "BB_TARGET_MAX_NEW_TOKENS": 32,
         "BB_TARGET_GENERATION_TIMEOUT_SECONDS": 12,
         "BB_TARGET_QUEUE_WAIT_SECONDS": 2,
     }

@@ -187,7 +187,7 @@ class Runtime:
         # makes readiness report a limit the carrier will never honor and
         # encourages callers to enqueue unnecessarily long generations.
         self.max_new_tokens = _env_int(
-            "BB_TARGET_MAX_NEW_TOKENS", 96, minimum=64, maximum=96
+            "BB_TARGET_MAX_NEW_TOKENS", 32, minimum=8, maximum=96
         )
         self.warmup_timeout_seconds = 1800.0
         self.warmup_complete = False

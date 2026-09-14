@@ -578,16 +578,14 @@ def build_batch_experts_user_prompt(
             name: _short_text(market_by_expert.get(name, ""), 48)
             for name in requested_experts
         }
-        compact_schema = ",".join(
-            f'"{name}":"l|s|h|cl|cs"' for name in requested_experts
-        )
+        compact_order = ",".join(requested_experts)
         return (
             "QWEN_TARGET_BATCH_V2\n"
-            "Production Qwen compact mode. JSON only; no markdown/thinking. "
-            f"Return exactly {{\"experts\":{{{compact_schema}}}}}. "
-            'Action-code reference: {"a":"l|s|h|cl|cs","c":0-1,"r":"中文4-8字"}.\n'
+            "Production Qwen ultra-compact mode. JSON only; no markdown/thinking/reasoning. "
+            f"Return exactly {{\"a\":[\"l|s|h|cl|cs\",...]}} in this order: {compact_order}. "
+            "Use one action code per item only; never include expert names, confidence, or explanations.\n"
             f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
-            "Each expert value is one action code only: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
+            "Codes: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
             "No invented data; position_expert=hold without a position."
         )
 
