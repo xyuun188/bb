@@ -2257,6 +2257,99 @@ def test_matching_native_fill_refreshes_missing_protection_execution() -> None:
     assert order.okx_raw_fills["protection_execution"] == lifecycle
 
 
+def test_fill_reuses_canonical_order_when_recovery_projection_has_same_exchange_id() -> None:
+    now = datetime.now(UTC)
+    order_id = "act-canonical-fact"
+    row = _act_fill_row(now, order_id=order_id)
+    fill = OkxNativeFillGroup(
+        order_id=order_id,
+        trade_ids=(f"trade-{order_id}",),
+        inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT",
+        side="buy",
+        pos_side="net",
+        contracts=4.0,
+        avg_price=0.00895,
+        fee_abs=0.001,
+        fill_pnl=0.0,
+        timestamp_ms=now.timestamp() * 1000.0,
+        timestamp=now,
+        raw_count=1,
+        rows=(row,),
+    )
+    canonical = Order(
+        id=10,
+        model_name="okx_authoritative_sync",
+        execution_mode="paper",
+        symbol="ACT/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.0,
+        price=0.0,
+        status="pending",
+        fee=0.0,
+        exchange_order_id=order_id,
+        created_at=now,
+    )
+    recovery_projection = Order(
+        id=11,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="ACT/USDT",
+        side="buy",
+        order_type="market",
+        quantity=4.0,
+        price=0.00895,
+        status="filled",
+        fee=0.001,
+        decision_id=99,
+        created_at=now,
+        filled_at=now,
+    )
+    recovery_decision = AIDecision(
+        id=99,
+        model_name="ensemble_trader",
+        symbol="ACT/USDT",
+        action="long",
+        confidence=0.7,
+        raw_llm_response={
+            "decision_state_machine": {
+                "stages": [
+                    {
+                        "stage": "exchange_submit",
+                        "status": "passed",
+                        "data": {
+                            "has_execution_result": True,
+                            "status": "filled",
+                            "exchange_order_id": order_id,
+                        },
+                    }
+                ]
+            }
+        },
+    )
+
+    result = OkxOrderFactSyncService(mode="paper")._apply_local_order_facts(
+        [recovery_projection],
+        fills=[fill],
+        fills_by_order_id={order_id: fill},
+        order_rows_by_id={},
+        protection_execution_by_order_id={},
+        contract_sizes={"ACT-USDT-SWAP": 1.0},
+        decisions_by_id={99: recovery_decision},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids=set(),
+        canonical_orders_by_exchange_id={order_id: canonical},
+    )
+
+    assert result[:4] == (1, 0, 0, 0)
+    assert canonical.okx_sync_status == OKX_SYNC_CONFIRMED
+    assert canonical.exchange_order_id == order_id
+    assert recovery_projection.exchange_order_id is None
+    assert any(item["kind"] == "local_fill_reused_canonical_exchange_fact" for item in result[4])
+
+
 def test_fill_storage_keeps_every_compact_row_without_twenty_row_truncation() -> None:
     now = datetime.now(UTC)
     order_id = "act-many-fills"

@@ -846,6 +846,7 @@ class OkxOrderFactSyncService:
                 since_naive,
                 authoritative_fill_order_ids=set(fills_by_order_id),
             )
+            canonical_orders_by_exchange_id = authoritative_orders_by_exchange_id(writable_orders)
             stored_repair_orders = (
                 writable_orders
                 if okx_pull_available
@@ -933,6 +934,7 @@ class OkxOrderFactSyncService:
                             )
                         }
                     ),
+                    canonical_orders_by_exchange_id=canonical_orders_by_exchange_id,
                 )
                 confirmed_count += local_confirmed_count
                 samples.extend(local_samples)
@@ -1497,6 +1499,7 @@ class OkxOrderFactSyncService:
                 since_naive,
                 authoritative_fill_order_ids=set(fills_by_order_id),
             )
+            canonical_orders_by_exchange_id = authoritative_orders_by_exchange_id(writable_orders)
             decision_ids = {
                 int(decision_id)
                 for order in writable_orders
@@ -1536,6 +1539,7 @@ class OkxOrderFactSyncService:
                 now=datetime.now(UTC),
                 since=since,
                 authoritative_absence_order_ids=set(),
+                canonical_orders_by_exchange_id=canonical_orders_by_exchange_id,
             )
             (
                 exit_lineage_recovered_count,
@@ -1630,6 +1634,7 @@ class OkxOrderFactSyncService:
         now: datetime,
         since: datetime,
         authoritative_absence_order_ids: set[str],
+        canonical_orders_by_exchange_id: dict[str, Order] | None = None,
     ) -> tuple[int, int, int, int, list[dict[str, Any]]]:
         confirmed_count = 0
         unverified_count = 0
@@ -1669,6 +1674,13 @@ class OkxOrderFactSyncService:
                 ),
                 None,
             )
+            if fill is not None and canonical_orders_by_exchange_id:
+                canonical = canonical_orders_by_exchange_id.get(str(fill.order_id or "").strip())
+                if canonical is not None and canonical is not order:
+                    samples.append(
+                        _sample(order, kind="local_fill_reused_canonical_exchange_fact")
+                    )
+                    order = canonical
             if fill is None:
                 pending_fill = _matching_native_full_close_pending_fill(
                     order,
