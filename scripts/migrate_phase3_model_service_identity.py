@@ -27,6 +27,8 @@ from services.phase3_server_migration_audit import FORBIDDEN_LEGACY_SERVICE_NAME
 TARGET_SERVICE = "bb-phase3-llm-target.service"
 TARGET_START_SCRIPT = "/data/BB/scripts/start_target_single_model.sh"
 TARGET_RUNTIME_SCRIPT = ROOT / "scripts" / "target_transformers_api.py"
+REMOTE_ADAPTER_ROOT = "/data/BB/models/finquant_target_27b"
+BASE_MODEL_NAME = "qwen3.8-27b-base"
 RETIRED_MODEL_SERVICES = tuple(
     dict.fromkeys(
         (
@@ -102,10 +104,25 @@ def _unit(*, description: str, exec_start: str) -> str:
     )
 
 
-def render_target_migration(candidate: ModelCandidateManifest) -> str:
+def render_target_migration(
+    candidate: ModelCandidateManifest,
+    *,
+    adapter_path: str | None = None,
+) -> str:
     """Generate the tested, transactional target migration command."""
 
     candidate.to_topology()
+    # Plan mode still renders a complete, inspectable transaction without
+    # pretending that a real adapter is present. Apply mode rejects this
+    # sentinel before opening SSH.
+    normalized_adapter = str(
+        adapter_path or f"{REMOTE_ADAPTER_ROOT}/versions/PLAN_ONLY"
+    ).replace("\\", "/")
+    if not normalized_adapter.startswith(f"{REMOTE_ADAPTER_ROOT}/"):
+        raise ValueError("target migration requires a verified FinQuant 27B adapter path")
+    relative = normalized_adapter.removeprefix(f"{REMOTE_ADAPTER_ROOT}/")
+    if not relative or any(part in {"", ".", ".."} for part in relative.split("/")):
+        raise ValueError("target adapter path is not an immutable version")
     for path in (candidate.model_path, candidate.tokenizer_path):
         if not any(path.startswith(root) for root in ALLOWED_MODEL_ROOTS):
             roots = ", ".join(ALLOWED_MODEL_ROOTS)
@@ -115,7 +132,12 @@ def render_target_migration(candidate: ModelCandidateManifest) -> str:
         "service_manifest": target_service_manifest(candidate),
         "target_service": TARGET_SERVICE,
         "conflicting_services": list(RETIRED_MODEL_SERVICES),
-        "start_script": model_host_deployment.target_start_script(candidate.to_dict()),
+        "adapter_path": normalized_adapter,
+        "start_script": model_host_deployment.target_start_script(
+            candidate.to_dict(),
+            adapter_path=normalized_adapter,
+            base_model_name=BASE_MODEL_NAME,
+        ),
         "runtime_script": TARGET_RUNTIME_SCRIPT.read_text(encoding="utf-8"),
         "unit": _unit(description="BB verified single model", exec_start=TARGET_START_SCRIPT),
     }
@@ -136,6 +158,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--profile", choices=("target_single_model",), default=DEFAULT_MODEL_TOPOLOGY_PROFILE)
     parser.add_argument("--candidate-manifest", required=True)
+    parser.add_argument(
+        "--adapter-path",
+        required=False,
+        help="Immutable verified FinQuant 27B adapter directory on the model host",
+    )
     return parser.parse_args(argv)
 
 
@@ -145,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         safe_print(json.dumps(target_service_manifest(candidate), ensure_ascii=False, indent=2))
         return 0
+    if not args.adapter_path:
+        raise ValueError("apply mode requires --adapter-path for a verified FinQuant 27B adapter")
 
     info = load_model_server_info_from_platform(ROOT)
     ssh = connect_remote_ssh(ROOT, timeout=20, info=info)
@@ -152,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         safe_print(
             run_remote_text(
                 ssh,
-                render_target_migration(candidate),
+                render_target_migration(candidate, adapter_path=args.adapter_path),
                 timeout=720,
                 check=True,
                 max_output_chars=20_000,

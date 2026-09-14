@@ -69,6 +69,25 @@ def test_paper_batch_expert_prompt_requires_complete_trade_plan() -> None:
     assert "unified risk remains authoritative" in prompt
 
 
+def test_qwen_production_batch_prompt_uses_compact_wire_schema() -> None:
+    prompt = build_batch_experts_user_prompt(
+        "symbol=BTC/USDT price=100",
+        {
+            "execution_mode": "paper",
+            "_compact_qwen_batch": True,
+            "review_positions": False,
+        },
+        ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
+    )
+
+    assert '"a":"l|s|h|cl|cs"' in prompt
+    assert '"c":0-1' in prompt
+    assert '"r":"中文4-8字"' in prompt
+    assert "Production Qwen compact mode" in prompt
+    assert "position_size_pct" not in prompt
+    assert len(prompt) < 4_000
+
+
 def test_paper_batch_expert_prompt_exposes_cost_complete_unpromoted_summary() -> None:
     prompt = build_batch_experts_user_prompt(
         "symbol=BTC/USDT price=100",
@@ -635,23 +654,17 @@ async def test_batch_format_failure_disables_batch_but_not_real_experts(
     first = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), first_context)
 
     assert _BatchFormatFailingExpert.calls == 1
-    assert _BatchFormatFailingExpert.individual_calls == 5
-    assert set(first) == {
-        "trend_expert",
-        "momentum_expert",
-        "sentiment_expert",
-        "position_expert",
-        "risk_expert",
-    }
-    assert {row["status"] for row in first_context["_model_timings"]} == {"completed"}
+    assert _BatchFormatFailingExpert.individual_calls == 0
+    assert first == {}
+    assert {row["status"] for row in first_context["_model_timings"]} == {"failed_no_retry"}
 
     second_context: dict[str, Any] = {}
     second = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
 
     assert _BatchFormatFailingExpert.calls == 1
-    assert _BatchFormatFailingExpert.individual_calls == 10
-    assert set(second) == set(first)
-    assert {row["status"] for row in second_context["_model_timings"]} == {"completed"}
+    assert _BatchFormatFailingExpert.individual_calls == 0
+    assert second == {}
+    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
 
 
 @pytest.mark.asyncio
@@ -680,31 +693,17 @@ async def test_batch_failure_retries_real_individual_experts(
     context: dict[str, Any] = {}
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
-    assert set(decisions) == {
-        "trend_expert",
-        "momentum_expert",
-        "sentiment_expert",
-        "position_expert",
-        "risk_expert",
-    }
+    assert decisions == {}
     assert _BatchFailingIndividualSuccessExpert.batch_calls == 1
-    assert _BatchFailingIndividualSuccessExpert.individual_calls == 5
-    assert {row["status"] for row in context["_model_timings"]} == {"completed"}
-    assert all(row["stage"] == "expert_independent_provider" for row in context["_model_timings"])
-    assert all(
-        decision.raw_response.get("provider_independent_expert_mode")
-        for decision in decisions.values()
-    )
+    assert _BatchFailingIndividualSuccessExpert.individual_calls == 0
+    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
 
     second_context: dict[str, Any] = {}
     await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
 
     assert _BatchFailingIndividualSuccessExpert.batch_calls == 1
-    assert _BatchFailingIndividualSuccessExpert.individual_calls == 10
-    assert {row["status"] for row in second_context["_model_timings"]} == {"completed"}
-    assert all(
-        row["stage"] == "expert_independent_provider" for row in second_context["_model_timings"]
-    )
+    assert _BatchFailingIndividualSuccessExpert.individual_calls == 0
+    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
 
 
 @pytest.mark.asyncio
@@ -728,21 +727,10 @@ async def test_batch_timeout_uses_bounded_independent_retry(
     context: dict[str, Any] = {}
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
-    assert set(decisions) == {
-        "trend_expert",
-        "momentum_expert",
-        "sentiment_expert",
-        "position_expert",
-        "risk_expert",
-    }
+    assert decisions == {}
     assert _BatchTimeoutExpert.batch_calls == 1
-    assert _BatchTimeoutExpert.individual_calls == 5
-    assert {row["status"] for row in context["_model_timings"]} == {"completed"}
-    assert all(float(row["duration_sec"]) > 0 for row in context["_model_timings"])
-    assert all(
-        decision.raw_response.get("provider_independent_expert_mode")
-        for decision in decisions.values()
-    )
+    assert _BatchTimeoutExpert.individual_calls == 0
+    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
 
 
 @pytest.mark.asyncio
@@ -775,8 +763,7 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
     assert decisions == {}
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {"analysis_budget_deferred"}
-    assert all(row["analysis_budget"]["scope"] == "market_ai" for row in context["_model_timings"])
+    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
 
 
 @pytest.mark.asyncio
@@ -802,8 +789,8 @@ async def test_batch_timeout_activates_minimum_circuit_breaker_when_config_is_ze
     await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
 
     assert _BatchTimeoutExpert.batch_calls == 1
-    assert _BatchTimeoutExpert.individual_calls == 10
-    assert {row["status"] for row in second_context["_model_timings"]} == {"completed"}
+    assert _BatchTimeoutExpert.individual_calls == 0
+    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
 
 
 @pytest.mark.asyncio
@@ -895,7 +882,7 @@ async def test_independent_provider_groups_run_concurrently(
 
 
 @pytest.mark.asyncio
-async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
+async def test_paper_complete_plans_use_one_shared_batch_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
@@ -922,12 +909,12 @@ async def test_paper_complete_plans_skip_oversized_multi_expert_batch(
         "position_expert",
         "risk_expert",
     }
-    assert _ProviderBatchExpert.batch_calls == []
-    assert len(_ProviderBatchExpert.individual_calls) == 5
-    assert all(row.get("batch_expert", False) is False for row in context["_model_timings"])
-    assert context["_force_independent_expert"] is True
-    assert context["_force_fast_independent_expert"] is True
-    assert context["_provider_independent_expert_mode"] is True
+    assert _ProviderBatchExpert.batch_calls == [
+        ("qwen3.8-27b", ("trend_expert", "momentum_expert", "sentiment_expert", "position_expert", "risk_expert")),
+    ]
+    assert _ProviderBatchExpert.individual_calls == []
+    assert all(row.get("batch_expert", False) is True for row in context["_model_timings"])
+    assert "_force_independent_expert" not in context
 
 
 @pytest.mark.asyncio

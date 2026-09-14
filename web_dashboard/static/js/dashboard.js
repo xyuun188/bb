@@ -952,7 +952,7 @@ function updateExecutionAccountPanel(account) {
     const balanceSource = account.balance_source || (account.balance_snapshot_stale ? 'OKX 缓存快照' : 'OKX 权威账户');
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     const pauseNote = account.risk_paused
-        ? `<div class="exec-risk-note paused">已暂停分析新交易对：${escHtml(translatePauseReason(account.risk_pause_reason || '账户触发风险限制'))}</div>`
+        ? `<div class="exec-risk-note paused">${account.market_analysis_paused ? '市场分析已暂停；' : '市场分析继续运行；'}已暂停新开仓：${escHtml(translatePauseReason(account.entry_pause_reason || account.risk_pause_reason || '账户触发风险限制'))}</div>`
         : '<div class="exec-risk-note">账户余额、权益、订单和持仓只以 OKX 实时/快照事实为准；本地不再使用固定金额或虚拟余额算账。</div>';
 
     container.innerHTML = `
@@ -962,7 +962,7 @@ function updateExecutionAccountPanel(account) {
                     <div class="exec-account-name">${escHtml(account.account_name || '多专家执行账户')}</div>
                     <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_age_seconds, 1)}秒` : ''}</div>
                 </div>
-                <span class="badge ${account.risk_paused ? 'badge-short' : 'badge-long'}">${account.risk_paused ? '暂停开新仓' : '可分析'}</span>
+                <span class="badge ${account.risk_paused ? 'badge-short' : 'badge-long'}">${account.risk_paused ? (account.market_analysis_paused ? '暂停分析/开仓' : '分析中·暂停开仓') : '可分析可开仓'}</span>
             </div>
             <div class="exec-status-grid">
                 <div class="exec-status-cell"><span>${accountBalanceLabel}可交易余额</span><strong>${accountMoneyText(remainingAllocation, account)} USDT</strong></div>
@@ -10921,12 +10921,23 @@ async function fetchTradingParams() {
 function renderHighRiskReviewerStatus(data) {
     const el = document.getElementById('cloud-reviewer-test-status');
     const routeSummary = document.getElementById('ai-model-route-summary');
+    const routeMatrix = document.getElementById('ai-cloud-route-matrix');
     if (!data) return;
+    const routes = Array.isArray(data.low_frequency_routes) ? data.low_frequency_routes : [];
+    if (routeMatrix) {
+        routeMatrix.innerHTML = routes.length
+            ? `<strong>低频路由：</strong> ${routes.map(route => {
+                const tone = route.active ? 'var(--success, #22c55e)' : 'var(--text-muted)';
+                const state = route.active ? '已启用' : (route.configured ? '已配置但未接管' : '未启用');
+                return `<span style="display:inline-block;margin-right:14px;color:${tone};">${escHtml(route.label)} · ${escHtml(state)}<small style="display:block;color:var(--text-muted);">${escHtml(route.status || '')}</small></span>`;
+            }).join('')}`
+            : '低频云端路由信息暂未返回。';
+    }
     if (routeSummary) {
         const stateText = data.route_valid
-            ? `云端 reviewer：${data.provider || '云端'} / ${data.model || '-'}（独立高风险复核路由）`
-            : '云端 reviewer：未配置或未通过校验（高风险新开仓继续 fail-closed）';
-        routeSummary.textContent = `本地专家：6 个固定槽位统一走本地 Qwen3.8-27B；${stateText}。`;
+            ? `云端高风险复核：${data.provider || '云端'} / ${data.model || '-'}（低频独立路由）`
+            : '云端高风险复核：未配置或未通过校验（高风险新开仓继续 fail-closed）';
+        routeSummary.textContent = `本地实时专家：6 个固定槽位统一走本地 Qwen3.8-27B；${stateText}。重大分歧会诊当前走本地回退，新闻/事件只进入采集与训练。`;
     }
     if (!el) return;
     if (data.route_valid === false) {

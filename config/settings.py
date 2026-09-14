@@ -106,6 +106,34 @@ MARKET_ANALYSIS_EXPERT_NAMES: tuple[str, ...] = tuple(
     if slot.get("name") != DECISION_MAKER_NAME and slot.get("role") != "position_exit"
 )
 
+# Cloud calls are deliberately limited to low-frequency review work.  The
+# realtime expert slots never use these routes; the catalog is exposed to the
+# dashboard so operators can see exactly which work is local versus optional
+# cloud review.
+CLOUD_LOW_FREQUENCY_ROUTE_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "high_risk_review",
+        "label": "高风险开仓复核",
+        "frequency": "低频",
+        "route": "cloud",
+        "status": "独立云端路由（配置并通过测试后启用）",
+    },
+    {
+        "id": "deep_consultation",
+        "label": "重大分歧深度会诊",
+        "frequency": "低频",
+        "route": "local_fallback",
+        "status": "当前走本地 Qwen3.8-27B；云端 reviewer 配置后可作为后续扩展",
+    },
+    {
+        "id": "news_event_review",
+        "label": "新闻/事件复核",
+        "frequency": "低频",
+        "route": "collector_only",
+        "status": "只写入情绪与训练样本，不直接参与下单",
+    },
+)
+
 
 class TradingMode(StrEnum):
     PAPER = "paper"
@@ -260,6 +288,9 @@ class Settings(BaseSettings):
     cny_per_usdt_assumption: float = 7.2
     expert_memory_enabled: bool = True
     ai_llm_concurrency: int = 2
+    # Bound provider calls per symbol analysis so repair/fallback/consultation
+    # cannot turn one local-model round into a multi-minute queue.
+    ai_llm_max_calls_per_analysis: int = 2
     ai_llm_call_delay_seconds: float = 0.15
     ai_expert_timeout_seconds: float = 30.0
     ai_decision_maker_timeout_seconds: float = 20.0

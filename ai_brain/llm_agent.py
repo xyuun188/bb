@@ -75,6 +75,42 @@ if TYPE_CHECKING:
 _LLM_CONCURRENCY = max(int(settings.ai_llm_concurrency or 5), 1)
 
 
+class LLMCallBudgetExceeded(ModelInferenceError):
+    """Raised when one analysis has exhausted its provider-call budget."""
+
+
+def ensure_llm_call_budget(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Create or return the mutable per-analysis provider-call budget."""
+
+    if not isinstance(context, dict):
+        return {"max_calls": 1, "used": 0, "calls": []}
+    budget = context.get("_llm_call_budget")
+    if not isinstance(budget, dict):
+        budget = {
+            "max_calls": max(int(getattr(settings, "ai_llm_max_calls_per_analysis", 2) or 2), 1),
+            "used": 0,
+            "calls": [],
+        }
+        context["_llm_call_budget"] = budget
+    return budget
+
+
+def _claim_llm_call(context: dict[str, Any] | None, stage: str) -> None:
+    """Claim one provider call without awaiting, so concurrent calls cannot oversubscribe."""
+
+    budget = ensure_llm_call_budget(context)
+    maximum = max(int(budget.get("max_calls") or 1), 1)
+    used = max(int(budget.get("used") or 0), 0)
+    if used >= maximum:
+        raise LLMCallBudgetExceeded(
+            f"analysis provider-call budget exhausted ({used}/{maximum})"
+        )
+    budget["used"] = used + 1
+    calls = budget.setdefault("calls", [])
+    if isinstance(calls, list):
+        calls.append(str(stage or "llm"))
+
+
 class _ScopedLLMCapacity:
     """Bound provider calls while reserving one slot for market discovery."""
 
@@ -312,6 +348,37 @@ def _bounded_number(
         return default
     number = max(number, minimum)
     return min(number, maximum) if maximum is not None else number
+
+
+def _expand_compact_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Expand the Qwen production wire format into the stable decision shape."""
+
+    action_codes = {
+        "l": "long",
+        "s": "short",
+        "h": "hold",
+        "cl": "close_long",
+        "cs": "close_short",
+    }
+    expanded = dict(payload)
+    code = str(payload.get("a") or payload.get("action") or "h").strip().lower()
+    expanded["action"] = action_codes.get(code, code)
+    expanded["confidence"] = payload.get("c", payload.get("confidence", 0.5))
+    expanded["reasoning"] = payload.get("r", payload.get("reasoning", "暂无分析内容。"))
+    expanded["cross_check_for"] = payload.get("x", payload.get("cross_check_for"))
+    return expanded
+
+
+def _normalize_compact_batch_value(value: Any) -> dict[str, Any] | None:
+    """Normalize the ultra-compact action-code form into a decision payload."""
+
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        code = value.strip().lower()
+        if code in {"l", "s", "h", "cl", "cs"}:
+            return {"a": code, "c": 0.5, "r": "紧凑诊断", "x": None}
+    return None
 
 
 def _format_local_ai_tools(tools: dict[str, Any]) -> str:
@@ -998,10 +1065,20 @@ class LLMAgent(AbstractAIModel):
             )
         else:
             requested_tokens = max_completion_tokens_override or configured_max_tokens or 0
+        # The production Qwen batch contract is intentionally tiny: four
+        # diagnostic objects use short keys and do not carry sizing/exit
+        # fields.  Do not let the generic 180-token floor silently turn the
+        # requested 128-token budget back into a longer generation.
+        compact_qwen_batch = (
+            str(model or "").strip().lower() == "qwen3.8-27b"
+            and token_stage in {"batch_expert", "paper_batch_expert"}
+            and max_completion_tokens_override is not None
+            and int(max_completion_tokens_override or 0) <= 128
+        )
         max_completion_tokens = completion_token_limit(
             token_stage,
             int(requested_tokens or 0),
-            floor=96 if fast_expert else 180,
+            floor=96 if (fast_expert or compact_qwen_batch) else 180,
             model=model,
         )
         client_api_key = self._api_key
@@ -1190,6 +1267,7 @@ class LLMAgent(AbstractAIModel):
             response_contract: dict[str, Any] = {}
             try:
                 messages = _messages_for_model(system_prompt, user_prompt, model_name)
+                _claim_llm_call(context, "expert" if expert_mode else "decision")
                 async with _bounded_llm_capacity_slot(context):
                     if _LLM_CALL_DELAY:
                         await asyncio.sleep(_LLM_CALL_DELAY)
@@ -1267,11 +1345,24 @@ class LLMAgent(AbstractAIModel):
         context: dict[str, Any],
         expert_names: list[str],
     ) -> dict[str, DecisionOutput]:
+        # The target carrier is a single local Qwen3.8-27B process.  Every
+        # fixed expert call must therefore use the compact wire contract;
+        # allowing a context-dependent fallback silently reintroduces the
+        # 1k+ token prompt that stalls the carrier and drains its queue.
+        target_single_call = (
+            self._model_name.strip().lower() == "qwen3.8-27b"
+            and isinstance(context.get("_llm_call_budget"), dict)
+        )
+
         async def _invoke_batch(prompt: str, *, repair: bool = False) -> dict[str, Any]:
             messages = _messages_for_model(
                 BATCH_EXPERT_SYSTEM_PROMPT,
                 prompt,
                 self._model_name,
+            )
+            _claim_llm_call(
+                context,
+                "batch_expert_repair" if repair else "batch_expert",
             )
             async with _bounded_llm_capacity_slot(context):
                 if _LLM_CALL_DELAY:
@@ -1279,8 +1370,8 @@ class LLMAgent(AbstractAIModel):
                 batch_llm = self._create_llm(
                     self._model_name,
                     max_completion_tokens_override=(
-                        max(settings.ai_batch_expert_max_completion_tokens, 960)
-                        if str(context.get("execution_mode") or "").lower() == "paper"
+                        128
+                        if target_single_call
                         else settings.ai_batch_expert_max_completion_tokens
                     ),
                     json_response=True,
@@ -1305,6 +1396,15 @@ class LLMAgent(AbstractAIModel):
                     response = await request
             parsed = _extract_json(_message_content_text(response))
             experts = parsed.get("experts") if isinstance(parsed, dict) else None
+            if not isinstance(experts, dict) and target_single_call and isinstance(parsed, dict):
+                # Accept compact Qwen output that omits only the outer wrapper.
+                top_level = {
+                    name: parsed.get(name)
+                    for name in expert_names
+                    if _normalize_compact_batch_value(parsed.get(name)) is not None
+                }
+                if top_level:
+                    experts = top_level
             if not isinstance(experts, dict):
                 kind = "repair" if repair else "batch"
                 raise LLMResponseParseError(f"{kind} experts response missing experts object")
@@ -1333,9 +1433,16 @@ class LLMAgent(AbstractAIModel):
             )
             for name in expert_names
         }
+        prompt_context = dict(context)
+        if target_single_call:
+            # Production Qwen calls use a compact diagnostic schema. Sizing,
+            # leverage and exits are authoritative in deterministic risk
+            # policy; asking one 27B generation to emit all plans causes
+            # avoidable 30s timeouts on the single-concurrency host.
+            prompt_context["_compact_qwen_batch"] = True
         user_prompt = build_batch_experts_user_prompt(
             feature_contexts,
-            context,
+            prompt_context,
             expert_names,
         )
         repair_error = ""
@@ -1346,9 +1453,19 @@ class LLMAgent(AbstractAIModel):
             experts_payload = {}
 
         missing_names = [
-            name for name in expert_names if not isinstance(experts_payload.get(name), dict)
+            name
+            for name in expert_names
+            if _normalize_compact_batch_value(experts_payload.get(name)) is None
         ]
         if missing_names:
+            # Production analysis already has a hard per-round call budget.
+            # A second repair request to the single-concurrency Qwen carrier
+            # can turn one malformed JSON response into a 30+ second stall;
+            # fail closed and let the deterministic risk gate hold instead.
+            if target_single_call:
+                raise LLMResponseParseError(
+                    "Qwen3.8-27B batch response incomplete; production repair call disabled"
+                )
             repair_prompt = build_batch_experts_user_prompt(
                 feature_contexts,
                 {**context, "batch_repair_retry": True},
@@ -1373,16 +1490,17 @@ class LLMAgent(AbstractAIModel):
                 )
             else:
                 for name in missing_names:
-                    repaired = repaired_payload.get(name)
-                    if isinstance(repaired, dict):
-                        repaired = dict(repaired)
+                    repaired = _normalize_compact_batch_value(repaired_payload.get(name))
+                    if repaired is not None:
                         repaired["batch_repair_retry"] = True
                         if repair_error:
                             repaired["batch_repair_reason"] = repair_error
                         experts_payload[name] = repaired
 
         missing_after_repair = [
-            name for name in expert_names if not isinstance(experts_payload.get(name), dict)
+            name
+            for name in expert_names
+            if _normalize_compact_batch_value(experts_payload.get(name)) is None
         ]
         if missing_after_repair:
             missing_text = ", ".join(missing_after_repair)
@@ -1392,11 +1510,13 @@ class LLMAgent(AbstractAIModel):
 
         decisions: dict[str, DecisionOutput] = {}
         paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
+        compact_qwen_batch = target_single_call
         for name in expert_names:
-            payload = experts_payload.get(name)
-            if not isinstance(payload, dict):  # pragma: no cover - guarded above.
+            payload = _normalize_compact_batch_value(experts_payload.get(name))
+            if payload is None:  # pragma: no cover - guarded above.
                 raise LLMResponseParseError(f"batch experts response missing {name}")
-            payload = dict(payload)
+            if compact_qwen_batch:
+                payload = _expand_compact_batch_payload(payload)
             payload["provider_model"] = self._model_name
             payload["batch_expert"] = True
             payload["batch_source_model"] = self.name

@@ -1010,6 +1010,10 @@ class TradingService:
         }
         self._pnl_history: dict[str, list[dict]] = {}  # model_name -> [{time, equity}, ...]
         self._new_pair_pause_reasons: dict[str, str] = {}
+        # Entry execution may be paused while market observation must continue.
+        # Keep this state separate from new-pair analysis pauses so dashboards
+        # and training can distinguish "do not open" from "do not analyze".
+        self._entry_pause_reasons: dict[str, str] = {}
         self._okx_balance_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._okx_balance_snapshot_locks: dict[str, asyncio.Lock] = {}
         self._okx_balance_snapshot_refresh_tasks: dict[str, asyncio.Task] = {}
@@ -1556,21 +1560,21 @@ class TradingService:
     def market_model_inference_timeout_seconds(self) -> float:
         """Return enough time for the configured expert execution strategy.
 
-        Paper analysis calls configured experts independently. With multiple experts and the
-        default global concurrency of two, their tasks can occupy three queue
-        batches. Live batch analysis may first consume its batch timeout and
-        then retry independently, so its outer boundary must cover both phases.
+        The fixed expert slots share one local Qwen3.8-27B carrier. The normal
+        path therefore uses one batch request in both paper and live modes;
+        independent calls remain only as a bounded provider-format fallback.
         """
 
         settings.refresh_runtime_env()
         independent_window = self._independent_expert_window_seconds()
-        execution_mode = str(settings.trading_mode or "").lower()
         batch_window = 0.0
-        if execution_mode != "paper" and bool(settings.ai_batch_experts_enabled):
+        if bool(settings.ai_batch_experts_enabled):
             batch_window = max(
                 float(settings.ai_batch_expert_timeout_seconds or 0.0),
                 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS,
             )
+        if batch_window > 0.0:
+            independent_window = 0.0
         decision_timeout = max(
             float(settings.ai_decision_maker_timeout_seconds or 0.0),
             0.0,
@@ -7456,7 +7460,6 @@ class TradingService:
         if monitoring_active is None:
             monitoring_active = bool(
                 getattr(self, "_running", False)
-                and not mode_manager.is_paused
                 and not self._safe_dict(getattr(self, "_new_pair_pause_reasons", {})).get(
                     ENSEMBLE_TRADER_NAME
                 )
@@ -9559,29 +9562,9 @@ class TradingService:
         account_pause_reason = ""
         if mode_manager.is_paused:
             account_pause_reason = (
-                "当前执行账户已暂停投资：停止新开仓和新交易对分析，"
+                "当前执行账户已暂停投资：停止新开仓和新订单提交，"
                 "已有仓位继续复盘直到触发正常平仓。"
             )
-            if analysis_scope == "market":
-                return {
-                    "status": "paused",
-                    "mode": mode_manager.mode.value,
-                    "analysis_scope": analysis_scope,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "symbols_processed": 0,
-                    "decisions": [],
-                    "executions": [],
-                    "warnings": [
-                        {
-                            "model": ENSEMBLE_TRADER_NAME,
-                            "symbol": "ALL",
-                            "warning": account_pause_reason,
-                        }
-                    ],
-                    "market_analysis_paused": True,
-                }
-            run_market_analysis = False
-            run_position_analysis = analysis_scope in {"full", "position"}
         new_pair_market_pause_applied = False
         round_start = datetime.now(UTC)
         round_id = f"{analysis_scope}:{round_start.strftime('%Y%m%dT%H%M%S.%fZ')}"
@@ -9594,6 +9577,10 @@ class TradingService:
             "status": "ok",
             "mode": mode_manager.mode.value,
             "analysis_scope": analysis_scope,
+            "entry_paused": bool(account_pause_reason),
+            "entry_pause_reason": account_pause_reason or None,
+            "market_analysis_paused": False,
+            "market_analysis_pause_reason": None,
             "timestamp": round_start.isoformat(),
             "round_id": round_id,
             "symbols_processed": 0,
@@ -9660,10 +9647,14 @@ class TradingService:
                 open_positions=open_positions,
                 allow_background_refresh=analysis_scope == "market",
             )
-            if account_pause_reason:
-                new_pair_pause_reason = account_pause_reason
             self._set_loop_stage("record_new_pair_pause_state")
+            entry_pause_reason = account_pause_reason or new_pair_pause_reason
             await self._record_new_pair_pause_state(ENSEMBLE_TRADER_NAME, new_pair_pause_reason)
+            await self._record_entry_pause_state(ENSEMBLE_TRADER_NAME, entry_pause_reason)
+            results["entry_paused"] = bool(entry_pause_reason)
+            results["entry_pause_reason"] = entry_pause_reason or None
+            results["market_analysis_paused"] = bool(new_pair_pause_reason)
+            results["market_analysis_pause_reason"] = new_pair_pause_reason or None
             if new_pair_pause_reason and run_market_analysis:
                 new_pair_market_pause_applied = True
                 logger.warning(
@@ -9682,7 +9673,7 @@ class TradingService:
                 # The account guard is only meant to stop opening new symbols.
                 # Existing positions still need SL/TP enforcement and AI review.
                 run_market_analysis = False
-            elif account_pause_reason:
+            if account_pause_reason:
                 results["warnings"].append(
                     {
                         "model": ENSEMBLE_TRADER_NAME,
@@ -9857,6 +9848,8 @@ class TradingService:
                         sorted(active_analysis_symbols)[:10] if run_market_analysis else []
                     ),
                     "new_pair_pause_reason": new_pair_pause_reason,
+                    "entry_pause_reason": entry_pause_reason,
+                    "account_paused": bool(account_pause_reason),
                 }
                 results["scan_filter_diagnostics"] = diagnostics
                 if new_pair_market_pause_applied and not run_position_analysis:
@@ -10394,7 +10387,7 @@ class TradingService:
                     results=results,
                     round_decision_ids=round_decision_ids,
                     open_positions=open_positions,
-                    position_entry_pause_reason=new_pair_pause_reason,
+                    position_entry_pause_reason=entry_pause_reason,
                     max_groups_override=int(
                         analysis_budget_context.get("position_max_groups")
                         or POSITION_REVIEW_MAX_GROUPS_PER_ROUND
@@ -10425,7 +10418,7 @@ class TradingService:
                     model_mode=self._get_model_execution_mode(ENSEMBLE_TRADER_NAME),
                     approved=False,
                     execution_status="paused",
-                    reason=new_pair_pause_reason,
+                    reason=entry_pause_reason,
                 )
 
             market_feature_items = list(market_feature_vectors.items())
@@ -10966,7 +10959,7 @@ class TradingService:
                     staged_entry_counts=staged_entry_counts,
                     strategy_mode_context=strategy_mode_context,
                     market_regime_context=market_regime_context,
-                    new_pair_pause_reason=new_pair_pause_reason,
+                    new_pair_pause_reason=entry_pause_reason,
                 )
                 if not scheduled:
                     reason = "该币种已有开仓执行任务，当前裁决不重复进入执行队列。"
@@ -14451,6 +14444,36 @@ class TradingService:
                 severity="warn",
             )
 
+    async def _record_entry_pause_state(self, model_name: str, reason: str | None) -> None:
+        """Persist the execution-only entry pause independently of analysis."""
+
+        reasons = getattr(self, "_entry_pause_reasons", None)
+        if not isinstance(reasons, dict):
+            reasons = {}
+            self._entry_pause_reasons = reasons
+        previous = reasons.get(model_name)
+        if reason:
+            if previous != reason:
+                reasons[model_name] = reason
+                await self._log_risk_event(
+                    "new_entry_execution_paused",
+                    "ALL",
+                    f"{reason} 系统动作：继续采集行情、特征和模型分析，但禁止新开仓和新订单提交。",
+                    model_name,
+                    severity="warn",
+                )
+            return
+
+        if previous:
+            reasons.pop(model_name, None)
+            await self._log_risk_event(
+                "new_entry_execution_resumed",
+                "ALL",
+                "账户执行暂停已解除；系统继续保留全部风控和订单前校验后恢复新开仓资格。",
+                model_name,
+                severity="warn",
+            )
+
     def _refresh_model_modes(self) -> None:
         """Rebuild model_name -> execution_mode mapping from current settings."""
         self._model_execution_modes = {ENSEMBLE_TRADER_NAME: mode_manager.mode.value}
@@ -15430,6 +15453,28 @@ class TradingService:
             "running": self._running,
             "mode": mode_manager.mode.value,
             "paused": mode_manager.is_paused,
+            "entry_paused": bool(
+                mode_manager.is_paused
+                or self._safe_dict(getattr(self, "_entry_pause_reasons", {})).get(
+                    ENSEMBLE_TRADER_NAME
+                )
+            ),
+            "entry_pause_reason": self._safe_dict(
+                getattr(self, "_entry_pause_reasons", {})
+            ).get(ENSEMBLE_TRADER_NAME)
+            or (
+                "当前执行账户已暂停投资：停止新开仓和新订单提交。"
+                if mode_manager.is_paused
+                else None
+            ),
+            "market_analysis_paused": bool(
+                self._safe_dict(getattr(self, "_new_pair_pause_reasons", {})).get(
+                    ENSEMBLE_TRADER_NAME
+                )
+            ),
+            "market_analysis_pause_reason": self._safe_dict(
+                getattr(self, "_new_pair_pause_reasons", {})
+            ).get(ENSEMBLE_TRADER_NAME),
             "uptime_seconds": int(uptime),
             "started_at": self._start_time.isoformat() if self._start_time else None,
             "heartbeat_at": now.isoformat(),

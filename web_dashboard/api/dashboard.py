@@ -2435,16 +2435,29 @@ def _build_execution_account_status(
         pnl_summary=pnl_summary,
     )
     pause_reason = None
+    entry_pause_reason = None
+    market_analysis_pause_reason = None
     if _trading_service:
-        pause_reason = getattr(_trading_service, "_new_pair_pause_reasons", {}).get(
+        entry_pause_reason = getattr(_trading_service, "_entry_pause_reasons", {}).get(
             ENSEMBLE_TRADER_NAME
         )
+        market_analysis_pause_reason = getattr(_trading_service, "_new_pair_pause_reasons", {}).get(
+            ENSEMBLE_TRADER_NAME
+        )
+        pause_reason = entry_pause_reason or market_analysis_pause_reason
+    if mode_manager.is_paused and not entry_pause_reason:
+        entry_pause_reason = "当前执行账户已暂停投资：停止新开仓和新订单提交，已有仓位继续复盘直到触发正常平仓。"
+        pause_reason = pause_reason or entry_pause_reason
     pause_reason = _translate_pause_reason(pause_reason)
+    entry_pause_reason = _translate_pause_reason(entry_pause_reason)
+    market_analysis_pause_reason = _translate_pause_reason(market_analysis_pause_reason)
     if not okx_error and not okx_balance_available:
         okx_error = "OKX balance unavailable"
     if okx_error and not pause_reason and not okx_balance_available:
         source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
         pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
+        market_analysis_pause_reason = market_analysis_pause_reason or pause_reason
+        entry_pause_reason = entry_pause_reason or pause_reason
     blocking_balance_error = okx_error if not okx_balance_available else None
     balance_warning = okx_error if okx_balance_available else None
     payload = {
@@ -2455,6 +2468,10 @@ def _build_execution_account_status(
         "account_equity": account_equity,
         "risk_paused": bool(pause_reason),
         "risk_pause_reason": pause_reason,
+        "entry_paused": bool(entry_pause_reason),
+        "entry_pause_reason": entry_pause_reason,
+        "market_analysis_paused": bool(market_analysis_pause_reason),
+        "market_analysis_pause_reason": market_analysis_pause_reason,
         "balance_error": blocking_balance_error,
         "balance_warning": balance_warning,
         "okx_available_balance": okx_available,

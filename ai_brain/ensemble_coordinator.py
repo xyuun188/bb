@@ -21,6 +21,7 @@ from ai_brain.analysis_quality import (
 )
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.cross_validator import CrossValidator
+from ai_brain.llm_agent import ensure_llm_call_budget
 from ai_brain.model_registry import ModelRegistry
 from config.settings import (
     DECISION_MAKER_NAME,
@@ -132,6 +133,7 @@ class EnsembleCoordinator:
         context: dict[str, Any],
     ) -> tuple[DecisionOutput, dict[str, DecisionOutput]]:
         self._set_strategy_context(context)
+        ensure_llm_call_budget(context)
         timing_records: list[dict[str, Any]] = []
         base_expert_context = self._base_expert_context(context)
         all_attempted: list[str] = []
@@ -167,6 +169,13 @@ class EnsembleCoordinator:
             "_analysis_budget_seconds": context.get("_analysis_budget_seconds"),
             "_consultation_reuse_key": context.get("_consultation_reuse_key"),
             "_consultation_reuse_ttl_seconds": context.get("_consultation_reuse_ttl_seconds"),
+            "_llm_call_budget": context.get("_llm_call_budget"),
+            "_target_qwen_batch": any(
+                isinstance(decision.raw_response, dict)
+                and str(decision.raw_response.get("provider_model") or "").strip().lower()
+                == "qwen3.8-27b"
+                for decision in opinions.values()
+            ),
         }
         cross_validations, consultation = await self.cross_validator.validate_all(
             opinions, validation_timing
@@ -244,6 +253,7 @@ class EnsembleCoordinator:
         raw["model_timings"] = model_timings
         raw["timing_breakdown"] = timing_records
         raw["latency_summary"] = self._latency_summary(timing_records, model_timings)
+        raw["llm_call_budget"] = dict(context.get("_llm_call_budget") or {})
         if isinstance(context.get("ml_signal"), dict):
             raw["ml_signal"] = context.get("ml_signal")
         if isinstance(context.get("local_ai_tools"), dict):

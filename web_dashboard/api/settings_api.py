@@ -17,7 +17,12 @@ import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config.settings import ENSEMBLE_TRADER_NAME, _is_target_local_model_config, settings
+from config.settings import (
+    CLOUD_LOW_FREQUENCY_ROUTE_CATALOG,
+    ENSEMBLE_TRADER_NAME,
+    _is_target_local_model_config,
+    settings,
+)
 from core.model_runtime import (
     HIGH_RISK_REVIEW_TOKEN_CAP,
     HIGH_RISK_REVIEW_TOKEN_FLOOR,
@@ -162,6 +167,14 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
         settings.high_risk_review_api_key,
     )
     parsed = urlsplit(base) if base else None
+    routes = []
+    for item in CLOUD_LOW_FREQUENCY_ROUTE_CATALOG:
+        route = dict(item)
+        route["configured"] = bool(valid and settings.high_risk_review_enabled)
+        route["active"] = bool(
+            route["configured"] and route["id"] == "high_risk_review"
+        )
+        routes.append(route)
     return {
         "enabled": bool(settings.high_risk_review_enabled),
         "api_base": base,
@@ -172,6 +185,7 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
         "route_valid": valid,
         "route_error": reason or None,
         "provider": parsed.netloc if parsed and parsed.netloc else None,
+        "low_frequency_routes": routes,
     }
 
 
@@ -519,14 +533,26 @@ async def _execution_account_status(mode: str) -> dict:
         pnl_summary=pnl_summary,
     )
     pause_reason = None
+    entry_pause_reason = None
+    market_analysis_pause_reason = None
     if _dash._trading_service and _dash.mode_manager.mode.value == mode:
-        pause_reason = getattr(_dash._trading_service, "_new_pair_pause_reasons", {}).get(
+        service = _dash._trading_service
+        entry_pause_reason = getattr(service, "_entry_pause_reasons", {}).get(
             ENSEMBLE_TRADER_NAME
         )
+        market_analysis_pause_reason = getattr(service, "_new_pair_pause_reasons", {}).get(
+            ENSEMBLE_TRADER_NAME
+        )
+        pause_reason = entry_pause_reason or market_analysis_pause_reason
+    if _dash.mode_manager.is_paused and not entry_pause_reason:
+        entry_pause_reason = "当前执行账户已暂停投资：停止新开仓和新订单提交，已有仓位继续复盘直到触发正常平仓。"
+        pause_reason = pause_reason or entry_pause_reason
     if okx_snapshot.get("balance_error") and not pause_reason and not okx_balance_available:
         pause_reason = (
             f"未同步到 {okx_snapshot.get('balance_source')} 的实际余额，暂停分析新的交易对。"
         )
+        market_analysis_pause_reason = market_analysis_pause_reason or pause_reason
+        entry_pause_reason = entry_pause_reason or pause_reason
     blocking_balance_error = (
         okx_snapshot.get("balance_error") if not okx_balance_available else None
     )
@@ -581,6 +607,10 @@ async def _execution_account_status(mode: str) -> dict:
             "allocation_exceeds_balance": False,
             "risk_paused": bool(pause_reason),
             "risk_pause_reason": pause_reason,
+            "entry_paused": bool(entry_pause_reason),
+            "entry_pause_reason": entry_pause_reason,
+            "market_analysis_paused": bool(market_analysis_pause_reason),
+            "market_analysis_pause_reason": market_analysis_pause_reason,
         }
     )
     if mode == "paper":

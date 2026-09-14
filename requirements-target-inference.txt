@@ -5,6 +5,13 @@ transformers==5.8.1
 accelerate==1.14.0
 bitsandbytes==0.49.0
 peft==0.18.1
+# Qwen3.8-27B uses GatedDeltaNet blocks. FLA is a pure Python package that
+# enables the fused attention kernels; causal-conv1d must be installed from a
+# wheel/source build compiled against the exact target torch ABI.
+flash-linear-attention==0.5.2
+# Qwen3.8-27B fused GatedDeltaNet path. Build on the target host against its
+# exact torch CUDA and C++ ABI; prebuilt wheels may carry the wrong ABI.
+causal-conv1d==1.6.2.post1
 datasets==4.8.5
 trl==0.29.1
 fastapi==0.141.1

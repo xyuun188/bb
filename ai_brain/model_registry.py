@@ -18,6 +18,7 @@ from ai_brain.expert_diversity_policy import (
     ExpertDiversityReview,
     review_batch_expert_consensus,
 )
+from ai_brain.llm_agent import ensure_llm_call_budget
 from config.settings import settings
 from core.safe_output import safe_error_text
 from data_feed.feature_vector import FeatureVector
@@ -56,6 +57,12 @@ def _batch_expert_decider(model: AbstractAIModel) -> BatchExpertDecider | None:
 def _provider_model_name(model: object | None) -> str | None:
     value = getattr(model, "_model_name", None)
     return str(value) if value else None
+
+
+def _is_target_qwen_provider(model: object | None) -> bool:
+    """Return whether a provider is the single-concurrency Qwen target."""
+
+    return (_provider_model_name(model) or "").strip().lower() == "qwen3.8-27b"
 
 
 def _provider_group_key(model: object) -> tuple[str, str]:
@@ -316,6 +323,7 @@ class ModelRegistry:
         context["_attempted_models"] = [model.name for model in active_models]
         context["_model_failures"] = []
         context["_model_timings"] = []
+        ensure_llm_call_budget(context)
 
         analysis_budget = _analysis_budget_snapshot(context)
         if analysis_budget is not None:
@@ -364,10 +372,14 @@ class ModelRegistry:
             )
             return {}
 
+        # The target Qwen3.8-27B endpoint is intentionally single-concurrency.
+        # Paper mode used to force one independent request per expert, so the
+        # four market experts queued behind one another and expired together
+        # inside the per-symbol deadline.  Batch mode preserves one result per
+        # expert for attribution while using a single provider request.
         if (
             settings.ai_batch_experts_enabled
             and len(active_models) >= 3
-            and str(context.get("execution_mode") or "").lower() != "paper"
             and {model.name for model in active_models}.issubset(batchable_names)
         ):
             grouped_models = _group_batchable_models_by_provider(active_models)
@@ -395,7 +407,9 @@ class ModelRegistry:
                     all_decisions,
                 )
                 context["_expert_diversity_policy"] = diversity_review.to_dict()
-                if diversity_review.should_retry:
+                if diversity_review.should_retry and not all(
+                    _is_target_qwen_provider(model) for model in active_models
+                ):
                     retry_decisions, retry_timings = await self._retry_independent_experts(
                         features=features,
                         context=context,
@@ -414,11 +428,10 @@ class ModelRegistry:
             return all_decisions
 
         if str(context.get("execution_mode") or "").lower() == "paper":
+            # Keep the independent fallback compact if a provider rejects the
+            # batch contract. Normal paper analysis reaches the batch branch
+            # above and does not enqueue one request per expert.
             context["_force_independent_expert"] = True
-            # Paper analysis keeps experts independent for per-role attribution,
-            # but must use the compact diagnostic contract. The former full
-            # multidimensional prompt made five experts emit oversized JSON,
-            # causing vLLM queueing and truncated responses.
             context["_force_fast_independent_expert"] = True
             context["_provider_independent_expert_mode"] = True
 
@@ -569,9 +582,38 @@ class ModelRegistry:
                 f"{self._batch_expert_last_error_by_provider.get(provider_key) or 'recent batch expert failure'}"
             )
             logger.warning(
-                "batch expert circuit breaker active, retrying experts independently",
+                (
+                    "batch expert circuit breaker active, fail-closed for Qwen target"
+                    if _is_target_qwen_provider(batch_model)
+                    else "batch expert circuit breaker active, retrying experts independently"
+                ),
                 reason=reason,
             )
+            if _is_target_qwen_provider(batch_model):
+                context.setdefault("_model_failures", []).extend(
+                    {
+                        "expert_name": model.name,
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": reason,
+                        "status": "batch_failure_no_retry",
+                    }
+                    for model in provider_group
+                )
+                return {}, [
+                    {
+                        "stage": "expert_initial",
+                        "name": model.name,
+                        "status": "failed_no_retry",
+                        "started_at": datetime.now(UTC).isoformat(),
+                        "duration_sec": 0.0,
+                        "batch_expert": True,
+                        "shared_batch_call": True,
+                        "batch_model_count": len(provider_group),
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": "Qwen3.8-27B batch failure is fail-closed; no independent retry",
+                    }
+                    for model in provider_group
+                ]
             return await self._retry_provider_group_independently(
                 features,
                 context,
@@ -680,7 +722,7 @@ class ModelRegistry:
             else:
                 self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
             logger.warning(
-                "batch expert decide failed, retrying experts independently",
+                "batch expert decide failed",
                 provider_model=_provider_model_name(batch_model),
                 experts=expert_names,
                 error=error_text,
@@ -693,6 +735,31 @@ class ModelRegistry:
                     "reason": error_text,
                 }
             )
+            if _is_target_qwen_provider(batch_model):
+                context.setdefault("_model_failures", []).extend(
+                    {
+                        "expert_name": model.name,
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": error_text,
+                        "status": "batch_failure_no_retry",
+                    }
+                    for model in provider_group
+                )
+                return {}, [
+                    {
+                        "stage": "expert_initial",
+                        "name": model.name,
+                        "status": "failed_no_retry",
+                        "started_at": started_at.isoformat(),
+                        "duration_sec": duration,
+                        "batch_expert": True,
+                        "shared_batch_call": True,
+                        "batch_model_count": len(provider_group),
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": "Qwen3.8-27B batch failure is fail-closed; no independent retry",
+                    }
+                    for model in provider_group
+                ]
             return await self._retry_provider_group_independently(
                 features,
                 context,
@@ -880,7 +947,14 @@ class ModelRegistry:
                     error_text,
                 )
 
-        results = await asyncio.gather(*[_retry_one(model) for model in active_models])
+        # The target Qwen3.8-27B carrier is deliberately single-concurrency.
+        # A batch timeout must never fan out four simultaneous fallback calls,
+        # otherwise the provider returns 429 for every expert and the whole
+        # symbol loses its analysis. Keep the fallback sequential and let the
+        # shared analysis deadline bound the total work.
+        results = []
+        for model in active_models:
+            results.append(await _retry_one(model))
         retry_decisions: dict[str, DecisionOutput] = {}
         retry_timings: list[dict[str, Any]] = []
         for model, decision, timing, _error_text in results:
@@ -1044,7 +1118,11 @@ class ModelRegistry:
                     ),
                 )
 
-        results = await asyncio.gather(*[_retry_one(model) for model in retry_models])
+        # Consensus retries target the same single-concurrency Qwen carrier;
+        # serialize them so a disagreement repair cannot create provider 429s.
+        results = []
+        for model in retry_models:
+            results.append(await _retry_one(model))
         retry_decisions: dict[str, DecisionOutput] = {}
         retry_timings: list[dict[str, Any]] = []
         for name, decision, timing in results:

@@ -218,7 +218,43 @@ class LinuxHost:
         return self.run("systemctl", "is-enabled", "--quiet", service, check=False).returncode == 0
 
     def control(self, action: str, service: str) -> None:
-        self.run("sudo", "-n", "systemctl", action, service)
+        try:
+            self.run("sudo", "-n", "systemctl", action, service)
+        except subprocess.TimeoutExpired:
+            if action != "stop":
+                raise
+            # Transformers/TorchInductor can leave background compiler tasks
+            # alive while systemd waits for graceful shutdown.  A target model
+            # restart is transactional: once graceful stop exceeds the hard
+            # bound, kill the whole cgroup and verify that it is gone before
+            # replacing files. This prevents a half-old/half-new GPU process.
+            self.run(
+                "sudo",
+                "-n",
+                "systemctl",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                service,
+                check=False,
+            )
+            self.run(
+                "sudo",
+                "-n",
+                "systemctl",
+                "stop",
+                "--no-block",
+                service,
+                check=False,
+            )
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if not self.active(service):
+                    return
+                time.sleep(0.5)
+            raise RuntimeError(
+                f"service did not stop after forced cgroup kill: {service}"
+            ) from None
 
     def reload(self) -> None:
         self.run("sudo", "-n", "systemctl", "daemon-reload")
@@ -250,7 +286,7 @@ class LinuxHost:
             time.sleep(2)
         raise RuntimeError("target model identity readiness timed out")
 
-    def chat_ready(self, model_id: str, *, port: int = 8000, timeout: float = 180) -> None:
+    def chat_ready(self, model_id: str, *, port: int = 8000, timeout: float = 900) -> None:
         payload = json.dumps(
             {
                 "model": model_id,
@@ -264,21 +300,35 @@ class LinuxHost:
                 "max_tokens": 32,
             }
         ).encode("utf-8")
-        request = urllib.request.Request(  # noqa: S310 - fixed loopback URL.
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                result = json.load(response)
-        except (OSError, ValueError, urllib.error.URLError) as exc:
-            raise RuntimeError("target adapter inference probe failed") from exc
-        choices = result.get("choices") if isinstance(result, dict) else None
-        if not isinstance(choices, list) or not choices:
+        deadline = time.monotonic() + max(float(timeout), 5.0)
+        while time.monotonic() < deadline:
+            request = urllib.request.Request(  # noqa: S310 - fixed loopback URL.
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=payload,
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            remaining = max(deadline - time.monotonic(), 1.0)
+            try:
+                with opener.open(request, timeout=min(15.0, remaining)) as response:
+                    result = json.load(response)
+            except urllib.error.HTTPError as exc:
+                # The target service exposes 503 while its startup warmup is
+                # still compiling. Treat that as a retryable readiness state,
+                # rather than rolling back a valid deployment immediately.
+                if exc.code in {429, 503}:
+                    time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
+                    continue
+                raise RuntimeError("target adapter inference probe failed") from exc
+            except (OSError, ValueError, urllib.error.URLError):
+                time.sleep(min(2.0, max(deadline - time.monotonic(), 0.0)))
+                continue
+            choices = result.get("choices") if isinstance(result, dict) else None
+            if isinstance(choices, list) and choices:
+                return
             raise RuntimeError("target adapter inference response has no choices")
+        raise RuntimeError("target adapter inference probe timed out")
 
     def verify_runtime(self, candidate: dict) -> None:
         engine = candidate["runtime"]["engine"]
@@ -589,6 +639,15 @@ def target_start_script(
         "export CUDA_VISIBLE_DEVICES=0\n"
         + environment
         + "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\n"
+        + "export TORCHINDUCTOR_CACHE_DIR=/data/BB/runtime/torchinductor-cache\n"
+        + "export TRITON_CACHE_DIR=/data/BB/runtime/triton-cache\n"
+        + "export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-8}\n"
+        + "export BB_TARGET_QUEUE_WAIT_SECONDS=${BB_TARGET_QUEUE_WAIT_SECONDS:-3}\n"
+        + "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=${BB_TARGET_GENERATION_TIMEOUT_SECONDS:-18}\n"
+        + "export BB_TARGET_MAX_NEW_TOKENS=${BB_TARGET_MAX_NEW_TOKENS:-128}\n"
+        + "export BB_TARGET_ATTN_IMPLEMENTATION=${BB_TARGET_ATTN_IMPLEMENTATION:-sdpa}\n"
+        + "export BB_TARGET_RESPONSE_CACHE_SECONDS=${BB_TARGET_RESPONSE_CACHE_SECONDS:-2}\n"
+        + "mkdir -p /data/BB/runtime/torchinductor-cache /data/BB/runtime/triton-cache\n"
         "exec " + shlex.join(args) + "\n"
     )
 

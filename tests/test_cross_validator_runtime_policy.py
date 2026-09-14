@@ -522,6 +522,32 @@ async def test_validate_all_marks_exhausted_analysis_budget_as_skipped(
 
 
 @pytest.mark.asyncio
+async def test_validate_all_skips_second_qwen_consultation_after_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = CrossValidator()
+
+    async def should_not_start_consultation(*args, **kwargs):
+        raise AssertionError("Qwen batch must not fan out into a second consultation")
+
+    monkeypatch.setattr(validator, "consult_if_needed", should_not_start_consultation)
+    timing = {
+        "_target_qwen_batch": True,
+        "_analysis_budget_scope": "market_symbol_ai",
+        "_analysis_deadline_monotonic": 0.0,
+        "_llm_call_budget": {"max_calls": 2, "used": 1, "calls": ["batch_expert"]},
+    }
+    _validations, consultation = await validator.validate_all(
+        _conflicting_opinions(),
+        timing,
+    )
+
+    assert consultation is not None
+    assert consultation["status"] == "skipped"
+    assert consultation["reason_code"] == "target_batch_latency_budget"
+
+
+@pytest.mark.asyncio
 async def test_validate_all_keeps_real_consultation_timeout_as_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

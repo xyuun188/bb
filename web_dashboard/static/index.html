@@ -1585,8 +1585,9 @@
                     <span class="card-subtitle">固定专家槽位；编辑和测试直接作用于本地模型路由</span>
                 </div>
                 <div id="ai-model-route-summary" class="settings-readonly-note" style="margin:0 12px 10px;">
-                    本地专家：行情方向、盈利质量、短线时序、持仓退出、异常风险、最终交易员，统一走本地 Qwen3.8-27B；云端 reviewer 仅用于高风险复核，配置入口在“交易参数”，未配置时保持 fail-closed。
+                    本地实时专家统一走本地 Qwen3.8-27B；低频云端能力单独列出：高风险开仓复核可走云端，重大分歧会诊当前本地回退，新闻/事件复核只进入采集与训练，不直接下单。
                 </div>
+                <div id="ai-cloud-route-matrix" class="settings-readonly-note" style="margin:0 12px 10px;"></div>
                 <div class="table-wrap">
                     <table class="model-table">
                         <thead>

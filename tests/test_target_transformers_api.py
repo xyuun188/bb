@@ -33,7 +33,11 @@ class _FakeTokenizer:
 
 
 class _FakeModel:
+    def __init__(self):
+        self.kwargs: dict = {}
+
     def generate(self, **_kwargs):
+        self.kwargs = _kwargs
         return _FakeOutput()
 
 
@@ -92,3 +96,18 @@ def test_generate_rejects_non_boolean_thinking_flag(
 
     assert error.value.status_code == 400
     assert tokenizer.template_calls == []
+
+
+def test_generate_caps_legacy_large_completion_request(
+    runtime: tuple[Runtime, _FakeTokenizer],
+) -> None:
+    instance, _tokenizer = runtime
+    instance.max_new_tokens = 320
+    request = ChatRequest(
+        model="qwen3.8-27b",
+        messages=[{"role": "user", "content": "Return JSON."}],
+        max_tokens=256,
+    )
+
+    assert instance.generate(request) == '{"status":"ok"}'
+    assert instance.model.kwargs["max_new_tokens"] == 128

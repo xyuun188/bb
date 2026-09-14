@@ -507,6 +507,7 @@ def build_batch_experts_user_prompt(
     ]
     if not requested_experts:
         requested_experts = list(supported_experts)
+    compact_qwen_batch = bool(context.get("_compact_qwen_batch"))
     requested_schema = ",".join(f'"{name}":{{...}}' for name in requested_experts)
     requested_list = ", ".join(requested_experts)
     omitted_experts = [name for name in supported_experts if name not in requested_experts]
@@ -543,15 +544,54 @@ def build_batch_experts_user_prompt(
             "evidence; otherwise use long/short only to identify the lower-risk side."
         ),
     }
-    role_contracts = "\n".join(
-        f"- {name}: {role_contract_by_expert[name]}" for name in requested_experts
-    )
+    if compact_qwen_batch:
+        compact_role_contracts = {
+            "trend_expert": "只报趋势方向，诊断用。",
+            "momentum_expert": "只报扣费后收益质量。",
+            "sentiment_expert": "只报下一窗口时序方向。",
+            "position_expert": "无持仓必须 hold。",
+            "risk_expert": "只报风险方向，风险不明则 hold。",
+        }
+        role_contracts = "\n".join(
+            f"- {name}: {compact_role_contracts[name]}" for name in requested_experts
+        )
+    else:
+        role_contracts = "\n".join(
+            f"- {name}: {role_contract_by_expert[name]}" for name in requested_experts
+        )
     if isinstance(feature_context, dict):
         market_by_expert = {
             name: _short_text(feature_context.get(name, ""), 640) for name in requested_experts
         }
     else:
         market_by_expert = {name: _short_text(feature_context, 420) for name in requested_experts}
+
+    # The local target model has one generation slot and a hard prefill knee.
+    # Keep its request independent of the verbose paper/strategy payload below:
+    # deterministic code owns sizing, exits, and execution permission, while
+    # this call only supplies five short diagnostic direction labels.
+    if compact_qwen_batch:
+        compact_data = {
+            name: _short_text(market_by_expert.get(name, ""), 72)
+            for name in requested_experts
+        }
+        compact_roles = ",".join(
+            f"{name}={role_contract_by_expert[name].split('.')[0][:18]}"
+            for name in requested_experts
+        )
+        compact_schema = ",".join(
+            f'"{name}":"l|s|h|cl|cs"' for name in requested_experts
+        )
+        return (
+            "QWEN_TARGET_BATCH_V2\n"
+            "Production Qwen compact mode. JSON only; no markdown/thinking. "
+            f"Return exactly {{\"experts\":{{{compact_schema}}}}}. "
+            'Action-code reference: {"a":"l|s|h|cl|cs","c":0-1,"r":"中文4-8字"}.\n'
+            f"Roles: {compact_roles}.\n"
+            f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Each expert value is one action code only: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
+            "No invented data; position_expert=hold without a position."
+        )
 
     strategy_mode = (
         context.get("strategy_mode") if isinstance(context.get("strategy_mode"), dict) else {}
@@ -683,18 +723,44 @@ def build_batch_experts_user_prompt(
             "position_expert holds when no matching position. risk_expert holds for hard risk or neutral/insufficient risk evidence, not as a production permission signal."
         ),
     }
-    paper_multidimensional = str(context.get("execution_mode") or "").lower() == "paper"
+    paper_multidimensional = (
+        str(context.get("execution_mode") or "").lower() == "paper"
+        and not compact_qwen_batch
+    )
+    if compact_qwen_batch:
+        # Keep production input small; deterministic risk code owns sizing,
+        # leverage, exits and governance.
+        payload["market_by_expert"] = {
+            name: _short_text(value, 120) for name, value in market_by_expert.items()
+        }
+        for key in (
+            "evidence",
+            "memory",
+            "strategy",
+            "unpromoted_quantitative_summary",
+            "ml_signal",
+            "local_ai_tools",
+            "portfolio",
+        ):
+            payload[key] = {}
     text = json.dumps(payload, ensure_ascii=False, default=str)
-    max_payload_chars = 6_800 if paper_multidimensional else 8_000
+    # Keep the single-card Qwen request below the prefill knee observed on the
+    # A100.  The deterministic risk layer owns all fields omitted here.
+    max_payload_chars = (
+        1_450 if compact_qwen_batch else 6_800 if paper_multidimensional else 8_000
+    )
     if len(text) > max_payload_chars:
         payload["memory"] = {}
         payload["local_ai_tools"] = {}
         payload["portfolio"] = {}
         payload["market_by_expert"] = {
-            name: _short_text(value, 220) for name, value in market_by_expert.items()
+            name: _short_text(value, 140) for name, value in market_by_expert.items()
         }
         text = json.dumps(payload, ensure_ascii=False, default=str)
     expert_schema = (
+        '{"a":"l|s|h|cl|cs","c":0-1,"r":"中文4-8字","x":null}'
+        if compact_qwen_batch
+        else (
         '{"action":"long|short|close_long|close_short|hold","confidence":0-1,'
         '"reasoning":"简体中文12-28字，写方向/收益/风险要点",'
         '"position_size_pct":0-1,"suggested_leverage":"number >=1",'
@@ -706,14 +772,19 @@ def build_batch_experts_user_prompt(
         else '{"action":"long|short|close_long|close_short|hold","confidence":0-1,'
         '"reasoning":"简体中文12-28字，写方向/收益/风险要点",'
         '"cross_check_for":null}'
+        )
     )
     expert_rule = (
+        "Production Qwen compact mode: use only the short keys a,c,r,x; a is l/s/h/cl/cs, r is 4-8 Chinese chars."
+        if compact_qwen_batch
+        else (
         "For paper mode every expert must provide a complete diagnostic trade plan: "
         "size, leverage, stop, target, expected holding time, maximum holding time, "
         "and close fraction. These are recommendations only; unified risk remains "
         "authoritative and may reduce or reject them."
         if paper_multidimensional
         else "Experts are diagnostic and cannot set size, leverage, stop loss, or take profit."
+        )
     )
     return f"""BATCH_EXPERT_JSON_V13
 Return one minified JSON object only. No markdown, no prose, no <think>. Keep every reasoning value to 8-20 Chinese chars so the complete object fits in one response.

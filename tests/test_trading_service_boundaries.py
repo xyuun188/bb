@@ -1741,29 +1741,50 @@ def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paused_market_scope_does_not_start_market_round(
+async def test_entry_pause_state_is_separate_from_market_analysis_pause(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._new_pair_pause_reasons = {}
+    service._entry_pause_reasons = {}
+    events: list[tuple[str, str]] = []
+
+    async def log_event(event_type: str, _symbol: str, message: str, _model: str, **_kwargs: Any) -> None:
+        events.append((event_type, message))
+
+    monkeypatch.setattr(service, "_log_risk_event", log_event)
+    await service._record_new_pair_pause_state("ensemble_trader", "市场数据暂停")
+    await service._record_entry_pause_state("ensemble_trader", "账户暂停开仓")
+
+    assert service._new_pair_pause_reasons == {"ensemble_trader": "市场数据暂停"}
+    assert service._entry_pause_reasons == {"ensemble_trader": "账户暂停开仓"}
+    assert {event[0] for event in events} == {
+        "new_pair_analysis_paused",
+        "new_entry_execution_paused",
+    }
+
+    await service._record_entry_pause_state("ensemble_trader", None)
+    assert service._new_pair_pause_reasons == {"ensemble_trader": "市场数据暂停"}
+    assert service._entry_pause_reasons == {}
+
+
+def test_market_defer_snapshot_stays_monitoring_when_account_is_paused(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
     service._running = True
-    service._last_market_round_started_at = None
-    service._analysis_runtime = {
-        "market": _AnalysisRuntimeState(),
-        "position": _AnalysisRuntimeState(),
-        "full": _AnalysisRuntimeState(),
+    service._new_pair_pause_reasons = {}
+    service._last_market_analysis_selection_diagnostics = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "coverage_due_symbols": [],
     }
-    state_path = tmp_path / "trading-control-state.json"
-    monkeypatch.setattr(mode_manager, "_state_path", state_path)
-    monkeypatch.setattr(mode_manager, "_last_state_mtime", 0.0)
-    await mode_manager.pause()
+    monkeypatch.setattr(mode_manager, "_paused", True)
+    monkeypatch.setattr(mode_manager, "_load_state_from_disk", lambda: None)
 
-    result = await service.run_once("market")
+    snapshot = service._market_defer_snapshot()
 
-    assert result["status"] == "paused"
-    assert result["market_analysis_paused"] is True
-    assert service._last_market_round_started_at is None
-    assert service._runtime_state("market").current_stage == "idle"
+    assert snapshot["monitoring_active"] is True
+    assert snapshot["coverage_window_evaluable"] is True
 
 
 async def _async_value(value: Any) -> Any:
@@ -6906,8 +6927,8 @@ def test_market_symbol_context_and_model_budgets_are_independent(
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
     assert service.market_symbol_context_timeout_seconds() == pytest.approx(10.25)
-    assert service.market_model_inference_timeout_seconds() == pytest.approx(105.0)
-    assert service.market_symbol_total_budget_seconds() == pytest.approx(115.25)
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(50.0)
+    assert service.market_symbol_total_budget_seconds() == pytest.approx(60.25)
 
 
 @pytest.mark.asyncio
@@ -6982,7 +7003,7 @@ def test_market_model_budget_covers_live_batch_failure_and_independent_retry(
     monkeypatch.setattr(trading_service.settings, "trading_mode", "live")
 
     assert service._independent_expert_window_seconds() == pytest.approx(90.0)
-    assert service.market_model_inference_timeout_seconds() == pytest.approx(140.0)
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(50.0)
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
@@ -7659,9 +7680,9 @@ def test_position_round_watchdog_follows_position_review_cadence(
     monkeypatch.setattr(trading_service.settings, "ai_llm_concurrency", 2)
     monkeypatch.setattr(trading_service.settings, "trading_mode", "paper")
 
-    assert service.position_review_stage_timeout_seconds() == 113.0
+    assert service.position_review_stage_timeout_seconds() == 58.0
     assert service.position_loop_interval_seconds() == pytest.approx(30.0)
-    assert service.position_round_watchdog_seconds() == pytest.approx(226.0)
+    assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,11 @@ import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai_brain.base_model import Action, DecisionOutput
-from ai_brain.llm_agent import shared_llm_capacity_slot
+from ai_brain.llm_agent import (
+    LLMCallBudgetExceeded,
+    _claim_llm_call,
+    shared_llm_capacity_slot,
+)
 from config.settings import settings
 from core.model_runtime import (
     completion_token_limit,
@@ -406,6 +410,22 @@ class CrossValidator:
             )
         if cached_consultation is not None:
             consultation = cached_consultation
+        elif (
+            isinstance(timing_context, dict)
+            and timing_context.get("_target_qwen_batch") is True
+            and major_conflicts
+        ):
+            # The single-concurrency Qwen carrier has already spent the round
+            # budget on the shared expert batch. Deterministic pairwise
+            # validation remains recorded; a second local generation would
+            # only queue behind the carrier and turn a conflict into a timeout.
+            consultation = self._consultation_unavailable(
+                major_conflicts,
+                "qwen3.8-27b",
+                "本轮已完成 Qwen 批量诊断，跳过第二次本地会诊以保护分析时延",
+                status="skipped",
+                reason_code="target_batch_latency_budget",
+            )
         else:
             try:
                 if major_conflicts and consultation_timeout < _CONSULTATION_TIMEOUT_FLOOR_SECONDS:
@@ -805,12 +825,17 @@ class CrossValidator:
             _CONSULTATION_QUEUE_WAIT_CAP_SECONDS,
         )
         shared_capacity_context = dict(capacity_context or {})
+        if isinstance(capacity_context, dict):
+            shared_capacity_context["_llm_call_budget"] = capacity_context.get(
+                "_llm_call_budget"
+            )
         original_scope = str(
             shared_capacity_context.get("_analysis_budget_scope") or "shared"
         )
         shared_capacity_context["_analysis_budget_scope"] = (
             f"consultation:{original_scope}"
         )
+        _claim_llm_call(shared_capacity_context, "deep_consultation")
         shared_slot = shared_llm_capacity_slot(shared_capacity_context)
         try:
             async with asyncio.timeout(queue_timeout):
@@ -1127,6 +1152,23 @@ class CrossValidator:
                             error_text,
                             runtime_metrics=runtime_metrics,
                         )
+                    )
+                except LLMCallBudgetExceeded as exc:
+                    attempts.append(
+                        self._consultation_attempt(
+                            candidate,
+                            attempt_no,
+                            "budget_exhausted",
+                            str(exc),
+                            runtime_metrics=runtime_metrics,
+                        )
+                    )
+                    return self._consultation_unavailable(
+                        major,
+                        candidate.get("model") or primary_model,
+                        "本轮模型调用预算已用尽，跳过深度会诊",
+                        attempts=attempts,
+                        reason_code="llm_call_budget_exhausted",
                     )
                 except Exception as exc:
                     error_text = safe_error_text(exc)
