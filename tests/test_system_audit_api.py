@@ -5343,3 +5343,29 @@ def test_latest_audit_snapshot_serializes_nested_datetimes(
     loaded_at, loaded_payload = loaded
     assert loaded_at == checked_at
     assert loaded_payload["cards"][0]["details"]["settlement_synced_at"] == (checked_at.isoformat())
+
+
+def test_optional_cloud_model_failure_is_not_local_ml_critical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(system_audit.settings, "high_risk_review_model", "deepseek-v4.1-flash-expires")
+    monkeypatch.setattr(
+        system_audit.settings,
+        "high_risk_review_api_base",
+        "https://tengsuan.xiweinet.com/v1",
+    )
+
+    assert system_audit._is_optional_cloud_model_row(
+        {
+            "model": "deepseek-v4.1-flash-expires",
+            "api_base": "https://tengsuan.xiweinet.com/v1",
+            "status_code": 401,
+        }
+    )
+    assert not system_audit._is_optional_cloud_model_row(
+        {
+            "model": "qwen3.8-27b",
+            "api_base": "http://127.0.0.1:18000/v1",
+            "name": "decision_maker",
+        }
+    )

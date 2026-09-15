@@ -63,11 +63,11 @@ from services.trade_execution_contract import TradeExecutionContractService
 from executor.okx_executor import OKXExecutor
 from web_dashboard.api.dashboard import (
     get_expert_memories,
-    get_model_training_registry_status,
     get_shadow_backtests,
     get_strategy_learning,
 )
 from web_dashboard.api.data_collection import get_data_collection_status
+from web_dashboard.api.model_training_status import get_model_training_registry_status
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position

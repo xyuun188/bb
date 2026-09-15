@@ -523,6 +523,28 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _is_optional_cloud_model_row(row: dict[str, Any]) -> bool:
+    """Cloud reviewer failures are optional-route warnings, not local ML faults."""
+
+    model = str(row.get("model") or row.get("name") or "").strip().lower()
+    api_base = str(row.get("api_base") or "").strip().lower()
+    route_name = " ".join(
+        str(row.get(key) or "").strip().lower()
+        for key in ("name", "role", "slot", "route", "route_id")
+    )
+    configured_model = str(getattr(settings, "high_risk_review_model", "") or "").strip().lower()
+    configured_base = str(
+        getattr(settings, "high_risk_review_api_base", "") or ""
+    ).strip().lower()
+    return bool(
+        "review" in route_name
+        or "high_risk" in route_name
+        or (configured_model and model == configured_model)
+        or (configured_base and api_base.rstrip("/") == configured_base.rstrip("/"))
+        or api_base.startswith("https://")
+    )
+
+
 def _safe_int_value(value: Any, default: int = 0) -> int:
     try:
         if value is None or value == "":
@@ -4401,6 +4423,7 @@ async def _model_training_audit() -> dict[str, Any]:
     optional_source_warnings, hard_source_warnings = _split_training_source_warnings(sources)
     runtime_probe: dict[str, Any] = {"status": "unknown"}
     model_critical: list[dict[str, Any]] = []
+    optional_cloud_model_warnings: list[dict[str, Any]] = []
     if isinstance(runtime_status, Exception):
         timeout = isinstance(runtime_status, TimeoutError)
         runtime_probe = {
@@ -4421,6 +4444,19 @@ async def _model_training_audit() -> dict[str, Any]:
         )
         for row in runtime_models:
             if not isinstance(row, dict) or bool(row.get("available")):
+                continue
+            if _is_optional_cloud_model_row(row):
+                optional_cloud_model_warnings.append(
+                    {
+                        "model": row.get("model") or row.get("name"),
+                        "api_base": row.get("api_base"),
+                        "status_code": row.get("status_code"),
+                        "error": row.get("error"),
+                        "route": row.get("role") or row.get("slot") or row.get("name"),
+                        "required_for_high_risk_entry": True,
+                        "fail_closed_when_unavailable": True,
+                    }
+                )
                 continue
             model_critical.append(
                 {
@@ -4754,6 +4790,7 @@ async def _model_training_audit() -> dict[str, Any]:
             "hard_source_warning_count": len(hard_source_warnings),
             "optional_source_warning_count": len(optional_source_warnings),
             "model_critical_items": model_critical[:8],
+            "optional_cloud_model_warnings": optional_cloud_model_warnings[:8],
         },
         evidence=[
             {
@@ -7009,6 +7046,9 @@ def _dashboard_system_audit_payload(value: Any) -> dict[str, Any]:
                 "source_warnings": list(details.get("source_warnings") or [])[:8],
                 "optional_source_warnings": list(details.get("optional_source_warnings") or [])[:8],
                 "model_critical_items": list(details.get("model_critical_items") or [])[:8],
+                "optional_cloud_model_warnings": list(
+                    details.get("optional_cloud_model_warnings") or []
+                )[:8],
             }
         elif key in {
             "phase3_paper_resume_preflight",
