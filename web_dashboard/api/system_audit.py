@@ -27,6 +27,7 @@ from sqlalchemy import and_, func, or_, select
 from config.settings import settings
 from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
+from core.trading_mode import mode_manager
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.market_data import Kline, Ticker
@@ -1681,6 +1682,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
     since_10m = now - timedelta(minutes=AUDIT_WINDOWS["fast_minutes"])
     since_2h = now - timedelta(hours=AUDIT_WINDOWS["trade_hours"])
     runtime_window = _load_trading_runtime_audit_window()
+    control_state = mode_manager.get_state()
     async with get_session_ctx() as session:
         recent_decisions = (
             await session.execute(
@@ -1730,7 +1732,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
     runtime_running = bool(runtime_window.get("running")) and runtime_heartbeat_fresh
     stale_runtime_heartbeat = bool(runtime_window.get("running")) and not runtime_heartbeat_fresh
     market_analysis_paused = (
-        runtime_running and bool(runtime_window.get("paused")) and runtime_heartbeat_fresh
+        runtime_running and bool(control_state.get("paused")) and runtime_heartbeat_fresh
     )
     dynamic_return_gate = (
         _phase3_dynamic_return_gate_status() if not runtime_running else {"ready": False}
@@ -1823,7 +1825,10 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "runtime_window": {
                 "running": runtime_running,
                 "reported_running": bool(runtime_window.get("running")),
-                "paused": bool(runtime_window.get("paused")),
+                "paused": bool(control_state.get("paused")),
+                "reported_paused": bool(runtime_window.get("paused")),
+                "pause_source": "trading_mode_manager_persisted_control",
+                "mode_changed_at": control_state.get("mode_changed_at"),
                 "mode": runtime_window.get("mode"),
                 "current_stage": runtime_window.get("current_stage"),
                 "round_active": bool(runtime_window.get("round_active")),

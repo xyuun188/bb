@@ -3720,6 +3720,15 @@ async def test_trade_loop_paused_market_analysis_is_observing(
     )
     monkeypatch.setattr(system_audit, "_now", lambda: now)
     monkeypatch.setattr(
+        system_audit.mode_manager,
+        "get_state",
+        lambda: {
+            "mode": "paper",
+            "paused": True,
+            "mode_changed_at": (now - timedelta(minutes=2)).isoformat(),
+        },
+    )
+    monkeypatch.setattr(
         system_audit,
         "_load_trading_runtime_audit_window",
         lambda: {
@@ -3729,7 +3738,7 @@ async def test_trade_loop_paused_market_analysis_is_observing(
             "heartbeat_at": heartbeat_at,
             "heartbeat_at_iso": heartbeat_at.isoformat(),
             "running": True,
-            "paused": True,
+            "paused": False,
             "mode": "paper",
             "decision_interval": 30,
             "current_stage": "idle",
@@ -3747,6 +3756,11 @@ async def test_trade_loop_paused_market_analysis_is_observing(
         assert card["status"] == "warning"
         assert card["details"]["market_analysis_paused"] is True
         assert card["details"]["runtime_window"]["paused"] is True
+        assert card["details"]["runtime_window"]["reported_paused"] is False
+        assert (
+            card["details"]["runtime_window"]["pause_source"]
+            == "trading_mode_manager_persisted_control"
+        )
         assert "paused" in card["summary"].lower()
         assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
         assert ledger["observing"][0]["key"] == "trade_loop"
