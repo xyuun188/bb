@@ -429,3 +429,36 @@ def test_dashboard_renders_model_cards_from_canonical_registry() -> None:
     assert "registryModels.map(model =>" in render_block
     assert "alias_only" not in render_block
     assert "const models = [" not in render_block
+    assert "最近成功训练" in script
+    assert "当前 Champion 产物" in render_block
+
+
+def test_registry_separates_scheduler_times_from_current_artifact_time() -> None:
+    payload = build_model_training_registry(
+        local_ml_status={
+            "available": True,
+            "trained_at": "2026-07-01T00:00:00+00:00",
+        },
+        scheduler_state={
+            "models": {
+                "local_ml_profit_quality": {
+                    "scheduler_id": "local_ml_auto_train",
+                    "last_successful_training_at": "2026-09-15T01:36:59+00:00",
+                    "last_started_at": "2026-09-15T01:35:00+00:00",
+                    "next_check_at": "2026-09-15T02:36:59+00:00",
+                }
+            },
+            "schedulers": {
+                "local_ml_auto_train": {
+                    "heartbeat_at": "2026-09-15T02:00:00+00:00",
+                }
+            },
+        },
+    )
+
+    row = _by_id(payload)["local_ml_profit_quality"]
+    assert row["artifact_trained_at"] == "2026-07-01T00:00:00+00:00"
+    assert row["last_successful_training_at"] == "2026-09-15T01:36:59+00:00"
+    assert row["last_training_attempt_at"] == "2026-09-15T01:35:00+00:00"
+    assert row["next_training_check_at"] == "2026-09-15T02:36:59+00:00"
+    assert row["scheduler_heartbeat_at"] == "2026-09-15T02:00:00+00:00"

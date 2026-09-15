@@ -22,6 +22,8 @@ _DEFAULT_TAIL_RISK_THRESHOLD = 0.65
 _DEFAULT_LEVERAGE_THRESHOLD = 8.0
 _DEFAULT_POSITION_SIZE_THRESHOLD = 0.12
 _DEFAULT_MIN_APPROVAL_CONFIDENCE = 0.5
+_PAPER_ADVISORY_RISK_FRACTION_CAP = 0.0002
+_PAPER_ADVISORY_LEVERAGE_CAP = 1.0
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _RETIRED_REVIEWER_MARKERS = ("deepseek-r1-14b-risk", "14b", "finquant-expert")
 
@@ -136,6 +138,91 @@ class EntryHighRiskReviewGatePolicy:
 
     def _threshold(self, name: str, default: float) -> float:
         return _safe_float(getattr(self.config, name, default), default)
+
+    @staticmethod
+    def _paper_advisory_contract(
+        decision: DecisionOutput,
+        model_mode: str,
+    ) -> dict[str, Any]:
+        raw = _safe_dict(decision.raw_response)
+        normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+        sizing = _safe_dict(raw.get("profit_risk_sizing"))
+        normal_risk_cap = _safe_float(
+            normal_trade.get("single_trade_risk_fraction_cap"), -1.0
+        )
+        sizing_risk_cap = _safe_float(
+            sizing.get("single_trade_risk_fraction_cap"), -1.0
+        )
+        final_leverage = _safe_float(sizing.get("final_leverage"), -1.0)
+        violations: list[str] = []
+        if str(model_mode or "").lower() != "paper":
+            violations.append("execution_mode_not_paper")
+        if normal_trade.get("execution_scope") != "paper_only":
+            violations.append("normal_trade_scope_invalid")
+        if normal_trade.get("production_permission") is not False:
+            violations.append("normal_trade_production_permission_invalid")
+        if normal_trade.get("paper_quality_observation_only") is not True:
+            violations.append("paper_quality_observation_contract_missing")
+        if sizing.get("execution_scope") != "paper_only":
+            violations.append("sizing_scope_invalid")
+        if sizing.get("production_permission") is not False:
+            violations.append("sizing_production_permission_invalid")
+        if sizing.get("production_eligible") is not True:
+            violations.append("sizing_not_eligible")
+        if sizing.get("paper_quality_observation_mode") is not True:
+            violations.append("paper_quality_observation_sizing_missing")
+        if not 0.0 < normal_risk_cap <= _PAPER_ADVISORY_RISK_FRACTION_CAP:
+            violations.append("normal_trade_risk_cap_exceeded")
+        if not 0.0 < sizing_risk_cap <= _PAPER_ADVISORY_RISK_FRACTION_CAP:
+            violations.append("sizing_risk_cap_exceeded")
+        if not 0.0 < final_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
+            violations.append("final_leverage_exceeded")
+        if not (
+            0.0
+            < _safe_float(decision.suggested_leverage, -1.0)
+            <= _PAPER_ADVISORY_LEVERAGE_CAP
+        ):
+            violations.append("decision_leverage_exceeded")
+        return {
+            "eligible": not violations,
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "paper_quality_observation_mode": sizing.get(
+                "paper_quality_observation_mode"
+            )
+            is True,
+            "single_trade_risk_fraction_cap": sizing_risk_cap,
+            "final_leverage": final_leverage,
+            "violations": violations,
+        }
+
+    def _allow_paper_advisory_only(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        base_review: dict[str, Any],
+        *,
+        status: str,
+        unavailable_reason: str,
+        extra: dict[str, Any] | None = None,
+    ) -> PolicyGateResult | None:
+        contract = self._paper_advisory_contract(decision, model_mode)
+        if not contract["eligible"]:
+            return None
+        payload = {
+            **base_review,
+            **(extra or {}),
+            "status": status,
+            "approved": None,
+            "hard_review_required": False,
+            "advisory_review_required": True,
+            "review_required_for_live": True,
+            "approval_semantics": "advisory_unavailable_is_not_cloud_approval",
+            "unavailable_reason": unavailable_reason,
+            "paper_advisory_contract": contract,
+        }
+        self._annotate(decision, payload)
+        return PolicyGateResult.allow({"high_risk_review": payload})
 
     def trigger_reasons(self, decision: DecisionOutput) -> list[str]:
         """Return deterministic reasons that require a second risk opinion."""
@@ -274,6 +361,15 @@ class EntryHighRiskReviewGatePolicy:
         revision = str(getattr(self.config, "high_risk_review_model_revision", "") or "").strip()
         base_review["provider"] = _review_provider(api_base)
         if not bool(getattr(self.config, "high_risk_review_enabled", False)):
+            advisory = self._allow_paper_advisory_only(
+                decision,
+                model_mode,
+                base_review,
+                status="skipped_advisory_only",
+                unavailable_reason="reviewer_config_disabled",
+            )
+            if advisory is not None:
+                return advisory
             payload = {**base_review, "status": "config_disabled", "approved": False}
             self._annotate(decision, payload)
             return PolicyGateResult.block(
@@ -288,6 +384,15 @@ class EntryHighRiskReviewGatePolicy:
             api_key,
         )
         if self.reviewer is None or not route_valid:
+            advisory = self._allow_paper_advisory_only(
+                decision,
+                model_mode,
+                base_review,
+                status="skipped_advisory_only",
+                unavailable_reason=route_error or "reviewer_service_missing",
+            )
+            if advisory is not None:
+                return advisory
             payload = {
                 **base_review,
                 "status": "config_missing",
@@ -304,6 +409,16 @@ class EntryHighRiskReviewGatePolicy:
 
         circuit_payload = getattr(self.reviewer, "circuit_payload", lambda: None)()
         if circuit_payload:
+            advisory = self._allow_paper_advisory_only(
+                decision,
+                model_mode,
+                base_review,
+                status="error_advisory_only",
+                unavailable_reason="reviewer_circuit_open",
+                extra={**circuit_payload, "required": False},
+            )
+            if advisory is not None:
+                return advisory
             payload = {
                 **base_review,
                 **circuit_payload,
@@ -363,6 +478,16 @@ class EntryHighRiskReviewGatePolicy:
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "allocation_error": allocation_error or None,
             }
+            advisory = self._allow_paper_advisory_only(
+                decision,
+                model_mode,
+                base_review,
+                status="error_advisory_only",
+                unavailable_reason="reviewer_call_failed",
+                extra=payload,
+            )
+            if advisory is not None:
+                return advisory
             self._annotate(decision, payload)
             return PolicyGateResult.block(
                 "high_risk_review_failed",

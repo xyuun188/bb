@@ -11196,7 +11196,7 @@ function renderReadableTrainableModelCard(model) {
             <div class="ml-train-model-desc">${escHtml(model.description || '-')}</div>
             <div class="ml-train-model-grid">
                 <div><span>样本情况</span><strong>${escHtml(model.samples || '-')}</strong></div>
-                <div><span>最近训练</span><strong>${escHtml(model.trainedAt || '-')}</strong></div>
+                <div><span>最近成功训练</span><strong>${escHtml(model.trainedAt || '-')}</strong></div>
                 <div><span>当前作用</span><strong>${escHtml(model.usage || '-')}</strong></div>
             </div>
             ${metrics}
@@ -11577,14 +11577,20 @@ function renderTrainableModels() {
                     : lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
         description: `${executionPlaneLabels[model.execution_plane] || '运行位置未说明'}；任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
         samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
-        trainedAt: model.trained_at ? toBeijingTime(model.trained_at) : '-',
+        trainedAt: model.last_successful_training_at
+            ? toBeijingTime(model.last_successful_training_at)
+            : '-',
         usage: model.live_ml_ready ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
         metrics: [
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
             { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
             { label: '运行服务', value: model.runtime_available ? '可用' : (model.availability_scope === 'optional_enhancement' ? '未启用（可选）' : '不可用') },
-        ],
+            model.trainable ? { label: '最近尝试', value: model.last_training_attempt_at ? toBeijingTime(model.last_training_attempt_at) : '-' } : null,
+            model.trainable ? { label: '下次检查', value: model.next_training_check_at ? toBeijingTime(model.next_training_check_at) : '-' } : null,
+            model.trainable ? { label: '调度心跳', value: model.scheduler_heartbeat_at ? toBeijingTime(model.scheduler_heartbeat_at) : '-' } : null,
+            model.trainable ? { label: '当前 Champion 产物', value: model.artifact_trained_at ? toBeijingTime(model.artifact_trained_at) : '-' } : null,
+        ].filter(Boolean),
         note: Array.isArray(model.blocking_reasons) && model.blocking_reasons.length
             ? `阻塞原因：${model.blocking_reasons.join('、')}`
             : `质量状态：${model.quality_state || '-'}`,

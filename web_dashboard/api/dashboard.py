@@ -9229,15 +9229,17 @@ async def _build_model_training_registry_status() -> dict[str, Any]:
     if not isinstance(contribution_performance, dict):
         contribution_performance = {}
         _start_model_contribution_refresh(selected_mode)
+    scheduler_state = MODEL_TRAINING_STATE_STORE.read()
     registry = build_model_training_registry(
         local_ml_status=local_ml_status,
         local_tools_status=local_tools_status,
         specialist_report=specialist_report,
         model_server_report=model_server_report,
         contribution_performance=contribution_performance,
+        scheduler_state=scheduler_state,
     )
     registry["contribution_performance_status"] = contribution_status
-    registry["scheduler_state"] = MODEL_TRAINING_STATE_STORE.read()
+    registry["scheduler_state"] = scheduler_state
     registry["model_observability"] = observability
     return registry
 

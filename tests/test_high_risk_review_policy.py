@@ -32,6 +32,35 @@ def high_risk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "high_risk_review_circuit_breaker_cooldown_seconds", 60.0)
 
 
+def _paper_quality_observation_decision() -> DecisionOutput:
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="bounded paper observation",
+        position_size_pct=0.01,
+        suggested_leverage=1.0,
+        raw_response={
+            "opinions": [{"action": "long"}, {"action": "short"}],
+            "normal_paper_trade": {
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "paper_quality_observation_only": True,
+                "single_trade_risk_fraction_cap": 0.0002,
+            },
+            "profit_risk_sizing": {
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "production_eligible": True,
+                "paper_quality_observation_mode": True,
+                "single_trade_risk_fraction_cap": 0.0002,
+                "final_leverage": 1.0,
+            },
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("api_base", "model", "revision", "api_key", "error"),
     [
@@ -711,3 +740,75 @@ async def test_entry_high_risk_review_does_not_annotate_non_entry() -> None:
     await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
 
     assert "high_risk_review" not in decision.raw_response
+
+
+@pytest.mark.asyncio
+async def test_paper_quality_observation_uses_bounded_advisory_when_cloud_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "high_risk_review_enabled", False)
+    decision = _paper_quality_observation_decision()
+
+    result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
+
+    assert result is not None and result.passed is True
+    review = decision.raw_response["high_risk_review"]
+    assert review["status"] == "skipped_advisory_only"
+    assert review["approved"] is None
+    assert review["hard_review_required"] is False
+    assert review["review_required_for_live"] is True
+    contract = review["paper_advisory_contract"]
+    assert contract["eligible"] is True
+    assert contract["single_trade_risk_fraction_cap"] <= 0.0002
+    assert contract["final_leverage"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_live_never_uses_paper_advisory_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "high_risk_review_enabled", False)
+    decision = _paper_quality_observation_decision()
+
+    result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "live", [])
+
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_config_missing"
+
+
+@pytest.mark.asyncio
+async def test_paper_advisory_fallback_rejects_contract_above_risk_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "high_risk_review_enabled", False)
+    decision = _paper_quality_observation_decision()
+    decision.raw_response["profit_risk_sizing"][
+        "single_trade_risk_fraction_cap"
+    ] = 0.00021
+
+    result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
+
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_config_missing"
+
+
+@pytest.mark.asyncio
+async def test_paper_quality_observation_records_reviewer_error_as_advisory(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerTimeout:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise TimeoutError("review timeout")
+
+    decision = _paper_quality_observation_decision()
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerTimeout()).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+
+    assert result is not None and result.passed is True
+    review = decision.raw_response["high_risk_review"]
+    assert review["status"] == "error_advisory_only"
+    assert review["approved"] is None
+    assert review["error_code"] == "reviewer_call_failed"

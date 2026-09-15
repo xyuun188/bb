@@ -645,6 +645,34 @@ def _llm_rows(
     return [finquant, *normalized_base_rows]
 
 
+def _attach_scheduler_timestamps(
+    rows: list[dict[str, Any]],
+    scheduler_state: dict[str, Any],
+) -> None:
+    model_states = _safe_dict(scheduler_state.get("models"))
+    schedulers = _safe_dict(scheduler_state.get("schedulers"))
+    for row in rows:
+        row["artifact_trained_at"] = row.get("trained_at")
+        state = _safe_dict(model_states.get(str(row.get("model_id") or "")))
+        scheduler_id = str(
+            state.get("scheduler_heartbeat_id") or state.get("scheduler_id") or ""
+        )
+        scheduler = _safe_dict(schedulers.get(scheduler_id))
+        row["last_successful_training_at"] = state.get(
+            "last_successful_training_at"
+        )
+        row["last_training_attempt_at"] = (
+            state.get("last_started_at")
+            or state.get("last_check_at")
+            or state.get("last_finished_at")
+        )
+        row["next_training_check_at"] = state.get("next_check_at")
+        row["scheduler_heartbeat_at"] = (
+            state.get("scheduler_heartbeat_at") or scheduler.get("heartbeat_at")
+        )
+        row["scheduler_id"] = scheduler_id or None
+
+
 def build_model_training_registry(
     *,
     local_ml_status: dict[str, Any] | None = None,
@@ -652,6 +680,7 @@ def build_model_training_registry(
     specialist_report: dict[str, Any] | None = None,
     model_server_report: dict[str, Any] | None = None,
     contribution_performance: dict[str, Any] | None = None,
+    scheduler_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one truthful model lifecycle view for APIs and audits."""
 
@@ -666,6 +695,7 @@ def build_model_training_registry(
         *_specialist_rows(local_tools, specialist),
         *_llm_rows(server, contributions),
     ]
+    _attach_scheduler_timestamps(models, _safe_dict(scheduler_state))
     lifecycle_counts = Counter(str(row.get("lifecycle") or "unknown") for row in models)
     trainable_count = sum(1 for row in models if bool(row.get("trainable")))
     identity_failures = [
