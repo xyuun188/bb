@@ -215,6 +215,39 @@ def _service_manifest_services(service_manifest: dict[str, Any]) -> list[dict[st
     return [_safe_dict(item) for item in _safe_list(service_manifest.get("services"))]
 
 
+def _target_specialization_fields(
+    *manifests: dict[str, Any],
+    model_id: str,
+) -> dict[str, Any]:
+    """Carry verified adapter evidence into the runtime service row."""
+
+    expected = str(model_id or "").strip()
+    for manifest in manifests:
+        for row in _safe_list(_safe_dict(manifest).get("models")):
+            item = _safe_dict(row)
+            if str(item.get("slot") or "") != TARGET_SERVICE_SLOT:
+                continue
+            served = str(item.get("served_model_name") or "").strip()
+            if expected and served and served != expected:
+                continue
+            fields = {
+                key: item.get(key)
+                for key in (
+                    "base_model_carrier",
+                    "specialization_required",
+                    "specialization_target",
+                    "specialization_status",
+                    "specialization_evidence_verified",
+                    *LLM_SPECIALIZATION_KEYS,
+                    "specialization_evidence",
+                )
+                if item.get(key) is not None
+            }
+            if fields:
+                return fields
+    return {}
+
+
 def _service_name_active(service_name: str, active_services: list[str]) -> bool:
     name = str(service_name or "").strip()
     return bool(name and any(name in line for line in active_services))
@@ -301,6 +334,8 @@ def _evaluate_target_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str
     """Evaluate the single local Qwen3.8-27B runtime contract."""
 
     service_manifest = _manifest_payload(snapshot, "service_manifest")
+    download_manifest = _manifest_payload(snapshot, "download_manifest")
+    validation_manifest = _manifest_payload(snapshot, "validation_manifest")
     service_present = _manifest_present(snapshot, "service_manifest")
     manifest_services = _service_manifest_services(service_manifest)
     active_services = _active_service_lines(snapshot)
@@ -309,7 +344,7 @@ def _evaluate_target_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str
     gpu_processes = [
         str(item).strip() for item in _safe_list(snapshot.get("gpu_processes")) if str(item).strip()
     ]
-    torch_info = _safe_dict(_manifest_payload(snapshot, "validation_manifest").get("torch"))
+    torch_info = _safe_dict(validation_manifest.get("torch"))
     candidate, candidate_errors = _target_candidate(snapshot)
     blockers: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -461,6 +496,11 @@ def _evaluate_target_model_server_snapshot(snapshot: dict[str, Any]) -> dict[str
         "service_active": service_ready,
         "endpoint_ready": endpoint_ready,
         "ready": service_ready and endpoint_ready and not blockers,
+        **_target_specialization_fields(
+            validation_manifest,
+            download_manifest,
+            model_id=expected_model_id,
+        ),
     }
     return {
         "status": "ready" if runtime_ready else "blocked",

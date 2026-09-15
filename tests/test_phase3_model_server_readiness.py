@@ -111,6 +111,34 @@ def test_target_single_model_readiness_accepts_verified_runtime_contract() -> No
     assert report["target_model_topology"]["model_id"] == "qwen3.8-27b"
 
 
+def test_target_readiness_carries_adapter_evidence_into_runtime_manifest() -> None:
+    snapshot = _target_ready_snapshot()
+    evidence = {
+        "adapter_version": "20260913T111144Z-a57cc450cc00",
+        "adapter_path": "/data/BB/models/finquant_target_27b/versions/test",
+        "specialization_manifest": "/data/BB/models/finquant_target_27b/versions/test/manifest.json",
+        "specialization_id": "qwen3.8-27b-test",
+        "dataset_version": "dataset-v1",
+        "source_code_version": "source-v1",
+        "base_model_repo": "Qwen/Qwen3.8-27B",
+        "trained_at": "2026-09-13T11:11:44+00:00",
+    }
+    snapshot["validation_manifest"]["data"]["models"] = [
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": "qwen3.8-27b",
+            "specialization_status": "trained_shadow_not_live",
+            "specialization_evidence": evidence,
+        }
+    ]
+
+    report = evaluate_phase3_model_server_snapshot(snapshot)
+
+    runtime = report["manifest_services"][0]
+    assert runtime["specialization_status"] == "trained_shadow_not_live"
+    assert runtime["specialization_evidence"] == evidence
+
+
 def test_target_readiness_surfaces_missing_candidate_in_final_topology_blockers() -> None:
     snapshot = _target_ready_snapshot()
     snapshot["target_candidate_manifest"] = {"present": False, "data": {}}
