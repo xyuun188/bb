@@ -16,7 +16,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-CONTINUOUS_OBSERVATION_VERSION = "2026-09-16.continuous-observation.v3"
+CONTINUOUS_OBSERVATION_VERSION = "2026-09-15.continuous-observation.v3"
 ALLOWED_WINDOW_HOURS = (24, 72)
 MAX_SAMPLES = 2000
 EXPECTED_SAMPLE_INTERVAL_SECONDS = 300.0
