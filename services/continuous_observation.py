@@ -238,6 +238,7 @@ class ContinuousObservationStore:
             "reset_count": 0,
             "last_reset_at": None,
             "last_reset_reason": None,
+            "deferred_reason": None,
         }
 
     def read(self) -> dict[str, Any]:
@@ -314,6 +315,7 @@ class ContinuousObservationStore:
                 "baseline_metrics": normalized_baseline,
                 "samples": [],
                 "blocked_reason": None,
+                "deferred_reason": None,
                 "reset_count": reset_count,
                 "last_reset_at": _iso(started) if restart and previous_started else payload.get("last_reset_at"),
                 "last_reset_reason": (
@@ -325,6 +327,22 @@ class ContinuousObservationStore:
         )
         self._write(payload)
         return self.snapshot(now=started)
+
+    def defer(self, reason: str) -> dict[str, Any]:
+        """Persist a truthful pre-window wait state without starting time."""
+
+        payload = self.read()
+        if payload.get("window_started_at"):
+            return self.snapshot()
+        payload.update(
+            {
+                "version": CONTINUOUS_OBSERVATION_VERSION,
+                "status": "deferred",
+                "deferred_reason": str(reason or "observation_baseline_incomplete")[:300],
+            }
+        )
+        self._write(payload)
+        return self.snapshot()
 
     def record(self, metrics: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         payload = self.read()
@@ -418,7 +436,7 @@ class ContinuousObservationStore:
             continuity_failures.append("latest_sample_stale")
         blocked_reason = str(payload.get("blocked_reason") or "").strip() or None
         if not started:
-            status = "not_started"
+            status = "deferred" if payload.get("status") == "deferred" else "not_started"
         elif blocked_reason:
             status = "blocked"
         elif continuity_failures:
@@ -443,6 +461,11 @@ class ContinuousObservationStore:
             "failed_metrics": failures,
             "continuity_failures": continuity_failures,
             "blocked_reason": blocked_reason,
+            "deferred_reason": (
+                str(payload.get("deferred_reason") or "")[:300] or None
+                if status == "deferred"
+                else None
+            ),
             "latest_metrics": latest_metrics,
             "baseline_metrics": baseline if isinstance(baseline, dict) else {},
             "reset_count": int(payload.get("reset_count") or 0),
@@ -507,6 +530,8 @@ class ContinuousObservationScheduler:
             snapshot = store.snapshot(now=now)
             if snapshot.get("status") == "not_started":
                 pending_stores.append((hours, store))
+            elif snapshot.get("status") == "deferred":
+                pending_stores.append((hours, store))
         baseline: dict[str, Any] = {}
         if pending_stores:
             try:
@@ -523,13 +548,16 @@ class ContinuousObservationScheduler:
                     now=now,
                     baseline_metrics=baseline,
                 )
-        elif pending_stores and self.worker_state is not None:
+        elif pending_stores:
             reason = str(
                 baseline.get("blocked_reason")
                 or baseline.get("collection_errors")
                 or "observation_baseline_incomplete"
             )
-            self.worker_state.mark_deferred(reason, now=now)
+            for _hours, store in pending_stores:
+                store.defer(reason)
+            if self.worker_state is not None:
+                self.worker_state.mark_deferred(reason, now=now)
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -581,9 +609,15 @@ class ContinuousObservationScheduler:
             if store is None:
                 continue
             current = store.snapshot(now=observed_at)
-            if current.get("status") == "not_started":
+            if current.get("status") in {"not_started", "deferred"}:
                 if not metrics_ready:
-                    snapshots[str(hours)] = current
+                    snapshots[str(hours)] = store.defer(
+                        str(
+                            metrics.get("blocked_reason")
+                            or metrics.get("collection_errors")
+                            or "observation_metrics_incomplete"
+                        )
+                    )
                     continue
                 store.start(
                     required_hours=hours,

@@ -206,6 +206,28 @@ async def test_model_observability_serves_stale_snapshot_while_refreshing(
 
 
 @pytest.mark.asyncio
+async def test_requestless_model_observability_never_runs_synchronous_full_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never_finishes() -> dict[str, Any]:
+        await asyncio.sleep(60)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_model_observability_refresh_task", None)
+    monkeypatch.setattr(dashboard, "_refresh_model_observability_cache", never_finishes)
+
+    started = time.perf_counter()
+    payload = await dashboard.get_model_observability_snapshot()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+    assert payload["cache"]["refresh_in_background"] is True
+    await dashboard.shutdown_dashboard_observability_tasks()
+
+
+@pytest.mark.asyncio
 async def test_cold_model_observability_keeps_local_models_visible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

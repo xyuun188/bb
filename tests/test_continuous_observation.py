@@ -106,6 +106,22 @@ def test_observation_metrics_ready_requires_complete_healthy_sample():
     assert observation_metrics_ready({**_metrics(), "collection_errors": "trade:timeout"}) is False
 
 
+def test_deferred_window_is_visible_without_starting_elapsed_time(tmp_path):
+    store = ContinuousObservationStore(tmp_path / "observation.json", default_required_hours=24)
+
+    deferred = store.defer("trade:trading_service_inactive")
+
+    assert deferred["status"] == "deferred"
+    assert deferred["deferred_reason"] == "trade:trading_service_inactive"
+    assert deferred["window_started_at"] is None
+    assert deferred["elapsed_hours"] == 0.0
+    assert deferred["sample_count"] == 0
+
+    started = store.start(now=datetime(2026, 8, 29, tzinfo=UTC), baseline_metrics=_metrics())
+    assert started["status"] == "observing"
+    assert started["deferred_reason"] is None
+
+
 def test_observation_rejects_record_before_explicit_start(tmp_path):
     store = ContinuousObservationStore(tmp_path / "observation.json")
     try:
@@ -235,7 +251,7 @@ async def test_scheduler_waits_for_healthy_baseline_then_starts_windows(tmp_path
     )
     await scheduler.start()
     try:
-        assert stores[24].snapshot()["status"] == "not_started"
+        assert stores[24].snapshot()["status"] == "deferred"
         snapshots = await scheduler.sample_once()
         assert snapshots["24"]["status"] == "observing"
         assert snapshots["72"]["status"] == "observing"

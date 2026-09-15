@@ -8,7 +8,6 @@ import asyncio
 import copy
 import hashlib
 import json
-import math
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
@@ -101,6 +100,7 @@ from services.training_effectiveness_report import (
 )
 from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
+from web_dashboard.api import model_observability_sections as _model_observability_sections
 from web_dashboard.api.model_training_status import load_model_training_report
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
@@ -8471,258 +8471,30 @@ async def get_local_ai_tools_status():
     return _compact_local_ai_tools_status_for_dashboard(status)
 
 
+
+# The section implementations live in a dedicated reader module.  Keep these
+# narrow wrappers here so existing route-level test seams and status contracts
+# remain stable while the expensive database readers stay out of this module.
 async def _build_authoritative_profit_observability(
     *, mode: str | None = None, since_hours: float | None = None
 ) -> dict[str, Any]:
-    """Summarise only complete OKX outcomes; shadow data never enters totals."""
-
-    try:
-        from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
-
-        outcomes = await load_authoritative_trade_outcomes(
-            mode=mode if mode in {"paper", "live"} else None,
-            since=(datetime.now(UTC) - timedelta(hours=float(since_hours)))
-            if since_hours is not None
-            else None,
-            limit=500,
-            compact=True,
-        )
-    except Exception as exc:
-        return {
-            "status": "error",
-            "degraded_reason": f"authoritative_outcomes_unavailable:{safe_error_text(exc, limit=120)}",
-            "observed": False,
-        }
-
-    complete = [
-        row
-        for row in outcomes
-        if isinstance(row, dict)
-        and row.get("outcome_complete") is True
-        and row.get("trade_fact_trusted") is True
-    ]
-    totals = {
-        "gross_pnl": 0.0,
-        "fee": 0.0,
-        "slippage": 0.0,
-        "funding_fee": 0.0,
-        "liquidation_penalty": 0.0,
-        "fee_after_net_pnl": 0.0,
-        "realized_net_pnl": 0.0,
-    }
-    mismatch_count = 0
-    equation_observed_count = 0
-    for row in complete:
-        gross = _safe_float(row.get("gross_pnl_usdt", row.get("gross_pnl")), None)
-        entry_fee = _safe_float(row.get("entry_fee_usdt", row.get("entry_fee")), None)
-        close_fee = _safe_float(row.get("close_fee_usdt", row.get("close_fee")), None)
-        slippage = _safe_float(
-            row.get("execution_slippage_usdt", row.get("slippage_cost_usdt")), None
-        )
-        funding = _safe_float(row.get("funding_fee_usdt", row.get("funding_fee")), None)
-        penalty = _safe_float(
-            row.get("liquidation_penalty_usdt", row.get("liquidation_penalty")), 0.0
-        )
-        realized = _safe_float(row.get("realized_net_pnl_usdt", row.get("realized_pnl")), None)
-        if gross is not None:
-            totals["gross_pnl"] += gross
-        if entry_fee is not None:
-            totals["fee"] += entry_fee
-        if close_fee is not None:
-            totals["fee"] += close_fee
-        if slippage is not None:
-            totals["slippage"] += slippage
-        if funding is not None:
-            totals["funding_fee"] += funding
-        if penalty is not None:
-            totals["liquidation_penalty"] += penalty
-        if realized is not None:
-            totals["realized_net_pnl"] += realized
-        if None not in (gross, entry_fee, close_fee, slippage, funding, penalty, realized):
-            totals["fee_after_net_pnl"] += (
-                gross - entry_fee - close_fee - slippage + funding - penalty
-            )
-        components = row.get("realized_net_pnl_components")
-        if isinstance(components, dict):
-            expected = _safe_float(components.get("components_total_usdt"), None)
-            reported = _safe_float(components.get("reported_realized_net_pnl_usdt", realized), None)
-            if expected is not None and reported is not None:
-                equation_observed_count += 1
-                if not math.isclose(expected, reported, rel_tol=1e-5, abs_tol=1e-5):
-                    mismatch_count += 1
-    status = "ok" if complete and mismatch_count == 0 else "missing" if not outcomes else "partial"
-    return {
-        "status": status,
-        "observed": bool(complete),
-        "sample_count": len(complete),
-        "excluded_incomplete_count": max(len(outcomes) - len(complete), 0),
-        "equation_observed_count": equation_observed_count,
-        "attribution_mismatch_count": mismatch_count,
-        "formula": "realized_net_pnl = gross_pnl - fee - slippage + funding_fee - liquidation_penalty",
-        "totals": {key: round(value, 8) for key, value in totals.items()},
-        "shadow_excluded": True,
-        "degraded_reason": ("authoritative_outcome_not_found" if not outcomes else None),
-    }
+    return await _model_observability_sections.build_authoritative_profit_observability(
+        mode=mode,
+        since_hours=since_hours,
+    )
 
 
 async def _build_expert_memory_observability(*, mode: str | None = None) -> dict[str, Any]:
-    """Expose memory authority counts without treating pending rows as evidence."""
-
-    # The Dashboard is also deployed while paper trading is intentionally
-    # stopped. Do not run the expensive outcome/memory joins in that state:
-    # they only produce repeated timeout storms and cannot add new evidence.
-    # Return an explicit deferred state so the UI and continuous observer keep
-    # the evidence gap visible without treating it as a healthy zero result.
-    if _trading_service is None:
-        return {
-            "status": "deferred",
-            "observed": False,
-            "degraded_reason": "trading_service_inactive",
-            "source": "dashboard.expert_memory_observability",
-        }
-
-    try:
-        from sqlalchemy import select
-
-        from db.repositories.memory_repo import MemoryRepository
-        from db.session import get_session_ctx
-        from models.learning import ExpertMemory, TradeReflection
-        from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
-
-        outcomes = await load_authoritative_trade_outcomes(
-            mode=mode if mode in {"paper", "live"} else None,
-            limit=500,
-            compact=True,
-        )
-        outcome_positions = {
-            int(position_id)
-            for outcome in outcomes
-            for position_id in (outcome.get("position_ids") or [outcome.get("position_id")])
-            if str(position_id or "").isdigit() and int(position_id) > 0
-        }
-        complete_outcomes = [
-            outcome
-            for outcome in outcomes
-            if outcome.get("outcome_complete") is True and outcome.get("trade_fact_trusted") is True
-        ]
-        shadow_count = sum(
-            len(outcome.get("counterfactual_evidence") or []) for outcome in outcomes
-        )
-        eligible_count = sum(
-            bool(
-                outcome.get("outcome_complete") is True
-                and outcome.get("trade_fact_trusted") is True
-            )
-            for outcome in outcomes
-        )
-        async with get_session_ctx() as session:
-            repo = MemoryRepository(session)
-            memory_count = await repo.count_memories()
-            reflection_count = await repo.count_reflections()
-            reflection_rows = list(
-                (await session.execute(select(TradeReflection.position_id).limit(5000)))
-                .scalars()
-                .all()
-            )
-            memory_extra_rows = list(
-                (await session.execute(select(ExpertMemory.extra).limit(5000))).scalars().all()
-            )
-            authoritative_memory_count = sum(
-                isinstance(extra, dict) and bool(str(extra.get("outcome_id") or "").strip())
-                for extra in memory_extra_rows
-            )
-        orphan_reflection_count = sum(
-            int(position_id or 0) > 0 and int(position_id) not in outcome_positions
-            for position_id in reflection_rows
-        )
-        pending_count = max(reflection_count - len(complete_outcomes), 0)
-        return {
-            "status": (
-                "ok"
-                if complete_outcomes and len(complete_outcomes) == len(outcomes)
-                else "partial"
-                if outcomes
-                else "missing"
-            ),
-            "memory_count": memory_count,
-            "reflection_count": reflection_count,
-            "authoritative_outcome_count": len(outcomes),
-            "complete_authoritative_outcome_count": len(complete_outcomes),
-            "pending_settlement_count": pending_count,
-            "orphan_position_count": orphan_reflection_count,
-            "shadow_sample_count": shadow_count,
-            "production_evidence_eligible_count": eligible_count,
-            "authoritative_memory_count": authoritative_memory_count,
-            "shadow_production_weight": 0.0,
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "degraded_reason": f"expert_memory_observability_unavailable:{safe_error_text(exc, limit=120)}",
-        }
+    return await _model_observability_sections.build_expert_memory_observability(
+        trading_service_active=_trading_service is not None,
+        mode=mode,
+    )
 
 
 async def _latest_analysis_observability() -> dict[str, Any]:
-    """Read one bounded analysis-quality sample for the model observability card."""
-
-    try:
-        from sqlalchemy import select
-
-        from db.session import get_session_ctx
-        from models.decision import AIDecision
-
-        async with get_session_ctx() as session:
-            result = await session.execute(
-                select(
-                    AIDecision.raw_llm_response,
-                    AIDecision.created_at,
-                    AIDecision.id,
-                )
-                .where(AIDecision.model_name == ENSEMBLE_TRADER_NAME)
-                .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
-                .limit(50)
-            )
-            for raw, created_at, decision_id in result.all():
-                payload = raw if isinstance(raw, dict) else {}
-                quality = payload.get("analysis_quality_contract")
-                if not isinstance(quality, dict):
-                    continue
-                counts = quality.get("status_counts")
-                counts = counts if isinstance(counts, dict) else {}
-                expected = int(quality.get("expected_expert_count") or 0)
-                attempted = int(quality.get("attempted_expert_count") or 0)
-                returned = int(quality.get("returned_expert_count") or 0)
-                successful = int(quality.get("successful_expert_count") or 0)
-                quality_status = "ok" if expected > 0 else "partial"
-                return {
-                    "status": quality_status,
-                    "decision_id": decision_id,
-                    "round_id": payload.get("round_id") or quality.get("round_id"),
-                    "checked_at": created_at.isoformat() if created_at else None,
-                    "expected_expert_count": expected,
-                    "attempted_expert_count": attempted,
-                    "returned_expert_count": returned,
-                    "successful_expert_count": successful,
-                    "failed_expert_count": sum(
-                        int(counts.get(key) or 0)
-                        for key in ("timeout", "parse_failed", "empty", "unavailable")
-                    ),
-                    "skipped_expert_count": int(counts.get("skipped") or 0),
-                    "analysis_complete": quality.get("analysis_complete"),
-                    "decision_eligible": quality.get("decision_eligible"),
-                    "reason_code": quality.get("reason_code")
-                    or ("expected_expert_count_zero" if expected == 0 else None),
-                }
-    except Exception as exc:
-        _log_dashboard_fallback("model observability analysis sample fallback", exc)
-        return {
-            "status": "error",
-            "degraded_reason": f"analysis_observability_unavailable:{safe_error_text(exc, limit=120)}",
-        }
-    return {
-        "status": "missing",
-        "degraded_reason": "analysis_quality_contract_not_found",
-    }
+    return await _model_observability_sections.latest_analysis_observability(
+        ensemble_trader_name=ENSEMBLE_TRADER_NAME,
+    )
 
 
 async def _build_model_observability_snapshot(
@@ -9197,6 +8969,16 @@ async def _refresh_model_observability_cache() -> None:
         _model_observability_refresh_task = None
 
 
+async def _get_model_observability_snapshot_for_refresh() -> dict[str, Any]:
+    """Build the complete snapshot only from an explicit background caller."""
+
+    return await _dashboard_heavy_cached(
+        ("model-observability",),
+        _build_model_observability_snapshot,
+        ttl_seconds=20.0,
+    )
+
+
 async def shutdown_dashboard_observability_tasks() -> None:
     global _model_observability_refresh_task
     task = _model_observability_refresh_task
@@ -9401,14 +9183,6 @@ async def get_model_observability_snapshot(request: Request = None) -> dict[str,
 
     global _model_observability_refresh_task
     key = ("model-observability",)
-    if request is None:
-        return sanitize_payload(
-            await _dashboard_heavy_cached(
-                key,
-                _build_model_observability_snapshot,
-                ttl_seconds=20.0,
-            )
-        )
     cached = _dashboard_heavy_cache_peek(
         key,
         max_age_seconds=_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS,

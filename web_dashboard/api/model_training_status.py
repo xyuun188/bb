@@ -135,9 +135,9 @@ def _cached_registry(*, include_stale: bool = False) -> dict[str, Any] | None:
 async def build_model_training_registry_status() -> dict[str, Any]:
     """Build the complete model lifecycle view outside the request path."""
 
-    from web_dashboard.api.dashboard import get_model_observability_snapshot
+    from web_dashboard.api.dashboard import _get_model_observability_snapshot_for_refresh
 
-    observability = await get_model_observability_snapshot()
+    observability = await _get_model_observability_snapshot_for_refresh()
     sections = observability.get("sections") if isinstance(observability, dict) else {}
     sections = sections if isinstance(sections, dict) else {}
     selected_mode = "live" if mode_manager.mode.value == "live" else "paper"
