@@ -256,10 +256,17 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     if paper_resume_card is not None:
         paper_resume = _details(paper_resume_card)
         paper_resume_status = str(paper_resume_card.get("status") or "unknown").lower()
+        paper_resume_preflight_satisfied = (
+            paper_resume.get("can_resume_paper") is True
+            or (
+                paper_resume.get("consumed_after_resume") is True
+                and paper_resume.get("effective_blockers") == []
+            )
+        )
         if (
             "phase3_paper_resume_preflight" not in deferred_required
             and paper_resume_status != "critical"
-            and paper_resume.get("can_resume_paper") is not True
+            and not paper_resume_preflight_satisfied
         ):
             blockers.append(
                 _blocker(
@@ -268,6 +275,12 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                     evidence={
                         "status": paper_resume.get("status"),
                         "blockers": _safe_list(paper_resume.get("blockers")),
+                        "consumed_after_resume": paper_resume.get(
+                            "consumed_after_resume"
+                        ),
+                        "effective_blockers": _safe_list(
+                            paper_resume.get("effective_blockers")
+                        ),
                     },
                 )
             )

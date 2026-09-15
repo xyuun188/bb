@@ -245,6 +245,48 @@ def test_phase3_go_no_go_rejects_paper_resume_without_operator_safe_preflight() 
     assert "paper_resume_preflight_not_ready" in report["blocker_codes"]
 
 
+def test_phase3_go_no_go_accepts_consumed_paper_resume_preflight() -> None:
+    cards = deepcopy(_cards())
+    preflight = next(
+        card for card in cards if card["key"] == "phase3_paper_resume_preflight"
+    )
+    preflight["status"] = "ok"
+    preflight["details"] = {
+        "status": "running",
+        "can_resume_paper": False,
+        "consumed_after_resume": True,
+        "blockers": [{"code": "paper_trading_already_active"}],
+        "effective_blockers": [],
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is True
+    assert report["status"] == "go"
+    assert "paper_resume_preflight_not_ready" not in report["blocker_codes"]
+
+
+def test_phase3_go_no_go_rejects_consumed_preflight_with_effective_blocker() -> None:
+    cards = deepcopy(_cards())
+    preflight = next(
+        card for card in cards if card["key"] == "phase3_paper_resume_preflight"
+    )
+    preflight["status"] = "warning"
+    preflight["details"] = {
+        "status": "running",
+        "can_resume_paper": False,
+        "consumed_after_resume": True,
+        "blockers": [{"code": "okx_authoritative_sync_not_clean"}],
+        "effective_blockers": [{"code": "okx_authoritative_sync_not_clean"}],
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is False
+    assert report["status"] == "no_go"
+    assert "paper_resume_preflight_not_ready" in report["blocker_codes"]
+
+
 def test_phase3_go_no_go_keeps_warning_observable_without_hard_threshold() -> None:
     cards = deepcopy(_cards())
     training = next(card for card in cards if card["key"] == "model_training")
