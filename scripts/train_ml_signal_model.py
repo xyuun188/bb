@@ -1,5 +1,7 @@
 """Build a local ML candidate from all clean shadow backtests."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +12,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Standalone invocations must use the same runtime environment and database
+# identity as the online services.  Without this bootstrap a root/operator
+# launch falls back to PostgreSQL peer authentication and fails before any
+# training work starts, even though the service itself is healthy.
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from services.ml_signal_service import (
     AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
