@@ -11558,7 +11558,8 @@ function renderTrainableModels() {
         training: '训练中', trained: '已训练', inference_only: '仅推理',
         shadow_evaluating: '影子评估', promotion_blocked: '禁止晋升',
         canary: '小资金验证', live: '已介入实盘', not_trained: '未训练',
-        service_unavailable: '服务不可用',
+        service_unavailable: '服务不可用', optional_disabled: '可选增强未启用',
+        cloud_unconfigured: '云端未配置',
     };
     const executionPlaneLabels = {
         local: '本地服务器',
@@ -11568,13 +11569,9 @@ function renderTrainableModels() {
         title: model.display_name || model.model_id || '-',
         type: model.model_family || '-',
         ready: Boolean(model.runtime_available && model.identity_verified),
-        statusLabel: model.lifecycle === 'service_unavailable' && model.availability_scope === 'optional_enhancement'
-            ? '可选增强未启用'
-            : model.runtime_available && model.runtime_role === 'decision_and_expert_carrier' && model.specialization_evidence_verified !== true
+        statusLabel: model.runtime_available && model.runtime_role === 'decision_and_expert_carrier' && model.specialization_evidence_verified !== true
                 ? '运行可用，FinQuant/盈利证据未达标'
-                : model.lifecycle === 'service_unavailable' && model.execution_plane === 'cloud'
-                    ? '云端未配置'
-                    : lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
+                : lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
         description: `${executionPlaneLabels[model.execution_plane] || '运行位置未说明'}；任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
         samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
         trainedAt: model.last_successful_training_at
@@ -11585,7 +11582,13 @@ function renderTrainableModels() {
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
             { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
-            { label: '运行服务', value: model.runtime_available ? '可用' : (model.availability_scope === 'optional_enhancement' ? '未启用（可选）' : '不可用') },
+            { label: '运行服务', value: model.runtime_available
+                ? '可用'
+                : model.lifecycle === 'optional_disabled'
+                    ? '未启用（可选）'
+                    : model.lifecycle === 'cloud_unconfigured'
+                        ? '未配置（按需云端）'
+                        : '不可用' },
             model.trainable ? { label: '最近尝试', value: model.last_training_attempt_at ? toBeijingTime(model.last_training_attempt_at) : '-' } : null,
             model.trainable ? { label: '下次检查', value: model.next_training_check_at ? toBeijingTime(model.next_training_check_at) : '-' } : null,
             model.trainable ? { label: '调度心跳', value: model.scheduler_heartbeat_at ? toBeijingTime(model.scheduler_heartbeat_at) : '-' } : null,

@@ -158,7 +158,7 @@ def test_registry_marks_optional_specialists_without_calling_them_core_failures(
     rows = _by_id(payload)
     assert rows["timesfm_2_5"]["availability_scope"] == "optional_enhancement"
     assert rows["timesfm_2_5"]["execution_plane"] == "local"
-    assert rows["timesfm_2_5"]["lifecycle"] == "service_unavailable"
+    assert rows["timesfm_2_5"]["lifecycle"] == "optional_disabled"
 
 
 def test_dashboard_distinguishes_local_cloud_and_optional_model_states() -> None:
@@ -353,7 +353,7 @@ def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() 
     rows = _by_id(payload)
     for model_id in ("finbert", "finbert_tone"):
         assert rows[model_id]["runtime_available"] is False
-        assert rows[model_id]["lifecycle"] == "service_unavailable"
+        assert rows[model_id]["lifecycle"] == "optional_disabled"
         assert rows[model_id]["identity_verified"] is True
         assert rows[model_id]["training_mode"] == "inference_only"
         assert rows[model_id]["evaluation_mode"] == "shadow_evaluating"

@@ -391,7 +391,7 @@ def _specialist_rows(
         promotion_ready = bool(report.get("promotion_ready"))
         runtime_available = bool(runtime_hint and (report or model_id == "finbert"))
         identity_verified = bool(runtime_available or inference_count > 0)
-        lifecycle = "inference_only" if runtime_available else "service_unavailable"
+        lifecycle = "inference_only" if runtime_available else "optional_disabled"
         evaluation_mode = (
             "shadow_evaluating"
             if report
@@ -638,7 +638,7 @@ def _llm_rows(
                 "lifecycle": (
                     "inference_only"
                     if row["runtime_available"]
-                    else "service_unavailable"
+                    else "cloud_unconfigured"
                 ),
             }
         )
