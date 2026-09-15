@@ -28,17 +28,19 @@ from models.learning import ShadowBacktest  # noqa: E402
 from services.ml_readiness import build_ml_readiness_report  # noqa: E402
 from services.ml_signal_service import (  # noqa: E402
     _influence_policy,
-    _shadow_action,
-    _shadow_is_trainable_trade_opportunity,
-    _shadow_quality_sample,
-    _shadow_sort_key,
-    _shadow_training_columns,
-    _shadow_training_row_from_mapping,
     build_training_frame,
-    count_shadow_training_rows,
-    select_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
+)
+from services.ml_training_dataset import (  # noqa: E402
+    count_shadow_training_rows,
+    select_shadow_training_rows,
+    shadow_action,
+    shadow_is_trainable_trade_opportunity,
+    shadow_quality_sample,
+    shadow_sort_key,
+    shadow_training_columns,
+    shadow_training_row_from_mapping,
 )
 from services.training_data_quality import assess_shadow_sample  # noqa: E402
 
@@ -58,15 +60,15 @@ def _dedupe_rows(rows: list[Any]) -> list[Any]:
         row_id = int(getattr(row, "id", 0) or 0)
         if row_id and row_id not in deduped:
             deduped[row_id] = row
-    return sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
+    return sorted(deduped.values(), key=shadow_sort_key, reverse=True)
 
 
 def _is_trainable(row: Any) -> bool:
-    return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
+    return not assess_shadow_sample(shadow_quality_sample(row)).exclude_from_training
 
 
 def _is_best_trade(row: Any) -> bool:
-    return _shadow_action(row, "best_action") in TRADE_ACTIONS
+    return shadow_action(row, "best_action") in TRADE_ACTIONS
 
 
 def _clean_trainable_rows(rows: list[Any]) -> list[Any]:
@@ -90,7 +92,7 @@ def _select_current_policy(rows: list[Any], _limit: int) -> list[Any]:
 
 
 def _select_exclude_best_hold(rows: list[Any], limit: int) -> list[Any]:
-    candidates = [row for row in _dedupe_rows(rows) if _shadow_is_trainable_trade_opportunity(row)]
+    candidates = [row for row in _dedupe_rows(rows) if shadow_is_trainable_trade_opportunity(row)]
     return _quality_sorted(candidates)[:limit]
 
 
@@ -118,7 +120,7 @@ def _select_cap_best_hold(rows: list[Any], limit: int, *, max_hold_share: float)
 
 
 def _select_balanced_action_exclude_best_hold(rows: list[Any], limit: int) -> list[Any]:
-    candidates = [row for row in _dedupe_rows(rows) if _shadow_is_trainable_trade_opportunity(row)]
+    candidates = [row for row in _dedupe_rows(rows) if shadow_is_trainable_trade_opportunity(row)]
     grouped: dict[str, list[Any]] = {
         "long": [],
         "short": [],
@@ -126,7 +128,7 @@ def _select_balanced_action_exclude_best_hold(rows: list[Any], limit: int) -> li
         "other": [],
     }
     for row in _quality_sorted(candidates):
-        action = _shadow_action(row, "decision_action")
+        action = shadow_action(row, "decision_action")
         if action in {"long", "short", "hold"}:
             grouped[action].append(row)
         else:
@@ -168,7 +170,7 @@ def _select_balanced_action_exclude_best_hold(rows: list[Any], limit: int) -> li
 
 def _trainable_trade_rows(rows: list[Any]) -> list[Any]:
     return _quality_sorted(
-        [row for row in _dedupe_rows(rows) if _shadow_is_trainable_trade_opportunity(row)]
+        [row for row in _dedupe_rows(rows) if shadow_is_trainable_trade_opportunity(row)]
     )
 
 
@@ -176,7 +178,7 @@ def _select_decision_equals_best(rows: list[Any], limit: int) -> list[Any]:
     candidates = [
         row
         for row in _trainable_trade_rows(rows)
-        if _shadow_action(row, "decision_action") == _shadow_action(row, "best_action")
+        if shadow_action(row, "decision_action") == shadow_action(row, "best_action")
     ]
     return candidates[:limit]
 
@@ -185,7 +187,7 @@ def _select_decision_not_equals_best(rows: list[Any], limit: int) -> list[Any]:
     candidates = [
         row
         for row in _trainable_trade_rows(rows)
-        if _shadow_action(row, "decision_action") != _shadow_action(row, "best_action")
+        if shadow_action(row, "decision_action") != shadow_action(row, "best_action")
     ]
     return candidates[:limit]
 
@@ -201,14 +203,14 @@ def _select_horizon(rows: list[Any], limit: int, horizon_minutes: int) -> list[A
 
 def _select_decision_side(rows: list[Any], limit: int, side: str) -> list[Any]:
     candidates = [
-        row for row in _trainable_trade_rows(rows) if _shadow_action(row, "decision_action") == side
+        row for row in _trainable_trade_rows(rows) if shadow_action(row, "decision_action") == side
     ]
     return candidates[:limit]
 
 
 def _select_best_side(rows: list[Any], limit: int, side: str) -> list[Any]:
     candidates = [
-        row for row in _trainable_trade_rows(rows) if _shadow_action(row, "best_action") == side
+        row for row in _trainable_trade_rows(rows) if shadow_action(row, "best_action") == side
     ]
     return candidates[:limit]
 
@@ -217,8 +219,8 @@ def _select_decision_equals_best_side(rows: list[Any], limit: int, side: str) ->
     candidates = [
         row
         for row in _trainable_trade_rows(rows)
-        if _shadow_action(row, "decision_action") == side
-        and _shadow_action(row, "best_action") == side
+        if shadow_action(row, "decision_action") == side
+        and shadow_action(row, "best_action") == side
     ]
     return candidates[:limit]
 
@@ -334,7 +336,7 @@ def extended_variants() -> list[WindowVariant]:
 
 
 async def load_candidate_rows() -> list[Any]:
-    columns = _shadow_training_columns()
+    columns = shadow_training_columns()
     filters = (
         ShadowBacktest.status == "completed",
         ShadowBacktest.long_return_pct.is_not(None),
@@ -346,7 +348,7 @@ async def load_candidate_rows() -> list[Any]:
 
         async def load(stmt: Any) -> list[Any]:
             return [
-                _shadow_training_row_from_mapping(row)
+                shadow_training_row_from_mapping(row)
                 for row in (await session.execute(stmt)).mappings().all()
             ]
 
@@ -355,13 +357,13 @@ async def load_candidate_rows() -> list[Any]:
 
 
 def _counter(rows: list[Any], field: str) -> dict[str, int]:
-    return dict(Counter(_shadow_action(row, field) or "unknown" for row in rows).most_common())
+    return dict(Counter(shadow_action(row, field) or "unknown" for row in rows).most_common())
 
 
 def _quality_counts(rows: list[Any]) -> dict[str, int]:
     counts: Counter[str] = Counter()
     for row in rows:
-        counts[assess_shadow_sample(_shadow_quality_sample(row)).status] += 1
+        counts[assess_shadow_sample(shadow_quality_sample(row)).status] += 1
     return dict(counts.most_common())
 
 

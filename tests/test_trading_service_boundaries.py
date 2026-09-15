@@ -8345,12 +8345,12 @@ async def test_ml_signal_auto_train_quarantines_before_training(
         promote_candidate=lambda _evidence: SimpleNamespace(version="candidate-v1")
     )
     monkeypatch.setattr(trading_service, "datetime", datetime)
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 

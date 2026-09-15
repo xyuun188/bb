@@ -1225,7 +1225,7 @@ async def test_data_collection_status_is_read_only_for_training_quarantine(
         lambda _limit: _async_value([]),
     )
     monkeypatch.setattr(
-        "services.ml_signal_service.load_shadow_training_rows",
+        "services.ml_training_dataset.load_shadow_training_rows",
         lambda *, limit: _async_value([]),
     )
 

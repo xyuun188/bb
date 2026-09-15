@@ -22,6 +22,7 @@ from models.learning import ShadowBacktest
 from scripts import evaluate_ml_training_windows as ml_window_eval
 from scripts import train_ml_signal_model as train_ml_signal_script
 from services import ml_signal_service as ml_signal_module
+from services import ml_training_dataset
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -37,14 +38,16 @@ from services.ml_signal_service import (
     _leave_one_symbol_out_stability,
     _training_data_sha256,
     build_training_frame,
-    count_shadow_training_rows,
     decision_group_partition,
-    load_authoritative_trade_training_samples,
-    load_shadow_training_rows,
     persist_cached_training_candidate,
-    select_shadow_training_rows,
     shadow_training_quality_report,
     train_from_frame,
+)
+from services.ml_training_dataset import (
+    count_shadow_training_rows,
+    load_authoritative_trade_training_samples,
+    load_shadow_training_rows,
+    select_shadow_training_rows,
 )
 from services.model_artifact_registry import (
     ARTIFACT_REGISTRY_VERSION,
@@ -79,7 +82,7 @@ from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 @pytest.fixture(autouse=True)
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        ml_signal_module,
+        ml_training_dataset,
         "load_training_data_start",
         lambda: PHASE3_CLEAN_START_UTC,
     )
@@ -145,8 +148,8 @@ async def test_authoritative_training_samples_use_compact_trade_loader(
 
     monkeypatch.setattr(training_script, "_load_trade_samples", fake_loader)
     monkeypatch.setattr(
-        ml_signal_module,
-        "annotate_samples",
+            ml_training_dataset,
+            "annotate_samples",
         lambda samples, _kind: samples,
     )
 
@@ -1755,7 +1758,7 @@ async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: {}  # type: ignore[method-assign]
     service._quarantine_dirty_training_samples = quarantine_dirty_training_samples  # type: ignore[method-assign]
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr(
         "services.ml_signal_service.shadow_training_quality_report",
         lambda _rows: {"quality_report": {"totals": {"total": 46}}},
@@ -1765,7 +1768,7 @@ async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
         lambda _rows: _multi_horizon_partition_frame(30),
     )
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
     monkeypatch.setattr(
@@ -1840,12 +1843,12 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
         promote_candidate=promote_candidate,
         transition_current=promote_candidate,
     )
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 
@@ -1978,12 +1981,12 @@ async def test_ml_signal_retrains_when_training_contract_changes(
         promote_candidate=promote_candidate,
         transition_current=promote_candidate,
     )
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 
@@ -2046,13 +2049,13 @@ async def test_ml_signal_auto_train_does_not_retrain_for_one_new_decision_group(
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: metadata  # type: ignore[method-assign]
     service._quarantine_dirty_training_samples = forbidden_quarantine  # type: ignore[method-assign]
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr(
         "services.ml_signal_service.build_training_frame",
         lambda _rows: _training_frame(81),
     )
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 
@@ -2119,12 +2122,12 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
         },
     )
     monkeypatch.setattr(
-        "services.ml_signal_service.count_shadow_training_decision_groups",
+        "services.ml_training_dataset.count_shadow_training_decision_groups",
         raw_group_count,
     )
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", forbidden_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", forbidden_rows)
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         forbidden_trade_samples,
     )
 
@@ -2192,13 +2195,13 @@ async def test_rejected_challenger_contract_and_cursor_prevent_rapid_retraining(
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: current_metadata  # type: ignore[method-assign]
     service._quarantine_dirty_training_samples = forbidden_quarantine  # type: ignore[method-assign]
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr(
         "services.ml_signal_service.build_training_frame",
         lambda _rows: _training_frame(2_050),
     )
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 
@@ -2323,12 +2326,12 @@ async def test_ml_signal_auto_train_promotes_ready_candidate_only_after_dry_run(
         promote_candidate=promote_candidate,
         transition_current=promote_candidate,
     )
-    monkeypatch.setattr("services.ml_signal_service.load_shadow_training_rows", load_rows)
+    monkeypatch.setattr("services.ml_training_dataset.load_shadow_training_rows", load_rows)
     monkeypatch.setattr("services.ml_signal_service.shadow_training_quality_report", quality_report)
     monkeypatch.setattr("services.ml_signal_service.build_training_frame", build_frame)
     monkeypatch.setattr("services.ml_signal_service.train_from_frame", train_frame)
     monkeypatch.setattr(
-        "services.ml_signal_service.load_authoritative_trade_training_samples",
+        "services.ml_training_dataset.load_authoritative_trade_training_samples",
         load_trade_samples,
     )
 

@@ -4149,7 +4149,7 @@ def _dashboard_local_ai_tools_client() -> Any | None:
 
 async def _completed_ml_shadow_sample_count() -> int:
     try:
-        from services.ml_signal_service import count_shadow_training_rows
+        from services.ml_training_dataset import count_shadow_training_rows
 
         db_count = int(await count_shadow_training_rows())
         if db_count >= 0:

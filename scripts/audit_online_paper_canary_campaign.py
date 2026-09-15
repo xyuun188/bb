@@ -40,7 +40,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=root)
 from sqlalchemy import select
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
-from services.ml_signal_service import load_authoritative_trade_training_samples
+from services.ml_training_dataset import load_authoritative_trade_training_samples
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,

@@ -28,13 +28,11 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
-from sqlalchemy import and_, func, or_, select
 
 from config.settings import settings
 from core.model_artifact_safety import dump_trusted_joblib, load_trusted_joblib
 from core.safe_output import safe_error_text
-from db.session import get_read_session_ctx
-from models.learning import ShadowBacktest
+from services import ml_training_dataset
 from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
@@ -93,13 +91,11 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import (
     annotate_samples,
     artifact_bound_governance_report,
-    assess_shadow_sample,
     governance_report,
     quality_report,
 )
 from services.training_epoch import (
     CURRENT_TRAINING_EPOCH_POLICY,
-    load_training_data_start,
     load_training_epoch_start,  # noqa: F401
     training_data_scope,
 )
@@ -150,12 +146,6 @@ def _training_source_code_version() -> str:
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 FULL_TRAINING_PROBE_INTERVAL_SECONDS = 6 * 60 * 60
-LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = max(
-    int(os.environ.get("LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", "5000")),
-    MIN_TRAINING_DECISION_GROUP_COUNT,
-    2,
-)
-LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -939,194 +929,6 @@ def _activation_gated_policy(
         "artifact_activation": activation,
     }
     return gated_influence, gated_readiness
-
-
-@dataclass(frozen=True)
-class ShadowTrainingRow:
-    id: int
-    decision_id: int | None
-    created_at: datetime | None
-    symbol: str
-    analysis_type: str
-    decision_action: str
-    decision_confidence: float
-    feature_snapshot: Any
-    due_at: datetime | None
-    horizon_minutes: int
-    label_version: str
-    long_return_pct: float | None
-    short_return_pct: float | None
-    best_action: str | None
-    missed_opportunity: bool
-
-
-_TRAINING_FEATURE_SNAPSHOT_KEYS = (
-    "abnormal_wick_count_72h",
-    "abnormal_wick_max_pct",
-    "abnormal_wick_recent_hours",
-    "adx_14",
-    "atr_14",
-    "bb_pct",
-    "bb_width",
-    "change_24h_pct",
-    "close",
-    "current_price",
-    "direct_news_item_count",
-    "direct_sentiment_data_available",
-    "ema_12",
-    "ema_26",
-    "entry_activity_volume_ratio",
-    "exchange_inflow",
-    "feature_at",
-    "feature_timestamp",
-    "funding_rate",
-    "high_24h",
-    "indicator_price_gap_pct",
-    "liquidation_risk_score",
-    "low_24h",
-    "macd",
-    "macd_diff",
-    "macd_signal",
-    "market_data_quality",
-    "market_news_item_count",
-    "news_article_count",
-    "news_sentiment_avg",
-    "notional_24h_usdt",
-    "observed_at",
-    "open_interest_value",
-    "orderbook_ask_depth",
-    "orderbook_bid_depth",
-    "orderbook_imbalance",
-    "price_reconciliation_warning",
-    "price_vs_sma20",
-    "price_vs_sma50",
-    "returns_1",
-    "returns_20",
-    "returns_5",
-    "rsi_14",
-    "rsi_7",
-    "sector_relative_strength",
-    "sentiment_data_available",
-    "sequence_length",
-    "social_mention_count",
-    "social_sentiment_avg",
-    "spread_pct",
-    "stale",
-    "stoch_k",
-    "ticker_stale",
-    "training_quality_reason",
-    "training_market_fact_contract",
-    "training_label_contract",
-    "volatility_20",
-    "volume_24h",
-    "volume_ratio",
-    "whale_txn_count",
-)
-_TRAINING_FEATURE_COLUMN_PREFIX = "training_feature__"
-
-
-def _shadow_training_columns() -> tuple[Any, ...]:
-    return (
-        ShadowBacktest.id,
-        ShadowBacktest.decision_id,
-        ShadowBacktest.created_at,
-        ShadowBacktest.symbol,
-        ShadowBacktest.analysis_type,
-        ShadowBacktest.decision_action,
-        ShadowBacktest.decision_confidence,
-        ShadowBacktest.training_feature_snapshot,
-        ShadowBacktest.due_at,
-        ShadowBacktest.horizon_minutes,
-        ShadowBacktest.label_version,
-        ShadowBacktest.long_return_pct,
-        ShadowBacktest.short_return_pct,
-        ShadowBacktest.best_action,
-        ShadowBacktest.missed_opportunity,
-    )
-
-
-def _shadow_training_row_from_mapping(mapping: Any) -> ShadowTrainingRow:
-    feature_snapshot = _parse_json(mapping.get("training_feature_snapshot"))
-    return ShadowTrainingRow(
-        id=int(mapping.get("id") or 0),
-        decision_id=int(mapping.get("decision_id") or 0) or None,
-        created_at=mapping.get("created_at"),
-        symbol=str(mapping.get("symbol") or ""),
-        analysis_type=str(mapping.get("analysis_type") or ""),
-        decision_action=str(mapping.get("decision_action") or ""),
-        decision_confidence=_safe_float(mapping.get("decision_confidence"), 0.0),
-        feature_snapshot=feature_snapshot,
-        due_at=mapping.get("due_at"),
-        horizon_minutes=int(mapping.get("horizon_minutes") or 10),
-        label_version=str(mapping.get("label_version") or ""),
-        long_return_pct=mapping.get("long_return_pct"),
-        short_return_pct=mapping.get("short_return_pct"),
-        best_action=mapping.get("best_action"),
-        missed_opportunity=bool(mapping.get("missed_opportunity")),
-    )
-
-
-def _shadow_row_id(row: Any) -> Any:
-    return getattr(row, "id", id(row))
-
-
-def _shadow_sort_key(row: Any) -> tuple[datetime, int]:
-    created_at = getattr(row, "created_at", None)
-    if not isinstance(created_at, datetime):
-        created_at = datetime.fromtimestamp(0, UTC)
-    elif created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=UTC)
-    return created_at.astimezone(UTC), int(getattr(row, "id", 0) or 0)
-
-
-def _shadow_action(row: Any, field: str) -> str:
-    return str(getattr(row, field, "") or "").lower().strip()
-
-
-def _shadow_decision_confidence(row: Any) -> float:
-    return _safe_float(getattr(row, "decision_confidence", 0.0), 0.0) or 0.0
-
-
-def _shadow_is_trainable_trade_opportunity(row: Any) -> bool:
-    action = _shadow_action(row, "decision_action")
-    best_action = _shadow_action(row, "best_action")
-    if action in {"long", "short"}:
-        return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
-    missed = bool(getattr(row, "missed_opportunity", False)) and best_action in {"long", "short"}
-    if not missed:
-        return False
-    return not assess_shadow_sample(_shadow_quality_sample(row)).exclude_from_training
-
-
-def _shadow_quality_sample(row: Any) -> dict[str, Any]:
-    return {
-        "id": int(getattr(row, "id", 0) or 0),
-        "decision_id": int(getattr(row, "decision_id", 0) or 0) or None,
-        "label_version": str(getattr(row, "label_version", "") or ""),
-        "symbol": getattr(row, "symbol", ""),
-        "analysis_type": getattr(row, "analysis_type", ""),
-        "decision_action": getattr(row, "decision_action", ""),
-        "decision_confidence": _shadow_decision_confidence(row),
-        "horizon_minutes": int(getattr(row, "horizon_minutes", 10) or 10),
-        "features": _parse_json(getattr(row, "feature_snapshot", None)),
-        "long_return_pct": _safe_float(getattr(row, "long_return_pct", None), None),
-        "short_return_pct": _safe_float(getattr(row, "short_return_pct", None), None),
-        "label_timestamp": getattr(row, "due_at", None),
-        "best_action": getattr(row, "best_action", ""),
-        "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
-    }
-
-
-def select_shadow_training_rows(rows: list[Any]) -> list[Any]:
-    """Select the latest quality-governed chronological training window."""
-
-    deduped: dict[Any, Any] = {}
-    for row in rows:
-        deduped.setdefault(_shadow_row_id(row), row)
-    recent = sorted(deduped.values(), key=_shadow_sort_key, reverse=True)
-    trainable_rows = [row for row in recent if _shadow_is_trainable_trade_opportunity(row)]
-
-    return trainable_rows
 
 
 def _training_window_composition(frame: pd.DataFrame) -> dict[str, Any]:
@@ -2153,7 +1955,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
     annotated_by_id = {
         int(sample.get("id") or 0): sample
         for sample in annotate_samples(
-            [_shadow_quality_sample(row) for row in rows],
+            [ml_training_dataset.shadow_quality_sample(row) for row in rows],
             "shadow",
         )
     }
@@ -3251,7 +3053,9 @@ class MLSignalService:
                 # fresh shadow data for the full circuit duration.
                 try:
                     completed_shadow = await self._completed_shadow_sample_count()
-                    completed_groups = await count_shadow_training_decision_groups()
+                    completed_groups = (
+                        await ml_training_dataset.count_shadow_training_decision_groups()
+                    )
                     probe = {
                         "completed_shadow_sample_count": int(completed_shadow),
                         "completed_training_decision_group_count": int(completed_groups),
@@ -3363,7 +3167,9 @@ class MLSignalService:
             try:
                 completed_count = await self._completed_shadow_sample_count()
                 try:
-                    completed_raw_group_count = await count_shadow_training_decision_groups()
+                    completed_raw_group_count = (
+                        await ml_training_dataset.count_shadow_training_decision_groups()
+                    )
                     raw_cursor_probe_error = None
                 except Exception as exc:
                     # A failed lightweight probe must not silently trigger the heavy
@@ -3522,7 +3328,7 @@ class MLSignalService:
                     self._last_train_result = result
                     return result
 
-                trigger_rows = await load_shadow_training_rows()
+                trigger_rows = await ml_training_dataset.load_shadow_training_rows()
                 trigger_frame = build_training_frame(trigger_rows)
                 completed_decision_group_count = (
                     int(trigger_frame["decision_group"].nunique()) if not trigger_frame.empty else 0
@@ -3641,7 +3447,9 @@ class MLSignalService:
                     self._last_train_result = result
                     return result
 
-                trade_samples = await load_authoritative_trade_training_samples()
+                trade_samples = (
+                    await ml_training_dataset.load_authoritative_trade_training_samples()
+                )
                 completed_trade_count = len(trade_samples)
                 new_trade_samples = max(
                     completed_trade_count - last_completed_trade_count,
@@ -3664,7 +3472,7 @@ class MLSignalService:
                 quarantine_result = await self._quarantine_dirty_training_samples()
                 completed_count = await self._completed_shadow_sample_count()
                 new_samples = max(completed_count - last_completed_count, 0)
-                rows = await load_shadow_training_rows()
+                rows = await ml_training_dataset.load_shadow_training_rows()
                 quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
                 partition = decision_group_partition(frame)
@@ -5022,7 +4830,7 @@ class MLSignalService:
         return checkpoint
 
     async def _completed_shadow_sample_count(self) -> int:
-        return await count_shadow_training_rows()
+        return await ml_training_dataset.count_shadow_training_rows()
 
     async def completed_shadow_sample_count(self) -> int:
         """Return completed shadow samples through a public dashboard boundary."""
@@ -5087,120 +4895,6 @@ class MLSignalService:
         if edge <= 0.0:
             return "ML 多空预期收益差距不明显，信号中性。"
         return "ML 盈亏质量信号中性，暂不改变 AI 决策。"
-
-
-async def load_shadow_training_rows() -> list[Any]:
-    """Load a time-stratified, resource-bounded clean training window.
-
-    The cumulative training cursor is counted separately. Keeping the fit
-    window bounded prevents large JSON snapshots from exhausting the trading
-    service while retaining coverage across the full current training epoch.
-    """
-
-    epoch_start = load_training_data_start()
-    base_filters = _shadow_training_candidate_filters(epoch_start)
-    columns = _shadow_training_columns()
-    selected_ids: list[int] = []
-    async with get_read_session_ctx() as session:
-        identity_result = await session.stream(
-            select(
-                ShadowBacktest.id,
-                ShadowBacktest.decision_id,
-            )
-            .where(*base_filters)
-            .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
-        )
-        group_ids: dict[int, list[int]] = {}
-        async for mapping in identity_result.mappings():
-            sample_id = int(mapping.get("id") or 0)
-            decision_id = int(mapping.get("decision_id") or 0)
-            if sample_id <= 0:
-                continue
-            group_ids.setdefault(decision_id or -sample_id, []).append(sample_id)
-
-        groups = list(group_ids.values())
-        if len(groups) > LOCAL_ML_TRAINING_MAX_DECISION_GROUPS:
-            budget = LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
-            selected_group_indexes = {
-                round(index * (len(groups) - 1) / (budget - 1))
-                for index in range(budget)
-            }
-            groups = [groups[index] for index in sorted(selected_group_indexes)]
-        selected_ids = [sample_id for group in groups for sample_id in group]
-
-        rows: list[ShadowTrainingRow] = []
-        for offset in range(0, len(selected_ids), LOCAL_ML_TRAINING_READ_PAGE_SIZE):
-            page_ids = selected_ids[offset : offset + LOCAL_ML_TRAINING_READ_PAGE_SIZE]
-            result = await session.execute(
-                select(*columns).where(ShadowBacktest.id.in_(page_ids))
-            )
-            rows.extend(
-                _shadow_training_row_from_mapping(row)
-                for row in result.mappings()
-            )
-    return select_shadow_training_rows(rows)
-
-
-def _shadow_training_candidate_filters(epoch_start: datetime) -> tuple[Any, ...]:
-    """Return the SQL identity filters shared by the heavy and cursor paths."""
-
-    return (
-        ShadowBacktest.status == "completed",
-        ShadowBacktest.created_at >= epoch_start,
-        ShadowBacktest.long_return_pct.is_not(None),
-        ShadowBacktest.short_return_pct.is_not(None),
-        or_(
-            ShadowBacktest.decision_action.in_(["long", "short"]),
-            and_(
-                ShadowBacktest.missed_opportunity.is_(True),
-                ShadowBacktest.best_action.in_(["long", "short"]),
-            ),
-        ),
-    )
-
-
-async def count_shadow_training_rows() -> int:
-    epoch_start = load_training_data_start()
-    async with get_read_session_ctx() as session:
-        result = await session.execute(
-            select(func.count(ShadowBacktest.id)).where(
-                ShadowBacktest.status == "completed",
-                ShadowBacktest.created_at >= epoch_start,
-                ShadowBacktest.long_return_pct.is_not(None),
-                ShadowBacktest.short_return_pct.is_not(None),
-            )
-        )
-        return int(result.scalar() or 0)
-
-
-async def count_shadow_training_decision_groups() -> int:
-    """Count candidate decision groups without loading feature snapshots."""
-
-    epoch_start = load_training_data_start()
-    async with get_read_session_ctx() as session:
-        result = await session.execute(
-            select(
-                func.count(
-                    func.distinct(func.coalesce(ShadowBacktest.decision_id, ShadowBacktest.id))
-                )
-            ).where(*_shadow_training_candidate_filters(epoch_start))
-        )
-        return int(result.scalar() or 0)
-
-
-async def load_authoritative_trade_training_samples() -> list[dict[str, Any]]:
-    """Load the clean OKX lifecycle view used only for realized calibration."""
-
-    from scripts.train_local_ai_tools_models import _load_trade_samples
-
-    annotated = annotate_samples(
-        # Training/health callers only consume the bounded realized-trade
-        # projection. Loading full decision evidence here detoasts large JSON
-        # snapshots and can exceed the online database statement timeout.
-        await _load_trade_samples(compact=True),
-        "trade",
-    )
-    return [sample for sample in annotated if not sample.get("exclude_from_training")]
 
 
 def _top_counts(values: list[Any], *, limit: int = 8) -> dict[str, int]:
