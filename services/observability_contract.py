@@ -14,6 +14,16 @@ from typing import Any
 
 OBSERVABILITY_STATUSES = {
     "ok",
+    # Positive runtime/lifecycle states are valid observations too.  They
+    # must not be normalized to ``missing`` merely because a section exposes
+    # a more specific state than ``ok``.
+    "ready",
+    "active",
+    "live",
+    "trained",
+    "available",
+    "configured",
+    "enabled",
     "warming",
     "partial",
     "timeout",
@@ -31,6 +41,18 @@ OBSERVABILITY_STATUSES = {
     "stale",
     "missing",
     "error",
+}
+
+_HEALTHY_OBSERVABILITY_STATUSES = {
+    "ok",
+    "ready",
+    "active",
+    "live",
+    "trained",
+    "available",
+    "configured",
+    "enabled",
+    "passed",
 }
 
 
@@ -134,11 +156,11 @@ def status_from_sections(sections: Mapping[str, Any]) -> tuple[str, list[str]]:
         row = value if isinstance(value, Mapping) else {}
         state = normalize_status(row.get("status"), default="missing")
         statuses.append(state)
-        if state != "ok":
+        if state not in _HEALTHY_OBSERVABILITY_STATUSES:
             degraded.append(str(name))
     if not statuses:
         return "missing", degraded
-    if all(state == "ok" for state in statuses):
+    if all(state in _HEALTHY_OBSERVABILITY_STATUSES for state in statuses):
         return "ok", degraded
     if any(state in {"error", "timeout"} for state in statuses):
         return "partial" if any(state == "ok" for state in statuses) else "error", degraded

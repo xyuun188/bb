@@ -9,7 +9,7 @@ from services.continuous_observation import (
     ContinuousObservationWorkerState,
     observation_metrics_ready,
 )
-from services.observability_contract import normalize_status
+from services.observability_contract import normalize_status, status_from_sections
 
 
 def _metrics(**overrides):
@@ -120,6 +120,19 @@ def test_observation_statuses_are_valid_snapshot_states():
     assert normalize_status("passed") == "passed"
     assert normalize_status("observing") == "observing"
     assert normalize_status("not_started") == "not_started"
+
+
+def test_runtime_model_states_are_not_misclassified_as_missing():
+    for state in ("ready", "active", "live", "trained", "available", "configured"):
+        assert normalize_status(state) == state
+    status, degraded = status_from_sections(
+        {
+            "local_ml": {"status": "trained"},
+            "local_ai_tools": {"status": "ready"},
+        }
+    )
+    assert status == "ok"
+    assert degraded == []
 
 
 def test_observation_counter_metrics_are_relative_to_window_baseline(tmp_path):
