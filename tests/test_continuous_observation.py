@@ -46,6 +46,19 @@ def test_observation_requires_real_elapsed_window_and_metrics(tmp_path):
     assert passed["status"] == "passed"
 
 
+def test_observation_store_can_bind_a_72_hour_window_contract(tmp_path):
+    store = ContinuousObservationStore(
+        tmp_path / "observation-72.json", default_required_hours=72
+    )
+
+    assert store.snapshot()["required_hours"] == 72
+    started = datetime(2026, 8, 29, tzinfo=UTC)
+    snapshot = store.start(now=started, baseline_metrics=_metrics())
+
+    assert snapshot["required_hours"] == 72
+    assert snapshot["status"] == "observing"
+
+
 def test_observation_blocks_on_failed_gate_and_never_fakes_zero(tmp_path):
     store = ContinuousObservationStore(tmp_path / "observation.json")
     started = datetime(2026, 8, 29, tzinfo=UTC)

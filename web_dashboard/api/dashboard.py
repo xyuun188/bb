@@ -122,7 +122,8 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
 )
 CONTINUOUS_OBSERVATION_STORES = {
     hours: ContinuousObservationStore(
-        settings.data_dir / "dashboard_read_models" / f"continuous_observation_{hours}h.json"
+        settings.data_dir / "dashboard_read_models" / f"continuous_observation_{hours}h.json",
+        default_required_hours=hours,
     )
     for hours in (24, 72)
 }
@@ -9275,6 +9276,125 @@ def _warming_model_observability_payload() -> dict[str, Any]:
     }
 
 
+async def _cold_model_observability_payload() -> dict[str, Any]:
+    """Return truthful local model state while the heavy snapshot warms up.
+
+    The full snapshot intentionally includes slow analysis, trade and memory
+    readers.  Those readers must not make the first dashboard request claim
+    that every model is unavailable.  Local model status is bounded and shown
+    immediately; the remaining sections stay explicitly in ``warming`` until
+    the background refresh has real data.
+    """
+
+    async def bounded_local(
+        key: tuple[Any, ...],
+        builder: Callable[[], Awaitable[Any]],
+        name: str,
+    ) -> dict[str, Any]:
+        stale = _dashboard_heavy_cache_peek(
+            key, max_age_seconds=_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS
+        )
+        if isinstance(stale, dict):
+            stale["status"] = "status_stale"
+            stale["stale"] = True
+            stale["stale_reason"] = "initial_snapshot_refresh_in_progress"
+            stale["degraded_reason"] = "initial_snapshot_refresh_in_progress"
+            return stale
+        try:
+            value = await asyncio.wait_for(builder(), timeout=3.0)
+            if isinstance(value, dict):
+                return value
+            return {"status": "status_error", "degraded_reason": f"{name}_invalid"}
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return {
+                "status": "status_timeout",
+                "degraded_reason": f"{name}_status_timeout",
+            }
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} cold observability fallback", exc)
+            return {
+                "status": "status_error",
+                "degraded_reason": f"{name}_status_error:{safe_error_text(exc, limit=120)}",
+            }
+
+    local_ml, local_tools = await asyncio.gather(
+        bounded_local(
+            ("model-observability-local-ml",),
+            get_ml_signal_status,
+            "local_ml",
+        ),
+        bounded_local(
+            ("model-observability-local-ai-tools",),
+            get_local_ai_tools_status,
+            "local_ai_tools",
+        ),
+    )
+    analysis = {"status": "warming", "degraded_reason": "initial_refresh_in_progress"}
+    trade = {"status": "warming", "degraded_reason": "initial_refresh_in_progress"}
+    expert_memory = {
+        "status": "warming",
+        "degraded_reason": "initial_refresh_in_progress",
+    }
+    scheduler = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
+    specialist_report = load_model_training_report(
+        "phase3/specialist_shadow_evaluation_latest.json"
+    )
+    from web_dashboard.api import model_training_status as model_training_status_api
+
+    try:
+        model_server_report = (
+            model_training_status_api._model_server_report_with_runtime_configuration()
+        )
+    except Exception as exc:
+        _log_dashboard_fallback("model server cold registry fallback", exc)
+        model_server_report = {}
+    registry = build_model_training_registry(
+        local_ml_status=local_ml,
+        local_tools_status=local_tools,
+        specialist_report=specialist_report,
+        model_server_report=model_server_report,
+        contribution_performance={},
+    )
+    sections = {
+        "local_ml": local_ml,
+        "local_ai_tools": local_tools,
+        "analysis": analysis,
+        "trade": trade,
+        "expert_memory": expert_memory,
+    }
+    return build_snapshot(
+        {
+            "sections": sections,
+            "scheduler": scheduler,
+            "registry": registry,
+            "expected_expert_names": list(MARKET_ANALYSIS_EXPERT_NAMES),
+            "expected_expert_count": len(MARKET_ANALYSIS_EXPERT_NAMES),
+            "analysis_round_id": None,
+            "analysis_quality": analysis,
+            "trade_observability": trade,
+            "expert_memory_observability": expert_memory,
+            "model_roles": {
+                "active": [],
+                "challenger": [],
+                "baseline": ["no_model_baseline"],
+            },
+            "degraded_sections": ["analysis", "trade", "expert_memory"],
+            "conclusion": "本地模型状态已读取；分析、交易和专家记忆正在后台刷新。",
+            "cache": {
+                "hit": False,
+                "refresh_in_background": True,
+                "reason": "initial_refresh_in_progress",
+            },
+        },
+        status="warming",
+        source="dashboard.model_observability",
+        stale_after_seconds=120.0,
+        degraded_reason="initial_refresh_in_progress",
+    )
+
+
 @router.get("/model-observability/snapshot")
 async def get_model_observability_snapshot(request: Request = None) -> dict[str, Any]:
     """Return a fast cached snapshot; cold refreshes run in the background."""
@@ -9314,7 +9434,7 @@ async def get_model_observability_snapshot(request: Request = None) -> dict[str,
             "refresh_in_background": True,
         }
         return sanitize_payload(stale)
-    return sanitize_payload(_warming_model_observability_payload())
+    return sanitize_payload(await _cold_model_observability_payload())
 
 
 def _count_timeout_statuses(value: Any) -> int:
@@ -9500,8 +9620,21 @@ async def collect_continuous_observation_metrics() -> dict[str, Any]:
         if isinstance(value, dict)
         and str(value.get("status") or "").lower() in {"error", "timeout"}
     ]
+    deferred_reasons = [
+        f"{name}:{value.get('degraded_reason') or value.get('status')}"
+        for name, value in (
+            ("trade", trade),
+            ("model", model),
+            ("analysis", analysis),
+            ("data", data),
+        )
+        if isinstance(value, dict)
+        and str(value.get("status") or "").lower() == "deferred"
+    ]
     if reasons:
         metrics["collection_errors"] = ";".join(reasons)[:300]
+    if deferred_reasons:
+        metrics["blocked_reason"] = ";".join(deferred_reasons)[:300]
     return metrics
 
 
@@ -9513,6 +9646,8 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
         str(hours): store.snapshot() for hours, store in CONTINUOUS_OBSERVATION_STORES.items()
     }
     statuses = [snapshot.get("status") for snapshot in windows.values()]
+    worker = CONTINUOUS_OBSERVATION_WORKER_STATE.read()
+    worker_deferred = worker.get("status") == "deferred"
     overall_status = (
         "passed"
         if all(status == "passed" for status in statuses)
@@ -9520,6 +9655,8 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
         if any(status == "blocked" for status in statuses)
         else "observing"
         if any(status == "observing" for status in statuses)
+        else "deferred"
+        if worker_deferred
         else "not_started"
     )
     return sanitize_payload(
@@ -9527,7 +9664,8 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
             {
                 "windows": windows,
                 "required_windows": [24, 72],
-                "worker": CONTINUOUS_OBSERVATION_WORKER_STATE.read(),
+                "worker": worker,
+                "deferred_reason": worker.get("last_deferred_reason") if worker_deferred else None,
             },
             status=overall_status,
             source="dashboard.continuous_observation",

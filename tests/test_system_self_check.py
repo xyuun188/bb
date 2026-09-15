@@ -462,6 +462,7 @@ async def test_data_source_self_check_reports_market_news_and_social_freshness(
         yield FakeSession()
 
     monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+    monkeypatch.setattr(system_health._dash, "_trading_service", None)
     monkeypatch.setattr(
         system_health,
         "load_external_event_source_health",

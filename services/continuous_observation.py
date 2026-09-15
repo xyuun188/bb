@@ -112,6 +112,7 @@ class ContinuousObservationWorkerState:
             "sample_count": 0,
             "error_count": 0,
             "last_error": None,
+            "last_deferred_reason": None,
             "stopped_at": None,
         }
 
@@ -151,6 +152,7 @@ class ContinuousObservationWorkerState:
             last_heartbeat_at=timestamp,
             stopped_at=None,
             last_error=None,
+            last_deferred_reason=None,
         )
 
     def mark_heartbeat(self, *, now: datetime | None = None) -> dict[str, Any]:
@@ -166,6 +168,17 @@ class ContinuousObservationWorkerState:
             last_heartbeat_at=_iso(now or _now()),
             last_sample_at=_iso(now or _now()),
             sample_count=int(payload.get("sample_count") or 0) + 1,
+            last_deferred_reason=None,
+        )
+
+    def mark_deferred(self, reason: str, *, now: datetime | None = None) -> dict[str, Any]:
+        """Record a truthful wait state without pretending an acceptance window ran."""
+
+        timestamp = now or _now()
+        return self._update(
+            status="deferred",
+            last_heartbeat_at=_iso(timestamp),
+            last_deferred_reason=str(reason)[:300],
         )
 
     def mark_error(self, error: str, *, now: datetime | None = None) -> dict[str, Any]:
@@ -206,14 +219,18 @@ def observation_metrics_ready(metrics: Any) -> bool:
 class ContinuousObservationStore:
     """Persist and evaluate one real-time observation window."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, default_required_hours: int | None = None):
         self.path = Path(path)
+        self._enforce_default_hours = default_required_hours is not None
+        self.default_required_hours = int(default_required_hours or 24)
+        if self.default_required_hours not in ALLOWED_WINDOW_HOURS:
+            raise ValueError("default_required_hours must be 24 or 72")
 
     def _default(self) -> dict[str, Any]:
         return {
             "version": CONTINUOUS_OBSERVATION_VERSION,
             "status": "not_started",
-            "required_hours": 24,
+            "required_hours": self.default_required_hours,
             "window_started_at": None,
             "last_sample_at": None,
             "baseline_metrics": {},
@@ -234,6 +251,17 @@ class ContinuousObservationStore:
             return self._default()
         result = self._default()
         result.update(payload)
+        stored_hours = int(result.get("required_hours") or self.default_required_hours)
+        if self._enforce_default_hours and stored_hours != self.default_required_hours:
+            # A previous build could persist the 72-hour store as 24 hours.
+            # Do not reinterpret that evidence under a different contract;
+            # invalidate it and require a fresh, explicitly labelled window.
+            result = self._default()
+            result["reset_count"] = int(payload.get("reset_count") or 0) + 1
+            result["last_reset_at"] = payload.get("last_reset_at")
+            result["last_reset_reason"] = (
+                f"window_contract_changed:{stored_hours}_to_{self.default_required_hours}"
+            )
         result["samples"] = [
             row for row in result.get("samples", []) if isinstance(row, dict)
         ][-MAX_SAMPLES:]
@@ -252,13 +280,13 @@ class ContinuousObservationStore:
     def start(
         self,
         *,
-        required_hours: int = 24,
+        required_hours: int | None = None,
         now: datetime | None = None,
         baseline_metrics: dict[str, Any] | None = None,
         restart: bool = False,
         reset_reason: str | None = None,
     ) -> dict[str, Any]:
-        hours = int(required_hours)
+        hours = int(required_hours or self.default_required_hours)
         if hours not in ALLOWED_WINDOW_HOURS:
             raise ValueError("required_hours must be 24 or 72")
         payload = self.read()
@@ -484,8 +512,10 @@ class ContinuousObservationScheduler:
             try:
                 collected = await self.collector()
                 baseline = collected if isinstance(collected, dict) else {}
-            except Exception:
+            except Exception as exc:
                 baseline = {}
+                if self.worker_state is not None:
+                    self.worker_state.mark_deferred(f"collector_error:{type(exc).__name__}", now=now)
         if observation_metrics_ready(baseline):
             for hours, store in pending_stores:
                 store.start(
@@ -493,6 +523,13 @@ class ContinuousObservationScheduler:
                     now=now,
                     baseline_metrics=baseline,
                 )
+        elif pending_stores and self.worker_state is not None:
+            reason = str(
+                baseline.get("blocked_reason")
+                or baseline.get("collection_errors")
+                or "observation_baseline_incomplete"
+            )
+            self.worker_state.mark_deferred(reason, now=now)
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -529,6 +566,15 @@ class ContinuousObservationScheduler:
             }
         observed_at = _now()
         metrics_ready = observation_metrics_ready(metrics)
+        if not metrics_ready and self.worker_state is not None:
+            self.worker_state.mark_deferred(
+                str(
+                    metrics.get("blocked_reason")
+                    or metrics.get("collection_errors")
+                    or "observation_metrics_incomplete"
+                ),
+                now=observed_at,
+            )
         snapshots: dict[str, Any] = {}
         for hours in ALLOWED_WINDOW_HOURS:
             store = self.stores.get(hours)
@@ -555,6 +601,15 @@ class ContinuousObservationScheduler:
             snapshots[str(hours)] = store.record(metrics, now=observed_at)
         if self.worker_state is not None:
             self.worker_state.mark_sample(now=observed_at)
+            if not metrics_ready:
+                self.worker_state.mark_deferred(
+                    str(
+                        metrics.get("blocked_reason")
+                        or metrics.get("collection_errors")
+                        or "observation_metrics_incomplete"
+                    ),
+                    now=observed_at,
+                )
         return snapshots
 
     async def _run(self) -> None:

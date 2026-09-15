@@ -206,6 +206,43 @@ async def test_model_observability_serves_stale_snapshot_while_refreshing(
 
 
 @pytest.mark.asyncio
+async def test_cold_model_observability_keeps_local_models_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def local_ml() -> dict[str, Any]:
+        return {"status": "trained", "available": True, "trained_at": "2026-09-15T00:00:00Z"}
+
+    async def local_tools() -> dict[str, Any]:
+        return {
+            "status": "canary",
+            "available": True,
+            "service_available": True,
+            "model_bundle_available": True,
+            "models": {"profit": "profit-model"},
+        }
+
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_model_observability_refresh_task", None)
+    monkeypatch.setattr(dashboard, "get_ml_signal_status", local_ml)
+    monkeypatch.setattr(dashboard, "get_local_ai_tools_status", local_tools)
+    monkeypatch.setattr(
+        dashboard,
+        "_refresh_model_observability_cache",
+        lambda: asyncio.sleep(60),
+    )
+
+    payload = await dashboard.get_model_observability_snapshot(object())
+
+    assert payload["status"] == "warming"
+    assert payload["sections"]["local_ml"]["available"] is True
+    assert payload["sections"]["local_ai_tools"]["service_available"] is True
+    assert payload["sections"]["analysis"]["status"] == "warming"
+    assert payload["cache"]["refresh_in_background"] is True
+    await dashboard.shutdown_dashboard_observability_tasks()
+
+
+@pytest.mark.asyncio
 async def test_model_observability_caches_slow_sections_independently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1097,14 +1097,23 @@ async def _data_source_items() -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     ticker_ok = bool(ticker_count and ticker_age is not None and ticker_age <= TICKER_FRESH_SECONDS)
+    trading_service_bound = getattr(_dash, "_trading_service", None) is not None
+    trading_runtime_active = bool(_dash._trading_service_is_running()) and not mode_manager.is_paused
+    # A dashboard-only process can still report persisted market freshness.
+    # Defer ticker freshness only when the trading runtime is explicitly bound
+    # and stopped, or when the operator has paused the system.
+    ticker_deferred = bool(mode_manager.is_paused or (trading_service_bound and not trading_runtime_active))
+    ticker_status = "deferred" if ticker_deferred else ("ok" if ticker_ok else "critical")
     items.append(
         _check_item(
             "market_ticker_freshness",
             "实时行情数据源",
-            "ok" if ticker_ok else "critical",
+            ticker_status,
             (
                 f"已沉淀 {ticker_count} 个 ticker，最新更新时间约 {_age_minutes(ticker_latest)} 分钟前。"
                 if ticker_ok
+                else "交易运行时当前暂停，实时 ticker 刷新已明确延期；恢复交易前必须重新通过行情新鲜度检查。"
+                if ticker_deferred
                 else "实时行情 ticker 不新鲜或为空，会导致余额、持仓估值和开仓判断失真。"
             ),
             details={
@@ -1112,6 +1121,8 @@ async def _data_source_items() -> list[dict[str, Any]]:
                 "latest_at": ticker_latest.isoformat() if ticker_latest else None,
                 "age_minutes": _age_minutes(ticker_latest),
                 "fresh_limit_minutes": round(TICKER_FRESH_SECONDS / 60, 1),
+                "deferred": ticker_deferred,
+                "trading_runtime_active": trading_runtime_active,
             },
         )
     )
