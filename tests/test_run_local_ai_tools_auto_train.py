@@ -11,6 +11,32 @@ def test_result_from_output_reads_only_structured_frame() -> None:
     assert runner._result_from_output(output) == {"trained": True, "reason": "ok"}
 
 
+def test_shadow_trainer_uses_isolated_child_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = runner.LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX + '{"trained":true,"reason":"ok"}'
+        stderr = ""
+
+    def fake_run(command: list[str], **kwargs: object) -> Completed:
+        captured["command"] = command
+        captured.update(kwargs)
+        return Completed()
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    result = runner._run_shadow_trainer()
+
+    assert result == {"trained": True, "reason": "ok"}
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert str(command[-3]).endswith("scripts\\train_local_ai_tools_models.py")
+    assert command[-2:] == ["--training-mode", "shadow"]
+    assert captured["capture_output"] is True
+    assert captured["check"] is False
+
+
 @pytest.mark.asyncio
 async def test_run_once_records_okx_block_without_invoking_trainer(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, object]] = []

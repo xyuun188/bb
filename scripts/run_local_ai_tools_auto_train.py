@@ -10,11 +10,9 @@ the refresh.  It never enables live routing or submits orders.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import io
 import json
 import logging
-import runpy
+import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -75,38 +73,50 @@ def _result_from_output(output: str) -> dict[str, Any]:
 
 
 def _run_shadow_trainer() -> dict[str, Any]:
-    """Invoke the existing shadow trainer without spawning a second service."""
+    """Run the trainer in a process with an isolated asyncpg event loop.
 
-    captured = io.StringIO()
-    previous_argv = sys.argv
-    sys.argv = ["scripts/train_local_ai_tools_models.py", "--training-mode", "shadow"]
+    Importing the trainer through ``runpy`` in a worker thread reused the
+    scheduler's ``db.session`` module globals.  That allowed the outer loop to
+    dispose a pool owned by the worker loop, producing cross-loop asyncpg
+    errors during shutdown.  A short-lived child process keeps engine and loop
+    ownership unambiguous while preserving the structured result contract.
+    """
+
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "train_local_ai_tools_models.py"),
+        "--training-mode",
+        "shadow",
+    ]
     try:
-        with contextlib.redirect_stdout(captured):
-            try:
-                runpy.run_path(
-                    str(ROOT / "scripts" / "train_local_ai_tools_models.py"),
-                    run_name="__main__",
-                )
-            except SystemExit as exc:
-                if isinstance(exc.code, int) and exc.code == 0:
-                    pass
-                elif exc.code not in (None, 0):
-                    output = captured.getvalue()
-                    parsed = _result_from_output(output)
-                    if parsed.get("reason") == "error":
-                        parsed["error"] = parsed.get("error") or (
-                            f"trainer exited with code {exc.code}"
-                        )
-                    return parsed
-    except BaseException as exc:  # pragma: no cover - defensive process boundary
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=TRAINING_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
         return {
             "trained": False,
             "reason": "error",
-            "error": safe_error_text(exc, limit=500),
+            "error": "local AI tools trainer timed out",
         }
-    finally:
-        sys.argv = previous_argv
-    return _result_from_output(captured.getvalue())
+    output = "\n".join(
+        part for part in (completed.stdout, completed.stderr) if part
+    )
+    parsed = _result_from_output(output)
+    if completed.returncode != 0 and parsed.get("reason") not in {
+        "okx_training_gate_blocked",
+        "local_ai_tools_training_already_running",
+    }:
+        parsed["trained"] = False
+        parsed["reason"] = "error"
+        parsed["error"] = parsed.get("error") or (
+            f"trainer exited with code {completed.returncode}"
+        )
+    return parsed
 
 
 async def run_once() -> dict[str, Any]:
