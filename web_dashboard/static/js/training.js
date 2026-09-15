@@ -67,6 +67,9 @@
     training: '训练中', promotion_blocked: '晋升阻断', shadow_evaluating: '影子评估', diagnostic_timeout: '诊断查询超时',
     inference_only: '仅推理', not_trained: '未训练', not_evaluated: '未评估',
     service_unavailable: '服务不可用', unavailable: '不可用', running: '运行中',
+    diagnostic_warming: '状态刷新中', optional_disabled: '可选本地增强未部署',
+    optional_blocked: '本地模型已配置，预检未通过', cloud_unconfigured: '云端未配置',
+    cloud_configured_unverified: '云端已配置，连接未验证',
     warning: '需要关注', error: '运行异常', ok: '正常',
   });
   const taskText = Object.freeze({
@@ -360,7 +363,11 @@
     const policy = ml.auto_train_last_result?.training_policy || {};
     const values = [
       ['治理状态', governance.status === 'ok' ? '治理快照正常' : localizedReason(governance.status || 'unavailable')],
-      ['数据质量版本', quality.data_quality_version || '未提供'],
+      ['质量契约版本', quality.data_quality_version || quality.version || '未提供'],
+      ['最近成功训练数据版本', localTools.latest_training_data_quality_version || localTools.latest_training?.data_quality_version || '未提供'],
+      ['最近成功训练产物', localTools.latest_training_artifact_version || localTools.latest_training?.artifact_version || '未提供'],
+      ['报告生成时间', time(quality.generated_at || governance.generated_at || localTools.trained_at)],
+      ['数据截止时间', time(quality.data_cutoff_at || quality.latest_sample_at || governance.data_cutoff_at || ml.trained_at)],
       ['全部 / 纳入 / 隔离', `${fmt(totals.total)} / ${fmt(totals.included)} / ${fmt(totals.excluded)}`],
       ['影子样本 / 真实成交样本', `${fmt(shadow.total)} / ${fmt(trade.total)}`],
       ['有效训练权重', ratio(totals.effective_weight_ratio)],
@@ -488,8 +495,18 @@
         ? '模拟盘正常参与；实盘逐笔门禁'
         : model.trainable ? '模拟盘正常参与；实盘未授权' : '仅推理或评估';
       const localizedModel = modelText[model.model_id] || [];
+      const route = model.execution_plane === 'cloud'
+        ? '云端低频'
+        : model.availability_scope === 'optional_enhancement'
+          ? '本地可选增强'
+          : '本地核心';
+      const configuration = model.configuration_mode === 'admin_settings'
+        ? '管理端可编辑'
+        : model.configuration_mode === 'managed_local_model_server'
+          ? '本地模型服务器自动托管'
+          : '系统托管';
       return `<tr>
-        <td><span class="model-name">${esc(localizedModel[0] || model.display_name || model.model_id || '未命名模型')}</span><span class="model-role">${esc(localizedModel[1] || '模型类型未登记')}</span></td>
+        <td><span class="model-name">${esc(localizedModel[0] || model.display_name || model.model_id || '未命名模型')}</span><span class="model-role">${esc(localizedModel[1] || '模型类型未登记')} · ${esc(route)} · ${esc(configuration)}</span></td>
         <td>${esc(lifecycleText[model.lifecycle] || model.lifecycle || '未提供')}</td>
         <td>${esc(taskText[model.task] || model.task || taskText[model.runtime_role] || model.runtime_role || '未提供')}</td>
         <td>${esc(modelSampleText(model))}</td><td>${esc(modelFeeAfter(model, ml))}</td><td>${esc(modelProfitFactor(model, ml))}</td>

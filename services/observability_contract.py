@@ -20,6 +20,11 @@ OBSERVABILITY_STATUSES = {
     "deferred",
     "blocked",
     "warning",
+    "degraded",
+    "canary",
+    "status_stale",
+    "status_error",
+    "status_timeout",
     "passed",
     "observing",
     "not_started",
@@ -137,10 +142,14 @@ def status_from_sections(sections: Mapping[str, Any]) -> tuple[str, list[str]]:
         return "ok", degraded
     if any(state in {"error", "timeout"} for state in statuses):
         return "partial" if any(state == "ok" for state in statuses) else "error", degraded
+    if any(state in {"status_error", "status_timeout"} for state in statuses):
+        return "partial" if any(state == "ok" for state in statuses) else "error", degraded
     if any(state == "deferred" for state in statuses):
         return "partial" if any(state == "ok" for state in statuses) else "deferred", degraded
     if any(state == "blocked" for state in statuses):
         return "partial" if any(state == "ok" for state in statuses) else "blocked", degraded
+    if any(state in {"degraded", "warning", "partial", "canary"} for state in statuses):
+        return "partial", degraded
     if any(state == "stale" for state in statuses):
         return "stale", degraded
     if any(state == "warming" for state in statuses):

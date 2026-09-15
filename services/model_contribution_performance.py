@@ -236,7 +236,10 @@ class ModelContributionPerformanceService:
                             Order.execution_mode == selected_mode,
                             Order.status == "filled",
                             Order.symbol.in_(symbol_variants),
-                            Order.exchange_order_id.like("manual_close:%"),
+                            or_(
+                                Order.exchange_order_id.like("manual_close:%"),
+                                Order.decision_id.is_(None),
+                            ),
                             or_(
                                 Order.filled_at.between(close_window_start, close_window_end),
                                 and_(

@@ -17,6 +17,7 @@ from services.high_risk_review_service import (
     HighRiskReviewGatewayError,
     HighRiskReviewService,
 )
+from web_dashboard.api import settings_api
 
 
 @pytest.fixture
@@ -67,7 +68,6 @@ def _paper_quality_observation_decision() -> DecisionOutput:
         ("http://127.0.0.1:18002/v1", "review-model", "2026-08-01", "key", "cloud_reviewer_requires_https_without_credentials"),
         ("https://127.0.0.1:18002/v1", "review-model", "2026-08-01", "key", "cloud_reviewer_must_not_use_loopback"),
         ("https://review.example", "deepseek-r1-14b-risk", "2026-08-01", "key", "retired_local_reviewer_model"),
-        ("https://review.example", "review-model", "", "key", "cloud_reviewer_identity_incomplete"),
         ("https://review.example", "review-model", "unknown", "key", "cloud_reviewer_identity_placeholder"),
     ],
 )
@@ -92,6 +92,102 @@ def test_cloud_reviewer_route_accepts_verified_public_https_identity() -> None:
     )
     assert valid is True
     assert reason == ""
+
+
+def test_cloud_reviewer_route_accepts_provider_managed_revision() -> None:
+    valid, reason = validate_cloud_reviewer_route(
+        "https://review.example/v1",
+        "provider-risk-review-v2",
+        "",
+        "review-key",
+    )
+    assert valid is True
+    assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_cloud_reviewer_connection_verifies_chat_when_revision_is_provider_managed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            requests.append(("GET", url))
+            return httpx.Response(200, json={"data": [{"id": "provider-risk-review-v2"}]})
+
+        async def post(self, url: str, **_kwargs: Any) -> httpx.Response:
+            requests.append(("POST", url))
+            return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    monkeypatch.setattr(settings_api.httpx, "AsyncClient", FakeClient)
+
+    result = await settings_api.test_high_risk_review_connection(
+        settings_api.CloudReviewerTestRequest(
+            api_base="https://review.example/v1",
+            api_key="review-key",
+            model="provider-risk-review-v2",
+            revision="",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["effective_revision"] == "provider-managed"
+    assert requests == [
+        ("GET", "https://review.example/v1/models"),
+        ("POST", "https://review.example/v1/chat/completions"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cloud_reviewer_connection_uses_chat_when_model_catalog_is_restricted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_headers: dict[str, str] = {}
+
+    class FakeClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def get(self, _url: str, **_kwargs: Any) -> httpx.Response:
+            return httpx.Response(401, json={"error": "catalog restricted"})
+
+        async def post(self, _url: str, **kwargs: Any) -> httpx.Response:
+            captured_headers.update(kwargs.get("headers") or {})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    monkeypatch.setattr(settings_api.httpx, "AsyncClient", FakeClient)
+
+    result = await settings_api.test_high_risk_review_connection(
+        settings_api.CloudReviewerTestRequest(
+            api_base="https://review.example/v1",
+            api_key="review-key",
+            model="provider-risk-review-v2",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["identity_source"] == "chat_probe"
+    assert captured_headers == {
+        "Authorization": "Bearer review-key",
+        "X-API-Key": "review-key",
+        "api-key": "review-key",
+    }
 
 
 class CapturingReviewer(HighRiskReviewService):

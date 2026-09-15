@@ -30,6 +30,17 @@ from services.execution_reason_localizer import localize_execution_reason
 logger = structlog.get_logger(__name__)
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
+
+
+def cloud_reviewer_auth_headers(api_key: str) -> dict[str, str]:
+    """Return the common OpenAI-compatible authentication header set."""
+
+    key = str(api_key or "").strip()
+    return {
+        "Authorization": f"Bearer {key}",
+        "X-API-Key": key,
+        "api-key": key,
+    }
 _ERROR_EXCERPT_LIMIT = 700
 
 
@@ -313,7 +324,7 @@ class HighRiskReviewService:
             async with httpx.AsyncClient(timeout=request_timeout) as client:
                 response = await client.post(
                     f"{api_base}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
+                    headers=cloud_reviewer_auth_headers(api_key),
                     json=request_body,
                 )
         except httpx.TimeoutException as exc:

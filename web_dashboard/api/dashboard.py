@@ -162,14 +162,18 @@ _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT = 1_000
 _DASHBOARD_OPENING_FUNNEL_MAX_ROWS = 50
 _DASHBOARD_OPENING_FUNNEL_CACHE_TTL_SECONDS = 30.0
 _DASHBOARD_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 1.0
-_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 18.0
+_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 8.0
 _DASHBOARD_LOCAL_AI_STATUS_STALE_MAX_AGE_SECONDS = 15 * 60.0
-_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
+_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 1.0
 _DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS = 1.5
 _DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS = 120.0
 _DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_MODEL_CONTRIBUTION_STATS_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_HEAVY_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS = 20.0
+_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS = 15 * 60.0
+_DASHBOARD_EXPERT_MEMORY_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_EXPERT_MEMORY_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
 _DASHBOARD_PENDING_LEDGER_CACHE_TTL_SECONDS = 15.0
@@ -274,6 +278,131 @@ def _bounded_dashboard_payload(
     return value
 
 
+def _compact_training_scheduler_state(value: Any) -> dict[str, Any]:
+    """Keep scheduler diagnostics small enough for browser/API polling.
+
+    The persisted state deliberately retains complete governance reports for
+    audits. Dashboard responses only need lifecycle counters, timestamps and
+    a short recent history; sending full fold/LOSO reports made cold registry
+    refreshes spend seconds serializing megabytes of JSON.
+    """
+
+    source = value if isinstance(value, dict) else {}
+    result = {
+        key: source[key]
+        for key in (
+            "version",
+            "status",
+            "state_file_available",
+            "updated_at",
+            "stale_scheduler_ids",
+            "superseded_scheduler_ids",
+            "heartbeat_stale",
+            "timed_out_model_ids",
+            "training_timeout_exceeded",
+            "failed_model_ids",
+            "interrupted_model_ids",
+            "unhealthy_model_ids",
+            "model_state_counts",
+            "model_state_healthy",
+        )
+        if key in source
+    }
+
+    schedulers = source.get("schedulers")
+    if isinstance(schedulers, dict):
+        result["schedulers"] = {
+            str(scheduler_id): _bounded_dashboard_payload(
+                row,
+                max_depth=2,
+                max_items=24,
+                max_text=240,
+            )
+            for scheduler_id, row in schedulers.items()
+            if isinstance(row, dict)
+        }
+
+    models = source.get("models")
+    if isinstance(models, dict):
+        compact_models: dict[str, Any] = {}
+        for model_id, row in models.items():
+            if not isinstance(row, dict):
+                continue
+            compact = {
+                key: row[key]
+                for key in (
+                    "model_id",
+                    "state",
+                    "scheduler_id",
+                    "scheduler_heartbeat_id",
+                    "scheduler_heartbeat_at",
+                    "last_check_at",
+                    "last_started_at",
+                    "last_finished_at",
+                    "last_successful_training_at",
+                    "next_check_at",
+                    "last_error",
+                    "error",
+                    "reason",
+                    "trigger_reason",
+                    "last_force",
+                    "active_run_id",
+                    "active_sample_cursor",
+                    "sample_cursor",
+                    "retry_count",
+                    "resource_failure_count",
+                    "resource_error_class",
+                    "running_age_seconds",
+                    "training_timeout_exceeded",
+                )
+                if key in row
+            }
+            if isinstance(row.get("last_result"), dict):
+                compact["last_result"] = _bounded_dashboard_payload(
+                    row["last_result"], max_depth=3, max_items=28, max_text=320
+                )
+            history = row.get("history")
+            if isinstance(history, list):
+                compact["history"] = _bounded_dashboard_payload(
+                    history[-8:], max_depth=2, max_items=16, max_text=240
+                )
+            compact_models[str(model_id)] = compact
+        result["models"] = compact_models
+    return result
+
+
+def _compact_local_ai_tools_status_for_dashboard(value: Any) -> dict[str, Any]:
+    """Trim large evaluation manifests while preserving model card fields."""
+
+    status = dict(value) if isinstance(value, dict) else {}
+    for key in (
+        "quality_report",
+        "governance_report",
+        "promotion_recommendation",
+        "return_objective_report",
+        "authoritative_trade_return_evidence",
+        "walk_forward_report",
+        "leave_one_symbol_out_report",
+        "oos_return_evaluation",
+        "execution_cost_holdout_report",
+        "profit_supervision_report",
+        "training_transport_report",
+    ):
+        if isinstance(status.get(key), dict):
+            status[key] = _bounded_dashboard_payload(
+                status[key], max_depth=4, max_items=28, max_text=420
+            )
+    if isinstance(status.get("health"), dict):
+        status["health"] = _bounded_dashboard_payload(
+            status["health"], max_depth=3, max_items=24, max_text=320
+        )
+    if isinstance(status.get("models"), dict):
+        status["models"] = _bounded_dashboard_payload(
+            status["models"], max_depth=3, max_items=24, max_text=320
+        )
+    return status
+
+
 def _compact_ml_status_for_dashboard(status: dict[str, Any]) -> dict[str, Any]:
     """Keep the ML page useful without shipping full evaluation manifests.
 
@@ -345,16 +474,30 @@ def _compact_ml_status_for_dashboard(status: dict[str, Any]) -> dict[str, Any]:
                     )
                     if key in row
                 }
-                | ({"rejection_manifest": compact_manifest(row.get("rejection_manifest"))} if isinstance(row.get("rejection_manifest"), dict) else {})
-                | ({"manifest": compact_manifest(row.get("manifest"))} if isinstance(row.get("manifest"), dict) else {})
-                | ({"activation_manifest": compact_manifest(row.get("activation_manifest"))} if isinstance(row.get("activation_manifest"), dict) else {})
+                | (
+                    {"rejection_manifest": compact_manifest(row.get("rejection_manifest"))}
+                    if isinstance(row.get("rejection_manifest"), dict)
+                    else {}
+                )
+                | (
+                    {"manifest": compact_manifest(row.get("manifest"))}
+                    if isinstance(row.get("manifest"), dict)
+                    else {}
+                )
+                | (
+                    {"activation_manifest": compact_manifest(row.get("activation_manifest"))}
+                    if isinstance(row.get("activation_manifest"), dict)
+                    else {}
+                )
                 for role, row in pointers.items()
                 if isinstance(row, dict)
             }
         if isinstance(registry.get("manifest"), dict):
             compact_registry["manifest"] = compact_manifest(registry["manifest"])
         if isinstance(registry.get("activation_manifest"), dict):
-            compact_registry["activation_manifest"] = compact_manifest(registry["activation_manifest"])
+            compact_registry["activation_manifest"] = compact_manifest(
+                registry["activation_manifest"]
+            )
         payload["artifact_registry"] = compact_registry
 
     for key in (
@@ -400,9 +543,7 @@ def _dashboard_heavy_cache_set(key: tuple[Any, ...], payload: Any) -> Any:
     return payload
 
 
-def _dashboard_heavy_cache_peek(
-    key: tuple[Any, ...], *, max_age_seconds: float
-) -> Any | None:
+def _dashboard_heavy_cache_peek(key: tuple[Any, ...], *, max_age_seconds: float) -> Any | None:
     """Return a bounded-age cached value without evicting it as stale."""
 
     cached = _dashboard_heavy_cache.get(key)
@@ -426,7 +567,10 @@ def _load_strategy_learning_snapshot(*, mode: str, detail: str) -> dict[str, Any
         envelope = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
-    if not isinstance(envelope, dict) or envelope.get("version") != _STRATEGY_LEARNING_SNAPSHOT_VERSION:
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("version") != _STRATEGY_LEARNING_SNAPSHOT_VERSION
+    ):
         return None
     payload = envelope.get("payload")
     saved_at = envelope.get("saved_at")
@@ -752,7 +896,11 @@ async def _refresh_dashboard_okx_balance_cache(selected_mode: str) -> None:
         if cached and (now - cached[0]).total_seconds() <= _DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS:
             return
         cached_error = _dashboard_okx_balance_error_cache.get(selected_mode)
-        if cached_error and (now - cached_error[0]).total_seconds() <= _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS:
+        if (
+            cached_error
+            and (now - cached_error[0]).total_seconds()
+            <= _DASHBOARD_OKX_BALANCE_ERROR_CACHE_TTL_SECONDS
+        ):
             return
         snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(selected_mode)
         if snapshot:
@@ -2078,6 +2226,7 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                         Position.is_open,
                         Position.closed_at,
                         Position.settlement_status,
+                        Position.settlement_source,
                         Position.settlement_raw,
                         Position.entry_exchange_order_id,
                         Position.close_exchange_order_id,
@@ -2444,7 +2593,9 @@ def _build_execution_account_status(
         )
         pause_reason = entry_pause_reason or market_analysis_pause_reason
     if mode_manager.is_paused and not entry_pause_reason:
-        entry_pause_reason = "当前执行账户已暂停投资：停止新开仓和新订单提交，已有仓位继续复盘直到触发正常平仓。"
+        entry_pause_reason = (
+            "当前执行账户已暂停投资：停止新开仓和新订单提交，已有仓位继续复盘直到触发正常平仓。"
+        )
         pause_reason = pause_reason or entry_pause_reason
     pause_reason = _translate_pause_reason(pause_reason)
     entry_pause_reason = _translate_pause_reason(entry_pause_reason)
@@ -3538,9 +3689,7 @@ async def _dashboard_open_position_evidence_bounded(
     mode: str | None,
 ) -> tuple[Any, Any]:
     operations = {
-        "risk": asyncio.create_task(
-            _dashboard_open_position_risk_evidence(positions, mode=mode)
-        ),
+        "risk": asyncio.create_task(_dashboard_open_position_risk_evidence(positions, mode=mode)),
         "protection": asyncio.create_task(
             _dashboard_open_position_protection_evidence(positions, mode=mode)
         ),
@@ -3645,8 +3794,7 @@ async def _build_dashboard_open_position_evidence_snapshot(
             }
     if isinstance(protection_result, BaseException):
         blocker = (
-            "okx_protection_evidence_unavailable:"
-            f"{safe_error_text(protection_result, limit=120)}"
+            f"okx_protection_evidence_unavailable:{safe_error_text(protection_result, limit=120)}"
         )
         for item in enriched:
             item["protection_contract"] = {
@@ -3727,9 +3875,7 @@ async def _get_dashboard_open_position_evidence_snapshot(
         if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_CACHE_TTL_SECONDS:
             return copy.deepcopy(cached_positions), copy.deepcopy(cached_inventory)
         if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_STALE_TTL_SECONDS:
-            _start_dashboard_open_position_evidence_refresh(
-                cache_key, positions, mode=mode
-            )
+            _start_dashboard_open_position_evidence_refresh(cache_key, positions, mode=mode)
             stale_positions = copy.deepcopy(cached_positions)
             for item in stale_positions:
                 item["evidence_stale"] = True
@@ -3740,9 +3886,7 @@ async def _get_dashboard_open_position_evidence_snapshot(
                 stale_inventory["refresh_in_background"] = True
             return stale_positions, stale_inventory
 
-    task = _start_dashboard_open_position_evidence_refresh(
-        cache_key, positions, mode=mode
-    )
+    task = _start_dashboard_open_position_evidence_refresh(cache_key, positions, mode=mode)
     done, _pending = await asyncio.wait(
         {task},
         timeout=max(_DASHBOARD_OPEN_POSITION_EVIDENCE_INITIAL_WAIT_SECONDS, 0.01),
@@ -4858,9 +5002,7 @@ async def _dashboard_pending_closed_position_rows_uncached(
     pending_positions = [
         position
         for position in pending_positions
-        if _dashboard_split_exchange_order_ids(
-            getattr(position, "close_exchange_order_id", None)
-        )
+        if _dashboard_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None))
         & confirmed_order_ids
     ]
     if not pending_positions:
@@ -7125,9 +7267,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             # ``refresh_pending`` here used to skip the real read entirely,
             # leaving the dashboard without an authoritative balance until a
             # later background poll happened to succeed.
-            snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(
-                selected_mode
-            )
+            snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(selected_mode)
             _dashboard_okx_balance_cache[selected_mode] = (
                 datetime.now(UTC),
                 copy.deepcopy(snapshot),
@@ -7648,10 +7788,13 @@ def _apply_open_position_ticker_overrides(
         symbol = _normalize_dashboard_symbol(str(position.get("symbol") or ""))
         override = ticker_overrides.get(symbol) if symbol else None
         if isinstance(override, dict):
-            position["change_24h"] = _ticker_change_24h(
-                override,
-                _safe_float(position.get("change_24h"), 0.0),
-            ) or 0.0
+            position["change_24h"] = (
+                _ticker_change_24h(
+                    override,
+                    _safe_float(position.get("change_24h"), 0.0),
+                )
+                or 0.0
+            )
     return adjusted
 
 
@@ -7983,7 +8126,13 @@ async def _build_ml_signal_status() -> dict[str, Any]:
     if not ml_signal_service:
         return {"available": False, "status": "service_not_ready"}
     try:
-        status = ml_signal_service.status()
+        # Dashboard diagnostics must not deserialize the full sklearn bundle.
+        # The metadata reader validates the active pointer and manifests while
+        # keeping request latency independent from model size.
+        status_reader = getattr(ml_signal_service, "status_metadata", None)
+        if not callable(status_reader):
+            status_reader = ml_signal_service.status
+        status = await asyncio.to_thread(status_reader)
     except Exception as exc:
         _log_dashboard_fallback("ml signal status fallback", exc)
         return {
@@ -8057,7 +8206,7 @@ async def _build_ml_signal_status() -> dict[str, Any]:
             f"current_training_epoch_shadow_count_unavailable:{safe_error_text(exc, limit=120)}"
         )
 
-    return _compact_ml_status_for_dashboard(status)
+    return await asyncio.to_thread(_compact_ml_status_for_dashboard, status)
 
 
 def _ml_signal_status_cache_key() -> tuple[Any, ...]:
@@ -8250,7 +8399,7 @@ async def get_local_ai_tools_status():
             )
         except Exception as exc:
             _log_dashboard_fallback("local ai tools training cursor fallback", exc)
-        scheduler_state = MODEL_TRAINING_STATE_STORE.read()
+        scheduler_state = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
         scheduler_models = (
             scheduler_state.get("models") if isinstance(scheduler_state.get("models"), dict) else {}
         )
@@ -8258,7 +8407,58 @@ async def get_local_ai_tools_status():
         status["auto_train_persistent_models"] = {
             model_id: scheduler_models.get(model_id, {}) for model_id in LOCAL_AI_TOOL_MODEL_IDS
         }
-    return status
+        # Keep the active Champion immutable while making successful newer
+        # training visible. A candidate can be newer yet remain blocked by
+        # return-quality governance; hiding it made the UI look untrained.
+        training_rows = [
+            row
+            for row in scheduler_models.values()
+            if isinstance(row, dict) and row.get("last_successful_training_at")
+        ]
+        training_rows.sort(
+            key=lambda row: str(row.get("last_successful_training_at") or ""),
+            reverse=True,
+        )
+        latest_row = training_rows[0] if training_rows else None
+        latest_result = latest_row.get("last_result") if isinstance(latest_row, dict) else {}
+        latest_result = latest_result if isinstance(latest_result, dict) else {}
+        latest_governance = latest_result.get("governance_report")
+        latest_governance = latest_governance if isinstance(latest_governance, dict) else {}
+        latest_quality = latest_result.get("quality_report")
+        latest_quality = latest_quality if isinstance(latest_quality, dict) else {}
+        latest_quality_version = (
+            latest_governance.get("data_quality_version")
+            or latest_quality.get("data_quality_version")
+            or latest_result.get("data_quality_version")
+        )
+        artifact_pointers = status.get("artifact_pointers")
+        artifact_pointers = artifact_pointers if isinstance(artifact_pointers, dict) else {}
+        challenger_pointer = artifact_pointers.get("challenger")
+        challenger_pointer = challenger_pointer if isinstance(challenger_pointer, dict) else {}
+        latest_artifact_version = (
+            challenger_pointer.get("version")
+            if challenger_pointer.get("available") is True
+            else None
+        ) or latest_result.get("artifact_version") or None
+        status["latest_training"] = {
+            "state": latest_row.get("state") if latest_row else None,
+            "trained_at": latest_row.get("last_successful_training_at") if latest_row else None,
+            "artifact_version": latest_artifact_version,
+            "data_quality_version": latest_quality_version,
+            "training_mode": latest_result.get("training_mode") or "walk_forward",
+            "promotion_blocked": bool(
+                latest_result.get("promotion_ready") is False
+                or latest_result.get("live_ml_ready") is False
+                or latest_governance.get("blocked_reason_count")
+            ),
+            "sample_cursor": latest_row.get("sample_cursor") if latest_row else None,
+        }
+        status["latest_training_data_quality_version"] = latest_quality_version
+        status["latest_training_artifact_version"] = latest_artifact_version
+        status["latest_training_at"] = (
+            latest_row.get("last_successful_training_at") if latest_row else None
+        )
+    return _compact_local_ai_tools_status_for_dashboard(status)
 
 
 async def _build_authoritative_profit_observability(
@@ -8310,10 +8510,10 @@ async def _build_authoritative_profit_observability(
             row.get("execution_slippage_usdt", row.get("slippage_cost_usdt")), None
         )
         funding = _safe_float(row.get("funding_fee_usdt", row.get("funding_fee")), None)
-        penalty = _safe_float(row.get("liquidation_penalty_usdt", row.get("liquidation_penalty")), 0.0)
-        realized = _safe_float(
-            row.get("realized_net_pnl_usdt", row.get("realized_pnl")), None
+        penalty = _safe_float(
+            row.get("liquidation_penalty_usdt", row.get("liquidation_penalty")), 0.0
         )
+        realized = _safe_float(row.get("realized_net_pnl_usdt", row.get("realized_pnl")), None)
         if gross is not None:
             totals["gross_pnl"] += gross
         if entry_fee is not None:
@@ -8329,13 +8529,13 @@ async def _build_authoritative_profit_observability(
         if realized is not None:
             totals["realized_net_pnl"] += realized
         if None not in (gross, entry_fee, close_fee, slippage, funding, penalty, realized):
-            totals["fee_after_net_pnl"] += gross - entry_fee - close_fee - slippage + funding - penalty
+            totals["fee_after_net_pnl"] += (
+                gross - entry_fee - close_fee - slippage + funding - penalty
+            )
         components = row.get("realized_net_pnl_components")
         if isinstance(components, dict):
             expected = _safe_float(components.get("components_total_usdt"), None)
-            reported = _safe_float(
-                components.get("reported_realized_net_pnl_usdt", realized), None
-            )
+            reported = _safe_float(components.get("reported_realized_net_pnl_usdt", realized), None)
             if expected is not None and reported is not None:
                 equation_observed_count += 1
                 if not math.isclose(expected, reported, rel_tol=1e-5, abs_tol=1e-5):
@@ -8351,15 +8551,11 @@ async def _build_authoritative_profit_observability(
         "formula": "realized_net_pnl = gross_pnl - fee - slippage + funding_fee - liquidation_penalty",
         "totals": {key: round(value, 8) for key, value in totals.items()},
         "shadow_excluded": True,
-        "degraded_reason": (
-            "authoritative_outcome_not_found" if not outcomes else None
-        ),
+        "degraded_reason": ("authoritative_outcome_not_found" if not outcomes else None),
     }
 
 
-async def _build_expert_memory_observability(
-    *, mode: str | None = None
-) -> dict[str, Any]:
+async def _build_expert_memory_observability(*, mode: str | None = None) -> dict[str, Any]:
     """Expose memory authority counts without treating pending rows as evidence."""
 
     try:
@@ -8384,14 +8580,16 @@ async def _build_expert_memory_observability(
         complete_outcomes = [
             outcome
             for outcome in outcomes
-            if outcome.get("outcome_complete") is True
-            and outcome.get("trade_fact_trusted") is True
+            if outcome.get("outcome_complete") is True and outcome.get("trade_fact_trusted") is True
         ]
         shadow_count = sum(
             len(outcome.get("counterfactual_evidence") or []) for outcome in outcomes
         )
         eligible_count = sum(
-            bool(outcome.get("outcome_complete") is True and outcome.get("trade_fact_trusted") is True)
+            bool(
+                outcome.get("outcome_complete") is True
+                and outcome.get("trade_fact_trusted") is True
+            )
             for outcome in outcomes
         )
         async with get_session_ctx() as session:
@@ -8399,20 +8597,12 @@ async def _build_expert_memory_observability(
             memory_count = await repo.count_memories()
             reflection_count = await repo.count_reflections()
             reflection_rows = list(
-                (
-                    await session.execute(
-                        select(TradeReflection.position_id).limit(5000)
-                    )
-                )
+                (await session.execute(select(TradeReflection.position_id).limit(5000)))
                 .scalars()
                 .all()
             )
             memory_extra_rows = list(
-                (
-                    await session.execute(select(ExpertMemory.extra).limit(5000))
-                )
-                .scalars()
-                .all()
+                (await session.execute(select(ExpertMemory.extra).limit(5000))).scalars().all()
             )
             authoritative_memory_count = sum(
                 isinstance(extra, dict) and bool(str(extra.get("outcome_id") or "").strip())
@@ -8497,7 +8687,8 @@ async def _latest_analysis_observability() -> dict[str, Any]:
                     "skipped_expert_count": int(counts.get("skipped") or 0),
                     "analysis_complete": quality.get("analysis_complete"),
                     "decision_eligible": quality.get("decision_eligible"),
-                    "reason_code": quality.get("reason_code") or ("expected_expert_count_zero" if expected == 0 else None),
+                    "reason_code": quality.get("reason_code")
+                    or ("expected_expert_count_zero" if expected == 0 else None),
                 }
     except Exception as exc:
         _log_dashboard_fallback("model observability analysis sample fallback", exc)
@@ -8520,7 +8711,11 @@ async def _build_model_observability_snapshot(
     async def bounded(builder: Callable[[], Awaitable[Any]], name: str) -> dict[str, Any]:
         try:
             value = await asyncio.wait_for(builder(), timeout=20.0)
-            return value if isinstance(value, dict) else {"status": "error", "degraded_reason": f"{name}_invalid"}
+            return (
+                value
+                if isinstance(value, dict)
+                else {"status": "error", "degraded_reason": f"{name}_invalid"}
+            )
         except TimeoutError:
             return {
                 "status": "timeout",
@@ -8533,24 +8728,122 @@ async def _build_model_observability_snapshot(
                 "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
             }
 
+    async def cached_section(
+        key: tuple[Any, ...],
+        builder: Callable[[], Awaitable[Any]],
+        name: str,
+        *,
+        ttl_seconds: float,
+        stale_ttl_seconds: float,
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        fresh = _dashboard_heavy_cache_get(key, ttl_seconds=ttl_seconds)
+        if isinstance(fresh, dict):
+            fresh.setdefault("cache", {"hit": True, "stale": False})
+            return fresh
+        try:
+            value = await asyncio.wait_for(builder(), timeout=timeout_seconds)
+            if isinstance(value, dict):
+                section_status = str(value.get("status") or "").strip().lower()
+                if section_status not in {
+                    "error",
+                    "status_error",
+                    "status_timeout",
+                    "timeout",
+                    "warming",
+                }:
+                    _dashboard_heavy_cache_set(key, value)
+                return value
+            return {"status": "error", "degraded_reason": f"{name}_invalid"}
+        except TimeoutError:
+            reason = f"{name}_timeout"
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} observability fallback", exc)
+            reason = f"{name}_error:{safe_error_text(exc, limit=120)}"
+        stale = _dashboard_heavy_cache_peek(key, max_age_seconds=stale_ttl_seconds)
+        if isinstance(stale, dict):
+            stale["status"] = "stale"
+            stale["stale"] = True
+            stale["stale_reason"] = reason
+            stale["degraded_reason"] = reason
+            stale["cache"] = {
+                "hit": True,
+                "stale": True,
+                "refresh_in_background": True,
+            }
+            return stale
+        return {"status": "timeout" if reason.endswith("_timeout") else "error", "degraded_reason": reason}
+
     async def trade_section() -> dict[str, Any]:
         if isinstance(trade_snapshot, dict):
             return copy.deepcopy(trade_snapshot)
-        return await bounded(_build_trade_observability_snapshot, "trade")
+        return await cached_section(
+            ("trade-observability",),
+            _build_trade_observability_snapshot,
+            "trade",
+            ttl_seconds=30.0,
+            stale_ttl_seconds=10 * 60.0,
+            timeout_seconds=15.0,
+        )
+
+    async def local_ml_section() -> dict[str, Any]:
+        return await cached_section(
+            ("model-observability-local-ml",),
+            get_ml_signal_status,
+            "local_ml",
+            ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS,
+            stale_ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS,
+            timeout_seconds=8.0,
+        )
+
+    async def local_tools_section() -> dict[str, Any]:
+        return await cached_section(
+            ("model-observability-local-ai-tools",),
+            get_local_ai_tools_status,
+            "local_ai_tools",
+            ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS,
+            stale_ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS,
+            # The remote status call is diagnostic and may include a large
+            # manifest. Keep it off the request path while allowing one
+            # bounded refresh to finish instead of falsely reporting timeout.
+            timeout_seconds=12.0,
+        )
+
+    async def analysis_section() -> dict[str, Any]:
+        return await cached_section(
+            ("model-observability-analysis",),
+            _latest_analysis_observability,
+            "analysis",
+            ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS,
+            stale_ttl_seconds=_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS,
+            timeout_seconds=8.0,
+        )
+
+    async def expert_memory_section() -> dict[str, Any]:
+        return await cached_section(
+            ("expert-memory-observability",),
+            _build_expert_memory_observability,
+            "expert_memory",
+            ttl_seconds=_DASHBOARD_EXPERT_MEMORY_CACHE_TTL_SECONDS,
+            stale_ttl_seconds=_DASHBOARD_EXPERT_MEMORY_STALE_TTL_SECONDS,
+            timeout_seconds=12.0,
+        )
 
     local_ml, local_tools, analysis, trade, expert_memory = await asyncio.gather(
-        bounded(get_ml_signal_status, "local_ml"),
-        bounded(get_local_ai_tools_status, "local_ai_tools"),
-        bounded(_latest_analysis_observability, "analysis"),
+        local_ml_section(),
+        local_tools_section(),
+        analysis_section(),
         trade_section(),
-        bounded(_build_expert_memory_observability, "expert_memory"),
+        expert_memory_section(),
     )
-    scheduler = MODEL_TRAINING_STATE_STORE.read()
+    scheduler = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
     specialist_report = load_model_training_report(
         "phase3/specialist_shadow_evaluation_latest.json"
     )
-    model_server_report = load_model_training_report(
-        "phase3_model_server_readiness_reports/latest.json"
+    from web_dashboard.api import model_training_status as model_training_status_api
+
+    model_server_report = (
+        model_training_status_api._model_server_report_with_runtime_configuration()
     )
     registry = build_model_training_registry(
         local_ml_status=local_ml,
@@ -8567,11 +8860,14 @@ async def _build_model_observability_snapshot(
         "expert_memory": expert_memory,
     }
     status, degraded_sections = status_from_sections(sections)
-    degraded_reason = ",".join(
-        str(sections[name].get("degraded_reason") or name)
-        for name in degraded_sections
-        if isinstance(sections.get(name), dict)
-    ) or None
+    degraded_reason = (
+        ",".join(
+            str(sections[name].get("degraded_reason") or name)
+            for name in degraded_sections
+            if isinstance(sections.get(name), dict)
+        )
+        or None
+    )
     return build_snapshot(
         {
             "sections": sections,
@@ -8649,12 +8945,19 @@ async def _build_trade_observability_snapshot() -> dict[str, Any]:
     ) -> dict[str, Any]:
         try:
             value = await asyncio.wait_for(factory(), timeout=timeout_seconds)
-            return value if isinstance(value, dict) else {"status": "error", "degraded_reason": f"{name}_invalid"}
+            return (
+                value
+                if isinstance(value, dict)
+                else {"status": "error", "degraded_reason": f"{name}_invalid"}
+            )
         except TimeoutError:
             return {"status": "timeout", "degraded_reason": f"{name}_timeout"}
         except Exception as exc:
             _log_dashboard_fallback(f"{name} trade observability fallback", exc)
-            return {"status": "error", "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}"}
+            return {
+                "status": "error",
+                "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
+            }
 
     async def contract_report() -> dict[str, Any]:
         from services.trade_execution_contract import TradeExecutionContractService
@@ -8685,19 +8988,32 @@ async def _build_trade_observability_snapshot() -> dict[str, Any]:
     )
 
     contract_summary = contract.get("summary") if isinstance(contract.get("summary"), dict) else {}
-    contract_available = contract.get("report_available", True) is not False and contract.get("status") not in {"timeout", "error"}
+    contract_available = contract.get("report_available", True) is not False and contract.get(
+        "status"
+    ) not in {"timeout", "error"}
     contract_violations = int(contract_summary.get("contract_violation_count") or 0)
-    fill_sync_pending = int(contract_summary.get("entry_authoritative_fill_sync_pending_count") or 0)
+    fill_sync_pending = int(
+        contract_summary.get("entry_authoritative_fill_sync_pending_count") or 0
+    )
     contract_state = (
-        "ok" if contract_available and contract_violations == 0 and fill_sync_pending == 0
-        else "partial" if contract_available else str(contract.get("status") or "error")
+        "ok"
+        if contract_available and contract_violations == 0 and fill_sync_pending == 0
+        else "partial"
+        if contract_available
+        else str(contract.get("status") or "error")
     )
 
     kind_counts = facts.get("kind_counts") if isinstance(facts.get("kind_counts"), dict) else {}
     unassigned_fill_count = sum(
         int(value or 0)
         for key, value in kind_counts.items()
-        if str(key) in {"order_position_missing", "position_order_link_missing_local_order", "position_missing_entry_order_link", "closed_position_missing_close_order_link"}
+        if str(key)
+        in {
+            "order_position_missing",
+            "position_order_link_missing_local_order",
+            "position_missing_entry_order_link",
+            "closed_position_missing_close_order_link",
+        }
     )
     duplicate_funding_count = sum(
         int(value or 0)
@@ -8715,14 +9031,22 @@ async def _build_trade_observability_snapshot() -> dict[str, Any]:
         else fact_raw_status
     )
 
-    protection_available = protection.get("available", True) is not False and protection.get("status") not in {"timeout", "error"}
+    protection_available = protection.get("available", True) is not False and protection.get(
+        "status"
+    ) not in {"timeout", "error"}
     protection_gaps = (
         len(protection.get("missing_keys") or [])
         + len(protection.get("orphan_keys") or [])
         + len(protection.get("coverage_mismatches") or [])
         + int(protection.get("invalid_order_count") or 0)
     )
-    protection_state = "ok" if protection_available and protection_gaps == 0 else "partial" if protection_available else str(protection.get("status") or "missing")
+    protection_state = (
+        "ok"
+        if protection_available and protection_gaps == 0
+        else "partial"
+        if protection_available
+        else str(protection.get("status") or "missing")
+    )
     sections = {
         "execution_contract": {"status": contract_state},
         "trade_facts": {"status": fact_state},
@@ -8739,7 +9063,9 @@ async def _build_trade_observability_snapshot() -> dict[str, Any]:
             "authoritative_fill_sync_pending_count": fill_sync_pending,
             "unassigned_fill_count": unassigned_fill_count,
             "duplicate_funding_attribution_count": duplicate_funding_count,
-            "funding_attribution_observed": any("funding" in str(key).lower() for key in kind_counts),
+            "funding_attribution_observed": any(
+                "funding" in str(key).lower() for key in kind_counts
+            ),
             "profit_attribution": attribution,
             "protection_gap_count": protection_gaps,
             "sections": {
@@ -8872,7 +9198,10 @@ async def get_model_observability_snapshot(request: Request = None) -> dict[str,
                 ttl_seconds=20.0,
             )
         )
-    cached = _dashboard_heavy_cache_get(key, ttl_seconds=20.0)
+    cached = _dashboard_heavy_cache_peek(
+        key,
+        max_age_seconds=_DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS,
+    )
     if cached is not None:
         cached["cache"] = {"hit": True, "refresh_in_background": False}
         return sanitize_payload(cached)
@@ -8880,6 +9209,20 @@ async def get_model_observability_snapshot(request: Request = None) -> dict[str,
         _model_observability_refresh_task = asyncio.create_task(
             _refresh_model_observability_cache()
         )
+    stale = _dashboard_heavy_cache_peek(
+        key,
+        max_age_seconds=_DASHBOARD_MODEL_OBSERVABILITY_STALE_TTL_SECONDS,
+    )
+    if isinstance(stale, dict):
+        stale["status"] = "stale"
+        stale["stale"] = True
+        stale["stale_reason"] = "refresh_in_background"
+        stale["cache"] = {
+            "hit": True,
+            "stale": True,
+            "refresh_in_background": True,
+        }
+        return sanitize_payload(stale)
     return sanitize_payload(_warming_model_observability_payload())
 
 
@@ -8920,7 +9263,11 @@ async def _continuous_observation_system_restart_count() -> int | None:
             return int(fallback.get("process_restart_count") or 0)
         if process.returncode != 0:
             return int(fallback.get("process_restart_count") or 0)
-        values = [int(line) for line in stdout.decode(errors="replace").splitlines() if line.strip().isdigit()]
+        values = [
+            int(line)
+            for line in stdout.decode(errors="replace").splitlines()
+            if line.strip().isdigit()
+        ]
         return sum(values) if len(values) == 3 else int(fallback.get("process_restart_count") or 0)
     except (FileNotFoundError, OSError, ValueError):
         return int(fallback.get("process_restart_count") or 0)
@@ -8983,9 +9330,7 @@ async def collect_continuous_observation_metrics() -> dict[str, Any]:
         except Exception as exc:
             return {"status": "error", "degraded_reason": f"{name}:{type(exc).__name__}"}
 
-    analysis_task = asyncio.create_task(
-        bounded(_continuous_analysis_metrics, "analysis_metrics")
-    )
+    analysis_task = asyncio.create_task(bounded(_continuous_analysis_metrics, "analysis_metrics"))
     trade = await bounded(
         lambda: _dashboard_heavy_cached(
             ("trade-observability",),
@@ -9036,7 +9381,9 @@ async def collect_continuous_observation_metrics() -> dict[str, Any]:
         and scheduler.get("heartbeat_stale") is not True
         and scheduler.get("training_timeout_exceeded") is not True
     )
-    attribution = trade.get("profit_attribution") if isinstance(trade.get("profit_attribution"), dict) else {}
+    attribution = (
+        trade.get("profit_attribution") if isinstance(trade.get("profit_attribution"), dict) else {}
+    )
     metrics: dict[str, Any] = {
         "service_restart_count": runtime_metrics,
         "dashboard_timeout_storm_count": timeout_count,
@@ -9072,8 +9419,7 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
     """Return the real elapsed 24/72-hour acceptance window state."""
 
     windows = {
-        str(hours): store.snapshot()
-        for hours, store in CONTINUOUS_OBSERVATION_STORES.items()
+        str(hours): store.snapshot() for hours, store in CONTINUOUS_OBSERVATION_STORES.items()
     }
     statuses = [snapshot.get("status") for snapshot in windows.values()]
     overall_status = (
@@ -9357,18 +9703,24 @@ async def get_positions(
             # settled history second.  Read only the closed page intersecting
             # the requested window; the total is returned separately by the
             # read model and is never used for an in-memory full-list slice.
-            closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
-                await _dashboard_closed_position_ledger_rows(
-                    session,
-                    repo,
-                    mode=mode,
-                    page=closed_page,
-                    page_size=ledger_page_size,
-                    paginate=True,
-                )
+            (
+                closed_rows,
+                closed_total,
+                _closed_page,
+                _closed_pages,
+                closed_ledger_source,
+            ) = await _dashboard_closed_position_ledger_rows(
+                session,
+                repo,
+                mode=mode,
+                page=closed_page,
+                page_size=ledger_page_size,
+                paginate=True,
             )
         display_total = open_count + closed_total
-        display_total_pages = max(1, (display_total + page_size - 1) // page_size) if display_total else 1
+        display_total_pages = (
+            max(1, (display_total + page_size - 1) // page_size) if display_total else 1
+        )
         page = min(requested_page, display_total_pages)
         if page != requested_page and end > open_count:
             # A request beyond the last page must be clamped before deriving
@@ -9380,23 +9732,29 @@ async def get_positions(
             closed_page = closed_offset // ledger_page_size + 1
             async with get_read_session_ctx() as session:
                 repo = TradeRepository(session)
-                closed_rows, closed_total, _closed_page, _closed_pages, closed_ledger_source = (
-                    await _dashboard_closed_position_ledger_rows(
-                        session,
-                        repo,
-                        mode=mode,
-                        page=closed_page,
-                        page_size=ledger_page_size,
-                        paginate=True,
-                    )
+                (
+                    closed_rows,
+                    closed_total,
+                    _closed_page,
+                    _closed_pages,
+                    closed_ledger_source,
+                ) = await _dashboard_closed_position_ledger_rows(
+                    session,
+                    repo,
+                    mode=mode,
+                    page=closed_page,
+                    page_size=ledger_page_size,
+                    paginate=True,
                 )
         start = (page - 1) * page_size
         end = start + page_size
-        open_slice = open_rows[start:min(end, open_count)]
+        open_slice = open_rows[start : min(end, open_count)]
         closed_slice: list[dict[str, Any]] = []
         if end > open_count:
             local_offset = closed_offset % ledger_page_size
-            closed_slice = closed_rows[local_offset:local_offset + max(page_size - len(open_slice), 0)]
+            closed_slice = closed_rows[
+                local_offset : local_offset + max(page_size - len(open_slice), 0)
+            ]
         combined_positions = [*open_slice, *closed_slice]
         return {
             "positions": combined_positions,
@@ -10486,10 +10844,7 @@ async def _build_opening_funnel_payload(
             .limit(capped_limit)
         )
         result = await session.execute(stmt)
-        rows = [
-            SimpleNamespace(**dict(row))
-            for row in result.mappings().all()
-        ]
+        rows = [SimpleNamespace(**dict(row)) for row in result.mappings().all()]
         decision_ids = [row.id for row in rows]
 
         order_map: dict[int, Order] = {}
@@ -11245,7 +11600,8 @@ async def get_analysis_records(
         record = {
             "id": str(d.id),
             "decision_id": d.id,
-            "round_id": raw.get("round_id") or _safe_dict(raw.get("analysis_quality_contract")).get("round_id"),
+            "round_id": raw.get("round_id")
+            or _safe_dict(raw.get("analysis_quality_contract")).get("round_id"),
             "analysis_type": d.analysis_type or analysis_type,
             "analysis_type_label": (
                 "持仓分析" if (d.analysis_type or analysis_type) == "position" else "市场分析"
@@ -12508,9 +12864,7 @@ def _trade_reflection_authority_status(
         if closed_at is not None
         else None
     )
-    if (
-        settlement_display["code"] == "identity_unresolved"
-    ):
+    if settlement_display["code"] == "identity_unresolved":
         return {
             "code": "authoritative_settlement_quarantined",
             "label": "权威结算身份未确认",
@@ -12610,9 +12964,13 @@ async def get_training_effectiveness_report(
             if report.get("status") in {"missing", "invalid"}:
                 report = failure
     refresh_state = "idle"
-    if refresh and report_id is None and (
-        report.get("status") in {"missing", "partial", "invalid", "generation_failed"}
-        or report.get("freshness", {}).get("is_stale") is True
+    if (
+        refresh
+        and report_id is None
+        and (
+            report.get("status") in {"missing", "partial", "invalid", "generation_failed"}
+            or report.get("freshness", {}).get("is_stale") is True
+        )
     ):
         global _training_effectiveness_generation_tasks
         task = _training_effectiveness_generation_tasks.get(selected_mode)
@@ -12677,7 +13035,9 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
             error_code="generation_timeout",
             stage="dashboard",
         )
-        failure_path = generation_failure_report_path(data_dir=settings.data_dir, mode=selected_mode)
+        failure_path = generation_failure_report_path(
+            data_dir=settings.data_dir, mode=selected_mode
+        )
         root = report_directory(settings.data_dir)
         root.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
@@ -12691,7 +13051,9 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
             error_code="generation_failed",
             stage="dashboard",
         )
-        failure_path = generation_failure_report_path(data_dir=settings.data_dir, mode=selected_mode)
+        failure_path = generation_failure_report_path(
+            data_dir=settings.data_dir, mode=selected_mode
+        )
         root = report_directory(settings.data_dir)
         root.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
@@ -12699,7 +13061,9 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
             handle.write("\n")
             temporary = Path(handle.name)
         await asyncio.to_thread(temporary.replace, failure_path)
-        logger.warning("training effectiveness report generation failed", error=safe_error_text(exc))
+        logger.warning(
+            "training effectiveness report generation failed", error=safe_error_text(exc)
+        )
 
 
 @router.get("/expert-memories")
@@ -12807,9 +13171,7 @@ async def get_expert_memories(
             "net_return_after_all_cost_pct": _safe_dict(m.extra).get(
                 "net_return_after_all_cost_pct"
             ),
-            "production_evidence_eligible": _safe_dict(m.extra).get(
-                "production_evidence_eligible"
-            ),
+            "production_evidence_eligible": _safe_dict(m.extra).get("production_evidence_eligible"),
             "hold_minutes": _safe_dict(m.extra).get("hold_minutes"),
         }
         for m in memories
@@ -12874,13 +13236,10 @@ async def get_expert_memories(
         item.get("outcome_complete") is True and item.get("trade_fact_trusted") is True
         for item in outcomes
     )
-    shadow_sample_count = sum(
-        len(item.get("counterfactual_evidence") or []) for item in outcomes
-    )
+    shadow_sample_count = sum(len(item.get("counterfactual_evidence") or []) for item in outcomes)
     production_evidence_eligible_count = complete_outcome_count
     orphan_reflection_count = sum(
-        int(row.position_id or 0) > 0
-        and int(row.position_id or 0) not in outcome_by_position_id
+        int(row.position_id or 0) > 0 and int(row.position_id or 0) not in outcome_by_position_id
         for row in reflections
     )
     return {
@@ -13180,7 +13539,9 @@ def _load_dashboard_daily_pnl_snapshot(
         payload = document.get("payload")
         if saved_at is None or not isinstance(payload, dict):
             return None
-        if (datetime.now(UTC) - saved_at).total_seconds() > _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS:
+        if (
+            datetime.now(UTC) - saved_at
+        ).total_seconds() > _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS:
             return None
         return saved_at, payload
     except (OSError, TypeError, ValueError, json.JSONDecodeError):

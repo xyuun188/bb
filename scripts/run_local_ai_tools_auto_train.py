@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one independent Local AI Tools shadow-training check.
+"""Run one independent governed Local AI Tools training refresh.
 
 This scheduler is deliberately separate from the trading process.  It always
 publishes a heartbeat, records an OKX training-gate block as a healthy skipped
@@ -86,7 +86,9 @@ def _run_shadow_trainer() -> dict[str, Any]:
         sys.executable,
         str(ROOT / "scripts" / "train_local_ai_tools_models.py"),
         "--training-mode",
-        "shadow",
+        "walk_forward",
+        "--persist-artifact",
+        "--confirm-phase3-rebuild",
     ]
     try:
         completed = subprocess.run(
@@ -140,7 +142,7 @@ async def run_once() -> dict[str, Any]:
                 "trained": False,
                 "reason": "okx_training_gate_blocked",
                 "training_gate": gate,
-                "training_mode": "shadow",
+                "training_mode": "walk_forward",
                 "live_routing_enabled": False,
             }
         else:
@@ -152,7 +154,7 @@ async def run_once() -> dict[str, Any]:
                 timeout_seconds=TRAINING_TIMEOUT_SECONDS,
             )
             result = await asyncio.to_thread(_run_shadow_trainer)
-            result.setdefault("training_mode", "shadow")
+            result.setdefault("training_mode", "walk_forward")
             result.setdefault("live_routing_enabled", False)
         STATE_STORE.finish_check(
             scheduler_id=SCHEDULER_ID,

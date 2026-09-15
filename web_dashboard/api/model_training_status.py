@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from fastapi import APIRouter
 from config.settings import settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import ModelTrainingStateStore
@@ -27,8 +29,13 @@ MODEL_TRAINING_STATE_STORE = ModelTrainingStateStore(
 )
 _REGISTRY_CACHE_TTL_SECONDS = 300.0
 _CONTRIBUTION_TIMEOUT_SECONDS = 4.0
+_FAST_LOCAL_STATUS_TIMEOUT_SECONDS = 9.0
+_FAST_OBSERVABILITY_TIMEOUT_SECONDS = 1.5
+_REGISTRY_SNAPSHOT_PATH = Path(settings.data_dir) / "model_training_registry_snapshot.json"
 _registry_cache: tuple[float, dict[str, Any]] | None = None
 _registry_refresh_task: asyncio.Task[Any] | None = None
+_registry_refresh_error: str | None = None
+_registry_last_success_at: str | None = None
 
 
 def load_model_training_report(relative_path: str) -> dict[str, Any]:
@@ -39,13 +46,90 @@ def load_model_training_report(relative_path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _cached_registry() -> dict[str, Any] | None:
+def _model_server_report_with_runtime_configuration() -> dict[str, Any]:
+    report = load_model_training_report(
+        "phase3_model_server_readiness_reports/latest.json"
+    )
+    cloud = report.get("cloud_reviewer")
+    cloud = dict(cloud) if isinstance(cloud, dict) else {}
+    valid, reason = validate_cloud_reviewer_route(
+        str(settings.high_risk_review_api_base or ""),
+        str(settings.high_risk_review_model or ""),
+        str(getattr(settings, "high_risk_review_model_revision", "") or ""),
+        str(settings.high_risk_review_api_key or ""),
+    )
+    cloud.update(
+        {
+            "configured": valid,
+            "enabled": bool(settings.high_risk_review_enabled),
+            "model": str(settings.high_risk_review_model or "") or None,
+            "revision": str(
+                getattr(settings, "high_risk_review_model_revision", "") or ""
+            )
+            or None,
+            "route_error": reason or None,
+        }
+    )
+    report["cloud_reviewer"] = cloud
+    return report
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _write_registry_snapshot(payload: dict[str, Any]) -> None:
+    try:
+        _REGISTRY_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _REGISTRY_SNAPSHOT_PATH.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(_REGISTRY_SNAPSHOT_PATH)
+    except OSError as exc:
+        logger.warning(
+            "model training registry snapshot write failed",
+            error=safe_error_text(exc, limit=180),
+        )
+
+
+def _load_registry_snapshot() -> dict[str, Any] | None:
+    try:
+        payload = json.loads(_REGISTRY_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) and payload.get("models") else None
+
+
+def _cached_registry(*, include_stale: bool = False) -> dict[str, Any] | None:
+    global _registry_cache, _registry_last_success_at
     if _registry_cache is None:
-        return None
+        persisted = _load_registry_snapshot()
+        if persisted is None:
+            return None
+        _registry_cache = (
+            time.monotonic() - _REGISTRY_CACHE_TTL_SECONDS - 1.0,
+            persisted,
+        )
+        _registry_last_success_at = str(
+            persisted.get("registry_snapshot_generated_at") or ""
+        ) or None
     stored_at, payload = _registry_cache
-    if time.monotonic() - stored_at > _REGISTRY_CACHE_TTL_SECONDS:
+    age_seconds = max(0.0, time.monotonic() - stored_at)
+    stale = age_seconds > _REGISTRY_CACHE_TTL_SECONDS
+    if stale and not include_stale:
         return None
-    return dict(payload)
+    result = dict(payload)
+    result["cache"] = {
+        "hit": True,
+        "stale": stale,
+        "age_seconds": round(age_seconds, 3),
+        "refresh_in_background": stale,
+        "last_success_at": _registry_last_success_at,
+        "refresh_error": _registry_refresh_error,
+    }
+    return result
 
 
 async def build_model_training_registry_status() -> dict[str, Any]:
@@ -80,16 +164,16 @@ async def build_model_training_registry_status() -> dict[str, Any]:
             }
         )
 
-    scheduler_state = MODEL_TRAINING_STATE_STORE.read()
+    from web_dashboard.api.dashboard import _compact_training_scheduler_state
+
+    scheduler_state = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
     registry = build_model_training_registry(
         local_ml_status=sections.get("local_ml") or {"status": "missing"},
         local_tools_status=sections.get("local_ai_tools") or {"status": "missing"},
         specialist_report=load_model_training_report(
             "phase3/specialist_shadow_evaluation_latest.json"
         ),
-        model_server_report=load_model_training_report(
-            "phase3_model_server_readiness_reports/latest.json"
-        ),
+        model_server_report=_model_server_report_with_runtime_configuration(),
         contribution_performance=contribution_performance,
         scheduler_state=scheduler_state,
     )
@@ -100,50 +184,128 @@ async def build_model_training_registry_status() -> dict[str, Any]:
 
 
 async def _refresh_registry_cache() -> None:
-    global _registry_cache, _registry_refresh_task
+    global _registry_cache, _registry_last_success_at, _registry_refresh_error, _registry_refresh_task
     try:
         payload = await build_model_training_registry_status()
+        _registry_last_success_at = _utc_now_iso()
+        _registry_refresh_error = None
+        payload["registry_snapshot_generated_at"] = _registry_last_success_at
         _registry_cache = (time.monotonic(), payload)
+        _write_registry_snapshot(payload)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        _registry_refresh_error = safe_error_text(exc, limit=240)
         logger.warning(
             "model training registry background refresh failed",
-            error=safe_error_text(exc, limit=240),
+            error=_registry_refresh_error,
         )
     finally:
         _registry_refresh_task = None
+
+
+async def _bounded_local_status(
+    factory: Any,
+    *,
+    name: str,
+    timeout_seconds: float = _FAST_LOCAL_STATUS_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    try:
+        payload = await asyncio.wait_for(
+            factory(),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        return {
+            "status": "status_timeout",
+            "degraded_reason": f"{name}_status_timeout",
+        }
+    except Exception as exc:
+        return {
+            "status": "status_error",
+            "degraded_reason": f"{name}_status_error",
+            "error": safe_error_text(exc, limit=180),
+        }
+    return payload if isinstance(payload, dict) else {"status": "status_error"}
+
+
+async def _fast_local_registry_status() -> dict[str, Any]:
+    """Build truthful local cards while the full observability report warms."""
+
+    from web_dashboard.api.dashboard import (
+        get_local_ai_tools_status,
+        get_ml_signal_status,
+        get_model_observability_snapshot,
+    )
+
+    local_ml, local_tools, observability = await asyncio.gather(
+        _bounded_local_status(get_ml_signal_status, name="local_ml"),
+        _bounded_local_status(get_local_ai_tools_status, name="local_ai_tools"),
+        _bounded_local_status(
+            lambda: get_model_observability_snapshot(request=object()),
+            name="model_observability",
+            timeout_seconds=_FAST_OBSERVABILITY_TIMEOUT_SECONDS,
+        ),
+    )
+    sections = observability.get("sections") if isinstance(observability, dict) else {}
+    sections = dict(sections) if isinstance(sections, dict) else {}
+    sections.update({"local_ml": local_ml, "local_ai_tools": local_tools})
+    observability = dict(observability) if isinstance(observability, dict) else {}
+    observability["sections"] = sections
+
+    from web_dashboard.api.dashboard import _compact_training_scheduler_state
+
+    scheduler_state = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
+    registry = build_model_training_registry(
+        local_ml_status=local_ml,
+        local_tools_status=local_tools,
+        specialist_report=load_model_training_report(
+            "phase3/specialist_shadow_evaluation_latest.json"
+        ),
+        model_server_report=_model_server_report_with_runtime_configuration(),
+        scheduler_state=scheduler_state,
+    )
+    registry["scheduler_state"] = scheduler_state
+    registry["model_observability"] = observability
+    registry["cache"] = {"hit": False, "refresh_in_background": True}
+    return registry
 
 
 @router.get("/model-training/registry")
 async def get_model_training_registry_status() -> dict[str, Any]:
     """Return the cached lifecycle view while a complete refresh runs."""
 
-    cached = _cached_registry()
+    global _registry_refresh_task
+    cached = _cached_registry(include_stale=True)
     if cached is not None:
+        if (
+            cached.get("cache", {}).get("stale")
+            and (_registry_refresh_task is None or _registry_refresh_task.done())
+        ):
+            _registry_refresh_task = asyncio.create_task(_refresh_registry_cache())
         return sanitize_payload(cached)
 
-    global _registry_refresh_task
     if _registry_refresh_task is None or _registry_refresh_task.done():
         _registry_refresh_task = asyncio.create_task(_refresh_registry_cache())
 
-    from web_dashboard.api.dashboard import get_model_observability_snapshot
-
-    observability = await get_model_observability_snapshot(request=object())
-    sections = observability.get("sections") if isinstance(observability, dict) else {}
-    sections = sections if isinstance(sections, dict) else {}
-    registry = build_model_training_registry(
-        local_ml_status=sections.get("local_ml") or {"status": "warming"},
-        local_tools_status=sections.get("local_ai_tools") or {"status": "warming"},
-    )
-    registry["model_observability"] = observability
-    registry["cache"] = {"hit": False, "refresh_in_background": True}
-    return sanitize_payload(registry)
+    fast = await _fast_local_registry_status()
+    fast["cache"] = {
+        "hit": False,
+        "stale": False,
+        "refresh_in_background": True,
+        "last_success_at": None,
+        "refresh_error": None,
+    }
+    return sanitize_payload(fast)
 
 
 @router.get("/model-training/scheduler")
 async def get_model_training_scheduler_status() -> dict[str, Any]:
-    return sanitize_payload(MODEL_TRAINING_STATE_STORE.read())
+    from web_dashboard.api.dashboard import _compact_training_scheduler_state
+
+    return sanitize_payload(
+        _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
+    )
 
 
 async def shutdown_model_training_status_tasks() -> None:

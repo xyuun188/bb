@@ -204,6 +204,7 @@ async def init_db(*, migrate_schema: bool = True) -> None:
     import models.runtime_config  # noqa: F401 - register runtime configuration snapshots
     import models.secure_config  # noqa: F401 - register encrypted config tables
     import models.trade  # noqa: F401 - register trade tables in metadata
+    import models.trading_control  # noqa: F401 - register cross-process operator commands
 
     engine = await get_engine()
     if not migrate_schema:

@@ -20,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -275,6 +277,10 @@ def _target_topology_from_environment() -> ModelTopology:
 
     manifest_path = str(os.environ.get("BB_TARGET_MODEL_MANIFEST") or "").strip()
     if not manifest_path:
+        default_manifest = PROJECT_ROOT / ".target_model_candidate.remote.json"
+        if default_manifest.is_file():
+            manifest_path = str(default_manifest)
+    if not manifest_path:
         return topology_for_profile(TARGET_SINGLE_MODEL_PROFILE)
     manifest = ModelCandidateManifest.load(manifest_path)
     topology = manifest.to_topology(stage="candidate_validated")
@@ -362,11 +368,6 @@ app_env_ai_route_keys = {{
     'AI_MODEL',
     'LOCAL_AI_TOOLS_ENABLED',
     'LOCAL_AI_TOOLS_API_BASE',
-    'HIGH_RISK_REVIEW_ENABLED',
-    'HIGH_RISK_REVIEW_API_BASE',
-    'HIGH_RISK_REVIEW_API_KEY',
-    'HIGH_RISK_REVIEW_MODEL',
-    'HIGH_RISK_REVIEW_MODEL_REVISION',
 }}
 app_env_ai_route_prefixes = (
     'MODEL_SERVER_',
@@ -456,18 +457,19 @@ for runtime_key in tuple(values):
         normalized_runtime_key.startswith('MODEL_SERVER_')
         or normalized_runtime_key.startswith('ONLINE_DECISION_MAKER_')
         or normalized_runtime_key.startswith('CLOUD_DECISION_MAKER_')
+        or normalized_runtime_key.startswith('ONLINE_HIGH_RISK_REVIEW_')
+        or normalized_runtime_key.startswith('CLOUD_HIGH_RISK_REVIEW_')
+        or normalized_runtime_key in {{
+            'HIGH_RISK_REVIEW_ENABLED',
+            'HIGH_RISK_REVIEW_API_BASE',
+            'HIGH_RISK_REVIEW_API_KEY',
+            'HIGH_RISK_REVIEW_MODEL',
+            'HIGH_RISK_REVIEW_MODEL_REVISION',
+        }}
     ):
         values.pop(runtime_key, None)
 local_ai_tools_api_key = read_secret_file(local_ai_tools_key_path)
 app_env_values = parse_env(app_env_path)
-
-def first_non_empty(*items):
-    for item in items:
-        text = str(item or '').strip()
-        if text:
-            return text
-    return ''
-
 
 if local_ai_tools_api_key:
     values['LOCAL_AI_TOOLS_API_KEY'] = local_ai_tools_api_key
@@ -500,44 +502,9 @@ values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '18'
 values['AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS'] = '96'
 values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '18'
 values['AI_DECISION_MAKER_MAX_COMPLETION_TOKENS'] = '96'
-cloud_reviewer_api_base = first_non_empty(
-    values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
-    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_API_BASE'),
-    values.get('CLOUD_HIGH_RISK_REVIEW_API_BASE'),
-    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_API_BASE'),
-)
-cloud_reviewer_api_key = first_non_empty(
-    values.get('ONLINE_HIGH_RISK_REVIEW_API_KEY'),
-    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_API_KEY'),
-    values.get('CLOUD_HIGH_RISK_REVIEW_API_KEY'),
-    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_API_KEY'),
-)
-cloud_reviewer_model = first_non_empty(
-    values.get('ONLINE_HIGH_RISK_REVIEW_MODEL'),
-    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_MODEL'),
-    values.get('CLOUD_HIGH_RISK_REVIEW_MODEL'),
-    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_MODEL'),
-)
-cloud_reviewer_revision = first_non_empty(
-    values.get('ONLINE_HIGH_RISK_REVIEW_MODEL_REVISION'),
-    app_env_values.get('ONLINE_HIGH_RISK_REVIEW_MODEL_REVISION'),
-    values.get('CLOUD_HIGH_RISK_REVIEW_MODEL_REVISION'),
-    app_env_values.get('CLOUD_HIGH_RISK_REVIEW_MODEL_REVISION'),
-)
-if cloud_reviewer_api_base and cloud_reviewer_api_key and cloud_reviewer_model:
-    values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
-    values['HIGH_RISK_REVIEW_API_BASE'] = cloud_reviewer_api_base.rstrip('/')
-    values['HIGH_RISK_REVIEW_API_KEY'] = cloud_reviewer_api_key
-    values['HIGH_RISK_REVIEW_MODEL'] = cloud_reviewer_model
-    values['HIGH_RISK_REVIEW_MODEL_REVISION'] = cloud_reviewer_revision
-else:
-    # Never resurrect the removed local DeepSeek reviewer.  Keeping the feature
-    # enabled with an incomplete route makes the entry gate fail closed.
-    values['HIGH_RISK_REVIEW_ENABLED'] = 'true'
-    values['HIGH_RISK_REVIEW_API_BASE'] = ''
-    values['HIGH_RISK_REVIEW_API_KEY'] = ''
-    values['HIGH_RISK_REVIEW_MODEL'] = ''
-    values['HIGH_RISK_REVIEW_MODEL_REVISION'] = ''
+# HIGH_RISK_REVIEW_* is edited atomically by the Dashboard and its secret is
+# stored in the encrypted settings service.  Keeping a second deployment-owned
+# copy here would override every UI save after a systemd restart.
 try:
     current_tools_timeout = float(values.get('LOCAL_AI_TOOLS_TIMEOUT_SECONDS') or 0)
 except ValueError:
@@ -960,6 +927,14 @@ def parse_args() -> argparse.Namespace:
         help="Install/restart model tunnels and Dashboard while explicitly keeping the paper-trading service stopped.",
     )
     parser.add_argument(
+        "--resume-trading",
+        action="store_true",
+        help=(
+            "Explicitly resume the paper-trading service after deployment. "
+            "Omitting this flag always leaves paper trading stopped."
+        ),
+    )
+    parser.add_argument(
         "--runtime-env-only",
         action="store_true",
         help=(
@@ -985,6 +960,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.keep_trading_stopped and args.resume_trading:
+        raise SystemExit("--keep-trading-stopped and --resume-trading are mutually exclusive")
     files = filter_upload_files(
         iter_upload_files(include_tests=args.include_tests),
         list(args.only or []),
@@ -1153,7 +1130,9 @@ def main() -> None:
                 model_tunnel_restart=model_tunnel_restart,
                 model_tunnel_active_check=model_tunnel_active_check,
                 model_readiness_refresh=model_readiness_refresh,
-                keep_trading_stopped=bool(args.keep_trading_stopped),
+                # Deployment is fail-closed: paper trading remains stopped
+                # unless the operator explicitly opts into a resume.
+                keep_trading_stopped=not bool(args.resume_trading),
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return

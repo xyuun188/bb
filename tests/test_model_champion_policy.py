@@ -8,7 +8,7 @@ def _metadata(
     profit_factor: float = 1.40,
     cvar: float = -0.20,
     drawdown: float = 0.40,
-    training_data_version: str = "2026-07-21.authoritative-trade-integrity.v5",
+    training_data_version: str = "2026-09-15.authoritative-trade-integrity.v6",
 ) -> dict:
     side = {
         "avg_return_pct": avg,
@@ -154,7 +154,7 @@ def test_same_stage_challenger_replaces_stale_training_data_contract() -> None:
     assert report["accepted"] is True
     assert report["reason"] == "training_data_contract_refresh"
     assert report["candidate_training_data_version"] == (
-        "2026-07-21.authoritative-trade-integrity.v5"
+        "2026-09-15.authoritative-trade-integrity.v6"
     )
     assert report["champion_training_data_version"] == (
         "2026-07-14.separated-profit-supervision.v4"

@@ -223,8 +223,7 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports(verified_target_top
     assert "values['HIGH_RISK_REVIEW_API_BASE'] = 'http://127.0.0.1:18002/v1'" not in source
     assert "deepseek" not in target_json.lower()
     assert "14b" not in target_json.lower()
-    assert "ONLINE_HIGH_RISK_REVIEW_API_BASE" in source
-    assert "CLOUD_HIGH_RISK_REVIEW_MODEL" in source
+    assert "copy here would override every UI save" in source
     assert "values['HIGH_RISK_REVIEW_MODEL'] = 'deepseek-r1-14b-risk'" not in source
 
 
@@ -234,6 +233,7 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
 
     monkeypatch.setenv("BB_TARGET_MODEL_ID", "fake-model-from-env")
     monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", "")
+    monkeypatch.setattr(sync, "PROJECT_ROOT", tmp_path)
     with pytest.raises(RuntimeError, match="verified candidate identity"):
         sync._online_tunnel_ai_models_json("target_single_model")
 
@@ -277,8 +277,10 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", str(manifest_path))
-
+    (tmp_path / ".target_model_candidate.remote.json").write_text(
+        manifest_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     rendered = sync._online_tunnel_ai_models_json("target_single_model")
     assert rendered.count("qwen3.8-27b") >= 6
     assert "deepseek" not in rendered.lower()
@@ -306,7 +308,10 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
         'AI_MODELS=[{"model":"qwen3-14b-trade","api_base":'
         '"http://stale-model-route.example.invalid:21840/v1"}]\n'
         "LOCAL_AI_TOOLS_API_BASE=http://old-local-ai.example\n"
-        "HIGH_RISK_REVIEW_MODEL=old-risk-model\n"
+        "HIGH_RISK_REVIEW_ENABLED=true\n"
+        "HIGH_RISK_REVIEW_API_BASE=https://review.example/v1\n"
+        "HIGH_RISK_REVIEW_MODEL=provider-risk-review-v2\n"
+        "HIGH_RISK_REVIEW_MODEL_REVISION=\n"
         "DATABASE_URL=postgresql+asyncpg://app\n"
         "BB_SECURE_SETTINGS_KEY=app-key\n"
         "PROJECT_ONLY=yes\n",
@@ -326,7 +331,9 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     assert "AI_MODEL=" not in cleaned
     assert "AI_MODELS=" not in cleaned
     assert "LOCAL_AI_TOOLS_API_BASE=" not in cleaned
-    assert "HIGH_RISK_REVIEW_MODEL=" not in cleaned
+    assert "HIGH_RISK_REVIEW_API_BASE=https://review.example/v1" in cleaned
+    assert "HIGH_RISK_REVIEW_MODEL=provider-risk-review-v2" in cleaned
+    assert "HIGH_RISK_REVIEW_MODEL_REVISION=" in cleaned
     assert "DATABASE_URL=postgresql+asyncpg://app" in cleaned
     assert "BB_SECURE_SETTINGS_KEY=app-key" in cleaned
     assert "PROJECT_ONLY=yes" in cleaned
@@ -338,6 +345,7 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     assert "http://127.0.0.1:18000/v1" in runtime_text
     assert "qwen3.8-27b" in runtime_text
     assert "deepseek" not in runtime_text.lower()
+    assert "HIGH_RISK_REVIEW_" not in runtime_text
 
 
 def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(

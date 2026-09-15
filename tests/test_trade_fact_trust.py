@@ -41,6 +41,15 @@ def test_closed_position_fact_requires_entry_and_close_order_links() -> None:
         entry_exchange_order_id="entry-ok",
         close_exchange_order_id="manual_close:local-only",
     )
+    manual_close_with_real_order = SimpleNamespace(
+        id=5,
+        is_open=False,
+        realized_pnl=1.2,
+        entry_exchange_order_id="entry-ok",
+        close_exchange_order_id="3924879792054972418",
+        settlement_status="settled",
+        settlement_source="manual_close_execution",
+    )
 
     assert closed_position_trade_fact_trusted(trusted) is True
     assert closed_position_trade_fact_untrusted_reason(missing_entry) == (
@@ -51,6 +60,9 @@ def test_closed_position_fact_requires_entry_and_close_order_links() -> None:
     )
     assert closed_position_trade_fact_untrusted_reason(manual_close) == (
         "manual_close_exchange_order_id"
+    )
+    assert closed_position_trade_fact_untrusted_reason(manual_close_with_real_order) == (
+        "manual_close_execution"
     )
 
 

@@ -70,9 +70,7 @@ def _fee_after_evaluation(
     pnl = float(evidence.get("pnl") or 0.0)
     profit_factor_raw = evidence.get("profit_factor")
     try:
-        profit_factor = (
-            float(profit_factor_raw) if profit_factor_raw is not None else None
-        )
+        profit_factor = float(profit_factor_raw) if profit_factor_raw is not None else None
     except (TypeError, ValueError):
         profit_factor = None
     blockers = []
@@ -90,9 +88,7 @@ def _fee_after_evaluation(
         "blocking_reasons": blockers,
         "realized_net_pnl_usdt": round(pnl, 6),
         "avg_realized_net_pnl_usdt": round(float(evidence.get("avg_pnl") or 0.0), 6),
-        "profit_factor": (
-            round(profit_factor, 6) if profit_factor is not None else None
-        ),
+        "profit_factor": (round(profit_factor, 6) if profit_factor is not None else None),
         "return_lcb_pct": _first_present(
             evidence.get("return_lcb_pct"), evidence.get("return_lcb")
         ),
@@ -279,7 +275,15 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
         status.get("model_bundle_available") or status.get("trained_models_available")
     )
     runtime_available = bool(status.get("service_available", status.get("available")))
-    diagnostic_timeout = str(status.get("status") or "") == "timeout"
+    status_name = str(status.get("status") or "").lower()
+    diagnostic_timeout = status_name in {
+        "timeout",
+        "status_timeout",
+        "status_error",
+        "client_error",
+        "request_error",
+    }
+    diagnostic_warming = status_name in {"warming", "refreshing"}
     promotion = _safe_dict(status.get("promotion_recommendation"))
     live_ml_ready = promotion.get("live_ml_ready") is True
     canary_ready = bool(promotion.get("canary_ready"))
@@ -289,6 +293,8 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
         artifact_available = bool(bundle_available and model_name)
         if diagnostic_timeout:
             lifecycle = "diagnostic_timeout"
+        elif diagnostic_warming:
+            lifecycle = "diagnostic_warming"
         elif artifact_available and live_ml_ready:
             lifecycle = "active"
         elif artifact_available and canary_ready:
@@ -324,6 +330,8 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                 "blocking_reasons": (
                     ["status_query_timeout"]
                     if diagnostic_timeout
+                    else ["status_refresh_in_progress"]
+                    if diagnostic_warming
                     else _safe_list(promotion.get("live_blocking_reasons"))
                 ),
                 "identity_verified": artifact_available,
@@ -332,14 +340,167 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _matching_specialist_evidence(
+    value: Any,
+    *,
+    identities: set[str],
+    depth: int = 0,
+) -> list[dict[str, Any]]:
+    if depth > 6:
+        return []
+    matches: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        normalized_keys = {str(key).strip().lower() for key in value}
+        identity_values = {
+            str(value.get(key) or "").strip().lower()
+            for key in ("repo_id", "model_id", "model", "name", "role", "kind")
+        }
+        if normalized_keys.intersection(identities) or identity_values.intersection(identities):
+            matches.append(value)
+        for key, nested in value.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key in identities and isinstance(nested, dict):
+                matches.append(nested)
+            matches.extend(
+                _matching_specialist_evidence(
+                    nested,
+                    identities=identities,
+                    depth=depth + 1,
+                )
+            )
+    elif isinstance(value, list):
+        for nested in value:
+            matches.extend(
+                _matching_specialist_evidence(
+                    nested,
+                    identities=identities,
+                    depth=depth + 1,
+                )
+            )
+    return matches
+
+
+def _merged_specialist_adapter_preflight(
+    local_tools_status: dict[str, Any],
+) -> dict[str, Any]:
+    original = _safe_dict(local_tools_status.get("specialist_adapter_preflight"))
+    original_adapters = original.get("adapters")
+    if isinstance(original_adapters, dict):
+        adapter_rows = [dict(row) for row in original_adapters.values() if isinstance(row, dict)]
+    else:
+        adapter_rows = [dict(row) for row in _safe_list(original_adapters) if isinstance(row, dict)]
+
+    definitions = (
+        (
+            "google/timesfm-2.5-200m-pytorch",
+            {"timesfm", "timesfm_2_5", "timeseries_primary", "timesfm-2.5-primary"},
+        ),
+        (
+            "amazon/chronos-2",
+            {
+                "chronos",
+                "chronos_2",
+                "timeseries_challenger",
+                "chronos-2-shadow-challenger",
+            },
+        ),
+    )
+    evidence_sources = (
+        local_tools_status.get("specialist_model_chains"),
+        local_tools_status.get("model_status"),
+        local_tools_status.get("actual_inference_count"),
+    )
+    ready_statuses = {
+        "ok",
+        "ready",
+        "available",
+        "loaded",
+        "artifact_ready",
+        "inference_only",
+    }
+    for repo_id, aliases in definitions:
+        identities = {repo_id.lower()}
+        identities.update(alias.lower() for alias in aliases)
+        row = next(
+            (
+                adapter
+                for adapter in adapter_rows
+                if str(adapter.get("repo_id") or "").strip().lower() in identities
+            ),
+            None,
+        )
+        if row is None:
+            row = {"repo_id": repo_id}
+            adapter_rows.append(row)
+
+        candidates: list[dict[str, Any]] = [row]
+        for source in evidence_sources:
+            candidates.extend(_matching_specialist_evidence(source, identities=identities))
+        for candidate in candidates[1:]:
+            for key, value in candidate.items():
+                row.setdefault(key, value)
+
+        artifact_ready = False
+        inference_count = 0
+        runtime_ready = bool(
+            row.get("shadow_inference_ready")
+            or row.get("runtime_available")
+            or row.get("inference_ready")
+        )
+        for candidate in candidates:
+            status = str(candidate.get("status") or "").strip().lower()
+            artifact_ready = artifact_ready or bool(
+                candidate.get("artifact_ready")
+                or candidate.get("configured")
+                or candidate.get("model_path")
+                or status in ready_statuses
+            )
+            raw_count = candidate.get("actual_inference_count")
+            if isinstance(raw_count, dict):
+                raw_count = next(
+                    (
+                        count
+                        for key, count in raw_count.items()
+                        if str(key).strip().lower() in identities
+                    ),
+                    0,
+                )
+            try:
+                inference_count = max(inference_count, int(raw_count or 0))
+            except (TypeError, ValueError):
+                pass
+            runtime_ready = runtime_ready or bool(
+                candidate.get("shadow_inference_ready")
+                or candidate.get("runtime_available")
+                or candidate.get("inference_ready")
+                or candidate.get("last_inference_at")
+                or candidate.get("last_shadow_inference_at")
+            )
+        runtime_ready = runtime_ready or inference_count > 0
+
+        row["repo_id"] = repo_id
+        row["artifact_ready"] = artifact_ready
+        row["configured"] = artifact_ready
+        row["actual_inference_count"] = inference_count
+        row["shadow_inference_ready"] = runtime_ready
+        row["runtime_available"] = runtime_ready
+        row["available"] = runtime_ready
+        if runtime_ready:
+            row["status"] = "ok"
+        elif artifact_ready:
+            row["status"] = "artifact_ready"
+
+    merged = dict(original)
+    merged["adapters"] = adapter_rows
+    return merged
+
+
 def _specialist_rows(
     local_tools_status: dict[str, Any],
     specialist_report: dict[str, Any],
 ) -> list[dict[str, Any]]:
     report_rows = [
-        row
-        for row in _safe_list(specialist_report.get("models"))
-        if isinstance(row, dict)
+        row for row in _safe_list(specialist_report.get("models")) if isinstance(row, dict)
     ]
 
     def report_for(*names: str) -> dict[str, Any]:
@@ -350,6 +511,25 @@ def _specialist_rows(
         return {}
 
     transformer = _safe_dict(local_tools_status.get("transformers_sentiment_backend"))
+    local_service_available = bool(
+        local_tools_status.get("service_available", local_tools_status.get("available"))
+    )
+    specialist_preflight = _merged_specialist_adapter_preflight(local_tools_status)
+    preflight_rows = [
+        row for row in _safe_list(specialist_preflight.get("adapters")) if isinstance(row, dict)
+    ]
+
+    def preflight_for(model_family: str) -> dict[str, Any]:
+        expected = model_family.strip().lower()
+        return next(
+            (
+                row
+                for row in preflight_rows
+                if str(row.get("repo_id") or "").strip().lower() == expected
+            ),
+            {},
+        )
+
     specs = (
         (
             "timesfm_2_5",
@@ -387,15 +567,32 @@ def _specialist_rows(
     rows: list[dict[str, Any]] = []
     for model_id, display_name, model_family, report_names, task, runtime_hint in specs:
         report = report_for(*report_names)
+        preflight = preflight_for(model_family)
         inference_count = _safe_int(report.get("actual_inference_count"))
         promotion_ready = bool(report.get("promotion_ready"))
-        runtime_available = bool(runtime_hint and (report or model_id == "finbert"))
+        runtime_available = bool(
+            runtime_hint
+            and (
+                inference_count > 0
+                or preflight.get("shadow_inference_ready") is True
+                or (model_id.startswith("finbert") and transformer.get("available") is True)
+            )
+        )
+        configured = bool(preflight or runtime_available)
         identity_verified = bool(runtime_available or inference_count > 0)
-        lifecycle = "inference_only" if runtime_available else "optional_disabled"
+        lifecycle = (
+            "inference_only"
+            if runtime_available
+            else "optional_blocked"
+            if configured and local_service_available
+            else "optional_disabled"
+        )
         evaluation_mode = (
             "shadow_evaluating"
             if report
-            else "not_evaluated" if runtime_available else "unavailable"
+            else "not_evaluated"
+            if runtime_available
+            else "unavailable"
         )
         rows.append(
             {
@@ -412,6 +609,10 @@ def _specialist_rows(
                 "runtime_role": "specialist_evidence",
                 "execution_plane": "local",
                 "availability_scope": "optional_enhancement",
+                "configuration_mode": "managed_local_model_server",
+                "configuration_editable": False,
+                "configuration_target": "model-server",
+                "configured": configured,
                 "lifecycle": lifecycle,
                 "runtime_available": runtime_available,
                 "artifact_available": runtime_available,
@@ -425,7 +626,14 @@ def _specialist_rows(
                     if report
                     else "not_evaluated"
                 ),
-                "blocking_reasons": _safe_list(report.get("promotion_blockers")),
+                "blocking_reasons": list(
+                    dict.fromkeys(
+                        [
+                            *_safe_list(report.get("promotion_blockers")),
+                            *_safe_list(preflight.get("blocked_reasons")),
+                        ]
+                    )
+                ),
                 "identity_verified": identity_verified,
                 "actual_inference_count": inference_count,
                 "fallback_count": _safe_int(report.get("fallback_count")),
@@ -438,9 +646,7 @@ def _specialist_rows(
                     report.get("avg_shadow_return_after_all_cost_pct"),
                 ),
                 "profit_factor": report.get("profit_factor"),
-                "authoritative_profit_factor": report.get(
-                    "authoritative_profit_factor"
-                ),
+                "authoritative_profit_factor": report.get("authoritative_profit_factor"),
                 "return_lcb_pct": _first_present(
                     report.get("authoritative_return_lcb_pct"),
                     report.get("return_lcb_pct"),
@@ -469,6 +675,7 @@ def _specialist_rows(
                 ),
                 "promotion_ready": promotion_ready,
                 "evaluation_generated_at": specialist_report.get("generated_at"),
+                "runtime_preflight": preflight,
             }
         )
     return rows
@@ -494,9 +701,7 @@ def _llm_rows(
     }
     target_topology = _safe_dict(model_server_report.get("target_model_topology"))
     target_model_id = str(
-        target_topology.get("model_id")
-        or target_topology.get("served_model_name")
-        or ""
+        target_topology.get("model_id") or target_topology.get("served_model_name") or ""
     ).strip()
     target_runtime = _safe_dict(
         runtime_reports.get("llm_decision_and_expert_carrier")
@@ -515,8 +720,7 @@ def _llm_rows(
     # manifest_services and target_model_topology are the authoritative runtime
     # evidence. Keep older required_slots support, but never require it.
     slot_carrier = _safe_dict(
-        slot_reports.get("llm_decision_and_expert_carrier")
-        or slot_reports.get("llm_expert_pool")
+        slot_reports.get("llm_decision_and_expert_carrier") or slot_reports.get("llm_expert_pool")
     )
     # Runtime manifest wins for endpoint identity; slot evidence is retained
     # for adapter/specialization metadata when the readiness report omits it.
@@ -555,12 +759,16 @@ def _llm_rows(
             )
         )
     carrier_specialized = _finquant_specialization_verified(carrier_slot, specialization)
-    runtime_model_id = str(
-        carrier_slot.get("served_model_name")
-        or carrier_slot.get("model_id")
-        or target_model_id
-        or ""
-    ).strip().lower()
+    runtime_model_id = (
+        str(
+            carrier_slot.get("served_model_name")
+            or carrier_slot.get("model_id")
+            or target_model_id
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     runtime_identity_verified = runtime_model_id == TARGET_SINGLE_MODEL_ID.lower()
     finquant = {
         "model_id": TARGET_SINGLE_MODEL_ID,
@@ -602,9 +810,7 @@ def _llm_rows(
         {
             "model_id": "online_reviewer_cloud",
             "display_name": "Cloud high-risk reviewer",
-            "model_family": str(
-                cloud_reviewer.get("model") or "provider_managed_reviewer"
-            ),
+            "model_family": str(cloud_reviewer.get("model") or "provider_managed_reviewer"),
             "task": "high_risk_review",
             "runtime_available": cloud_reviewer_available,
         },
@@ -614,9 +820,7 @@ def _llm_rows(
         evaluation_bucket = None
         missing_reason = "high_risk_review_fee_after_evaluation_missing"
         if row["model_id"] == "online_reviewer_cloud":
-            evaluation_bucket = _safe_dict(
-                contribution_performance.get("high_risk_review")
-            )
+            evaluation_bucket = _safe_dict(contribution_performance.get("high_risk_review"))
         evaluation = _fee_after_evaluation(
             evaluation_bucket,
             missing_reason=missing_reason,
@@ -630,6 +834,10 @@ def _llm_rows(
                 "runtime_role": row["task"],
                 "execution_plane": "cloud",
                 "availability_scope": "conditional_cloud",
+                "configuration_mode": "admin_settings",
+                "configuration_editable": True,
+                "configuration_target": "cloud-high-risk-reviewer",
+                "configured": bool(cloud_reviewer.get("configured")),
                 "artifact_available": bool(row["runtime_available"]),
                 "trained_at": None,
                 "sample_count": evaluation["evaluation_sample_count"],
@@ -638,6 +846,8 @@ def _llm_rows(
                 "lifecycle": (
                     "inference_only"
                     if row["runtime_available"]
+                    else "cloud_configured_unverified"
+                    if cloud_reviewer.get("configured") is True
                     else "cloud_unconfigured"
                 ),
             }
@@ -654,21 +864,17 @@ def _attach_scheduler_timestamps(
     for row in rows:
         row["artifact_trained_at"] = row.get("trained_at")
         state = _safe_dict(model_states.get(str(row.get("model_id") or "")))
-        scheduler_id = str(
-            state.get("scheduler_heartbeat_id") or state.get("scheduler_id") or ""
-        )
+        scheduler_id = str(state.get("scheduler_heartbeat_id") or state.get("scheduler_id") or "")
         scheduler = _safe_dict(schedulers.get(scheduler_id))
-        row["last_successful_training_at"] = state.get(
-            "last_successful_training_at"
-        )
+        row["last_successful_training_at"] = state.get("last_successful_training_at")
         row["last_training_attempt_at"] = (
             state.get("last_started_at")
             or state.get("last_check_at")
             or state.get("last_finished_at")
         )
         row["next_training_check_at"] = state.get("next_check_at")
-        row["scheduler_heartbeat_at"] = (
-            state.get("scheduler_heartbeat_at") or scheduler.get("heartbeat_at")
+        row["scheduler_heartbeat_at"] = state.get("scheduler_heartbeat_at") or scheduler.get(
+            "heartbeat_at"
         )
         row["scheduler_id"] = scheduler_id or None
 
@@ -716,4 +922,3 @@ def build_model_training_registry(
             "identity_failure_models": identity_failures,
         },
     }
-

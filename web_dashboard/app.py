@@ -85,6 +85,8 @@ _LIGHT_API_PATH_MARKERS = (
     "/auth/",
     "/dashboard/summary",
     "/dashboard/market",
+    "/ml-signal/status",
+    "/local-ai-tools/status",
 )
 
 # Global WebSocket manager

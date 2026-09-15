@@ -5,6 +5,8 @@ Pytest fixtures and configuration for the AI trading system.
 import asyncio
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,26 @@ os.environ["BB_RUNTIME_ENV_PATH"] = str(
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def _wait_for_aiosqlite_workers(timeout_seconds: float = 0.5) -> None:
+    """Wait for disposed aiosqlite connection workers before loop shutdown."""
+
+    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+    while True:
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if getattr(getattr(thread, "_target", None), "__name__", "")
+            == "_connection_worker_thread"
+        ]
+        if not workers:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        for thread in workers:
+            thread.join(timeout=min(remaining, 0.02))
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +81,11 @@ async def dispose_shared_db_engine_after_test():
     from db.session import close_db
 
     await close_db()
+    # aiosqlite schedules worker-thread callbacks back onto the event loop;
+    # wait for the disposed connection workers and then give their final
+    # callbacks one turn before pytest starts the next test.
+    _wait_for_aiosqlite_workers()
+    await asyncio.sleep(0)
 
 
 @pytest.fixture(scope="session")
@@ -75,6 +102,8 @@ def event_loop():
         from db.session import close_db
 
         loop.run_until_complete(close_db())
+        _wait_for_aiosqlite_workers()
+        loop.run_until_complete(asyncio.sleep(0))
     finally:
         loop.close()
 

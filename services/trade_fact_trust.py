@@ -95,6 +95,8 @@ def closed_position_trade_fact_untrusted_reason(position: Any) -> str | None:
             if settlement_status == "settlement_unresolved"
             else "settlement_not_final"
         )
+    if _text(getattr(position, "settlement_source", None)).startswith("manual_close"):
+        return "manual_close_execution"
     if not _text(getattr(position, "entry_exchange_order_id", None)):
         return "missing_entry_exchange_order_id"
     close_exchange_order_id = getattr(position, "close_exchange_order_id", None)

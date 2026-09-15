@@ -152,7 +152,7 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1&daily-pnl-readable-v1" in html
+    assert "dashboard.js?v=20260915-local-ml-stable-config-v1" in html
     assert "模拟盘交易权限" in script
     assert "实盘候选权限" in script
 
@@ -240,7 +240,7 @@ def test_expert_memory_table_uses_readable_structured_outcomes() -> None:
     assert "<th>标的与方向</th>" in html
     assert "<th>结算结果</th>" in html
     assert "<th>经验结论</th>" in html
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "dashboard.js?v=20260915-local-ml-stable-config-v1" in html
     assert "function expertMemoryPresentation(memory = {})" in script
     assert "function expertMemoryOutcome(memory = {})" in script
     assert "观察并复核分布" in script
@@ -779,7 +779,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "dashboard.js?v=20260915-local-ml-stable-config-v1" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -921,7 +921,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260828-training-effectiveness-layout-v1" in html
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "dashboard.js?v=20260915-local-ml-stable-config-v1" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -1091,7 +1091,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260828-training-effectiveness-layout-v1" in html
-    assert "dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "dashboard.js?v=20260915-local-ml-stable-config-v1" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1209,6 +1209,17 @@ def test_local_ml_dashboard_request_failure_degrades_per_endpoint() -> None:
     assert "fetchJSON('/api/local-ai-tools/status').catch(err => ({" in fetch_block
     assert "本地 ML 状态接口请求失败" in fetch_block
     assert "本地量化工具状态接口请求失败" in fetch_block
+
+
+def test_local_ml_registry_warmup_is_bounded_and_not_rendered_as_service_failure() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "scheduleModelTrainingRegistryRefresh" in script
+    assert "modelTrainingRegistryRefreshAttempts >= 3" in script
+    assert "diagnostic_warming: '状态加载中'" in script
+    assert "Revision（可选）" in html
+    assert "供应商未提供时留空" in html
 
 
 def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
@@ -1355,7 +1366,7 @@ def test_dashboard_localizes_okx_settlement_reconciliation_gaps() -> None:
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20260829-data-collection-warmup-v1" in html
+    assert "/static/js/dashboard.js?v=20260915-local-ml-stable-config-v1" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:

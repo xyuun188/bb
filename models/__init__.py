@@ -15,6 +15,7 @@ from models.news import NewsArticle, SocialPost
 from models.risk import RiskEvent
 from models.secure_config import SecureSetting, SecureSettingAudit
 from models.trade import Order, Position
+from models.trading_control import TradingControlCommand
 
 __all__ = [
     "Base",
@@ -39,4 +40,5 @@ __all__ = [
     "StrategyProfileSnapshot",
     "TradeReflection",
     "RiskEvent",
+    "TradingControlCommand",
 ]

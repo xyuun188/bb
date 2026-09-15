@@ -31,8 +31,13 @@ def test_shadow_trainer_uses_isolated_child_process(monkeypatch: pytest.MonkeyPa
     assert result == {"trained": True, "reason": "ok"}
     command = captured["command"]
     assert isinstance(command, list)
-    assert str(command[-3]).endswith("scripts\\train_local_ai_tools_models.py")
-    assert command[-2:] == ["--training-mode", "shadow"]
+    assert str(command[-5]).endswith("scripts\\train_local_ai_tools_models.py")
+    assert command[-4:] == [
+        "--training-mode",
+        "walk_forward",
+        "--persist-artifact",
+        "--confirm-phase3-rebuild",
+    ]
     assert captured["capture_output"] is True
     assert captured["check"] is False
 

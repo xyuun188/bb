@@ -159,6 +159,52 @@ def test_registry_marks_optional_specialists_without_calling_them_core_failures(
     assert rows["timesfm_2_5"]["availability_scope"] == "optional_enhancement"
     assert rows["timesfm_2_5"]["execution_plane"] == "local"
     assert rows["timesfm_2_5"]["lifecycle"] == "optional_disabled"
+    assert rows["timesfm_2_5"]["configuration_mode"] == "managed_local_model_server"
+
+
+def test_registry_uses_specialist_preflight_as_runtime_evidence() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={
+            "available": True,
+            "service_available": True,
+            "specialist_adapter_preflight": {
+                "adapters": [
+                    {
+                        "repo_id": "google/timesfm-2.5-200m-pytorch",
+                        "shadow_inference_ready": True,
+                        "blocked_reasons": [],
+                    },
+                    {
+                        "repo_id": "amazon/chronos-2",
+                        "shadow_inference_ready": True,
+                        "blocked_reasons": [],
+                    },
+                ]
+            },
+        }
+    )
+    rows = _by_id(payload)
+    assert rows["timesfm_2_5"]["runtime_available"] is True
+    assert rows["chronos_2"]["runtime_available"] is True
+    assert rows["timesfm_2_5"]["lifecycle"] == "inference_only"
+    assert rows["chronos_2"]["configuration_editable"] is False
+
+
+def test_registry_exposes_cloud_reviewer_admin_configuration() -> None:
+    payload = build_model_training_registry(
+        model_server_report={
+            "cloud_reviewer": {
+                "configured": True,
+                "runtime_available": False,
+                "identity_verified": False,
+                "model": "review-model",
+            }
+        }
+    )
+    reviewer = _by_id(payload)["online_reviewer_cloud"]
+    assert reviewer["lifecycle"] == "cloud_configured_unverified"
+    assert reviewer["configuration_editable"] is True
+    assert reviewer["configuration_target"] == "cloud-high-risk-reviewer"
 
 
 def test_dashboard_distinguishes_local_cloud_and_optional_model_states() -> None:
@@ -167,6 +213,33 @@ def test_dashboard_distinguishes_local_cloud_and_optional_model_states() -> None
     assert "云端未配置" in script
     assert "本地服务器" in script
     assert "云端模型" in script
+
+
+def test_registry_does_not_report_warming_local_tools_as_service_failure() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={"status": "warming"},
+    )
+    rows = _by_id(payload)
+    local_rows = [
+        row for model_id, row in rows.items() if model_id.startswith("local_ai_")
+    ]
+
+    assert local_rows
+    assert {row["lifecycle"] for row in local_rows} == {"diagnostic_warming"}
+    assert all(row["blocking_reasons"] == ["status_refresh_in_progress"] for row in local_rows)
+
+
+def test_registry_reports_local_status_timeout_as_diagnostic_not_service_failure() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={"status": "status_timeout"},
+    )
+    rows = _by_id(payload)
+    local_rows = [
+        row for model_id, row in rows.items() if model_id.startswith("local_ai_")
+    ]
+
+    assert local_rows
+    assert {row["lifecycle"] for row in local_rows} == {"diagnostic_timeout"}
 
 
 def test_registry_does_not_publish_retired_llm_rows() -> None:

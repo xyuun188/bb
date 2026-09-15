@@ -5091,6 +5091,7 @@ async function fetchMLSignalDashboard() {
     state.mlSignalStatus = status || null;
     state.localAIToolsStatus = localToolsStatus || null;
     state.modelTrainingRegistry = registryData || null;
+    scheduleModelTrainingRegistryRefresh(state.modelTrainingRegistry);
     state.modelContributionStats = contributionData || null;
     state.mlSignalRecords = (recordsData?.records || []).filter(r => r && r.ml_signal && r.ml_signal.available !== false);
     const totalPages = Math.max(Math.ceil(state.mlSignalRecords.length / ML_SIGNAL_PAGE_SIZE), 1);
@@ -9196,6 +9197,30 @@ async function testModelByName(name, sourceButton = null) {
     }
 }
 
+let modelTrainingRegistryRefreshTimer = null;
+let modelTrainingRegistryRefreshAttempts = 0;
+
+function scheduleModelTrainingRegistryRefresh(registry) {
+    if (!registry?.cache?.refresh_in_background) {
+        modelTrainingRegistryRefreshAttempts = 0;
+        return;
+    }
+    if (modelTrainingRegistryRefreshTimer || modelTrainingRegistryRefreshAttempts >= 3) return;
+    modelTrainingRegistryRefreshAttempts += 1;
+    const delayMs = 1200 * modelTrainingRegistryRefreshAttempts;
+    modelTrainingRegistryRefreshTimer = setTimeout(async () => {
+        modelTrainingRegistryRefreshTimer = null;
+        try {
+            const refreshed = await fetchJSON('/api/model-training/registry');
+            state.modelTrainingRegistry = refreshed || null;
+            renderTrainableModels();
+            scheduleModelTrainingRegistryRefresh(state.modelTrainingRegistry);
+        } catch (_) {
+            scheduleModelTrainingRegistryRefresh({ cache: { refresh_in_background: true } });
+        }
+    }, delayMs);
+}
+
 // Model configuration is read from the live API only.
 async function fetchAIModels() {
     const data = await fetchJSON('/api/settings/ai-models');
@@ -9925,8 +9950,15 @@ async function closeOpenPosition(positionId, symbol, side) {
         const data = await postJSON(`/api/positions/${positionId}/close`, {
             reason: '\u7528\u6237\u5728\u6301\u4ed3\u8bb0\u5f55\u9875\u9762\u624b\u52a8\u70b9\u51fb\u5e73\u4ed3\u3002',
         });
-        if (!data.approved) {
-            alert('\u5e73\u4ed3\u672a\u6267\u884c: ' + (data.rejection_reason || '\u672a\u77e5\u539f\u56e0'));
+        const result = data.status === 'queued'
+            ? await waitForCloseCommand(data.command_id)
+            : data;
+        if (result.status === 'requires_reconfirmation') {
+            alert('\u5e73\u4ed3\u547d\u4ee4\u5728\u6267\u884c\u4e2d\u65ad\uff0c\u7cfb\u7edf\u5df2\u7981\u6b62\u81ea\u52a8\u91cd\u8bd5\u3002\u8bf7\u5148\u6838\u5bf9 OKX \u6301\u4ed3\uff0c\u518d\u624b\u52a8\u63d0\u4ea4\u65b0\u547d\u4ee4\u3002');
+        } else if (result.status === 'pending_timeout') {
+            alert('\u5e73\u4ed3\u547d\u4ee4\u5df2\u5165\u961f\uff0c\u4ecd\u5728\u6267\u884c\u3002\u8bf7\u5237\u65b0\u6301\u4ed3\u9875\u67e5\u770b\u7ed3\u679c\u3002');
+        } else if (!result.approved) {
+            alert('\u5e73\u4ed3\u672a\u6267\u884c: ' + (result.rejection_reason || '\u672a\u77e5\u539f\u56e0'));
         }
     } catch (err) {
         alert('\u5e73\u4ed3\u5931\u8d25: ' + (err.message || '\u672a\u77e5\u9519\u8bef'));
@@ -9956,10 +9988,17 @@ async function closeAllOpenPositions() {
             mode: state.mode || 'paper',
             reason: '\u7528\u6237\u5728\u6301\u4ed3\u8bb0\u5f55\u9875\u9762\u70b9\u51fb\u4e00\u952e\u5e73\u4ed3\u3002',
         });
-        if (data.failed > 0) {
-            alert(`\u4e00\u952e\u5e73\u4ed3\u5b8c\u6210 ${data.closed || 0} \u6761\uff0c\u5931\u8d25 ${data.failed} \u6761\u3002`);
+        const result = data.status === 'queued'
+            ? await waitForCloseCommand(data.command_id, btn)
+            : data;
+        if (result.status === 'requires_reconfirmation') {
+            alert('\u5e73\u4ed3\u547d\u4ee4\u5728\u6267\u884c\u4e2d\u65ad\uff0c\u7cfb\u7edf\u5df2\u7981\u6b62\u81ea\u52a8\u91cd\u8bd5\u3002\u8bf7\u5148\u6838\u5bf9 OKX \u6301\u4ed3\uff0c\u518d\u624b\u52a8\u63d0\u4ea4\u65b0\u547d\u4ee4\u3002');
+        } else if (result.status === 'pending_timeout') {
+            alert('\u5e73\u4ed3\u547d\u4ee4\u5df2\u5165\u961f\uff0c\u4ecd\u5728\u6267\u884c\u3002\u5237\u65b0\u6301\u4ed3\u9875\u53ef\u7ee7\u7eed\u67e5\u770b\u7ed3\u679c\u3002');
+        } else if ((result.failed || 0) > 0) {
+            alert(`\u4e00\u952e\u5e73\u4ed3\u5b8c\u6210 ${result.closed || 0} \u6761\uff0c\u5931\u8d25 ${result.failed} \u6761\u3002`);
         } else {
-            alert(`\u4e00\u952e\u5e73\u4ed3\u5df2\u63d0\u4ea4 ${data.closed || 0} \u6761\u3002`);
+            alert(`\u4e00\u952e\u5e73\u4ed3\u5df2\u63d0\u4ea4 ${result.closed || 0} \u6761\u3002`);
         }
     } catch (err) {
         alert('\u4e00\u952e\u5e73\u4ed3\u5931\u8d25: ' + (err.message || '\u672a\u77e5\u9519\u8bef'));
@@ -10940,7 +10979,7 @@ function renderHighRiskReviewerStatus(data) {
                 const tone = route.active ? 'var(--success, #22c55e)' : 'var(--text-muted)';
                 const state = route.active ? '已启用' : (route.configured ? '已配置但未接管' : '未配置');
                 const identity = route.model
-                    ? ` / ${route.model}${route.revision ? ` @ ${route.revision}` : ''}`
+                    ? ` / ${route.model} @ ${route.revision || '供应商托管版本'}`
                     : '';
                 return `<span style="display:inline-block;margin-right:14px;color:${tone};"><strong>${escHtml(routeKind)}</strong> ${escHtml(route.label)} · ${escHtml(state)}${escHtml(identity)}<small style="display:block;color:var(--text-muted);">${escHtml(route.status || '')}</small></span>`;
             }).join('')}`
@@ -10988,6 +11027,25 @@ async function fetchHighRiskReviewerSettings() {
     }
 }
 
+async function waitForCloseCommand(commandId, button) {
+    if (!commandId) throw new Error('\u5e73\u4ed3\u547d\u4ee4\u7f3a\u5c11\u7f16\u53f7');
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+        if (button) button.textContent = `\u5e73\u4ed3\u961f\u5217\u5904\u7406\u4e2d ${attempt + 1}s`;
+        const response = await fetchWithAuth(
+            `/api/positions/close-commands/${encodeURIComponent(commandId)}`,
+        );
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(apiErrorText(error, '\u67e5\u8be2\u5e73\u4ed3\u547d\u4ee4\u5931\u8d25'));
+        }
+        const command = await response.json();
+        if (command.status === 'completed') return command.result || {};
+        if (command.status === 'requires_reconfirmation') return command;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    return { status: 'pending_timeout' };
+}
+
 async function testHighRiskReviewer() {
     const button = document.getElementById('cloud-reviewer-test-btn');
     const status = document.getElementById('cloud-reviewer-test-status');
@@ -10999,7 +11057,7 @@ async function testHighRiskReviewer() {
     const key = document.getElementById('cfg-high-risk-review-api-key')?.value.trim() || '';
     if (key && !key.startsWith('****')) body.api_key = key;
     if (button) { button.disabled = true; button.textContent = '测试中...'; }
-    if (status) { status.textContent = '正在真实请求云端 /models'; status.style.color = 'var(--text-muted)'; }
+    if (status) { status.textContent = '正在验证云端模型列表与最小推理调用'; status.style.color = 'var(--text-muted)'; }
     try {
         const res = await fetchWithAuth('/api/settings/high-risk-review/test', dashboardWriteOptions({
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -11008,7 +11066,7 @@ async function testHighRiskReviewer() {
         if (!res.ok) throw new Error(apiErrorText(data));
         if (status) {
             status.textContent = data.success
-                ? `连接成功：${data.provider || '云端'} / ${data.model} / ${data.revision} · ${data.latency_ms ?? '-'} ms`
+                ? `连接成功：${data.provider || '云端'} / ${data.model} / ${data.effective_revision || data.revision || '供应商托管版本'} · ${data.latency_ms ?? '-'} ms`
                 : `连接失败：${data.error || data.status || '未知错误'}`;
             status.style.color = data.success ? 'var(--success, #22c55e)' : 'var(--danger, #ef4444)';
         }
@@ -11201,8 +11259,29 @@ function renderReadableTrainableModelCard(model) {
             </div>
             ${metrics}
             <div class="ml-train-model-note">${escHtml(model.note || '')}</div>
+            ${model.action ? `<div class="settings-actions"><button type="button" class="btn btn-outline btn-sm" data-local-model-config-target="${escHtml(model.action.target)}">${escHtml(model.action.label)}</button></div>` : ''}
         </div>`;
 }
+
+function openLocalModelConfiguration(target) {
+    document.querySelector('.nav-item[data-page="settings"]')?.click();
+    const settingsTarget = target === 'cloud-high-risk-reviewer' ? 'models' : 'model-server';
+    activateSettingsTab(settingsTarget);
+    window.setTimeout(() => {
+        const element = target === 'cloud-high-risk-reviewer'
+            ? document.getElementById('cfg-high-risk-review-api-base')
+            : document.querySelector('[data-settings-section="model-server"]');
+        element?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+        element?.focus?.();
+    }, 80);
+}
+
+document.addEventListener('click', event => {
+    const button = event.target?.closest?.('[data-local-model-config-target]');
+    if (!button) return;
+    event.preventDefault();
+    openLocalModelConfiguration(button.dataset.localModelConfigTarget || 'model-server');
+});
 
 function mlEvidenceValue(value, suffix = '', missingText = '证据缺失') {
     if (value === null || value === undefined || value === '') return missingText;
@@ -11255,7 +11334,7 @@ function mlLocalEvidenceHtml(status) {
         || status.training_data_sha256;
     const evidenceSections = [
         `<section class="ml-evidence-panel">
-            <div class="ml-evidence-head"><strong>数据版本与样本分布</strong><span>${escHtml(quality.data_quality_version || '版本缺失')}</span></div>
+            <div class="ml-evidence-head"><strong>数据版本与样本分布</strong><span>${escHtml(quality.required_training_data_version || status.readiness?.metrics?.required_training_data_version || quality.data_quality_version || '版本缺失')}</span></div>
             ${mlEvidenceRow('数据指纹', evidenceValue(fingerprint))}
             ${mlEvidenceRow('全部 / 纳入 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(totals.total))} / ${mlSampleCountLabel(mlOptionalNumber(totals.included))} / ${mlSampleCountLabel(mlOptionalNumber(totals.excluded))}`)}
             ${mlEvidenceRow('影子样本 原始 / 纳入 / 降权 / 隔离', `${mlSampleCountLabel(mlOptionalNumber(shadow.total))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.included))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.downweighted))} / ${mlSampleCountLabel(mlOptionalNumber(shadow.excluded))}`)}
@@ -11450,7 +11529,8 @@ function renderMLSignalOverview() {
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} ${distributionSummaryText(latestDistribution)}` : '等待新分析', latestDistribution && Number(latestDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn')}
             ${mlMetricCard('正目标期望数量', `${strongSignals} / ${records.length}`, '最近记录里标准合同目标期望为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
             ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
-            ${mlMetricCard('数据质量版本', readinessMetrics.training_data_version || status.quality_report?.data_quality_version || '证据缺失', `要求 ${readinessMetrics.required_training_data_version || '证据缺失'}`, readinessMetrics.training_data_version && readinessMetrics.training_data_version === readinessMetrics.required_training_data_version ? 'good' : 'warn')}
+            ${mlMetricCard('质量契约版本', readinessMetrics.required_training_data_version || status.quality_report?.required_training_data_version || status.quality_report?.data_quality_version || '证据缺失', '当前训练和晋升必须满足的质量门禁', readinessMetrics.required_training_data_version ? 'good' : 'warn')}
+            ${mlMetricCard('当前 Champion 训练数据版本', readinessMetrics.training_data_version || '证据缺失', `目标 ${readinessMetrics.required_training_data_version || status.quality_report?.data_quality_version || '证据缺失'}`, readinessMetrics.training_data_version && readinessMetrics.training_data_version === (readinessMetrics.required_training_data_version || status.quality_report?.data_quality_version) ? 'good' : 'warn')}
             ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}
         </div>
         ${mlLocalEvidenceHtml(evidenceStatus)}`;
@@ -11475,6 +11555,11 @@ function renderLocalAIToolsStatus() {
         : Object.values(childEndpoints).filter(item => item && (item.live_probe_ok || item.actual_inference_probe)).length;
     const childTotalCount = Object.keys(childEndpoints).length || 4;
     const childContractStatus = status.child_contract_status || (childLiveProbeOkCount ? 'live_probe_ok' : childMetadataReadyCount ? 'metadata_ready' : 'unavailable');
+    const latestTraining = status.latest_training || {};
+    const latestTrainingAt = latestTraining.trained_at || status.latest_training_at || status.trained_at;
+    const activeArtifact = status.artifact_version || '-';
+    const latestArtifact = latestTraining.artifact_version || status.latest_training_artifact_version || '-';
+    const latestQuality = latestTraining.data_quality_version || status.latest_training_data_quality_version || '-';
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
             ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口登记 ${childMetadataReadyCount}/${childTotalCount} · 实时探针 ${childLiveProbeOkCount}/${childTotalCount} · 状态 ${childContractStatus}`
@@ -11487,6 +11572,12 @@ function renderLocalAIToolsStatus() {
             value: serviceAvailable ? '可用' : '不可用',
             subtitle: serviceAvailable ? (status.model_bundle_available === false ? '服务已连接，训练模型未就绪，子接口使用启发式/轻量模型' : '服务器量化工具已连接') : (status.error || status.message || '等待服务返回状态'),
             tone: serviceAvailable ? 'good' : 'bad',
+        },
+        {
+            label: '最近训练与数据版本',
+            value: latestTrainingAt ? toBeijingTime(latestTrainingAt) : '暂无成功训练记录',
+            subtitle: `候选 ${latestArtifact} · 质量 ${latestQuality} · 当前 Champion ${activeArtifact}${latestArtifact !== '-' && latestArtifact !== activeArtifact ? '（候选未晋升）' : ''}`,
+            tone: latestArtifact !== '-' && latestArtifact !== activeArtifact ? 'warn' : 'muted',
         },
         {
             label: '子接口状态',
@@ -11558,8 +11649,10 @@ function renderTrainableModels() {
         training: '训练中', trained: '已训练', inference_only: '仅推理',
         shadow_evaluating: '影子评估', promotion_blocked: '禁止晋升',
         canary: '小资金验证', live: '已介入实盘', not_trained: '未训练',
-        service_unavailable: '服务不可用', optional_disabled: '可选增强未启用',
-        cloud_unconfigured: '云端未配置',
+        service_unavailable: '服务不可用', diagnostic_timeout: '状态读取超时',
+        diagnostic_warming: '状态加载中', optional_disabled: '可选增强未启用',
+        optional_blocked: '本地模型预检未通过', cloud_unconfigured: '云端未配置',
+        cloud_configured_unverified: '云端已配置，连接未验证',
     };
     const executionPlaneLabels = {
         local: '本地服务器',
@@ -11578,12 +11671,21 @@ function renderTrainableModels() {
             ? toBeijingTime(model.last_successful_training_at)
             : '-',
         usage: model.live_ml_ready ? '影响实盘交易' : (model.trainable ? '未晋升，不影响实盘' : '推理或影子评估'),
+        action: model.configuration_mode === 'admin_settings'
+            ? { target: model.configuration_target || 'cloud-high-risk-reviewer', label: '配置并测试云端模型' }
+            : model.configuration_mode === 'managed_local_model_server'
+                ? { target: model.configuration_target || 'model-server', label: '查看本地模型服务器' }
+                : null,
         metrics: [
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
             { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
             { label: '运行服务', value: model.runtime_available
                 ? '可用'
+                : model.lifecycle === 'diagnostic_timeout'
+                    ? '状态读取超时'
+                    : model.lifecycle === 'diagnostic_warming'
+                        ? '状态加载中'
                 : model.lifecycle === 'optional_disabled'
                     ? '未启用（可选）'
                     : model.lifecycle === 'cloud_unconfigured'

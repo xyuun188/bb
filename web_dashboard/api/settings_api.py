@@ -32,6 +32,7 @@ from core.safe_output import safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
 from services.entry_high_risk_review import validate_cloud_reviewer_route
+from services.high_risk_review_service import cloud_reviewer_auth_headers
 from services.model_server_config import (
     ModelServerConfigError,
     ModelServerConfigNotConfigured,
@@ -203,6 +204,8 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
         "has_api_key": bool(settings.high_risk_review_api_key),
         "model": model,
         "revision": revision,
+        "effective_revision": revision or "provider-managed",
+        "revision_required": False,
         "route_valid": valid,
         "route_error": reason or None,
         "provider": parsed.netloc if parsed and parsed.netloc else None,
@@ -1163,7 +1166,7 @@ async def update_high_risk_review_settings(req: CloudReviewerSettingsRequest):
 
 @router.post("/settings/high-risk-review/test")
 async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
-    """Probe the configured public reviewer and verify the requested model identity."""
+    """Verify both the configured model identity and a minimal inference call."""
     started = time.perf_counter()
     try:
         api_base, api_key, model, revision = _cloud_reviewer_candidate(req)
@@ -1179,36 +1182,83 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
             "model": model,
             "revision": revision,
         }
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = cloud_reviewer_auth_headers(api_key)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{api_base}/models", headers=headers)
+            models_response = await client.get(f"{api_base}/models", headers=headers)
+            model_ids: set[str] = set()
+            if models_response.is_success:
+                payload = models_response.json()
+                rows = payload.get("data") if isinstance(payload, dict) else []
+                model_ids = {
+                    str(item.get("id") or item.get("root") or "").strip()
+                    for item in rows
+                    if isinstance(item, dict)
+                }
+                model_ids.discard("")
+                if model_ids and model not in model_ids:
+                    return {
+                        "success": False,
+                        "status": "model_not_found",
+                        "status_code": models_response.status_code,
+                        "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                        "error": "cloud reviewer model identity was not returned by /models",
+                        "provider": urlsplit(api_base).netloc,
+                        "model": model,
+                        "revision": revision,
+                    }
+            elif models_response.status_code not in {401, 403, 404, 405}:
+                latency_ms = round((time.perf_counter() - started) * 1000, 1)
+                return {
+                    "success": False,
+                    "status": "http_error",
+                    "status_code": models_response.status_code,
+                    "latency_ms": latency_ms,
+                    "error": f"cloud reviewer returned HTTP {models_response.status_code} for /models",
+                    "provider": urlsplit(api_base).netloc,
+                    "model": model,
+                    "revision": revision,
+                }
+
+            # A catalog response alone does not prove that the account can use
+            # this exact model.  Keep the probe deliberately tiny, but exercise
+            # the same chat-completions route used by the runtime reviewer.
+            response = await client.post(
+                f"{api_base}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Reply with OK only. This is a connectivity probe.",
+                        }
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 2,
+                },
+            )
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
         if not response.is_success:
             return {
                 "success": False,
-                "status": "http_error",
+                "status": "chat_probe_http_error",
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
-                "error": f"cloud reviewer returned HTTP {response.status_code}",
+                "error": f"cloud reviewer chat probe returned HTTP {response.status_code}",
                 "provider": urlsplit(api_base).netloc,
                 "model": model,
                 "revision": revision,
             }
-        payload = response.json()
-        rows = payload.get("data") if isinstance(payload, dict) else []
-        model_ids = {
-            str(item.get("id") or item.get("root") or "").strip()
-            for item in rows
-            if isinstance(item, dict)
-        }
-        if model not in model_ids:
+        completion_payload = response.json()
+        choices = completion_payload.get("choices") if isinstance(completion_payload, dict) else []
+        if not isinstance(choices, list) or not choices:
             return {
                 "success": False,
-                "status": "model_not_found",
+                "status": "invalid_response",
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
-                "error": "cloud reviewer model identity was not returned by /models",
+                "error": "cloud reviewer chat probe returned no choices",
                 "provider": urlsplit(api_base).netloc,
                 "model": model,
                 "revision": revision,
@@ -1221,6 +1271,8 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
             "provider": urlsplit(api_base).netloc,
             "model": model,
             "revision": revision,
+            "effective_revision": revision or "provider-managed",
+            "identity_source": "models_and_chat_probe" if model_ids else "chat_probe",
             "message": "云端 reviewer 连接成功，模型身份已验证",
         }
     except httpx.TimeoutException:

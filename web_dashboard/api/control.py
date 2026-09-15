@@ -13,10 +13,12 @@ from pydantic import BaseModel
 from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from services.trading_control_command_queue import TradingControlCommandQueue
 from web_dashboard.api import dashboard as _dash
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+trading_control_commands = TradingControlCommandQueue()
 
 
 class ModeSwitchRequest(BaseModel):
@@ -156,7 +158,12 @@ async def manual_trade(req: ManualTradeRequest):
 async def manual_close_position(position_id: int, req: ManualClosePositionRequest):
     """Manually close one open position directly through OKX."""
     if not _dash._trading_service:
-        raise HTTPException(status_code=503, detail="Trading service not initialized")
+        command = await trading_control_commands.enqueue_close_position(
+            position_id=position_id,
+            mode=mode_manager.mode.value,
+            reason=req.reason,
+        )
+        return {"status": "queued", **command}
 
     result = await _dash._trading_service.manual_close_position(
         position_id,
@@ -168,18 +175,31 @@ async def manual_close_position(position_id: int, req: ManualClosePositionReques
 @router.post("/positions/close-all")
 async def manual_close_all_positions(req: ManualCloseAllPositionsRequest):
     """Manually close all open positions in the selected execution mode."""
-    if not _dash._trading_service:
-        raise HTTPException(status_code=503, detail="Trading service not initialized")
-
     mode = req.mode or mode_manager.mode.value
     if str(mode).lower() not in {"paper", "live"}:
         raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+
+    if not _dash._trading_service:
+        command = await trading_control_commands.enqueue_close_all(
+            mode=mode,
+            reason=req.reason,
+        )
+        return {"status": "queued", **command}
 
     result = await _dash._trading_service.manual_close_all_positions(
         mode=mode,
         reason=req.reason,
     )
     return result
+
+
+@router.get("/positions/close-commands/{command_id}")
+async def get_manual_close_command(command_id: str):
+    """Return the authoritative state of a queued cross-process close command."""
+    command = await trading_control_commands.get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail="Close command not found")
+    return command
 
 
 @router.get("/market/klines/{symbol:path}")

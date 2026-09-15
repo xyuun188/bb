@@ -267,7 +267,7 @@ async def test_manual_close_bypasses_ai_risk_and_persists_manual_order(
     assert state["executor_decisions"][0].action == Action.CLOSE_LONG
     assert state["executor_decisions"][0].raw_response["exclude_from_training"] is True
     assert state["orders"][0]["decision_id"] is None
-    assert state["orders"][0]["exchange_order_id"] == "manual_close:okx-manual-1"
+    assert state["orders"][0]["exchange_order_id"] == "okx-manual-1"
     assert state["orders"][0]["side"] == "sell"
     assert state["db_position"].is_open is False
     assert state["db_position"].realized_pnl == pytest.approx(9.7)

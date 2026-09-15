@@ -527,6 +527,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         self.market_decision_result_recorder = MarketDecisionResultRecorder()
         self.redis = redis_client
+        from services.trading_control_command_queue import TradingControlCommandQueue
+
+        self.trading_control_commands = TradingControlCommandQueue()
         self.execution_result_classifier = ExecutionResultClassifier()
         self.execution_result_factory = ExecutionResultFactory()
         self.open_positions_execution_applier = OpenPositionsExecutionApplier(
@@ -11118,6 +11121,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
     async def start(self) -> None:
         """Start the continuous trading loop."""
         await self.initialize()
+        interrupted_commands = await self.trading_control_commands.recover_interrupted_commands()
+        if interrupted_commands:
+            logger.warning(
+                "frozen interrupted trading control commands",
+                count=interrupted_commands,
+            )
         self._running = True
         self._start_time = datetime.now(UTC)
         self._ensure_market_shadow_sample_worker()
@@ -11146,6 +11155,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._okx_position_settlement_sync_task = asyncio.create_task(
             self._okx_position_settlement_sync_loop()
         )
+        self._trading_control_command_task = asyncio.create_task(
+            self._trading_control_command_loop()
+        )
         try:
             await asyncio.gather(
                 self._position_analysis_task,
@@ -11154,9 +11166,28 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 self._okx_authoritative_sync_task,
                 self._okx_settlement_fact_sync_task,
                 self._okx_position_settlement_sync_task,
+                self._trading_control_command_task,
             )
         except asyncio.CancelledError:
             pass
+
+    async def _trading_control_command_loop(self) -> None:
+        """Let this execution owner consume Dashboard close commands serially."""
+        while self._running:
+            try:
+                processed = await self.trading_control_commands.process_once(
+                    close_all=self.manual_close_all_positions,
+                    close_position=self.manual_close_position,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "trading control command worker failed",
+                    error=safe_error_text(exc),
+                )
+                processed = False
+            await asyncio.sleep(0.25 if processed else 1.0)
 
     async def stop(self) -> None:
         """Stop the trading loop gracefully."""
@@ -11176,6 +11207,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             getattr(self, "_market_shadow_sample_worker_task", None),
             getattr(self, "_stale_entry_expire_task", None),
             getattr(self, "_market_indicator_prewarm_task", None),
+            getattr(self, "_trading_control_command_task", None),
         ):
             if task and not task.done():
                 task.cancel()
@@ -11195,6 +11227,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._market_shadow_sample_worker_task = None
         self._stale_entry_expire_task = None
         self._market_indicator_prewarm_task = None
+        self._trading_control_command_task = None
         market_entry_tasks = list(self._market_entry_task_store().values())
         for task in market_entry_tasks:
             if not task.done():
@@ -11682,10 +11715,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
     @staticmethod
     def _manual_close_exchange_order_id(result: ExecutionResult) -> str:
-        raw_order_id = str(result.exchange_order_id or result.order_id or "").strip()
-        if raw_order_id.startswith("manual_close:"):
-            return raw_order_id
-        return f"manual_close:{raw_order_id or 'unknown'}"
+        exchange_order_id = str(result.exchange_order_id or "").strip()
+        if exchange_order_id:
+            return exchange_order_id
+        raw_order_id = str(result.order_id or "").strip()
+        if raw_order_id in {
+            "",
+            "okx_native_full_close",
+            "okx_native_full_close_not_confirmed",
+            "okx_native_full_close_fill_pending",
+        }:
+            return ""
+        return raw_order_id
 
     @staticmethod
     def _manual_close_order_side(result: ExecutionResult, action: Action) -> str:
@@ -11693,6 +11734,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if raw_side in {"buy", "sell"}:
             return raw_side
         return "sell" if action == Action.CLOSE_LONG else "buy"
+
+    @staticmethod
+    def _manual_close_exchange_flat_pending_backfill(result: ExecutionResult) -> bool:
+        """Accept only a native full close whose exchange position is already zero."""
+
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        if not (
+            raw.get("okx_native_close_position") is True
+            and raw.get("requires_okx_fill_backfill") is True
+        ):
+            return False
+        try:
+            contracts_after = abs(float(raw.get("position_contracts_after") or 0.0))
+            remaining_contracts = abs(float(raw.get("remaining_contracts") or 0.0))
+        except (TypeError, ValueError):
+            return False
+        return contracts_after <= 1e-12 and remaining_contracts <= 1e-12
 
     def _manual_close_exchange_base_quantity(self, exchange_position: dict[str, Any]) -> float:
         info = self._safe_dict(exchange_position.get("info"))
@@ -11796,13 +11854,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 close_qty,
                 result.quantity,
             )
+            pending_fill_backfill = self._manual_close_exchange_flat_pending_backfill(result)
             settlement = build_position_settlement_snapshot(
                 close_fill_pnl=gross_pnl,
                 entry_fee=entry_fee,
                 close_fee=close_fee,
                 funding_fee=funding_fee,
-                status=SETTLEMENT_STATUS_SETTLING,
-                source="manual_close_execution",
+                status=(
+                    "pending_okx_fill_backfill"
+                    if pending_fill_backfill
+                    else SETTLEMENT_STATUS_SETTLING
+                ),
+                source=(
+                    "manual_close_okx_fill_pending_backfill"
+                    if pending_fill_backfill
+                    else "manual_close_execution"
+                ),
                 synced_at=result.timestamp,
                 raw={
                     "gross_pnl_source": gross_pnl_source,
@@ -12030,7 +12097,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             }
 
         execution_completed = self._is_exchange_confirmed_execution(execution_result)
-        if not execution_completed:
+        exchange_flat_pending_backfill = self._manual_close_exchange_flat_pending_backfill(
+            execution_result
+        )
+        if not execution_completed and not exchange_flat_pending_backfill:
             await self._record_strategy_learning_event(
                 mode=execution_mode,
                 model_name=model_name,
@@ -12101,6 +12171,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return {
             "approved": True,
             "closed": bool(persisted.get("closed")),
+            "settlement_pending": exchange_flat_pending_backfill,
+            "settlement_status": (
+                "pending_okx_fill_backfill" if exchange_flat_pending_backfill else "settled"
+            ),
             "position_id": position.get("id"),
             "symbol": symbol,
             "side": side,

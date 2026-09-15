@@ -66,12 +66,19 @@ def validate_cloud_reviewer_route(
     model_id = str(model or "").strip()
     model_revision = str(revision or "").strip()
     key = str(api_key or "").strip()
-    if not base or not model_id or not model_revision or not key:
+    # Most OpenAI-compatible cloud gateways expose a stable model ID but do
+    # not publish a provider revision.  Requiring an invented revision blocks
+    # otherwise verifiable routes and gives the operator no value.  When a
+    # provider does publish one we retain and validate it as extra identity.
+    if not base or not model_id or not key:
         return False, "cloud_reviewer_identity_incomplete"
     lowered_model = model_id.lower()
     if any(marker in lowered_model for marker in _RETIRED_REVIEWER_MARKERS):
         return False, "retired_local_reviewer_model"
-    if any(value in {"unknown", "unverified", "pending"} for value in (model_id.lower(), model_revision.lower())):
+    identity_values = [model_id.lower()]
+    if model_revision:
+        identity_values.append(model_revision.lower())
+    if any(value in {"unknown", "unverified", "pending"} for value in identity_values):
         return False, "cloud_reviewer_identity_placeholder"
     try:
         parsed = urlsplit(base)
