@@ -97,7 +97,12 @@ def test_win_rate_does_not_flow_into_production_decisions(
 
 
 def test_local_quant_training_has_no_hindsight_best_direction_target() -> None:
-    source = _source("scripts/deploy_local_ai_tools_service.py")
+    source = "\n".join(
+        (
+            _source("scripts/deploy_local_ai_tools_service.py"),
+            _source("scripts/phase3_quant_api_service.py"),
+        )
+    )
 
     assert 'max(r["long_return"], r["short_return"], key=abs)' not in source
     assert (

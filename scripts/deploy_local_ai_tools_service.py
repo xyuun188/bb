@@ -10,6 +10,8 @@ import textwrap
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from scripts.phase3_quant_api_source import SERVICE_CODE
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -29,8 +31,6 @@ PHASE3_RUNTIME_DIR = f"{PHASE3_ROOT}/runtime/phase3_quant_api"
 PHASE3_ENV_FILE = f"{PHASE3_ROOT}/env/phase3.env"
 PHASE3_PYTHON_BIN = f"{PHASE3_ROOT}/envs/phase3-quant/bin/python"
 PHASE3_POLICY_ID = "phase3_quant_api_shadow_contract_v2_2026_06_27"
-
-from scripts.phase3_quant_api_source import SERVICE_CODE
 
 def sh(value: str | int | float) -> str:
     text = str(value)
