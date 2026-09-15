@@ -142,6 +142,11 @@ async def test_paper_start_entrypoint_starts_only_after_ready_and_confirmed() ->
 
     def runner(args: list[str], _timeout: float) -> CommandResult:
         calls.append(args)
+        if args[1].endswith("apply_phase3_paper_resume_control.py"):
+            return CommandResult(
+                status=0,
+                stdout='{"status":"ok","action":"resume","after":{"paused":false}}',
+            )
         if args[:2] == ["systemctl", "start"]:
             return CommandResult(status=0, stdout="")
         return CommandResult(status=0, stdout="active")
@@ -155,8 +160,21 @@ async def test_paper_start_entrypoint_starts_only_after_ready_and_confirmed() ->
 
     assert report["status"] == "started"
     assert report["starts_trading_service"] is True
+    assert report["control_state_resumed"] is True
     assert report["submits_orders"] is False
     assert calls == [
+        [
+            calls[0][0],
+            str(start_cli.ROOT / "scripts" / "apply_phase3_paper_resume_control.py"),
+            "--action",
+            "resume",
+            "--confirm-resume-paper",
+            CONFIRMATION_PHRASE,
+            "--stdout-only",
+            "--json-indent",
+            "0",
+            "--fail-on-blocked",
+        ],
         ["systemctl", "start", "bb-paper-trading.service"],
         ["systemctl", "is-active", "bb-paper-trading.service"],
     ]
@@ -173,6 +191,11 @@ async def test_paper_start_entrypoint_default_path_runs_preflight_command_before
                 status=0,
                 stdout='{"status":"ready","can_resume_paper":true,"blockers":[]}',
             )
+        if args[1].endswith("apply_phase3_paper_resume_control.py"):
+            return CommandResult(
+                status=0,
+                stdout='{"status":"ok","action":"resume","after":{"paused":false}}',
+            )
         if args[:2] == ["systemctl", "start"]:
             return CommandResult(status=0, stdout="")
         return CommandResult(status=0, stdout="active")
@@ -186,10 +209,41 @@ async def test_paper_start_entrypoint_default_path_runs_preflight_command_before
     assert report["status"] == "started"
     assert [call[:2] for call in calls] == [
         [calls[0][0], calls[0][1]],
+        [calls[1][0], calls[1][1]],
         ["systemctl", "start"],
         ["systemctl", "is-active"],
     ]
     assert calls[0][1].endswith("run_phase3_paper_resume_preflight.py")
+    assert calls[1][1].endswith("apply_phase3_paper_resume_control.py")
+
+
+@pytest.mark.asyncio
+async def test_paper_start_failure_rolls_control_state_back_to_paused() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], _timeout: float) -> CommandResult:
+        calls.append(args)
+        if args[1].endswith("apply_phase3_paper_resume_control.py"):
+            action = args[args.index("--action") + 1]
+            return CommandResult(status=0, stdout=f'{{"status":"ok","action":"{action}"}}')
+        if args[:2] == ["systemctl", "start"]:
+            return CommandResult(status=1, stderr="failed")
+        raise AssertionError(args)
+
+    report = await build_phase3_paper_start_report(
+        preflight_provider=_ready_preflight,
+        command_runner=runner,
+        start_service=True,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["action_status"] == "start_failed"
+    assert report["rollback_paused"] is True
+    assert [call[call.index("--action") + 1] for call in calls if "--action" in call] == [
+        "resume",
+        "pause",
+    ]
 
 
 @pytest.mark.asyncio

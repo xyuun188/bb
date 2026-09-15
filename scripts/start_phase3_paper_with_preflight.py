@@ -30,11 +30,13 @@ load_runtime_env_files(project_root=ROOT)
 
 # These imports must follow runtime environment loading because settings are read at import time.
 from core.safe_output import safe_error_text  # noqa: E402
+from scripts.apply_phase3_paper_resume_control import (  # noqa: E402
+    CONFIRMATION_PHRASE,
+)
 from scripts.run_phase3_paper_resume_preflight import (  # noqa: E402
     write_report as write_preflight_report,
 )
 
-CONFIRMATION_PHRASE = "CONFIRM_PHASE3_PAPER_RESUME"
 DEFAULT_SERVICE_NAME = "bb-paper-trading.service"
 
 
@@ -130,6 +132,47 @@ def collect_phase3_paper_resume_preflight_via_command(
     }
 
 
+def apply_paper_control_via_command(
+    *,
+    action: str,
+    confirmation: str,
+    command_runner: CommandRunner = _run_command,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "apply_phase3_paper_resume_control.py"),
+        "--action",
+        str(action),
+        "--confirm-resume-paper",
+        str(confirmation or ""),
+        "--stdout-only",
+        "--json-indent",
+        "0",
+        "--fail-on-blocked",
+    ]
+    result = command_runner(command, max(float(timeout_seconds or 1.0), 1.0))
+    payload = _parse_json_stdout(result.stdout)
+    if result.status == 0 and payload.get("status") == "ok":
+        return payload
+    return {
+        "status": "blocked",
+        "action": action,
+        "blockers": [
+            {
+                "code": f"paper_control_{action}_failed",
+                "severity": "blocking",
+                "message": f"Paper control {action} did not complete successfully.",
+                "evidence": {
+                    "status": result.status,
+                    "stdout": str(result.stdout or "")[-1000:],
+                    "stderr": str(result.stderr or "")[-1000:],
+                },
+            }
+        ],
+    }
+
+
 async def _maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
@@ -169,7 +212,10 @@ async def build_phase3_paper_start_report(
     action_status = "preflight_only"
     blockers: list[dict[str, Any]] = []
     command_results: list[dict[str, Any]] = []
+    control_actions: list[dict[str, Any]] = []
     started = False
+    control_state_resumed = False
+    rollback_paused = False
 
     if not can_resume:
         blockers.append(
@@ -195,36 +241,56 @@ async def build_phase3_paper_start_report(
         if blockers:
             action_status = "blocked"
         else:
-            start_result = command_runner(
-                ["systemctl", "start", service_name],
-                max(float(command_timeout_seconds or 1.0), 1.0),
+            resume_result = apply_paper_control_via_command(
+                action="resume",
+                confirmation=confirm_resume_paper,
+                command_runner=command_runner,
+                timeout_seconds=command_timeout_seconds,
             )
-            command_results.append(
-                {
-                    "command": ["systemctl", "start", service_name],
-                    "status": start_result.status,
-                    "stdout": start_result.stdout,
-                    "stderr": start_result.stderr,
-                }
-            )
-            if start_result.status == 0:
-                active_result = command_runner(
-                    ["systemctl", "is-active", service_name],
+            control_actions.append(resume_result)
+            control_state_resumed = resume_result.get("status") == "ok"
+            if not control_state_resumed:
+                action_status = "control_resume_failed"
+            else:
+                start_result = command_runner(
+                    ["systemctl", "start", service_name],
                     max(float(command_timeout_seconds or 1.0), 1.0),
                 )
                 command_results.append(
                     {
-                        "command": ["systemctl", "is-active", service_name],
-                        "status": active_result.status,
-                        "stdout": active_result.stdout,
-                        "stderr": active_result.stderr,
+                        "command": ["systemctl", "start", service_name],
+                        "status": start_result.status,
+                        "stdout": start_result.stdout,
+                        "stderr": start_result.stderr,
                     }
                 )
-                started = active_result.status == 0 and active_result.stdout.strip() == "active"
-                action_status = "started" if started else "start_verification_failed"
-            else:
-                action_status = "start_failed"
+                if start_result.status == 0:
+                    active_result = command_runner(
+                        ["systemctl", "is-active", service_name],
+                        max(float(command_timeout_seconds or 1.0), 1.0),
+                    )
+                    command_results.append(
+                        {
+                            "command": ["systemctl", "is-active", service_name],
+                            "status": active_result.status,
+                            "stdout": active_result.stdout,
+                            "stderr": active_result.stderr,
+                        }
+                    )
+                    started = active_result.status == 0 and active_result.stdout.strip() == "active"
+                    action_status = "started" if started else "start_verification_failed"
+                else:
+                    action_status = "start_failed"
             if not started:
+                if control_state_resumed:
+                    rollback_result = apply_paper_control_via_command(
+                        action="pause",
+                        confirmation=confirm_resume_paper,
+                        command_runner=command_runner,
+                        timeout_seconds=command_timeout_seconds,
+                    )
+                    control_actions.append(rollback_result)
+                    rollback_paused = rollback_result.get("status") == "ok"
                 blockers.append(
                     {
                         "code": action_status,
@@ -246,16 +312,20 @@ async def build_phase3_paper_start_report(
         "confirmation_phrase_required": CONFIRMATION_PHRASE,
         "confirmation_present": confirmed,
         "starts_trading_service": started,
+        "control_state_resumed": control_state_resumed,
+        "rollback_paused": rollback_paused,
         "submits_orders": False,
         "changes_model_routing": False,
         "live_trading_enabled": False,
         "operator_controlled": True,
         "blockers": blockers,
         "command_results": command_results,
+        "control_actions": control_actions,
         "action_status": action_status,
         "safety_note": (
             "This entrypoint never bypasses the Phase 3 paper-resume preflight. "
-            "Without --start-service and the explicit confirmation token it only writes a report."
+            "Without --start-service and the explicit confirmation token it only writes a report. "
+            "A failed service start is rolled back to paused paper control state."
         ),
     }
 
