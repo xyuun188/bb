@@ -146,6 +146,15 @@ POSITION_CAPACITY_RELEASE_AUDIT_LIMIT = 500
 STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_HOURS = 24
 STRATEGY_SIGNAL_ROOT_CAUSE_AUDIT_LIMIT = 500
 OPTIONAL_TRAINING_SOURCE_STATUSES = {"disabled", "not_configured"}
+# The aggregate/platform scheduler and optional local-AI-tools scheduler are
+# owned by the trading process. They are intentionally stopped while Phase 3
+# is No-Go. The dedicated local-ML timer is the required scheduler because it
+# continues to run independently while trading is paused.
+REQUIRED_TRAINING_SCHEDULER_IDS = {"local_ml_auto_train"}
+OPTIONAL_TRAINING_SCHEDULER_IDS = {
+    "platform_model_training_loop",
+    "local_ai_tools_auto_train",
+}
 TRADE_EXECUTION_CONTRACT_AUDIT_HOURS = 24
 TRADE_EXECUTION_CONTRACT_AUDIT_LIMIT = 500
 TRADE_EXECUTION_CONTRACT_REPORT_TIMEOUT_SECONDS = 15.0
@@ -326,6 +335,35 @@ def _trade_execution_contract_lock() -> asyncio.Lock:
     if _trade_execution_contract_report_lock is None:
         _trade_execution_contract_report_lock = asyncio.Lock()
     return _trade_execution_contract_report_lock
+
+
+def _training_scheduler_scope(state: dict[str, Any]) -> dict[str, Any]:
+    """Partition stale training schedulers by whether they are required now.
+
+    The platform aggregate loop is coupled to trading and is expected to be
+    paused during a Phase 3 No-Go. Only the dedicated local-ML timer is a
+    required readiness signal while trading remains stopped.
+    """
+
+    stale_scheduler_ids = {
+        str(item) for item in (state.get("stale_scheduler_ids") or []) if str(item)
+    }
+    required_stale = sorted(stale_scheduler_ids & REQUIRED_TRAINING_SCHEDULER_IDS)
+    optional_stale = sorted(stale_scheduler_ids & OPTIONAL_TRAINING_SCHEDULER_IDS)
+    unknown_stale = sorted(
+        stale_scheduler_ids
+        - REQUIRED_TRAINING_SCHEDULER_IDS
+        - OPTIONAL_TRAINING_SCHEDULER_IDS
+    )
+    return {
+        "stale_scheduler_ids": sorted(stale_scheduler_ids),
+        "required_stale_scheduler_ids": required_stale,
+        "optional_stale_scheduler_ids": optional_stale,
+        "unknown_stale_scheduler_ids": unknown_stale,
+        "required_scheduler_ids": sorted(REQUIRED_TRAINING_SCHEDULER_IDS),
+        "optional_scheduler_ids": sorted(OPTIONAL_TRAINING_SCHEDULER_IDS),
+        "required_stale": bool(required_stale or unknown_stale),
+    }
 
 
 def _cache_trade_execution_contract_task_result(
@@ -4457,7 +4495,16 @@ async def _model_training_audit() -> dict[str, Any]:
         runtime_probe_timeout_is_observing
     )
     training_scheduler_state = MODEL_TRAINING_STATE_STORE.read()
-    training_scheduler_stale = bool(training_scheduler_state.get("heartbeat_stale"))
+    scheduler_scope = _training_scheduler_scope(training_scheduler_state)
+    stale_scheduler_ids = set(scheduler_scope["stale_scheduler_ids"])
+    required_stale_scheduler_ids = scheduler_scope["required_stale_scheduler_ids"]
+    optional_stale_scheduler_ids = scheduler_scope["optional_stale_scheduler_ids"]
+    unknown_stale_scheduler_ids = scheduler_scope["unknown_stale_scheduler_ids"]
+    # Do not report the intentionally stopped trading-process schedulers as a
+    # local-ML health failure. Their IDs remain visible in the payload so an
+    # operator can distinguish a paused optional loop from a broken required
+    # local-ML timer.
+    training_scheduler_stale = bool(scheduler_scope["required_stale"])
     training_scheduler_error = training_scheduler_state.get("status") == "error"
     training_scheduler_unavailable = training_scheduler_state.get("status") == "unavailable"
     training_timeout_exceeded = bool(training_scheduler_state.get("training_timeout_exceeded"))
@@ -4501,6 +4548,12 @@ async def _model_training_audit() -> dict[str, Any]:
             for item in resource_failure_models
         ),
         "resource_models": resource_failure_models[:8],
+        "stale_scheduler_ids": sorted(stale_scheduler_ids),
+        "required_stale_scheduler_ids": required_stale_scheduler_ids,
+        "optional_stale_scheduler_ids": optional_stale_scheduler_ids,
+        "unknown_stale_scheduler_ids": unknown_stale_scheduler_ids,
+        "required_scheduler_ids": sorted(REQUIRED_TRAINING_SCHEDULER_IDS),
+        "optional_scheduler_ids": sorted(OPTIONAL_TRAINING_SCHEDULER_IDS),
     }
     hard_failure = (
         bool(model_critical)
@@ -4590,6 +4643,8 @@ async def _model_training_audit() -> dict[str, Any]:
             observing_reasons.append("旧模型产物退役巡检暂不可用")
         if training_scheduler_stale:
             observing_reasons.append("训练调度心跳过期")
+        elif optional_stale_scheduler_ids:
+            observing_reasons.append("交易进程停机，附属训练循环暂停")
         if training_scheduler_error:
             observing_reasons.append("训练调度状态不可读")
         if training_scheduler_unavailable:
@@ -4669,6 +4724,14 @@ async def _model_training_audit() -> dict[str, Any]:
             "historical_trade_fact_audit": historical_trade_fact_report,
             "artifact_retirement_audit": artifact_retirement_report,
             "model_training_scheduler_state": training_scheduler_state,
+            "training_scheduler_scope": {
+                "required_scheduler_ids": sorted(REQUIRED_TRAINING_SCHEDULER_IDS),
+                "optional_scheduler_ids": sorted(OPTIONAL_TRAINING_SCHEDULER_IDS),
+                "stale_scheduler_ids": sorted(stale_scheduler_ids),
+                "required_stale_scheduler_ids": required_stale_scheduler_ids,
+                "optional_stale_scheduler_ids": optional_stale_scheduler_ids,
+                "unknown_stale_scheduler_ids": unknown_stale_scheduler_ids,
+            },
             "governance_status": governance.get("status") if isinstance(governance, dict) else None,
             "runtime_probe": runtime_probe,
             "runtime_probe_attempts": runtime_probe_attempts,

@@ -25,6 +25,24 @@ def test_okx_reconciliation_dashboard_scan_capacity_covers_current_history() -> 
     assert system_audit.OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS >= 2000
 
 
+def test_training_scheduler_scope_does_not_promote_paused_trading_loops_to_required_stale() -> None:
+    scope = system_audit._training_scheduler_scope(
+        {
+            "stale_scheduler_ids": [
+                "platform_model_training_loop",
+                "local_ai_tools_auto_train",
+            ]
+        }
+    )
+
+    assert scope["required_stale"] is False
+    assert scope["required_stale_scheduler_ids"] == []
+    assert scope["optional_stale_scheduler_ids"] == [
+        "local_ai_tools_auto_train",
+        "platform_model_training_loop",
+    ]
+
+
 def test_required_audit_card_reuses_recent_completed_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
