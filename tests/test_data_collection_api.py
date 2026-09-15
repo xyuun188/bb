@@ -843,7 +843,7 @@ async def test_training_governance_refresh_triggers_clean_artifact_refresh(
             return {"trained": True, "force": force}
 
     class FakeTradingService:
-        async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
+        async def train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
             calls.append(f"local_ai:{force}")
             return {"trained": True, "force": force}
 
@@ -925,7 +925,7 @@ async def test_training_governance_refresh_blocks_when_okx_daily_gate_blocks(
             return {"trained": True, "force": force}
 
     class FakeTradingService:
-        async def _maybe_train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
+        async def train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
             calls.append(f"local_ai:{force}")
             return {"trained": True, "force": force}
 

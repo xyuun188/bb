@@ -1715,7 +1715,7 @@ async def refresh_training_governance(
 
     trading_service = getattr(_dash, "_trading_service", None)
     if trading_service is not None:
-        trainer = getattr(trading_service, "_maybe_train_local_ai_tools", None)
+        trainer = getattr(trading_service, "train_local_ai_tools", None)
         if callable(trainer):
             local_ai_result = await trainer(force=True)
     else:

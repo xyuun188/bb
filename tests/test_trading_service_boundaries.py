@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+import services.model_training_coordinator as model_training_coordinator
 import services.sync_service as sync_module
 import services.trading_service as trading_service
 from ai_brain.base_model import Action, DecisionOutput
@@ -2806,7 +2807,7 @@ async def test_local_ai_tools_auto_train_blocks_when_okx_daily_training_gate_blo
     )
     service.local_ai_tools = FakeLocalAITools()
 
-    result = await service._maybe_train_local_ai_tools(force=True)
+    result = await service.train_local_ai_tools(force=True)
 
     assert result["trained"] is False
     assert result["reason"] == "okx_daily_reconciliation_training_blocked"
@@ -3022,7 +3023,7 @@ def test_dead_training_subprocess_closes_state_and_reclaims_lease() -> None:
         "try_acquire_lease",
         {
             "scheduler_id": "local_ml_auto_train",
-            "stale_after_seconds": trading_service.AUTO_TRAIN_LEASE_STALE_SECONDS,
+            "stale_after_seconds": model_training_coordinator.AUTO_TRAIN_LEASE_STALE_SECONDS,
         },
     )
     assert released == [True]
@@ -3261,7 +3262,7 @@ async def test_local_ml_auto_train_failure_uses_retry_interval(
             "training_process_isolated": True,
         }
     )
-    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+    service.train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
         {"trained": False, "reason": "not_due"}
     )
 
@@ -3306,7 +3307,7 @@ async def test_local_ml_immature_partition_is_info_and_uses_normal_interval(
             "purged_training_sample_count": 37,
         }
     )
-    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+    service.train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
         {"trained": False, "reason": "not_due"}
     )
 
@@ -3318,12 +3319,12 @@ async def test_local_ml_immature_partition_is_info_and_uses_normal_interval(
         info=lambda event, **kwargs: logs.append(("info", event, kwargs)),
         warning=lambda event, **kwargs: logs.append(("warning", event, kwargs)),
     )
-    monkeypatch.setattr(trading_service, "logger", logger)
+    monkeypatch.setattr(model_training_coordinator, "logger", logger)
     monkeypatch.setattr(trading_service.asyncio, "sleep", stop_after_sleep)
 
     await service._ml_auto_train_loop()
 
-    assert delays == [trading_service.AUTO_TRAIN_CHECK_INTERVAL_SECONDS]
+    assert delays == [model_training_coordinator.AUTO_TRAIN_CHECK_INTERVAL_SECONDS]
     assert [level for level, _event, _kwargs in logs] == ["info"]
     assert logs[0][1] == "local ML signal auto-train waiting for mature data"
     assert logs[0][2]["purged_training_sample_count"] == 37
@@ -3341,7 +3342,7 @@ async def test_local_ai_training_failure_uses_retry_interval(
     service._run_local_ml_training_subprocess = lambda: _async_value(  # type: ignore[method-assign]
         {"trained": False, "reason": "not_due"}
     )
-    service._maybe_train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
+    service.train_local_ai_tools = lambda: _async_value(  # type: ignore[method-assign]
         {
             "trained": False,
             "reason": reason,
@@ -3380,7 +3381,7 @@ async def test_local_ai_training_runs_after_long_ml_run_to_avoid_resource_conten
         return {"trained": False, "reason": "not_due"}
 
     service._run_local_ml_training_subprocess = slow_ml  # type: ignore[method-assign]
-    service._maybe_train_local_ai_tools = local_ai  # type: ignore[method-assign]
+    service.train_local_ai_tools = local_ai  # type: ignore[method-assign]
 
     async def stop_after_sleep(_delay: float) -> None:
         service._running = False
@@ -3492,7 +3493,7 @@ async def test_local_ai_tools_auto_train_persists_artifact_after_status_probe_fa
         }
     )
 
-    result = await service._maybe_train_local_ai_tools(force=True)
+    result = await service.train_local_ai_tools(force=True)
 
     assert result["trained"] is True
     assert result["completed_shadow_sample_count"] == 9999
@@ -6739,8 +6740,8 @@ async def test_auto_training_waits_for_startup_grace_before_first_check(
         return {"trained": False, "reason": "not_due"}
 
     service._run_local_ml_training_subprocess = fake_ml_step  # type: ignore[method-assign]
-    service._maybe_train_local_ai_tools = fake_ml_step  # type: ignore[method-assign]
-    monkeypatch.setattr(trading_service, "TRAINING_STARTUP_GRACE_SECONDS", 0.02)
+    service.train_local_ai_tools = fake_ml_step  # type: ignore[method-assign]
+    monkeypatch.setattr(model_training_coordinator, "TRAINING_STARTUP_GRACE_SECONDS", 0.02)
 
     task = asyncio.create_task(service._ml_auto_train_loop())
     await asyncio.sleep(0)
@@ -12637,3 +12638,18 @@ async def test_position_review_service_fails_fast_without_boundaries():
             max_groups_override=1,
             claimed_analysis_symbols=[],
         )
+
+
+def test_model_training_coordinator_owns_extracted_methods() -> None:
+    extracted_methods = {
+        "initialize_model_training",
+        "start_model_training",
+        "stop_model_training",
+        "train_local_ai_tools",
+        "_maybe_train_local_ai_tools_process",
+    }
+    assert extracted_methods.isdisjoint(TradingService.__dict__)
+    assert (
+        extracted_methods
+        <= model_training_coordinator.ModelTrainingCoordinatorMixin.__dict__.keys()
+    )

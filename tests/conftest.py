@@ -26,7 +26,7 @@ def isolate_model_training_scheduler_state(tmp_path, monkeypatch):
 
     store = ModelTrainingStateStore(tmp_path / "model_training_scheduler_state.json")
     monkeypatch.setattr("services.ml_signal_service.MODEL_TRAINING_STATE_STORE", store)
-    monkeypatch.setattr("services.trading_service.MODEL_TRAINING_STATE_STORE", store)
+    monkeypatch.setattr("services.model_training_coordinator.MODEL_TRAINING_STATE_STORE", store)
     data_collection = sys.modules.get("web_dashboard.api.data_collection")
     if data_collection is not None:
         monkeypatch.setattr(data_collection, "MODEL_TRAINING_STATE_STORE", store)

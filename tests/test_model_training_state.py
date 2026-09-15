@@ -18,14 +18,14 @@ from services.model_training_state import (
 
 def test_pytest_scheduler_state_isolated_from_runtime_data() -> None:
     from config.settings import settings
-    from services import ml_signal_service, trading_service
+    from services import ml_signal_service, model_training_coordinator
     from web_dashboard.api import data_collection
 
     runtime_path = (settings.data_dir / "model_training_scheduler_state.json").resolve()
     test_store = ml_signal_service.MODEL_TRAINING_STATE_STORE
 
     assert test_store.path.resolve() != runtime_path
-    assert trading_service.MODEL_TRAINING_STATE_STORE is test_store
+    assert model_training_coordinator.MODEL_TRAINING_STATE_STORE is test_store
     assert data_collection.MODEL_TRAINING_STATE_STORE is test_store
 
 
