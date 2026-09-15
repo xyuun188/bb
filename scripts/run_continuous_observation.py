@@ -13,7 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import settings
 from db.session import close_db, init_db
-from services.continuous_observation import ContinuousObservationScheduler
+from services.continuous_observation import (
+    ContinuousObservationScheduler,
+    ContinuousObservationWorkerState,
+)
 from services.secure_runtime_config import load_secure_settings_into_runtime
 from web_dashboard.api.dashboard import (
     CONTINUOUS_OBSERVATION_STORES,
@@ -29,16 +32,31 @@ async def main() -> None:
         except OSError:
             pass
 
-    await init_db(migrate_schema=False)
-    await load_secure_settings_into_runtime()
+    worker_state = ContinuousObservationWorkerState(
+        settings.data_dir / "dashboard_read_models" / "continuous_observation_worker.json"
+    )
+    worker_state.mark_started()
+    startup_timeout_seconds = max(
+        float(os.environ.get("BB_CONTINUOUS_OBSERVATION_STARTUP_TIMEOUT_SECONDS", "45")),
+        5.0,
+    )
+    try:
+        await asyncio.wait_for(init_db(migrate_schema=False), timeout=startup_timeout_seconds)
+        await asyncio.wait_for(
+            load_secure_settings_into_runtime(), timeout=startup_timeout_seconds
+        )
+    except TimeoutError:
+        worker_state.mark_error("startup_timeout")
+        raise
+    except Exception as exc:
+        worker_state.mark_error(f"startup_error:{type(exc).__name__}")
+        raise
     scheduler = ContinuousObservationScheduler(
         CONTINUOUS_OBSERVATION_STORES,
         collect_continuous_observation_metrics,
         interval_seconds=300.0,
         startup_delay_seconds=0.0,
-        worker_state_path=(
-            settings.data_dir / "dashboard_read_models" / "continuous_observation_worker.json"
-        ),
+        worker_state_path=worker_state.path,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
