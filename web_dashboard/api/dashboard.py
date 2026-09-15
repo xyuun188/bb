@@ -98,6 +98,7 @@ from services.training_effectiveness_report import (
 )
 from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
+from web_dashboard.api.model_training_status import load_model_training_report
 from web_dashboard.api.security import require_destructive_dashboard_confirmation
 from web_dashboard.api.text_sanitize import sanitize_payload, sanitize_text
 
@@ -165,7 +166,6 @@ _DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 18.0
 _DASHBOARD_LOCAL_AI_STATUS_STALE_MAX_AGE_SECONDS = 15 * 60.0
 _DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 2.0
 _DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS = 1.5
-_DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS = 4.0
 _DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS = 120.0
 _DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_MODEL_CONTRIBUTION_STATS_TIMEOUT_SECONDS = 12.0
@@ -228,9 +228,7 @@ _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 _model_observability_refresh_task: asyncio.Task[Any] | None = None
 _dashboard_summary_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
-_dashboard_model_contribution_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
 _dashboard_model_contribution_stats_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
-_dashboard_model_training_registry_refresh_task: asyncio.Task[Any] | None = None
 
 
 def _dashboard_open_position_snapshot_key(selected_mode: str) -> str:
@@ -8263,14 +8261,6 @@ async def get_local_ai_tools_status():
     return status
 
 
-def _load_model_training_report(relative_path: str) -> dict[str, Any]:
-    try:
-        payload = json.loads((settings.data_dir / relative_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
 async def _build_authoritative_profit_observability(
     *, mode: str | None = None, since_hours: float | None = None
 ) -> dict[str, Any]:
@@ -8556,10 +8546,10 @@ async def _build_model_observability_snapshot(
         bounded(_build_expert_memory_observability, "expert_memory"),
     )
     scheduler = MODEL_TRAINING_STATE_STORE.read()
-    specialist_report = _load_model_training_report(
+    specialist_report = load_model_training_report(
         "phase3/specialist_shadow_evaluation_latest.json"
     )
-    model_server_report = _load_model_training_report(
+    model_server_report = load_model_training_report(
         "phase3_model_server_readiness_reports/latest.json"
     )
     registry = build_model_training_registry(
@@ -8799,7 +8789,7 @@ async def _refresh_model_observability_cache() -> None:
 
 
 async def shutdown_dashboard_observability_tasks() -> None:
-    global _model_observability_refresh_task, _dashboard_model_training_registry_refresh_task
+    global _model_observability_refresh_task
     task = _model_observability_refresh_task
     _model_observability_refresh_task = None
     tasks = [task] if task is not None else []
@@ -8832,23 +8822,6 @@ async def shutdown_dashboard_observability_tasks() -> None:
             pass
     _dashboard_open_position_evidence_refresh_tasks.clear()
     _dashboard_open_position_evidence_cache.clear()
-    registry_task = _dashboard_model_training_registry_refresh_task
-    _dashboard_model_training_registry_refresh_task = None
-    if registry_task is not None and not registry_task.done():
-        registry_task.cancel()
-        try:
-            await registry_task
-        except asyncio.CancelledError:
-            pass
-    for task in list(_dashboard_model_contribution_refresh_tasks.values()):
-        if task.done():
-            continue
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    _dashboard_model_contribution_refresh_tasks.clear()
     for task in list(_dashboard_model_contribution_stats_refresh_tasks.values()):
         if task.done():
             continue
@@ -9174,119 +9147,6 @@ async def record_continuous_observation(metrics: dict[str, Any]) -> dict[str, An
             stale_after_seconds=300.0,
         )
     )
-
-
-async def _refresh_model_contribution_cache(selected_mode: str) -> None:
-    from services.model_contribution_performance import ModelContributionPerformanceService
-
-    cache_key = ("model-contribution-performance", selected_mode)
-    contribution = await asyncio.wait_for(
-        ModelContributionPerformanceService().recent(selected_mode),
-        timeout=_DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS,
-    )
-    _dashboard_heavy_cache_set(cache_key, contribution if isinstance(contribution, dict) else {})
-
-
-def _start_model_contribution_refresh(selected_mode: str) -> None:
-    task = _dashboard_model_contribution_refresh_tasks.get(selected_mode)
-    if task is not None and not task.done():
-        return
-    task = asyncio.create_task(_refresh_model_contribution_cache(selected_mode))
-    _dashboard_model_contribution_refresh_tasks[selected_mode] = task
-    task.add_done_callback(
-        _consume_dashboard_refresh_task(
-            _dashboard_model_contribution_refresh_tasks,
-            selected_mode,
-            label="model contribution",
-        )
-    )
-
-
-async def _build_model_training_registry_status() -> dict[str, Any]:
-    """Build the full registry off the request path."""
-
-    observability = await get_model_observability_snapshot()
-    observability_sections = observability.get("sections") if isinstance(observability, dict) else {}
-    observability_sections = observability_sections if isinstance(observability_sections, dict) else {}
-    local_ml_status = observability_sections.get("local_ml") or {"status": "missing"}
-    local_tools_status = observability_sections.get("local_ai_tools") or {"status": "missing"}
-    specialist_report = _load_model_training_report(
-        "phase3/specialist_shadow_evaluation_latest.json"
-    )
-    model_server_report = _load_model_training_report(
-        "phase3_model_server_readiness_reports/latest.json"
-    )
-    selected_mode = "live" if mode_manager.mode.value == "live" else "paper"
-    contribution_key = ("model-contribution-performance", selected_mode)
-    contribution_performance = _dashboard_heavy_cache_get(
-        contribution_key,
-        ttl_seconds=_DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS,
-    )
-    contribution_status = {
-        "state": "ready" if isinstance(contribution_performance, dict) else "warming",
-        "timeout_seconds": _DASHBOARD_MODEL_CONTRIBUTION_TIMEOUT_SECONDS,
-    }
-    if not isinstance(contribution_performance, dict):
-        contribution_performance = {}
-        _start_model_contribution_refresh(selected_mode)
-    scheduler_state = MODEL_TRAINING_STATE_STORE.read()
-    registry = build_model_training_registry(
-        local_ml_status=local_ml_status,
-        local_tools_status=local_tools_status,
-        specialist_report=specialist_report,
-        model_server_report=model_server_report,
-        contribution_performance=contribution_performance,
-        scheduler_state=scheduler_state,
-    )
-    registry["contribution_performance_status"] = contribution_status
-    registry["scheduler_state"] = scheduler_state
-    registry["model_observability"] = observability
-    return registry
-
-
-async def _refresh_model_training_registry_cache() -> None:
-    global _dashboard_model_training_registry_refresh_task
-    try:
-        payload = await _build_model_training_registry_status()
-        _dashboard_heavy_cache_set(("model-training-registry",), payload)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        _log_dashboard_fallback("model training registry background refresh failed", exc)
-    finally:
-        _dashboard_model_training_registry_refresh_task = None
-
-
-@router.get("/model-training/registry")
-async def get_model_training_registry_status() -> dict[str, Any]:
-    """Return a cached lifecycle view without blocking the dashboard request."""
-
-    cache_key = ("model-training-registry",)
-    cached = _dashboard_heavy_cache_get(cache_key, ttl_seconds=300.0)
-    if cached is not None:
-        return sanitize_payload(cached)
-
-    global _dashboard_model_training_registry_refresh_task
-    task = _dashboard_model_training_registry_refresh_task
-    if task is None or task.done():
-        task = asyncio.create_task(_refresh_model_training_registry_cache())
-        _dashboard_model_training_registry_refresh_task = task
-
-    observability = await get_model_observability_snapshot(request=object())
-    sections = observability.get("sections") if isinstance(observability, dict) else {}
-    sections = sections if isinstance(sections, dict) else {}
-    registry = build_model_training_registry(
-        local_ml_status=sections.get("local_ml") or {"status": "warming"},
-        local_tools_status=sections.get("local_ai_tools") or {"status": "warming"},
-    )
-    registry["model_observability"] = observability
-    registry["cache"] = {"hit": False, "refresh_in_background": True}
-    return sanitize_payload(registry)
-
-
-@router.get("/model-training/scheduler")
-async def get_model_training_scheduler_status() -> dict[str, Any]:
-    return sanitize_payload(MODEL_TRAINING_STATE_STORE.read())
 
 
 @router.get("/server-monitor/status")

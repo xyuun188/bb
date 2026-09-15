@@ -37,6 +37,7 @@ from services.server_monitor_status import (
 )
 from services.trade_execution_contract import entry_opportunity_evidence_score
 from web_dashboard.api import dashboard as _dash
+from web_dashboard.api import model_training_status
 from web_dashboard.api.text_sanitize import sanitize_payload
 
 # Preserve the module-level hook name used by existing tests/extensions while
@@ -1631,7 +1632,7 @@ async def _run_self_check_section(
 
 
 async def _model_training_identity_item() -> dict[str, Any]:
-    registry = await _dash.get_model_training_registry_status()
+    registry = await model_training_status.get_model_training_registry_status()
     summary = registry.get("summary") if isinstance(registry.get("summary"), dict) else {}
     alias_only = (
         summary.get("alias_only_models")

@@ -188,12 +188,22 @@ async def lifespan(app: FastAPI):
             shutdown_dashboard_observability_tasks,
             shutdown_dashboard_read_clients,
         )
+        from web_dashboard.api.model_training_status import (
+            shutdown_model_training_status_tasks,
+        )
 
         try:
             await shutdown_dashboard_observability_tasks()
         except Exception as exc:
             logger.warning(
                 "dashboard observability task shutdown failed",
+                error=safe_error_text(exc, limit=240),
+            )
+        try:
+            await shutdown_model_training_status_tasks()
+        except Exception as exc:
+            logger.warning(
+                "model training status task shutdown failed",
                 error=safe_error_text(exc, limit=240),
             )
         try:
