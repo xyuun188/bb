@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ MAX_SAMPLES = 2000
 EXPECTED_SAMPLE_INTERVAL_SECONDS = 300.0
 MAX_ALLOWED_SAMPLE_GAP_SECONDS = EXPECTED_SAMPLE_INTERVAL_SECONDS * 3
 MAX_LATEST_SAMPLE_AGE_SECONDS = EXPECTED_SAMPLE_INTERVAL_SECONDS * 3
+WORKER_STATE_VERSION = "2026-09-15.continuous-observation-worker.v1"
 
 _REQUIRED_24H_METRICS = (
     "service_restart_count",
@@ -91,6 +93,96 @@ def _normalise_metrics(value: Any) -> dict[str, Any]:
         if source.get(key):
             result[key] = str(source[key])[:300]
     return result
+
+
+class ContinuousObservationWorkerState:
+    """Persist worker liveness separately from the acceptance window facts."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def _default(self) -> dict[str, Any]:
+        return {
+            "version": WORKER_STATE_VERSION,
+            "status": "stopped",
+            "worker_pid": None,
+            "started_at": None,
+            "last_heartbeat_at": None,
+            "last_sample_at": None,
+            "sample_count": 0,
+            "error_count": 0,
+            "last_error": None,
+            "stopped_at": None,
+        }
+
+    def read(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return self._default()
+        if not isinstance(payload, dict) or payload.get("version") != WORKER_STATE_VERSION:
+            return self._default()
+        result = self._default()
+        result.update(payload)
+        return result
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.path.parent, delete=False
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        temporary.replace(self.path)
+
+    def _update(self, **fields: Any) -> dict[str, Any]:
+        payload = self.read()
+        payload.update(fields)
+        self._write(payload)
+        return payload
+
+    def mark_started(self, *, now: datetime | None = None) -> dict[str, Any]:
+        timestamp = _iso(now or _now())
+        return self._update(
+            status="running",
+            worker_pid=os.getpid(),
+            started_at=timestamp,
+            last_heartbeat_at=timestamp,
+            stopped_at=None,
+            last_error=None,
+        )
+
+    def mark_heartbeat(self, *, now: datetime | None = None) -> dict[str, Any]:
+        return self._update(
+            status="running",
+            last_heartbeat_at=_iso(now or _now()),
+        )
+
+    def mark_sample(self, *, now: datetime | None = None) -> dict[str, Any]:
+        payload = self.read()
+        return self._update(
+            status="running",
+            last_heartbeat_at=_iso(now or _now()),
+            last_sample_at=_iso(now or _now()),
+            sample_count=int(payload.get("sample_count") or 0) + 1,
+        )
+
+    def mark_error(self, error: str, *, now: datetime | None = None) -> dict[str, Any]:
+        payload = self.read()
+        return self._update(
+            status="degraded",
+            last_heartbeat_at=_iso(now or _now()),
+            error_count=int(payload.get("error_count") or 0) + 1,
+            last_error=str(error)[:300],
+        )
+
+    def mark_stopped(self, *, now: datetime | None = None) -> dict[str, Any]:
+        return self._update(
+            status="stopped",
+            last_heartbeat_at=_iso(now or _now()),
+            stopped_at=_iso(now or _now()),
+        )
 
 
 def observation_metrics_ready(metrics: Any) -> bool:
@@ -352,11 +444,17 @@ class ContinuousObservationScheduler:
         *,
         interval_seconds: float = 300.0,
         startup_delay_seconds: float = 5.0,
+        worker_state_path: Path | None = None,
     ) -> None:
         self.stores = stores
         self.collector = collector
         self.interval_seconds = max(float(interval_seconds), 1.0)
         self.startup_delay_seconds = max(float(startup_delay_seconds), 0.0)
+        self.worker_state = (
+            ContinuousObservationWorkerState(worker_state_path)
+            if worker_state_path is not None
+            else None
+        )
         self._task: asyncio.Task[Any] | None = None
         self._stop_event = asyncio.Event()
 
@@ -370,6 +468,8 @@ class ContinuousObservationScheduler:
         if self._task is not None and not self._task.done():
             return
         self._stop_event = asyncio.Event()
+        if self.worker_state is not None:
+            self.worker_state.mark_started()
         now = _now()
         pending_stores: list[tuple[int, ContinuousObservationStore]] = []
         for hours in ALLOWED_WINDOW_HOURS:
@@ -400,21 +500,29 @@ class ContinuousObservationScheduler:
         self._task = None
         self._stop_event.set()
         if task is None:
+            if self.worker_state is not None:
+                self.worker_state.mark_stopped()
             return
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        if self.worker_state is not None:
+            self.worker_state.mark_stopped()
 
     async def sample_once(self) -> dict[str, Any]:
         """Collect and persist one sample for every active window."""
 
+        if self.worker_state is not None:
+            self.worker_state.mark_heartbeat()
         try:
             metrics = await self.collector()
             if not isinstance(metrics, dict):
                 raise TypeError("observation_collector_must_return_mapping")
         except Exception as exc:
+            if self.worker_state is not None:
+                self.worker_state.mark_error(f"collector_error:{type(exc).__name__}")
             metrics = {
                 "source": "continuous_observation_scheduler",
                 "collection_errors": f"collector_error:{type(exc).__name__}",
@@ -445,6 +553,8 @@ class ContinuousObservationScheduler:
                     reset_reason=str(current.get("blocked_reason") or "blocked_window"),
                 )
             snapshots[str(hours)] = store.record(metrics, now=observed_at)
+        if self.worker_state is not None:
+            self.worker_state.mark_sample(now=observed_at)
         return snapshots
 
     async def _run(self) -> None:

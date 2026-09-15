@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from config.settings import settings
 from db.session import close_db, init_db
 from services.continuous_observation import ContinuousObservationScheduler
 from services.secure_runtime_config import load_secure_settings_into_runtime
@@ -35,6 +36,9 @@ async def main() -> None:
         collect_continuous_observation_metrics,
         interval_seconds=300.0,
         startup_delay_seconds=0.0,
+        worker_state_path=(
+            settings.data_dir / "dashboard_read_models" / "continuous_observation_worker.json"
+        ),
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

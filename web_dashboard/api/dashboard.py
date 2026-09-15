@@ -43,7 +43,10 @@ from services.account_accounting_service import (
     balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
-from services.continuous_observation import ContinuousObservationStore
+from services.continuous_observation import (
+    ContinuousObservationStore,
+    ContinuousObservationWorkerState,
+)
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.decision_state import decision_state_from_raw
 from services.entry_funnel_diagnostics import (
@@ -123,6 +126,9 @@ CONTINUOUS_OBSERVATION_STORES = {
     )
     for hours in (24, 72)
 }
+CONTINUOUS_OBSERVATION_WORKER_STATE = ContinuousObservationWorkerState(
+    settings.data_dir / "dashboard_read_models" / "continuous_observation_worker.json"
+)
 
 
 # In-memory reference to the trading service (set by main loop)
@@ -231,6 +237,9 @@ _DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS = 20.0
 _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 _model_observability_refresh_task: asyncio.Task[Any] | None = None
+_dashboard_model_observability_section_refresh_tasks: dict[
+    tuple[Any, ...], asyncio.Task[Any]
+] = {}
 _dashboard_summary_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _dashboard_model_contribution_stats_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 
@@ -8750,13 +8759,19 @@ async def _build_model_observability_snapshot(
         stale_ttl_seconds: float,
         timeout_seconds: float = 20.0,
     ) -> dict[str, Any]:
+        # Peek before the fresh lookup: _dashboard_heavy_cache_get evicts an
+        # expired entry, while stale-while-revalidate must retain that copy.
+        stale = _dashboard_heavy_cache_peek(key, max_age_seconds=stale_ttl_seconds)
         fresh = _dashboard_heavy_cache_get(key, ttl_seconds=ttl_seconds)
         if isinstance(fresh, dict):
             fresh.setdefault("cache", {"hit": True, "stale": False})
             return fresh
-        try:
-            value = await asyncio.wait_for(builder(), timeout=timeout_seconds)
-            if isinstance(value, dict):
+
+        async def refresh_section() -> dict[str, Any]:
+            try:
+                value = await asyncio.wait_for(builder(), timeout=timeout_seconds)
+                if not isinstance(value, dict):
+                    return {"status": "error", "degraded_reason": f"{name}_invalid"}
                 section_status = str(value.get("status") or "").strip().lower()
                 if section_status not in {
                     "error",
@@ -8767,25 +8782,60 @@ async def _build_model_observability_snapshot(
                 }:
                     _dashboard_heavy_cache_set(key, value)
                 return value
-            return {"status": "error", "degraded_reason": f"{name}_invalid"}
-        except TimeoutError:
-            reason = f"{name}_timeout"
-        except Exception as exc:
-            _log_dashboard_fallback(f"{name} observability fallback", exc)
-            reason = f"{name}_error:{safe_error_text(exc, limit=120)}"
-        stale = _dashboard_heavy_cache_peek(key, max_age_seconds=stale_ttl_seconds)
+            except TimeoutError:
+                return {"status": "timeout", "degraded_reason": f"{name}_timeout"}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log_dashboard_fallback(f"{name} observability fallback", exc)
+                return {
+                    "status": "error",
+                    "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
+                }
+            finally:
+                task = _dashboard_model_observability_section_refresh_tasks.get(key)
+                if task is asyncio.current_task():
+                    _dashboard_model_observability_section_refresh_tasks.pop(key, None)
+
+        def ensure_refresh_task() -> asyncio.Task[Any]:
+            existing = _dashboard_model_observability_section_refresh_tasks.get(key)
+            if existing is not None and not existing.done():
+                return existing
+            task = asyncio.create_task(refresh_section())
+            _dashboard_model_observability_section_refresh_tasks[key] = task
+            return task
+
+        # Return stale data immediately while one bounded refresh runs in the
+        # background. This keeps a slow diagnostic section from delaying the
+        # whole model-observability response.
         if isinstance(stale, dict):
+            ensure_refresh_task()
             stale["status"] = "stale"
             stale["stale"] = True
-            stale["stale_reason"] = reason
-            stale["degraded_reason"] = reason
+            stale["stale_reason"] = "refresh_in_background"
+            stale["degraded_reason"] = "refresh_in_background"
             stale["cache"] = {
                 "hit": True,
                 "stale": True,
                 "refresh_in_background": True,
             }
             return stale
-        return {"status": "timeout" if reason.endswith("_timeout") else "error", "degraded_reason": reason}
+
+        task = ensure_refresh_task()
+        try:
+            value = await asyncio.shield(task)
+            return value if isinstance(value, dict) else {
+                "status": "error",
+                "degraded_reason": f"{name}_invalid",
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log_dashboard_fallback(f"{name} observability fallback", exc)
+            return {
+                "status": "error",
+                "degraded_reason": f"{name}_error:{safe_error_text(exc, limit=120)}",
+            }
 
     async def trade_section() -> dict[str, Any]:
         if isinstance(trade_snapshot, dict):
@@ -9189,6 +9239,15 @@ async def shutdown_dashboard_observability_tasks() -> None:
         except asyncio.CancelledError:
             pass
     _dashboard_model_contribution_stats_refresh_tasks.clear()
+    for task in list(_dashboard_model_observability_section_refresh_tasks.values()):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _dashboard_model_observability_section_refresh_tasks.clear()
 
 
 def _warming_model_observability_payload() -> dict[str, Any]:
@@ -9465,7 +9524,11 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
     )
     return sanitize_payload(
         build_snapshot(
-            {"windows": windows, "required_windows": [24, 72]},
+            {
+                "windows": windows,
+                "required_windows": [24, 72],
+                "worker": CONTINUOUS_OBSERVATION_WORKER_STATE.read(),
+            },
             status=overall_status,
             source="dashboard.continuous_observation",
             stale_after_seconds=300.0,

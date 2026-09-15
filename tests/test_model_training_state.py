@@ -544,6 +544,43 @@ def test_stale_sub_scheduler_is_superseded_by_fresh_covering_scheduler(tmp_path)
     assert status["status"] == "ok"
 
 
+def test_stale_aggregate_scheduler_is_superseded_by_fresh_child_union(tmp_path) -> None:
+    now = [datetime(2026, 7, 12, 1, 0, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+    store.heartbeat(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        interval_seconds=1800,
+    )
+    store.heartbeat(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        interval_seconds=1800,
+    )
+    now[0] += timedelta(seconds=181)
+    store.heartbeat(
+        scheduler_id="platform_model_training_loop",
+        model_ids=(*LOCAL_ML_MODEL_IDS, *LOCAL_AI_TOOL_MODEL_IDS),
+        interval_seconds=120,
+    )
+    now[0] += timedelta(seconds=181)
+
+    status = store.read()
+    aggregate = status["schedulers"]["platform_model_training_loop"]
+    assert aggregate["heartbeat_stale"] is True
+    assert aggregate["heartbeat_superseded"] is True
+    assert set(aggregate["heartbeat_superseded_by"]) == {
+        "local_ai_tools_auto_train",
+        "local_ml_auto_train",
+    }
+    assert status["heartbeat_stale"] is False
+    assert status["stale_scheduler_ids"] == []
+    assert status["superseded_scheduler_ids"] == ["platform_model_training_loop"]
+
+
 def test_running_model_timeout_is_observable_without_stealing_live_lease(tmp_path) -> None:
     now = [datetime(2026, 7, 12, 1, 0, tzinfo=UTC)]
     store = ModelTrainingStateStore(

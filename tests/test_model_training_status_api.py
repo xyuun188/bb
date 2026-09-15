@@ -302,3 +302,53 @@ async def test_model_observability_does_not_cache_transient_section_timeout(
     assert first["sections"]["local_ml"]["status"] == "status_timeout"
     assert second["sections"]["local_ml"]["status"] == "trained"
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_model_observability_returns_stale_section_without_waiting_for_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def local_ml() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.5)
+        return {"status": "trained", "available": True}
+
+    async def fast_section() -> dict[str, Any]:
+        return {"status": "ok"}
+
+    monkeypatch.setattr(dashboard, "get_ml_signal_status", local_ml)
+    monkeypatch.setattr(dashboard, "get_local_ai_tools_status", fast_section)
+    monkeypatch.setattr(dashboard, "_latest_analysis_observability", fast_section)
+    monkeypatch.setattr(dashboard, "_build_trade_observability_snapshot", fast_section)
+    monkeypatch.setattr(dashboard, "_build_expert_memory_observability", fast_section)
+    monkeypatch.setattr(
+        dashboard,
+        "MODEL_TRAINING_STATE_STORE",
+        type("Store", (), {"read": lambda self: {}})(),
+    )
+    monkeypatch.setattr(dashboard, "load_model_training_report", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        dashboard,
+        "build_model_training_registry",
+        lambda **kwargs: {"models": [], "summary": {}, **kwargs},
+    )
+    dashboard._clear_dashboard_heavy_cache()
+    dashboard._dashboard_heavy_cache[("model-observability-local-ml",)] = (
+        datetime.now(UTC)
+        - timedelta(seconds=dashboard._DASHBOARD_MODEL_OBSERVABILITY_TTL_SECONDS + 1),
+        {"status": "trained", "available": True},
+    )
+
+    started = time.perf_counter()
+    payload = await dashboard._build_model_observability_snapshot()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.3
+    assert payload["sections"]["local_ml"]["status"] == "stale"
+    assert payload["sections"]["local_ml"]["cache"]["refresh_in_background"] is True
+    await asyncio.sleep(0)
+    assert calls == 1
+    await dashboard.shutdown_dashboard_observability_tasks()

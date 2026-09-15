@@ -449,12 +449,20 @@ class ModelTrainingStateStore:
                 continue
             normalized_id = str(scheduler_id)
             model_ids = scheduler_model_ids.get(normalized_id, set())
+            # A retired aggregate scheduler may be replaced by several
+            # independent timers (for example local-ML and local-AI-tools).
+            # Treat it as superseded when the union of fresh child schedulers
+            # covers every model, rather than requiring one child to own the
+            # whole aggregate set.
             covered_by = sorted(
                 fresh_id
                 for fresh_id, fresh_models in fresh_scheduler_models.items()
-                if fresh_id != normalized_id and model_ids and model_ids.issubset(fresh_models)
+                if fresh_id != normalized_id and model_ids.intersection(fresh_models)
             )
-            superseded = bool(raw.get("heartbeat_stale") and covered_by)
+            covered_models: set[str] = set()
+            for fresh_id in covered_by:
+                covered_models.update(fresh_scheduler_models.get(fresh_id, set()))
+            superseded = bool(raw.get("heartbeat_stale") and model_ids and model_ids.issubset(covered_models))
             raw["heartbeat_superseded"] = superseded
             raw["heartbeat_superseded_by"] = covered_by
             raw["heartbeat_effective_stale"] = bool(raw.get("heartbeat_stale") and not superseded)

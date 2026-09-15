@@ -6,6 +6,7 @@ import pytest
 from services.continuous_observation import (
     ContinuousObservationScheduler,
     ContinuousObservationStore,
+    ContinuousObservationWorkerState,
     observation_metrics_ready,
 )
 from services.observability_contract import normalize_status
@@ -247,3 +248,38 @@ async def test_scheduler_recovers_blocked_window_with_fresh_full_window(tmp_path
         assert snapshot["elapsed_hours"] < 0.01
     finally:
         await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_persists_worker_liveness_and_sample_count(tmp_path):
+    async def collect():
+        return _metrics()
+
+    stores = {
+        24: ContinuousObservationStore(tmp_path / "24.json"),
+        72: ContinuousObservationStore(tmp_path / "72.json"),
+    }
+    worker_path = tmp_path / "worker.json"
+    scheduler = ContinuousObservationScheduler(
+        stores,
+        collect,
+        interval_seconds=60,
+        startup_delay_seconds=60,
+        worker_state_path=worker_path,
+    )
+    await scheduler.start()
+    try:
+        running = ContinuousObservationWorkerState(worker_path).read()
+        assert running["status"] == "running"
+        assert running["last_heartbeat_at"]
+        await scheduler.sample_once()
+        sampled = ContinuousObservationWorkerState(worker_path).read()
+        assert sampled["status"] == "running"
+        assert sampled["sample_count"] == 1
+        assert sampled["last_sample_at"]
+    finally:
+        await scheduler.stop()
+
+    stopped = ContinuousObservationWorkerState(worker_path).read()
+    assert stopped["status"] == "stopped"
+    assert stopped["stopped_at"]
