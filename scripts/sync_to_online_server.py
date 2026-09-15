@@ -1136,15 +1136,27 @@ def main() -> None:
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return
+        if args.resume_trading:
+            trading_action = (
+                f"systemctl restart {_remote_quote(args.service)} && "
+                f"systemctl is-active {_remote_quote(args.service)} && "
+            )
+        else:
+            # Deployment is fail-closed even when the legacy single-service
+            # path is used.  Never restart paper trading implicitly; only an
+            # explicit --resume-trading may start it.
+            trading_action = (
+                f"systemctl stop {_remote_quote(args.service)} >/dev/null 2>&1 || true; "
+                f"systemctl disable {_remote_quote(args.service)} >/dev/null 2>&1 || true; "
+            )
         command = (
-            f"systemctl restart {_remote_quote(args.service)} && "
-            f"systemctl is-active {_remote_quote(args.service)} && "
-            f"{_okx_network_probe_command()}"
-            "for i in $(seq 1 30); do "
-            "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
-            'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
-            "sleep 2; "
-            "done; echo dashboard-timeout; exit 7"
+            trading_action
+            + f"{_okx_network_probe_command()}"
+            + "for i in $(seq 1 30); do "
+            + "code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://127.0.0.1:8002/ || true); "
+            + 'case "$code" in 200|302|401) echo dashboard-ok:$code; exit 0;; esac; '
+            + "sleep 2; "
+            + "done; echo dashboard-timeout; exit 7"
         )
         safe_print(run_remote_text(ssh, command, timeout=120, check=True))
     finally:
