@@ -83,6 +83,26 @@ def test_local_ai_tools_training_lock_rejects_concurrent_process(
 
 
 @pytest.mark.asyncio
+async def test_trainer_cli_disposes_database_on_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_main() -> None:
+        calls.append("main")
+
+    async def fake_close_db() -> None:
+        calls.append("close")
+
+    monkeypatch.setattr(train_script, "_main", fake_main)
+    monkeypatch.setattr(train_script, "close_db", fake_close_db)
+
+    await train_script._run_cli()
+
+    assert calls == ["main", "close"]
+
+
+@pytest.mark.asyncio
 async def test_sequence_loader_transports_native_series_without_expanded_window_copies(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

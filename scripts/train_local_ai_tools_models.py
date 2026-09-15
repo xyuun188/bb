@@ -35,7 +35,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
 from core.url_safety import normalize_http_base_url  # noqa: E402
-from db.session import get_read_session_ctx, get_session_ctx  # noqa: E402
+from db.session import close_db, get_read_session_ctx, get_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from models.market_data import Kline  # noqa: E402
 from models.news import NewsArticle, SocialPost  # noqa: E402
@@ -1278,6 +1278,18 @@ async def _main() -> None:
     )
 
 
+async def _run_cli() -> None:
+    """Run the trainer and dispose its async engine on the same event loop."""
+
+    try:
+        await _main()
+    finally:
+        # The scheduler invokes this module in an isolated worker thread.  The
+        # asyncpg pool is bound to that thread's event loop and must be
+        # disposed before asyncio.run() tears the loop down.
+        await close_db()
+
+
 if __name__ == "__main__":
     training_lock = _try_acquire_training_lock()
     if training_lock is None:
@@ -1294,6 +1306,6 @@ if __name__ == "__main__":
         )
     else:
         try:
-            asyncio.run(_main())
+            asyncio.run(_run_cli())
         finally:
             training_lock.close()
