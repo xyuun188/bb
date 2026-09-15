@@ -2389,6 +2389,14 @@ def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -
     assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
 
 
+def test_ml_training_window_evaluator_bootstraps_runtime_before_db_import() -> None:
+    source = Path(ml_window_eval.__file__).read_text(encoding="utf-8")
+
+    assert source.index("load_runtime_env_files(project_root=ROOT)") < source.index(
+        "from db.session import get_read_session_ctx"
+    )
+
+
 def test_ml_training_window_evaluator_exposes_extended_diagnostic_variants() -> None:
     names = [variant.name for variant in ml_window_eval.extended_variants()]
     assert "diagnostic_decision_equals_best" in names

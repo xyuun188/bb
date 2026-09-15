@@ -23,6 +23,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.runtime_env_bootstrap import (  # noqa: E402
+    drop_privileges_to_runtime_user_if_needed,
+    load_runtime_env_files,
+)
+
+load_runtime_env_files(project_root=ROOT)
+drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
+
 from db.session import get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from services.ml_readiness import build_ml_readiness_report  # noqa: E402
