@@ -1,0 +1,7034 @@
+
+from __future__ import annotations
+
+import hashlib
+import gc
+import json
+import math
+import multiprocessing
+import os
+import re
+import signal
+import tempfile
+import threading
+import time
+import uuid
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import joblib
+import numpy as np
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import Ridge
+
+
+PHASE3_ROOT = Path(os.environ.get("BB_PHASE3_ROOT", "/data/BB"))
+PHASE3_API_PORT = int(os.environ.get("PHASE3_QUANT_API_PORT", "8101"))
+MODEL_DIR = Path(
+    os.environ.get(
+        "LOCAL_AI_TOOLS_MODEL_DIR",
+        str(PHASE3_ROOT / "models" / "local_ai_tools"),
+    )
+)
+ARTIFACT_REGISTRY_VERSION = "2026-07-24.local-ai-tools.v3"
+ARTIFACT_ACTIVATION_MANIFEST_VERSION = (
+    "2026-07-27.paper-live-permission-activation.v4"
+)
+ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
+VERSIONS_ROOT = MODEL_DIR / "versions"
+CANDIDATE_POINTER_PATH = MODEL_DIR / "candidate.json"
+CHALLENGER_POINTER_PATH = MODEL_DIR / "challenger.json"
+CURRENT_POINTER_PATH = MODEL_DIR / "current.json"
+ROLLBACK_POINTER_PATH = MODEL_DIR / "rollback.json"
+PHASE3_VALIDATION_REPORT_PATH = (
+    PHASE3_ROOT / "reports" / "inventory" / "phase3_model_validation_latest.json"
+)
+PHASE3_DOWNLOAD_REPORT_PATH = (
+    PHASE3_ROOT / "reports" / "inventory" / "phase3_model_download_manifest_latest.json"
+)
+PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
+CURRENT_TRAINING_EPOCH_POLICY = "current_epoch_plus_approved_historical_rebuild"
+PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
+TRAIN_REQUEST_TIMEOUT_SECONDS = min(
+    max(
+        float(
+            os.environ.get(
+                "LOCAL_AI_TOOLS_TRAINING_TIMEOUT_SECONDS",
+                "5400",
+            )
+        ),
+        60.0,
+    ),
+    7200.0,
+)
+TRAINING_RUNTIME_STATE_PATH = PHASE3_ROOT / "runtime" / "phase3_quant_api" / "training_process.json"
+LOCAL_REVIEW_DISABLED_DETAIL = (
+    "Local AI tools do not provide high-risk trade review. "
+    "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
+)
+
+FEATURE_KEYS = [
+    "change_24h_pct", "spread_pct", "rsi_14", "rsi_7", "macd", "macd_signal",
+    "macd_diff", "stoch_k", "adx_14", "bb_width", "bb_pct", "atr_pct",
+    "volume_ratio", "returns_1", "returns_5", "returns_20", "volatility_20",
+    "price_vs_sma20", "price_vs_sma50", "funding_rate", "log_volume_24h",
+    "log_open_interest_value", "orderbook_imbalance", "orderbook_depth_ratio",
+    "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
+    "news_article_count", "decision_confidence", "horizon_minutes",
+]
+SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
+PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
+RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
+RETURN_OBJECTIVE_VERSION = "2026-07-27.separated-source-supervision.v3"
+PRIMARY_PREDICTION_HORIZON_MINUTES = 5
+RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
+RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
+COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
+PROFIT_SUPERVISION_VERSION = "2026-07-24.separated-profit-supervision.v2"
+RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
+MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
+EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
+AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
+EVALUATION_REPORT_FIELDS = (
+    "walk_forward_report",
+    "leave_one_symbol_out_report",
+    "oos_return_evaluation",
+    "execution_cost_holdout_report",
+    "authoritative_trade_return_evidence",
+)
+COMPACT_SEQUENCE_SERIES_FORMAT = "compact_native_kline_series.v1"
+TIMESERIES_MODEL_INPUT_ROWS = int(
+    os.environ.get("LOCAL_AI_TOOLS_TIMESERIES_MODEL_INPUT_ROWS", "30")
+)
+TIMESERIES_PRIMARY_REPO_ID = os.environ.get(
+    "LOCAL_AI_TOOLS_TIMESERIES_PRIMARY_MODEL",
+    "google/timesfm-2.5-200m-pytorch",
+).strip() or "google/timesfm-2.5-200m-pytorch"
+TIMESERIES_LEGACY_TIMESFM_REPO_ID = "google/timesfm-2.5-200m-transformers"
+TIMESERIES_CHRONOS_REPO_ID = "amazon/chronos-2"
+TIMESERIES_FALLBACK_REPO_ID = "ibm-granite/granite-timeseries-ttm-r2"
+TORCH_PATCH_MAX_SAMPLES = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_TORCH_PATCH_MAX_SAMPLES", "8000")),
+    2048,
+)
+TORCH_PATCH_MAX_EPOCHS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_TORCH_PATCH_MAX_EPOCHS", "6")),
+    1,
+)
+SEQUENCE_MODEL_MAX_SAMPLES = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SEQUENCE_MODEL_MAX_SAMPLES", "8000")),
+    2048,
+)
+# Keep the model artifact contract unchanged while bounding the peak memory of
+# the forest ensemble built during a refresh.  The previous 240/260-tree
+# defaults multiplied across horizons, sides, cost, sentiment, and sequence
+# models and could exhaust the training worker before an artifact was written.
+TRAINING_REGRESSOR_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_REGRESSOR_TREE_COUNT", "96")), 32),
+    192,
+)
+TRAINING_CLASSIFIER_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_CLASSIFIER_TREE_COUNT", "80")), 32),
+    192,
+)
+TRAINING_SENTIMENT_TREE_COUNT = min(
+    max(int(os.environ.get("LOCAL_AI_TOOLS_SENTIMENT_TREE_COUNT", "64")), 32),
+    160,
+)
+ISOLATE_TRAINING_PROCESS = os.environ.get(
+    "LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
+ERROR_TEXT_LIMIT = 180
+SECRET_TEXT_RE = re.compile(
+    r"(Authorization\s*:\s*Bearer\s+)[^\s,;\"']+"
+    r"|((?:api[_-]?key|secret|password|passphrase|token|webhook)"
+    r"\s*[:=]\s*)[^\s,;\"']+",
+    re.IGNORECASE,
+)
+LOCAL_AI_TOOLS_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "LOCAL_AI_TOOLS_CORS_ORIGINS",
+        "http://127.0.0.1:8002,http://localhost:8002",
+    ).split(",")
+    if origin.strip()
+]
+ALLOW_UNAUTHENTICATED_LOOPBACK = os.environ.get(
+    "LOCAL_AI_TOOLS_ALLOW_UNAUTHENTICATED_LOOPBACK",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+
+_BUNDLE_CACHE: dict[str, Any] | None = None
+_CURRENT_POINTER_MTIME_NS: int | None = None
+_CURRENT_MODEL_MTIME_NS: int | None = None
+_CURRENT_MODEL_PATH: Path | None = None
+_STATUS_ARTIFACT_CACHE: dict[str, dict[str, Any]] = {}
+_TRANSFORMER_MODEL_CACHE: dict[str, Any] = {}
+_BUNDLE_CACHE_LOCK = threading.RLock()
+_SPECIALIST_MODEL_CACHE_LOCK = threading.RLock()
+_SHADOW_EXECUTOR: ThreadPoolExecutor | None = None
+_SHADOW_EXECUTOR_LOCK = threading.RLock()
+_SHADOW_INFLIGHT: dict[str, Future] = {}
+_SHADOW_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SHADOW_CACHE_TTL_SECONDS = max(
+    float(os.environ.get("LOCAL_AI_TOOLS_SHADOW_CACHE_TTL_SECONDS", "45")),
+    5.0,
+)
+_SHADOW_FAILURE_TTL_SECONDS = max(
+    float(os.environ.get("LOCAL_AI_TOOLS_SHADOW_FAILURE_TTL_SECONDS", "10")),
+    2.0,
+)
+_SHADOW_EXECUTOR_MAX_WORKERS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS", "1")),
+    1,
+)
+_SHADOW_MAX_INFLIGHT = _SHADOW_EXECUTOR_MAX_WORKERS * 2
+_SHADOW_MAX_CACHE_ENTRIES = 256
+_SPECIALIST_NUM_THREADS = max(
+    int(os.environ.get("LOCAL_AI_TOOLS_SPECIALIST_NUM_THREADS", "1")),
+    1,
+)
+_TRAIN_LOCK = threading.Lock()
+_TRAIN_EXECUTOR_LOCK = threading.Lock()
+_TRAIN_EXECUTOR: ProcessPoolExecutor | None = None
+_TRAIN_EXECUTOR_MANUAL_RECYCLE = False
+_STATUS_METADATA_KEYS = (
+    "artifact_policy_id",
+    "phase",
+    "trained_at",
+    "source",
+    "shadow_sample_count",
+    "train_shadow_sample_count",
+    "holdout_shadow_sample_count",
+    "train_decision_group_count",
+    "holdout_decision_group_count",
+    "purged_holdout_decision_group_count",
+    "authoritative_cost_sample_count",
+    "train_authoritative_cost_sample_count",
+    "holdout_authoritative_cost_sample_count",
+    "train_cost_decision_group_count",
+    "holdout_cost_decision_group_count",
+    "purged_cost_holdout_decision_group_count",
+    "completed_market_decision_group_count",
+    "completed_authoritative_cost_decision_group_count",
+    "completed_training_decision_group_count",
+    "last_trained_completed_training_decision_group_count",
+    "training_distribution_profile",
+    "completed_shadow_sample_count",
+    "last_trained_completed_shadow_sample_count",
+    "trade_sample_count",
+    "completed_trade_sample_count",
+    "last_trained_completed_trade_sample_count",
+    "sequence_sample_count",
+    "text_sentiment_sample_count",
+    "torch_patch_available",
+    "torch_patch_status",
+    "transformers_sentiment_backend",
+    "feature_count",
+    "horizons",
+    "profile_count",
+    "training_data_sha256",
+    "source_code_sha256",
+    "objective_name",
+    "objective_version",
+    "label_name",
+    "label_version",
+    "cost_model_version",
+    "training_cost_policy",
+    "profit_supervision_version",
+    "profit_supervision_report",
+    "market_fact_contract",
+    "quality_report",
+    "governance_report",
+    "return_objective_report",
+    "training_policy",
+    "trade_sample_cursor_policy",
+    "training_mode",
+    "model_stage",
+    "artifact_persisted",
+    "preflight_only",
+    "persist_artifact_requested",
+    "confirm_phase3_rebuild",
+    "promotion_recommendation",
+    "training_objective",
+    "models",
+    "objective",
+    "artifact_registry_version",
+    "artifact_model_id",
+    "artifact_version",
+    "artifact_lifecycle",
+    "live_ml_ready",
+    "artifact_activation_manifest",
+    "live_promotion_manifest",
+    "walk_forward_report",
+    "leave_one_symbol_out_report",
+    "oos_return_evaluation",
+    "execution_cost_holdout_report",
+    "authoritative_trade_return_evidence",
+    "evaluation_report_hashes",
+    "artifact_return_evidence_sha256",
+)
+_STATUS_LIST_LIMIT = 12
+_STATUS_DICT_LIMIT = 80
+_STATUS_MAX_DEPTH = 8
+_STATUS_OMITTED_DETAIL_KEYS = {
+    "authoritative_evidence",
+    "raw_samples",
+    "return_evidence_report",
+    "return_observations",
+    "shadow_events",
+    "training_rows",
+    "worst_samples",
+}
+
+
+def safe_error(value: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    def repl(match: re.Match[str]) -> str:
+        auth_prefix = match.group(1)
+        key_prefix = match.group(2)
+        if auth_prefix:
+            return auth_prefix + "***"
+        if key_prefix:
+            return key_prefix + "***"
+        return "***"
+
+    redacted = SECRET_TEXT_RE.sub(repl, text)
+    if limit and len(redacted) > limit:
+        return redacted[:limit] + "..."
+    return redacted
+
+
+def _cache_get_or_load(key: str, loader):
+    """Load one heavyweight specialist without blocking the live bundle."""
+
+    with _SPECIALIST_MODEL_CACHE_LOCK:
+        if key not in _TRANSFORMER_MODEL_CACHE:
+            _TRANSFORMER_MODEL_CACHE[key] = loader()
+        return _TRANSFORMER_MODEL_CACHE[key]
+
+
+def _configure_specialist_runtime() -> None:
+    """Keep observation-only transformer work from starving real-time routes."""
+
+    try:
+        import torch
+
+        torch.set_num_threads(_SPECIALIST_NUM_THREADS)
+        try:
+            torch.set_num_interop_threads(_SPECIALIST_NUM_THREADS)
+        except RuntimeError:
+            # PyTorch only permits changing inter-op threads before work starts.
+            pass
+    except Exception:
+        pass
+
+
+def _shadow_executor() -> ThreadPoolExecutor:
+    global _SHADOW_EXECUTOR
+    with _SHADOW_EXECUTOR_LOCK:
+        if _SHADOW_EXECUTOR is None:
+            _configure_specialist_runtime()
+            _SHADOW_EXECUTOR = ThreadPoolExecutor(max_workers=_SHADOW_EXECUTOR_MAX_WORKERS, thread_name_prefix="phase3-shadow")
+        return _SHADOW_EXECUTOR
+
+
+def _shadow_cache_key(kind: str, features: dict[str, Any]) -> str:
+    relevant = {
+        "kind": kind,
+        "symbol": features.get("symbol"),
+        "close_sequence": features.get("close_sequence") or features.get("recent_closes") or features.get("closes"),
+        "recent_headlines": features.get("recent_headlines") or features.get("headlines"),
+        "news_sentiment_avg": features.get("news_sentiment_avg"),
+        "social_sentiment_avg": features.get("social_sentiment_avg"),
+        "horizon_steps": features.get("horizon_steps") or features.get("forecast_horizon_steps") or features.get("horizon_minutes"),
+    }
+    return canonical_sha256(relevant)
+
+
+def _shadow_ready_or_submit(kind: str, features: dict[str, Any], worker) -> dict[str, Any]:
+    """Return cached shadow evidence or submit one bounded background job."""
+    if kind in {"timesfm", "chronos2"}:
+        try:
+            closes, reason, sequence_source = _timeseries_close_sequence(features)
+            if reason:
+                return {
+                    "available": False,
+                    "actual_inference": False,
+                    "status": "shadow_unavailable",
+                    "reason": reason,
+                    "sequence_length": len(closes),
+                    "sequence_source": sequence_source,
+                    "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+                }
+        except NameError:
+            pass
+    key = _shadow_cache_key(kind, features)
+    now = time.monotonic()
+    with _SHADOW_EXECUTOR_LOCK:
+        cached = _SHADOW_RESULT_CACHE.get(key)
+        cache_ttl = (
+            _SHADOW_CACHE_TTL_SECONDS
+            if cached and cached[1].get("available")
+            else _SHADOW_FAILURE_TTL_SECONDS
+        )
+        if cached and now - cached[0] < cache_ttl:
+            return {**cached[1], "shadow_cache_hit": True}
+        if key in _SHADOW_INFLIGHT:
+            return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_in_progress", "shadow_cache_key": key}
+        if len(_SHADOW_INFLIGHT) >= _SHADOW_MAX_INFLIGHT:
+            return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_capacity_exhausted"}
+        try:
+            future = _shadow_executor().submit(worker, dict(features))
+        except RuntimeError:
+            return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_executor_unavailable"}
+        _SHADOW_INFLIGHT[key] = future
+
+    def complete(done: Future, cache_key: str = key) -> None:
+        try:
+            value = done.result()
+            result = dict(value) if isinstance(value, dict) else {"available": False, "reason": "shadow_invalid_result"}
+        except Exception as exc:
+            result = {"available": False, "reason": safe_error(exc, 220)}
+        with _SHADOW_EXECUTOR_LOCK:
+            _SHADOW_INFLIGHT.pop(cache_key, None)
+            _SHADOW_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+            if len(_SHADOW_RESULT_CACHE) > _SHADOW_MAX_CACHE_ENTRIES:
+                oldest = min(_SHADOW_RESULT_CACHE, key=lambda item: _SHADOW_RESULT_CACHE[item][0])
+                _SHADOW_RESULT_CACHE.pop(oldest, None)
+
+    future.add_done_callback(complete)
+    # Keep tests and very small adapters responsive without waiting on real
+    # transformer inference. Production model calls normally exceed this grace
+    # window and return immediately with a pending shadow marker.
+    try:
+        immediate = future.result(timeout=0.05)
+    except TimeoutError:
+        immediate = None
+    except Exception:
+        immediate = None
+    if isinstance(immediate, dict):
+        return {**immediate, "shadow_completed_inline": True}
+    return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_queued", "shadow_cache_key": key}
+
+
+def _preserve_torch_default_device(loader):
+    """Prevent optional model loaders from leaking a process-wide meta device."""
+
+    try:
+        import torch
+
+        default_device = torch.get_default_device()
+    except Exception:
+        return loader()
+    try:
+        return loader()
+    finally:
+        torch.set_default_device(default_device)
+
+
+def _is_loopback_request(request: Request) -> bool:
+    client_host = (request.client.host if request.client else "") or ""
+    return client_host in {"127.0.0.1", "::1", "localhost"}
+
+
+def require_api_key(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    if LOCAL_AI_TOOLS_API_KEY:
+        expected = f"Bearer {LOCAL_AI_TOOLS_API_KEY}"
+        if authorization == expected:
+            return
+        raise HTTPException(status_code=401, detail="Invalid local AI tools API key.")
+    if ALLOW_UNAUTHENTICATED_LOOPBACK and _is_loopback_request(request):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="LOCAL_AI_TOOLS_API_KEY is required for non-loopback access.",
+    )
+
+
+app = FastAPI(
+    title="Trade Local AI Tools",
+    version="1.0.0",
+    dependencies=[Depends(require_api_key)],
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=LOCAL_AI_TOOLS_CORS_ORIGINS,
+    allow_credentials=bool(LOCAL_AI_TOOLS_API_KEY),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup_load_current_bundle() -> None:
+    """Load the verified bundle before accepting inference traffic."""
+
+    _cleanup_stale_training_workers()
+    # The first request otherwise pays the full joblib/scikit-learn and optional
+    # specialist-model load cost and is mistaken for a route timeout by the
+    # platform. Warm every inference path before accepting traffic.
+    _post_training_inference_warmup()
+
+
+@app.on_event("shutdown")
+def shutdown_shadow_executor() -> None:
+    """Stop background specialist work so deploys do not leave threads behind."""
+    global _SHADOW_EXECUTOR
+    with _SHADOW_EXECUTOR_LOCK:
+        executor = _SHADOW_EXECUTOR
+        _SHADOW_EXECUTOR = None
+        _SHADOW_INFLIGHT.clear()
+        _SHADOW_RESULT_CACHE.clear()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+class FeatureRequest(BaseModel):
+    symbol: str | None = None
+    features: dict[str, Any] = {}
+    local_ml_signal: dict[str, Any] | None = None
+    open_positions: list[dict[str, Any]] | None = None
+
+
+class TrainRequest(BaseModel):
+    shadow_samples: list[dict[str, Any]] = []
+    trade_samples: list[dict[str, Any]] = []
+    sequence_samples: list[dict[str, Any]] = []
+    text_sentiment_samples: list[dict[str, Any]] = []
+    source: str = "local_trading_system"
+    completed_shadow_sample_count: int | None = None
+    completed_trade_sample_count: int | None = None
+    quality_report: dict[str, Any] = {}
+    governance_report: dict[str, Any] = {}
+    training_transport_report: dict[str, Any] = {}
+    return_objective_report: dict[str, Any] = {}
+    profit_supervision_report: dict[str, Any] = {}
+    training_mode: str = "shadow"
+    promotion_recommendation: dict[str, Any] = {}
+    persist_artifact: bool = False
+    confirm_phase3_rebuild: bool = False
+
+
+_RESOURCE_RECOVERY_FRACTIONS = (0.50, 0.25)
+
+
+def _bounded_training_rows(rows: list[dict[str, Any]], fraction: float) -> list[dict[str, Any]]:
+    """Keep an evenly spaced chronological subset for memory recovery."""
+
+    source = list(rows or [])
+    if len(source) <= 2:
+        return source
+    target = max(2, min(len(source), int(math.ceil(len(source) * fraction))))
+    if target >= len(source):
+        return source
+    indices = {
+        round(index * (len(source) - 1) / max(target - 1, 1))
+        for index in range(target)
+    }
+    return [source[index] for index in sorted(indices)]
+
+
+def _reduced_training_request(req: TrainRequest, fraction: float) -> TrainRequest:
+    """Build a bounded retry request without mutating the caller's payload."""
+
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    for key in (
+        "shadow_samples",
+        "trade_samples",
+        "sequence_samples",
+        "text_sentiment_samples",
+    ):
+        payload[key] = _bounded_training_rows(payload.get(key) or [], fraction)
+    return TrainRequest(**payload)
+
+
+def f(features: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        raw = features.get(key, default)
+        value = float(default if raw is None or raw == "" else raw)
+        return value if math.isfinite(value) else default
+    except Exception:
+        return default
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def empirical_lower_hinge(values: list[float]) -> float:
+    ordered = sorted(value for value in values if math.isfinite(value))
+    if not ordered:
+        return 0.0
+    lower = ordered[: len(ordered) // 2 + (len(ordered) % 2)]
+    middle = len(lower) // 2
+    if len(lower) % 2:
+        return lower[middle]
+    return (lower[middle - 1] + lower[middle]) / 2.0
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _parsed_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_text(value: Any) -> str:
+    parsed = _parsed_timestamp(value)
+    return parsed.isoformat() if parsed is not None else ""
+
+
+def _chronological_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if any(_parsed_timestamp(row.get("label_timestamp")) is None for row in rows):
+        raise ValueError("label_timestamp is required for chronological evaluation")
+    if any(not str(row.get("decision_group") or "").strip() for row in rows):
+        raise ValueError("decision_group is required for chronological evaluation")
+    if any(not str(row.get("symbol") or "").strip() for row in rows):
+        raise ValueError("native symbol identity is required for evaluation")
+    return sorted(
+        rows,
+        key=lambda row: (
+            _parsed_timestamp(row.get("label_timestamp")),
+            str(row.get("decision_group") or ""),
+            int(row.get("id") or 0),
+            int(row.get("horizon") or 0),
+        ),
+    )
+
+
+def _decision_group_availability(
+    rows: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, dict[str, datetime]]]:
+    bounds: dict[str, dict[str, datetime]] = {}
+    for row in _chronological_rows(rows):
+        group = str(row["decision_group"])
+        timestamp = _parsed_timestamp(row["label_timestamp"])
+        if timestamp is None:
+            raise ValueError("label_timestamp is required for group availability")
+        horizon_minutes = int(row.get("horizon") or 0)
+        if horizon_minutes <= 0:
+            raise ValueError("positive horizon is required for group availability")
+        decision_timestamp = _parsed_timestamp(row.get("decision_timestamp"))
+        if decision_timestamp is None:
+            decision_timestamp = timestamp - timedelta(minutes=horizon_minutes)
+        current = bounds.setdefault(
+            group,
+            {
+                "start": timestamp,
+                "end": timestamp,
+                "decision_start": decision_timestamp,
+                "decision_end": decision_timestamp,
+            },
+        )
+        current["start"] = min(current["start"], timestamp)
+        current["end"] = max(current["end"], timestamp)
+        current["decision_start"] = min(
+            current["decision_start"],
+            decision_timestamp,
+        )
+        current["decision_end"] = max(
+            current["decision_end"],
+            decision_timestamp,
+        )
+    groups = sorted(
+        bounds,
+        key=lambda group: (
+            bounds[group]["decision_start"],
+            bounds[group]["decision_end"],
+            group,
+        ),
+    )
+    return groups, bounds
+
+
+def _predict_positive_probabilities(model: Pipeline, x: list[list[float]]) -> np.ndarray:
+    try:
+        probabilities = np.asarray(model.predict_proba(x), dtype=float)
+        named_steps = getattr(model, "named_steps", {})
+        estimator = named_steps.get("model") if hasattr(named_steps, "get") else model
+        classes = list(getattr(estimator, "classes_", []))
+        if probabilities.ndim == 2 and 1 in classes:
+            return probabilities[:, classes.index(1)]
+    except Exception:
+        pass
+    return np.zeros(len(x), dtype=float)
+
+
+def _max_drawdown(returns: list[float]) -> float | None:
+    if not returns:
+        return None
+    equity = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in returns:
+        equity += float(value)
+        peak = max(peak, equity)
+        drawdown = max(drawdown, peak - equity)
+    return float(drawdown)
+
+
+def _profit_factor(returns: list[float]) -> float | None:
+    values = np.asarray(returns, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    gross_loss = abs(float(values[values < 0].sum()))
+    if gross_loss <= np.finfo(float).eps:
+        return None
+    return float(values[values > 0].sum()) / gross_loss
+
+
+def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("decision_group") or ""),
+        ),
+    )
+    values = np.asarray(
+        [float(row["return_pct"]) for row in ordered],
+        dtype=float,
+    )
+    values = values[np.isfinite(values)]
+    return_semantics = str(
+        next(
+            (
+                row.get("return_semantics")
+                for row in ordered
+                if row.get("return_semantics")
+            ),
+            "authoritative_realized_net_return_after_all_cost",
+        )
+    )
+    if values.size == 0:
+        return {
+            "count": 0,
+            "avg_return_pct": None,
+            "median_return_pct": None,
+            "return_lcb_pct": None,
+            "profit_factor": None,
+            "cvar_10_pct": None,
+            "max_drawdown_pct": None,
+            "tail_loss_rate": None,
+            "tail_loss_policy": {
+                "source": "oos_negative_return_lower_hinge",
+                "value": None,
+                "observation_window": "current_oos_evidence_only",
+            },
+            "promotion_math_ready": False,
+            "return_semantics": return_semantics,
+        }
+    negatives = values[values < 0].tolist()
+    tail_boundary = empirical_lower_hinge(negatives) if negatives else None
+    mean = float(values.mean())
+    if values.size == 1:
+        return_lcb = mean
+    else:
+        standard_error = float(values.std(ddof=1)) / math.sqrt(values.size)
+        return_lcb = mean - 1.645 * standard_error
+    tail_cutoff = float(np.quantile(values, 0.10))
+    cvar_values = values[values <= tail_cutoff]
+    cvar_value = float(cvar_values.mean()) if cvar_values.size else tail_cutoff
+    profit_factor_value = _profit_factor(values.tolist())
+    max_drawdown = _max_drawdown(values.tolist())
+    return {
+        "count": int(values.size),
+        "avg_return_pct": mean,
+        "median_return_pct": float(np.median(values)),
+        "return_lcb_pct": return_lcb,
+        "profit_factor": profit_factor_value,
+        "cvar_10_pct": cvar_value,
+        "max_drawdown_pct": max_drawdown,
+        "tail_loss_rate": (
+            float((values < float(tail_boundary)).mean())
+            if tail_boundary is not None
+            else None
+        ),
+        "tail_loss_policy": {
+            "source": "oos_negative_return_lower_hinge",
+            "value": tail_boundary,
+            "observation_window": "current_oos_evidence_only",
+        },
+        "promotion_math_ready": bool(
+            return_lcb > 0.0
+            and profit_factor_value is not None
+            and profit_factor_value > 1.0
+            and math.isfinite(cvar_value)
+            and max_drawdown is not None
+        ),
+        "return_semantics": return_semantics,
+    }
+
+
+def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    selected_count = max(int(math.sqrt(len(rows))), 1)
+    return sorted(rows, key=lambda row: float(row["score"]))[-selected_count:]
+
+
+def _market_regime_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        regime = str(row.get("market_regime") or "").strip().lower()
+        if regime and regime != "unknown":
+            grouped.setdefault(regime, []).append(row)
+    reports = {
+        regime: _return_evidence(_select_top_return_rows(regime_rows))
+        for regime, regime_rows in sorted(grouped.items())
+    }
+    stable = bool(len(reports) >= 2) and all(
+        report.get("promotion_math_ready") is True for report in reports.values()
+    )
+    return {
+        "stable": stable,
+        "observed_regime_count": len(reports),
+        "required_regime_count": 2,
+        "regimes": reports,
+        "blocking_reasons": (
+            []
+            if stable
+            else [
+                "insufficient_market_regime_coverage"
+                if len(reports) < 2
+                else "market_regime_fee_after_return_unstable"
+            ]
+        ),
+    }
+
+
+def _leave_one_symbol_out_stability(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    symbols = sorted(
+        {str(row.get("symbol") or "") for row in rows if row.get("symbol")}
+    )
+    reports = []
+    for symbol in symbols:
+        remaining = [
+            row for row in rows if str(row.get("symbol") or "") != symbol
+        ]
+        reports.append(
+            {
+                "excluded_symbol": symbol,
+                "remaining_symbol_count": len(
+                    {
+                        str(row.get("symbol") or "")
+                        for row in remaining
+                        if row.get("symbol")
+                    }
+                ),
+                "evidence": _return_evidence(_select_top_return_rows(remaining)),
+            }
+        )
+    return {
+        "version": "2026-07-15.leave-one-symbol-out.v1",
+        "evaluated_symbol_count": len(symbols),
+        "rows": reports,
+        "stable": bool(reports)
+        and all(row["evidence"]["promotion_math_ready"] for row in reports),
+        "policy": "recompute_oos_fee_after_return_evidence_after_each_symbol_removal",
+    }
+
+
+def _fit_walk_forward_side(
+    train_rows: list[dict[str, Any]],
+    validation_rows: list[dict[str, Any]],
+    *,
+    side: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return_key = f"{side}_return"
+    negatives = [float(row[return_key]) for row in train_rows if row[return_key] < 0]
+    tail_boundary = empirical_lower_hinge(negatives) if negatives else 0.0
+    tail_scale = abs(float(tail_boundary))
+    x_train = [row["x"] for row in train_rows]
+    x_validation = [row["x"] for row in validation_rows]
+    weights = [float(row["sample_weight"]) for row in train_rows]
+    market_model = _make_regressor(len(train_rows))
+    tail_labels = [int(row[return_key] < tail_boundary) for row in train_rows]
+    tail_model = _make_classifier(tail_labels)
+    market_model.fit(
+        x_train,
+        [row[return_key] for row in train_rows],
+        model__sample_weight=weights,
+    )
+    tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
+    scores = (
+        np.asarray(market_model.predict(x_validation), dtype=float)
+        - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
+    )
+    evaluated_rows = [
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "market_regime": str(row.get("market_regime") or "unknown"),
+                "horizon_minutes": int(row.get("horizon") or 0),
+                "decision_group": str(row.get("decision_group") or ""),
+            "label_timestamp": str(row.get("label_timestamp") or ""),
+            "return_pct": float(row[return_key]),
+            "gross_market_return_pct": float(row[return_key]),
+            "return_semantics": "gross_fixed_horizon_market_opportunity",
+            "score": float(scores[index]),
+        }
+        for index, row in enumerate(validation_rows)
+    ]
+    return evaluated_rows, {
+        "source": "walk_forward_training_gross_market_negative_return_lower_hinge",
+        "value": tail_boundary if negatives else None,
+        "scale_pct": tail_scale,
+        "observation_window": "walk_forward_training_groups_only",
+        "training_decision_group_count": len(
+            {str(row["decision_group"]) for row in train_rows}
+        ),
+    }
+
+
+def _walk_forward_return_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = _chronological_rows(rows)
+    groups, group_bounds = _decision_group_availability(ordered)
+    version = "2026-07-15.expanding-decision-group-walk-forward.v1"
+    if len(groups) <= 1:
+        return {
+            "version": version,
+            "status": "insufficient_chronological_decision_groups",
+            "folds": [],
+            "decision_group_disjoint": False,
+            "model_refit_per_fold": True,
+            "chronological": True,
+        }
+    validation_candidates = [
+        group
+        for group in groups
+        if any(
+            group_bounds[prior]["end"]
+            < group_bounds[group]["decision_start"]
+            for prior in groups
+            if group_bounds[prior]["decision_start"]
+            < group_bounds[group]["decision_start"]
+        )
+    ]
+    if not validation_candidates:
+        return {
+            "version": version,
+            "status": "insufficient_purged_chronological_decision_groups",
+            "folds": [],
+            "decision_group_count": len(groups),
+            "decision_group_disjoint": False,
+            "chronological_label_disjoint": False,
+            "model_refit_per_fold": True,
+            "chronological": True,
+        }
+    validation_fold_count = max(
+        int(math.ceil(math.log10(len(validation_candidates) + 1))),
+        1,
+    )
+    blocks = [
+        [str(value) for value in block.tolist()]
+        for block in np.array_split(
+            np.asarray(validation_candidates, dtype=object),
+            validation_fold_count,
+        )
+        if len(block)
+    ]
+    folds = []
+    oos_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    available_horizons = sorted(
+        {
+            int(row.get("horizon") or 0)
+            for row in ordered
+            if int(row.get("horizon") or 0) > 0
+        }
+    )
+    horizon_oos_rows = {
+        str(horizon): {"long": [], "short": []}
+        for horizon in available_horizons
+    }
+    evaluation_horizon = (
+        PRIMARY_PREDICTION_HORIZON_MINUTES
+        if PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons
+        else available_horizons[0]
+        if len(available_horizons) == 1
+        else PRIMARY_PREDICTION_HORIZON_MINUTES
+    )
+    for fold_number, validation_groups in enumerate(blocks, start=1):
+        validation_decision_start = min(
+            group_bounds[group]["decision_start"]
+            for group in validation_groups
+        )
+        training_set = {
+            group
+            for group in groups
+            if group_bounds[group]["end"] < validation_decision_start
+        }
+        training_label_end = max(
+            group_bounds[group]["end"] for group in training_set
+        )
+        purged_training_groups = [
+            group
+            for group in groups
+            if group_bounds[group]["decision_start"] < validation_decision_start
+            and group not in training_set
+        ]
+        validation_set = set(validation_groups)
+        if training_set & validation_set:
+            raise ValueError("walk-forward decision groups overlap")
+        train_rows = [
+            row for row in ordered if str(row["decision_group"]) in training_set
+        ]
+        validation_rows = [
+            row for row in ordered if str(row["decision_group"]) in validation_set
+        ]
+        mixed_fold_side_reports = {}
+        fold_horizon_rows = {
+            str(horizon): {"long": [], "short": []}
+            for horizon in available_horizons
+        }
+        for side in ("long", "short"):
+            evaluated, tail_policy = _fit_walk_forward_side(
+                train_rows,
+                validation_rows,
+                side=side,
+            )
+            oos_rows[side].extend(evaluated)
+            for row in evaluated:
+                horizon_key = str(int(row.get("horizon_minutes") or 0))
+                horizon_oos_rows.setdefault(
+                    horizon_key, {"long": [], "short": []}
+                )[side].append(row)
+                fold_horizon_rows.setdefault(
+                    horizon_key, {"long": [], "short": []}
+                )[side].append(row)
+            mixed_fold_side_reports[side] = {
+                **_return_evidence(_select_top_return_rows(evaluated)),
+                "training_tail_loss_policy": tail_policy,
+            }
+        fold_horizon_reports = {
+            str(horizon): {
+                side: _return_evidence(
+                    _select_top_return_rows(fold_horizon_rows[str(horizon)][side])
+                )
+                for side in ("long", "short")
+            }
+            for horizon in available_horizons
+        }
+        primary_fold_evidence = fold_horizon_reports.get(str(evaluation_horizon), {})
+        primary_fold_side_reports = {
+            side: {
+                **(
+                    primary_fold_evidence.get(side)
+                    or mixed_fold_side_reports.get(side, {})
+                ),
+                "training_tail_loss_policy": mixed_fold_side_reports.get(side, {}).get(
+                    "training_tail_loss_policy"
+                ),
+            }
+            for side in ("long", "short")
+        }
+        folds.append(
+            {
+                "fold": fold_number,
+                "training_decision_group_count": len(training_set),
+                "validation_decision_group_count": len(validation_set),
+                "validation_start": validation_rows[0]["label_timestamp"],
+                "validation_end": validation_rows[-1]["label_timestamp"],
+                "training_label_end": training_label_end.isoformat(),
+                "validation_decision_start": validation_decision_start.isoformat(),
+                "label_timestamp_overlap_count": 0,
+                "purged_training_decision_group_count": len(
+                    purged_training_groups
+                ),
+                "decision_group_overlap_count": 0,
+                "sides": primary_fold_side_reports,
+                "horizon_diagnostics": fold_horizon_reports,
+                "mixed_horizon_diagnostics": mixed_fold_side_reports,
+            }
+        )
+    mixed_side_reports = {}
+    for side in ("long", "short"):
+        evidence = _return_evidence(_select_top_return_rows(oos_rows[side]))
+        mixed_side_reports[side] = {
+            **evidence,
+            "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
+            "market_regime_stability": _market_regime_stability(oos_rows[side]),
+        }
+    horizon_diagnostics: dict[str, dict[str, Any]] = {}
+    for horizon in available_horizons:
+        horizon_diagnostics[str(horizon)] = {}
+        for side in ("long", "short"):
+            rows_for_horizon = horizon_oos_rows[str(horizon)][side]
+            evidence = _return_evidence(_select_top_return_rows(rows_for_horizon))
+            horizon_diagnostics[str(horizon)][side] = {
+                **evidence,
+                "leave_one_symbol_out": _leave_one_symbol_out_stability(rows_for_horizon),
+                "market_regime_stability": _market_regime_stability(rows_for_horizon),
+            }
+    side_reports = {
+        side: horizon_diagnostics.get(str(evaluation_horizon), {}).get(
+            side, mixed_side_reports[side]
+        )
+        for side in ("long", "short")
+    }
+    return {
+        "version": version,
+        "status": "complete" if folds else "insufficient_chronological_decision_groups",
+        "folds": folds,
+        "fold_count": len(folds),
+        "decision_group_count": len(groups),
+        "decision_group_disjoint": all(
+            fold["decision_group_overlap_count"] == 0 for fold in folds
+        ),
+        "chronological_label_disjoint": all(
+            fold["label_timestamp_overlap_count"] == 0
+            and fold["training_label_end"] < fold["validation_decision_start"]
+            for fold in folds
+        ),
+        "model_refit_per_fold": True,
+        "chronological": True,
+        "sides": side_reports,
+        "primary_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "evaluation_horizon_minutes": evaluation_horizon,
+        "primary_horizon_available": PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons,
+        "horizon_diagnostics": horizon_diagnostics,
+        "mixed_horizon_diagnostics": mixed_side_reports,
+        "stable": len(folds) >= 2
+        and all(
+            report["promotion_math_ready"]
+            and report["leave_one_symbol_out"]["stable"]
+            and report["market_regime_stability"]["stable"]
+            and all(
+                fold["sides"][side]["promotion_math_ready"]
+                for fold in folds
+            )
+            for side, report in side_reports.items()
+        ),
+    }
+
+
+def _authoritative_trade_return_evidence(
+    trade_samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    side_rows: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for sample in trade_samples:
+        supervision = sample.get("profit_supervision") or {}
+        tasks = supervision.get("tasks") or {}
+        realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+        side = str(realized.get("side") or sample.get("side") or "").lower()
+        value = f(realized, PROFIT_TRAINING_TARGET, float("nan"))
+        if (
+            supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or realized.get("eligible") is not True
+            or side not in side_rows
+            or not math.isfinite(value)
+        ):
+            continue
+        side_rows[side].append(
+            {
+                "symbol": symbol_key(sample.get("symbol")),
+                "decision_group": str(
+                    sample.get("lifecycle_key")
+                    or sample.get("position_id")
+                    or sample.get("id")
+                    or ""
+                ),
+                "label_timestamp": _timestamp_text(
+                    sample.get("label_timestamp")
+                    or sample.get("closed_at")
+                    or sample.get("updated_at")
+                ),
+                "return_pct": float(value),
+                "score": float(value),
+            }
+        )
+    sides = {side: _return_evidence(rows) for side, rows in side_rows.items()}
+    fingerprint_payload = {
+        side: [
+            {
+                key: row.get(key)
+                for key in (
+                    "symbol",
+                    "decision_group",
+                    "label_timestamp",
+                    "return_pct",
+                )
+            }
+            for row in rows
+        ]
+        for side, rows in side_rows.items()
+    }
+    return {
+        "version": "2026-07-15.authoritative-trade-return-evidence.v1",
+        "source_authority": "okx_position_history_profit_supervision",
+        "sides": sides,
+        "sample_count": sum(len(rows) for rows in side_rows.values()),
+        "data_fingerprint": canonical_sha256(fingerprint_payload),
+    }
+
+
+def _evaluation_report_hashes(metadata: dict[str, Any]) -> dict[str, str]:
+    return {
+        field: canonical_sha256(metadata.get(field) or {})
+        for field in EVALUATION_REPORT_FIELDS
+    }
+
+
+def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
+    blockers = []
+    if not _is_sha256(metadata.get("training_data_sha256")):
+        blockers.append("training_data_fingerprint_invalid")
+    if not _is_sha256(metadata.get("source_code_sha256")):
+        blockers.append("source_code_fingerprint_invalid")
+    if (
+        metadata.get("time_split_policy")
+        != "independent_chronological_disjoint_decision_groups"
+    ):
+        blockers.append("chronological_decision_group_policy_missing")
+    governance = metadata.get("governance_report") or {}
+    if (
+        not str(governance.get("quality_fingerprint") or "")
+        or governance.get("artifact_quality_fingerprint")
+        != governance.get("quality_fingerprint")
+        or governance.get("artifact_matches_quality") is not True
+        or governance.get("requires_artifact_refresh") is True
+    ):
+        blockers.append("artifact_quality_fingerprint_mismatch")
+    market_fact_contract = metadata.get("market_fact_contract") or {}
+    market_fact_provenance = market_fact_contract.get("provenance") or {}
+    market_fact_assertions = market_fact_contract.get("assertions") or {}
+    try:
+        market_fact_violation_count = int(
+            market_fact_contract.get("violation_count")
+        )
+    except (TypeError, ValueError):
+        market_fact_violation_count = None
+    if (
+        market_fact_contract.get("status") != "clean"
+        or market_fact_violation_count != 0
+        or not _is_sha256(market_fact_provenance.get("data_fingerprint"))
+        or any(
+            market_fact_assertions.get(name) is not True
+            for name in (
+                "native_instrument_identity_verified",
+                "same_contract_price_path_verified",
+                "executable_market_fact_verified",
+            )
+        )
+    ):
+        blockers.append("market_fact_contract_not_clean")
+    expected_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_hashes:
+        blockers.append("evaluation_report_hash_mismatch")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_hashes
+    ):
+        blockers.append("artifact_return_evidence_hash_mismatch")
+    walk_forward = metadata.get("walk_forward_report") or {}
+    folds = list(walk_forward.get("folds") or [])
+    horizons = [int(value) for value in (metadata.get("horizons") or [])]
+    if len(horizons) > 1 and PRIMARY_PREDICTION_HORIZON_MINUTES not in horizons:
+        blockers.append("primary_horizon_evidence_missing")
+    if len(horizons) > 1 and (
+        metadata.get("primary_prediction_horizon_minutes")
+        != PRIMARY_PREDICTION_HORIZON_MINUTES
+        or walk_forward.get("primary_horizon_available") is not True
+    ):
+        blockers.append("primary_horizon_contract_incomplete")
+    if (
+        walk_forward.get("status") != "complete"
+        or walk_forward.get("decision_group_disjoint") is not True
+        or walk_forward.get("chronological_label_disjoint") is not True
+        or walk_forward.get("model_refit_per_fold") is not True
+        or len(folds) < 2
+    ):
+        blockers.append("walk_forward_evidence_incomplete")
+    cost_holdout = metadata.get("execution_cost_holdout_report") or {}
+    if (
+        cost_holdout.get("source_authority") != "okx_fills_fees_funding"
+        or cost_holdout.get("chronological") is not True
+        or cost_holdout.get("decision_group_disjoint") is not True
+        or int(cost_holdout.get("sample_count") or 0) <= 0
+    ):
+        blockers.append("authoritative_execution_cost_holdout_incomplete")
+    loso_report = metadata.get("leave_one_symbol_out_report") or {}
+    oos_report = metadata.get("oos_return_evaluation") or {}
+    walk_sides = walk_forward.get("sides") or {}
+    for side in ("long", "short"):
+        if (walk_sides.get(side) or {}).get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_walk_forward_return_evidence_not_ready")
+        if (
+            (walk_sides.get(side) or {}).get("market_regime_stability") or {}
+        ).get("stable") is not True:
+            blockers.append(f"{side}_market_regime_stability_not_ready")
+        if any(
+            ((fold.get("sides") or {}).get(side) or {}).get(
+                "promotion_math_ready"
+            )
+            is not True
+            for fold in folds
+        ):
+            blockers.append(f"{side}_walk_forward_fold_not_ready")
+        if (loso_report.get(side) or {}).get("stable") is not True:
+            blockers.append(f"{side}_leave_one_symbol_out_not_stable")
+        evidence = oos_report.get(side) or {}
+        if evidence.get("profit_factor") is None:
+            blockers.append(f"{side}_oos_profit_factor_undefined")
+        if evidence.get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_oos_return_evidence_not_ready")
+        if any(
+            evidence.get(field) is None
+            for field in (
+                "return_lcb_pct",
+                "cvar_10_pct",
+                "max_drawdown_pct",
+            )
+        ):
+            blockers.append(f"{side}_oos_tail_evidence_incomplete")
+    authoritative = metadata.get("authoritative_trade_return_evidence") or {}
+    if (
+        authoritative.get("source_authority")
+        != "okx_position_history_profit_supervision"
+        or int(authoritative.get("sample_count") or 0) <= 0
+    ):
+        blockers.append("authoritative_realized_return_evidence_incomplete")
+    for side in ("long", "short"):
+        evidence = ((authoritative.get("sides") or {}).get(side) or {})
+        if evidence.get("promotion_math_ready") is not True:
+            blockers.append(f"{side}_authoritative_return_evidence_not_ready")
+    return list(dict.fromkeys(blockers))
+
+
+def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None) -> dict[str, float]:
+    price = f(features, "current_price", f(features, "close", 0.0))
+    atr = f(features, "atr_14")
+    bid_depth = f(features, "orderbook_bid_depth")
+    ask_depth = f(features, "orderbook_ask_depth")
+    total_depth = max(bid_depth + ask_depth, 1e-9)
+    volume_24h = max(f(features, "volume_24h"), 0.0)
+    oi_value = max(f(features, "open_interest_value"), 0.0)
+    values = {
+        "change_24h_pct": f(features, "change_24h_pct"),
+        "spread_pct": f(features, "spread_pct"),
+        "rsi_14": f(features, "rsi_14", 50.0),
+        "rsi_7": f(features, "rsi_7", 50.0),
+        "macd": f(features, "macd"),
+        "macd_signal": f(features, "macd_signal"),
+        "macd_diff": f(features, "macd_diff"),
+        "stoch_k": f(features, "stoch_k", 50.0),
+        "adx_14": f(features, "adx_14"),
+        "bb_width": f(features, "bb_width"),
+        "bb_pct": f(features, "bb_pct", 0.5),
+        "atr_pct": atr / price if price > 0 else 0.0,
+        "volume_ratio": f(features, "volume_ratio", 1.0),
+        "returns_1": f(features, "returns_1"),
+        "returns_5": f(features, "returns_5"),
+        "returns_20": f(features, "returns_20"),
+        "volatility_20": f(features, "volatility_20"),
+        "price_vs_sma20": f(features, "price_vs_sma20"),
+        "price_vs_sma50": f(features, "price_vs_sma50"),
+        "funding_rate": f(features, "funding_rate"),
+        "log_volume_24h": math.log10(volume_24h + 1.0),
+        "log_open_interest_value": math.log10(oi_value + 1.0),
+        "orderbook_imbalance": f(features, "orderbook_imbalance"),
+        "orderbook_depth_ratio": (bid_depth - ask_depth) / total_depth,
+        "news_sentiment_avg": f(features, "news_sentiment_avg"),
+        "social_sentiment_avg": f(features, "social_sentiment_avg"),
+        "social_mention_count": f(features, "social_mention_count"),
+        "news_article_count": f(features, "news_article_count"),
+        "decision_confidence": f(features, "decision_confidence"),
+        "horizon_minutes": float(horizon_minutes if horizon_minutes is not None else f(features, "horizon_minutes", 10.0)),
+    }
+    return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
+
+
+def _market_regime_label(features: dict[str, Any]) -> str:
+    explicit = str(
+        features.get("market_regime")
+        or features.get("regime")
+        or features.get("market_state")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit[:80]
+    volatility = abs(f(features, "volatility_20"))
+    if volatility <= 0:
+        price = max(f(features, "current_price"), f(features, "close"))
+        volatility = abs(f(features, "atr_14")) / price if price > 0 else 0.0
+    returns_20 = abs(f(features, "returns_20"))
+    return (
+        "volatile"
+        if volatility >= 0.03
+        else "trending"
+        if returns_20 >= 0.01
+        else "ranging"
+    )
+
+
+def model_x(features: dict[str, Any], *, horizon_minutes: int | None = None) -> list[float]:
+    row = feature_row(features, horizon_minutes=horizon_minutes)
+    return [row[key] for key in FEATURE_KEYS]
+
+
+def _dynamic_min_samples_leaf(sample_count: int) -> int:
+    observed_count = max(int(sample_count or 0), 1)
+    return max(int(math.log2(max(observed_count, 2))), 1)
+
+
+def _training_gc() -> None:
+    """Release temporary sklearn/torch arrays between independent stages."""
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _training_tree_count(sample_count: int, configured: int) -> int:
+    """Use a bounded forest size so a refresh cannot starve live inference."""
+
+    observed = max(int(sample_count or 0), 1)
+    # Larger datasets are already statistically supported; extra trees mostly
+    # increase resident memory and duplicate the same feature matrix.
+    if observed >= 4096:
+        return min(int(configured), 64)
+    if observed >= 1024:
+        return min(int(configured), 80)
+    return min(int(configured), 96)
+
+
+def _available_cpu_count() -> int:
+    try:
+        return max(len(os.sched_getaffinity(0)), 1)
+    except (AttributeError, OSError):
+        return max(int(os.cpu_count() or 1), 1)
+
+
+def _adaptive_training_worker_count() -> int:
+    """Use sublinear training parallelism so live inference always has headroom."""
+
+    return max(min(int(math.sqrt(_available_cpu_count())), 2), 1)
+
+
+def _make_regressor(sample_count: int) -> Pipeline:
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", ExtraTreesRegressor(
+            n_estimators=_training_tree_count(
+                sample_count,
+                TRAINING_REGRESSOR_TREE_COUNT,
+            ),
+            max_depth=12,
+            min_samples_leaf=_dynamic_min_samples_leaf(sample_count),
+            random_state=42,
+            n_jobs=_adaptive_training_worker_count(),
+        )),
+    ])
+
+
+def _make_classifier(y: list[int]) -> Pipeline:
+    unique = set(int(v) for v in y)
+    if len(unique) < 2:
+        from sklearn.dummy import DummyClassifier
+        estimator = DummyClassifier(strategy="prior")
+    else:
+        estimator = ExtraTreesClassifier(
+            n_estimators=_training_tree_count(
+                len(y),
+                TRAINING_CLASSIFIER_TREE_COUNT,
+            ),
+            max_depth=12,
+            min_samples_leaf=_dynamic_min_samples_leaf(len(y)),
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=_adaptive_training_worker_count(),
+        )
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", estimator),
+    ])
+
+
+def _trusted_model_artifact_path(path: Path) -> Path:
+    root = MODEL_DIR.resolve(strict=False)
+    if not root.is_absolute():
+        raise ValueError("Model directory must be absolute.")
+    target = Path(path).resolve(strict=False)
+    if target.suffix != ".joblib":
+        raise ValueError("Model artifact must use .joblib suffix.")
+    if not target.is_relative_to(root):
+        raise ValueError("Model artifact path escapes trusted model directory.")
+    return target
+
+
+def load_trusted_joblib_bundle(path: Path) -> dict[str, Any]:
+    target = _trusted_model_artifact_path(path)
+    value = joblib.load(target)
+    if not isinstance(value, dict):
+        raise ValueError("Model artifact must contain a dictionary bundle.")
+    return value
+
+
+def dump_trusted_joblib_bundle(bundle: dict[str, Any], path: Path) -> Path:
+    if not isinstance(bundle, dict):
+        raise ValueError("Model artifact must be a dictionary bundle.")
+    target = _trusted_model_artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{target.stem}.",
+            suffix=".tmp",
+            dir=str(target.parent),
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        joblib.dump(bundle, tmp_path)
+        os.replace(tmp_path, target)
+        return target
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Artifact registry JSON must be an object: {path}")
+    return value
+
+
+def _required_text(payload: dict[str, Any], key: str) -> str:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        raise ValueError(f"{key} is required")
+    return value
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+class IncompatibleArtifactContractError(ValueError):
+    """A verified artifact belongs to an older, non-loadable model contract."""
+
+
+def _resolve_artifact_pointer(
+    pointer_path: Path,
+    *,
+    role: str,
+    deserialize_bundle: bool = False,
+) -> dict[str, Any] | None:
+    if not pointer_path.exists():
+        return None
+    pointer = read_json_object(pointer_path)
+    if pointer.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION:
+        raise ValueError("Unsupported local AI artifact registry pointer version.")
+    if pointer.get("pointer_role") != role:
+        raise ValueError("Local AI artifact pointer role mismatch.")
+    if pointer.get("model_id") != ARTIFACT_MODEL_ID:
+        raise ValueError("Local AI artifact pointer model identity mismatch.")
+    version = _required_text(pointer, "version")
+    version_root = (VERSIONS_ROOT / version).resolve(strict=True)
+    manifest_path = (MODEL_DIR / _required_text(pointer, "manifest_path")).resolve(
+        strict=True
+    )
+    manifest_path.relative_to(version_root)
+    if sha256_file(manifest_path) != _required_text(pointer, "manifest_sha256"):
+        raise ValueError("Local AI artifact manifest hash verification failed.")
+    manifest = read_json_object(manifest_path)
+    if manifest.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION:
+        raise ValueError("Local AI artifact manifest registry version mismatch.")
+    if manifest.get("artifact_model_id") != ARTIFACT_MODEL_ID:
+        raise ValueError("Local AI artifact manifest model identity mismatch.")
+    if manifest.get("artifact_version") != version:
+        raise ValueError("Local AI artifact manifest version mismatch.")
+    model_path = (version_root / _required_text(manifest, "model_relative_path")).resolve(
+        strict=True
+    )
+    metadata_path = (
+        version_root / _required_text(manifest, "metadata_relative_path")
+    ).resolve(strict=True)
+    model_path.relative_to(version_root)
+    metadata_path.relative_to(version_root)
+    artifact_hash = _required_text(pointer, "artifact_sha256")
+    if artifact_hash != manifest.get("artifact_sha256") or sha256_file(model_path) != artifact_hash:
+        raise ValueError("Local AI artifact model hash verification failed.")
+    metadata_hash = _required_text(pointer, "metadata_sha256")
+    if metadata_hash != manifest.get("metadata_sha256") or sha256_file(metadata_path) != metadata_hash:
+        raise ValueError("Local AI artifact metadata hash verification failed.")
+    metadata = read_json_object(metadata_path)
+    contract_expectations = {
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "time_split_policy": "independent_chronological_disjoint_decision_groups",
+        "training_cost_policy": (
+            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+        ),
+    }
+    for field, expected in contract_expectations.items():
+        if metadata.get(field) != manifest.get(field):
+            raise ValueError(f"Local AI artifact metadata/manifest {field} mismatch.")
+        if metadata.get(field) != expected:
+            raise IncompatibleArtifactContractError(
+                f"Local AI artifact {field} belongs to an incompatible contract."
+            )
+    expected_report_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_report_hashes:
+        raise ValueError("Local AI artifact evaluation report hash mismatch.")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_report_hashes
+    ):
+        raise ValueError("Local AI artifact return evidence hash mismatch.")
+    for field, expected in (
+        ("artifact_registry_version", ARTIFACT_REGISTRY_VERSION),
+        ("artifact_model_id", ARTIFACT_MODEL_ID),
+        ("artifact_version", version),
+        ("artifact_sha256", artifact_hash),
+    ):
+        if metadata.get(field) != expected:
+            raise ValueError(f"Local AI artifact metadata {field} mismatch.")
+    for field in (
+        "training_data_sha256",
+        "source_code_sha256",
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "cost_model_version",
+        "profit_supervision_version",
+        "time_split_policy",
+        "training_cost_policy",
+        "model_stage",
+        "market_fact_contract",
+        "governance_report",
+        "evaluation_report_hashes",
+        "artifact_return_evidence_sha256",
+    ):
+        if metadata.get(field) != manifest.get(field):
+            raise ValueError(f"Local AI artifact metadata/manifest {field} mismatch.")
+    activation = None
+    rejection = None
+    if role in {"current", "rollback"}:
+        activation_path = (
+            MODEL_DIR / _required_text(pointer, "activation_manifest_path")
+        ).resolve(strict=True)
+        activation_path.relative_to(version_root)
+        if sha256_file(activation_path) != _required_text(
+            pointer, "activation_manifest_sha256"
+        ):
+            raise ValueError("Local AI activation manifest hash verification failed.")
+        activation = read_json_object(activation_path)
+        if (
+            activation.get("activation_manifest_version")
+            != ARTIFACT_ACTIVATION_MANIFEST_VERSION
+        ):
+            raise IncompatibleArtifactContractError(
+                "Local AI activation belongs to an incompatible permission contract."
+            )
+        if (
+            activation.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or activation.get("artifact_version") != version
+            or activation.get("artifact_sha256") != artifact_hash
+        ):
+            raise ValueError("Local AI activation identity mismatch.")
+        if activation.get("training_data_sha256") != manifest.get(
+            "training_data_sha256"
+        ):
+            raise ValueError("Local AI activation training-data identity mismatch.")
+        if activation.get("source_code_sha256") != manifest.get("source_code_sha256"):
+            raise ValueError("Local AI activation source-code identity mismatch.")
+        if activation.get("artifact_return_evidence_sha256") != metadata.get(
+            "artifact_return_evidence_sha256"
+        ):
+            raise ValueError("Local AI activation return-evidence identity mismatch.")
+        stage = activation.get("activation_stage")
+        production_authorized = activation.get("live_ml_ready") is True
+        if stage in {"shadow", "canary"} and production_authorized:
+            raise ValueError("Observation-only local AI artifact has production authorization.")
+        if stage == "canary":
+            recommendation = activation.get("promotion_recommendation") or {}
+            if (
+                activation.get("execution_scope") != "paper_only"
+                or activation.get("production_permission") is not False
+                or activation.get("canary_authorized") is not True
+                or recommendation.get("canary_ready") is not True
+            ):
+                raise ValueError("Canary local AI activation contract is incomplete.")
+        if stage == "active":
+            recommendation = activation.get("promotion_recommendation") or {}
+            if (
+                recommendation.get("recommended_stage") != "active"
+                or recommendation.get("live_ml_ready") is not True
+            ):
+                raise ValueError("Active local AI activation recommendation is incomplete.")
+            if not production_authorized:
+                raise ValueError("Active local AI activation is not authorized.")
+            evidence_blockers = _production_return_evidence_blockers(metadata)
+            if evidence_blockers:
+                raise ValueError(
+                    "Active local AI activation return evidence is not ready: "
+                    + ",".join(evidence_blockers)
+                )
+            if activation.get("return_evidence_ready") is not True:
+                raise ValueError("Active local AI activation evidence was not authorized.")
+            if (
+                activation.get("execution_scope") != "production"
+                or activation.get("production_permission") is not True
+            ):
+                raise ValueError("Active local AI activation permission is incomplete.")
+        if stage not in {"shadow", "canary", "active"}:
+            raise ValueError("Local AI activation stage is invalid.")
+    elif role == "challenger":
+        rejection_path = (
+            MODEL_DIR / _required_text(pointer, "rejection_manifest_path")
+        ).resolve(strict=True)
+        rejection_path.relative_to(version_root)
+        if sha256_file(rejection_path) != _required_text(
+            pointer, "rejection_manifest_sha256"
+        ):
+            raise ValueError("Local AI rejection manifest hash verification failed.")
+        rejection = read_json_object(rejection_path)
+        if (
+            rejection.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or rejection.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or rejection.get("artifact_version") != version
+            or rejection.get("artifact_sha256") != artifact_hash
+            or not isinstance(rejection.get("comparison_report"), dict)
+        ):
+            raise ValueError("Local AI rejection manifest identity mismatch.")
+    bundle = None
+    if deserialize_bundle:
+        bundle = load_trusted_joblib_bundle(model_path)
+        embedded = bundle.get("metadata") if isinstance(bundle, dict) else None
+        if not isinstance(embedded, dict):
+            raise ValueError("Local AI artifact bundle metadata is missing.")
+        for field in (
+            "artifact_registry_version",
+            "artifact_model_id",
+            "artifact_version",
+            "training_data_sha256",
+            "source_code_sha256",
+            "objective_version",
+            "label_version",
+            "profit_supervision_version",
+        ):
+            if embedded.get(field) != metadata.get(field):
+                raise ValueError(f"Local AI artifact bundle {field} mismatch.")
+    return {
+        "role": role,
+        "pointer": pointer,
+        "version": version,
+        "version_root": version_root,
+        "manifest_path": manifest_path,
+        "manifest": manifest,
+        "model_path": model_path,
+        "metadata_path": metadata_path,
+        "metadata": metadata,
+        "activation_manifest": activation,
+        "rejection_manifest": rejection,
+        "bundle": bundle,
+    }
+
+
+def persist_candidate_bundle(
+    bundle: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    if not _is_sha256(metadata.get("training_data_sha256")):
+        raise ValueError("Local AI training_data_sha256 is invalid.")
+    if not _is_sha256(metadata.get("source_code_sha256")):
+        raise ValueError("Local AI source_code_sha256 is invalid.")
+    for field in (
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "cost_model_version",
+        "profit_supervision_version",
+        "time_split_policy",
+        "training_cost_policy",
+    ):
+        _required_text(metadata, field)
+    for field in EVALUATION_REPORT_FIELDS:
+        if not isinstance(metadata.get(field), dict):
+            raise ValueError(f"Local AI {field} is required for candidate persistence.")
+    expected_report_hashes = _evaluation_report_hashes(metadata)
+    if metadata.get("evaluation_report_hashes") != expected_report_hashes:
+        raise ValueError("Local AI evaluation report hashes are invalid.")
+    if metadata.get("artifact_return_evidence_sha256") != canonical_sha256(
+        expected_report_hashes
+    ):
+        raise ValueError("Local AI combined return-evidence hash is invalid.")
+    created_at = datetime.now(timezone.utc)
+    version = f"{created_at.strftime('%Y%m%dT%H%M%S%fZ')}-{uuid.uuid4().hex[:8]}"
+    version_root = VERSIONS_ROOT / version
+    version_root.mkdir(parents=True, exist_ok=False)
+    model_path = version_root / "model.joblib"
+    metadata_path = version_root / "model_metadata.json"
+    manifest_path = version_root / "manifest.json"
+    registry_metadata = {
+        **metadata,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": version,
+        "artifact_lifecycle": "candidate",
+        "model_stage": "candidate",
+        "live_ml_ready": False,
+    }
+    persisted_bundle = dict(bundle)
+    persisted_bundle["metadata"] = registry_metadata
+    dump_trusted_joblib_bundle(persisted_bundle, model_path)
+    artifact_hash = sha256_file(model_path)
+    registry_metadata["artifact_sha256"] = artifact_hash
+    registry_metadata["artifact_size_bytes"] = model_path.stat().st_size
+    write_json_atomic(metadata_path, registry_metadata)
+    metadata_hash = sha256_file(metadata_path)
+    manifest = {
+        **registry_metadata,
+        "created_at": created_at.isoformat(),
+        "artifact_sha256": artifact_hash,
+        "metadata_sha256": metadata_hash,
+        "model_relative_path": "model.joblib",
+        "metadata_relative_path": "model_metadata.json",
+    }
+    write_json_atomic(manifest_path, manifest)
+    write_json_atomic(
+        CANDIDATE_POINTER_PATH,
+        {
+            "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+            "pointer_role": "candidate",
+            "model_id": ARTIFACT_MODEL_ID,
+            "version": version,
+            "manifest_path": str(manifest_path.relative_to(MODEL_DIR)),
+            "artifact_sha256": artifact_hash,
+            "metadata_sha256": metadata_hash,
+            "manifest_sha256": sha256_file(manifest_path),
+            "updated_at": created_at.isoformat(),
+        },
+    )
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=True,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact did not resolve after persistence.")
+    return candidate
+
+
+def _governed_candidate_activation_stage(
+    promotion_recommendation: dict[str, Any],
+    evidence_blockers: list[str],
+) -> str:
+    recommended = str(promotion_recommendation.get("recommended_stage") or "shadow").lower()
+    if (
+        recommended == "active"
+        and promotion_recommendation.get("live_ml_ready") is True
+        and not evidence_blockers
+    ):
+        return "active"
+    if (
+        recommended in {"canary", "active"}
+        and promotion_recommendation.get("canary_ready") is True
+        and promotion_recommendation.get("canary_execution_scope") == "paper_only"
+        and promotion_recommendation.get("canary_production_permission") is False
+    ):
+        return "canary"
+    return "shadow"
+
+
+def _local_artifact_stage_rank(stage: str) -> int:
+    return {"shadow": 0, "canary": 1, "active": 2}.get(
+        str(stage or "").lower(),
+        -1,
+    )
+
+
+def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
+    values: dict[str, list[float]] = {
+        "avg_return_pct": [],
+        "return_lcb_pct": [],
+        "profit_factor": [],
+        "cvar_10_pct": [],
+        "max_drawdown_pct": [],
+    }
+    evidence = metadata.get("oos_return_evaluation") or {}
+    for side in ("long", "short"):
+        row = evidence.get(side) if isinstance(evidence, dict) else None
+        if not isinstance(row, dict):
+            continue
+        for key in values:
+            try:
+                value = float(row.get(key))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values[key].append(value)
+    return {
+        key: sum(items) / len(items) if items else None
+        for key, items in values.items()
+    }
+
+
+def _replaceable_current_artifact(
+    *,
+    deserialize_bundle: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        current = _resolve_artifact_pointer(
+            CURRENT_POINTER_PATH,
+            role="current",
+            deserialize_bundle=deserialize_bundle,
+        )
+        return current, None
+    except IncompatibleArtifactContractError as exc:
+        return None, str(exc)
+
+
+def _compare_candidate_to_current(
+    candidate_metadata: dict[str, Any],
+    *,
+    candidate_stage: str,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "policy": "local_ai_tools_fee_after_champion_v1",
+        "candidate_stage": candidate_stage,
+        "accepted": False,
+        "blocking_reasons": [],
+    }
+    try:
+        current, incompatible_reason = _replaceable_current_artifact()
+    except ValueError as exc:
+        # A transient/incomplete champion registry must not turn /train into a
+        # 500 or allow an unverified replacement. Leave the current pointer
+        # untouched and let the scheduler retry after the registry is stable.
+        return {
+            **report,
+            "reason": "champion_integrity_unverified",
+            "blocking_reasons": ["champion_integrity_unverified"],
+            "champion_integrity_error": safe_error(exc, ERROR_TEXT_LIMIT),
+            "retryable": True,
+        }
+    if current is None:
+        return {
+            **report,
+            "accepted": True,
+            "reason": (
+                "incompatible_champion_contract_replaced"
+                if incompatible_reason
+                else "initial_champion"
+            ),
+            "replaced_champion_reason": incompatible_reason,
+        }
+    current_stage = str(
+        (current.get("activation_manifest") or {}).get("activation_stage") or ""
+    ).lower()
+    candidate_rank = _local_artifact_stage_rank(candidate_stage)
+    champion_rank = _local_artifact_stage_rank(current_stage)
+    if candidate_rank < champion_rank:
+        return {
+            **report,
+            "reason": "champion_retained",
+            "blocking_reasons": ["candidate_lifecycle_regression"],
+            "champion_version": current.get("version"),
+        }
+    if candidate_rank > champion_rank:
+        return {
+            **report,
+            "accepted": True,
+            "reason": "governed_lifecycle_upgrade",
+            "champion_version": current.get("version"),
+        }
+    candidate = _local_oos_aggregate(candidate_metadata)
+    champion = _local_oos_aggregate(current.get("metadata") or {})
+    report["candidate_metrics"] = candidate
+    report["champion_metrics"] = champion
+    if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
+        return {
+            **report,
+            "reason": "champion_retained",
+            "blocking_reasons": ["champion_comparison_metric_missing"],
+            "champion_version": current.get("version"),
+        }
+    blockers: list[str] = []
+    primary = ("avg_return_pct", "return_lcb_pct", "profit_factor")
+    if champion_rank == _local_artifact_stage_rank("active"):
+        if candidate_stage != "active":
+            blockers.append("active_champion_requires_active_challenger")
+        for key in primary:
+            if candidate[key] <= champion[key]:
+                blockers.append(f"candidate_{key}_not_improved")
+        if candidate["return_lcb_pct"] <= 0:
+            blockers.append("candidate_return_lcb_not_positive")
+        if candidate["profit_factor"] <= 1:
+            blockers.append("candidate_profit_factor_not_above_one")
+        if candidate["cvar_10_pct"] < champion["cvar_10_pct"]:
+            blockers.append("candidate_cvar_worsened")
+        if candidate["max_drawdown_pct"] > champion["max_drawdown_pct"]:
+            blockers.append("candidate_max_drawdown_worsened")
+    else:
+        if not any(candidate[key] > champion[key] for key in primary):
+            blockers.append("candidate_primary_fee_after_metrics_not_improved")
+        if candidate["cvar_10_pct"] < champion["cvar_10_pct"] - 0.05:
+            blockers.append("candidate_cvar_materially_worsened")
+        if candidate["max_drawdown_pct"] > champion["max_drawdown_pct"] + 0.05:
+            blockers.append("candidate_max_drawdown_materially_worsened")
+    return {
+        **report,
+        "accepted": not blockers,
+        "reason": "challenger_quality_improved" if not blockers else "champion_retained",
+        "blocking_reasons": blockers,
+        "champion_version": current.get("version"),
+    }
+
+
+def _local_activation_manifest(
+    artifact: dict[str, Any],
+    return_evidence: dict[str, Any],
+    activation_stage: str,
+    *,
+    transition_from_stage: str | None = None,
+) -> tuple[dict[str, Any], Path]:
+    if activation_stage not in {"shadow", "canary", "active"}:
+        raise ValueError("Local AI artifact activation stage is invalid.")
+    evidence_blockers = _production_return_evidence_blockers(artifact["metadata"])
+    promotion_recommendation = return_evidence.get("promotion_recommendation") or {}
+    production_authorized = activation_stage == "active"
+    activation_path = artifact["version_root"] / f"activation-{activation_stage}.json"
+    activation = {
+        "activation_manifest_version": ARTIFACT_ACTIVATION_MANIFEST_VERSION,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": artifact["version"],
+        "artifact_sha256": artifact["manifest"]["artifact_sha256"],
+        "training_data_sha256": artifact["manifest"].get("training_data_sha256"),
+        "source_code_sha256": artifact["manifest"].get("source_code_sha256"),
+        "artifact_return_evidence_sha256": artifact["metadata"].get(
+            "artifact_return_evidence_sha256"
+        ),
+        "activation_stage": activation_stage,
+        "transition_from_stage": transition_from_stage,
+        "live_ml_ready": production_authorized,
+        "execution_scope": (
+            "production"
+            if activation_stage == "active"
+            else "paper_only"
+        ),
+        "paper_execution_permission": True,
+        "production_permission": production_authorized,
+        "canary_authorized": activation_stage == "canary",
+        "promotion_recommendation": promotion_recommendation,
+        "return_evidence_report": return_evidence,
+        "return_evidence_ready": not evidence_blockers,
+        "return_evidence_blockers": evidence_blockers,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return activation, activation_path
+
+
+def activate_candidate_shadow(
+    return_evidence: dict[str, Any],
+    *,
+    activation_stage: str = "shadow",
+) -> dict[str, Any]:
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=False,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact is not registered.")
+    if activation_stage != "shadow":
+        raise ValueError("Local AI candidate must first activate as shadow.")
+    activation, activation_path = _local_activation_manifest(
+        candidate,
+        return_evidence,
+        "shadow",
+    )
+    write_json_atomic(activation_path, activation)
+    current, _incompatible_reason = _replaceable_current_artifact(
+        deserialize_bundle=True
+    )
+    if current is not None:
+        write_json_atomic(
+            ROLLBACK_POINTER_PATH,
+            {
+                **current["pointer"],
+                "pointer_role": "rollback",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **candidate["pointer"],
+            "pointer_role": "current",
+            "activation_manifest_path": str(activation_path.relative_to(MODEL_DIR)),
+            "activation_manifest_sha256": sha256_file(activation_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    current = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=True,
+    )
+    if current is None:
+        raise ValueError("Local AI shadow activation did not produce a current artifact.")
+    CANDIDATE_POINTER_PATH.unlink(missing_ok=True)
+    return current
+
+
+def transition_current_artifact(
+    return_evidence: dict[str, Any],
+    *,
+    activation_stage: str,
+) -> dict[str, Any]:
+    current = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=False,
+    )
+    if current is None:
+        raise ValueError("Local AI current artifact is not registered.")
+    current_activation = current.get("activation_manifest") or {}
+    current_stage = str(current_activation.get("activation_stage") or "")
+    allowed_targets = {
+        "shadow": {"canary"},
+        "canary": {"active"},
+    }
+    if activation_stage not in allowed_targets.get(current_stage, set()):
+        raise ValueError(
+            f"Local AI artifact transition {current_stage or 'unregistered'} -> "
+            f"{activation_stage} is not allowed."
+        )
+    evidence_blockers = _production_return_evidence_blockers(current["metadata"])
+    governed_stage = _governed_candidate_activation_stage(
+        return_evidence.get("promotion_recommendation") or {},
+        evidence_blockers,
+    )
+    if activation_stage == "active" and governed_stage != "active":
+        raise ValueError("Local AI active transition is not governed by return evidence.")
+    if activation_stage == "canary" and governed_stage not in {"canary", "active"}:
+        raise ValueError("Local AI canary transition is not governed by return evidence.")
+    activation, activation_path = _local_activation_manifest(
+        current,
+        return_evidence,
+        activation_stage,
+        transition_from_stage=current_stage,
+    )
+    write_json_atomic(activation_path, activation)
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **current["pointer"],
+            "pointer_role": "current",
+            "activation_manifest_path": str(activation_path.relative_to(MODEL_DIR)),
+            "activation_manifest_sha256": sha256_file(activation_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    transitioned = _resolve_artifact_pointer(
+        CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=True,
+    )
+    if transitioned is None:
+        raise ValueError("Local AI artifact transition did not preserve current artifact.")
+    return transitioned
+
+
+def reject_candidate_artifact(comparison_report: dict[str, Any]) -> dict[str, Any]:
+    candidate = _resolve_artifact_pointer(
+        CANDIDATE_POINTER_PATH,
+        role="candidate",
+        deserialize_bundle=False,
+    )
+    if candidate is None:
+        raise ValueError("Local AI candidate artifact is not registered.")
+    rejection_path = candidate["version_root"] / "rejection.json"
+    rejection = {
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": candidate["version"],
+        "artifact_sha256": candidate["manifest"]["artifact_sha256"],
+        "comparison_report": comparison_report,
+        "rejected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json_atomic(rejection_path, rejection)
+    write_json_atomic(
+        CHALLENGER_POINTER_PATH,
+        {
+            **candidate["pointer"],
+            "pointer_role": "challenger",
+            "rejection_manifest_path": str(rejection_path.relative_to(MODEL_DIR)),
+            "rejection_manifest_sha256": sha256_file(rejection_path),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    challenger = _resolve_artifact_pointer(
+        CHALLENGER_POINTER_PATH,
+        role="challenger",
+        deserialize_bundle=True,
+    )
+    if challenger is None:
+        raise ValueError("Local AI rejected challenger did not resolve.")
+    CANDIDATE_POINTER_PATH.unlink(missing_ok=True)
+    return challenger
+
+
+def rollback_current_artifact() -> dict[str, Any]:
+    rollback = _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    if rollback is None:
+        raise ValueError("Local AI rollback artifact is not registered.")
+    current_pointer = read_json_object(CURRENT_POINTER_PATH)
+    write_json_atomic(
+        CURRENT_POINTER_PATH,
+        {
+            **rollback["pointer"],
+            "pointer_role": "current",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    restored = _resolve_artifact_pointer(CURRENT_POINTER_PATH, role="current")
+    if restored is None:
+        raise ValueError("Local AI rollback did not restore a current artifact.")
+    write_json_atomic(
+        ROLLBACK_POINTER_PATH,
+        {
+            **current_pointer,
+            "pointer_role": "rollback",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _resolve_artifact_pointer(ROLLBACK_POINTER_PATH, role="rollback")
+    return restored
+
+
+def _path_stat_signature(path: Path) -> tuple[str, int | None, int | None, int | None]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return str(path), None, None, None
+    return str(path), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
+def _resolved_artifact_signature(
+    pointer_path: Path,
+    resolved: dict[str, Any] | None,
+) -> tuple[tuple[str, int | None, int | None, int | None], ...]:
+    paths = [pointer_path]
+    if resolved:
+        paths.extend(
+            path
+            for path in (
+                resolved.get("manifest_path"),
+                resolved.get("model_path"),
+                resolved.get("metadata_path"),
+            )
+            if isinstance(path, Path)
+        )
+        activation_relative = str(
+            (resolved.get("pointer") or {}).get("activation_manifest_path") or ""
+        ).strip()
+        if activation_relative:
+            paths.append(MODEL_DIR / activation_relative)
+    return tuple(_path_stat_signature(path) for path in paths)
+
+
+def _resolve_artifact_pointer_for_status(
+    pointer_path: Path,
+    *,
+    role: str,
+) -> dict[str, Any] | None:
+    """Reuse a verified immutable artifact while all source file stats are unchanged."""
+
+    cache_key = f"{role}:{pointer_path}"
+    cached = _STATUS_ARTIFACT_CACHE.get(cache_key)
+    if cached is not None:
+        cached_resolved = cached.get("resolved")
+        if _resolved_artifact_signature(pointer_path, cached_resolved) == cached.get(
+            "signature"
+        ):
+            return cached_resolved
+    resolved = _resolve_artifact_pointer(pointer_path, role=role)
+    _STATUS_ARTIFACT_CACHE[cache_key] = {
+        "resolved": resolved,
+        "signature": _resolved_artifact_signature(pointer_path, resolved),
+    }
+    return resolved
+
+
+def _load_bundle_unlocked() -> dict[str, Any] | None:
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    model_mtime_ns: int | None = None
+    pointer_mtime_ns = (
+        CURRENT_POINTER_PATH.stat().st_mtime_ns
+        if CURRENT_POINTER_PATH.exists()
+        else None
+    )
+    if (
+        _CURRENT_POINTER_MTIME_NS == pointer_mtime_ns
+        and _CURRENT_MODEL_PATH is not None
+    ):
+        try:
+            model_mtime_ns = _CURRENT_MODEL_PATH.stat().st_mtime_ns
+        except OSError:
+            model_mtime_ns = None
+        if _CURRENT_MODEL_MTIME_NS == model_mtime_ns:
+            return _BUNDLE_CACHE
+    try:
+        current = _resolve_artifact_pointer_for_status(
+            CURRENT_POINTER_PATH,
+            role="current",
+        )
+        if current is None:
+            _BUNDLE_CACHE = None
+            _CURRENT_MODEL_PATH = None
+            _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+            _CURRENT_MODEL_MTIME_NS = None
+            return None
+        _CURRENT_MODEL_PATH = current["model_path"]
+        model_mtime_ns = _CURRENT_MODEL_PATH.stat().st_mtime_ns
+        candidate = load_trusted_joblib_bundle(_CURRENT_MODEL_PATH)
+        metadata = candidate.get("metadata") if isinstance(candidate, dict) else None
+        if not isinstance(metadata, dict) or (
+            metadata.get("objective_name") != RETURN_OBJECTIVE_NAME
+            or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
+            or metadata.get("label_version") != RETURN_LABEL_VERSION
+            or metadata.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
+            or not all(
+                key in candidate
+                for key in (
+                    "long_return_model",
+                    "short_return_model",
+                    "long_cost_model",
+                    "short_cost_model",
+                )
+            )
+        ):
+            raise ValueError("local quant artifact separated supervision rejected")
+        activation = current.get("activation_manifest") or {}
+        runtime_metadata = {
+            **metadata,
+            "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
+            "model_stage": activation.get("activation_stage") or "unregistered",
+            "live_ml_ready": bool(
+                activation.get("live_ml_ready")
+            ),
+            "artifact_activation_manifest": activation,
+        }
+        candidate = {**candidate, "metadata": runtime_metadata}
+        _configure_bundle_for_inference(candidate)
+        _BUNDLE_CACHE = candidate
+        _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+        _CURRENT_MODEL_MTIME_NS = model_mtime_ns
+        return _BUNDLE_CACHE
+    except Exception:
+        _BUNDLE_CACHE = None
+        _CURRENT_POINTER_MTIME_NS = pointer_mtime_ns
+        _CURRENT_MODEL_MTIME_NS = model_mtime_ns if model_mtime_ns is not None else -1
+        return None
+
+
+def load_bundle() -> dict[str, Any] | None:
+    """Load one verified artifact once when concurrent inference starts."""
+
+    with _BUNDLE_CACHE_LOCK:
+        return _load_bundle_unlocked()
+
+
+def _set_estimator_inference_workers(value: Any) -> None:
+    """Prevent one-row tree inference from fanning out across every CPU."""
+
+    if isinstance(value, dict):
+        for nested in value.values():
+            _set_estimator_inference_workers(nested)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _set_estimator_inference_workers(nested)
+        return
+    get_params = getattr(value, "get_params", None)
+    set_params = getattr(value, "set_params", None)
+    if callable(get_params) and callable(set_params):
+        try:
+            parameters = get_params(deep=True)
+            updates = {
+                name: 1
+                for name in parameters
+                if name == "n_jobs" or name.endswith("__n_jobs")
+            }
+            if updates:
+                set_params(**updates)
+                return
+        except Exception:
+            pass
+    if hasattr(value, "n_jobs"):
+        try:
+            value.n_jobs = 1
+        except Exception:
+            pass
+
+
+def _configure_bundle_for_inference(bundle: dict[str, Any]) -> None:
+    for key in (
+        "long_return_model",
+        "short_return_model",
+        "long_cost_model",
+        "short_cost_model",
+        "long_loss_model",
+        "short_loss_model",
+        "horizon_models",
+        "sentiment_model",
+        "text_sentiment_model",
+    ):
+        _set_estimator_inference_workers(bundle.get(key))
+
+
+def _file_stat(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return {
+            "exists": False,
+            "error": safe_error(exc),
+        }
+    return {
+        "exists": True,
+        "size_bytes": int(stat.st_size),
+        "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+    }
+
+
+def _read_metadata_file() -> dict[str, Any]:
+    try:
+        current = _resolve_artifact_pointer_for_status(
+            CURRENT_POINTER_PATH,
+            role="current",
+        )
+        return current["metadata"] if current else {}
+    except Exception:
+        return {}
+
+
+def _status_summary_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    """Bound status payloads without changing the persisted training artifact."""
+
+    if key in _STATUS_OMITTED_DETAIL_KEYS:
+        return None
+    if depth >= _STATUS_MAX_DEPTH:
+        return "status_detail_omitted"
+    if isinstance(value, dict):
+        result = {}
+        rows = list(value.items())
+        for child_key, child_value in rows[:_STATUS_DICT_LIMIT]:
+            summarized = _status_summary_value(
+                child_value,
+                key=str(child_key),
+                depth=depth + 1,
+            )
+            if summarized is not None:
+                result[str(child_key)] = summarized
+        if len(rows) > _STATUS_DICT_LIMIT:
+            result["status_omitted_key_count"] = len(rows) - _STATUS_DICT_LIMIT
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            summarized
+            for item in list(value)[:_STATUS_LIST_LIMIT]
+            if (
+                summarized := _status_summary_value(
+                    item,
+                    key=key,
+                    depth=depth + 1,
+                )
+            )
+            is not None
+        ]
+    if isinstance(value, str):
+        return value[:1000]
+    return value
+
+
+def _status_metadata() -> dict[str, Any]:
+    metadata = _read_metadata_file()
+    if not metadata and _BUNDLE_CACHE and isinstance(_BUNDLE_CACHE.get("metadata"), dict):
+        metadata = _BUNDLE_CACHE["metadata"]
+    return {
+        key: summarized
+        for key in _STATUS_METADATA_KEYS
+        if key in metadata
+        and (
+            summarized := _status_summary_value(metadata.get(key), key=key)
+        )
+        is not None
+    }
+
+
+def _status_child_endpoint_contracts(model_bundle_available: bool) -> dict[str, Any]:
+    routes = {
+        "profit_prediction": "/profit/predict",
+        "time_series_prediction": "/timeseries/deep/predict",
+        "sentiment_analysis": "/sentiment/deep/analyze",
+        "exit_advice": "/exit/advise",
+    }
+    return {
+        name: {
+            "available": bool(model_bundle_available),
+            "path": path,
+            "probe_mode": "metadata_contract",
+            "actual_inference_probe": False,
+            "message": (
+                "服务和模型产物已就绪；实际推理由影子评估持续验证。"
+                if model_bundle_available
+                else "服务在线，但模型产物尚未就绪。"
+            ),
+        }
+        for name, path in routes.items()
+    }
+
+
+def _lightweight_model_bundle_available() -> bool:
+    """Check bundle file presence for the cheap liveness contract.
+
+    Full pointer/hash verification remains owned by ``/models/status`` and
+    ``/health``.  Liveness must not perform that expensive verification because
+    a transient status probe timeout would otherwise make the platform lose the
+    child-endpoint contract.
+    """
+
+    try:
+        pointer = read_json_object(CURRENT_POINTER_PATH)
+        if (
+            pointer.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or pointer.get("pointer_role") != "current"
+            or pointer.get("model_id") != ARTIFACT_MODEL_ID
+        ):
+            return False
+        version = str(pointer.get("version") or "").strip()
+        manifest_relative = str(pointer.get("manifest_path") or "").strip()
+        if not version or not manifest_relative:
+            return False
+        version_root = (VERSIONS_ROOT / version).resolve()
+        manifest_path = (MODEL_DIR / manifest_relative).resolve()
+        manifest_path.relative_to(version_root)
+        manifest = read_json_object(manifest_path)
+        if (
+            manifest.get("artifact_registry_version") != ARTIFACT_REGISTRY_VERSION
+            or manifest.get("artifact_model_id") != ARTIFACT_MODEL_ID
+            or manifest.get("artifact_version") != version
+        ):
+            return False
+        model_relative = str(manifest.get("model_relative_path") or "").strip()
+        metadata_relative = str(manifest.get("metadata_relative_path") or "").strip()
+        if not model_relative or not metadata_relative:
+            return False
+        model_path = (version_root / model_relative).resolve()
+        metadata_path = (version_root / metadata_relative).resolve()
+        model_path.relative_to(version_root)
+        metadata_path.relative_to(version_root)
+        return model_path.is_file() and metadata_path.is_file()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _model_artifact_status() -> dict[str, Any]:
+    pointer_rows = {}
+    resolved_rows = {}
+    for role, path in (
+        ("candidate", CANDIDATE_POINTER_PATH),
+        ("challenger", CHALLENGER_POINTER_PATH),
+        ("current", CURRENT_POINTER_PATH),
+        ("rollback", ROLLBACK_POINTER_PATH),
+    ):
+        try:
+            resolved = _resolve_artifact_pointer_for_status(path, role=role)
+            resolved_rows[role] = resolved
+            pointer_rows[role] = {
+                "available": resolved is not None,
+                "version": resolved.get("version") if resolved else None,
+                "error": None if resolved else f"{role}_artifact_not_registered",
+            }
+        except Exception as exc:
+            resolved_rows[role] = None
+            pointer_rows[role] = {
+                "available": False,
+                "version": None,
+                "error": safe_error(exc),
+            }
+    current = resolved_rows["current"]
+    candidate = resolved_rows.get("candidate")
+    challenger = resolved_rows.get("challenger")
+    raw_metadata = current["metadata"] if current else {}
+    metadata = {
+        key: summarized
+        for key in _STATUS_METADATA_KEYS
+        if key in raw_metadata
+        and (
+            summarized := _status_summary_value(raw_metadata.get(key), key=key)
+        )
+        is not None
+    }
+    activation = current["activation_manifest"] if current else {}
+    activation_status = _status_summary_value(
+        activation,
+        key="activation_manifest",
+    )
+    activation_status = activation_status if isinstance(activation_status, dict) else {}
+    model_bundle_available = current is not None and bool(raw_metadata)
+    activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
+    def candidate_summary(resolved: dict[str, Any] | None) -> dict[str, Any]:
+        metadata = resolved.get("metadata") if isinstance(resolved, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        quality = metadata.get("quality_report")
+        quality = quality if isinstance(quality, dict) else {}
+        recommendation = metadata.get("promotion_recommendation")
+        recommendation = recommendation if isinstance(recommendation, dict) else {}
+        return {
+            "available": resolved is not None,
+            "version": resolved.get("version") if resolved else None,
+            "trained_at": metadata.get("trained_at") if resolved else None,
+            "data_quality_version": (
+                quality.get("data_quality_version")
+                or metadata.get("data_quality_version")
+                if resolved
+                else None
+            ),
+            "artifact_lifecycle": (
+                (resolved.get("activation_manifest") or {}).get("activation_stage")
+                if resolved
+                else None
+            ),
+            "promotion_ready": recommendation.get("promotion_ready") if resolved else None,
+            "blocking_reasons": (
+                recommendation.get("live_blocking_reasons")
+                or recommendation.get("blocking_reasons")
+                if resolved
+                else []
+            ),
+        }
+
+    candidate_info = candidate_summary(candidate)
+    challenger_info = candidate_summary(challenger)
+    latest_training = (
+        challenger_info if challenger_info.get("available") else candidate_info
+    )
+    return {
+        "available": model_bundle_available,
+        "model_bundle_available": model_bundle_available,
+        "trained_models_available": model_bundle_available,
+        "status": activation_stage if model_bundle_available else "artifact_unavailable",
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
+        "artifact_model_id": ARTIFACT_MODEL_ID,
+        "artifact_version": current.get("version") if current else None,
+        "artifact_lifecycle": activation_stage,
+        "live_ml_ready": bool(
+            (activation or {}).get("live_ml_ready")
+        ),
+        "model_path": str(current["model_path"]) if current else None,
+        "metadata_path": str(current["metadata_path"]) if current else None,
+        "bundle_file": _file_stat(current["model_path"]) if current else {"exists": False},
+        "metadata_file": (
+            _file_stat(current["metadata_path"]) if current else {"exists": False}
+        ),
+        "metadata_loaded": bool(raw_metadata),
+        "metadata_source": "verified_current_pointer" if raw_metadata else "missing",
+        "status_payload_compacted": True,
+        "activation_manifest": activation_status,
+        "artifact_pointers": pointer_rows,
+        "candidate_artifact": candidate_info,
+        "challenger_artifact": challenger_info,
+        "latest_training": latest_training,
+        "latest_training_artifact_version": latest_training.get("version"),
+        "latest_training_at": latest_training.get("trained_at"),
+        "latest_training_data_quality_version": latest_training.get(
+            "data_quality_version"
+        ),
+        **metadata,
+        "artifact_lifecycle": activation_stage,
+        "model_stage": activation_stage if model_bundle_available else "candidate",
+        "artifact_activation_manifest": activation_status,
+        "live_ml_ready": bool(
+            (activation or {}).get("live_ml_ready")
+        ),
+    }
+
+
+def predict_proba_positive(model: Pipeline, x: list[list[float]]) -> float:
+    try:
+        estimator = model.named_steps["model"]
+        proba = model.predict_proba(x)
+        classes = list(getattr(estimator, "classes_", []))
+        if 1 in classes:
+            return float(proba[0][classes.index(1)])
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
+    """Return a current tree-prediction distribution without a fixed cutoff."""
+
+    expected = float(model.predict(x)[0])
+    named_steps = getattr(model, "named_steps", {})
+    estimator = named_steps.get("model") if hasattr(named_steps, "get") else None
+    imputer = named_steps.get("imputer") if hasattr(named_steps, "get") else None
+    trees = list(getattr(estimator, "estimators_", []) or [])
+    if not trees or imputer is None:
+        return {
+            "expected": expected,
+            "median": expected,
+            "lower_bound": expected,
+            "upper_bound": expected,
+            "std": 0.0,
+            "spread": 0.0,
+            "sample_count": 0,
+            "distribution_ready": False,
+            "source_authority": "regressor_point_prediction_without_members",
+        }
+    transformed = imputer.transform(x)
+    values = np.asarray([float(tree.predict(transformed)[0]) for tree in trees], dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            "expected": expected,
+            "median": expected,
+            "lower_bound": expected,
+            "upper_bound": expected,
+            "std": 0.0,
+            "spread": 0.0,
+            "sample_count": 0,
+            "distribution_ready": False,
+            "source_authority": "regressor_point_prediction_without_members",
+        }
+    ordered = np.sort(values)
+    lower_tail_count = max(int(math.sqrt(ordered.size)), 1)
+    spread = float(ordered[-1] - ordered[0])
+    numerical_resolution = float(np.finfo(float).eps) * max(
+        abs(float(ordered[0])),
+        abs(float(ordered[-1])),
+        1.0,
+    )
+    return {
+        "expected": expected,
+        "median": float(np.median(values)),
+        "lower_bound": float(np.median(ordered[:lower_tail_count])),
+        "upper_bound": float(np.median(ordered[-lower_tail_count:])),
+        "std": float(np.std(values)),
+        "spread": spread,
+        "sample_count": int(values.size),
+        "distribution_ready": spread > numerical_resolution,
+        "source_authority": "extra_trees_empirical_distribution",
+    }
+
+
+def execution_cost_distribution_contract(
+    distribution: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose one stable counterfactual-cost contract to return composition."""
+
+    return {
+        "expected_pct": distribution.get("expected"),
+        "upper_tail_pct": distribution.get("upper_bound"),
+        "uncertainty_pct": distribution.get("std"),
+        "distribution_member_count": distribution.get("sample_count"),
+        "distribution_ready": distribution.get("distribution_ready") is True,
+        "source_authority": "okx_fills_fees_funding_model",
+    }
+
+
+def model_return_distribution_input(
+    distribution: dict[str, Any],
+    *,
+    side: str,
+    horizon_minutes: int,
+    tail_loss_probability: Any,
+    tail_loss_scale_pct: Any,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    def finite_or_none(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else None
+        except (TypeError, ValueError):
+            return None
+
+    values = {
+        "raw_expected_return_pct": finite_or_none(distribution.get("expected")),
+        "median_return_pct": finite_or_none(distribution.get("median")),
+        "lower_quantile_return_pct": finite_or_none(distribution.get("lower_bound")),
+        "upper_quantile_return_pct": finite_or_none(distribution.get("upper_bound")),
+        "dispersion_pct": finite_or_none(distribution.get("std")),
+        "tail_loss_probability": finite_or_none(tail_loss_probability),
+        "tail_loss_scale_pct": finite_or_none(tail_loss_scale_pct),
+    }
+    try:
+        member_count = int(distribution.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        member_count = 0
+    blockers: list[str] = []
+    if distribution.get("distribution_ready") is not True:
+        blockers.append(
+            "current_tree_prediction_distribution_degenerate"
+            if member_count > 0
+            else "current_tree_prediction_distribution_missing"
+        )
+    blockers.extend(
+        f"{field}_missing"
+        for field, value in values.items()
+        if value is None
+    )
+    if side not in {"long", "short"}:
+        blockers.append("distribution_side_invalid")
+    if int(horizon_minutes or 0) <= 0:
+        blockers.append("distribution_horizon_missing")
+    if member_count <= 0:
+        blockers.append("distribution_members_missing")
+    expected = values["raw_expected_return_pct"]
+    median = values["median_return_pct"]
+    lower = values["lower_quantile_return_pct"]
+    upper = values["upper_quantile_return_pct"]
+    dispersion = values["dispersion_pct"]
+    tail_probability = values["tail_loss_probability"]
+    tail_scale = values["tail_loss_scale_pct"]
+    if expected is not None and lower is not None and lower > expected:
+        blockers.append("lower_quantile_above_raw_expected")
+    if lower is not None and median is not None and lower > median:
+        blockers.append("lower_quantile_above_median")
+    if median is not None and upper is not None and median > upper:
+        blockers.append("median_above_upper_quantile")
+    if dispersion is not None and dispersion < 0:
+        blockers.append("return_dispersion_negative")
+    if tail_probability is not None and not 0.0 <= tail_probability <= 1.0:
+        blockers.append("tail_loss_probability_out_of_bounds")
+    if tail_scale is not None and tail_scale < 0:
+        blockers.append("tail_loss_scale_negative")
+    for field, expected_version in (
+        ("objective_version", RETURN_OBJECTIVE_VERSION),
+        ("label_version", RETURN_LABEL_VERSION),
+        ("cost_model_version", COST_MODEL_VERSION),
+        ("profit_supervision_version", PROFIT_SUPERVISION_VERSION),
+    ):
+        if str(metadata.get(field) or "") != expected_version:
+            blockers.append(f"return_distribution_{field}_mismatch")
+    if not str(distribution.get("source_authority") or "").strip():
+        blockers.append("return_distribution_source_authority_missing")
+    blockers = list(dict.fromkeys(blockers))
+    contract_complete = not blockers
+    return {
+        "side": side,
+        "horizon_minutes": int(horizon_minutes),
+        **values,
+        "distribution_member_count": member_count,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "source_authority": distribution.get("source_authority"),
+        "objective_version": metadata.get("objective_version"),
+        "label_version": metadata.get("label_version"),
+        "cost_model_version": metadata.get("cost_model_version"),
+        "profit_supervision_version": metadata.get("profit_supervision_version"),
+        "contract_complete": contract_complete,
+        "paper_eligible": contract_complete,
+        "production_eligible": contract_complete,
+        "blockers": blockers,
+    }
+
+
+def unavailable_return_distribution_inputs(
+    *,
+    horizon_minutes: int,
+    source_authority: str,
+) -> dict[str, dict[str, Any]]:
+    missing_distribution = {
+        "expected": None,
+        "median": None,
+        "lower_bound": None,
+        "upper_bound": None,
+        "std": None,
+        "sample_count": 0,
+        "source_authority": source_authority,
+    }
+    return {
+        side: model_return_distribution_input(
+            missing_distribution,
+            side=side,
+            horizon_minutes=horizon_minutes,
+            tail_loss_probability=None,
+            tail_loss_scale_pct=None,
+            metadata={},
+        )
+        for side in ("long", "short")
+    }
+
+
+def symbol_key(symbol: str | None) -> str:
+    value = str(symbol or "").upper().split(":")[0]
+    if value.endswith("-SWAP"):
+        value = value[:-5]
+    if "/" not in value and "-" in value:
+        parts = value.split("-")
+        if len(parts) >= 2:
+            value = f"{parts[0]}/{parts[1]}"
+    return value
+
+
+def _weighted_empirical_distribution(values: list[tuple[Any, Any]]) -> dict[str, Any]:
+    pairs = []
+    for raw_value, raw_weight in values:
+        value = f({"value": raw_value}, "value", float("nan"))
+        weight = max(f({"weight": raw_weight}, "weight", 0.0), 0.0)
+        if math.isfinite(value) and weight > 0:
+            pairs.append((value, weight))
+    if not pairs:
+        return {
+            "count": 0,
+            "effective_sample_size": 0.0,
+            "expected": None,
+            "median": None,
+            "lower_hinge": None,
+            "upper_hinge": None,
+        }
+    pairs.sort(key=lambda item: item[0])
+    total = sum(weight for _value, weight in pairs)
+    square_total = sum(weight * weight for _value, weight in pairs)
+
+    def quantile(fraction: float) -> float:
+        target = total * fraction
+        cumulative = 0.0
+        for value, weight in pairs:
+            cumulative += weight
+            if cumulative >= target:
+                return value
+        return pairs[-1][0]
+
+    return {
+        "count": len(pairs),
+        "effective_sample_size": total * total / square_total if square_total > 0 else 0.0,
+        "expected": sum(value * weight for value, weight in pairs) / total,
+        "median": quantile(0.5),
+        "lower_hinge": quantile(0.25),
+        "upper_hinge": quantile(0.75),
+    }
+
+
+def _return_profile_distribution(profile: dict[str, Any]) -> dict[str, Any]:
+    distribution = profile.get(PROFIT_TRAINING_TARGET)
+    return distribution if isinstance(distribution, dict) else {}
+
+
+def _authoritative_return_target_value(sample: dict[str, Any]) -> Any:
+    tasks = ((sample.get("profit_supervision") or {}).get("tasks") or {})
+    realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+    return realized.get(PROFIT_TRAINING_TARGET)
+
+
+def _train_profiles(trade_samples: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in trade_samples:
+        if bool(row.get("exclude_from_training")):
+            continue
+        supervision = row.get("profit_supervision") or {}
+        if supervision.get("version") != PROFIT_SUPERVISION_VERSION:
+            continue
+        tasks = supervision.get("tasks") or {}
+        realized = tasks.get(AUTHORITATIVE_REALIZED_RETURN_TASK) or {}
+        if realized.get("eligible") is not True:
+            continue
+        if not math.isfinite(f(realized, PROFIT_TRAINING_TARGET, float("nan"))):
+            continue
+        symbol = symbol_key(row.get("symbol"))
+        side = str(realized.get("side") or row.get("side") or "").lower()
+        if not symbol or side not in {"long", "short"}:
+            continue
+        for key in (f"{symbol}|{side}", f"*|{side}"):
+            buckets.setdefault(key, []).append(row)
+
+    profiles: dict[str, Any] = {}
+    for key, rows in buckets.items():
+        side = key.rsplit("|", 1)[-1]
+
+        def task_pairs(task_name: str, field: str) -> list[tuple[Any, Any]]:
+            pairs = []
+            for row in rows:
+                tasks = (row.get("profit_supervision") or {}).get("tasks") or {}
+                task = tasks.get(task_name) or {}
+                if task.get("eligible") is True:
+                    pairs.append((task.get(field), row.get("sample_weight", 1.0)))
+            return pairs
+
+        profiles[key] = {
+            "source_authority": "okx_position_history",
+            "symbol": key.rsplit("|", 1)[0],
+            "side": side,
+            PROFIT_TRAINING_TARGET: _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, PROFIT_TRAINING_TARGET)
+            ),
+            "execution_cost_pct": _weighted_empirical_distribution(
+                task_pairs(EXECUTION_COST_TASK, "total_cost_pct")
+            ),
+            "slippage_pct": _weighted_empirical_distribution(
+                task_pairs(EXECUTION_COST_TASK, "slippage_pct")
+            ),
+            "stop_loss_slippage_pct": _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "stop_loss_slippage_pct")
+            ),
+            "hold_minutes": _weighted_empirical_distribution(
+                task_pairs(AUTHORITATIVE_REALIZED_RETURN_TASK, "hold_minutes")
+            ),
+        }
+    return profiles
+
+
+def _profile_for_side(
+    profiles: dict[str, Any],
+    *,
+    symbol: str,
+    side: str,
+) -> dict[str, Any]:
+    exact = f"{symbol_key(symbol)}|{side}"
+    global_key = f"*|{side}"
+    if exact in profiles:
+        return {**(profiles.get(exact) or {}), "profile_source": "symbol_side"}
+    if global_key in profiles:
+        return {**(profiles.get(global_key) or {}), "profile_source": "global_side"}
+    return {
+        "profile_source": "missing",
+        "fallback_reason": "authoritative_trade_calibration_missing",
+    }
+
+
+def side_scores(features: dict[str, Any]) -> tuple[float, float]:
+    returns_1 = f(features, "returns_1")
+    returns_5 = f(features, "returns_5")
+    returns_20 = f(features, "returns_20")
+    macd_diff = f(features, "macd_diff")
+    price_vs_sma20 = f(features, "price_vs_sma20")
+    price_vs_sma50 = f(features, "price_vs_sma50")
+    rsi = f(features, "rsi_14", 50.0)
+    stoch = f(features, "stoch_k", 50.0)
+    orderbook = f(features, "orderbook_imbalance")
+    funding = f(features, "funding_rate")
+    volume_ratio = f(features, "volume_ratio", 1.0)
+    adx = f(features, "adx_14")
+
+    momentum = returns_1 * 0.22 + returns_5 * 0.34 + returns_20 * 0.44
+    trend = price_vs_sma20 * 0.35 + price_vs_sma50 * 0.35 + macd_diff * 25.0
+    oscillator_long = clamp((rsi - 45.0) / 25.0, -1.0, 1.0) + clamp((stoch - 50.0) / 35.0, -1.0, 1.0)
+    oscillator_short = -oscillator_long
+    participation = clamp(volume_ratio / 1.5, 0.0, 2.0) * clamp(adx / 25.0, 0.0, 2.0)
+    flow = orderbook * 0.45 - funding * 8.0
+
+    long_score = momentum * 70.0 + trend * 26.0 + oscillator_long * 0.11 + flow + participation * 0.08
+    short_score = -momentum * 70.0 - trend * 26.0 + oscillator_short * 0.11 - flow + participation * 0.08
+    return long_score, short_score
+
+
+def _safe_sequence(values: Any, limit: int = 80) -> list[float]:
+    if not isinstance(values, list):
+        return []
+    out: list[float] = []
+    for item in values[-limit:]:
+        try:
+            value = float(item)
+            if math.isfinite(value):
+                out.append(value)
+        except Exception:
+            continue
+    return out
+
+
+def _compact_sequence_series(
+    sample: dict[str, Any],
+) -> tuple[list[float], list[float]] | None:
+    if sample.get("sequence_format") != COMPACT_SEQUENCE_SERIES_FORMAT:
+        return None
+    closes = sample.get("close_sequence")
+    volumes = sample.get("volume_sequence")
+    if not isinstance(closes, list) or not isinstance(volumes, list):
+        return None
+    if len(closes) != len(volumes):
+        return None
+    parsed_closes: list[float] = []
+    parsed_volumes: list[float] = []
+    for raw_close, raw_volume in zip(closes, volumes):
+        try:
+            close = float(raw_close)
+            volume = float(raw_volume)
+        except Exception:
+            return None
+        if not math.isfinite(close) or close <= 0:
+            return None
+        if not math.isfinite(volume) or volume < 0:
+            return None
+        parsed_closes.append(close)
+        parsed_volumes.append(volume)
+    expected_count = max(len(parsed_closes) - 31, 0)
+    if int(f(sample, "observation_count", -1.0)) != expected_count:
+        return None
+    if str(sample.get("label_name") or "") != "gross_market_move_pct":
+        return None
+    if not str(sample.get("label_version") or "").strip():
+        return None
+    return parsed_closes, parsed_volumes
+
+
+def _iter_sequence_training_windows(
+    samples: list[dict[str, Any]],
+):
+    """Expand compact native series lazily on the model server."""
+
+    for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        compact = _compact_sequence_series(sample)
+        if sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+            if compact is None:
+                continue
+        else:
+            yield sample
+            continue
+        closes, volumes = compact
+        for idx in range(30, len(closes) - 1):
+            start = max(0, idx - 59)
+            current_close = closes[start : idx + 1]
+            current_volume = volumes[start : idx + 1]
+            current_price = current_close[-1]
+            future_return = (closes[idx + 1] - current_price) / current_price * 100.0
+            yield {
+                "symbol": sample.get("symbol"),
+                "timeframe": sample.get("timeframe"),
+                "close_sequence": current_close,
+                "volume_sequence": current_volume,
+                "future_return_pct": future_return,
+                "long_return_pct": future_return,
+                "short_return_pct": -future_return,
+            }
+
+
+def _sequence_training_window_count(samples: list[dict[str, Any]]) -> int:
+    """Count valid source windows without allocating each overlapping window."""
+
+    total = 0
+    for sample in samples or []:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        compact = _compact_sequence_series(sample)
+        if sample.get("sequence_format") == COMPACT_SEQUENCE_SERIES_FORMAT:
+            if compact is not None:
+                total += max(len(compact[0]) - 31, 0)
+        else:
+            total += 1
+    return total
+
+
+def _iter_bounded_sequence_training_windows(
+    samples: list[dict[str, Any]],
+    max_samples: int,
+):
+    """Yield an evenly spaced chronological subset of sequence windows."""
+
+    source_count = _sequence_training_window_count(samples)
+    target = min(max(int(max_samples), 1), source_count)
+    if target <= 0:
+        return
+    if source_count <= target:
+        yield from _iter_sequence_training_windows(samples)
+        return
+    selected_indices = {
+        round(index * (source_count - 1) / (target - 1))
+        for index in range(target)
+    }
+    for source_index, sample in enumerate(_iter_sequence_training_windows(samples)):
+        if source_index in selected_indices:
+            yield sample
+
+
+def sequence_features(close_sequence: Any, volume_sequence: Any | None = None) -> list[float]:
+    closes = _safe_sequence(close_sequence)
+    volumes = _safe_sequence(volume_sequence or [])
+    if len(closes) < 4:
+        closes = [0.0, 0.0, 0.0, 0.0]
+    last = closes[-1] if abs(closes[-1]) > 1e-9 else 1.0
+    returns = []
+    for window in (1, 3, 5, 10, 20, 40):
+        if len(closes) > window and abs(closes[-window - 1]) > 1e-9:
+            returns.append((closes[-1] - closes[-window - 1]) / closes[-window - 1] * 100.0)
+        else:
+            returns.append(0.0)
+    diffs = np.diff(np.array(closes[-40:], dtype=float))
+    volatility = float(np.std(diffs / max(abs(last), 1e-9)) * 100.0) if len(diffs) else 0.0
+    drawdown = (min(closes[-40:]) - max(closes[-40:])) / max(abs(last), 1e-9) * 100.0 if closes else 0.0
+    vol_ratio = 1.0
+    if len(volumes) >= 10:
+        recent = float(np.mean(volumes[-5:]))
+        base = float(np.mean(volumes[-30:])) if len(volumes) >= 30 else float(np.mean(volumes))
+        vol_ratio = recent / max(base, 1e-9)
+    return returns + [volatility, drawdown, vol_ratio, float(len(closes))]
+
+
+def sequence_deep_features(close_sequence: Any, volume_sequence: Any | None = None, length: int = 60) -> list[float]:
+    closes = _safe_sequence(close_sequence, limit=length)
+    volumes = _safe_sequence(volume_sequence or [], limit=length)
+    if len(closes) < 2:
+        closes = [0.0, 0.0]
+    last = closes[-1] if abs(closes[-1]) > 1e-9 else 1.0
+    returns = [0.0]
+    for prev, cur in zip(closes[:-1], closes[1:]):
+        base = prev if abs(prev) > 1e-9 else last
+        returns.append((cur - base) / base)
+    if len(returns) < length:
+        returns = [0.0] * (length - len(returns)) + returns
+    else:
+        returns = returns[-length:]
+    if volumes:
+        vol_base = float(np.mean(volumes)) if volumes else 1.0
+        vol_base = vol_base if abs(vol_base) > 1e-9 else 1.0
+        vol_values = [(v / vol_base) - 1.0 for v in volumes]
+    else:
+        vol_values = []
+    if len(vol_values) < length:
+        vol_values = [0.0] * (length - len(vol_values)) + vol_values
+    else:
+        vol_values = vol_values[-length:]
+    patch_stats: list[float] = []
+    patch_size = 10
+    for start in range(0, length, patch_size):
+        patch = np.array(returns[start:start + patch_size], dtype=float)
+        patch_stats.extend([
+            float(np.mean(patch)),
+            float(np.std(patch)),
+            float(patch[-1] - patch[0]) if len(patch) else 0.0,
+        ])
+    return [float(x) for x in returns + vol_values + patch_stats]
+
+
+def _train_sequence_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    rows = []
+    source_sample_count = _sequence_training_window_count(samples)
+    for sample in _iter_bounded_sequence_training_windows(
+        samples,
+        SEQUENCE_MODEL_MAX_SAMPLES,
+    ):
+        x = sequence_features(sample.get("close_sequence"), sample.get("volume_sequence"))
+        future_move = f(sample, "future_return_pct")
+        long_return = f(sample, "long_return_pct", future_move)
+        short_return = f(sample, "short_return_pct", -future_move)
+        if not x:
+            continue
+        rows.append((x, long_return, short_return, sample.get("timeframe") or "unknown"))
+    if len(rows) <= 1:
+        return None
+    long_model = _make_regressor(len(rows))
+    short_model = _make_regressor(len(rows))
+    long_model.fit([x for x, _, _, _ in rows], [y for _, y, _, _ in rows])
+    short_model.fit([x for x, _, _, _ in rows], [y for _, _, y, _ in rows])
+    timeframes: dict[str, int] = {}
+    for _, _, _, timeframe in rows:
+        timeframes[str(timeframe)] = timeframes.get(str(timeframe), 0) + 1
+    _training_gc()
+    return {
+        "long_model": long_model,
+        "short_model": short_model,
+        "samples": len(rows),
+        "source_samples": source_sample_count,
+        "max_samples": SEQUENCE_MODEL_MAX_SAMPLES,
+        "timeframes": timeframes,
+    }
+
+
+def _train_torch_patch_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    try:
+        import torch
+        from torch import nn
+    except Exception as exc:
+        return {"available": False, "reason": f"torch_unavailable: {safe_error(exc, 120)}"}
+
+    # Sequence windows overlap heavily. Count cheap windows first, then keep an
+    # evenly spaced chronological subset before constructing deep features.
+    source_sample_count = _sequence_training_window_count(samples)
+    rows = []
+    for sample in _iter_bounded_sequence_training_windows(
+        samples,
+        TORCH_PATCH_MAX_SAMPLES,
+    ):
+        x = sequence_deep_features(sample.get("close_sequence"), sample.get("volume_sequence"))
+        future_move = f(sample, "future_return_pct")
+        long_return = f(sample, "long_return_pct", future_move)
+        short_return = f(sample, "short_return_pct", -future_move)
+        if x:
+            rows.append((x, long_return, short_return))
+    if len(rows) <= 1:
+        return {"available": False, "reason": "sequence_distribution_unavailable", "samples": len(rows)}
+
+    if len(rows) > TORCH_PATCH_MAX_SAMPLES:
+        rows = rows[:TORCH_PATCH_MAX_SAMPLES]
+
+    X = np.array([x for x, _, _ in rows], dtype=np.float32)
+    y = np.array([[long_y, short_y] for _, long_y, short_y in rows], dtype=np.float32)
+    mean = X.mean(axis=0, keepdims=True)
+    std = X.std(axis=0, keepdims=True) + 1e-6
+    X = (X - mean) / std
+
+    torch.set_num_threads(_adaptive_training_worker_count())
+    # Optional TimesFM loading can leave torch's process-wide default device at
+    # ``meta``. This patch model is deliberately CPU-only, so pin both tensors
+    # and module construction to CPU instead of inheriting that global default.
+    xt = torch.tensor(X, dtype=torch.float32, device="cpu")
+    yt = torch.tensor(y, dtype=torch.float32, device="cpu")
+    with torch.device("cpu"):
+        model = nn.Sequential(
+            nn.Linear(X.shape[1], 96),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(96, 48),
+            nn.GELU(),
+            nn.Linear(48, 2),
+        )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=0.01)
+    loss_fn = nn.SmoothL1Loss()
+    model.train()
+    epochs = min(120 if len(rows) < 1000 else 80, TORCH_PATCH_MAX_EPOCHS)
+    for _ in range(epochs):
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_fn(model(xt), yt)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        train_mae = float(torch.mean(torch.abs(model(xt) - yt)).item())
+    # Capture the shape before releasing the large feature arrays below.
+    # Reading X after ``del X`` caused every Torch-backed refresh to fail with
+    # UnboundLocalError.
+    input_dim = int(X.shape[1])
+    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    del optimizer, loss_fn, xt, yt, model, X, y
+    _training_gc()
+    return {
+        "available": True,
+        "backend": "torch_patch_mlp_cpu",
+        "samples": len(rows),
+        "source_samples": source_sample_count,
+        "max_samples": TORCH_PATCH_MAX_SAMPLES,
+        "epochs": epochs,
+        "input_dim": input_dim,
+        "state_dict": state_dict,
+        "mean": mean.astype(float).tolist()[0],
+        "std": std.astype(float).tolist()[0],
+        "train_mae_pct": round(train_mae, 5),
+    }
+
+
+def _predict_torch_patch_model(
+    model_info: dict[str, Any],
+    close_sequence: Any,
+    volume_sequence: Any | None = None,
+) -> tuple[float, float] | None:
+    if not model_info or model_info.get("available") is not True:
+        return None
+    try:
+        import torch
+        from torch import nn
+        x = np.array([sequence_deep_features(close_sequence, volume_sequence)], dtype=np.float32)
+        mean = np.array(model_info.get("mean") or [], dtype=np.float32).reshape(1, -1)
+        std = np.array(model_info.get("std") or [], dtype=np.float32).reshape(1, -1)
+        if mean.shape != x.shape or std.shape != x.shape:
+            return None
+        x = (x - mean) / (std + 1e-6)
+        with torch.device("cpu"):
+            net = nn.Sequential(
+                nn.Linear(x.shape[1], 96),
+                nn.GELU(),
+                nn.Dropout(0.05),
+                nn.Linear(96, 48),
+                nn.GELU(),
+                nn.Linear(48, 2),
+            )
+        net.load_state_dict(model_info["state_dict"])
+        net.eval()
+        with torch.no_grad():
+            prediction = net(torch.tensor(x, dtype=torch.float32, device="cpu"))[0]
+            return float(prediction[0].item()), float(prediction[1].item())
+    except Exception:
+        return None
+
+
+def _timeseries_close_sequence(features: dict[str, Any]) -> tuple[list[float], str, str]:
+    source = ""
+    raw: Any = []
+    for key in ("close_sequence", "recent_closes", "closes"):
+        candidate = features.get(key)
+        if candidate:
+            raw = candidate
+            source = key
+            break
+    closes = _safe_sequence(raw, limit=512)
+    if len(closes) < TIMESERIES_MODEL_INPUT_ROWS:
+        return closes, "not_enough_real_close_sequence", source or "missing"
+    return closes, "", source
+
+
+def _rolling_forecast_quality(
+    closes: list[float],
+    forecast_price: float,
+    horizon_step: int,
+) -> dict[str, Any]:
+    """Build a scale-aware forecast interval from the current rolling distribution."""
+
+    prices = np.asarray(closes, dtype=float)
+    if (
+        prices.size < 2
+        or not np.all(np.isfinite(prices))
+        or np.any(prices <= 0)
+        or not math.isfinite(forecast_price)
+        or forecast_price <= 0
+    ):
+        return {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": "invalid_forecast_price_scale",
+            "threshold_source": "rolling_horizon_empirical_order_statistics",
+            "sample_count": 0,
+        }
+
+    effective_horizon = min(max(int(horizon_step), 1), prices.size - 1)
+    historical_returns = (
+        (prices[effective_horizon:] - prices[:-effective_horizon])
+        / prices[:-effective_horizon]
+        * 100.0
+    )
+    historical_returns = historical_returns[np.isfinite(historical_returns)]
+    if historical_returns.size == 0:
+        return {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": "rolling_horizon_distribution_unavailable",
+            "threshold_source": "rolling_horizon_empirical_order_statistics",
+            "sample_count": 0,
+        }
+
+    ordered = np.sort(historical_returns)
+    tail_count = max(int(math.sqrt(ordered.size)), 1)
+    lower_index = min(tail_count - 1, ordered.size - 1)
+    upper_index = max(ordered.size - tail_count, lower_index)
+    lower_bound = float(ordered[lower_index])
+    upper_bound = float(ordered[upper_index])
+    predicted_return = float((forecast_price - prices[-1]) / prices[-1] * 100.0)
+    anomalous = predicted_return < lower_bound or predicted_return > upper_bound
+    rank = int(np.searchsorted(ordered, predicted_return, side="right"))
+    empirical_cdf = (rank + 0.5) / (ordered.size + 1.0)
+    distribution_confidence = max(
+        0.0,
+        min(2.0 * min(empirical_cdf, 1.0 - empirical_cdf), 1.0),
+    )
+    return {
+        "production_eligible": not anomalous,
+        "anomalous": anomalous,
+        "reason": (
+            "outside_dynamic_rolling_forecast_interval"
+            if anomalous
+            else "within_dynamic_rolling_forecast_interval"
+        ),
+        "threshold_source": "rolling_horizon_empirical_order_statistics",
+        "threshold_policy": "tail_count_is_square_root_of_current_rolling_sample_count",
+        "sample_count": int(ordered.size),
+        "effective_horizon_step": int(effective_horizon),
+        "lower_return_bound_pct": round(lower_bound, 6),
+        "upper_return_bound_pct": round(upper_bound, 6),
+        "predicted_return_pct": round(predicted_return, 6),
+        "distribution_confidence": round(distribution_confidence, 6),
+    }
+
+
+def _load_timesfm_model(model_dir: str):
+    def loader():
+        official_error = ""
+        try:
+            import timesfm
+
+            model_ref = model_dir if Path(model_dir).exists() else TIMESERIES_PRIMARY_REPO_ID
+            model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(model_ref)
+            if hasattr(model, "compile"):
+                model.compile(
+                    timesfm.ForecastConfig(
+                        max_context=1024,
+                        max_horizon=256,
+                        normalize_inputs=True,
+                        use_continuous_quantile_head=True,
+                        force_flip_invariance=True,
+                        infer_is_positive=True,
+                        fix_quantile_crossing=True,
+                    )
+                )
+            return {"backend": "timesfm", "model": model}
+        except Exception as exc:
+            official_error = safe_error(exc, 160)
+
+        from transformers import AutoModelForTimeSeriesPrediction
+
+        model = AutoModelForTimeSeriesPrediction.from_pretrained(
+            model_dir,
+            local_files_only=True,
+        )
+        model.eval()
+        return {
+            "backend": "transformers",
+            "model": model,
+            "official_backend_error": official_error,
+        }
+
+    return _cache_get_or_load(
+        f"timesfm::{model_dir}",
+        lambda: _preserve_torch_default_device(loader),
+    )
+
+
+def _load_chronos2_pipeline(model_dir: str):
+    def loader():
+        from chronos import Chronos2Pipeline
+
+        return Chronos2Pipeline.from_pretrained(model_dir)
+
+    return _cache_get_or_load(
+        f"chronos2::{model_dir}",
+        lambda: _preserve_torch_default_device(loader),
+    )
+
+
+def _prediction_values(value: Any) -> list[float]:
+    if value is None:
+        return []
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "float"):
+            value = value.float()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+    except Exception:
+        pass
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return [number] if math.isfinite(number) else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    rows = list(value)
+    while rows and isinstance(rows[0], (list, tuple)):
+        if rows and all(isinstance(item, (int, float)) for item in rows):
+            break
+        rows = list(rows[0])
+    out = []
+    for item in rows:
+        try:
+            number = float(item)
+            if math.isfinite(number):
+                out.append(number)
+        except Exception:
+            continue
+    return out
+
+
+def _extract_timesfm_mean_predictions(output: Any) -> list[float]:
+    candidates = []
+    if isinstance(output, dict):
+        candidates.extend([
+            output.get("mean_predictions"),
+            output.get("prediction_outputs"),
+            output.get("predictions"),
+            output.get("full_predictions"),
+        ])
+    else:
+        candidates.extend([
+            getattr(output, "mean_predictions", None),
+            getattr(output, "prediction_outputs", None),
+            getattr(output, "predictions", None),
+            getattr(output, "full_predictions", None),
+        ])
+    for candidate in candidates:
+        values = _prediction_values(candidate)
+        if values:
+            return values
+    return []
+
+
+def _timesfm_model_dir() -> Path:
+    candidates = [
+        PHASE3_ROOT / "models" / "timeseries" / "google--timesfm-2.5-200m-pytorch",
+        PHASE3_ROOT / "models" / "timeseries" / "google--timesfm-2.5-200m-transformers",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _timesfm_forecast_values(loaded_model: Any, closes: list[float], horizon_step: int) -> tuple[list[float], str, str]:
+    backend = "transformers"
+    model = loaded_model
+    official_backend_error = ""
+    if isinstance(loaded_model, dict):
+        backend = str(loaded_model.get("backend") or backend)
+        official_backend_error = str(loaded_model.get("official_backend_error") or "")
+        model = loaded_model.get("model")
+
+    if model is None:
+        return [], backend, official_backend_error
+
+    if backend == "timesfm" and hasattr(model, "forecast"):
+        point_forecast, _quantile_forecast = model.forecast(
+            horizon=max(horizon_step, 1),
+            inputs=[np.asarray(closes, dtype=np.float32)],
+        )
+        predictions = _prediction_values(point_forecast)
+        if predictions:
+            return predictions, backend, official_backend_error
+
+    import torch
+
+    series = torch.tensor(closes, dtype=torch.float32)
+    output = None
+    errors = []
+    with torch.no_grad():
+        for past_values in ([series], getattr(series, "reshape", lambda *_: series)(1, -1)):
+            try:
+                output = model(past_values=past_values)
+                break
+            except Exception as exc:
+                errors.append(safe_error(exc, 120))
+    predictions = _extract_timesfm_mean_predictions(output)
+    if predictions:
+        return predictions, backend, official_backend_error
+    error = official_backend_error or "; ".join(errors[-2:])
+    return [], backend, error
+
+
+def _chronos_prediction_values(value: Any) -> list[float]:
+    if value is None:
+        return []
+    tensor_values = _chronos_tensor_prediction_values(value)
+    if tensor_values:
+        return tensor_values
+    if isinstance(value, dict):
+        for key in (
+            "median",
+            "mean",
+            "prediction",
+            "predictions",
+            "forecast",
+            "forecast_values",
+        ):
+            values = _prediction_values(value.get(key))
+            if values:
+                return values
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            for key in (
+                "median",
+                "mean",
+                "prediction",
+                "predictions",
+                "forecast",
+                "forecast_values",
+                "target",
+            ):
+                collected = []
+                for item in value:
+                    values = _prediction_values(item.get(key))
+                    if values:
+                        collected.extend(values)
+                if collected:
+                    return collected
+        for item in value:
+            values = _chronos_prediction_values(item)
+            if values:
+                return values
+    try:
+        if hasattr(value, "to_dict"):
+            records = value.to_dict("records")
+            values = _chronos_prediction_values(records)
+            if values:
+                return values
+        columns = list(getattr(value, "columns", []) or [])
+        for name in ("median", "mean", "prediction", "forecast", "target"):
+            if name in columns:
+                values = _prediction_values(value[name])
+                if values:
+                    return values
+    except Exception:
+        pass
+    return _prediction_values(value)
+
+
+def _chronos_tensor_prediction_values(value: Any) -> list[float]:
+    """Extract the median forecast path from Chronos tensor-style outputs."""
+    try:
+        item = value
+        if hasattr(item, "detach"):
+            item = item.detach()
+        if hasattr(item, "cpu"):
+            item = item.cpu()
+        if hasattr(item, "float"):
+            item = item.float()
+        if hasattr(item, "numpy"):
+            array = item.numpy()
+        else:
+            return []
+        arr = np.asarray(array, dtype=float)
+        if arr.ndim >= 3:
+            # Chronos direct predict returns (n_variates, n_quantiles, horizon).
+            arr = arr[0, arr.shape[1] // 2, :]
+        elif arr.ndim == 2:
+            arr = arr[arr.shape[0] // 2, :] if arr.shape[0] > 1 else arr[0, :]
+        elif arr.ndim != 1:
+            return []
+        return [float(item) for item in arr.ravel().tolist() if math.isfinite(float(item))]
+    except Exception:
+        return []
+
+
+def _run_chronos2_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    closes, reason, sequence_source = _timeseries_close_sequence(features)
+    if reason:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-challenger",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": reason,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+    try:
+        import pandas as pd
+
+        model_dir = PHASE3_ROOT / "models" / "timeseries" / "amazon--chronos-2"
+        pipeline = _load_chronos2_pipeline(model_dir.as_posix())
+        horizon_step = int(
+            max(
+                1,
+                f(
+                    features,
+                    "horizon_steps",
+                    f(features, "forecast_horizon_steps", f(features, "horizon_minutes", 1.0)),
+                ),
+            )
+        )
+        end_timestamp = pd.Timestamp.utcnow()
+        try:
+            end_timestamp = end_timestamp.tz_localize(None)
+        except (AttributeError, TypeError):
+            pass
+        history = pd.DataFrame(
+            {
+                "id": [str(features.get("symbol") or "series")] * len(closes),
+                "timestamp": pd.date_range(
+                    end=end_timestamp,
+                    periods=len(closes),
+                    freq=str(features.get("chronos_freq") or "min"),
+                ),
+                "target": np.asarray(closes, dtype=np.float64),
+            }
+        )
+        try:
+            forecast = pipeline.predict_df(
+                history,
+                prediction_length=max(horizon_step, 1),
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column="id",
+                timestamp_column="timestamp",
+                target="target",
+                validate_inputs=False,
+                freq=str(features.get("chronos_freq") or "min"),
+            )
+            predictions = _chronos_prediction_values(forecast)
+        except Exception:
+            forecast = pipeline.predict(
+                [np.asarray(closes, dtype=np.float32)],
+                prediction_length=max(horizon_step, 1),
+                limit_prediction_length=False,
+            )
+            predictions = _chronos_prediction_values(forecast)
+        if not predictions:
+            return {
+                "available": False,
+                "kind": "timeseries",
+                "model": "chronos-2-shadow-challenger",
+                "primary_model": chain.get("primary_model"),
+                "challenger_model": chain.get("challenger_model"),
+                "artifacts_ready": bool(chain.get("artifacts_ready")),
+                "actual_inference": False,
+                "reason": "chronos_empty_prediction",
+                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            }
+        horizon_index = min(horizon_step, len(predictions)) - 1
+        last_close = closes[-1]
+        forecast_price = float(predictions[horizon_index])
+        expected_move_pct = (
+            (forecast_price - last_close) / max(abs(last_close), 1e-9) * 100.0
+            if math.isfinite(forecast_price)
+            else 0.0
+        )
+        recent = np.array(closes[-80:], dtype=float)
+        diff = np.diff(recent)
+        realized_vol_pct = (
+            float(np.std(diff / max(abs(last_close), 1e-9)) * 100.0)
+            if len(diff)
+            else 0.0
+        )
+        prediction_quality = _rolling_forecast_quality(closes, forecast_price, horizon_step)
+        confidence = float(prediction_quality.get("distribution_confidence") or 0.0)
+        direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
+        return {
+            "available": True,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-challenger",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": True,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+            "horizon_step": horizon_step,
+            "forecast_price": round(forecast_price, 8),
+            "last_close": round(float(last_close), 8),
+            "expected_move_pct": round(expected_move_pct, 6),
+            "expected_return_pct": round(expected_move_pct, 6),
+            "direction": direction,
+            "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
+            "confidence": round(confidence, 6),
+            "prediction_quality": prediction_quality,
+            "realized_vol_pct": round(realized_vol_pct, 6),
+            "prediction_count": len(predictions),
+            "adapter": "chronos_2_pipeline_adapter",
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "model": "chronos-2-shadow-challenger",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": safe_error(exc, 220),
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+
+
+def _run_timesfm_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    closes, reason, sequence_source = _timeseries_close_sequence(features)
+    if reason:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": reason,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+    try:
+        horizon_step = int(
+            max(
+                1,
+                f(
+                    features,
+                    "horizon_steps",
+                    f(features, "forecast_horizon_steps", f(features, "horizon_minutes", 1.0)),
+                ),
+            )
+        )
+        model_dir = _timesfm_model_dir()
+        loaded_model = _load_timesfm_model(model_dir.as_posix())
+        predictions, backend, backend_error = _timesfm_forecast_values(
+            loaded_model,
+            closes,
+            horizon_step,
+        )
+        if not predictions:
+            return {
+                "available": False,
+                "kind": "timeseries",
+                "model": "timesfm-2.5-primary",
+                "primary_model": chain.get("primary_model"),
+                "challenger_model": chain.get("challenger_model"),
+                "artifacts_ready": bool(chain.get("artifacts_ready")),
+                "actual_inference": False,
+                "reason": "timesfm_empty_prediction" if not backend_error else backend_error,
+                "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+            }
+        horizon_index = min(horizon_step, len(predictions)) - 1
+        last_close = closes[-1]
+        forecast_price = float(predictions[horizon_index])
+        expected_move_pct = (
+            (forecast_price - last_close) / max(abs(last_close), 1e-9) * 100.0
+            if math.isfinite(forecast_price)
+            else 0.0
+        )
+        recent = np.array(closes[-80:], dtype=float)
+        diff = np.diff(recent)
+        realized_vol_pct = (
+            float(np.std(diff / max(abs(last_close), 1e-9)) * 100.0)
+            if len(diff)
+            else 0.0
+        )
+        prediction_quality = _rolling_forecast_quality(closes, forecast_price, horizon_step)
+        confidence = float(prediction_quality.get("distribution_confidence") or 0.0)
+        direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
+        return {
+            "available": True,
+            "kind": "timeseries",
+            "model": "timesfm-2.5-primary",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": True,
+            "sequence_length": len(closes),
+            "sequence_source": sequence_source,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+            "horizon_step": horizon_step,
+            "forecast_price": round(forecast_price, 8),
+            "last_close": round(float(last_close), 8),
+            "expected_move_pct": round(expected_move_pct, 6),
+            "expected_return_pct": round(expected_move_pct, 6),
+            "direction": direction,
+            "best_side": "long" if direction == "up" else "short" if direction == "down" else "hold",
+            "confidence": round(confidence, 6),
+            "prediction_quality": prediction_quality,
+            "realized_vol_pct": round(realized_vol_pct, 6),
+            "prediction_count": len(predictions),
+            "adapter": "timesfm_official_adapter"
+            if backend == "timesfm"
+            else "timesfm_transformers_adapter",
+            "backend": backend,
+            "model_dir": model_dir.as_posix(),
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "kind": "timeseries",
+            "model": "timesfm-2.5-primary",
+            "primary_model": chain.get("primary_model"),
+            "challenger_model": chain.get("challenger_model"),
+            "artifacts_ready": bool(chain.get("artifacts_ready")),
+            "actual_inference": False,
+            "reason": safe_error(exc, 220),
+            "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        }
+
+
+def _attach_timeseries_specialist_shadow(
+    payload: dict[str, Any],
+    *,
+    features: dict[str, Any],
+) -> dict[str, Any]:
+    chain = _specialist_model_chain("timeseries")
+    primary_shadow = _shadow_ready_or_submit(
+        "timesfm",
+        features,
+        _run_timesfm_shadow,
+    )
+    challenger_shadow = _shadow_ready_or_submit(
+        "chronos2",
+        features,
+        _run_chronos2_shadow,
+    )
+    active = bool(primary_shadow.get("available") or challenger_shadow.get("available"))
+    specialist_shadow = primary_shadow if primary_shadow.get("available") else challenger_shadow
+    payload["specialist_response_applied"] = False
+    payload["specialist_applied_model"] = None
+    chain = dict(chain)
+    chain["actual_inference"] = active
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = active
+    payload["specialist_model_chain"] = chain
+    payload["timesfm_shadow_expected_move_pct"] = primary_shadow.get("expected_move_pct")
+    payload["timesfm_shadow_expected_return_pct"] = primary_shadow.get("expected_return_pct")
+    payload["timesfm_shadow_side"] = primary_shadow.get("best_side")
+    payload["timesfm_shadow_confidence"] = primary_shadow.get("confidence")
+    payload["timesfm_shadow_horizon_step"] = primary_shadow.get("horizon_step")
+    payload["chronos_shadow_expected_move_pct"] = challenger_shadow.get("expected_move_pct")
+    payload["chronos_shadow_expected_return_pct"] = challenger_shadow.get("expected_return_pct")
+    payload["chronos_shadow_side"] = challenger_shadow.get("best_side")
+    payload["chronos_shadow_confidence"] = challenger_shadow.get("confidence")
+    payload["chronos_shadow_horizon_step"] = challenger_shadow.get("horizon_step")
+    payload["professional_model_shadow"] = {
+        "kind": "timeseries",
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": active,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": "walk_forward_required",
+        "shadow_result": specialist_shadow,
+        "primary_shadow_result": primary_shadow,
+        "challenger_shadow_result": challenger_shadow,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+    }
+    payload["fallback_reason"] = (
+        "specialist_timeseries_shadow_only"
+        if active
+        else "specialist_timeseries_adapter_not_promoted"
+    )
+    payload["note"] = (
+        "TimesFM is the primary time-series evidence model; Chronos/Granite remain comparison and fallback."
+        if active
+        else payload.get("note")
+        or "Timeseries specialist adapters remain blocked until preflight and walk-forward pass."
+    )
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        "time_series_prediction",
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=payload.get("fallback_reason") or "",
+    )
+
+
+def _text_value(row: dict[str, Any]) -> str:
+    text = str(row.get("text") or "").strip()
+    platform = str(row.get("platform") or "")
+    symbols = " ".join(str(s) for s in (row.get("symbols") or [])[:8])
+    return " ".join(part for part in (platform, symbols, text) if part).strip()
+
+
+def _train_text_sentiment_model(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    rows = [
+        (_text_value(sample), f(sample, "sentiment_score"))
+        for sample in samples or []
+        if not bool(sample.get("exclude_from_training"))
+    ]
+    rows = [(text, score) for text, score in rows if text]
+    if len(rows) <= 1:
+        return None
+    model = Pipeline([
+        ("tfidf", TfidfVectorizer(max_features=6000, ngram_range=(1, 2), min_df=1)),
+        ("model", Ridge(alpha=1.2)),
+    ])
+    model.fit([text for text, _ in rows], [score for _, score in rows])
+    return {"model": model, "samples": len(rows)}
+
+
+def _probe_transformers_sentiment_backend() -> dict[str, Any]:
+    try:
+        import transformers
+        return {
+            "available": True,
+            "library": "transformers",
+            "version": getattr(transformers, "__version__", "unknown"),
+            "preferred_models": ["ProsusAI/finbert", "ElKulako/cryptobert"],
+            "mode": "optional_runtime_backend",
+        }
+    except Exception as exc:
+        return {"available": False, "reason": f"transformers_unavailable: {safe_error(exc, 120)}"}
+
+
+def _public_torch_patch_status(model_info: dict[str, Any] | None) -> dict[str, Any]:
+    info = model_info or {}
+    return {
+        "available": bool(info.get("available")),
+        "backend": info.get("backend"),
+        "samples": int(info.get("samples") or 0),
+        "input_dim": int(info.get("input_dim") or 0),
+        "train_mae_pct": info.get("train_mae_pct"),
+        "reason": info.get("reason"),
+    }
+
+
+def _feature_coverage(features: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(features, dict):
+        return {"ratio": 0.0, "present": 0, "total": len(FEATURE_KEYS), "status": "missing"}
+    present = 0
+    for key in FEATURE_KEYS:
+        value = features.get(key)
+        if value is not None and str(value).strip() != "":
+            present += 1
+    total = max(len(FEATURE_KEYS), 1)
+    return {
+        "ratio": round(present / total, 6),
+        "present": present,
+        "total": total,
+        "status": "reported",
+    }
+
+
+def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "available",
+        "trained",
+        "primary_model",
+        "challenger_model",
+        "model_version",
+        "route_mode",
+        "horizon_minutes",
+        "objective_name",
+        "objective_version",
+        "label_name",
+        "label_version",
+        "training_cost_policy",
+        "artifact_persisted",
+        "prediction_quality",
+        "return_semantics",
+        "return_distribution_input_version",
+        "return_distribution_inputs",
+        "fallback_reason",
+        "best_side",
+        "side",
+        "action",
+        "loss_probability",
+        "profit_quality_score",
+        "expected_move_pct",
+        "confidence",
+        "urgency",
+        "feature_coverage",
+        "specialist_primary_model",
+        "specialist_challenger_model",
+        "specialist_artifacts_ready",
+        "specialist_inference_active",
+        "specialist_model_chain",
+        "professional_model_shadow",
+    ]
+    shadow = {
+        "tool": tool,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+    }
+    for key in keys:
+        if key in payload:
+            shadow[key] = payload.get(key)
+    return shadow
+
+
+def with_model_metadata(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    features: dict[str, Any] | None = None,
+    challenger_model: str | None = None,
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    defaults = {
+        "profit_prediction": "profit_v1_baseline",
+        "time_series_prediction": "timeseries_v1_baseline",
+        "sentiment_analysis": "sentiment_v1_baseline",
+        "exit_advice": "exit_profile_observer_v2",
+    }
+    model_name = str(payload.get("model") or defaults.get(tool) or "local_ai_tools")
+    payload.setdefault("primary_model", model_name)
+    payload.setdefault("challenger_model", challenger_model)
+    payload.setdefault("model_version", f"{model_name}.v1")
+    payload.setdefault(
+        "route_mode",
+        "shadow_candidate" if bool(payload.get("trained")) else "shadow_observation",
+    )
+    payload.setdefault("fallback_reason", fallback_reason)
+    payload.setdefault("feature_coverage", _feature_coverage(features or {}))
+    payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
+    payload.setdefault("production_permission", False)
+    payload.setdefault("live_ml_ready", False)
+    if payload.get("trained") is True:
+        bundle = load_bundle()
+        metadata = bundle.get("metadata") if isinstance(bundle, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        for key in (
+            "objective_name",
+            "objective_version",
+            "label_name",
+            "label_version",
+            "training_cost_policy",
+            "artifact_persisted",
+            "artifact_lifecycle",
+            "model_stage",
+            "training_mode",
+            "profit_supervision_version",
+            "live_ml_ready",
+        ):
+            if key in metadata:
+                payload.setdefault(key, metadata.get(key))
+        distribution_inputs = payload.get("return_distribution_inputs")
+        distribution_inputs = (
+            distribution_inputs if isinstance(distribution_inputs, dict) else {}
+        )
+        activation_stage = str(
+            metadata.get("artifact_lifecycle")
+            or metadata.get("model_stage")
+            or "candidate"
+        ).lower()
+        live_authorized = bool(
+            activation_stage == "active"
+            and metadata.get("live_ml_ready") is True
+            and not _production_return_evidence_blockers(metadata)
+        )
+        distribution_inputs_ready = True
+        for side in ("long", "short"):
+            distribution_input = distribution_inputs.get(side)
+            if not isinstance(distribution_input, dict):
+                distribution_inputs_ready = False
+                continue
+            structural_blockers = list(distribution_input.get("blockers") or [])
+            distribution_input["blockers"] = structural_blockers
+            if "contract_complete" in distribution_input:
+                structurally_eligible = distribution_input.get("contract_complete") is True
+            elif "paper_eligible" in distribution_input:
+                structurally_eligible = distribution_input.get("paper_eligible") is True
+            else:
+                structurally_eligible = (
+                    distribution_input.get("production_eligible") is True
+                )
+            contract_complete = bool(
+                structurally_eligible and not structural_blockers
+            )
+            distribution_input["contract_complete"] = contract_complete
+            distribution_input["paper_eligible"] = contract_complete
+            distribution_input["production_eligible"] = bool(
+                contract_complete and live_authorized
+            )
+            distribution_input["production_blockers"] = (
+                []
+                if live_authorized and contract_complete
+                else list(
+                    dict.fromkeys(
+                        [
+                            *structural_blockers,
+                            *(
+                                ["artifact_activation_not_production_authorized"]
+                                if not live_authorized
+                                else []
+                            ),
+                        ]
+                    )
+                )
+            )
+            distribution_inputs_ready = bool(
+                distribution_inputs_ready and contract_complete
+            )
+        payload["route_mode"] = "live" if live_authorized else "paper_analysis"
+        payload["production_permission"] = live_authorized
+        payload["live_ml_ready"] = live_authorized
+        payload["paper_trading_permission"] = distribution_inputs_ready
+        contract_ready = bool(
+            payload.get("objective_name") == RETURN_OBJECTIVE_NAME
+            and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
+            and payload.get("label_name") == RETURN_LABEL_NAME
+            and payload.get("label_version") == RETURN_LABEL_VERSION
+            and payload.get("training_cost_policy")
+            == "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+            and payload.get("profit_supervision_version")
+            == PROFIT_SUPERVISION_VERSION
+            and payload.get("return_semantics")
+            == "gross_market_opportunity_before_execution"
+            and payload.get("return_distribution_input_version")
+            == RETURN_DISTRIBUTION_INPUT_VERSION
+            and distribution_inputs_ready
+            and payload.get("artifact_persisted") is True
+        )
+        prediction_quality = payload.get("prediction_quality")
+        if not isinstance(prediction_quality, dict):
+            prediction_quality = {
+                "production_eligible": False,
+                "contract_complete": False,
+                "paper_eligible": False,
+                "anomalous": True,
+                "reason": "current_prediction_distribution_missing",
+                "blockers": ["current_prediction_distribution_missing"],
+            }
+            payload["prediction_quality"] = prediction_quality
+        quality_blockers = list(prediction_quality.get("blockers") or [])
+        if not contract_ready:
+            quality_blockers.append("runtime_return_artifact_contract_incomplete")
+        quality_blockers = list(dict.fromkeys(quality_blockers))
+        quality_contract_complete = bool(
+            contract_ready
+            and prediction_quality.get("anomalous") is not True
+            and not quality_blockers
+        )
+        original_production_eligible = bool(
+            prediction_quality.get("production_eligible") is True
+        )
+        prediction_quality["contract_complete"] = quality_contract_complete
+        prediction_quality["paper_eligible"] = quality_contract_complete
+        prediction_quality["production_eligible"] = bool(
+            quality_contract_complete
+            and original_production_eligible
+            and live_authorized
+        )
+        prediction_quality["anomalous"] = not quality_contract_complete
+        prediction_quality["blockers"] = quality_blockers
+        production_blockers = list(
+            prediction_quality.get("production_blockers") or []
+        )
+        if not live_authorized:
+            production_blockers.append(
+                "artifact_activation_not_production_authorized"
+            )
+        prediction_quality["production_blockers"] = list(
+            dict.fromkeys([*quality_blockers, *production_blockers])
+        )
+        prediction_quality["reason"] = (
+            "standardized_return_distribution_ready"
+            if prediction_quality["production_eligible"]
+            else "standardized_return_distribution_ready_for_paper"
+            if quality_contract_complete
+            else quality_blockers[0]
+            if quality_blockers
+            else "current_prediction_distribution_missing"
+        )
+    if not isinstance(payload.get("shadow_payload"), dict):
+        payload["shadow_payload"] = _shadow_payload(tool, payload)
+    return payload
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _phase3_inventory_status() -> dict[str, Any]:
+    validation = _read_json_file(PHASE3_VALIDATION_REPORT_PATH)
+    download = _read_json_file(PHASE3_DOWNLOAD_REPORT_PATH)
+    rows = validation.get("models") if isinstance(validation.get("models"), list) else []
+    model_status = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_status.append(
+            {
+                "slot": row.get("slot") or row.get("role") or "",
+                "repo_id": row.get("repo_id") or row.get("model") or "",
+                "status": row.get("status") or ("ok" if row.get("required_any_ok") else "unknown"),
+                "path": row.get("path") or row.get("target") or "",
+            }
+        )
+    ok_count = sum(1 for row in model_status if row.get("status") == "ok")
+    downloaded_rows = download.get("models") if isinstance(download.get("models"), list) else []
+    downloaded_count = len(downloaded_rows) if downloaded_rows else ok_count
+    validation_all_ok = bool(model_status) and ok_count == len(model_status)
+    if validation.get("all_ok") is not None:
+        validation_all_ok = bool(validation.get("all_ok"))
+    return {
+        "downloaded_model_count": downloaded_count,
+        "validated_model_count": ok_count,
+        "validation_all_ok": validation_all_ok,
+        "imports_ok": bool(validation.get("imports_ok", validation_all_ok)),
+        "torch_cuda_visible": bool(validation.get("torch_cuda_visible", True)),
+        "model_status": model_status,
+        "download_manifest_path": PHASE3_DOWNLOAD_REPORT_PATH.as_posix(),
+        "validation_report_path": PHASE3_VALIDATION_REPORT_PATH.as_posix(),
+    }
+
+
+SPECIALIST_MODEL_CHAINS = {
+    "timeseries": [
+        {
+            "slot": "timeseries_primary",
+            "role": "primary",
+            "repo_id": TIMESERIES_PRIMARY_REPO_ID,
+            "purpose": "online_primary_time_series_forecast",
+        },
+        {
+            "slot": "timeseries_challenger",
+            "role": "challenger",
+            "repo_id": TIMESERIES_CHRONOS_REPO_ID,
+            "purpose": "shadow_challenger_time_series_forecast",
+        },
+        {
+            "slot": "timeseries_fallback",
+            "role": "fallback",
+            "repo_id": TIMESERIES_FALLBACK_REPO_ID,
+            "purpose": "fallback_time_series_regime_check",
+        },
+    ],
+    "sentiment": [
+        {
+            "slot": "sentiment_primary",
+            "role": "primary",
+            "repo_id": "ProsusAI/finbert",
+            "purpose": "finance_sentiment_primary",
+        },
+        {
+            "slot": "sentiment_challenger",
+            "role": "challenger",
+            "repo_id": "yiyanghkust/finbert-tone",
+            "purpose": "finance_sentiment_challenger",
+        },
+    ],
+}
+
+SPECIALIST_ADAPTER_REQUIREMENTS = {
+    "timeseries_primary": {
+        "adapter": "timesfm_official_primary_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": ["timesfm"],
+        "requires_walk_forward": True,
+    },
+    "timeseries_challenger": {
+        "adapter": "chronos_2_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": ["chronos"],
+        "requires_walk_forward": True,
+    },
+    "timeseries_fallback": {
+        "adapter": "granite_ttm_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+    "sentiment_primary": {
+        "adapter": "finbert_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+    "sentiment_challenger": {
+        "adapter": "finbert_tone_transformers_adapter",
+        "required_imports": ["torch", "transformers"],
+        "optional_imports": [],
+        "requires_walk_forward": True,
+    },
+}
+IMPLEMENTED_SPECIALIST_ADAPTERS = {
+    "timeseries_primary",
+    "timeseries_challenger",
+    "sentiment_primary",
+    "sentiment_challenger",
+}
+
+
+def _import_state(module_name: str) -> dict[str, Any]:
+    try:
+        module = __import__(module_name)
+        return {
+            "module": module_name,
+            "available": True,
+            "version": str(getattr(module, "__version__", "")),
+        }
+    except Exception as exc:
+        return {
+            "module": module_name,
+            "available": False,
+            "error": safe_error(exc, 160),
+        }
+
+
+def _specialist_adapter_preflight(kind: str | None = None) -> dict[str, Any]:
+    chain_names = [kind] if kind in SPECIALIST_MODEL_CHAINS else sorted(SPECIALIST_MODEL_CHAINS)
+    chains = {name: _specialist_model_chain(name) for name in chain_names}
+    rows = []
+    blocked_reasons: set[str] = set()
+
+    for chain_name, chain in chains.items():
+        for model in chain.get("models", []):
+            if not isinstance(model, dict):
+                continue
+            slot = str(model.get("slot") or "")
+            req = SPECIALIST_ADAPTER_REQUIREMENTS.get(slot, {})
+            required_imports = [
+                _import_state(name) for name in req.get("required_imports", [])
+            ]
+            optional_imports = [
+                _import_state(name) for name in req.get("optional_imports", [])
+            ]
+            required_imports_ready = all(item.get("available") for item in required_imports)
+            artifact_ready = bool(model.get("artifact_ready"))
+            adapter_code_ready = slot in IMPLEMENTED_SPECIALIST_ADAPTERS
+            row_blockers = []
+            if not artifact_ready:
+                row_blockers.append("specialist_artifact_not_ready")
+            if not required_imports_ready:
+                row_blockers.append("specialist_required_import_missing")
+            if not adapter_code_ready:
+                row_blockers.append("specialist_adapter_not_implemented")
+            if bool(req.get("requires_walk_forward", True)):
+                row_blockers.append("walk_forward_required")
+            blocked_reasons.update(row_blockers)
+            rows.append(
+                {
+                    "kind": chain_name,
+                    "slot": slot,
+                    "repo_id": model.get("repo_id"),
+                    "role": model.get("role"),
+                    "adapter": req.get("adapter", ""),
+                    "artifact_ready": artifact_ready,
+                    "required_imports": required_imports,
+                    "optional_imports": optional_imports,
+                    "required_imports_ready": required_imports_ready,
+                    "adapter_code_ready": adapter_code_ready,
+                    "shadow_inference_ready": (
+                        artifact_ready and required_imports_ready and adapter_code_ready
+                    ),
+                    "requires_walk_forward": bool(req.get("requires_walk_forward", True)),
+                    "blocked_reasons": row_blockers,
+                }
+            )
+
+    return {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "root": PHASE3_ROOT.as_posix(),
+        "policy": "phase3_specialist_adapter_preflight",
+        "stage": "preflight_only",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "all_artifacts_ready": bool(rows) and all(row["artifact_ready"] for row in rows),
+        "all_required_imports_ready": bool(rows)
+        and all(row["required_imports_ready"] for row in rows),
+        "any_shadow_inference_ready": any(row["shadow_inference_ready"] for row in rows),
+        "blocked_reasons": sorted(blocked_reasons),
+        "chains": chains,
+        "adapters": rows,
+    }
+
+
+def _specialist_model_chain(kind: str) -> dict[str, Any]:
+    inventory = _phase3_inventory_status()
+    by_slot = {
+        str(row.get("slot") or ""): row
+        for row in inventory.get("model_status", [])
+        if isinstance(row, dict)
+    }
+    models = []
+    for expected in SPECIALIST_MODEL_CHAINS.get(kind, []):
+        row = by_slot.get(expected["slot"], {})
+        status = str(row.get("status") or "missing")
+        models.append({**expected, "status": status, "artifact_ready": status == "ok"})
+    primary = next((row for row in models if row.get("role") == "primary"), {})
+    challenger = next((row for row in models if row.get("role") == "challenger"), {})
+    required = [row for row in models if row.get("role") in {"primary", "challenger"}]
+    artifacts_ready = bool(required) and all(bool(row.get("artifact_ready")) for row in required)
+    return {
+        "kind": kind,
+        "primary_model": primary.get("repo_id", ""),
+        "challenger_model": challenger.get("repo_id", ""),
+        "artifacts_ready": artifacts_ready,
+        "actual_inference": False,
+        "activation_gate": "specialist_adapter_and_walk_forward_required",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "models": models,
+    }
+
+
+def _attach_specialist_shadow(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    features: dict[str, Any],
+    fallback_reason: str,
+) -> dict[str, Any]:
+    chain = _specialist_model_chain(kind)
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = False
+    payload["specialist_model_chain"] = chain
+    payload["professional_model_shadow"] = {
+        "kind": kind,
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": False,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": "specialist_adapter_and_walk_forward_required",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+    }
+    payload["fallback_reason"] = fallback_reason
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        tool,
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=fallback_reason,
+    )
+
+
+def _attach_baseline_only_shadow(
+    tool: str,
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    features: dict[str, Any],
+    fallback_reason: str,
+) -> dict[str, Any]:
+    chain = _specialist_model_chain(kind)
+    payload["specialist_primary_model"] = chain.get("primary_model")
+    payload["specialist_challenger_model"] = chain.get("challenger_model")
+    payload["specialist_artifacts_ready"] = bool(chain.get("artifacts_ready"))
+    payload["specialist_inference_active"] = False
+    payload["specialist_model_chain"] = chain
+    payload["professional_model_shadow"] = {
+        "kind": kind,
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": False,
+        "baseline_model": payload.get("model"),
+        "baseline_response": True,
+        "activation_blocker": fallback_reason,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+    }
+    payload["fallback_reason"] = fallback_reason
+    return with_model_metadata(
+        tool,
+        payload,
+        features=features,
+        challenger_model=str(chain.get("challenger_model") or ""),
+        fallback_reason=fallback_reason,
+    )
+
+
+def _text_items_from_features(features: dict[str, Any], limit: int = 12) -> list[str]:
+    raw_items = (
+        features.get("recent_headlines")
+        or features.get("headlines")
+        or features.get("news_headlines")
+        or features.get("texts")
+        or []
+    )
+    if isinstance(raw_items, str):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        return []
+    items = []
+    for raw in raw_items[:limit]:
+        text = str(raw or "").strip()
+        if text:
+            items.append(text[:512])
+    return items
+
+
+def _sentiment_score_from_label(label: str, score: float) -> float:
+    normalized = str(label or "").strip().lower()
+    if normalized == "positive":
+        return abs(score)
+    if normalized == "negative":
+        return -abs(score)
+    return 0.0
+
+
+def _load_transformer_classifier(model_dir: str):
+    def loader():
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            BertConfig,
+            BertForSequenceClassification,
+            BertTokenizer,
+        )
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        except Exception:
+            vocab_path = Path(model_dir) / "vocab.txt"
+            if not vocab_path.exists():
+                raise
+            tokenizer = BertTokenizer.from_pretrained(model_dir, local_files_only=True)
+        try:
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_dir,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            config_path = Path(model_dir) / "config.json"
+            if "model_type" not in str(exc) or not config_path.exists():
+                raise
+            config = BertConfig.from_json_file(config_path.as_posix())
+            config.model_type = "bert"
+            model = BertForSequenceClassification.from_pretrained(
+                model_dir,
+                config=config,
+                local_files_only=True,
+            )
+        model.eval()
+        return tokenizer, model
+
+    return _cache_get_or_load(model_dir, loader)
+
+
+def _predict_transformer_sentiment(model_dir: str, texts: list[str]) -> dict[str, Any]:
+    if not texts:
+        return {"available": False, "reason": "no_text_inputs"}
+    try:
+        import torch
+
+        tokenizer, model = _load_transformer_classifier(model_dir)
+        encoded = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=192,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            output = model(**encoded)
+            probabilities = torch.softmax(output.logits, dim=-1)
+        id2label = getattr(model.config, "id2label", {}) or {}
+        rows = []
+        scores = []
+        for index, text in enumerate(texts):
+            probs = probabilities[index]
+            best_index = int(torch.argmax(probs).item())
+            confidence = float(probs[best_index].item())
+            label = str(id2label.get(best_index) or id2label.get(str(best_index)) or best_index)
+            signed = _sentiment_score_from_label(label, confidence)
+            scores.append(signed)
+            rows.append(
+                {
+                    "label": label,
+                    "confidence": round(confidence, 6),
+                    "signed_score": round(signed, 6),
+                    "text_preview": text[:120],
+                }
+            )
+        avg_score = float(sum(scores) / max(len(scores), 1))
+        return {
+            "available": True,
+            "text_count": len(texts),
+            "score": round(avg_score, 6),
+            "label": "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral",
+            "rows": rows,
+        }
+    except Exception as exc:
+        return {"available": False, "reason": safe_error(exc, 220)}
+
+
+def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
+    texts = _text_items_from_features(features)
+    chain = _specialist_model_chain("sentiment")
+    model_dirs = {
+        "sentiment_primary": PHASE3_ROOT
+        / "models"
+        / "sentiment"
+        / "ProsusAI--finbert",
+        "sentiment_challenger": PHASE3_ROOT
+        / "models"
+        / "sentiment"
+        / "yiyanghkust--finbert-tone",
+    }
+    predictions = {}
+    for slot, path in model_dirs.items():
+        predictions[slot] = _predict_transformer_sentiment(path.as_posix(), texts)
+    available = any(item.get("available") for item in predictions.values())
+    primary = predictions.get("sentiment_primary", {})
+    challenger = predictions.get("sentiment_challenger", {})
+    score_values = [
+        float(item.get("score"))
+        for item in (primary, challenger)
+        if item.get("available") and item.get("score") is not None
+    ]
+    avg_score = sum(score_values) / len(score_values) if score_values else 0.0
+    disagreement = (
+        abs(float(primary.get("score") or 0.0) - float(challenger.get("score") or 0.0))
+        if primary.get("available") and challenger.get("available")
+        else None
+    )
+    return {
+        "available": available,
+        "kind": "sentiment",
+        "text_count": len(texts),
+        "primary_model": chain.get("primary_model"),
+        "challenger_model": chain.get("challenger_model"),
+        "artifacts_ready": bool(chain.get("artifacts_ready")),
+        "actual_inference": available,
+        "score": round(avg_score, 6),
+        "label": "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral",
+        "disagreement": round(disagreement, 6) if disagreement is not None else None,
+        "predictions": predictions,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+    }
+
+
+@app.get("/health/live")
+async def liveness() -> dict[str, Any]:
+    """Return a cheap liveness plus child-contract snapshot.
+
+    The platform uses this endpoint when the full metadata endpoint is busy.
+    Keeping the route contracts here prevents a transient metadata timeout from
+    being misreported as four missing quant endpoints.
+    """
+
+    model_bundle_available = _lightweight_model_bundle_available()
+    return {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "port": PHASE3_API_PORT,
+        "model_bundle_available": model_bundle_available,
+        "status": "ready" if model_bundle_available else "artifact_unavailable",
+        "status_endpoint_uses_metadata_only": True,
+        "child_endpoints": _status_child_endpoint_contracts(model_bundle_available),
+    }
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    artifact_status = _model_artifact_status()
+    live_authorized = artifact_status.get("live_ml_ready") is True
+    payload = {
+        "ok": True,
+        "service": "phase3_quant_api",
+        "root": PHASE3_ROOT.as_posix(),
+        "server_role": "dedicated_cryptocurrency_quant_model_server",
+        "storage_policy": "new model/cache/training/runtime/log data under /data/BB",
+        "port": PHASE3_API_PORT,
+        "policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "route_mode": "live" if live_authorized else "shadow_observation",
+        "tools": ["profit", "timeseries", "sentiment", "exit", "train"],
+        "review_backend": "disabled_use_trading_app_online_model",
+        "model_dir": MODEL_DIR.as_posix(),
+        "status_endpoint_uses_metadata_only": True,
+    }
+    payload.update(artifact_status)
+    payload.setdefault("trained_at", None)
+    payload.setdefault("shadow_sample_count", 0)
+    payload.setdefault("trade_sample_count", 0)
+    payload.setdefault("completed_shadow_sample_count", 0)
+    payload.setdefault("completed_trade_sample_count", 0)
+    payload.setdefault("quality_report", {})
+    payload.setdefault("governance_report", {})
+    payload.setdefault("return_objective_report", {})
+    payload.setdefault("profit_supervision_report", {})
+    payload.update(_phase3_inventory_status())
+    payload["child_endpoints"] = _status_child_endpoint_contracts(
+        bool(payload.get("model_bundle_available"))
+    )
+    payload["specialist_model_chains"] = {
+        "timeseries": _specialist_model_chain("timeseries"),
+        "sentiment": _specialist_model_chain("sentiment"),
+    }
+    return payload
+
+
+@app.get("/models/status")
+def local_models_status() -> dict[str, Any]:
+    artifact_status = _model_artifact_status()
+    message = ""
+    if not artifact_status.get("available"):
+        if artifact_status.get("status") == "metadata_missing":
+            message = "Trained bundle exists but metadata is missing; rebuild training artifacts."
+        else:
+            message = "No trained local quant bundle found; return inference is unavailable."
+    return {
+        **artifact_status,
+        "message": message,
+        "child_endpoints": _status_child_endpoint_contracts(
+            bool(artifact_status.get("model_bundle_available"))
+        ),
+        "specialist_adapter_preflight": _specialist_adapter_preflight(),
+        "status_endpoint_uses_metadata_only": True,
+    }
+
+
+@app.get("/specialists/preflight")
+def specialist_preflight(kind: str | None = None) -> dict[str, Any]:
+    return _specialist_adapter_preflight(kind)
+
+
+def _market_training_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        features = sample.get("features") or {}
+        horizon = int(sample.get("horizon_minutes") or features.get("horizon_minutes") or 10)
+        supervision = sample.get("profit_supervision") or {}
+        tasks = supervision.get("tasks") or {}
+        market_task = tasks.get(MARKET_OPPORTUNITY_TASK) or {}
+        if (
+            not features
+            or horizon <= 0
+            or supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or market_task.get("eligible") is not True
+        ):
+            continue
+        long_return = f(
+            market_task,
+            "long_gross_market_return_pct",
+            float("nan"),
+        )
+        short_return = f(
+            market_task,
+            "short_gross_market_return_pct",
+            float("nan"),
+        )
+        if not all(math.isfinite(value) for value in (long_return, short_return)):
+            continue
+        sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
+        if sample_weight <= 0.0:
+            continue
+        correlation = sample.get("correlation_weight") or {}
+        decision_group = str(correlation.get("correlation_group") or "").strip()
+        if not decision_group:
+            decision_identity = sample.get("decision_id") or sample.get("id")
+            decision_group = (
+                f"shadow_decision:{decision_identity}" if decision_identity else ""
+            )
+        rows.append({
+            "x": model_x(features, horizon_minutes=horizon),
+            "id": int(sample.get("id") or 0),
+            "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
+            "market_regime": _market_regime_label(features),
+            "horizon": horizon,
+            "decision_group": decision_group,
+            "decision_timestamp": _timestamp_text(sample.get("decision_timestamp")),
+            "label_timestamp": _timestamp_text(sample.get("label_timestamp")),
+            "long_return": long_return,
+            "short_return": short_return,
+            "best_side": (
+                "long"
+                if long_return > 0.0 and long_return >= short_return
+                else "short"
+                if short_return > 0.0 and short_return > long_return
+                else "hold"
+            ),
+            "best_market_return": max(long_return, short_return),
+            "features": features,
+            "sample_weight": sample_weight,
+            "return_semantics": "gross_fixed_horizon_market_opportunity",
+        })
+    return rows
+
+
+def _authoritative_cost_training_rows(
+    samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        if bool(sample.get("exclude_from_training")):
+            continue
+        features = sample.get("features") or {}
+        supervision = sample.get("profit_supervision") or {}
+        tasks = supervision.get("tasks") or {}
+        cost_task = tasks.get(EXECUTION_COST_TASK) or {}
+        side = str(sample.get("side") or "").strip().lower()
+        total_cost = f(cost_task, "total_cost_pct", float("nan"))
+        sample_weight = max(0.0, f(sample, "sample_weight", 1.0))
+        holding_minutes = max(1, int(math.ceil(f(sample, "holding_minutes", 1.0))))
+        lifecycle = str(
+            sample.get("lifecycle_key")
+            or sample.get("position_id")
+            or sample.get("id")
+            or ""
+        ).strip()
+        if (
+            not features
+            or supervision.get("version") != PROFIT_SUPERVISION_VERSION
+            or cost_task.get("eligible") is not True
+            or cost_task.get("source_authority") != "okx_fills_fees_funding"
+            or side not in {"long", "short"}
+            or not math.isfinite(total_cost)
+            or sample_weight <= 0.0
+        ):
+            continue
+        prediction_horizon = int(
+            features.get("horizon_minutes")
+            or sample.get("prediction_horizon_minutes")
+            or holding_minutes
+        )
+        rows.append({
+            "x": model_x(features, horizon_minutes=max(prediction_horizon, 1)),
+            "id": int(sample.get("id") or 0),
+            "symbol": symbol_key(sample.get("symbol") or features.get("symbol")),
+            "side": side,
+            "horizon": holding_minutes,
+            "decision_group": f"okx_lifecycle:{lifecycle}" if lifecycle else "",
+            "decision_timestamp": _timestamp_text(
+                sample.get("decision_timestamp") or sample.get("opened_at")
+            ),
+            "label_timestamp": _timestamp_text(
+                sample.get("label_timestamp")
+                or sample.get("closed_at")
+                or sample.get("updated_at")
+            ),
+            "execution_cost": total_cost,
+            "sample_weight": sample_weight,
+            "source_authority": cost_task.get("source_authority"),
+        })
+    return rows
+
+
+def _training_distribution_profile(
+    market_rows: list[dict[str, Any]],
+    cost_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    values: dict[str, list[float]] = {
+        key: []
+        for key in (
+            "returns_5",
+            "returns_20",
+            "volatility_20",
+            "spread_pct",
+            "orderbook_imbalance",
+            "long_return_pct",
+            "short_return_pct",
+            "authoritative_execution_cost_pct",
+        )
+    }
+    for row in market_rows:
+        features = row.get("features") or {}
+        for key in (
+            "returns_5",
+            "returns_20",
+            "volatility_20",
+            "spread_pct",
+            "orderbook_imbalance",
+        ):
+            value = f(features, key, float("nan"))
+            if math.isfinite(value):
+                values[key].append(value)
+        values["long_return_pct"].append(float(row["long_return"]))
+        values["short_return_pct"].append(float(row["short_return"]))
+    values["authoritative_execution_cost_pct"].extend(
+        float(row["execution_cost"]) for row in cost_rows
+    )
+    return {
+        "version": "2026-07-27.training-distribution-profile.v1",
+        "features": {
+            key: {
+                "count": len(rows),
+                "mean": float(np.mean(rows)),
+                "std": float(np.std(rows)),
+            }
+            for key, rows in values.items()
+            if rows
+        },
+    }
+
+
+def _purged_chronological_holdout(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = _chronological_rows(rows)
+    ordered_groups, group_bounds = _decision_group_availability(ordered)
+    if len(ordered_groups) <= 1:
+        raise ValueError("decision_group_holdout_unavailable")
+    split = len(ordered_groups) // 2
+    holdout_candidates = ordered_groups[split:]
+    holdout_decision_start = min(
+        group_bounds[group]["decision_start"] for group in holdout_candidates
+    )
+    train_groups = {
+        group
+        for group in ordered_groups[:split]
+        if group_bounds[group]["end"] < holdout_decision_start
+    }
+    holdout_groups = set(holdout_candidates)
+    train_rows = [row for row in ordered if str(row["decision_group"]) in train_groups]
+    holdout_rows = [
+        row for row in ordered if str(row["decision_group"]) in holdout_groups
+    ]
+    if not train_rows or not holdout_rows or train_groups & holdout_groups:
+        raise ValueError("decision_group_holdout_unavailable")
+    return {
+        "rows": ordered,
+        "train_rows": train_rows,
+        "holdout_rows": holdout_rows,
+        "train_groups": train_groups,
+        "holdout_groups": holdout_groups,
+        "purged_group_count": split - len(train_groups),
+    }
+
+
+def _post_training_inference_warmup() -> dict[str, Any]:
+    """Prime the retained champion before the training request releases its worker."""
+
+    started = time.monotonic()
+    if load_bundle() is None:
+        return {
+            "status": "skipped",
+            "reason": "current_artifact_unavailable",
+            "duration_sec": round(time.monotonic() - started, 4),
+        }
+    features = {
+        "symbol": "BTC/USDT",
+        "current_price": 100.0,
+        "close": 100.0,
+        "returns_1": 0.001,
+        "returns_5": 0.002,
+        "returns_20": 0.003,
+        "rsi_14": 52.0,
+        "volume_ratio": 1.0,
+        "news_sentiment_avg": 0.0,
+        "social_sentiment_avg": 0.0,
+        "recent_headlines": ["Market liquidity remains stable."],
+        "close_sequence": [100.0 + (index * 0.01) for index in range(30)],
+        "volume_sequence": [1000.0 + index for index in range(30)],
+    }
+    request = FeatureRequest.model_construct(symbol="BTC/USDT", features=features)
+    routes = (
+        ("profit_prediction", profit_predict),
+        ("sentiment_analysis", deep_sentiment_analyze),
+        ("time_series_prediction", timeseries_predict),
+    )
+    route_results: dict[str, dict[str, Any]] = {}
+    for name, predictor in routes:
+        route_started = time.monotonic()
+        try:
+            payload = predictor(request)
+            available = isinstance(payload, dict) and payload.get("available") is not False
+            route_results[name] = {
+                "status": "completed" if available else "unavailable",
+                "duration_sec": round(time.monotonic() - route_started, 4),
+            }
+        except Exception as exc:
+            route_results[name] = {
+                "status": "error",
+                "error": safe_error(exc, 180),
+                "duration_sec": round(time.monotonic() - route_started, 4),
+            }
+    completed = all(item.get("status") == "completed" for item in route_results.values())
+    return {
+        "status": "completed" if completed else "degraded",
+        "routes": route_results,
+        "duration_sec": round(time.monotonic() - started, 4),
+    }
+
+
+def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, Any]:
+    if os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1":
+        return payload
+    return {
+        **payload,
+        "post_training_inference_warmup": _post_training_inference_warmup(),
+    }
+
+
+def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
+    rows = _market_training_rows(req.shadow_samples or [])
+    cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
+    if len(rows) <= 1:
+        return {
+            "trained": False,
+            "reason": "market_opportunity_distribution_unavailable",
+            "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": "Need fixed-horizon market labels from separate decision groups.",
+        }
+    if len(cost_rows) <= 1:
+        return {
+            "trained": False,
+            "reason": "authoritative_execution_cost_distribution_unavailable",
+            "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": "Need OKX fills, fees, funding, slippage, and entry features.",
+        }
+    try:
+        market_split = _purged_chronological_holdout(rows)
+    except ValueError as exc:
+        return {
+            "trained": False,
+            "reason": "chronological_market_training_identity_incomplete",
+            "shadow_sample_count": len(rows),
+            "message": str(exc),
+        }
+    try:
+        cost_split = _purged_chronological_holdout(cost_rows)
+    except ValueError as exc:
+        return {
+            "trained": False,
+            "reason": "chronological_cost_training_identity_incomplete",
+            "shadow_sample_count": len(rows),
+            "authoritative_cost_sample_count": len(cost_rows),
+            "message": str(exc),
+        }
+    rows = market_split["rows"]
+    train_rows = market_split["train_rows"]
+    holdout_rows = market_split["holdout_rows"]
+    train_groups = market_split["train_groups"]
+    holdout_groups = market_split["holdout_groups"]
+    purged_holdout_group_count = market_split["purged_group_count"]
+    cost_rows = cost_split["rows"]
+    cost_train_rows = cost_split["train_rows"]
+    cost_holdout_rows = cost_split["holdout_rows"]
+    cost_train_groups = cost_split["train_groups"]
+    cost_holdout_groups = cost_split["holdout_groups"]
+    purged_cost_holdout_group_count = cost_split["purged_group_count"]
+
+    long_tail_boundary = empirical_lower_hinge(
+        [row["long_return"] for row in train_rows if row["long_return"] < 0]
+    )
+    short_tail_boundary = empirical_lower_hinge(
+        [row["short_return"] for row in train_rows if row["short_return"] < 0]
+    )
+    for row in rows:
+        row["lossy_long"] = int(row["long_return"] < long_tail_boundary)
+        row["lossy_short"] = int(row["short_return"] < short_tail_boundary)
+
+    X = [r["x"] for r in train_rows]
+    long_y = [r["long_return"] for r in train_rows]
+    short_y = [r["short_return"] for r in train_rows]
+    long_loss_y = [r["lossy_long"] for r in train_rows]
+    short_loss_y = [r["lossy_short"] for r in train_rows]
+    sample_weights = [
+        max(0.0, float(r.get("sample_weight") or 0.0)) for r in train_rows
+    ]
+
+    long_return_model = _make_regressor(len(train_rows))
+    short_return_model = _make_regressor(len(train_rows))
+    long_loss_model = _make_classifier(long_loss_y)
+    short_loss_model = _make_classifier(short_loss_y)
+    long_return_model.fit(X, long_y, model__sample_weight=sample_weights)
+    short_return_model.fit(X, short_y, model__sample_weight=sample_weights)
+    long_loss_model.fit(X, long_loss_y, model__sample_weight=sample_weights)
+    short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
+    del X, long_y, short_y, long_loss_y, short_loss_y, sample_weights
+    _training_gc()
+
+    cost_side_training_counts: dict[str, int] = {}
+    cost_side_fallbacks: dict[str, str | None] = {}
+
+    def fit_cost_model(side: str) -> Any:
+        side_rows = [row for row in cost_train_rows if row["side"] == side]
+        selected_rows = side_rows if len(side_rows) > 1 else cost_train_rows
+        cost_side_training_counts[side] = len(selected_rows)
+        cost_side_fallbacks[side] = (
+            None if len(side_rows) > 1 else "global_authoritative_cost_distribution"
+        )
+        model = _make_regressor(len(selected_rows))
+        model.fit(
+            [row["x"] for row in selected_rows],
+            [row["execution_cost"] for row in selected_rows],
+            model__sample_weight=[
+                max(0.0, float(row.get("sample_weight") or 0.0))
+                for row in selected_rows
+            ],
+        )
+        return model
+
+    long_cost_model = fit_cost_model("long")
+    short_cost_model = fit_cost_model("short")
+    _training_gc()
+    cost_models = {"long": long_cost_model, "short": short_cost_model}
+    cost_holdout_errors: dict[str, list[float]] = {"long": [], "short": []}
+    for row in cost_holdout_rows:
+        side = str(row["side"])
+        prediction = float(cost_models[side].predict([row["x"]])[0])
+        cost_holdout_errors[side].append(
+            abs(prediction - float(row["execution_cost"]))
+        )
+    execution_cost_holdout_report = {
+        "source_authority": "okx_fills_fees_funding",
+        "chronological": True,
+        "decision_group_disjoint": not bool(
+            cost_train_groups & cost_holdout_groups
+        ),
+        "sample_count": len(cost_holdout_rows),
+        "sides": {
+            side: {
+                "sample_count": len(errors),
+                "mae_pct": float(np.mean(errors)) if errors else None,
+                "training_sample_count": cost_side_training_counts[side],
+                "fallback": cost_side_fallbacks[side],
+            }
+            for side, errors in cost_holdout_errors.items()
+        },
+    }
+
+    horizon_models: dict[int, dict[str, Any]] = {}
+    for horizon in sorted({int(r["horizon"]) for r in train_rows}):
+        h_rows = [r for r in train_rows if int(r["horizon"]) == horizon]
+        hX = [r["x"] for r in h_rows]
+        long_horizon_y = [r["long_return"] for r in h_rows]
+        short_horizon_y = [r["short_return"] for r in h_rows]
+        h_weights = [max(0.0, float(r.get("sample_weight") or 0.0)) for r in h_rows]
+        long_model = _make_regressor(len(h_rows))
+        short_model = _make_regressor(len(h_rows))
+        long_model.fit(hX, long_horizon_y, model__sample_weight=h_weights)
+        short_model.fit(hX, short_horizon_y, model__sample_weight=h_weights)
+        horizon_models[horizon] = {
+            "long_model": long_model,
+            "short_model": short_model,
+            "samples": len(h_rows),
+        }
+        del hX, long_horizon_y, short_horizon_y, h_weights
+        _training_gc()
+
+    try:
+        deep_sequence_model = _train_sequence_model(req.sequence_samples or [])
+    except MemoryError:
+        deep_sequence_model = {
+            "available": False,
+            "reason": "resource_memory",
+            "samples": 0,
+        }
+        _training_gc()
+    try:
+        torch_patch_model = _train_torch_patch_model(req.sequence_samples or [])
+    except MemoryError:
+        torch_patch_model = {
+            "available": False,
+            "reason": "resource_memory",
+            "samples": 0,
+        }
+        _training_gc()
+
+    sentiment_model = None
+    sentiment_samples = []
+    for row in train_rows:
+        features = row["features"]
+        sentiment_samples.append(
+            (
+                [feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS],
+                row["long_return"],
+                row["short_return"],
+                row["sample_weight"],
+            )
+        )
+    if len(sentiment_samples) > 1:
+        sentiment_leaf_size = _dynamic_min_samples_leaf(len(sentiment_samples))
+
+        def make_sentiment_regressor(random_state: int) -> Pipeline:
+            return Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", RandomForestRegressor(
+                    n_estimators=_training_tree_count(
+                        len(sentiment_samples),
+                        TRAINING_SENTIMENT_TREE_COUNT,
+                    ),
+                    max_depth=8,
+                    min_samples_leaf=sentiment_leaf_size,
+                    random_state=random_state,
+                    n_jobs=_adaptive_training_worker_count(),
+                )),
+            ])
+
+        sentiment_model = {
+            "long_model": make_sentiment_regressor(43),
+            "short_model": make_sentiment_regressor(44),
+        }
+        sentiment_model["long_model"].fit(
+            [x for x, _, _, _ in sentiment_samples],
+            [long_y for _, long_y, _, _ in sentiment_samples],
+            model__sample_weight=[weight for _, _, _, weight in sentiment_samples],
+        )
+        sentiment_model["short_model"].fit(
+            [x for x, _, _, _ in sentiment_samples],
+            [short_y for _, _, short_y, _ in sentiment_samples],
+            model__sample_weight=[weight for _, _, _, weight in sentiment_samples],
+        )
+        _training_gc()
+    text_sentiment_model = _train_text_sentiment_model(req.text_sentiment_samples or [])
+    transformers_sentiment_backend = _probe_transformers_sentiment_backend()
+
+    trainable_trade_samples = [
+        sample for sample in (req.trade_samples or []) if not bool(sample.get("exclude_from_training"))
+    ]
+    walk_forward_report = _walk_forward_return_report(rows)
+    leave_one_symbol_out_report = {
+        side: (walk_forward_report.get("sides") or {}).get(side, {}).get(
+            "leave_one_symbol_out",
+            {},
+        )
+        for side in ("long", "short")
+    }
+    oos_return_evaluation = {
+        side: {
+            key: value
+            for key, value in (walk_forward_report.get("sides") or {}).get(
+                side,
+                {},
+            ).items()
+            if key != "leave_one_symbol_out"
+        }
+        for side in ("long", "short")
+    }
+    authoritative_trade_return_evidence = _authoritative_trade_return_evidence(
+        trainable_trade_samples
+    )
+    profiles = _train_profiles(trainable_trade_samples)
+    fingerprint_payload = {
+        "shadow": [
+            {
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "decision_group": row.get("decision_group"),
+                "label_timestamp": row.get("label_timestamp"),
+                "horizon": row.get("horizon"),
+                "long_return_pct": row.get("long_return"),
+                "short_return_pct": row.get("short_return"),
+                "sample_weight": row.get("sample_weight"),
+                "feature_vector": row.get("x"),
+            }
+            for row in rows
+        ],
+        "authoritative_cost": [
+            {
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "decision_group": row.get("decision_group"),
+                "decision_timestamp": row.get("decision_timestamp"),
+                "label_timestamp": row.get("label_timestamp"),
+                "execution_cost_pct": row.get("execution_cost"),
+                "sample_weight": row.get("sample_weight"),
+                "feature_vector": row.get("x"),
+                "source_authority": row.get("source_authority"),
+            }
+            for row in cost_rows
+        ],
+        "trades": sorted([
+            {
+                "id": sample.get("id"),
+                "position_id": sample.get("position_id"),
+                "realized_pnl": sample.get("realized_pnl"),
+                PROFIT_TRAINING_TARGET: _authoritative_return_target_value(sample),
+                "sample_weight": sample.get("sample_weight"),
+                "profit_supervision": sample.get("profit_supervision") or {},
+            }
+            for sample in trainable_trade_samples
+        ], key=lambda row: (str(row.get("position_id") or ""), str(row.get("id") or ""))),
+        "sequence": sorted([
+            {
+                "symbol": sample.get("symbol"),
+                "timeframe": sample.get("timeframe"),
+                "sequence_format": sample.get("sequence_format"),
+                "observation_count": sample.get("observation_count"),
+                "first_open_time": sample.get("first_open_time"),
+                "last_open_time": sample.get("last_open_time"),
+                "feature_timestamp": sample.get("feature_timestamp"),
+                "label_timestamp": sample.get("label_timestamp"),
+                "long_return_pct": sample.get("long_return_pct"),
+                "short_return_pct": sample.get("short_return_pct"),
+                "close_sequence": sample.get("close_sequence"),
+                "volume_sequence": sample.get("volume_sequence"),
+                "training_sample_fingerprint": (
+                    sample.get("training_sample_contract") or {}
+                ).get("sample_fingerprint"),
+            }
+            for sample in (req.sequence_samples or [])
+            if not bool(sample.get("exclude_from_training"))
+        ], key=lambda row: (
+            str(row.get("label_timestamp") or ""),
+            str(row.get("symbol") or ""),
+            str(row.get("timeframe") or ""),
+        )),
+        "text_sentiment": sorted(
+            [
+                {
+                    "id": sample.get("id"),
+                    "label_timestamp": sample.get("label_timestamp"),
+                    "text": _text_value(sample),
+                    "sentiment_score": f(sample, "sentiment_score"),
+                    "sample_weight": sample.get("sample_weight"),
+                }
+                for sample in (req.text_sentiment_samples or [])
+                if not bool(sample.get("exclude_from_training"))
+                and _text_value(sample)
+            ],
+            key=lambda row: (
+                str(row.get("label_timestamp") or ""),
+                str(row.get("id") or ""),
+                str(row.get("text") or ""),
+            ),
+        ),
+    }
+    training_data_sha256 = canonical_sha256(fingerprint_payload)
+    source_path = Path(str(globals().get("__file__") or ""))
+    if source_path.is_file():
+        source_code_sha256 = sha256_file(source_path)
+    else:
+        source_digest = hashlib.sha256()
+        for function in (
+            train,
+            _walk_forward_return_report,
+            _fit_walk_forward_side,
+            _return_evidence,
+            _leave_one_symbol_out_stability,
+            _authoritative_trade_return_evidence,
+            timeseries_predict,
+            deep_timeseries_predict,
+            sentiment_analyze,
+            profit_predict,
+        ):
+            source_digest.update(function.__code__.co_code)
+        source_code_sha256 = source_digest.hexdigest()
+    metadata = {
+        "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "phase": "phase3_model_factory",
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "source": req.source,
+        "shadow_sample_count": len(rows),
+        "train_shadow_sample_count": len(train_rows),
+        "holdout_shadow_sample_count": len(holdout_rows),
+        "train_decision_group_count": len(train_groups),
+        "holdout_decision_group_count": len(holdout_groups),
+        "purged_holdout_decision_group_count": purged_holdout_group_count,
+        "authoritative_cost_sample_count": len(cost_rows),
+        "train_authoritative_cost_sample_count": len(cost_train_rows),
+        "holdout_authoritative_cost_sample_count": len(cost_holdout_rows),
+        "train_cost_decision_group_count": len(cost_train_groups),
+        "holdout_cost_decision_group_count": len(cost_holdout_groups),
+        "purged_cost_holdout_decision_group_count": (
+            purged_cost_holdout_group_count
+        ),
+        "completed_market_decision_group_count": len(
+            {str(row["decision_group"]) for row in rows}
+        ),
+        "completed_authoritative_cost_decision_group_count": len(
+            {str(row["decision_group"]) for row in cost_rows}
+        ),
+        "completed_training_decision_group_count": len(
+            {
+                str(row["decision_group"])
+                for row in [*rows, *cost_rows]
+            }
+        ),
+        "last_trained_completed_training_decision_group_count": len(
+            {
+                str(row["decision_group"])
+                for row in [*rows, *cost_rows]
+            }
+        ),
+        "training_distribution_profile": _training_distribution_profile(
+            rows,
+            cost_rows,
+        ),
+        "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
+        "last_trained_completed_shadow_sample_count": int(
+            req.completed_shadow_sample_count or len(rows)
+        ),
+        "trade_sample_count": len(trainable_trade_samples),
+        "completed_trade_sample_count": int(
+            req.completed_trade_sample_count or len(trainable_trade_samples)
+        ),
+        "last_trained_completed_trade_sample_count": int(
+            req.completed_trade_sample_count or len(trainable_trade_samples)
+        ),
+        "sequence_sample_count": int((deep_sequence_model or {}).get("samples") or 0),
+        "sequence_source_sample_count": int(
+            (deep_sequence_model or {}).get("source_samples") or 0
+        ),
+        "sequence_model_max_samples": SEQUENCE_MODEL_MAX_SAMPLES,
+        "text_sentiment_sample_count": int((text_sentiment_model or {}).get("samples") or 0),
+        "torch_patch_available": bool((torch_patch_model or {}).get("available")),
+        "torch_patch_status": _public_torch_patch_status(torch_patch_model),
+        "transformers_sentiment_backend": transformers_sentiment_backend,
+        "feature_count": len(FEATURE_KEYS),
+        "horizons": sorted(horizon_models),
+        "primary_prediction_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "primary_prediction_horizon_runtime_policy": "runtime_primary_horizon_5m_when_available",
+        "profile_count": len(profiles),
+        "training_cost_policy": (
+            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+        ),
+        "execution_cost_holdout_report": execution_cost_holdout_report,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "profit_supervision_report": req.profit_supervision_report or {},
+        "market_fact_contract": (req.quality_report or {}).get(
+            "market_fact_contract",
+            {},
+        ),
+        "tail_loss_policy": {
+            "long": {
+                "source": "chronological_training_gross_market_negative_return_lower_hinge",
+                "value": long_tail_boundary,
+                "observation_window": "chronological_training_groups_only",
+            },
+            "short": {
+                "source": "chronological_training_gross_market_negative_return_lower_hinge",
+                "value": short_tail_boundary,
+                "observation_window": "chronological_training_groups_only",
+            },
+        },
+        "tail_loss_scale_pct": {
+            "long": abs(float(long_tail_boundary)),
+            "short": abs(float(short_tail_boundary)),
+        },
+        "objective_name": RETURN_OBJECTIVE_NAME,
+        "objective_version": RETURN_OBJECTIVE_VERSION,
+        "label_name": RETURN_LABEL_NAME,
+        "label_version": RETURN_LABEL_VERSION,
+        "cost_model_version": COST_MODEL_VERSION,
+        "training_data_sha256": training_data_sha256,
+        "source_code_sha256": source_code_sha256,
+        "time_split_policy": "independent_chronological_disjoint_decision_groups",
+        "walk_forward_report": walk_forward_report,
+        "leave_one_symbol_out_report": leave_one_symbol_out_report,
+        "oos_return_evaluation": oos_return_evaluation,
+        "authoritative_trade_return_evidence": authoritative_trade_return_evidence,
+        "quality_report": req.quality_report or {},
+        "governance_report": req.governance_report or {},
+        "training_transport_report": req.training_transport_report or {},
+        "return_objective_report": req.return_objective_report or {},
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "training_mode": str(req.training_mode or "shadow"),
+        "model_stage": "candidate",
+        "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
+        "artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild),
+        "preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild),
+        "persist_artifact_requested": bool(req.persist_artifact),
+        "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
+        "promotion_recommendation": req.promotion_recommendation or {},
+        "artifact_activation_manifest": {
+            "status": "not_activated",
+            "activation_stage": "candidate",
+            "live_ml_ready": False,
+        },
+        "live_promotion_manifest": {
+            "status": "not_issued",
+            "reason": "candidate_requires_independent_shadow_and_return_readiness",
+            "live_ml_ready": False,
+        },
+        "training_objective": (
+            "Predict fixed-horizon market opportunity only from shadow market paths; "
+            "predict execution cost and calibrate realized net return only from "
+            "authoritative OKX lifecycles."
+        ),
+        "models": {
+            "profit": "ExtraTreesRegressor long/short gross market opportunity",
+            "execution_cost": "ExtraTreesRegressor authoritative OKX long/short execution cost",
+            "loss_filter": "ExtraTreesClassifier fixed-horizon market tail probability",
+            "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
+            "deep_timeseries": (
+                "Torch PatchTST/TFT-style sequence model"
+                if (torch_patch_model or {}).get("available")
+                else ("Sequence ExtraTreesRegressor PatchTST/TFT-style input" if deep_sequence_model else "not enough kline sequences")
+            ),
+            "sentiment": "Side-specific RandomForest sentiment return calibration" if sentiment_model else "heuristic fallback",
+            "deep_sentiment": (
+                "Transformers-ready text sentiment + TF-IDF Ridge model"
+                if (transformers_sentiment_backend or {}).get("available") and text_sentiment_model
+                else ("TF-IDF Ridge text sentiment model" if text_sentiment_model else "not enough text samples")
+            ),
+            "exit": "trade-profile plus live pnl rules",
+        },
+        "objective": RETURN_OBJECTIVE_NAME,
+    }
+    metadata["evaluation_report_hashes"] = _evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    return_evidence_blockers = _production_return_evidence_blockers(metadata)
+    metadata["live_promotion_manifest"] = {
+        "status": "not_issued",
+        "reason": (
+            "candidate_return_evidence_not_ready"
+            if return_evidence_blockers
+            else "candidate_requires_independent_shadow_activation"
+        ),
+        "blocking_reasons": return_evidence_blockers,
+        "live_ml_ready": False,
+    }
+    bundle = {
+        "metadata": metadata,
+        "feature_keys": FEATURE_KEYS,
+        "long_return_model": long_return_model,
+        "short_return_model": short_return_model,
+        "long_cost_model": long_cost_model,
+        "short_cost_model": short_cost_model,
+        "long_loss_model": long_loss_model,
+        "short_loss_model": short_loss_model,
+        "horizon_models": horizon_models,
+        "deep_sequence_model": deep_sequence_model,
+        "torch_patch_model": torch_patch_model,
+        "sentiment_model": sentiment_model,
+        "text_sentiment_model": text_sentiment_model,
+        "transformers_sentiment_backend": transformers_sentiment_backend,
+        "profiles": profiles,
+    }
+    if not req.persist_artifact:
+        return {
+            "trained": False,
+            "reason": "phase3_preflight_no_artifact_write",
+            **metadata,
+        }
+    if not req.confirm_phase3_rebuild:
+        return {
+            "trained": False,
+            "reason": "phase3_rebuild_confirmation_required",
+            **metadata,
+        }
+    candidate = persist_candidate_bundle(bundle, metadata)
+    activation_evidence = {
+        field: metadata[field]
+        for field in EVALUATION_REPORT_FIELDS
+    }
+    activation_evidence.update({
+        "evaluation_report_hashes": metadata["evaluation_report_hashes"],
+        "blocking_reasons": return_evidence_blockers,
+        "promotion_recommendation": req.promotion_recommendation or {},
+        "training_mode": str(req.training_mode or "shadow"),
+    })
+    activation_stage = _governed_candidate_activation_stage(
+        req.promotion_recommendation or {},
+        return_evidence_blockers,
+    )
+    champion_comparison = _compare_candidate_to_current(
+        metadata,
+        candidate_stage=activation_stage,
+    )
+    if champion_comparison.get("accepted") is not True:
+        challenger = reject_candidate_artifact(champion_comparison)
+        try:
+            champion = _resolve_artifact_pointer(
+                CURRENT_POINTER_PATH,
+                role="current",
+                deserialize_bundle=False,
+            )
+        except ValueError as exc:
+            return _with_post_training_inference_warmup({
+                "trained": False,
+                "reason": "champion_integrity_unverified",
+                "retryable": True,
+                "artifact_integrity_failure": True,
+                "challenger_rejected": True,
+                "challenger_version": challenger["version"],
+                "champion_retained": None,
+                "champion_version": None,
+                "champion_integrity_error": safe_error(exc, ERROR_TEXT_LIMIT),
+                "champion_comparison": champion_comparison,
+                **metadata,
+            })
+        return _with_post_training_inference_warmup({
+            "trained": True,
+            "reason": "trained_challenger_rejected",
+            "challenger_rejected": True,
+            "challenger_version": challenger["version"],
+            "champion_retained": True,
+            "champion_version": champion["version"] if champion else None,
+            "champion_comparison": champion_comparison,
+            "artifact_version": champion["version"] if champion else None,
+            "artifact_activation_stage": (
+                (champion.get("activation_manifest") or {}).get("activation_stage")
+                if champion
+                else None
+            ),
+            **metadata,
+        })
+    activation_evidence["champion_comparison"] = champion_comparison
+    current = activate_candidate_shadow(activation_evidence)
+    if activation_stage in {"canary", "active"}:
+        current = transition_current_artifact(
+            activation_evidence,
+            activation_stage="canary",
+        )
+    if activation_stage == "active":
+        current = transition_current_artifact(
+            activation_evidence,
+            activation_stage="active",
+        )
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+    _BUNDLE_CACHE = None
+    _CURRENT_MODEL_PATH = None
+    _CURRENT_POINTER_MTIME_NS = None
+    _CURRENT_MODEL_MTIME_NS = None
+    _STATUS_ARTIFACT_CACHE.clear()
+    loaded = load_bundle()
+    if loaded is None:
+        raise ValueError("Local AI artifact failed post-activation load verification.")
+    return _with_post_training_inference_warmup({
+        "trained": True,
+        **current["metadata"],
+        "artifact_version": current["version"],
+        "artifact_activation_stage": activation_stage,
+        "live_ml_ready": activation_stage == "active",
+        "candidate_version": candidate["version"],
+        "champion_comparison": champion_comparison,
+    })
+
+
+def _train_impl(req: TrainRequest) -> dict[str, Any]:
+    """Run one training refresh without leaking resource failures to callers."""
+
+    try:
+        return _train_impl_inner(req)
+    except MemoryError:
+        # Retry with bounded chronological windows before opening the resource
+        # circuit. No candidate/current pointer is written until the inner
+        # trainer completes, so the last good artifact remains intact.
+        original_counts = {
+            key: len(getattr(req, key, None) or [])
+            for key in (
+                "shadow_samples",
+                "trade_samples",
+                "sequence_samples",
+                "text_sentiment_samples",
+            )
+        }
+        for fraction in _RESOURCE_RECOVERY_FRACTIONS:
+            reduced_request = _reduced_training_request(req, fraction)
+            try:
+                recovered = _train_impl_inner(reduced_request)
+            except MemoryError:
+                continue
+            if recovered.get("trained") is True:
+                recovered["resource_recovery"] = {
+                    "attempted": True,
+                    "fraction": fraction,
+                    "original_counts": original_counts,
+                    "reduced_counts": {
+                        key: len(getattr(reduced_request, key, None) or [])
+                        for key in original_counts
+                    },
+                    "policy": "chronological_window_retry_before_circuit",
+                }
+                return recovered
+
+        # No candidate/current pointer is written on a failed recovery. Return
+        # a structured failure so the scheduler can apply resource backoff.
+        return {
+            "trained": False,
+            "reason": "resource_memory",
+            "error": "MemoryError",
+            "message": (
+                "训练刷新因内存不足停止；已尝试缩小训练窗口，现有模型产物保持不变。"
+            ),
+            "resource_failure": True,
+            "resource_failure_policy": "preserve_current_artifact_after_bounded_retry",
+            "shadow_sample_count": len(req.shadow_samples or []),
+            "trade_sample_count": len(req.trade_samples or []),
+            "sequence_sample_count": len(req.sequence_samples or []),
+            "text_sentiment_sample_count": len(req.text_sentiment_samples or []),
+            "resource_recovery": {
+                "attempted": True,
+                "fractions": list(_RESOURCE_RECOVERY_FRACTIONS),
+                "original_counts": original_counts,
+                "policy": "chronological_window_retry_before_circuit",
+            },
+        }
+
+
+def _configure_training_child() -> None:
+    os.environ["LOCAL_AI_TOOLS_TRAINING_CHILD"] = "1"
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
+def _process_start_token(pid: int) -> str:
+    """Return a PID-reuse-safe identity token on Linux when available."""
+
+    if os.name == "nt":
+        return ""
+    try:
+        stat_text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+        _comm, remainder = stat_text.split(") ", 1)
+        fields = remainder.split()
+        # /proc/<pid>/stat field 22 is index 19 after the comm field.
+        return str(fields[19])
+    except (IndexError, OSError, ValueError):
+        return ""
+
+
+def _pid_matches_identity(pid: int, token: str | None) -> bool:
+    current = _process_start_token(pid)
+    return bool(current) and (not token or current == str(token))
+
+
+def _terminate_pid(pid: int, token: str | None = None) -> bool:
+    """Terminate one known training process without touching a reused PID."""
+
+    if int(pid or 0) <= 0 or int(pid) == os.getpid():
+        return False
+    if token and not _pid_matches_identity(int(pid), token):
+        return False
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _pid_matches_identity(int(pid), token):
+            return True
+        time.sleep(0.05)
+    try:
+        if _pid_matches_identity(int(pid), token):
+            os.kill(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    return True
+
+
+def _training_worker_processes(executor: ProcessPoolExecutor) -> list[Any]:
+    processes = getattr(executor, "_processes", {})
+    if not isinstance(processes, dict):
+        return []
+    return [process for process in processes.values() if getattr(process, "pid", None)]
+
+
+def _write_training_runtime_state(
+    *,
+    request_id: str,
+    started_at: str,
+    executor: ProcessPoolExecutor,
+    phase: str,
+) -> None:
+    TRAINING_RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    workers = _training_worker_processes(executor)
+    payload = {
+        "request_id": request_id,
+        "owner_pid": os.getpid(),
+        "started_at": started_at,
+        "phase": phase,
+        "timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+        "worker_pids": [int(process.pid) for process in workers],
+        "worker_identities": {
+            str(int(process.pid)): _process_start_token(int(process.pid))
+            for process in workers
+        },
+    }
+    temporary = TRAINING_RUNTIME_STATE_PATH.with_suffix(
+        f".{uuid.uuid4().hex}.tmp"
+    )
+    temporary.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    os.replace(temporary, TRAINING_RUNTIME_STATE_PATH)
+
+
+def _clear_training_runtime_state(request_id: str | None = None) -> None:
+    try:
+        payload = json.loads(TRAINING_RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    if request_id and str(payload.get("request_id") or "") != request_id:
+        return
+    try:
+        TRAINING_RUNTIME_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _terminate_training_executor(executor: ProcessPoolExecutor) -> None:
+    """Cancel queued work and terminate an in-flight worker before returning."""
+
+    workers = _training_worker_processes(executor)
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except (RuntimeError, TypeError):
+        executor.shutdown(wait=False)
+    for process in workers:
+        pid = int(getattr(process, "pid", 0) or 0)
+        token = _process_start_token(pid)
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=2.0)
+        except (AttributeError, OSError, ValueError):
+            _terminate_pid(pid, token)
+
+
+def _cleanup_stale_training_workers() -> None:
+    """Reap workers recorded by a previous API process before accepting traffic."""
+
+    try:
+        payload = json.loads(TRAINING_RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    owner_pid = int(payload.get("owner_pid") or 0)
+    if owner_pid == os.getpid():
+        return
+    identities = payload.get("worker_identities")
+    identities = identities if isinstance(identities, dict) else {}
+    for raw_pid in payload.get("worker_pids") or []:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        _terminate_pid(pid, identities.get(str(pid)))
+    _clear_training_runtime_state()
+    try:
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) >= 4:
+            os.sched_setaffinity(0, set(available[: max(len(available) // 2, 1)]))
+    except (AttributeError, OSError):
+        pass
+
+
+def _isolated_training_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    _configure_training_child()
+    return _train_impl(TrainRequest(**payload))
+
+
+def _training_executor() -> ProcessPoolExecutor:
+    global _TRAIN_EXECUTOR, _TRAIN_EXECUTOR_MANUAL_RECYCLE
+
+    with _TRAIN_EXECUTOR_LOCK:
+        if _TRAIN_EXECUTOR is None:
+            executor_kwargs = {
+                "max_workers": 1,
+                "mp_context": multiprocessing.get_context("spawn"),
+            }
+            try:
+                # max_tasks_per_child was added in Python 3.11. Keep the
+                # worker isolated on older runtimes and recycle it explicitly
+                # after each completed request.
+                _TRAIN_EXECUTOR = ProcessPoolExecutor(
+                    **executor_kwargs,
+                    max_tasks_per_child=1,
+                )
+                _TRAIN_EXECUTOR_MANUAL_RECYCLE = False
+            except TypeError:
+                _TRAIN_EXECUTOR = ProcessPoolExecutor(**executor_kwargs)
+                _TRAIN_EXECUTOR_MANUAL_RECYCLE = True
+        return _TRAIN_EXECUTOR
+
+
+def _invalidate_parent_bundle_cache() -> None:
+    global _BUNDLE_CACHE, _CURRENT_MODEL_PATH
+    global _CURRENT_POINTER_MTIME_NS, _CURRENT_MODEL_MTIME_NS
+
+    _BUNDLE_CACHE = None
+    _CURRENT_MODEL_PATH = None
+    _CURRENT_POINTER_MTIME_NS = None
+    _CURRENT_MODEL_MTIME_NS = None
+    _STATUS_ARTIFACT_CACHE.clear()
+
+
+def _run_training_request(req: TrainRequest) -> dict[str, Any]:
+    global _TRAIN_EXECUTOR
+
+    if (
+        not ISOLATE_TRAINING_PROCESS
+        or os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1"
+    ):
+        return _train_impl(req)
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    executor = _training_executor()
+    request_id = uuid.uuid4().hex
+    started_at = datetime.now(timezone.utc).isoformat()
+    future = executor.submit(_isolated_training_worker, payload)
+    _write_training_runtime_state(
+        request_id=request_id,
+        started_at=started_at,
+        executor=executor,
+        phase="running",
+    )
+    try:
+        result = future.result(timeout=TRAIN_REQUEST_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        return {
+            "trained": False,
+            "reason": "timeout",
+            "error": (
+                "isolated local AI training exceeded its bounded request deadline "
+                f"of {TRAIN_REQUEST_TIMEOUT_SECONDS:.0f} seconds"
+            ),
+            "training_process_isolated": True,
+            "training_request_id": request_id,
+            "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+            "training_worker_terminated": True,
+        }
+    except MemoryError:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        return {
+            "trained": False,
+            "reason": "resource_memory",
+            "error": "MemoryError",
+            "message": (
+                "训练刷新因内存不足停止；现有模型产物保持不变，已进入资源退避。"
+            ),
+            "resource_failure": True,
+            "resource_failure_policy": "preserve_current_artifact_and_backoff",
+            "training_process_isolated": True,
+            "training_request_id": request_id,
+            "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
+            "training_worker_terminated": True,
+        }
+    except BaseException:
+        _terminate_training_executor(executor)
+        _clear_training_runtime_state(request_id)
+        with _TRAIN_EXECUTOR_LOCK:
+            if _TRAIN_EXECUTOR is executor:
+                _TRAIN_EXECUTOR = None
+        raise
+    else:
+        _clear_training_runtime_state(request_id)
+        if not isinstance(result, dict):
+            result = {"trained": False, "reason": "invalid_training_response"}
+        result.setdefault("training_process_isolated", True)
+        result.setdefault("training_request_id", request_id)
+        result.setdefault("training_timeout_seconds", TRAIN_REQUEST_TIMEOUT_SECONDS)
+        if _TRAIN_EXECUTOR_MANUAL_RECYCLE:
+            # Python 3.10 has no max_tasks_per_child. Recycle the completed
+            # worker explicitly so model tensors and sklearn arenas cannot
+            # accumulate across scheduled refreshes.
+            _terminate_training_executor(executor)
+            with _TRAIN_EXECUTOR_LOCK:
+                if _TRAIN_EXECUTOR is executor:
+                    _TRAIN_EXECUTOR = None
+    if bool(req.persist_artifact) and bool(result.get("trained")):
+        _invalidate_parent_bundle_cache()
+        result = _with_post_training_inference_warmup(result)
+    return result
+
+
+@app.post("/train")
+def train(req: TrainRequest) -> dict[str, Any]:
+    # Training mutates candidate/challenger/current pointers and the shared
+    # model cache. Reject overlapping scheduler retries instead of allowing two
+    # requests to observe a half-transitioned artifact registry.
+    if not _TRAIN_LOCK.acquire(blocking=False):
+        return {
+            "trained": False,
+            "reason": "training_in_progress",
+            "message": "A local AI training request is already running.",
+    }
+    try:
+        return _run_training_request(req)
+    finally:
+        _TRAIN_LOCK.release()
+
+
+@app.post("/profit/predict")
+def profit_predict(req: FeatureRequest) -> dict[str, Any]:
+    features = req.features or {}
+    bundle = load_bundle()
+    if bundle:
+        try:
+            x = [model_x(features)]
+            metadata = bundle.get("metadata") or {}
+            horizon_minutes = int(feature_row(features)["horizon_minutes"])
+            long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
+            short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
+            long_cost_distribution = regression_prediction_distribution(
+                bundle["long_cost_model"], x
+            )
+            short_cost_distribution = regression_prediction_distribution(
+                bundle["short_cost_model"], x
+            )
+            long_expected = float(long_distribution["expected"])
+            short_expected = float(short_distribution["expected"])
+            long_loss_prob = predict_proba_positive(bundle["long_loss_model"], x)
+            short_loss_prob = predict_proba_positive(bundle["short_loss_model"], x)
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
+            long_tail_scale = tail_scales.get("long")
+            short_tail_scale = tail_scales.get("short")
+            profiles = bundle.get("profiles") or {}
+            profile_symbol = req.symbol or features.get("symbol") or ""
+            long_profile = _profile_for_side(
+                profiles,
+                symbol=profile_symbol,
+                side="long",
+            )
+            short_profile = _profile_for_side(
+                profiles,
+                symbol=profile_symbol,
+                side="short",
+            )
+            long_lower_bound = float(long_distribution["lower_bound"])
+            short_lower_bound = float(short_distribution["lower_bound"])
+            long_return_input = model_return_distribution_input(
+                long_distribution,
+                side="long",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=long_loss_prob,
+                tail_loss_scale_pct=long_tail_scale,
+                metadata=metadata,
+            )
+            short_return_input = model_return_distribution_input(
+                short_distribution,
+                side="short",
+                horizon_minutes=horizon_minutes,
+                tail_loss_probability=short_loss_prob,
+                tail_loss_scale_pct=short_tail_scale,
+                metadata=metadata,
+            )
+            return_input_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(long_return_input.get("blockers") or []),
+                        *(short_return_input.get("blockers") or []),
+                    ]
+                )
+            )
+            best_side = "long" if long_expected >= short_expected else "short"
+            best_expected = long_expected if best_side == "long" else short_expected
+            edge = abs(long_expected - short_expected)
+            loss_prob = long_loss_prob if best_side == "long" else short_loss_prob
+            best_lower_bound = (
+                long_lower_bound if best_side == "long" else short_lower_bound
+            )
+            quality = best_lower_bound
+            actual_calibration_ready = all(
+                int(_return_profile_distribution(profile).get("count") or 0) > 0
+                and int((profile.get("slippage_pct") or {}).get("count") or 0) > 0
+                for profile in (long_profile, short_profile)
+            )
+            contract_blockers = list(return_input_blockers)
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    long_expected,
+                    short_expected,
+                    long_lower_bound,
+                    short_lower_bound,
+                )
+            ):
+                contract_blockers.append("return_distribution_values_not_finite")
+            contract_blockers = list(dict.fromkeys(contract_blockers))
+            production_blockers = list(contract_blockers)
+            if not long_cost_distribution["distribution_ready"] or not short_cost_distribution[
+                "distribution_ready"
+            ]:
+                production_blockers.append(
+                    "counterfactual_execution_cost_distribution_not_ready"
+                )
+            if not actual_calibration_ready:
+                production_blockers.append("actual_trade_calibration_not_ready")
+            production_blockers = list(dict.fromkeys(production_blockers))
+            contract_ready = not contract_blockers
+            production_ready = not production_blockers
+            return _attach_baseline_only_shadow("profit_prediction", {
+                "available": True,
+                "trained": True,
+                "model": "local-profit-trained-v2",
+                "symbol": req.symbol,
+                "best_side": best_side,
+                "horizon_minutes": int(feature_row(features)["horizon_minutes"]),
+                "profit_edge_pct": round(edge, 4),
+                "profit_quality_score": round(quality, 4),
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": {
+                    "long": long_return_input,
+                    "short": short_return_input,
+                },
+                "counterfactual_execution_cost_distribution": {
+                    "long": execution_cost_distribution_contract(
+                        long_cost_distribution
+                    ),
+                    "short": execution_cost_distribution_contract(
+                        short_cost_distribution
+                    ),
+                    "source_authority": "okx_fills_fees_funding_model",
+                },
+                "actual_trade_calibration": {
+                    "long": long_profile,
+                    "short": short_profile,
+                    "source_authority": "okx_position_history",
+                },
+                "long_loss_probability": round(long_loss_prob, 4),
+                "short_loss_probability": round(short_loss_prob, 4),
+                "loss_probability": round(loss_prob, 4),
+                "prediction_quality": {
+                    "contract_complete": contract_ready,
+                    "paper_eligible": contract_ready,
+                    "production_eligible": production_ready,
+                    "anomalous": not contract_ready,
+                    "reason": (
+                        "separated_market_cost_and_actual_calibration_ready"
+                        if production_ready
+                        else "market_opportunity_distribution_ready_for_paper"
+                        if contract_ready
+                        else contract_blockers[0]
+                    ),
+                    "source": "current_extra_trees_prediction_distribution",
+                    "blockers": contract_blockers,
+                    "production_blockers": production_blockers,
+                    "long": long_distribution,
+                    "short": short_distribution,
+                },
+                "symbol_side_profile": {
+                    "long": long_profile,
+                    "short": short_profile,
+                },
+                "note": "Shadow models predict gross market opportunity and counterfactual cost separately; only OKX lifecycles calibrate realized return and slippage.",
+            }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
+        except Exception as exc:
+            fallback_error = safe_error(exc)
+    else:
+        fallback_error = None
+
+    fallback_reason = fallback_error or "trained_profit_model_unavailable"
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
+    return _attach_baseline_only_shadow("profit_prediction", {
+        "available": False,
+        "trained": False,
+        "model": "local-profit-artifact-required-v3",
+        "symbol": req.symbol,
+        "best_side": "hold",
+        "side": "hold",
+        "horizon_minutes": horizon_minutes,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": unavailable_return_distribution_inputs(
+            horizon_minutes=horizon_minutes,
+            source_authority="artifact_unavailable",
+        ),
+        "prediction_quality": {
+            "contract_complete": False,
+            "paper_eligible": False,
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": fallback_reason,
+            "blockers": [fallback_reason],
+            "production_blockers": [fallback_reason],
+        },
+        "fallback_error": fallback_error,
+        "note": "A persisted governed artifact is required before return inference.",
+    }, kind="profit", features=features, fallback_reason=fallback_reason)
+
+
+@app.post("/timeseries/predict")
+def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
+    features = req.features or {}
+    fallback_reason = "trained_timeseries_model_unavailable"
+    bundle = load_bundle()
+    if bundle:
+        predictions = []
+        try:
+            metadata = bundle.get("metadata") or {}
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
+            profiles = bundle.get("profiles") or {}
+            profile_symbol = req.symbol or features.get("symbol") or ""
+            actual_calibration = {
+                "long": _profile_for_side(
+                    profiles,
+                    symbol=profile_symbol,
+                    side="long",
+                ),
+                "short": _profile_for_side(
+                    profiles,
+                    symbol=profile_symbol,
+                    side="short",
+                ),
+                "source_authority": "okx_position_history",
+            }
+            for horizon, item in (bundle.get("horizon_models") or {}).items():
+                x = [model_x(features, horizon_minutes=int(horizon))]
+                long_distribution = regression_prediction_distribution(item["long_model"], x)
+                short_distribution = regression_prediction_distribution(item["short_model"], x)
+                long_cost_distribution = regression_prediction_distribution(
+                    bundle["long_cost_model"],
+                    x,
+                )
+                short_cost_distribution = regression_prediction_distribution(
+                    bundle["short_cost_model"],
+                    x,
+                )
+                long_return = float(long_distribution["expected"])
+                short_return = float(short_distribution["expected"])
+                long_loss_probability = predict_proba_positive(
+                    bundle["long_loss_model"],
+                    x,
+                )
+                short_loss_probability = predict_proba_positive(
+                    bundle["short_loss_model"],
+                    x,
+                )
+                best_side = "long" if long_return >= short_return else "short"
+                return_distribution_inputs = {
+                    "long": model_return_distribution_input(
+                        long_distribution,
+                        side="long",
+                        horizon_minutes=int(horizon),
+                        tail_loss_probability=long_loss_probability,
+                        tail_loss_scale_pct=tail_scales.get("long"),
+                        metadata=metadata,
+                    ),
+                    "short": model_return_distribution_input(
+                        short_distribution,
+                        side="short",
+                        horizon_minutes=int(horizon),
+                        tail_loss_probability=short_loss_probability,
+                        tail_loss_scale_pct=tail_scales.get("short"),
+                        metadata=metadata,
+                    ),
+                }
+                return_input_blockers = list(
+                    dict.fromkeys(
+                        [
+                            *(return_distribution_inputs["long"].get("blockers") or []),
+                            *(return_distribution_inputs["short"].get("blockers") or []),
+                        ]
+                    )
+                )
+                return_inputs_ready = bool(
+                    return_distribution_inputs["long"].get("production_eligible")
+                    is True
+                    and return_distribution_inputs["short"].get(
+                        "production_eligible"
+                    )
+                    is True
+                    and not return_input_blockers
+                )
+                predictions.append({
+                    "horizon_minutes": int(horizon),
+                    "prediction_sample_count": min(
+                        int(long_distribution["sample_count"]),
+                        int(short_distribution["sample_count"]),
+                    ),
+                    "prediction_distribution_ready": bool(
+                        return_inputs_ready
+                    ),
+                    "prediction_distribution_blockers": return_input_blockers,
+                    "return_distribution_input_version": (
+                        RETURN_DISTRIBUTION_INPUT_VERSION
+                    ),
+                    "return_distribution_inputs": return_distribution_inputs,
+                    "counterfactual_execution_cost_distribution": {
+                        "long": execution_cost_distribution_contract(
+                            long_cost_distribution
+                        ),
+                        "short": execution_cost_distribution_contract(
+                            short_cost_distribution
+                        ),
+                        "source_authority": "okx_fills_fees_funding_model",
+                    },
+                    "actual_trade_calibration": actual_calibration,
+                    "best_side": best_side,
+                    "direction": "up" if best_side == "long" else "down",
+                    "samples": int(item.get("samples") or 0),
+                    "return_semantics": "gross_market_opportunity_before_execution",
+                })
+            eligible_predictions = [
+                item
+                for item in predictions
+                if item.get("prediction_distribution_ready") is True
+            ]
+            if eligible_predictions:
+                if metadata.get("primary_prediction_horizon_minutes") == PRIMARY_PREDICTION_HORIZON_MINUTES:
+                    primary = next(
+                        (
+                            item
+                            for item in eligible_predictions
+                            if int(item.get("horizon_minutes") or 0)
+                            == PRIMARY_PREDICTION_HORIZON_MINUTES
+                        ),
+                        eligible_predictions[0],
+                    )
+                else:
+                    primary = max(
+                        eligible_predictions,
+                        key=lambda item: max(
+                            float(
+                                item["return_distribution_inputs"]["long"][
+                                    "lower_quantile_return_pct"
+                                ]
+                            ),
+                            float(
+                                item["return_distribution_inputs"]["short"][
+                                    "lower_quantile_return_pct"
+                                ]
+                            ),
+                        ),
+                    )
+                best_side = str(primary["best_side"])
+                edge = abs(
+                    float(
+                        primary["return_distribution_inputs"]["long"][
+                            "raw_expected_return_pct"
+                        ]
+                    )
+                    - float(
+                        primary["return_distribution_inputs"]["short"][
+                            "raw_expected_return_pct"
+                        ]
+                    )
+                )
+                confidence = clamp(edge / 0.8, 0.0, 1.0)
+                primary_cost_distribution = primary[
+                    "counterfactual_execution_cost_distribution"
+                ]
+                actual_calibration_ready = all(
+                    int(_return_profile_distribution(profile).get("count") or 0) > 0
+                    and int((profile.get("slippage_pct") or {}).get("count") or 0)
+                    > 0
+                    for profile in (
+                        actual_calibration["long"],
+                        actual_calibration["short"],
+                    )
+                )
+                cost_distribution_ready = all(
+                    (primary_cost_distribution.get(side) or {}).get(
+                        "distribution_ready"
+                    )
+                    is True
+                    for side in ("long", "short")
+                )
+                contract_blockers = list(
+                    primary.get("prediction_distribution_blockers") or []
+                )
+                production_blockers = list(contract_blockers)
+                if not cost_distribution_ready:
+                    production_blockers.append(
+                        "counterfactual_execution_cost_distribution_not_ready"
+                    )
+                if not actual_calibration_ready:
+                    production_blockers.append("actual_trade_calibration_not_ready")
+                contract_blockers = list(dict.fromkeys(contract_blockers))
+                production_blockers = list(dict.fromkeys(production_blockers))
+                contract_ready = not contract_blockers
+                production_ready = not production_blockers
+                payload = with_model_metadata("time_series_prediction", {
+                    "available": True,
+                    "trained": True,
+                    "model": "local-timeseries-trained-v2",
+                    "architecture": "tree_horizon_ensemble",
+                    "symbol": req.symbol,
+                    "best_side": best_side,
+                    "side": best_side,
+                    "direction": primary["direction"],
+                    "horizon_minutes": primary["horizon_minutes"],
+                    "horizon_selection_policy": (
+                        "runtime_primary_horizon_5m_when_available"
+                        if metadata.get("primary_prediction_horizon_minutes")
+                        == PRIMARY_PREDICTION_HORIZON_MINUTES
+                        else "best_governed_lower_quantile_native_horizon"
+                    ),
+                    "available_horizon_minutes": sorted(
+                        int(item["horizon_minutes"])
+                        for item in eligible_predictions
+                    ),
+                    "profit_edge_pct": round(edge, 4),
+                    "return_semantics": "gross_market_opportunity_before_execution",
+                    "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                    "return_distribution_input_version": primary[
+                        "return_distribution_input_version"
+                    ],
+                    "return_distribution_inputs": primary[
+                        "return_distribution_inputs"
+                    ],
+                    "counterfactual_execution_cost_distribution": (
+                        primary_cost_distribution
+                    ),
+                    "actual_trade_calibration": actual_calibration,
+                    "confidence": round(confidence, 4),
+                    "predictions": predictions,
+                    "prediction_quality": {
+                        "contract_complete": contract_ready,
+                        "paper_eligible": contract_ready,
+                        "production_eligible": production_ready,
+                        "anomalous": not contract_ready,
+                        "reason": (
+                            "separated_market_cost_and_actual_calibration_ready"
+                            if production_ready
+                            else "market_opportunity_distribution_ready_for_paper"
+                            if contract_ready
+                            else contract_blockers[0]
+                            if contract_blockers
+                            else (
+                                "current_tree_prediction_distribution_degenerate"
+                                if primary["prediction_sample_count"] > 0
+                                else "current_tree_prediction_distribution_missing"
+                            )
+                        ),
+                        "source": "current_horizon_extra_trees_prediction_distribution",
+                        "sample_count": primary["prediction_sample_count"],
+                        "blockers": contract_blockers,
+                        "production_blockers": production_blockers,
+                    },
+                }, features=features)
+                return _attach_timeseries_specialist_shadow(payload, features=features)
+        except Exception as exc:
+            fallback_reason = f"timeseries_prediction_failed:{type(exc).__name__}"
+
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
+    return with_model_metadata("time_series_prediction", {
+        "available": False,
+        "trained": bool(bundle),
+        "model": (
+            "local-timeseries-trained-v2"
+            if bundle
+            else "local-timeseries-artifact-required-v3"
+        ),
+        "architecture": "persisted_distribution_artifact_required",
+        "symbol": req.symbol,
+        "best_side": "hold",
+        "side": "hold",
+        "direction": "flat",
+        "horizon_minutes": horizon_minutes,
+        "return_semantics": "gross_market_opportunity_before_execution",
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": unavailable_return_distribution_inputs(
+            horizon_minutes=horizon_minutes,
+            source_authority="artifact_unavailable",
+        ),
+        "prediction_quality": {
+            "production_eligible": False,
+            "anomalous": True,
+            "reason": fallback_reason,
+            "blockers": [fallback_reason],
+        },
+    }, features=features, fallback_reason=fallback_reason)
+
+
+@app.post("/timeseries/deep/predict")
+def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
+    """Sequence time-series service slot with PatchTST/TFT-style inputs."""
+    features = req.features or {}
+    bundle = load_bundle()
+    torch_patch_model = (bundle or {}).get("torch_patch_model") or {}
+    sequence_model = (bundle or {}).get("deep_sequence_model") or {}
+    close_sequence, sequence_reason, sequence_source = _timeseries_close_sequence(features)
+    volume_sequence = features.get("volume_sequence") or features.get("recent_volumes")
+    metadata = (bundle or {}).get("metadata") or {}
+    horizon_minutes = int(feature_row(features)["horizon_minutes"])
+    try:
+        torch_expected = (
+            None
+            if sequence_reason
+            else _predict_torch_patch_model(torch_patch_model, close_sequence, volume_sequence)
+        )
+        if torch_expected is not None:
+            long_expected, short_expected = torch_expected
+            best_side = "long" if long_expected >= short_expected else "short"
+            edge = abs(long_expected - short_expected)
+            confidence = clamp(edge / 0.8, 0.0, 1.0)
+            direction = "up" if best_side == "long" else "down"
+            point_distributions = {
+                "long": {
+                    "expected": long_expected,
+                    "median": long_expected,
+                    "lower_bound": None,
+                    "upper_bound": None,
+                    "std": None,
+                    "sample_count": 0,
+                    "source_authority": "torch_point_prediction_without_distribution",
+                },
+                "short": {
+                    "expected": short_expected,
+                    "median": short_expected,
+                    "lower_bound": None,
+                    "upper_bound": None,
+                    "std": None,
+                    "sample_count": 0,
+                    "source_authority": "torch_point_prediction_without_distribution",
+                },
+            }
+            return_distribution_inputs = {
+                side: model_return_distribution_input(
+                    point_distributions[side],
+                    side=side,
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=None,
+                    metadata=metadata,
+                )
+                for side in ("long", "short")
+            }
+            prediction_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(return_distribution_inputs["long"].get("blockers") or []),
+                        *(return_distribution_inputs["short"].get("blockers") or []),
+                    ]
+                )
+            )
+            return _attach_timeseries_specialist_shadow({
+                "available": True,
+                "trained": True,
+                "model": "local-torch-patch-timeseries-v1",
+                "architecture": "torch_patch_mlp_tft_patchtst_style",
+                "symbol": req.symbol,
+                "best_side": best_side,
+                "side": best_side,
+                "direction": direction,
+                "horizon_minutes": horizon_minutes,
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": return_distribution_inputs,
+                "profit_edge_pct": round(edge, 4),
+                "confidence": round(confidence, 4),
+                "sample_count": int(torch_patch_model.get("samples") or 0),
+                "train_mae_pct": torch_patch_model.get("train_mae_pct"),
+                "endpoint": "timeseries_deep",
+                "model_family": "PatchTST/TFT-style torch sequence model",
+                "status": "trained_torch_sequence_model",
+                "sequence_length": len(close_sequence),
+                "sequence_source": sequence_source,
+                "prediction_quality": {
+                    "production_eligible": False,
+                    "anomalous": True,
+                    "reason": prediction_blockers[0],
+                    "blockers": prediction_blockers,
+                },
+            }, features=features)
+        long_model = sequence_model.get("long_model")
+        short_model = sequence_model.get("short_model")
+        if long_model and short_model and not sequence_reason:
+            x = [sequence_features(close_sequence, volume_sequence)]
+            long_distribution = regression_prediction_distribution(long_model, x)
+            short_distribution = regression_prediction_distribution(short_model, x)
+            long_expected = float(long_distribution["expected"])
+            short_expected = float(short_distribution["expected"])
+            best_side = "long" if long_expected >= short_expected else "short"
+            edge = abs(long_expected - short_expected)
+            confidence = clamp(edge / 0.8, 0.0, 1.0)
+            direction = "up" if best_side == "long" else "down"
+            tail_scales = metadata.get("tail_loss_scale_pct") or {}
+            return_distribution_inputs = {
+                "long": model_return_distribution_input(
+                    long_distribution,
+                    side="long",
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=tail_scales.get("long"),
+                    metadata=metadata,
+                ),
+                "short": model_return_distribution_input(
+                    short_distribution,
+                    side="short",
+                    horizon_minutes=horizon_minutes,
+                    tail_loss_probability=None,
+                    tail_loss_scale_pct=tail_scales.get("short"),
+                    metadata=metadata,
+                ),
+            }
+            prediction_blockers = list(
+                dict.fromkeys(
+                    [
+                        *(return_distribution_inputs["long"].get("blockers") or []),
+                        *(return_distribution_inputs["short"].get("blockers") or []),
+                    ]
+                )
+            )
+            return _attach_timeseries_specialist_shadow({
+                "available": True,
+                "trained": True,
+                "model": "local-sequence-timeseries-v1",
+                "architecture": "sequence_extra_trees_patchtst_tft_style",
+                "symbol": req.symbol,
+                "best_side": best_side,
+                "side": best_side,
+                "direction": direction,
+                "horizon_minutes": horizon_minutes,
+                "return_semantics": "gross_market_opportunity_before_execution",
+                "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+                "return_distribution_input_version": (
+                    RETURN_DISTRIBUTION_INPUT_VERSION
+                ),
+                "return_distribution_inputs": return_distribution_inputs,
+                "profit_edge_pct": round(edge, 4),
+                "confidence": round(confidence, 4),
+                "sample_count": int(sequence_model.get("samples") or 0),
+                "timeframes": sequence_model.get("timeframes") or {},
+                "endpoint": "timeseries_deep",
+                "model_family": "PatchTST/TFT-style sequence model",
+                "status": "trained_sequence_model",
+                "sequence_length": len(close_sequence),
+                "sequence_source": sequence_source,
+                "prediction_quality": {
+                    "production_eligible": False,
+                    "anomalous": True,
+                    "reason": prediction_blockers[0],
+                    "blockers": prediction_blockers,
+                },
+            }, features=features)
+    except Exception:
+        pass
+    base = timeseries_predict(req)
+    base.update(
+        {
+            "endpoint": "timeseries_deep",
+            "model_family": "TimesFM primary with Chronos/Granite comparison time-series chain",
+            "status": (
+                "trained_horizon_fallback" if base.get("trained") else "heuristic_fallback"
+            ),
+            "note": (
+                "TimesFM is evaluated as the primary specialist time-series evidence source; "
+                "Chronos and Granite remain comparison/fallback models."
+            ),
+            "sequence_input_status": sequence_reason or "real_sequence_ready",
+            "sequence_length": len(close_sequence),
+            "sequence_source": sequence_source,
+            "model_input_rows": TIMESERIES_MODEL_INPUT_ROWS,
+        }
+    )
+    return _attach_timeseries_specialist_shadow(
+        base,
+        features=features,
+    )
+
+
+@app.post("/sentiment/analyze")
+def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
+    features = req.features or {}
+    news = f(features, "news_sentiment_avg")
+    social = f(features, "social_sentiment_avg")
+    mentions = f(features, "social_mention_count")
+    articles = f(features, "news_article_count")
+    score = news * 0.55 + social * 0.45
+    trained_expected = None
+    trained_long_expected = None
+    trained_short_expected = None
+    bundle = load_bundle()
+    try:
+        sentiment_model = bundle.get("sentiment_model") if bundle else None
+        if isinstance(sentiment_model, dict):
+            x = [[feature_row(features).get(key, 0.0) for key in SENTIMENT_KEYS]]
+            trained_long_expected = float(sentiment_model["long_model"].predict(x)[0])
+            trained_short_expected = float(sentiment_model["short_model"].predict(x)[0])
+            trained_expected = max(trained_long_expected, trained_short_expected)
+            return_edge = trained_long_expected - trained_short_expected
+            score = score * 0.35 + clamp(return_edge / 1.5, -1.0, 1.0) * 0.65
+    except Exception:
+        trained_expected = None
+        trained_long_expected = None
+        trained_short_expected = None
+    text_score = None
+    try:
+        text_model = (bundle or {}).get("text_sentiment_model") or {}
+        model = text_model.get("model")
+        texts = features.get("recent_headlines") or features.get("headlines") or []
+        if model and isinstance(texts, list) and texts:
+            text_blob = " ".join(str(t) for t in texts[:12] if t)
+            if text_blob.strip():
+                text_score = float(model.predict([text_blob])[0])
+                score = score * 0.5 + clamp(text_score, -1.0, 1.0) * 0.5
+    except Exception:
+        text_score = None
+    if mentions <= 0 and articles <= 0 and abs(score) < 0.03:
+        label = "neutral"
+        risk = "unknown"
+    elif score > 0.08:
+        label = "positive"
+        risk = "normal"
+    elif score < -0.08:
+        label = "negative"
+        risk = "elevated"
+    else:
+        label = "neutral"
+        risk = "normal"
+    best_side = "long" if label == "positive" else "short" if label == "negative" else "hold"
+    return with_model_metadata("sentiment_analysis", {
+        "available": True,
+        "trained": trained_expected is not None,
+        "model": "local-sentiment-trained-v2" if trained_expected is not None else "local-sentiment-light-v1",
+        "architecture": "finbert_cryptobert_ready_calibrator" if trained_expected is not None else "lexicon_feature_fallback",
+        "symbol": req.symbol,
+        "best_side": best_side,
+        "side": best_side,
+        "label": label,
+        "score": round(score, 4),
+        "return_calibration_observation_only": bool(trained_expected is not None),
+        "text_sentiment_score": round(text_score, 4) if text_score is not None else None,
+        "risk_level": risk,
+        "mentions": int(mentions),
+        "articles": int(articles),
+    }, features=features, fallback_reason="" if trained_expected is not None else "trained_sentiment_model_unavailable")
+
+
+@app.post("/sentiment/deep/analyze")
+def deep_sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
+    """Independent text sentiment service slot for CryptoBERT/FinBERT style models."""
+    features = req.features or {}
+    base = sentiment_analyze(req)
+    specialist_shadow = _shadow_ready_or_submit(
+        "finbert",
+        features,
+        _run_finbert_shadow,
+    )
+    base.update(
+        {
+            "endpoint": "sentiment_deep",
+            "model_family": "FinBERT shadow-ready sentiment chain",
+            "status": (
+                "specialist_shadow_inference"
+                if specialist_shadow.get("available")
+                else "trained_text_model"
+                if base.get("text_sentiment_score") is not None
+                else ("trained_calibrator" if base.get("trained") else "feature_fallback")
+            ),
+            "note": (
+                "FinBERT specialist inference is shadow-only and cannot mutate live routing."
+                if specialist_shadow.get("available")
+                else "FinBERT artifacts are audited separately; this response remains baseline-only "
+                "until specialist adapters pass evaluation gates."
+            ),
+        }
+    )
+    payload = _attach_specialist_shadow(
+        "sentiment_analysis",
+        base,
+        kind="sentiment",
+        features=features,
+        fallback_reason=(
+            "specialist_sentiment_shadow_only"
+            if specialist_shadow.get("available")
+            else "specialist_sentiment_adapter_not_promoted"
+        ),
+    )
+    payload["specialist_inference_active"] = bool(specialist_shadow.get("available"))
+    payload["professional_model_shadow"].update(specialist_shadow)
+    payload["professional_model_shadow"]["baseline_response"] = True
+    payload.pop("shadow_payload", None)
+    return with_model_metadata(
+        "sentiment_analysis",
+        payload,
+        features=features,
+        challenger_model=str(payload.get("specialist_challenger_model") or ""),
+        fallback_reason=payload.get("fallback_reason") or "",
+    )
+
+
+@app.post("/exit/advise")
+def exit_advise(req: FeatureRequest) -> dict[str, Any]:
+    features = req.features or {}
+    symbol = symbol_key(req.symbol or features.get("symbol"))
+    bundle = load_bundle()
+    profiles = (bundle or {}).get("profiles") or {}
+    positions = []
+    for pos in req.open_positions or []:
+        if symbol_key(pos.get("symbol")) == symbol:
+            positions.append(pos)
+    if not positions:
+        return with_model_metadata("exit_advice", {
+            "available": True,
+            "trained": bool(bundle),
+            "model": "local-exit-advisor-v1",
+            "symbol": req.symbol,
+            "action": "hold",
+            "no_matching_position": True,
+            "reason": "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。",
+        }, features=features, fallback_reason="no_matching_open_position")
+    observations = []
+    for pos in positions:
+        side = str(pos.get("side") or "").lower()
+        pnl_pct = f(pos, "unrealized_pnl_pct", f(pos, "pnl_pct"))
+        unrealized = f(pos, "unrealized_pnl")
+        hold = f(pos, "hold_minutes")
+        profile = profiles.get(f"{symbol}|{side}", {})
+        observations.append({
+            "side": side,
+            "unrealized_pnl": round(unrealized, 4),
+            "pnl_pct": round(pnl_pct, 5),
+            "hold_minutes": round(hold, 2),
+            "profile": profile,
+            "production_permission": False,
+        })
+    return with_model_metadata("exit_advice", {
+        "available": True,
+        "trained": bool(bundle),
+        "model": "local-exit-profile-observer-v2",
+        "symbol": req.symbol,
+        "action": "hold",
+        "reason": "本地退出画像只提供观察事实；生产平仓由动态退出契约独占。",
+        "observations": observations,
+        "production_permission": False,
+    }, features=features, fallback_reason="dynamic_exit_policy_owns_production_exit")
+
+
+@app.get("/v1/models")
+def models() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [],
+        "disabled": LOCAL_REVIEW_DISABLED_DETAIL,
+    }
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(_payload: dict[str, Any]) -> Any:
+    raise HTTPException(status_code=410, detail=LOCAL_REVIEW_DISABLED_DETAIL)
