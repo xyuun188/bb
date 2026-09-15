@@ -213,6 +213,7 @@ async def test_system_audit_subprocess_reloads_matching_snapshot(
         "checked_at": checked_at,
         "status": "warning",
         "summary": {"cards": 27},
+        "schema_version": system_audit.SYSTEM_AUDIT_SCHEMA_VERSION,
     }
     snapshot_path = tmp_path / "system_audit_latest.json"
     snapshot_path.write_text(json.dumps(payload), encoding="utf-8")

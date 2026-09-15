@@ -103,6 +103,10 @@ MARKET_WEBSOCKET_STALE_SECONDS = 120.0
 STATUS_RANK = {"critical": 0, "warning": 1, "ok": 2, "info": 3}
 SYSTEM_AUDIT_HISTORY_FILE = "system_audit_history.jsonl"
 SYSTEM_AUDIT_LATEST_FILE = "system_audit_latest.json"
+# Persisted snapshots are an optimization only.  Bump this whenever the
+# audit classification or safety contract changes so an older snapshot cannot
+# replay obsolete blockers after deployment.
+SYSTEM_AUDIT_SCHEMA_VERSION = "2026-09-15.v2"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
@@ -6338,6 +6342,8 @@ def _load_latest_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
         return None
     if not isinstance(payload, dict):
         return None
+    if payload.get("schema_version") != SYSTEM_AUDIT_SCHEMA_VERSION:
+        return None
     checked_at = _parse_utc_datetime(payload.get("checked_at"))
     if checked_at is None:
         return None
@@ -6363,6 +6369,8 @@ def _load_canonical_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != SYSTEM_AUDIT_SCHEMA_VERSION:
         return None
     checked_at = _parse_utc_datetime(payload.get("checked_at"))
     if checked_at is None or str(payload.get("status") or "").lower() in {
@@ -6407,9 +6415,11 @@ def _store_latest_audit_snapshot(payload: dict[str, Any]) -> None:
     path = _latest_audit_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(f"{path.suffix}.tmp")
+    snapshot = dict(payload)
+    snapshot["schema_version"] = SYSTEM_AUDIT_SCHEMA_VERSION
     temp.write_text(
         json.dumps(
-            payload,
+            snapshot,
             ensure_ascii=False,
             separators=(",", ":"),
             default=_audit_snapshot_json_default,
