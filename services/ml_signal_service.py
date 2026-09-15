@@ -40,6 +40,12 @@ from services.artifact_retirement_audit import (
     PHASE3_REQUIRED_PROMOTION_FLOW,
 )
 from services.dynamic_policy_values import empirical_policy_value
+from services.ml_prediction_contract import (
+    profit_quality_score,
+    regression_prediction_distribution,
+    risk_adjusted_expected_scores,
+    standardized_model_return_distribution,
+)
 from services.ml_readiness import build_ml_readiness_report, disabled_ml_readiness
 from services.ml_training_contract import (
     DECISION_GROUP_PARTITION_VERSION,
@@ -81,7 +87,6 @@ from services.return_objective import (
     holdout_return_metric_contract_errors,
     return_distribution_summary,
     risk_adjusted_expected_return,
-    standardized_return_distribution,
 )
 from services.shadow_training_quarantine import quarantine_dirty_shadow_samples
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -612,70 +617,6 @@ def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float |
     return float(pd.Series(y_win).iloc[idx].mean())
 
 
-def _regression_prediction_distribution(
-    model: Pipeline,
-    x: pd.DataFrame,
-) -> dict[str, Any]:
-    expected = np.asarray(model.predict(x), dtype=float)
-    named_steps = getattr(model, "named_steps", {})
-    getter = getattr(named_steps, "get", None)
-    estimator = getter("model") if callable(getter) else None
-    imputer = getter("imputer") if callable(getter) else None
-    trees = list(getattr(estimator, "estimators_", []) or [])
-    if not trees or imputer is None:
-        return {
-            "expected": expected,
-            "median": expected.copy(),
-            "lower_quantile": expected.copy(),
-            "upper_quantile": expected.copy(),
-            "std": np.zeros(len(expected), dtype=float),
-            "member_count": 0,
-            "source_authority": "regressor_point_prediction_without_members",
-        }
-    transformed = imputer.transform(x)
-    tree_predictions = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
-    ordered_tree_predictions = np.sort(tree_predictions, axis=0)
-    lower_tail_count = max(int(math.sqrt(len(ordered_tree_predictions))), 1)
-    return {
-        "expected": expected,
-        "median": np.median(tree_predictions, axis=0),
-        "lower_quantile": np.median(ordered_tree_predictions[:lower_tail_count], axis=0),
-        "upper_quantile": np.median(ordered_tree_predictions[-lower_tail_count:], axis=0),
-        "std": np.std(tree_predictions, axis=0),
-        "member_count": len(trees),
-        "source_authority": "random_forest_tree_empirical_distribution",
-    }
-
-
-def _standardized_model_return_distribution(
-    distribution: dict[str, Any],
-    index: int,
-    *,
-    side: str,
-    horizon_minutes: int,
-    tail_loss_probability: float | None,
-    tail_loss_scale_pct: float,
-) -> dict[str, Any]:
-    return standardized_return_distribution(
-        side=side,
-        horizon_minutes=horizon_minutes,
-        raw_expected_return_pct=distribution["expected"][index],
-        median_return_pct=distribution["median"][index],
-        lower_quantile_return_pct=distribution["lower_quantile"][index],
-        upper_quantile_return_pct=distribution["upper_quantile"][index],
-        dispersion_pct=distribution["std"][index],
-        tail_loss_probability=tail_loss_probability,
-        tail_loss_scale_pct=tail_loss_scale_pct,
-        distribution_member_count=distribution.get("member_count"),
-        return_semantics="gross_market_opportunity_before_execution",
-        source_authority=str(distribution.get("source_authority") or ""),
-        objective_version=RETURN_OBJECTIVE_VERSION,
-        label_version=RETURN_LABEL_VERSION,
-        cost_model_version=COST_MODEL_VERSION,
-        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
-    )
-
-
 def _optional_regression_value(
     bundle: dict[str, Any],
     model_key: str,
@@ -805,55 +746,6 @@ def _distribution_ready_at(
         all(math.isfinite(value) for value in (expected, lower, upper, std))
         and (upper - lower > numerical_resolution or std > numerical_resolution)
     )
-
-
-def _risk_adjusted_expected_scores(
-    market_distribution: dict[str, np.ndarray],
-    cost_distribution: dict[str, np.ndarray],
-    tail_loss_scores: np.ndarray,
-    *,
-    tail_loss_scale_pct: float,
-) -> np.ndarray:
-    gross_expected = np.asarray(market_distribution["expected"], dtype=float)
-    gross_lower = np.asarray(market_distribution["lower_quantile"], dtype=float)
-    cost_expected = np.maximum(
-        np.asarray(cost_distribution["expected"], dtype=float),
-        0.0,
-    )
-    cost_upper = np.maximum(
-        np.asarray(cost_distribution["upper_quantile"], dtype=float),
-        cost_expected,
-    )
-    expected_net = gross_expected - cost_expected
-    lower_net = np.minimum(gross_lower - cost_upper, expected_net)
-    return np.asarray(
-        [
-            risk_adjusted_expected_return(
-                expected_return_pct=float(expected_net[index]),
-                lower_quantile_return_pct=float(lower_net[index]),
-                tail_loss_probability=float(tail_loss_scores[index]),
-                tail_loss_scale_pct=tail_loss_scale_pct,
-            )["objective_net_return_pct"]
-            for index in range(len(expected_net))
-        ],
-        dtype=float,
-    )
-
-
-def _profit_quality_score(
-    objective_return_pct: float,
-    lower_quantile_return_pct: float,
-    edge_pct: float,
-    tail_loss_probability: float,
-    tail_loss_scale_pct: float,
-) -> float:
-    """Score fee-after return quality without win-rate input."""
-
-    expected_component = max(objective_return_pct, 0.0)
-    lower_bound_component = max(lower_quantile_return_pct, 0.0)
-    edge_component = max(edge_pct, 0.0)
-    tail_penalty = _clamp(tail_loss_probability) * max(tail_loss_scale_pct, 0.0)
-    return expected_component + lower_bound_component + edge_component - tail_penalty
 
 
 def _side_influence_status(metadata: dict[str, Any], side: str) -> dict[str, Any]:
@@ -2674,23 +2566,23 @@ def train_from_frame(
     short_scores = _positive_proba(short_classifier, x_test)
     long_tail_scores = _positive_proba(long_tail_classifier, x_test)
     short_tail_scores = _positive_proba(short_tail_classifier, x_test)
-    long_distribution = _regression_prediction_distribution(long_regressor, x_test)
-    short_distribution = _regression_prediction_distribution(short_regressor, x_test)
-    long_cost_distribution = _regression_prediction_distribution(
+    long_distribution = regression_prediction_distribution(long_regressor, x_test)
+    short_distribution = regression_prediction_distribution(short_regressor, x_test)
+    long_cost_distribution = regression_prediction_distribution(
         long_cost_regressor,
         x_test,
     )
-    short_cost_distribution = _regression_prediction_distribution(
+    short_cost_distribution = regression_prediction_distribution(
         short_cost_regressor,
         x_test,
     )
-    long_expected_scores = _risk_adjusted_expected_scores(
+    long_expected_scores = risk_adjusted_expected_scores(
         long_distribution,
         long_cost_distribution,
         long_tail_scores,
         tail_loss_scale_pct=tail_scales["long"],
     )
-    short_expected_scores = _risk_adjusted_expected_scores(
+    short_expected_scores = risk_adjusted_expected_scores(
         short_distribution,
         short_cost_distribution,
         short_tail_scores,
@@ -4220,19 +4112,19 @@ class MLSignalService:
             ],
             columns=FEATURE_KEYS,
         )
-        long_distribution = _regression_prediction_distribution(
+        long_distribution = regression_prediction_distribution(
             self._bundle["long_regressor"],
             frame,
         )
-        short_distribution = _regression_prediction_distribution(
+        short_distribution = regression_prediction_distribution(
             self._bundle["short_regressor"],
             frame,
         )
-        long_cost_distribution = _regression_prediction_distribution(
+        long_cost_distribution = regression_prediction_distribution(
             self._bundle["long_cost_regressor"],
             frame,
         )
-        short_cost_distribution = _regression_prediction_distribution(
+        short_cost_distribution = regression_prediction_distribution(
             self._bundle["short_cost_regressor"],
             frame,
         )
@@ -4269,7 +4161,7 @@ class MLSignalService:
                 if not math.isfinite(float(short_tail_probabilities[index]))
                 else float(short_tail_probabilities[index])
             )
-            long_contract = _standardized_model_return_distribution(
+            long_contract = standardized_model_return_distribution(
                 long_distribution,
                 index,
                 side="long",
@@ -4277,7 +4169,7 @@ class MLSignalService:
                 tail_loss_probability=long_tail_probability,
                 tail_loss_scale_pct=long_tail_scale,
             )
-            short_contract = _standardized_model_return_distribution(
+            short_contract = standardized_model_return_distribution(
                 short_distribution,
                 index,
                 side="short",
@@ -4412,16 +4304,16 @@ class MLSignalService:
             x = pd.DataFrame([row], columns=FEATURE_KEYS)
             long_win_rate = float(_positive_proba(self._bundle["long_classifier"], x)[0])
             short_win_rate = float(_positive_proba(self._bundle["short_classifier"], x)[0])
-            long_distribution = _regression_prediction_distribution(
+            long_distribution = regression_prediction_distribution(
                 self._bundle["long_regressor"], x
             )
-            short_distribution = _regression_prediction_distribution(
+            short_distribution = regression_prediction_distribution(
                 self._bundle["short_regressor"], x
             )
-            long_cost_distribution = _regression_prediction_distribution(
+            long_cost_distribution = regression_prediction_distribution(
                 self._bundle["long_cost_regressor"], x
             )
-            short_cost_distribution = _regression_prediction_distribution(
+            short_cost_distribution = regression_prediction_distribution(
                 self._bundle["short_cost_regressor"], x
             )
             long_mfe = _optional_regression_value(self._bundle, "long_mfe_regressor", x)
@@ -4460,7 +4352,7 @@ class MLSignalService:
                 if short_tail_model is not None
                 else None
             )
-            long_return_contract = _standardized_model_return_distribution(
+            long_return_contract = standardized_model_return_distribution(
                 long_distribution,
                 0,
                 side="long",
@@ -4468,7 +4360,7 @@ class MLSignalService:
                 tail_loss_probability=long_tail_loss_probability,
                 tail_loss_scale_pct=long_tail_scale,
             )
-            short_return_contract = _standardized_model_return_distribution(
+            short_return_contract = standardized_model_return_distribution(
                 short_distribution,
                 0,
                 side="short",
@@ -4610,7 +4502,7 @@ class MLSignalService:
                     )
                 )
             )
-            profit_quality = _profit_quality_score(
+            profit_quality = profit_quality_score(
                 best_scoring_expected,
                 best_lower_quantile,
                 profit_edge,
