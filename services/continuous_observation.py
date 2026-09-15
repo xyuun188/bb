@@ -15,9 +15,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-CONTINUOUS_OBSERVATION_VERSION = "2026-09-01.continuous-observation.v2"
+CONTINUOUS_OBSERVATION_VERSION = "2026-09-16.continuous-observation.v3"
 ALLOWED_WINDOW_HOURS = (24, 72)
 MAX_SAMPLES = 2000
+EXPECTED_SAMPLE_INTERVAL_SECONDS = 300.0
+MAX_ALLOWED_SAMPLE_GAP_SECONDS = EXPECTED_SAMPLE_INTERVAL_SECONDS * 3
+MAX_LATEST_SAMPLE_AGE_SECONDS = EXPECTED_SAMPLE_INTERVAL_SECONDS * 3
 
 _REQUIRED_24H_METRICS = (
     "service_restart_count",
@@ -84,10 +87,28 @@ def _normalise_metrics(value: Any) -> dict[str, Any]:
             result[key] = source.get(key) is True
         else:
             result[key] = _int(source.get(key))
-    for key in ("source", "blocked_reason"):
+    for key in ("source", "blocked_reason", "collection_errors"):
         if source.get(key):
             result[key] = str(source[key])[:300]
     return result
+
+
+def observation_metrics_ready(metrics: Any) -> bool:
+    """Return whether a collected sample can start or recover a window."""
+
+    normalized = _normalise_metrics(metrics)
+    if normalized.get("blocked_reason") or normalized.get("collection_errors"):
+        return False
+    analysis_interval = normalized.get("max_analysis_interval_seconds")
+    if analysis_interval is None or float(analysis_interval) > 180.0:
+        return False
+    if normalized.get("training_state_clear") is not True:
+        return False
+    return all(
+        normalized.get(key) is not None
+        for key in _REQUIRED_72H_METRICS
+        if key not in {"max_analysis_interval_seconds", "training_state_clear"}
+    )
 
 
 class ContinuousObservationStore:
@@ -105,6 +126,9 @@ class ContinuousObservationStore:
             "last_sample_at": None,
             "baseline_metrics": {},
             "samples": [],
+            "reset_count": 0,
+            "last_reset_at": None,
+            "last_reset_reason": None,
         }
 
     def read(self) -> dict[str, Any]:
@@ -139,17 +163,27 @@ class ContinuousObservationStore:
         required_hours: int = 24,
         now: datetime | None = None,
         baseline_metrics: dict[str, Any] | None = None,
+        restart: bool = False,
+        reset_reason: str | None = None,
     ) -> dict[str, Any]:
         hours = int(required_hours)
         if hours not in ALLOWED_WINDOW_HOURS:
             raise ValueError("required_hours must be 24 or 72")
         payload = self.read()
-        if payload.get("window_started_at") and int(payload.get("required_hours") or 24) == hours:
+        if (
+            not restart
+            and payload.get("window_started_at")
+            and int(payload.get("required_hours") or 24) == hours
+        ):
             return self.snapshot(now=now)
         started = now or _now()
         normalized_baseline = _normalise_metrics(baseline_metrics or {})
         normalized_baseline.pop("source", None)
         normalized_baseline.pop("blocked_reason", None)
+        previous_started = payload.get("window_started_at")
+        reset_count = int(payload.get("reset_count") or 0)
+        if restart and previous_started:
+            reset_count += 1
         payload.update(
             {
                 "version": CONTINUOUS_OBSERVATION_VERSION,
@@ -160,6 +194,13 @@ class ContinuousObservationStore:
                 "baseline_metrics": normalized_baseline,
                 "samples": [],
                 "blocked_reason": None,
+                "reset_count": reset_count,
+                "last_reset_at": _iso(started) if restart and previous_started else payload.get("last_reset_at"),
+                "last_reset_reason": (
+                    str(reset_reason or "explicit_restart")[:300]
+                    if restart and previous_started
+                    else payload.get("last_reset_reason")
+                ),
             }
         )
         self._write(payload)
@@ -186,6 +227,9 @@ class ContinuousObservationStore:
         payload["samples"] = samples[-MAX_SAMPLES:]
         payload["last_sample_at"] = row["observed_at"]
         blocked_reason = str(metrics.get("blocked_reason") or "").strip()
+        collection_errors = str(metrics.get("collection_errors") or "").strip()
+        if not blocked_reason and collection_errors:
+            blocked_reason = f"collection_error:{collection_errors}"
         if blocked_reason:
             payload["blocked_reason"] = blocked_reason[:300]
         self._write(payload)
@@ -200,6 +244,26 @@ class ContinuousObservationStore:
         baseline = baseline if isinstance(baseline, dict) else {}
         samples = [item for item in payload.get("samples", []) if isinstance(item, dict)]
         latest_metrics = samples[-1].get("metrics", {}) if samples else {}
+        sample_times = [
+            parsed
+            for parsed in (_parse(item.get("observed_at")) for item in samples)
+            if parsed is not None
+        ]
+        first_sample_delay_seconds = (
+            max((sample_times[0] - started).total_seconds(), 0.0)
+            if started and sample_times
+            else None
+        )
+        max_sample_gap_seconds = None
+        if started and sample_times:
+            continuity_points = [started, *sample_times]
+            max_sample_gap_seconds = max(
+                max((right - left).total_seconds(), 0.0)
+                for left, right in zip(continuity_points, continuity_points[1:], strict=False)
+            )
+        latest_sample_age_seconds = (
+            max((current - sample_times[-1]).total_seconds(), 0.0) if sample_times else None
+        )
         elapsed_hours = (
             max((current - started).total_seconds(), 0.0) / 3600.0 if started else 0.0
         )
@@ -216,11 +280,30 @@ class ContinuousObservationStore:
                     failures.append(key)
             elif value is not None and int(value) != 0:
                 failures.append(key)
+        continuity_failures: list[str] = []
+        if (
+            first_sample_delay_seconds is not None
+            and first_sample_delay_seconds > MAX_ALLOWED_SAMPLE_GAP_SECONDS
+        ):
+            continuity_failures.append("first_sample_delayed")
+        if (
+            max_sample_gap_seconds is not None
+            and max_sample_gap_seconds > MAX_ALLOWED_SAMPLE_GAP_SECONDS
+        ):
+            continuity_failures.append("sample_gap_exceeded")
+        if (
+            latest_sample_age_seconds is not None
+            and latest_sample_age_seconds > MAX_LATEST_SAMPLE_AGE_SECONDS
+        ):
+            continuity_failures.append("latest_sample_stale")
         blocked_reason = str(payload.get("blocked_reason") or "").strip() or None
         if not started:
             status = "not_started"
         elif blocked_reason:
             status = "blocked"
+        elif continuity_failures:
+            status = "blocked"
+            blocked_reason = "continuity_failed:" + ",".join(continuity_failures)
         elif missing or elapsed_hours < required_hours:
             status = "observing"
         elif failures:
@@ -238,13 +321,23 @@ class ContinuousObservationStore:
             "sample_count": len(samples),
             "missing_metrics": missing,
             "failed_metrics": failures,
+            "continuity_failures": continuity_failures,
             "blocked_reason": blocked_reason,
             "latest_metrics": latest_metrics,
             "baseline_metrics": baseline if isinstance(baseline, dict) else {},
+            "reset_count": int(payload.get("reset_count") or 0),
+            "last_reset_at": payload.get("last_reset_at"),
+            "last_reset_reason": payload.get("last_reset_reason"),
             "evidence": {
                 "real_elapsed_time_required": True,
                 "synthetic_time_allowed": False,
                 "source": "persisted_observation_samples",
+                "expected_sample_interval_seconds": EXPECTED_SAMPLE_INTERVAL_SECONDS,
+                "max_allowed_sample_gap_seconds": MAX_ALLOWED_SAMPLE_GAP_SECONDS,
+                "max_latest_sample_age_seconds": MAX_LATEST_SAMPLE_AGE_SECONDS,
+                "first_sample_delay_seconds": first_sample_delay_seconds,
+                "max_sample_gap_seconds": max_sample_gap_seconds,
+                "latest_sample_age_seconds": latest_sample_age_seconds,
             },
         }
 
@@ -293,12 +386,13 @@ class ContinuousObservationScheduler:
                 baseline = collected if isinstance(collected, dict) else {}
             except Exception:
                 baseline = {}
-        for hours, store in pending_stores:
-            store.start(
-                required_hours=hours,
-                now=now,
-                baseline_metrics=baseline,
-            )
+        if observation_metrics_ready(baseline):
+            for hours, store in pending_stores:
+                store.start(
+                    required_hours=hours,
+                    now=now,
+                    baseline_metrics=baseline,
+                )
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -323,20 +417,34 @@ class ContinuousObservationScheduler:
         except Exception as exc:
             metrics = {
                 "source": "continuous_observation_scheduler",
-                "collection_error": f"collector_error:{type(exc).__name__}",
+                "collection_errors": f"collector_error:{type(exc).__name__}",
             }
+        observed_at = _now()
+        metrics_ready = observation_metrics_ready(metrics)
         snapshots: dict[str, Any] = {}
         for hours in ALLOWED_WINDOW_HOURS:
             store = self.stores.get(hours)
             if store is None:
                 continue
-            try:
-                snapshots[str(hours)] = store.record(
-                    metrics,
-                    now=_now(),
+            current = store.snapshot(now=observed_at)
+            if current.get("status") == "not_started":
+                if not metrics_ready:
+                    snapshots[str(hours)] = current
+                    continue
+                store.start(
+                    required_hours=hours,
+                    now=observed_at,
+                    baseline_metrics=metrics,
                 )
-            except RuntimeError:
-                continue
+            elif current.get("status") == "blocked" and metrics_ready:
+                store.start(
+                    required_hours=hours,
+                    now=observed_at,
+                    baseline_metrics=metrics,
+                    restart=True,
+                    reset_reason=str(current.get("blocked_reason") or "blocked_window"),
+                )
+            snapshots[str(hours)] = store.record(metrics, now=observed_at)
         return snapshots
 
     async def _run(self) -> None:

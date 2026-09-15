@@ -9475,11 +9475,33 @@ async def get_continuous_observation_snapshot() -> dict[str, Any]:
 
 @router.post("/continuous-observation/start")
 async def start_continuous_observation(required_hours: int = 24) -> dict[str, Any]:
-    """Explicitly start a real observation window; no metrics are fabricated."""
+    """Start a real window only after a complete, healthy baseline is collected."""
 
     try:
+        from services.continuous_observation import observation_metrics_ready
+
         store = CONTINUOUS_OBSERVATION_STORES[int(required_hours)]
-        snapshot = store.start(required_hours=required_hours)
+        existing = store.snapshot()
+        if existing.get("status") != "not_started":
+            snapshot = existing
+        else:
+            baseline = await collect_continuous_observation_metrics()
+            if not observation_metrics_ready(baseline):
+                return sanitize_payload(
+                    build_snapshot(
+                        {
+                            "required_hours": required_hours,
+                            "baseline": baseline,
+                        },
+                        status="blocked",
+                        source="dashboard.continuous_observation",
+                        degraded_reason="observation_baseline_incomplete",
+                    )
+                )
+            snapshot = store.start(
+                required_hours=required_hours,
+                baseline_metrics=baseline,
+            )
     except (KeyError, ValueError) as exc:
         return sanitize_payload(
             build_snapshot(

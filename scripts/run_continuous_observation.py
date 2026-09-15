@@ -34,7 +34,7 @@ async def main() -> None:
         CONTINUOUS_OBSERVATION_STORES,
         collect_continuous_observation_metrics,
         interval_seconds=300.0,
-        startup_delay_seconds=300.0,
+        startup_delay_seconds=0.0,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

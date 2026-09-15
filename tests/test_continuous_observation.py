@@ -6,6 +6,7 @@ import pytest
 from services.continuous_observation import (
     ContinuousObservationScheduler,
     ContinuousObservationStore,
+    observation_metrics_ready,
 )
 from services.observability_contract import normalize_status
 
@@ -37,7 +38,8 @@ def test_observation_requires_real_elapsed_window_and_metrics(tmp_path):
     assert observing["status"] == "observing"
     assert "duplicate_analysis_count" in observing["missing_metrics"]
 
-    store.record(_metrics(), now=started + timedelta(hours=23, minutes=59))
+    for minutes in range(0, 24 * 60 + 1, 5):
+        store.record(_metrics(), now=started + timedelta(minutes=minutes))
     assert store.snapshot(now=started + timedelta(hours=23, minutes=59))["status"] == "observing"
     passed = store.snapshot(now=started + timedelta(hours=24))
     assert passed["status"] == "passed"
@@ -54,6 +56,40 @@ def test_observation_blocks_on_failed_gate_and_never_fakes_zero(tmp_path):
     snapshot = store.snapshot(now=started + timedelta(hours=72))
     assert snapshot["status"] == "blocked"
     assert "max_analysis_interval_seconds" in snapshot["failed_metrics"]
+
+
+def test_observation_blocks_on_sampling_gap_and_stale_latest_sample(tmp_path):
+    store = ContinuousObservationStore(tmp_path / "observation.json")
+    started = datetime(2026, 8, 29, tzinfo=UTC)
+    store.start(required_hours=24, now=started, baseline_metrics=_metrics())
+    store.record(_metrics(), now=started + timedelta(minutes=5))
+    snapshot = store.record(_metrics(), now=started + timedelta(minutes=21))
+
+    assert snapshot["status"] == "blocked"
+    assert "sample_gap_exceeded" in snapshot["continuity_failures"]
+    stale = store.snapshot(now=started + timedelta(minutes=40))
+    assert "latest_sample_stale" in stale["continuity_failures"]
+
+
+def test_collection_error_blocks_window_instead_of_observing_forever(tmp_path):
+    store = ContinuousObservationStore(tmp_path / "observation.json")
+    started = datetime(2026, 8, 29, tzinfo=UTC)
+    store.start(required_hours=24, now=started, baseline_metrics=_metrics())
+
+    snapshot = store.record(
+        {"collection_errors": "model:timeout"},
+        now=started + timedelta(minutes=5),
+    )
+
+    assert snapshot["status"] == "blocked"
+    assert snapshot["blocked_reason"] == "collection_error:model:timeout"
+
+
+def test_observation_metrics_ready_requires_complete_healthy_sample():
+    assert observation_metrics_ready(_metrics()) is True
+    assert observation_metrics_ready(_metrics(max_analysis_interval_seconds=None)) is False
+    assert observation_metrics_ready(_metrics(training_state_clear=False)) is False
+    assert observation_metrics_ready({**_metrics(), "collection_errors": "trade:timeout"}) is False
 
 
 def test_observation_rejects_record_before_explicit_start(tmp_path):
@@ -146,5 +182,68 @@ async def test_scheduler_does_not_recollect_baseline_for_existing_windows(tmp_pa
     try:
         await asyncio.sleep(0)
         assert calls == 0
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_waits_for_healthy_baseline_then_starts_windows(tmp_path):
+    samples = [
+        {"collection_errors": "model:timeout"},
+        _metrics(),
+    ]
+
+    async def collect():
+        return samples.pop(0)
+
+    stores = {
+        24: ContinuousObservationStore(tmp_path / "24.json"),
+        72: ContinuousObservationStore(tmp_path / "72.json"),
+    }
+    scheduler = ContinuousObservationScheduler(
+        stores,
+        collect,
+        interval_seconds=60,
+        startup_delay_seconds=60,
+    )
+    await scheduler.start()
+    try:
+        assert stores[24].snapshot()["status"] == "not_started"
+        snapshots = await scheduler.sample_once()
+        assert snapshots["24"]["status"] == "observing"
+        assert snapshots["72"]["status"] == "observing"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_recovers_blocked_window_with_fresh_full_window(tmp_path):
+    metrics = _metrics()
+
+    async def collect():
+        return metrics
+
+    store = ContinuousObservationStore(tmp_path / "24.json")
+    started = datetime(2026, 8, 29, tzinfo=UTC)
+    store.start(required_hours=24, now=started, baseline_metrics=metrics)
+    store.record(
+        {**metrics, "collection_errors": "analysis:timeout"},
+        now=started + timedelta(minutes=5),
+    )
+    assert store.snapshot(now=started + timedelta(minutes=5))["status"] == "blocked"
+
+    scheduler = ContinuousObservationScheduler(
+        {24: store},
+        collect,
+        interval_seconds=60,
+        startup_delay_seconds=60,
+    )
+    await scheduler.start()
+    try:
+        snapshot = (await scheduler.sample_once())["24"]
+        assert snapshot["status"] == "observing"
+        assert snapshot["reset_count"] == 1
+        assert snapshot["last_reset_reason"] == "collection_error:analysis:timeout"
+        assert snapshot["elapsed_hours"] < 0.01
     finally:
         await scheduler.stop()
