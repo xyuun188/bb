@@ -10932,9 +10932,17 @@ function renderHighRiskReviewerStatus(data) {
     if (routeMatrix) {
         routeMatrix.innerHTML = routes.length
             ? `<strong>低频路由：</strong> ${routes.map(route => {
+                const routeKind = route.route === 'cloud'
+                    ? '云端'
+                    : route.route === 'local_fallback'
+                        ? '本地'
+                        : '采集器';
                 const tone = route.active ? 'var(--success, #22c55e)' : 'var(--text-muted)';
-                const state = route.active ? '已启用' : (route.configured ? '已配置但未接管' : '未启用');
-                return `<span style="display:inline-block;margin-right:14px;color:${tone};">${escHtml(route.label)} · ${escHtml(state)}<small style="display:block;color:var(--text-muted);">${escHtml(route.status || '')}</small></span>`;
+                const state = route.active ? '已启用' : (route.configured ? '已配置但未接管' : '未配置');
+                const identity = route.model
+                    ? ` / ${route.model}${route.revision ? ` @ ${route.revision}` : ''}`
+                    : '';
+                return `<span style="display:inline-block;margin-right:14px;color:${tone};"><strong>${escHtml(routeKind)}</strong> ${escHtml(route.label)} · ${escHtml(state)}${escHtml(identity)}<small style="display:block;color:var(--text-muted);">${escHtml(route.status || '')}</small></span>`;
             }).join('')}`
             : '低频云端路由信息暂未返回。';
     }

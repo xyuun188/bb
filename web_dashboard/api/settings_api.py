@@ -170,10 +170,31 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
     routes = []
     for item in CLOUD_LOW_FREQUENCY_ROUTE_CATALOG:
         route = dict(item)
-        route["configured"] = bool(valid and settings.high_risk_review_enabled)
-        route["active"] = bool(
-            route["configured"] and route["id"] == "high_risk_review"
-        )
+        route_id = str(route.get("id") or "")
+        if route_id == "high_risk_review":
+            # Only the independent public reviewer depends on cloud identity.
+            # Local consultation and collector routes must not inherit its
+            # configured state in the admin matrix.
+            route["configured"] = bool(valid)
+            route["active"] = bool(valid and settings.high_risk_review_enabled)
+            route["provider"] = parsed.netloc if parsed and parsed.netloc else None
+            route["model"] = model or None
+            route["revision"] = revision or None
+        elif route_id == "deep_consultation":
+            route["configured"] = True
+            route["active"] = True
+            route["provider"] = "BB target inference"
+            route["model"] = "qwen3.8-27b"
+            route["revision"] = None
+        elif route_id == "news_event_review":
+            route["configured"] = True
+            route["active"] = True
+            route["provider"] = "collector"
+            route["model"] = None
+            route["revision"] = None
+        else:
+            route["configured"] = False
+            route["active"] = False
         routes.append(route)
     return {
         "enabled": bool(settings.high_risk_review_enabled),
