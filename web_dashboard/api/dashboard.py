@@ -8558,6 +8558,19 @@ async def _build_authoritative_profit_observability(
 async def _build_expert_memory_observability(*, mode: str | None = None) -> dict[str, Any]:
     """Expose memory authority counts without treating pending rows as evidence."""
 
+    # The Dashboard is also deployed while paper trading is intentionally
+    # stopped. Do not run the expensive outcome/memory joins in that state:
+    # they only produce repeated timeout storms and cannot add new evidence.
+    # Return an explicit deferred state so the UI and continuous observer keep
+    # the evidence gap visible without treating it as a healthy zero result.
+    if _trading_service is None:
+        return {
+            "status": "deferred",
+            "observed": False,
+            "degraded_reason": "trading_service_inactive",
+            "source": "dashboard.expert_memory_observability",
+        }
+
     try:
         from sqlalchemy import select
 
@@ -8939,6 +8952,25 @@ async def _build_model_observability_snapshot(
 
 async def _build_trade_observability_snapshot() -> dict[str, Any]:
     """Aggregate bounded trade/execution facts into one truthful read snapshot."""
+
+    # No paper-trading worker means there is no new execution lifecycle to
+    # audit. Avoid issuing four heavyweight database/exchange reads on every
+    # model-observability refresh; return a truthful deferred state instead.
+    if _trading_service is None:
+        return build_snapshot(
+            {
+                "window_hours": 24,
+                "counts_are_observed": False,
+                "observed": False,
+                "sections": {},
+                "degraded_sections": ["trading_service"],
+                "conclusion": "纸面交易服务未运行，交易事实审计等待交易服务恢复。",
+            },
+            status="deferred",
+            source="dashboard.trade_observability",
+            stale_after_seconds=120.0,
+            degraded_reason="trading_service_inactive",
+        )
 
     async def run_bounded(
         factory: Callable[[], Awaitable[Any]], name: str, timeout_seconds: float

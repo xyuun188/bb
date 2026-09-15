@@ -6,10 +6,10 @@ import httpx
 import pytest
 
 from config.settings import settings
+from services.trading_control_command_queue import TradingControlCommandQueue
 from web_dashboard.api import control
 from web_dashboard.api import dashboard as dashboard_api
 from web_dashboard.app import create_app
-from services.trading_control_command_queue import TradingControlCommandQueue
 
 
 class _QueuedCloseCommands:

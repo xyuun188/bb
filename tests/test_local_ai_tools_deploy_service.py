@@ -9,6 +9,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -836,6 +837,54 @@ def test_generated_service_status_does_not_advertise_heuristic_fallback(
     assert status["return_distribution_input_version"] == (module.RETURN_DISTRIBUTION_INPUT_VERSION)
     assert endpoint["status"] == "artifact_unavailable"
     assert "heuristic" not in endpoint["message"].lower()
+
+
+def test_generated_service_status_exposes_latest_candidate_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("local_ai_tools_api_candidate_status_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    def resolve(_path: Path, *, role: str) -> dict[str, Any] | None:
+        if role == "current":
+            return {
+                "version": "champion-v1",
+                "metadata": {
+                    "trained_at": "2026-07-27T22:56:14+00:00",
+                    "quality_report": {"data_quality_version": "quality-v5"},
+                },
+                "activation_manifest": {"activation_stage": "canary"},
+                "model_path": Path("champion.joblib"),
+                "metadata_path": Path("champion.json"),
+            }
+        if role == "challenger":
+            return {
+                "version": "challenger-v2",
+                "metadata": {
+                    "trained_at": "2026-09-15T17:46:33+00:00",
+                    "quality_report": {"data_quality_version": "quality-v6"},
+                    "promotion_recommendation": {
+                        "promotion_ready": False,
+                        "live_blocking_reasons": ["profit_factor_not_above_break_even"],
+                    },
+                },
+                "activation_manifest": {"activation_stage": "challenger"},
+                "model_path": Path("challenger.joblib"),
+                "metadata_path": Path("challenger.json"),
+            }
+        return None
+
+    monkeypatch.setattr(module, "_resolve_artifact_pointer_for_status", resolve)
+    monkeypatch.setattr(module, "_file_stat", lambda _path: {"exists": True})
+
+    status = module._model_artifact_status()
+
+    assert status["artifact_version"] == "champion-v1"
+    assert status["latest_training_artifact_version"] == "challenger-v2"
+    assert status["latest_training_data_quality_version"] == "quality-v6"
+    assert status["latest_training"]["blocking_reasons"] == [
+        "profit_factor_not_above_break_even"
+    ]
 
 
 def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> None:

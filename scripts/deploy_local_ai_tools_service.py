@@ -2668,6 +2668,8 @@ def _model_artifact_status() -> dict[str, Any]:
                 "error": safe_error(exc),
             }
     current = resolved_rows["current"]
+    candidate = resolved_rows.get("candidate")
+    challenger = resolved_rows.get("challenger")
     raw_metadata = current["metadata"] if current else {}
     metadata = {
         key: summarized
@@ -2686,6 +2688,42 @@ def _model_artifact_status() -> dict[str, Any]:
     activation_status = activation_status if isinstance(activation_status, dict) else {}
     model_bundle_available = current is not None and bool(raw_metadata)
     activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
+    def candidate_summary(resolved: dict[str, Any] | None) -> dict[str, Any]:
+        metadata = resolved.get("metadata") if isinstance(resolved, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        quality = metadata.get("quality_report")
+        quality = quality if isinstance(quality, dict) else {}
+        recommendation = metadata.get("promotion_recommendation")
+        recommendation = recommendation if isinstance(recommendation, dict) else {}
+        return {
+            "available": resolved is not None,
+            "version": resolved.get("version") if resolved else None,
+            "trained_at": metadata.get("trained_at") if resolved else None,
+            "data_quality_version": (
+                quality.get("data_quality_version")
+                or metadata.get("data_quality_version")
+                if resolved
+                else None
+            ),
+            "artifact_lifecycle": (
+                (resolved.get("activation_manifest") or {}).get("activation_stage")
+                if resolved
+                else None
+            ),
+            "promotion_ready": recommendation.get("promotion_ready") if resolved else None,
+            "blocking_reasons": (
+                recommendation.get("live_blocking_reasons")
+                or recommendation.get("blocking_reasons")
+                if resolved
+                else []
+            ),
+        }
+
+    candidate_info = candidate_summary(candidate)
+    challenger_info = candidate_summary(challenger)
+    latest_training = (
+        challenger_info if challenger_info.get("available") else candidate_info
+    )
     return {
         "available": model_bundle_available,
         "model_bundle_available": model_bundle_available,
@@ -2710,6 +2748,14 @@ def _model_artifact_status() -> dict[str, Any]:
         "status_payload_compacted": True,
         "activation_manifest": activation_status,
         "artifact_pointers": pointer_rows,
+        "candidate_artifact": candidate_info,
+        "challenger_artifact": challenger_info,
+        "latest_training": latest_training,
+        "latest_training_artifact_version": latest_training.get("version"),
+        "latest_training_at": latest_training.get("trained_at"),
+        "latest_training_data_quality_version": latest_training.get(
+            "data_quality_version"
+        ),
         **metadata,
         "artifact_lifecycle": activation_stage,
         "model_stage": activation_stage if model_bundle_available else "candidate",

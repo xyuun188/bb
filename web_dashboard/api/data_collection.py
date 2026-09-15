@@ -665,6 +665,35 @@ async def _local_ai_training_status() -> dict[str, Any]:
         "model_bundle_available": bool(status.get("model_bundle_available")),
         "service_available": service_available,
         "trained_at": status.get("trained_at"),
+        "artifact_version": status.get("artifact_version"),
+        "artifact_lifecycle": status.get("artifact_lifecycle"),
+        "artifact_pointers": (
+            status.get("artifact_pointers")
+            if isinstance(status.get("artifact_pointers"), dict)
+            else {}
+        ),
+        "candidate_artifact": (
+            status.get("candidate_artifact")
+            if isinstance(status.get("candidate_artifact"), dict)
+            else {}
+        ),
+        "challenger_artifact": (
+            status.get("challenger_artifact")
+            if isinstance(status.get("challenger_artifact"), dict)
+            else {}
+        ),
+        "latest_training": (
+            status.get("latest_training")
+            if isinstance(status.get("latest_training"), dict)
+            else {}
+        ),
+        "latest_training_artifact_version": status.get(
+            "latest_training_artifact_version"
+        ),
+        "latest_training_at": status.get("latest_training_at"),
+        "latest_training_data_quality_version": status.get(
+            "latest_training_data_quality_version"
+        ),
         "training_mode": status.get("training_mode"),
         "model_stage": status.get("model_stage"),
         "promotion_flow": status.get("promotion_flow"),

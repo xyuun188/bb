@@ -269,6 +269,52 @@ async def test_data_collection_reads_local_ai_status_once_without_fixed_outer_ti
 
 
 @pytest.mark.asyncio
+async def test_data_collection_preserves_latest_candidate_training_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLocalAIToolsClient:
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "service_available": True,
+                "status": "canary",
+                "artifact_version": "champion-v1",
+                "artifact_lifecycle": "canary",
+                "latest_training": {
+                    "version": "challenger-v2",
+                    "trained_at": "2026-09-15T17:46:33+00:00",
+                    "data_quality_version": "quality-v6",
+                },
+                "latest_training_artifact_version": "challenger-v2",
+                "latest_training_at": "2026-09-15T17:46:33+00:00",
+                "latest_training_data_quality_version": "quality-v6",
+            }
+
+    monkeypatch.setattr(
+        data_collection_module._dash,
+        "_dashboard_local_ai_tools_client",
+        lambda: FakeLocalAIToolsClient(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_shadow_count",
+        AsyncMock(return_value=12),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_completed_training_trade_count",
+        AsyncMock(return_value=3),
+    )
+
+    status = await data_collection_module._local_ai_training_status()
+
+    assert status["artifact_version"] == "champion-v1"
+    assert status["latest_training_artifact_version"] == "challenger-v2"
+    assert status["latest_training_data_quality_version"] == "quality-v6"
+    assert status["latest_training"]["version"] == "challenger-v2"
+
+
+@pytest.mark.asyncio
 async def test_data_collection_training_count_timeout_keeps_last_known_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
