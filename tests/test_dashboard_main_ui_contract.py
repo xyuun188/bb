@@ -1222,6 +1222,16 @@ def test_local_ml_registry_warmup_is_bounded_and_not_rendered_as_service_failure
     assert "供应商未提供时留空" in html
 
 
+def test_training_dashboard_distinguishes_transient_model_warmup_from_failure() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/training.js").read_text(encoding="utf-8")
+
+    assert "function transientModelState(ml)" in script
+    assert "if (transientModelState(ml)) return '状态刷新中';" in script
+    assert "模型状态正在刷新，暂不判定为不可用。" in script
+    assert "snapshot.status === 'warming'" in script
+    assert "transient ? '状态刷新中'" in script
+
+
 def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     fetch_block = script[

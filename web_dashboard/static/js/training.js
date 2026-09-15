@@ -166,11 +166,22 @@
   function visibleModelState(ml) {
     const diagnostic = ml.model_load_diagnostic || {};
     const code = diagnostic.code || ml.status || 'unavailable';
+    if (transientModelState(ml)) return '状态刷新中';
     if (ml.available !== true) return localizedReason(code);
     if (ml.live_ml_ready === true) return '已生产就绪';
     if (ml.paper_trading_permission === true) return '模拟盘可用，实盘未晋升';
     if (code === 'degraded' || ml.readiness_state === 'degraded') return '模型可用，实盘证据未达标';
     return localizedReason(code);
+  }
+
+  function transientModelState(ml) {
+    const status = String(ml?.status || '').toLowerCase();
+    const diagnosticCode = String(ml?.model_load_diagnostic?.code || '').toLowerCase();
+    return [
+      'warming', 'refreshing', 'status_refreshing', 'diagnostic_warming',
+    ].includes(status) || [
+      'warming', 'refreshing', 'status_refreshing', 'diagnostic_warming',
+    ].includes(diagnosticCode);
   }
 
   function trainingData() {
@@ -418,10 +429,12 @@
     const authoritative = ml.authoritative_trade_return_evidence || {};
     const activation = ml.artifact_activation_manifest || ml.artifact_registry?.activation_manifest || {};
     const diagnostic = ml.model_load_diagnostic || {};
-    const stateTone = ml.available !== true ? 'bad' : ml.live_ml_ready === true ? 'good' : 'warn';
+    const stateTone = transientModelState(ml)
+      ? 'warn'
+      : ml.available !== true ? 'bad' : ml.live_ml_ready === true ? 'good' : 'warn';
     const blockerHtml = blockers.length
       ? `<div class="blocker-list">${blockers.map((item) => `<div><span>${esc(item.code || '阻断')}</span><strong>${esc(localizedReason(item))}</strong></div>`).join('')}</div>`
-      : `<div class="empty-line">${ml.available === true ? '当前接口没有返回晋升阻断。' : esc(localizedReason(diagnostic.code || ml.status || 'unavailable'))}</div>`;
+      : `<div class="empty-line">${transientModelState(ml) ? '模型状态正在刷新，暂不判定为不可用。' : ml.available === true ? '当前接口没有返回晋升阻断。' : esc(localizedReason(diagnostic.code || ml.status || 'unavailable'))}</div>`;
     const container = $('#model-readiness');
     container.classList.remove('empty');
     container.innerHTML = `
@@ -643,8 +656,14 @@
         if (key === 'observability') {
           const snapshot = unwrap(value);
           const sections = snapshot.sections && typeof snapshot.sections === 'object' ? snapshot.sections : {};
-          payloads.ml = sections.local_ml || {};
-          payloads.localAITools = sections.local_ai_tools || {};
+          payloads.ml = { ...(sections.local_ml || {}) };
+          payloads.localAITools = { ...(sections.local_ai_tools || {}) };
+          if (!payloads.ml.status && snapshot.status) payloads.ml.status = snapshot.status;
+          if (!payloads.localAITools.status && snapshot.status) payloads.localAITools.status = snapshot.status;
+          if (snapshot.status === 'warming') {
+            if (payloads.ml.available === undefined) payloads.ml.available = false;
+            if (payloads.localAITools.available === undefined) payloads.localAITools.available = false;
+          }
           payloads.registry = snapshot.registry || {};
           payloads.scheduler = snapshot.scheduler || {};
         }
@@ -669,7 +688,11 @@
       $('#error-text').hidden = false;
     } else {
       const ml = unwrap(payloads.ml);
-      setState(ml.available === true ? (ml.live_ml_ready === true ? '模型已就绪' : '模型学习观察中') : '模型不可用', ml.available === true ? (ml.live_ml_ready === true ? 'ok' : 'warn') : 'error');
+      const transient = transientModelState(ml);
+      setState(
+        transient ? '状态刷新中' : ml.available === true ? (ml.live_ml_ready === true ? '模型已就绪' : '模型学习观察中') : '模型不可用',
+        transient ? 'warn' : ml.available === true ? (ml.live_ml_ready === true ? 'ok' : 'warn') : 'error',
+      );
     }
     })();
     try {

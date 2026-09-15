@@ -578,6 +578,19 @@ class ModelTrainingCoordinatorMixin:
 
     async def train_local_ai_tools(self, *, force: bool = False) -> dict[str, Any]:
         state_store = self._model_training_state()
+        # Keep the scheduler observable even when its gate returns a normal
+        # cooldown/resource skip before a lease is acquired.
+        try:
+            state_store.heartbeat(
+                scheduler_id="local_ai_tools_auto_train",
+                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "local AI tools training scheduler heartbeat write failed",
+                error=safe_error_text(exc, limit=180),
+            )
         gate = getattr(state_store, "training_gate", None)
         if callable(gate):
             gate_result = gate(
@@ -628,11 +641,6 @@ class ModelTrainingCoordinatorMixin:
         self._local_tools_active_training_run_id = lease.run_id
         now = datetime.now(UTC)
         try:
-            state_store.heartbeat(
-                scheduler_id="local_ai_tools_auto_train",
-                model_ids=LOCAL_AI_TOOL_MODEL_IDS,
-                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
-            )
             state_store.record_check(
                 scheduler_id="local_ai_tools_auto_train",
                 model_ids=LOCAL_AI_TOOL_MODEL_IDS,

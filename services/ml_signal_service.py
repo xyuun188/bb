@@ -3037,6 +3037,21 @@ class MLSignalService:
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
         """Run one cross-process single-flight training check."""
 
+        # A cooldown, lease contention, or resource circuit is still a live
+        # scheduler check. Record the heartbeat before any early gate return so
+        # observability does not mistake a deliberate skip for a dead trainer.
+        try:
+            self.training_state_store.heartbeat(
+                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
+                model_ids=LOCAL_ML_MODEL_IDS,
+                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "local ML training scheduler heartbeat write failed",
+                error=safe_error_text(exc, limit=180),
+            )
+
         gate = getattr(self.training_state_store, "training_gate", None)
         if callable(gate):
             gate_result = gate(
@@ -3093,11 +3108,6 @@ class MLSignalService:
         self._active_training_run_id = lease.run_id
         now = datetime.now(UTC)
         try:
-            self.training_state_store.heartbeat(
-                scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
-                model_ids=LOCAL_ML_MODEL_IDS,
-                interval_seconds=AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
-            )
             self.training_state_store.record_check(
                 scheduler_id=LOCAL_ML_TRAINING_SCHEDULER_ID,
                 model_ids=LOCAL_ML_MODEL_IDS,
