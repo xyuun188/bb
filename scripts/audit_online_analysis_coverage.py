@@ -43,6 +43,7 @@ load_runtime_env_files(project_root=root)
 drop_privileges_to_runtime_user_if_needed(project_root=root)
 
 from sqlalchemy import func, select
+from core.trading_mode import mode_manager
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
@@ -98,6 +99,7 @@ async def run():
     since = now - timedelta(minutes=WINDOW_MINUTES)
     runtime_path = root / "data" / "trading_runtime_status.json"
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    control = mode_manager.get_state()
     async with get_read_session_ctx() as session:
         rows = (
             await session.execute(
@@ -194,8 +196,13 @@ async def run():
         "read_only": True,
         "window_minutes": WINDOW_MINUTES,
         "window_started_at": since.isoformat(),
-        "mode": runtime.get("mode"),
-        "paused": runtime.get("paused"),
+        "mode": control.get("mode"),
+        "paused": control.get("paused"),
+        "control_state": {{
+            "source": "trading_mode_manager_persisted_control",
+            "mode_changed_at": control.get("mode_changed_at"),
+            "active_model_name": control.get("active_model_name"),
+        }},
         "services": {{
             "trading": service_status("bb-paper-trading.service"),
             "dashboard": service_status("bb-dashboard.service"),

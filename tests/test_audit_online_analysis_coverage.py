@@ -199,3 +199,13 @@ def test_decode_remote_json_ignores_logs_before_report() -> None:
     )
 
     assert payload == {"mode": "paper", "paused": True}
+
+
+def test_remote_audit_reads_authoritative_control_state() -> None:
+    source = audit._remote_script(remote_app_dir="/data/bb/app", window_minutes=30)
+
+    assert "from core.trading_mode import mode_manager" in source
+    assert "control = mode_manager.get_state()" in source
+    assert '"mode": control.get("mode")' in source
+    assert '"paused": control.get("paused")' in source
+    assert '"source": "trading_mode_manager_persisted_control"' in source
