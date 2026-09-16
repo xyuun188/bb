@@ -1199,7 +1199,14 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
         }
     headers = cloud_reviewer_auth_headers(api_key)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # Use the same bounded read budget as the low-frequency runtime route.
+        # A fixed 10-second admin probe produced false negatives for otherwise
+        # valid providers while the actual reviewer correctly allowed 30s.
+        reviewer_timeout = max(
+            10.0,
+            min(float(settings.high_risk_review_timeout_seconds or 30.0), 60.0),
+        )
+        async with httpx.AsyncClient(timeout=reviewer_timeout) as client:
             models_response = await client.get(f"{api_base}/models", headers=headers)
             model_ids: set[str] = set()
             if models_response.is_success:
