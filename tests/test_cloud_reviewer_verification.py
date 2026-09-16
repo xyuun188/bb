@@ -75,3 +75,15 @@ def test_training_registry_uses_current_verified_cloud_route(monkeypatch) -> Non
     assert cloud["identity_verified"] is True
     assert cloud["runtime_available"] is True
     assert cloud["verified_at"] == "2026-09-16T00:00:00+00:00"
+
+
+def test_registry_cache_clear_removes_persisted_snapshot(monkeypatch, tmp_path) -> None:
+    snapshot = tmp_path / "registry.json"
+    snapshot.write_text('{"models":[{"model_id":"stale"}]}', encoding="utf-8")
+    monkeypatch.setattr(model_training_status, "_REGISTRY_SNAPSHOT_PATH", snapshot)
+    monkeypatch.setattr(model_training_status, "_registry_cache", (1.0, {"models": []}))
+
+    model_training_status.clear_model_training_registry_cache()
+
+    assert model_training_status._registry_cache is None
+    assert snapshot.exists() is False

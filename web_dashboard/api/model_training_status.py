@@ -41,6 +41,20 @@ _registry_refresh_error: str | None = None
 _registry_last_success_at: str | None = None
 
 
+def clear_model_training_registry_cache() -> None:
+    """Discard runtime and persisted snapshots after model-route changes."""
+
+    global _registry_cache
+    _registry_cache = None
+    try:
+        _REGISTRY_SNAPSHOT_PATH.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "model training registry snapshot invalidation failed",
+            error=safe_error_text(exc, limit=180),
+        )
+
+
 def load_model_training_report(relative_path: str) -> dict[str, Any]:
     try:
         payload = json.loads((settings.data_dir / relative_path).read_text(encoding="utf-8"))

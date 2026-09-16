@@ -157,6 +157,12 @@ def _connection_error_text(value: Any) -> str:
     return safe_error_text(value, limit=_MODEL_CONNECTION_ERROR_LIMIT)
 
 
+def _clear_model_training_registry_cache() -> None:
+    from web_dashboard.api.model_training_status import clear_model_training_registry_cache
+
+    clear_model_training_registry_cache()
+
+
 def _model_server_error(exc: Exception) -> str:
     return safe_error_text(exc, limit=500)
 
@@ -1176,6 +1182,7 @@ async def update_high_risk_review_settings(req: CloudReviewerSettingsRequest):
     env_updates = strip_secret_env_updates(updates)
     if env_updates:
         settings.update_env_file(env_updates)
+    _clear_model_training_registry_cache()
     return {"status": "ok", "message": "云端 reviewer 配置已原子保存", **_cloud_reviewer_payload()}
 
 
@@ -1295,6 +1302,7 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
             provider=urlsplit(api_base).netloc,
             identity_source=identity_source,
         )
+        _clear_model_training_registry_cache()
         return {
             "success": True,
             "status": "ready",
