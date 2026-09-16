@@ -5066,6 +5066,56 @@ def test_issue_ledger_treats_runtime_only_okx_entry_block_as_observing() -> None
     assert ledger["observing"][0]["key"] == "okx_trade_fact_integrity"
 
 
+def test_phase3_profitability_gate_is_observing_when_runtime_contracts_are_clean() -> None:
+    card = system_audit._audit_card(
+        "phase3_go_no_go",
+        "Phase 3 fee-after return gate",
+        "critical",
+        "Profitability evidence has not passed.",
+        details={
+            "status": "no_go",
+            "ready": False,
+            "blockers": [
+                {"code": "local_ml_not_live_ready"},
+                {"code": "model_profit_factor_below_unity"},
+            ],
+            "summary": {
+                "current_contract_violation_count": 0,
+                "position_economics_incomplete_count": 0,
+                "executed_dynamic_exit_contract_gap_count": 0,
+            },
+        },
+    )
+
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert ledger["summary"] == {"fixed": 0, "unresolved": 0, "observing": 1, "total": 1}
+    assert ledger["observing"][0]["key"] == "phase3_go_no_go"
+
+
+def test_phase3_gate_remains_unresolved_when_position_contract_is_incomplete() -> None:
+    card = system_audit._audit_card(
+        "phase3_go_no_go",
+        "Phase 3 fee-after return gate",
+        "critical",
+        "Runtime contract is incomplete.",
+        details={
+            "status": "no_go",
+            "ready": False,
+            "blockers": [
+                {"code": "position_economics_or_exit_contract_gap"},
+                {"code": "model_profit_factor_below_unity"},
+            ],
+            "summary": {"position_economics_incomplete_count": 1},
+        },
+    )
+
+    ledger = system_audit._issue_ledger_from_cards([card])
+
+    assert ledger["summary"]["unresolved"] == 1
+    assert ledger["unresolved"][0]["key"] == "phase3_go_no_go"
+
+
 @pytest.mark.asyncio
 async def test_position_price_integrity_reports_unmatched_okx_and_local_positions(
     monkeypatch: pytest.MonkeyPatch,

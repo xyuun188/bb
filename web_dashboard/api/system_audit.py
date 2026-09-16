@@ -5601,6 +5601,59 @@ def _strategy_closed_loop_is_historical_only(cards_by_key: dict[str, dict[str, A
     return _strategy_closed_loop_observation_only(card)
 
 
+_PHASE3_PROFITABILITY_GATE_CODES = {
+    "local_ml_not_live_ready",
+    "model_profit_factor_below_unity",
+    "model_return_lcb_not_positive",
+    "model_mean_fee_after_return_non_positive",
+}
+
+
+def _phase3_profitability_gate_observation_only(card: dict[str, Any]) -> bool:
+    """Keep a truthful no-go without presenting it as a runtime outage."""
+
+    key = str(card.get("key") or "")
+    if key not in {"phase3_go_no_go", "phase3_stage_handoff"}:
+        return False
+    details = _safe_dict(card.get("details"))
+    if key == "phase3_stage_handoff" and not (
+        details.get("audit_only") is True
+        and details.get("read_only") is True
+        and details.get("production_permission") is False
+        and details.get("starts_trading_service") is False
+        and details.get("submits_orders") is False
+        and details.get("changes_model_routing") is False
+    ):
+        return False
+
+    summary = _safe_dict(details.get("summary"))
+    if any(
+        int(summary.get(name) or 0) > 0
+        for name in (
+            "current_contract_violation_count",
+            "position_economics_incomplete_count",
+            "executed_dynamic_exit_contract_gap_count",
+            "okx_unresolved_count",
+        )
+    ):
+        return False
+
+    codes: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            code = str(value.get("code") or "").strip()
+            if code and code != "dynamic_return_gate_not_ready":
+                codes.add(code)
+            collect(value.get("evidence"))
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(details.get("blockers"))
+    return bool(codes) and codes.issubset(_PHASE3_PROFITABILITY_GATE_CODES)
+
+
 def _issue_ledger_state(
     card: dict[str, Any],
     *,
@@ -5616,6 +5669,8 @@ def _issue_ledger_state(
         return "fixed", "已修复 / 当前验证通过"
     if observation_only:
         return "observing", "历史/样本观察 / 当前未复现硬错误"
+    if _phase3_profitability_gate_observation_only(card):
+        return "observing", "实盘收益门槛未满足 / 运行链路保持可用"
     if (
         key == "trade_execution_contract"
         and status == "warning"
@@ -6922,17 +6977,26 @@ async def _collect_system_audit_status_unlocked(
     nodes = _build_audit_nodes(cards)
     findings = _root_cause_findings(cards)
     issue_ledger = _issue_ledger_from_cards(cards)
+    unresolved_cards = _safe_list(issue_ledger.get("unresolved"))
+    observing_cards = _safe_list(issue_ledger.get("observing"))
     status = "ok"
-    if any(card.get("status") == "critical" for card in cards):
+    if any(card.get("status") == "critical" for card in unresolved_cards):
         status = "critical"
-    elif any(card.get("status") == "warning" for card in cards):
+    elif unresolved_cards or observing_cards:
         status = "warning"
+    profitability_gate_observing = any(
+        str(card.get("key") or "") in {"phase3_go_no_go", "phase3_stage_handoff"}
+        for card in observing_cards
+    )
+    status_label = {"ok": "正常", "warning": "需关注", "critical": "异常"}.get(
+        status, status
+    )
+    if status == "warning" and not unresolved_cards and profitability_gate_observing:
+        status_label = "运行正常，实盘收益门槛未满足"
     payload = sanitize_payload(
         {
             "status": status,
-            "status_label": {"ok": "正常", "warning": "需关注", "critical": "异常"}.get(
-                status, status
-            ),
+            "status_label": status_label,
             "checked_at": _now().isoformat(),
             "windows": AUDIT_WINDOWS,
             "summary": {

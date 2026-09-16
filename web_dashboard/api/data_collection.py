@@ -33,6 +33,7 @@ from models.learning import ShadowBacktest
 from models.market_data import Kline, Ticker
 from models.news import NewsArticle, SocialPost
 from services.crypto_feature_coverage import CryptoFeatureCoverageService
+from services.external_event_service import ExternalEventService
 from services.ml_signal_service import (
     AUTO_TRAIN_LEASE_STALE_SECONDS,
     AUTO_TRAIN_RETRY_INTERVAL_SECONDS,
@@ -69,6 +70,26 @@ STATUS_SNAPSHOT_FILE_PREFIX = "data_collection_status_latest"
 EXPECTED_KLINE_TIMEFRAMES = ("1m", "5m", "15m", "1h")
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _status_cache: dict[bool, tuple[datetime, dict[str, Any]]] = {}
+_external_event_service: ExternalEventService | None = None
+
+
+def _external_event_runtime_service() -> ExternalEventService:
+    global _external_event_service
+    if _external_event_service is None:
+        _external_event_service = ExternalEventService()
+    return _external_event_service
+
+
+async def start_external_event_collector() -> None:
+    """Run optional web-event collection outside the trading process."""
+
+    await _external_event_runtime_service().start_controller()
+
+
+async def stop_external_event_collector() -> None:
+    service = _external_event_service
+    if service is not None:
+        await service.stop()
 _status_refresh_tasks: dict[bool, asyncio.Task[Any]] = {}
 _status_refresh_locks: dict[bool, asyncio.Lock] = {}
 
@@ -1776,21 +1797,23 @@ async def refresh_training_governance(
 
 
 async def _sync_runtime_external_event_service(enabled: bool) -> dict[str, Any]:
-    data_service = getattr(_dash, "_data_service", None)
-    service = getattr(data_service, "external_event_service", None) if data_service else None
-    if service is None:
-        return {
-            "attached": False,
-            "message": "配置已保存；交易主循环会在数秒内自动热加载采集配置。",
-        }
+    service = _external_event_runtime_service()
     reload_runtime_settings = getattr(service, "reload_runtime_settings", None)
     if callable(reload_runtime_settings):
         await reload_runtime_settings()
     if enabled:
         await service.start()
-        return {"attached": True, "message": "已热加载并启动当前进程的数据采集后台任务。"}
+        return {
+            "attached": True,
+            "owner": "dashboard_isolated_collector",
+            "message": "已热加载并启动独立数据采集后台任务。",
+        }
     await service.stop()
-    return {"attached": True, "message": "已热加载并停止当前进程的数据采集后台任务。"}
+    return {
+        "attached": True,
+        "owner": "dashboard_isolated_collector",
+        "message": "已热加载并停止独立数据采集后台任务。",
+    }
 
 
 @router.post("/data-collection/settings")

@@ -280,6 +280,7 @@ class ExpertMemoryService:
                 since=load_training_epoch_start(),
                 limit=AUTHORITATIVE_BACKFILL_LIMIT,
                 compact=True,
+                include_decision_evidence=True,
             )
             complete_outcomes = [
                 outcome

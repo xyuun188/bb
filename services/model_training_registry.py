@@ -602,6 +602,8 @@ def _specialist_rows(
                 "task": task,
                 "trainable": False,
                 "training_mode": "inference_only",
+                "training_applicable": False,
+                "sample_semantics": "inference_observations",
                 "evaluation_mode": evaluation_mode,
                 "fine_tune_available": False,
                 "project_adapter_available": False,
@@ -776,6 +778,8 @@ def _llm_rows(
         "model_family": str(carrier_slot.get("base_model_carrier") or "Qwen3.8-27B target carrier"),
         "task": "quant_expert_reasoning",
         "trainable": True,
+        "training_applicable": True,
+        "sample_semantics": "specialization_training_samples",
         "training_owner": "bb_finquant_qlora_pipeline",
         "runtime_role": "decision_and_expert_carrier",
         "execution_plane": "local",
@@ -830,6 +834,8 @@ def _llm_rows(
                 **row,
                 **evaluation,
                 "trainable": False,
+                "training_applicable": False,
+                "sample_semantics": "fee_after_evaluation_samples",
                 "training_owner": None,
                 "runtime_role": row["task"],
                 "execution_plane": "cloud",
@@ -866,7 +872,9 @@ def _attach_scheduler_timestamps(
         state = _safe_dict(model_states.get(str(row.get("model_id") or "")))
         scheduler_id = str(state.get("scheduler_heartbeat_id") or state.get("scheduler_id") or "")
         scheduler = _safe_dict(schedulers.get(scheduler_id))
-        row["last_successful_training_at"] = state.get("last_successful_training_at")
+        row["last_successful_training_at"] = state.get(
+            "last_successful_training_at"
+        ) or (row.get("trained_at") if row.get("trainable") else None)
         row["last_training_attempt_at"] = (
             state.get("last_started_at")
             or state.get("last_check_at")

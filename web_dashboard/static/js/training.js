@@ -495,9 +495,17 @@
 
   function modelSampleText(model) {
     const samples = number(model.sample_count);
+    if (model.sample_semantics === 'inference_observations') {
+      return samples > 0 ? `${fmt(samples)} 次推理观察` : '不适用（预训练推理模型）';
+    }
+    if (model.sample_semantics === 'fee_after_evaluation_samples') {
+      return samples > 0 ? `${fmt(samples)} 条费后评估样本` : '0 条费后评估样本';
+    }
     if (samples === null) return '未提供';
     if (samples === 0 && model.artifact_available !== true) return '未训练或未评估';
-    return fmt(samples);
+    return model.sample_semantics === 'specialization_training_samples'
+      ? `${fmt(samples)} 条专项训练样本`
+      : fmt(samples);
   }
 
   function renderModels() {

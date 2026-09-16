@@ -11658,6 +11658,21 @@ function renderTrainableModels() {
         local: '本地服务器',
         cloud: '云端模型',
     };
+    const modelSampleLabel = (model) => {
+        const count = mlOptionalNumber(model.sample_count);
+        if (model.sample_semantics === 'inference_observations') {
+            return Number(count || 0) > 0
+                ? `${mlSampleCountLabel(count)} 次推理观察`
+                : '不适用（预训练推理模型）';
+        }
+        if (model.sample_semantics === 'fee_after_evaluation_samples') {
+            return `${mlSampleCountLabel(count)} 条费后评估样本`;
+        }
+        const suffix = model.sample_semantics === 'specialization_training_samples'
+            ? '条专项训练样本'
+            : '条可追溯样本';
+        return `${mlSampleCountLabel(count)} ${suffix}`;
+    };
     const models = registryModels.map(model => ({
         title: model.display_name || model.model_id || '-',
         type: model.model_family || '-',
@@ -11666,7 +11681,7 @@ function renderTrainableModels() {
                 ? '运行可用，FinQuant/盈利证据未达标'
                 : lifecycleLabels[model.lifecycle] || model.lifecycle || '未知',
         description: `${executionPlaneLabels[model.execution_plane] || '运行位置未说明'}；任务：${model.task || '-'}；运行角色：${model.runtime_role || '-'}`,
-        samples: `${mlSampleCountLabel(mlOptionalNumber(model.sample_count))} 条可追溯样本`,
+        samples: modelSampleLabel(model),
         trainedAt: model.last_successful_training_at
             ? toBeijingTime(model.last_successful_training_at)
             : '-',

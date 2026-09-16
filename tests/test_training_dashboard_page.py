@@ -22,6 +22,8 @@ def test_training_page_is_independent_from_main_dashboard() -> None:
     assert "training.governance" in script
     assert "model.display_name" in script
     assert "model.blocking_reasons" in script
+    assert "inference_observations" in script
+    assert "fee_after_evaluation_samples" in script
     assert "本地 ML 费后收益质量" in script
     assert "online_reviewer_cloud" in script
     assert "云端高风险复核" in script

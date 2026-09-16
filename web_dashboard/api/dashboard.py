@@ -13162,6 +13162,7 @@ async def get_expert_memories(
     outcomes = await load_authoritative_trade_outcomes(
         mode=selected_mode if selected_mode in {"paper", "live"} else None,
         compact=True,
+        include_decision_evidence=True,
     )
     outcome_by_position_id = {
         int(position_id): outcome
@@ -13262,7 +13263,8 @@ async def get_expert_memories(
             }
         )
     complete_outcome_count = sum(
-        item.get("outcome_complete") is True and item.get("trade_fact_trusted") is True
+        item.get("outcome_complete") is True
+        and item.get("settlement_fact_trusted") is True
         for item in outcomes
     )
     shadow_sample_count = sum(len(item.get("counterfactual_evidence") or []) for item in outcomes)

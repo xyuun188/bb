@@ -164,9 +164,28 @@ async def lifespan(app: FastAPI):
         else None
     )
     observation_task = asyncio.create_task(_continuous_observation_loop())
+    from web_dashboard.api.data_collection import (
+        start_external_event_collector,
+        stop_external_event_collector,
+    )
+
+    try:
+        await start_external_event_collector()
+    except Exception as exc:
+        logger.warning(
+            "isolated external event collector startup failed",
+            error=safe_error_text(exc, limit=240),
+        )
     try:
         yield
     finally:
+        try:
+            await stop_external_event_collector()
+        except Exception as exc:
+            logger.warning(
+                "isolated external event collector shutdown failed",
+                error=safe_error_text(exc, limit=240),
+            )
         if audit_task:
             audit_task.cancel()
             try:
