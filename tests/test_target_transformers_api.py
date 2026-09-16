@@ -161,7 +161,7 @@ def test_busy_generation_waits_on_single_worker_lock_instead_of_immediate_503() 
     instance = object.__new__(Runtime)
     instance.model_id = "qwen3.8-27b"
     instance.warmup_complete = True
-    instance.max_queue_wait_seconds = 3.0
+    instance.max_queue_wait_seconds = 6.0
     instance.generation_timeout_seconds = 18.0
     instance.lock = _ImmediateLock()
     instance.cache_key = lambda _request: "cache-key"
@@ -184,7 +184,7 @@ def test_busy_generation_waits_on_single_worker_lock_instead_of_immediate_503() 
     )
 
     assert response.status_code == 200
-    assert instance.lock.acquire_timeouts == [3.0]
+    assert instance.lock.acquire_timeouts == [6.0]
     assert instance.lock.released is True
 
 

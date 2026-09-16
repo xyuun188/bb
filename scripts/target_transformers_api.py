@@ -177,7 +177,7 @@ class Runtime:
         # A timed-out generation is isolated from the HTTP request; the process
         # is not killed and restarted for one slow prompt.
         self.max_queue_wait_seconds = _env_float(
-            "BB_TARGET_QUEUE_WAIT_SECONDS", 3.0, minimum=0.5, maximum=30.0
+            "BB_TARGET_QUEUE_WAIT_SECONDS", 6.0, minimum=0.5, maximum=30.0
         )
         self.generation_timeout_seconds = _env_float(
             "BB_TARGET_GENERATION_TIMEOUT_SECONDS", 18.0, minimum=8.0, maximum=120.0
