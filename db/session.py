@@ -41,18 +41,27 @@ async def _close_session_uncancelled(session: AsyncSession) -> None:
         # only models execute/rollback.  There is no underlying connection to
         # close in that case.
         return
-    close_task = asyncio.create_task(close())
+    current = asyncio.current_task()
+    cancellation_count = int(current.cancelling()) if current is not None else 0
+    if current is not None and cancellation_count:
+        # A task cancelled while leaving an async context can immediately
+        # re-raise CancelledError at every following await.  Temporarily clear
+        # the count so the database driver's close handshake can finish.
+        uncancel = getattr(current, "uncancel", None)
+        if callable(uncancel):
+            for _ in range(cancellation_count):
+                uncancel()
     try:
-        await asyncio.shield(close_task)
-    except asyncio.CancelledError:
-        # ``shield`` protects the child task but propagates cancellation to the
-        # caller immediately.  Drain the child before re-raising so aiosqlite
-        # never reaches loop teardown with a live connection.
-        try:
-            await close_task
-        except Exception as exc:
-            logger.debug("async session close failed during cancellation", error=type(exc).__name__)
-        raise
+        await close()
+    except Exception as exc:
+        logger.debug("async session close failed", error=type(exc).__name__)
+    finally:
+        if current is not None and cancellation_count:
+            # Preserve the caller's cancellation semantics after the resource
+            # has been released.  The next await/return observes CancelledError
+            # as it would have without this cleanup guard.
+            for _ in range(cancellation_count):
+                current.cancel()
 
 
 async def get_engine():

@@ -52,6 +52,16 @@ def isolate_model_training_scheduler_state(tmp_path, monkeypatch):
     data_collection = sys.modules.get("web_dashboard.api.data_collection")
     if data_collection is not None:
         monkeypatch.setattr(data_collection, "MODEL_TRAINING_STATE_STORE", store)
+    model_training_status = sys.modules.get("web_dashboard.api.model_training_status")
+    if model_training_status is not None:
+        # Never let a persisted production registry snapshot change the cold
+        # start branch of a unit test.  Tests that exercise persistence replace
+        # this path explicitly with their own temporary file.
+        monkeypatch.setattr(
+            model_training_status,
+            "_REGISTRY_SNAPSHOT_PATH",
+            tmp_path / "model_training_registry_snapshot.json",
+        )
 
 
 @pytest.fixture(autouse=True)

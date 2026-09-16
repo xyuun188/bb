@@ -32,6 +32,7 @@ _REGISTRY_CACHE_TTL_SECONDS = 300.0
 _CONTRIBUTION_TIMEOUT_SECONDS = 4.0
 _FAST_LOCAL_STATUS_TIMEOUT_SECONDS = 9.0
 _FAST_OBSERVABILITY_TIMEOUT_SECONDS = 1.5
+_REGISTRY_SHUTDOWN_GRACE_SECONDS = 5.0
 _REGISTRY_SNAPSHOT_PATH = Path(settings.data_dir) / "model_training_registry_snapshot.json"
 _registry_cache: tuple[float, dict[str, Any]] | None = None
 _registry_refresh_task: asyncio.Task[Any] | None = None
@@ -353,9 +354,19 @@ async def shutdown_model_training_status_tasks() -> None:
     task = _registry_refresh_task
     _registry_refresh_task = None
     if task is not None and not task.done():
-        task.cancel()
+        # Let an in-flight read finish its connection handshake first.  A hard
+        # cancellation during aiosqlite connect can create an orphaned driver
+        # object after AsyncSession.close() has already run.
         try:
-            await task
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_REGISTRY_SHUTDOWN_GRACE_SECONDS
+            )
+        except TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         except asyncio.CancelledError:
             pass
 
