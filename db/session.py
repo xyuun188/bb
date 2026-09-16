@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from config.settings import settings
 from core.runtime_data_retention_contract import (
@@ -30,6 +32,29 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 logger = structlog.get_logger(__name__)
 
 
+async def _close_session_uncancelled(session: AsyncSession) -> None:
+    """Finish an AsyncSession close even when the owning task is cancelled."""
+
+    close = getattr(session, "close", None)
+    if not callable(close):
+        # A few unit tests intentionally use a minimal session double that
+        # only models execute/rollback.  There is no underlying connection to
+        # close in that case.
+        return
+    close_task = asyncio.create_task(close())
+    try:
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        # ``shield`` protects the child task but propagates cancellation to the
+        # caller immediately.  Drain the child before re-raising so aiosqlite
+        # never reaches loop teardown with a live connection.
+        try:
+            await close_task
+        except Exception as exc:
+            logger.debug("async session close failed during cancellation", error=type(exc).__name__)
+        raise
+
+
 async def get_engine():
     global _engine
     if _engine is None:
@@ -37,6 +62,12 @@ async def get_engine():
         engine_kwargs: dict[str, Any] = {"echo": False}
         if is_sqlite:
             engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30.0}
+            # SQLite is used by tests and one-shot maintenance jobs.  A pooled
+            # aiosqlite connection can outlive the event loop by a callback turn
+            # and emit a ResourceWarning during teardown.  NullPool closes each
+            # connection with its owning session, which is the lifecycle these
+            # short-lived processes actually need.
+            engine_kwargs["poolclass"] = NullPool
         else:
             # Market, position, training, and reconciliation work concurrently.
             # The old implicit 5+10 pool could queue a simple open-position read
@@ -88,6 +119,12 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         except BaseException:
             await session.rollback()
             raise
+        finally:
+            # Cancellation can interrupt AsyncSession.__aexit__ before the
+            # aiosqlite connection has been returned.  Shield the final close
+            # so short-lived workers cannot leak a connection into loop
+            # teardown.
+            await _close_session_uncancelled(session)
 
 
 @asynccontextmanager
@@ -100,6 +137,8 @@ async def get_session_ctx() -> AsyncGenerator[AsyncSession, None]:
         except BaseException:
             await session.rollback()
             raise
+        finally:
+            await _close_session_uncancelled(session)
 
 
 @asynccontextmanager
@@ -182,6 +221,8 @@ async def get_read_session_ctx(
                     "database session rollback skipped",
                     error=type(exc).__name__,
                 )
+            finally:
+                await _close_session_uncancelled(session)
 
 
 async def init_db(*, migrate_schema: bool = True) -> None:
@@ -1767,7 +1808,15 @@ async def _postgres_index_names(conn: Any) -> set[str]:
 async def close_db() -> None:
     """Dispose engine. Called at application shutdown."""
     global _engine, _sessionmaker
-    if _engine:
-        await _engine.dispose()
-        _engine = None
-        _sessionmaker = None
+    engine = _engine
+    _engine = None
+    _sessionmaker = None
+    if engine is None:
+        return
+    try:
+        await engine.dispose()
+    finally:
+        # Let aiosqlite worker callbacks scheduled by dispose run before the
+        # caller closes its loop.  This is intentionally a single cooperative
+        # turn rather than a sleep-based polling loop.
+        await asyncio.sleep(0)

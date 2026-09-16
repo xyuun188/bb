@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -238,15 +239,54 @@ async def _fast_local_registry_status() -> dict[str, Any]:
         get_model_observability_snapshot,
     )
 
-    local_ml, local_tools, observability = await asyncio.gather(
-        _bounded_local_status(get_ml_signal_status, name="local_ml"),
-        _bounded_local_status(get_local_ai_tools_status, name="local_ai_tools"),
-        _bounded_local_status(
-            lambda: get_model_observability_snapshot(request=object()),
-            name="model_observability",
-            timeout_seconds=_FAST_OBSERVABILITY_TIMEOUT_SECONDS,
-        ),
+    # The observability endpoint already owns the local-model readers and their
+    # single-flight/cache lifecycle.  Calling both readers again here made a
+    # cold dashboard request fan out into duplicate probes and could turn a
+    # temporary timeout into a misleading "unavailable" card.  Reuse the
+    # sections returned by that endpoint and only probe a section that is truly
+    # absent or still represented by a generic warming/error placeholder.
+    observability = await _bounded_local_status(
+        lambda: get_model_observability_snapshot(request=object()),
+        name="model_observability",
+        timeout_seconds=_FAST_OBSERVABILITY_TIMEOUT_SECONDS,
     )
+    raw_sections = observability.get("sections") if isinstance(observability, dict) else {}
+    sections = dict(raw_sections) if isinstance(raw_sections, dict) else {}
+
+    def _usable_section(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        status = str(value.get("status") or "").strip().lower()
+        return status not in {"", "warming", "status_timeout", "timeout", "status_error", "error"}
+
+    local_ml = sections.get("local_ml") if _usable_section(sections.get("local_ml")) else None
+    local_tools = (
+        sections.get("local_ai_tools")
+        if _usable_section(sections.get("local_ai_tools"))
+        else None
+    )
+    fallback_tasks: list[Awaitable[dict[str, Any]]] = []
+    fallback_names: list[str] = []
+    if local_ml is None:
+        fallback_names.append("local_ml")
+        fallback_tasks.append(_bounded_local_status(get_ml_signal_status, name="local_ml"))
+    if local_tools is None:
+        fallback_names.append("local_ai_tools")
+        fallback_tasks.append(
+            _bounded_local_status(get_local_ai_tools_status, name="local_ai_tools")
+        )
+    if fallback_tasks:
+        fallback_values = await asyncio.gather(*fallback_tasks)
+        for name, value in zip(fallback_names, fallback_values, strict=True):
+            if name == "local_ml":
+                local_ml = value
+            else:
+                local_tools = value
+    local_ml = local_ml or {"status": "status_error", "degraded_reason": "local_ml_missing"}
+    local_tools = local_tools or {
+        "status": "status_error",
+        "degraded_reason": "local_ai_tools_missing",
+    }
     sections = observability.get("sections") if isinstance(observability, dict) else {}
     sections = dict(sections) if isinstance(sections, dict) else {}
     sections.update({"local_ml": local_ml, "local_ai_tools": local_tools})
@@ -312,10 +352,24 @@ async def shutdown_model_training_status_tasks() -> None:
     global _registry_refresh_task
     task = _registry_refresh_task
     _registry_refresh_task = None
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # A registry refresh owns the complete model-observability build, which in
+    # turn may have spawned section refresh tasks that touch the async DB.  A
+    # caller shutting down only this module must drain that child task tree too;
+    # otherwise aiosqlite can be finalized after the event loop is closed.
+    from web_dashboard.api.dashboard import shutdown_dashboard_observability_tasks
+
+    await shutdown_dashboard_observability_tasks()
+    # Registry/observability refreshes may have opened read-only SQLite
+    # sessions before cancellation reached their callers.  Dispose the shared
+    # engine here as part of module shutdown so worker connections are closed
+    # before the event loop is torn down.
+    from db.session import close_db
+
+    await close_db()

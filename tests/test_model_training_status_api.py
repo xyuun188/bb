@@ -138,6 +138,47 @@ async def test_cold_registry_bounds_slow_observability_without_hiding_local_stat
 
 
 @pytest.mark.asyncio
+async def test_fast_registry_reuses_observability_local_sections_without_duplicate_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"local_ml": 0, "local_tools": 0}
+
+    async def local_ml() -> dict[str, Any]:
+        calls["local_ml"] += 1
+        return {"available": True, "status": "trained"}
+
+    async def local_tools() -> dict[str, Any]:
+        calls["local_tools"] += 1
+        return {"available": True, "service_available": True, "status": "canary"}
+
+    async def cached_observability(request: object = None) -> dict[str, Any]:
+        del request
+        return {
+            "status": "ready",
+            "sections": {
+                "local_ml": {"available": True, "status": "trained"},
+                "local_ai_tools": {
+                    "available": True,
+                    "service_available": True,
+                    "status": "canary",
+                },
+            },
+        }
+
+    monkeypatch.setattr(model_training_status, "_registry_cache", None)
+    monkeypatch.setattr(model_training_status, "_registry_refresh_task", None)
+    monkeypatch.setattr(dashboard, "get_ml_signal_status", local_ml)
+    monkeypatch.setattr(dashboard, "get_local_ai_tools_status", local_tools)
+    monkeypatch.setattr(dashboard, "get_model_observability_snapshot", cached_observability)
+
+    payload = await model_training_status._fast_local_registry_status()
+
+    assert payload["model_observability"]["status"] == "ready"
+    assert payload["models"]
+    assert calls == {"local_ml": 0, "local_tools": 0}
+
+
+@pytest.mark.asyncio
 async def test_stale_registry_keeps_last_known_good_during_background_refresh(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

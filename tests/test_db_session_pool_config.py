@@ -70,6 +70,7 @@ async def test_sqlite_engine_keeps_sqlite_specific_connection_options(
     assert captured["kwargs"] == {
         "echo": False,
         "connect_args": {"check_same_thread": False, "timeout": 30.0},
+        "poolclass": session_module.NullPool,
     }
 
 
