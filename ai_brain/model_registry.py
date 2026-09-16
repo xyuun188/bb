@@ -107,10 +107,30 @@ def _is_batch_format_failure(exc: BaseException, error_text: str) -> bool:
     )
 
 
+def _is_transient_batch_transport_failure(exc: BaseException, error_text: str) -> bool:
+    class_name = exc.__class__.__name__.lower()
+    lowered = str(error_text or "").lower()
+    markers = (
+        "connection error",
+        "connection refused",
+        "connecterror",
+        "apiconnectionerror",
+        "target model is warming up",
+        "previous generation is still draining",
+        "single model queue wait exceeded",
+    )
+    return any(marker in class_name or marker in lowered for marker in markers)
+
+
 def _batch_failure_breaker_seconds(exc: BaseException, error_text: str) -> float:
     configured = max(float(settings.ai_batch_expert_circuit_breaker_seconds or 0.0), 0.0)
     if _is_timeout_error(exc):
         return max(configured, 1.0)
+    if _is_transient_batch_transport_failure(exc, error_text):
+        return max(
+            float(settings.ai_batch_expert_transient_circuit_breaker_seconds or 0.0),
+            0.0,
+        )
     if _is_batch_format_failure(exc, error_text):
         format_configured = max(
             float(settings.ai_batch_expert_format_failure_circuit_breaker_seconds or 0.0),

@@ -315,6 +315,7 @@ class Settings(BaseSettings):
     ai_target_qwen_timeout_seconds: float = 12.0
     ai_target_qwen_queue_wait_seconds: float = 2.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
+    ai_batch_expert_transient_circuit_breaker_seconds: float = 3.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0
     strategy_learning_llm_candidates_enabled: bool = True
     strategy_learning_llm_candidate_interval_seconds: int = 21600

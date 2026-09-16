@@ -11,12 +11,27 @@ from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.llm_agent import (
     LLMAgent,
 )
-from ai_brain.model_registry import ModelRegistry
+from ai_brain.model_registry import ModelRegistry, _batch_failure_breaker_seconds
 from ai_brain.prompts import build_batch_experts_user_prompt
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
+
+
+def test_transient_transport_failure_does_not_inherit_long_generic_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_expert_circuit_breaker_seconds", 60.0)
+    monkeypatch.setattr(
+        settings,
+        "ai_batch_expert_transient_circuit_breaker_seconds",
+        3.0,
+    )
+
+    error = RuntimeError("Connection error.")
+
+    assert _batch_failure_breaker_seconds(error, str(error)) == 3.0
 
 
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
