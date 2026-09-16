@@ -20,6 +20,19 @@ class _FakeTimer:
         self.started = True
 
 
+class _ImmediateLock:
+    def __init__(self):
+        self.acquire_timeouts = []
+        self.released = False
+
+    def acquire(self, *, timeout):
+        self.acquire_timeouts.append(timeout)
+        return True
+
+    def release(self):
+        self.released = True
+
+
 class _FakeInputIds:
     shape = (1, 4)
 
@@ -142,6 +155,37 @@ def test_generation_timeout_schedules_one_systemd_recovery_restart(monkeypatch) 
     assert _FakeTimer.instances[0].interval == 0.75
     assert _FakeTimer.instances[0].daemon is True
     assert _FakeTimer.instances[0].started is True
+
+
+def test_busy_generation_waits_on_single_worker_lock_instead_of_immediate_503() -> None:
+    instance = object.__new__(Runtime)
+    instance.model_id = "qwen3.8-27b"
+    instance.warmup_complete = True
+    instance.max_queue_wait_seconds = 3.0
+    instance.generation_timeout_seconds = 18.0
+    instance.lock = _ImmediateLock()
+    instance.cache_key = lambda _request: "cache-key"
+    instance.get_cached_response = lambda _key: None
+    instance.generation_busy = lambda: True
+    instance._generate_with_timeout = lambda _request, _timeout: '{"a":["h"]}'
+    instance.cache_response = lambda _key, _content: None
+    instance._last_prompt_tokens = 10
+    instance._last_generation_tokens = 6
+
+    route = next(
+        route for route in build_app(instance).routes if route.path == "/v1/chat/completions"
+    )
+    response = route.endpoint(
+        ChatRequest(
+            model="qwen3.8-27b",
+            messages=[{"role": "user", "content": "Return compact JSON."}],
+        ),
+        None,
+    )
+
+    assert response.status_code == 200
+    assert instance.lock.acquire_timeouts == [3.0]
+    assert instance.lock.released is True
 
 
 def test_health_ready_rejects_traffic_until_warmup_completes() -> None:

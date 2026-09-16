@@ -523,15 +523,6 @@ def build_app(runtime: Runtime) -> FastAPI:
                     "bb_cache": "hit",
                 }
             )
-        if runtime.generation_busy():
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "previous generation is still draining",
-                    "retry_after_seconds": 2,
-                },
-                headers={"Retry-After": "2"},
-            )
         if not runtime.lock.acquire(timeout=runtime.max_queue_wait_seconds):
             raise HTTPException(
                 status_code=503,
