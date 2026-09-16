@@ -74,6 +74,7 @@ _HEAVY_API_PATH_MARKERS = (
     "/profit-attribution",
     "/model-contribution/",
     "/model-training/registry",
+    "/settings/high-risk-review/test",
     "/training-effectiveness/",
     "/expert-memories",
     "/shadow-backtests",
@@ -241,6 +242,12 @@ def _dashboard_api_pool(path: str) -> str:
 
 
 def _dashboard_api_timeout(path: str) -> float:
+    if str(path or "").lower().endswith("/settings/high-risk-review/test"):
+        reviewer_timeout = max(
+            10.0,
+            min(float(settings.high_risk_review_timeout_seconds or 30.0), 60.0),
+        )
+        return reviewer_timeout + 5.0
     return DASHBOARD_API_TIMEOUT_SECONDS[_dashboard_api_pool(path)]
 
 

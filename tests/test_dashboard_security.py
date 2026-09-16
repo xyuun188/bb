@@ -76,6 +76,19 @@ async def test_api_timeout_returns_diagnostic_and_releases_slot(
     assert app.state.dashboard_api_inflight == 0
 
 
+def test_cloud_reviewer_probe_uses_external_provider_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "high_risk_review_timeout_seconds", 30.0)
+
+    assert dashboard_app_module._dashboard_api_pool(
+        "/api/settings/high-risk-review/test"
+    ) == "heavy"
+    assert dashboard_app_module._dashboard_api_timeout(
+        "/api/settings/high-risk-review/test"
+    ) == 35.0
+
+
 class _FakeHumanMessage:
     def __init__(self, content: str) -> None:
         self.content = content
