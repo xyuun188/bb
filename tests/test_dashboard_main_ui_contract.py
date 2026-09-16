@@ -1232,6 +1232,14 @@ def test_training_dashboard_distinguishes_transient_model_warmup_from_failure() 
     assert "transient ? '状态刷新中'" in script
 
 
+def test_training_dashboard_prefers_latest_training_quality_version() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/training.js").read_text(encoding="utf-8")
+
+    assert "最新训练数据质量版本" in script
+    assert "当前生效产物质量版本" in script
+    assert "localTools.latest_training_data_quality_version" in script
+
+
 def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     fetch_block = script[

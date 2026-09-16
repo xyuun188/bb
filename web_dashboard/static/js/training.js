@@ -372,10 +372,17 @@
     const tasks = ml.training_task_manifest || {};
     const replay = ml.replay_weight_manifest || {};
     const policy = ml.auto_train_last_result?.training_policy || {};
+    // The active champion may intentionally remain older while a challenger
+    // is evaluated.  Show the newest training contract first so operators do
+    // not mistake the champion's historical quality version for fresh data.
+    const latestQualityVersion = localTools.latest_training_data_quality_version
+      || localTools.latest_training?.data_quality_version
+      || quality.data_quality_version
+      || quality.version;
     const values = [
       ['治理状态', governance.status === 'ok' ? '治理快照正常' : localizedReason(governance.status || 'unavailable')],
-      ['质量契约版本', quality.data_quality_version || quality.version || '未提供'],
-      ['最近成功训练数据版本', localTools.latest_training_data_quality_version || localTools.latest_training?.data_quality_version || '未提供'],
+      ['最新训练数据质量版本', latestQualityVersion || '未提供'],
+      ['当前生效产物质量版本', quality.data_quality_version || quality.version || '未提供'],
       ['最近成功训练产物', localTools.latest_training_artifact_version || localTools.latest_training?.artifact_version || '未提供'],
       ['报告生成时间', time(quality.generated_at || governance.generated_at || localTools.trained_at)],
       ['数据截止时间', time(quality.data_cutoff_at || quality.latest_sample_at || governance.data_cutoff_at || ml.trained_at)],
