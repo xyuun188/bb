@@ -16,6 +16,7 @@ from fastapi import APIRouter
 from config.settings import settings
 from core.safe_output import safe_error_text
 from core.trading_mode import mode_manager
+from services.cloud_reviewer_verification import load_cloud_reviewer_verification
 from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.model_contribution_performance import ModelContributionPerformanceService
 from services.model_training_registry import build_model_training_registry
@@ -60,6 +61,16 @@ def _model_server_report_with_runtime_configuration() -> dict[str, Any]:
         str(getattr(settings, "high_risk_review_model_revision", "") or ""),
         str(settings.high_risk_review_api_key or ""),
     )
+    verification = load_cloud_reviewer_verification(
+        api_base=str(settings.high_risk_review_api_base or ""),
+        model=str(settings.high_risk_review_model or ""),
+        revision=str(getattr(settings, "high_risk_review_model_revision", "") or ""),
+        api_key=str(settings.high_risk_review_api_key or ""),
+    )
+    connection_verified = bool(valid and verification.get("connection_verified"))
+    runtime_available = bool(
+        connection_verified and settings.high_risk_review_enabled
+    )
     cloud.update(
         {
             "configured": valid,
@@ -70,6 +81,12 @@ def _model_server_report_with_runtime_configuration() -> dict[str, Any]:
             )
             or None,
             "route_error": reason or None,
+            "connection_verified": connection_verified,
+            "identity_verified": connection_verified,
+            "runtime_available": runtime_available,
+            "verified_at": verification.get("verified_at"),
+            "last_test_latency_ms": verification.get("latency_ms"),
+            "identity_source": verification.get("identity_source"),
         }
     )
     report["cloud_reviewer"] = cloud

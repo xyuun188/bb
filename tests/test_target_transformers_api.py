@@ -6,6 +6,20 @@ from fastapi import HTTPException
 from scripts.target_transformers_api import ChatRequest, Runtime, build_app
 
 
+class _FakeTimer:
+    instances = []
+
+    def __init__(self, interval, callback):
+        self.interval = interval
+        self.callback = callback
+        self.daemon = False
+        self.started = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+
 class _FakeInputIds:
     shape = (1, 4)
 
@@ -111,6 +125,23 @@ def test_generate_caps_legacy_large_completion_request(
 
     assert instance.generate(request) == '{"status":"ok"}'
     assert instance.model.kwargs["max_new_tokens"] == 96
+
+
+def test_generation_timeout_schedules_one_systemd_recovery_restart(monkeypatch) -> None:
+    instance = object.__new__(Runtime)
+    instance._generation_state_lock = __import__("threading").Lock()
+    instance._restart_scheduled = False
+    _FakeTimer.instances = []
+    monkeypatch.setattr("scripts.target_transformers_api.threading.Timer", _FakeTimer)
+
+    instance.schedule_restart_after_generation_timeout()
+    instance.schedule_restart_after_generation_timeout()
+
+    assert instance._restart_scheduled is True
+    assert len(_FakeTimer.instances) == 1
+    assert _FakeTimer.instances[0].interval == 0.75
+    assert _FakeTimer.instances[0].daemon is True
+    assert _FakeTimer.instances[0].started is True
 
 
 def test_health_ready_rejects_traffic_until_warmup_completes() -> None:

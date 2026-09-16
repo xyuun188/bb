@@ -31,6 +31,10 @@ from core.phase3_model_contract import PHASE3_TARGET_MODEL_ID
 from core.safe_output import safe_error_text
 from core.secret_utils import is_masked_secret, mask_secret
 from core.url_safety import normalize_http_base_url
+from services.cloud_reviewer_verification import (
+    load_cloud_reviewer_verification,
+    save_cloud_reviewer_verification,
+)
 from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.high_risk_review_service import cloud_reviewer_auth_headers
 from services.model_server_config import (
@@ -168,6 +172,12 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
         settings.high_risk_review_api_key,
     )
     parsed = urlsplit(base) if base else None
+    verification = load_cloud_reviewer_verification(
+        api_base=base,
+        model=model,
+        revision=revision,
+        api_key=settings.high_risk_review_api_key,
+    )
     routes = []
     for item in CLOUD_LOW_FREQUENCY_ROUTE_CATALOG:
         route = dict(item)
@@ -209,6 +219,11 @@ def _cloud_reviewer_payload() -> dict[str, Any]:
         "route_valid": valid,
         "route_error": reason or None,
         "provider": parsed.netloc if parsed and parsed.netloc else None,
+        "connection_verified": bool(verification.get("connection_verified")),
+        "verification_status": verification.get("status"),
+        "verified_at": verification.get("verified_at"),
+        "last_test_latency_ms": verification.get("latency_ms"),
+        "identity_source": verification.get("identity_source"),
         "low_frequency_routes": routes,
     }
 
@@ -1263,6 +1278,16 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
                 "model": model,
                 "revision": revision,
             }
+        identity_source = "models_and_chat_probe" if model_ids else "chat_probe"
+        verification = save_cloud_reviewer_verification(
+            api_base=api_base,
+            model=model,
+            revision=revision,
+            api_key=api_key,
+            latency_ms=latency_ms,
+            provider=urlsplit(api_base).netloc,
+            identity_source=identity_source,
+        )
         return {
             "success": True,
             "status": "ready",
@@ -1272,7 +1297,9 @@ async def test_high_risk_review_connection(req: CloudReviewerTestRequest):
             "model": model,
             "revision": revision,
             "effective_revision": revision or "provider-managed",
-            "identity_source": "models_and_chat_probe" if model_ids else "chat_probe",
+            "identity_source": identity_source,
+            "connection_verified": True,
+            "verified_at": verification.get("verified_at"),
             "message": "云端 reviewer 连接成功，模型身份已验证",
         }
     except httpx.TimeoutException:

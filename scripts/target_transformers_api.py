@@ -177,17 +177,17 @@ class Runtime:
         # A timed-out generation is isolated from the HTTP request; the process
         # is not killed and restarted for one slow prompt.
         self.max_queue_wait_seconds = _env_float(
-            "BB_TARGET_QUEUE_WAIT_SECONDS", 2.0, minimum=0.5, maximum=30.0
+            "BB_TARGET_QUEUE_WAIT_SECONDS", 3.0, minimum=0.5, maximum=30.0
         )
         self.generation_timeout_seconds = _env_float(
-            "BB_TARGET_GENERATION_TIMEOUT_SECONDS", 12.0, minimum=8.0, maximum=120.0
+            "BB_TARGET_GENERATION_TIMEOUT_SECONDS", 18.0, minimum=8.0, maximum=120.0
         )
         # Keep the runtime contract identical to the generation boundary.
         # Older unit files may still export 128/256; accepting those values
         # makes readiness report a limit the carrier will never honor and
         # encourages callers to enqueue unnecessarily long generations.
         self.max_new_tokens = _env_int(
-            "BB_TARGET_MAX_NEW_TOKENS", 32, minimum=8, maximum=96
+            "BB_TARGET_MAX_NEW_TOKENS", 96, minimum=8, maximum=96
         )
         self.warmup_timeout_seconds = 1800.0
         self.warmup_complete = False
@@ -210,6 +210,22 @@ class Runtime:
             max_workers=1,
             thread_name_prefix="qwen-generation",
         )
+        self._restart_scheduled = False
+
+    def schedule_restart_after_generation_timeout(self) -> None:
+        """Exit after the timeout response so systemd replaces a poisoned worker."""
+
+        with self._generation_state_lock:
+            if self._restart_scheduled:
+                return
+            self._restart_scheduled = True
+
+        def terminate() -> None:
+            os._exit(70)
+
+        timer = threading.Timer(0.75, terminate)
+        timer.daemon = True
+        timer.start()
 
     def generation_busy(self) -> bool:
         with self._generation_state_lock:
@@ -532,6 +548,7 @@ def build_app(runtime: Runtime) -> FastAPI:
                     runtime.generation_timeout_seconds,
                 )
             except GenerationTimeoutError as exc:
+                runtime.schedule_restart_after_generation_timeout()
                 return JSONResponse(
                     status_code=504,
                     content={
