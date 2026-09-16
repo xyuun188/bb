@@ -3436,7 +3436,7 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert "Environment=TOKENIZERS_PARALLELISM=false" in service
     assert "EnvironmentFile=-/data/BB/env/phase3.env" in service
     assert "--host 127.0.0.1 --port 8101" in service
-    assert "KillMode=mixed" in service
+    assert "KillMode=control-group" in service
     assert "TimeoutStopSec=20" in service
     assert "bb-phase3-quant-api.service" in source
     assert "/data/trade_ai" not in source

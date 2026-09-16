@@ -70,7 +70,10 @@ def render_phase3_quant_api_service() -> str:
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
             ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 30
-            KillMode=mixed
+            # Training uses isolated multiprocessing workers.  Reap the whole
+            # service cgroup on restart so stale workers cannot keep the API
+            # port busy or leave the model in an intermittent state.
+            KillMode=control-group
             TimeoutStopSec=20
             Restart=always
             RestartSec=5
