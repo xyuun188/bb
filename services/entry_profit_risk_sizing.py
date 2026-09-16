@@ -1412,7 +1412,7 @@ class EntryProfitRiskSizingPolicy:
                 bool(leverage_contributors)
                 and "suggested_leverage" not in recommendation_fallback_fields
                 if recommendation
-                else True
+                else False
             )
         )
         model_requested_leverage = max(
@@ -1573,11 +1573,7 @@ class EntryProfitRiskSizingPolicy:
             and fill_notional_ceiling
             >= minimum_order_notional * (1.0 + fill_drift_reserve_fraction)
         )
-        target_notional = (
-            max(unconstrained_target_notional, minimum_order_notional)
-            if minimum_order_supported
-            else unconstrained_target_notional
-        )
+        target_notional = unconstrained_target_notional
         expected_net = _safe_float(
             distribution.get("raw_expected_return_pct"),
             float("nan"),

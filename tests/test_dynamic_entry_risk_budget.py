@@ -337,6 +337,11 @@ async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
     small.suggested_leverage = 2.0
     large.position_size_pct = 0.9
     large.suggested_leverage = 12.0
+    for decision in (small, large):
+        decision.raw_response["multidimensional_recommendation"] = {
+            "fallback_fields": [],
+            "contributors": {"suggested_leverage": ["risk_expert"]},
+        }
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(small, "paper", [])
@@ -361,7 +366,10 @@ async def test_normal_paper_uses_dynamic_leverage_for_positive_edge() -> None:
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is True
     assert decision.suggested_leverage > 1.0
-    assert decision.suggested_leverage <= 8.0
+    assert (
+        decision.suggested_leverage
+        <= sizing["leverage_tier_selection"]["max_leverage"]
+    )
     assert sizing["dynamic_leverage_decision"]["version"] == "dynamic_leverage_allocator_v5"
     assert sizing["dynamic_leverage_decision"]["policy_provenance"]["policy_scope"] == "paper"
 
@@ -382,6 +390,39 @@ async def test_fallback_one_x_is_not_treated_as_model_leverage_cap() -> None:
     assert sizing["model_leverage_is_explicit"] is False
     assert sizing["model_requested_leverage"] == 1.0
     assert decision.suggested_leverage > 1.0
+
+
+@pytest.mark.asyncio
+async def test_missing_leverage_recommendation_does_not_cap_dynamic_allocator() -> None:
+    decision = _decision()
+    decision.suggested_leverage = 1.0
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["model_leverage_is_explicit"] is False
+    assert sizing["model_requested_leverage"] == 1.0
+    assert decision.suggested_leverage > 1.0
+
+
+
+@pytest.mark.asyncio
+async def test_sub_minimum_bounded_target_is_not_promoted_to_exchange_minimum() -> None:
+    decision = _decision()
+    decision.position_size_pct = 1e-9
+    decision.raw_response["multidimensional_recommendation"] = {
+        "fallback_fields": ["suggested_leverage"],
+        "contributors": {"suggested_leverage": []},
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["minimum_order_supported"] is False
+    assert sizing["target_notional_usdt"] < sizing["minimum_order_notional_usdt"]
+    assert sizing["final_notional_usdt"] == 0.0
 
 
 @pytest.mark.asyncio
