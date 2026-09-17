@@ -107,6 +107,8 @@ async def run():
                     AIDecision.analysis_type,
                     AIDecision.symbol,
                     AIDecision.created_at,
+                    AIDecision.reasoning,
+                    AIDecision.raw_llm_response,
                 )
                 .where(
                     AIDecision.is_paper.is_(True),
@@ -158,15 +160,59 @@ async def run():
     )
     market_symbol_counts = Counter(str(row.symbol or "") for row in market_rows)
     symbol_times = defaultdict(list)
+    completed_symbol_times = defaultdict(list)
+    retry_symbol_times = defaultdict(list)
+    analysis_status_counts = Counter()
+    retry_within_cooldown = []
+
+    def _dict(value):
+        return value if isinstance(value, dict) else {{}}
+
+    def _analysis_status(row):
+        raw = _dict(row.raw_llm_response)
+        timeout = _dict(raw.get("market_model_timeout"))
+        quality = _dict(raw.get("analysis_quality"))
+        state = _dict(raw.get("decision_state_summary"))
+        reason = " ".join(
+            str(value or "")
+            for value in (
+                row.reasoning,
+                timeout.get("reason"),
+                quality.get("reason"),
+                state.get("final_reason"),
+            )
+        ).lower()
+        retry_later = timeout.get("retry_later") is True
+        incomplete = (
+            retry_later
+            or quality.get("analysis_complete") is False
+            or quality.get("decision_eligible") is False
+            or state.get("failed") is True
+            or "timeout" in reason
+            or "超时" in reason
+            or "connection error" in reason
+        )
+        if retry_later or "timeout" in reason or "超时" in reason:
+            return "retryable_failure"
+        if incomplete:
+            return "incomplete"
+        return "completed"
+
     for row in market_rows:
         symbol = str(row.symbol or "")
         timestamp = as_utc(row.created_at)
         if symbol and timestamp is not None:
             symbol_times[symbol].append(timestamp)
+            status = _analysis_status(row)
+            analysis_status_counts[status] += 1
+            if status == "completed":
+                completed_symbol_times[symbol].append(timestamp)
+            else:
+                retry_symbol_times[symbol].append(timestamp)
     symbol_min_gaps = {{}}
     duplicate_within_cooldown = []
     cooldown_seconds = 10 * 60
-    for symbol, timestamps in symbol_times.items():
+    for symbol, timestamps in completed_symbol_times.items():
         gaps = [
             max((current - previous).total_seconds(), 0.0)
             for previous, current in zip(timestamps, timestamps[1:])
@@ -183,6 +229,18 @@ async def run():
                 for index, gap in enumerate(gaps)
                 if gap < cooldown_seconds
             )
+    for symbol, timestamps in retry_symbol_times.items():
+        for previous, current in zip(timestamps, timestamps[1:]):
+            gap = max((current - previous).total_seconds(), 0.0)
+            if gap < cooldown_seconds:
+                retry_within_cooldown.append(
+                    {{
+                        "symbol": symbol,
+                        "started_at": previous.isoformat(),
+                        "finished_at": current.isoformat(),
+                        "gap_seconds": round(gap, 3),
+                    }}
+                )
     smallest_symbol_gaps = sorted(
         (
             {{"symbol": symbol, "min_gap_seconds": gap}}
@@ -220,10 +278,18 @@ async def run():
             "top_symbol_count": top_count,
             "top_symbol_share": round(top_count / len(market_rows), 6) if market_rows else None,
             "symbol_counts": dict(market_symbol_counts.most_common()),
+            "analysis_status_counts": dict(analysis_status_counts),
+            "incomplete_analysis_count": sum(
+                count
+                for status, count in analysis_status_counts.items()
+                if status != "completed"
+            ),
             "cooldown_seconds": cooldown_seconds,
             "symbol_min_gaps": smallest_symbol_gaps,
             "duplicate_within_cooldown_count": len(duplicate_within_cooldown),
             "duplicate_within_cooldown": duplicate_within_cooldown[:20],
+            "retry_within_cooldown_count": len(retry_within_cooldown),
+            "retry_within_cooldown": retry_within_cooldown[:20],
         }},
         "position_review": {{
             "open_position_count": open_position_count,

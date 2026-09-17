@@ -157,6 +157,14 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "实盘候选权限" in script
 
 
+def test_opening_funnel_explains_zero_entry_window_in_plain_language() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "本窗口没有形成可执行的做多或做空信号" in script
+    assert "系统未提交新开仓订单" in script
+    assert "entry_funnel_reasons" in script
+
+
 def test_dashboard_refreshes_auth_status_in_topbar() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 

@@ -11927,10 +11927,20 @@ function renderOpeningFunnelSummary(data) {
     const executed = Number(data.stages?.executed_entries || 0);
     const bottleneck = data.bottleneck_label || '暂无足够数据';
     const tone = data.bottleneck === 'healthy_selective' ? 'good' : scans ? 'warn' : 'muted';
+    const entryReasons = data.entry_funnel_reasons || {};
+    const noCandidateCount = Number(entryReasons.no_candidate || 0);
+    const serviceErrorCount = Number(entryReasons.service_error || 0);
+    const noEntryDetail = signals === 0 && scans > 0
+        ? serviceErrorCount > 0
+            ? `其中 ${serviceErrorCount} 次模型/服务异常已安全跳过，未拿异常结果下单。`
+            : noCandidateCount > 0 || Number(data.hold_count || 0) === scans
+                ? '本窗口没有形成可执行的做多或做空信号；系统未提交新开仓订单，继续等待满足方向、费后收益和风险条件的候选。'
+                : '本窗口没有形成可执行的新开仓信号；系统未提交新开仓订单。'
+        : '';
     el.innerHTML = `
         <div class="opening-funnel-verdict opening-funnel-${tone}">
             <strong>${escHtml(bottleneck)}</strong>
-            <span>扫描 ${scans} 次，可执行开仓信号 ${signals} 次，实际开仓 ${executed} 次。${observations ? `另有 ${observations} 次仅观察，不会下单。` : ''} 总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。</span>
+            <span>扫描 ${scans} 次，可执行开仓信号 ${signals} 次，实际开仓 ${executed} 次。${observations ? `另有 ${observations} 次仅观察，不会下单。` : ''} 总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。${noEntryDetail ? ` ${noEntryDetail}` : ''}</span>
         </div>
         <div class="opening-funnel-kpis">
             <div><span>可执行信号率</span><strong>${pctFmt(data.rates?.signal_rate)}</strong></div>
