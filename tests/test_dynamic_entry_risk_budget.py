@@ -140,14 +140,14 @@ def _decision() -> DecisionOutput:
     return decision
 
 
-def _quality_observation_decision(*, return_lcb_pct: float = -3.3) -> DecisionOutput:
+def _quality_observation_decision(*, return_lcb_pct: float = 0.3) -> DecisionOutput:
     decision = _decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
         {
             "paper_execution_permission": False,
-            "paper_execution_reason": "fee_after_return_lcb_not_positive",
-            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_reason": "average_fee_after_return_not_positive",
+            "paper_execution_blockers": ["average_fee_after_return_not_positive"],
             "paper_execution_evidence": {"sample_count": 0},
         }
     )
@@ -166,7 +166,7 @@ def _quality_observation_decision(*, return_lcb_pct: float = -3.3) -> DecisionOu
             "quant_quality_permissions": {"local_ml": permission},
             "paper_quality_observation_only": True,
             "paper_quality_observation_reasons": [
-                "fee_after_return_lcb_not_positive"
+                "average_fee_after_return_not_positive"
             ],
             "strong_expert_opposition": False,
         },
@@ -472,8 +472,8 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_quality_observation_forces_one_x_and_prices_negative_lcb_risk() -> None:
-    decision = _quality_observation_decision(return_lcb_pct=-3.3)
+async def test_positive_lcb_quality_observation_stays_one_x() -> None:
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
@@ -483,8 +483,7 @@ async def test_quality_observation_forces_one_x_and_prices_negative_lcb_risk() -
     assert sizing["paper_quality_observation_mode"] is True
     assert sizing["final_leverage"] == 1.0
     assert decision.suggested_leverage == 1.0
-    assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.033)
-    assert sizing["stressed_loss_fraction"] >= 0.033
+    assert sizing["negative_lcb_stress_fraction"] == 0.0
     assert sizing["risk_budget_usdt"] <= 0.3 + 1e-8
     assert sizing["risk_budget_usdt"] > 0.1
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]

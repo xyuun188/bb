@@ -10,7 +10,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
+NORMAL_PAPER_TRADE_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
+LEGACY_NORMAL_PAPER_TRADE_V8_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
 LEGACY_NORMAL_PAPER_TRADE_V7_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
 LEGACY_NORMAL_PAPER_TRADE_V6_VERSION = "2026-08-19.normal-paper-strategy-trade.v6"
 LEGACY_NORMAL_PAPER_TRADE_V5_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
@@ -376,10 +377,7 @@ def select_normal_paper_trade_side(
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
         and item["objective_net_return_pct"] is not None
-        and (
-            float(item["objective_net_return_pct"]) > 0.0
-            or item["selection_reason"] == "paper_quality_observation"
-        )
+        and float(item["objective_net_return_pct"]) > 0.0
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -457,10 +455,7 @@ def build_normal_paper_trade_contract(
         or expected_net is None
         or expected_net <= 0.0
         or objective_net is None
-        or (
-            objective_net <= 0.0
-            and selection_reason != "paper_quality_observation"
-        )
+        or objective_net <= 0.0
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
@@ -697,18 +692,22 @@ def _normal_strategy_trade_contract_reasons(
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
         reasons.append("normal_paper_trade_horizon_invalid")
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
+    graduated_observation_version = expected_version in {
+        NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
+    }
     expected_single_cap = (
         quality_observation_risk_fraction(
             expected_net_return_pct=contract.get("expected_net_return_pct"),
             objective_net_return_pct=contract.get("objective_net_return_pct"),
             loss_probability=contract.get("loss_probability"),
         )
-        if observation_mode and expected_version == NORMAL_PAPER_TRADE_VERSION
+        if observation_mode and graduated_observation_version
         else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
         if observation_mode
         else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
-    if observation_mode and expected_version == NORMAL_PAPER_TRADE_VERSION:
+    if observation_mode and graduated_observation_version:
         legacy_floor = isclose(
             single_cap,
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
@@ -743,6 +742,17 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     return _normal_strategy_trade_contract_reasons(
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+        require_quality_permission=True,
+    )
+
+
+def legacy_normal_paper_v8_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v8 envelopes for settlement and recovery only."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
@@ -961,6 +971,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V8_VERSION:
+        return legacy_normal_paper_v8_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION:
         return legacy_normal_paper_v7_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION:

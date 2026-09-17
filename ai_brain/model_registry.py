@@ -122,9 +122,19 @@ def _is_transient_batch_transport_failure(exc: BaseException, error_text: str) -
     return any(marker in class_name or marker in lowered for marker in markers)
 
 
-def _batch_failure_breaker_seconds(exc: BaseException, error_text: str) -> float:
+def _batch_failure_breaker_seconds(
+    exc: BaseException,
+    error_text: str,
+    *,
+    target_qwen: bool = False,
+) -> float:
     configured = max(float(settings.ai_batch_expert_circuit_breaker_seconds or 0.0), 0.0)
     if _is_timeout_error(exc):
+        if target_qwen:
+            return max(
+                float(settings.ai_batch_expert_transient_circuit_breaker_seconds or 0.0),
+                1.0,
+            )
         return max(configured, 1.0)
     if _is_transient_batch_transport_failure(exc, error_text):
         return max(
@@ -749,7 +759,11 @@ class ModelRegistry:
         except Exception as exc:
             duration = round(time.perf_counter() - perf_started, 3)
             error_text = safe_error_text(exc, limit=240)
-            breaker_seconds = _batch_failure_breaker_seconds(exc, error_text)
+            breaker_seconds = _batch_failure_breaker_seconds(
+                exc,
+                error_text,
+                target_qwen=_is_target_qwen_provider(batch_model),
+            )
             self._batch_expert_last_error_by_provider[provider_key] = error_text
             if breaker_seconds > 0:
                 self._batch_expert_disabled_until_by_provider[provider_key] = (

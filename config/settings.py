@@ -312,7 +312,7 @@ class Settings(BaseSettings):
     # their own longer low-frequency budget without allowing the single A100
     # hot path to regress to a 35-second request.
     ai_target_qwen_max_completion_tokens: int = 96
-    ai_target_qwen_timeout_seconds: float = 12.0
+    ai_target_qwen_timeout_seconds: float = 18.0
     ai_target_qwen_queue_wait_seconds: float = 2.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_transient_circuit_breaker_seconds: float = 3.0

@@ -34,6 +34,25 @@ def test_transient_transport_failure_does_not_inherit_long_generic_breaker(
     assert _batch_failure_breaker_seconds(error, str(error)) == 3.0
 
 
+def test_target_qwen_timeout_uses_short_recovery_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_expert_circuit_breaker_seconds", 60.0)
+    monkeypatch.setattr(
+        settings,
+        "ai_batch_expert_transient_circuit_breaker_seconds",
+        3.0,
+    )
+
+    error = TimeoutError("target batch timed out")
+
+    assert (
+        _batch_failure_breaker_seconds(error, str(error), target_qwen=True)
+        == 3.0
+    )
+    assert _batch_failure_breaker_seconds(error, str(error)) == 60.0
+
+
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
     prompt = build_batch_experts_user_prompt(
         "symbol=BTC/USDT price=100",

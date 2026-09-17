@@ -709,8 +709,8 @@ def test_quality_observation_contract_passes_entry_gate_only_at_one_x() -> None:
     permission.update(
         {
             "paper_execution_permission": False,
-            "paper_execution_reason": "fee_after_return_lcb_not_positive",
-            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_reason": "average_fee_after_return_not_positive",
+            "paper_execution_blockers": ["average_fee_after_return_not_positive"],
             "paper_execution_evidence": {"sample_count": 0},
         }
     )
@@ -723,13 +723,13 @@ def test_quality_observation_contract_passes_entry_gate_only_at_one_x() -> None:
             "selected_side": "short",
             "prediction_horizon_minutes": 30.0,
             "expected_net_return_pct": 0.35,
-            "objective_net_return_pct": -0.2,
+            "objective_net_return_pct": 0.2,
             "loss_probability": 0.3,
             "quant_evidence_families": ["local_ml"],
             "quant_quality_permissions": {"local_ml": permission},
             "paper_quality_observation_only": True,
             "paper_quality_observation_reasons": [
-                "fee_after_return_lcb_not_positive"
+                "average_fee_after_return_not_positive"
             ],
             "strong_expert_opposition": False,
         },
