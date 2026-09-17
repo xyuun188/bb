@@ -89,12 +89,19 @@ class ExitExecutionSingleFlightService:
             )
             if not positions:
                 return ExitExecutionLease(
-                    acquired=True,
+                    # The position lifecycle is already closed (usually by a
+                    # protection/full-close order).  This is a terminal skip,
+                    # not a lease that may continue to the exchange submit.
+                    acquired=False,
                     token="",
                     key=f"{mode}:{symbol}:{side}:no_local_position",
                     position_ids=(),
                     state="no_local_position",
                     attempt_count=0,
+                    reason=(
+                        "前一笔平仓已经完成，当前没有可平仓位；"
+                        "本次重复平仓请求已跳过，未再次提交交易所。"
+                    ),
                 )
 
             position_ids = tuple(sorted(int(position.id) for position in positions))
@@ -200,7 +207,13 @@ class ExitExecutionSingleFlightService:
                 "singleflight_state": lease.state,
                 "attempt_count": lease.attempt_count,
                 "retry_after_seconds": round(max(lease.retry_after_seconds, 0.0), 3),
-                "message": lease.reason,
+                "message": lease.reason
+                or (
+                    "前一笔平仓已经完成，当前没有可平仓位；"
+                    "本次重复平仓请求已跳过，未再次提交交易所。"
+                    if lease.state == "no_local_position"
+                    else ""
+                ),
             },
         )
 

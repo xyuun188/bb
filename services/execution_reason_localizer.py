@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 _EXACT_TRANSLATIONS = {
+    "前一笔平仓已经完成，当前没有可平仓位；本次重复平仓请求已跳过，未再次提交交易所。": "前一笔平仓已经完成，当前没有可平仓位；本次重复平仓请求已跳过，未再次提交交易所。",
+    "no_local_position": "前一笔平仓已经完成，当前没有可平仓位；本次重复平仓请求已跳过，未再次提交交易所。",
     "dynamic_exit_policy_passed": "动态退出策略初步检查已通过，正在继续校验减仓比例、费用和交易规则。",
     "dynamic_exit_fraction_below_execution_minimum": "建议减仓比例低于系统最小自动减仓比例 5%，本轮不提交平仓订单，继续持有。",
     "dynamic_exit_pressure_zero": "当前没有达到减仓或平仓条件，本轮继续持有。",

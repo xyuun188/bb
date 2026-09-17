@@ -189,6 +189,28 @@ async def test_temporary_exchange_error_uses_wait_state_instead_of_duplicate_sub
     assert waiting.raw_response["exit_singleflight_wait"] is True
 
 
+@pytest.mark.asyncio
+async def test_no_local_position_is_terminal_skip_and_never_a_submit_lease() -> None:
+    repo = _Repo([])
+    session = _Session()
+    now = [datetime(2026, 8, 20, 3, 0, tzinfo=UTC)]
+    service = _service(repo, session, now)
+
+    lease = await service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=_decision(),
+        decision_id=369700,
+    )
+
+    assert lease.acquired is False
+    assert lease.state == "no_local_position"
+    waiting = service.waiting_result(_decision(), lease)
+    assert waiting.quantity == 0.0
+    assert waiting.raw_response["do_not_persist_order"] is True
+    assert "前一笔平仓已经完成" in waiting.raw_response["message"]
+
+
 def test_position_contract_refresh_preserves_exit_lease_without_stale_policy_fields() -> None:
     previous = {
         "contract_version": "old",

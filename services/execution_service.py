@@ -1656,6 +1656,11 @@ class ExecutionService:
                 and execution_raw.get("exit_tracking")
                 and execution_result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
             )
+            exit_singleflight_terminal_skip = bool(
+                decision.is_exit
+                and execution_raw.get("exit_singleflight_wait")
+                and execution_raw.get("singleflight_state") == "no_local_position"
+            )
             confirm_reason = execution_reason_from_result(execution_result)
             local_order_persisted = True
             local_order_fact_created = True
@@ -1765,6 +1770,19 @@ class ExecutionService:
                         "exchange_order_id": execution_result.exchange_order_id,
                         "status": execution_result.status.value,
                         "recovery_requested": recovery_requested,
+                    },
+                )
+            elif exit_singleflight_terminal_skip:
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.SKIPPED,
+                    confirm_reason,
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                        "skip_kind": "position_already_closed",
+                        "singleflight_state": execution_raw.get("singleflight_state"),
                     },
                 )
             elif exit_waiting_confirmation:

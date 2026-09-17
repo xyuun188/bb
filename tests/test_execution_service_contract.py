@@ -13,6 +13,7 @@ from services.authoritative_trade_outcome import build_authoritative_trade_outco
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
+from services.exit_execution_singleflight import ExitExecutionLease
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     build_normal_paper_trade_contract,
@@ -54,6 +55,7 @@ def _test_execution_service(
     open_positions_execution_applier=None,
     decision_stage_recorder=None,
     entry_instrument_unavailable_marker=None,
+    exit_execution_singleflight=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
         if reasons is not None:
@@ -117,6 +119,7 @@ def _test_execution_service(
         exit_policy_evaluator=exit_policy_evaluator or allow_entry,
         production_trade_gate_provider=production_trade_gate_provider,
         entry_instrument_unavailable_marker=entry_instrument_unavailable_marker,
+        exit_execution_singleflight=exit_execution_singleflight,
         execution_skills_provider=lambda **_kwargs: [],
         execution_skills_attacher=lambda *_args, **_kwargs: None,
         execution_skills_block_reason_provider=lambda *_args, **_kwargs: None,
@@ -1630,6 +1633,92 @@ async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() 
     assert result.order_id == "exit_submission_result_unknown"
     assert result.raw_response["execution_transport_unknown"] is True
     assert result.raw_response["do_not_persist_order"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_local_exit_position_skips_exchange_submit_and_order_persistence() -> None:
+    place_calls = 0
+    stages: list[tuple[str, str, str]] = []
+    lease = ExitExecutionLease(
+        acquired=False,
+        token="",
+        key="paper:ZAMA/USDT:short:no_local_position",
+        position_ids=(),
+        state="no_local_position",
+        attempt_count=0,
+        reason="前一笔平仓已经完成，当前没有可平仓位；本次重复平仓请求已跳过，未再次提交交易所。",
+    )
+
+    class NoLocalPositionSingleFlight:
+        async def acquire(self, **_kwargs: Any) -> ExitExecutionLease:
+            return lease
+
+        @staticmethod
+        def waiting_result(
+            decision: DecisionOutput,
+            received_lease: ExitExecutionLease,
+        ) -> ExecutionResult:
+            from services.exit_execution_singleflight import ExitExecutionSingleFlightService
+
+            return ExitExecutionSingleFlightService.waiting_result(decision, received_lease)
+
+    class Executor:
+        async def place_order(self, *_args: Any, **_kwargs: Any) -> ExecutionResult:
+            nonlocal place_calls
+            place_calls += 1
+            raise AssertionError("closed lifecycle must not submit a second exit")
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return Executor()
+
+    service = _test_execution_service(
+        okx_executor_provider=okx_executor_provider,
+        exit_execution_singleflight=NoLocalPositionSingleFlight(),
+        stages=stages,
+    )
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ZAMA/USDT",
+        action=Action.CLOSE_SHORT,
+        confidence=1.0,
+        reasoning="stale position review",
+        position_size_pct=1.0,
+        suggested_leverage=1.0,
+        raw_response={
+            "dynamic_exit_policy": {
+                "eligible": True,
+                "close_fraction": 1.0,
+                "policy_provenance": {
+                    "source": "test",
+                    "observation_window": "current_position",
+                    "sample_count": 1,
+                    "generated_at": "2026-08-20T00:00:00+00:00",
+                    "strategy_version": "test",
+                    "fallback_reason": "",
+                },
+            }
+        },
+    )
+
+    result = await service.execute_candidate(
+        "ZAMA/USDT",
+        "ensemble_trader",
+        decision,
+        SimpleNamespace(warnings=[]),
+        369700,
+        {"warnings": [], "decisions": [], "executions": []},
+        open_positions=[],
+    )
+
+    assert place_calls == 0
+    assert result is not None
+    assert result.order_id == "exit_singleflight_wait"
+    assert result.quantity == 0.0
+    assert result.raw_response["do_not_persist_order"] is True
+    assert any(
+        stage == DecisionStage.EXCHANGE_CONFIRM and status == DecisionStageStatus.SKIPPED
+        for stage, status, _reason in stages
+    )
 
 
 @pytest.mark.asyncio
