@@ -7363,7 +7363,15 @@ function systemAuditCardDetailsHtml(card) {
 function systemAuditOverviewHtml(data) {
     const status = systemAuditTone(data.status);
     const summary = data.summary || {};
-    const title = status === 'ok' ? '当前未发现关键根因' : (status === 'critical' ? '发现异常根因' : '发现需关注项');
+    const ledgerSummary = data.issue_ledger?.summary || {};
+    const unresolved = Number(summary.unresolved ?? ledgerSummary.unresolved ?? 0);
+    const observing = Number(summary.observing ?? ledgerSummary.observing ?? 0);
+    const fixed = Number(summary.fixed ?? ledgerSummary.fixed ?? 0);
+    const title = unresolved > 0
+        ? `当前有 ${monitorNumber(unresolved, 0)} 项未修复问题`
+        : (observing > 0
+            ? `当前无未修复问题，${monitorNumber(observing, 0)} 项处于历史观察`
+            : '当前无未修复问题');
     const cache = data.cache || {};
     const refreshing = cache.refresh_in_background === true;
     const ageSeconds = Number(cache.age_seconds || 0);
@@ -7383,9 +7391,9 @@ function systemAuditOverviewHtml(data) {
             </div>
             <div class="system-audit-health-strip">
                 ${collectionMetric('巡检模块', `${monitorNumber(summary.cards || 0, 0)} 个`, '交易/对账/行情/策略/模型', 'muted')}
-                ${collectionMetric('异常根因', `${monitorNumber(summary.critical || 0, 0)} 项`, '需要优先处理', summary.critical ? 'bad' : 'good')}
-                ${collectionMetric('需关注项', `${monitorNumber(summary.warning || 0, 0)} 项`, '继续观察或排查', summary.warning ? 'warn' : 'good')}
-                ${collectionMetric('正常项', `${monitorNumber(summary.ok || 0, 0)} 项`, '已通过只读巡检', 'good')}
+                ${collectionMetric('当前未修复', `${monitorNumber(unresolved, 0)} 项`, '当前仍需处理', unresolved ? 'bad' : 'good')}
+                ${collectionMetric('历史观察', `${monitorNumber(observing, 0)} 项`, '历史遗留或修复后观察', observing ? 'warn' : 'good')}
+                ${collectionMetric('当前正常', `${monitorNumber(fixed, 0)} 项`, '已修复或本轮检查通过', 'good')}
             </div>
         </div>`;
 }

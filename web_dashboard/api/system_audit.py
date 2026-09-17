@@ -5945,6 +5945,33 @@ def _issue_ledger_from_cards(cards: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _system_audit_summary(
+    cards: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    issue_ledger: dict[str, Any],
+) -> dict[str, int]:
+    ledger_summary = _safe_dict(issue_ledger.get("summary"))
+    raw_critical = sum(1 for card in cards if card.get("status") == "critical")
+    raw_warning = sum(1 for card in cards if card.get("status") == "warning")
+    raw_ok = sum(1 for card in cards if card.get("status") == "ok")
+    return {
+        "cards": len(cards),
+        "unresolved": _safe_int_value(ledger_summary.get("unresolved")),
+        "observing": _safe_int_value(ledger_summary.get("observing")),
+        "fixed": _safe_int_value(ledger_summary.get("fixed")),
+        # Preserve the original severity counters for diagnostics and older clients.
+        "critical": raw_critical,
+        "warning": raw_warning,
+        "ok": raw_ok,
+        "raw_critical": raw_critical,
+        "raw_warning": raw_warning,
+        "raw_ok": raw_ok,
+        "findings": len(findings),
+        "nodes": len(nodes),
+    }
+
+
 def _worst_status(*statuses: Any) -> str:
     normalized = [str(status or "info") for status in statuses]
     return min(normalized or ["info"], key=lambda item: STATUS_RANK.get(item, 9))
@@ -6977,6 +7004,7 @@ async def _collect_system_audit_status_unlocked(
     nodes = _build_audit_nodes(cards)
     findings = _root_cause_findings(cards)
     issue_ledger = _issue_ledger_from_cards(cards)
+    summary = _system_audit_summary(cards, findings, nodes, issue_ledger)
     unresolved_cards = _safe_list(issue_ledger.get("unresolved"))
     observing_cards = _safe_list(issue_ledger.get("observing"))
     status = "ok"
@@ -6999,14 +7027,7 @@ async def _collect_system_audit_status_unlocked(
             "status_label": status_label,
             "checked_at": _now().isoformat(),
             "windows": AUDIT_WINDOWS,
-            "summary": {
-                "cards": len(cards),
-                "critical": sum(1 for card in cards if card.get("status") == "critical"),
-                "warning": sum(1 for card in cards if card.get("status") == "warning"),
-                "ok": sum(1 for card in cards if card.get("status") == "ok"),
-                "findings": len(findings),
-                "nodes": len(nodes),
-            },
+            "summary": summary,
             "root_causes": findings,
             "issue_ledger": issue_ledger,
             "nodes": nodes,

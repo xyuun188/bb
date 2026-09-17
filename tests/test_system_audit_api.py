@@ -5066,6 +5066,56 @@ def test_issue_ledger_treats_runtime_only_okx_entry_block_as_observing() -> None
     assert ledger["observing"][0]["key"] == "okx_trade_fact_integrity"
 
 
+def test_system_audit_summary_uses_ledger_state_for_current_problem_counts() -> None:
+    cards = [
+        system_audit._audit_card(
+            "phase3_go_no_go",
+            "Phase 3 fee-after return gate",
+            "critical",
+            "Profitability evidence has not passed.",
+            details={
+                "status": "no_go",
+                "ready": False,
+                "blockers": [{"code": "model_profit_factor_below_unity"}],
+                "summary": {
+                    "current_contract_violation_count": 0,
+                    "position_economics_incomplete_count": 0,
+                    "executed_dynamic_exit_contract_gap_count": 0,
+                    "okx_unresolved_count": 0,
+                },
+            },
+        ),
+        system_audit._audit_card(
+            "model_training",
+            "Model training",
+            "warning",
+            "Model remains under observation.",
+            details={"observing": True, "hard_failure": False},
+        ),
+        system_audit._audit_card(
+            "trade_loop",
+            "Trade loop",
+            "ok",
+            "Trade loop is healthy.",
+        ),
+    ]
+    ledger = system_audit._issue_ledger_from_cards(cards)
+
+    summary = system_audit._system_audit_summary(
+        cards,
+        system_audit._root_cause_findings(cards),
+        system_audit._build_audit_nodes(cards),
+        ledger,
+    )
+
+    assert summary["unresolved"] == 0
+    assert summary["observing"] == 2
+    assert summary["fixed"] == 1
+    assert summary["raw_critical"] == 1
+    assert summary["raw_warning"] == 1
+    assert summary["raw_ok"] == 1
+
+
 def test_phase3_profitability_gate_is_observing_when_runtime_contracts_are_clean() -> None:
     card = system_audit._audit_card(
         "phase3_go_no_go",

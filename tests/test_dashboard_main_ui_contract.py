@@ -760,6 +760,13 @@ def test_system_audit_displays_issue_ledger() -> None:
     assert "已修复" in script
     assert "未修复" in script
     assert "历史观察" in script
+    assert "当前未修复" in script
+    assert "当前正常" in script
+    assert "summary.unresolved" in script
+    assert "summary.observing" in script
+    assert "summary.fixed" in script
+    assert "data.issue_ledger?.summary" in script
+    assert "ledgerSummary.unresolved" in script
     assert ".system-audit-ledger-grid" in style
     assert ".system-audit-ledger-column" in style
     assert ".system-audit-ledger-item" in style
