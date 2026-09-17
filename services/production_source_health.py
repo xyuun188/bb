@@ -12,6 +12,18 @@ from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from services.normal_paper_trade import normal_paper_trade_contract_reasons
 
+_NORMAL_PAPER_PRIMARY_QUALITY_GATE_REASONS = {
+    "direction_support_expected_net_not_positive",
+    "direction_support_objective_net_not_positive",
+    "direction_support_quality_observation_loss_probability_too_high",
+    "direction_support_quant_family_conflict",
+    "direction_support_strong_expert_opposition",
+}
+_NORMAL_PAPER_QUALITY_GATE_REASONS = (
+    _NORMAL_PAPER_PRIMARY_QUALITY_GATE_REASONS
+    | {"direction_support_quant_evidence_missing"}
+)
+
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -62,6 +74,32 @@ def _is_normal_paper_candidate(raw: dict[str, Any]) -> bool:
     return bool(contract) and not normal_paper_trade_contract_reasons(contract)
 
 
+def _paper_trade_gate_reasons(raw: dict[str, Any]) -> list[str]:
+    selection = _safe_dict(raw.get("paper_trade_selection"))
+    if selection.get("selected") is True:
+        return []
+    by_side = _safe_dict(selection.get("by_side"))
+    reasons: list[str] = []
+    for side in ("long", "short"):
+        support = _safe_dict(by_side.get(side))
+        blockers = support.get("blocking_reasons")
+        if isinstance(blockers, list):
+            reasons.extend(str(reason) for reason in blockers if str(reason).strip())
+        reason = str(support.get("reason") or "").strip()
+        if reason and reason != "independent_positive_direction_support_ready":
+            reasons.append(reason)
+    return list(dict.fromkeys(reasons))
+
+
+def _is_quality_gated_paper_decision(raw: dict[str, Any]) -> bool:
+    reasons = _paper_trade_gate_reasons(raw)
+    reason_set = set(reasons)
+    return bool(
+        reason_set & _NORMAL_PAPER_PRIMARY_QUALITY_GATE_REASONS
+        and reason_set.issubset(_NORMAL_PAPER_QUALITY_GATE_REASONS)
+    )
+
+
 def summarize_production_source_health(
     decisions: list[Any],
     *,
@@ -79,6 +117,7 @@ def summarize_production_source_health(
         row for row in rows if str(_row_value(row, "analysis_type") or "market") == "market"
     ]
     source_rows = [row for row in market_rows if _source_count(_raw(row)) > 0]
+    latest_market_at = _as_utc(_row_value(market_rows[0], "created_at")) if market_rows else None
     last_source_at = _as_utc(_row_value(source_rows[0], "created_at")) if source_rows else None
     oldest_at = _as_utc(_row_value(market_rows[-1], "created_at")) if market_rows else None
     no_source_since = last_source_at or oldest_at
@@ -89,6 +128,37 @@ def summarize_production_source_health(
     )
     warning_after = max(int(decision_interval_seconds or 60) * 6, 600)
     critical_after = max(int(decision_interval_seconds or 60) * 30, 3600)
+    market_decision_age_seconds = (
+        max((checked_at - latest_market_at).total_seconds(), 0.0)
+        if latest_market_at is not None
+        else None
+    )
+    decision_pipeline_active = bool(
+        market_decision_age_seconds is not None
+        and market_decision_age_seconds < warning_after
+    )
+    recent_market_rows = [
+        row
+        for row in market_rows
+        if (
+            (created_at := _as_utc(_row_value(row, "created_at"))) is not None
+            and max((checked_at - created_at).total_seconds(), 0.0) < critical_after
+        )
+    ]
+    paper_selection_rows = [
+        row
+        for row in recent_market_rows
+        if _safe_dict(_raw(row).get("paper_trade_selection")).get("by_side")
+    ]
+    quality_gated_rows = [
+        row for row in paper_selection_rows if _is_quality_gated_paper_decision(_raw(row))
+    ]
+    quality_gate_reason_counts: dict[str, int] = {}
+    for row in quality_gated_rows:
+        for gate_reason in _paper_trade_gate_reasons(_raw(row)):
+            quality_gate_reason_counts[gate_reason] = (
+                quality_gate_reason_counts.get(gate_reason, 0) + 1
+            )
     normal_paper_rows = [row for row in market_rows if _is_normal_paper_candidate(_raw(row))]
     normal_paper_executed = sum(bool(_row_value(row, "was_executed")) for row in normal_paper_rows)
     latest_normal_paper_at = (
@@ -108,11 +178,30 @@ def summarize_production_source_health(
     paper_trade_alert_reason = (
         "continuous_no_normal_paper_candidate" if paper_trade_alert_active else None
     )
+    quality_gate_waiting = bool(
+        paper_trade_alert_active
+        and decision_pipeline_active
+        and paper_selection_rows
+        and len(quality_gated_rows) == len(paper_selection_rows)
+    )
     if not market_rows:
         status = "warning"
         reason = "market_decision_evidence_unavailable"
+    elif (
+        production_permission
+        and no_source_seconds is not None
+        and no_source_seconds >= critical_after
+    ):
+        status = "critical"
+        reason = "continuous_no_production_return_source"
+    elif not decision_pipeline_active:
+        status = "warning"
+        reason = "market_decision_pipeline_stale"
     elif not production_permission:
-        if paper_trade_alert_active:
+        if quality_gate_waiting:
+            status = "warning"
+            reason = "normal_paper_quality_gate_waiting"
+        elif paper_trade_alert_active:
             status = "warning"
             reason = paper_trade_alert_reason
         else:
@@ -125,9 +214,6 @@ def summarize_production_source_health(
         else:
             status = "ok"
             reason = "governed_production_return_source_recent"
-    elif no_source_seconds is not None and no_source_seconds >= critical_after:
-        status = "critical"
-        reason = "continuous_no_production_return_source"
     else:
         status = "warning"
         reason = "production_return_source_recovery_window"
@@ -137,6 +223,13 @@ def summarize_production_source_health(
         "alert_active": status in {"warning", "critical"},
         "production_permission": bool(production_permission),
         "market_decision_count": len(market_rows),
+        "latest_market_decision_at": latest_market_at.isoformat() if latest_market_at else None,
+        "market_decision_age_seconds": (
+            round(market_decision_age_seconds, 3)
+            if market_decision_age_seconds is not None
+            else None
+        ),
+        "decision_pipeline_active": decision_pipeline_active,
         "production_source_decision_count": len(source_rows),
         "latest_production_source_at": last_source_at.isoformat() if last_source_at else None,
         "continuous_no_source_seconds": (
@@ -164,8 +257,23 @@ def summarize_production_source_health(
         ),
         "paper_trade_alert_active": paper_trade_alert_active,
         "paper_trade_alert_reason": paper_trade_alert_reason,
+        "paper_selection_decision_count": len(paper_selection_rows),
+        "quality_gated_decision_count": len(quality_gated_rows),
+        "quality_gate_reason_counts": quality_gate_reason_counts,
+        "observing": quality_gate_waiting,
+        "hard_failure": bool(
+            not decision_pipeline_active
+            or (
+                production_permission
+                and reason == "continuous_no_production_return_source"
+            )
+        ),
         "recovery_state": (
-            "normal_paper_trading" if normal_paper_rows else "normal_paper_candidate_waiting"
+            "normal_paper_quality_gate_waiting"
+            if quality_gate_waiting
+            else "normal_paper_trading"
+            if normal_paper_rows and not paper_trade_alert_active
+            else "normal_paper_candidate_waiting"
         ),
         "checked_at": checked_at.isoformat(),
     }

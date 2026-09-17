@@ -3667,8 +3667,31 @@ async def _production_source_health_audit() -> dict[str, Any]:
         )
     status = str(report.get("status") or "warning")
     duration = report.get("continuous_no_source_seconds")
-    if status == "ok":
+    title = "连续无生产收益源"
+    next_actions = [
+        "检查模拟盘正常策略的运行时风控、成交、费用结算和版本归因。",
+        "所有完整平仓继续进入训练，不再以固定样本数量控制开仓。",
+        "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
+    ]
+    quality_gate_waiting = bool(
+        report.get("observing")
+        and report.get("recovery_state") == "normal_paper_quality_gate_waiting"
+        and not report.get("hard_failure")
+    )
+    if quality_gate_waiting:
+        title = "模拟策略质量门禁观察"
+        summary = (
+            "策略评估链路正常，当前候选均未通过正收益下界或风险要求，"
+            "系统未提交弱候选订单；实盘晋升门禁保持关闭。"
+        )
+        next_actions = [
+            "保持正收益下界和风险门槛，不提交负收益或弱候选订单。",
+            "继续采集可信模拟盘结算样本并训练，等待模型费后收益改善。",
+            "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
+        ]
+    elif status == "ok":
         summary = "近期存在通过治理的生产收益源。"
+        next_actions = []
     elif report.get("paper_trade_alert_active"):
         summary = "模拟盘持续没有生成正常策略候选；实盘仍由生产晋升门禁独立控制。"
     elif report.get("recovery_state") == "normal_paper_trading":
@@ -3677,7 +3700,7 @@ async def _production_source_health_audit() -> dict[str, Any]:
         summary = "正式生产收益源仍为空，模拟盘正在等待下一次正常策略候选；实盘保持关闭。"
     return _audit_card(
         "production_source_health",
-        "连续无生产收益源",
+        title,
         status if status in {"ok", "warning", "critical"} else "warning",
         summary,
         details=report,
@@ -3695,12 +3718,16 @@ async def _production_source_health_audit() -> dict[str, Any]:
                 "label": "连续无模拟候选秒数",
                 "value": report.get("continuous_no_normal_paper_candidate_seconds"),
             },
+            {
+                "label": "正收益/风险门槛拦截",
+                "value": int(report.get("quality_gated_decision_count") or 0),
+            },
+            {
+                "label": "决策链路",
+                "value": "正常" if report.get("decision_pipeline_active") else "异常",
+            },
         ],
-        next_actions=[
-            "检查模拟盘正常策略的运行时风控、成交、费用结算和版本归因。",
-            "所有完整平仓继续进入训练，不再以固定样本数量控制开仓。",
-            "只有 walk-forward、样本外和权威成交费后收益下界转正后才恢复正式生产源。",
-        ],
+        next_actions=next_actions,
         owner_path="services/production_source_health.py",
     )
 
@@ -5683,21 +5710,32 @@ def _issue_ledger_state(
         and _okx_reconciliation_is_quarantined_observation(details)
     ):
         return "observing", "历史交易事实只读隔离 / 当前交易与训练不受阻断"
-    if status == "warning" and bool(details.get("observing")):
-        return "observing", "观察项 / 受控阶段或预热中"
     if key == "production_source_health" and status == "warning":
         controlled_paper_observation = bool(
-            details.get("recovery_state") == "normal_paper_trading"
+            details.get("recovery_state")
+            in {
+                "normal_paper_trading",
+                "normal_paper_quality_gate_waiting",
+            }
             and str(details.get("reason") or "")
             in {
                 "continuous_no_normal_paper_candidate",
                 "live_production_permission_disabled",
+                "normal_paper_quality_gate_waiting",
             }
             and not details.get("error")
             and not bool(details.get("hard_failure"))
         )
         if controlled_paper_observation:
+            if details.get("recovery_state") == "normal_paper_quality_gate_waiting":
+                return "observing", "观察项 / 决策链路正常，弱候选被正收益门槛拦截"
             return "observing", "观察项 / 模拟盘持续训练中，等待新的合格候选"
+    if (
+        status == "warning"
+        and bool(details.get("observing"))
+        and not bool(details.get("hard_failure"))
+    ):
+        return "observing", "观察项 / 受控阶段或预热中"
     if (
         key == "model_training"
         and status == "warning"

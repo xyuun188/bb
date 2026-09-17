@@ -13,6 +13,7 @@ def _decision(
     source_count: int = 0,
     executed: bool = False,
     normal_paper: bool = False,
+    quality_gate_reason: str | None = None,
 ) -> SimpleNamespace:
     decision = SimpleNamespace(
         created_at=created_at,
@@ -40,6 +41,20 @@ def _decision(
                 "quant_quality_permissions": paper_quality_permissions(),
             },
         )
+    if quality_gate_reason:
+        decision.raw_llm_response["paper_trade_selection"] = {
+            "selected": False,
+            "selected_side": "neutral",
+            "selection_reason": "no_direction",
+            "by_side": {
+                side: {
+                    "eligible": False,
+                    "selected_side": side,
+                    "reason": quality_gate_reason,
+                }
+                for side in ("long", "short")
+            },
+        }
     return decision
 
 
@@ -79,6 +94,8 @@ def test_old_bootstrap_contract_does_not_count_as_normal_paper_activity() -> Non
     assert report["recovery_state"] == "normal_paper_candidate_waiting"
     assert report["normal_paper_executed_count"] == 0
     assert report["paper_trade_alert_active"] is True
+    assert report["decision_pipeline_active"] is False
+    assert report["hard_failure"] is True
 
 
 def test_normal_paper_trading_reports_continuous_training_without_sample_target() -> None:
@@ -102,11 +119,11 @@ def test_normal_paper_trading_reports_continuous_training_without_sample_target(
     assert report["status"] == "ok"
 
 
-def test_continuous_no_normal_paper_candidate_is_reported_separately() -> None:
+def test_active_pipeline_without_a_classified_candidate_remains_unresolved() -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
     rows = [
+        _decision(now - timedelta(minutes=2)),
         _decision(now - timedelta(hours=2)),
-        _decision(now - timedelta(hours=3)),
     ]
 
     report = summarize_production_source_health(rows, now=now)
@@ -116,3 +133,88 @@ def test_continuous_no_normal_paper_candidate_is_reported_separately() -> None:
     assert report["paper_trade_alert_active"] is True
     assert report["paper_trade_alert_reason"] == "continuous_no_normal_paper_candidate"
     assert report["recovery_state"] == "normal_paper_candidate_waiting"
+    assert report["decision_pipeline_active"] is True
+    assert report["observing"] is False
+
+
+def test_active_pipeline_with_positive_return_gate_rejections_is_observing() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    gate_reason = "direction_support_objective_net_not_positive"
+    rows = [
+        _decision(
+            now - timedelta(minutes=2),
+            quality_gate_reason=gate_reason,
+        ),
+        _decision(
+            now - timedelta(hours=2),
+            quality_gate_reason=gate_reason,
+        ),
+    ]
+    for row in rows:
+        for support in row.raw_llm_response["paper_trade_selection"]["by_side"].values():
+            support["blocking_reasons"] = [
+                gate_reason,
+                "direction_support_quant_evidence_missing",
+            ]
+
+    report = summarize_production_source_health(rows, now=now)
+
+    assert report["status"] == "warning"
+    assert report["reason"] == "normal_paper_quality_gate_waiting"
+    assert report["decision_pipeline_active"] is True
+    assert report["quality_gated_decision_count"] == 1
+    assert report["quality_gate_reason_counts"] == {
+        gate_reason: 1,
+        "direction_support_quant_evidence_missing": 1,
+    }
+    assert report["observing"] is True
+    assert report["hard_failure"] is False
+    assert report["recovery_state"] == "normal_paper_quality_gate_waiting"
+
+
+def test_missing_quant_evidence_alone_is_not_a_quality_gate_observation() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    rows = [
+        _decision(
+            now - timedelta(minutes=2),
+            quality_gate_reason="direction_support_quant_evidence_missing",
+        ),
+        _decision(now - timedelta(hours=2)),
+    ]
+
+    report = summarize_production_source_health(rows, now=now)
+
+    assert report["reason"] == "continuous_no_normal_paper_candidate"
+    assert report["quality_gated_decision_count"] == 0
+    assert report["observing"] is False
+    assert report["recovery_state"] == "normal_paper_candidate_waiting"
+
+
+def test_stale_quality_gate_evidence_does_not_hide_pipeline_failure() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    rows = [
+        _decision(
+            now - timedelta(hours=2),
+            quality_gate_reason="direction_support_objective_net_not_positive",
+        )
+    ]
+
+    report = summarize_production_source_health(rows, now=now)
+
+    assert report["status"] == "warning"
+    assert report["reason"] == "market_decision_pipeline_stale"
+    assert report["decision_pipeline_active"] is False
+    assert report["observing"] is False
+    assert report["hard_failure"] is True
+
+
+def test_missing_market_decisions_remain_a_hard_failure() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+
+    report = summarize_production_source_health([], now=now)
+
+    assert report["status"] == "warning"
+    assert report["reason"] == "market_decision_evidence_unavailable"
+    assert report["decision_pipeline_active"] is False
+    assert report["observing"] is False
+    assert report["hard_failure"] is True

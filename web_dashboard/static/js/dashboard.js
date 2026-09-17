@@ -8070,6 +8070,17 @@ function runtimeEndpointStatusLabel(item, options = {}) {
     return '不可达';
 }
 
+function runtimeProbeModeLabel(item) {
+    const mode = String(item && item.probe_mode || '').toLowerCase();
+    if (mode === 'liveness' || mode === 'liveness_fallback') {
+        return '\u8f7b\u91cf\u5065\u5eb7\u63a2\u9488';
+    }
+    if (mode === 'metadata_status') {
+        return '\u540e\u53f0\u72b6\u6001\u5237\u65b0';
+    }
+    return '';
+}
+
 function runtimeEndpointSummary(health) {
     if (!health || typeof health !== 'object') return '';
     const status = Number(health.status_code || 0);
@@ -8077,6 +8088,8 @@ function runtimeEndpointSummary(health) {
     const parts = [];
     parts.push(status ? `HTTP ${status}` : (health.ok ? 'HTTP 正常' : 'HTTP 未连接'));
     if (Number.isFinite(latency)) parts.push(`${monitorNumber(latency, 0)} ms`);
+    const probeModeLabel = runtimeProbeModeLabel(health);
+    if (probeModeLabel) parts.push(probeModeLabel);
     if (health.error) parts.push(dashboardReasonText(health.error));
     if (health.truncated) parts.push('响应已截断');
     return parts.join(' · ');

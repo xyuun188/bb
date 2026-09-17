@@ -2691,22 +2691,63 @@ async def test_production_source_health_card_exposes_normal_paper_trade_alert(
     assert card["details"]["paper_trade_alert_active"] is True
 
 
+@pytest.mark.asyncio
+async def test_production_source_health_card_explains_quality_gate_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProductionSourceHealthService:
+        async def report(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "status": "warning",
+                "reason": "normal_paper_quality_gate_waiting",
+                "continuous_no_source_seconds": 7200.0,
+                "production_source_decision_count": 0,
+                "normal_paper_executed_count": 0,
+                "continuous_no_normal_paper_candidate_seconds": 7200.0,
+                "paper_trade_alert_active": True,
+                "quality_gated_decision_count": 38,
+                "decision_pipeline_active": True,
+                "observing": True,
+                "hard_failure": False,
+                "recovery_state": "normal_paper_quality_gate_waiting",
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "ProductionSourceHealthService",
+        FakeProductionSourceHealthService,
+    )
+
+    card = await system_audit._production_source_health_audit()
+
+    assert card["title"] == "模拟策略质量门禁观察"
+    assert "策略评估链路正常" in card["summary"]
+    assert "未提交弱候选订单" in card["summary"]
+    assert {item["label"]: item["value"] for item in card["evidence"]}[
+        "正收益/风险门槛拦截"
+    ] == 38
+
+
 def test_production_source_normal_paper_wait_is_observing_but_failure_is_unresolved() -> None:
     card = {
         "key": "production_source_health",
         "status": "warning",
         "summary": "Waiting for another qualified normal-paper candidate.",
         "details": {
-            "reason": "continuous_no_normal_paper_candidate",
-            "recovery_state": "normal_paper_trading",
+            "reason": "normal_paper_quality_gate_waiting",
+            "recovery_state": "normal_paper_quality_gate_waiting",
             "paper_trade_alert_active": True,
-            "normal_paper_executed_count": 2,
+            "quality_gated_decision_count": 38,
+            "decision_pipeline_active": True,
+            "observing": True,
+            "hard_failure": False,
         },
     }
 
     ledger = system_audit._issue_ledger_from_cards([card])
     assert ledger["summary"]["observing"] == 1
     assert ledger["summary"]["unresolved"] == 0
+    assert "弱候选被正收益门槛拦截" in ledger["observing"][0]["state_label"]
 
     card["details"]["hard_failure"] = True
     failed_ledger = system_audit._issue_ledger_from_cards([card])

@@ -2652,10 +2652,12 @@ async def test_collect_platform_runtime_status_uses_lightweight_child_endpoint_c
     assert tools["child_endpoints"]["profit_prediction"]["available"] is True
     assert tools["child_endpoints"]["exit_advice"]["available"] is False
     assert tools["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
-    assert tools["health"]["probe_mode"] == "models_status_reachability"
+    assert tools["health"]["probe_mode"] == "liveness"
+    assert tools["status"]["probe_mode"] == "metadata_status"
     assert tools["expected_platform_api_base"] == "http://127.0.0.1:18001"
     assert tools["tunnel_contract"]["status"] == "external_or_dev_endpoint"
-    assert all(not url.endswith("/health/live") for _method, url, _auth in requests)
+    assert any(url.endswith("/health/live") for _method, url, _auth in requests)
+    assert any(url.endswith("/models/status") for _method, url, _auth in requests)
     assert all(method == "GET" for method, _url, _auth in requests)
     limits = client_options["limits"]
     assert limits.max_keepalive_connections == 0
@@ -2715,14 +2717,15 @@ async def test_collect_platform_runtime_status_falls_back_to_liveness_when_statu
     result = await server_monitor_status.collect_platform_runtime_status()
 
     tools = result["local_ai_tools"]
-    assert requests[-2:] == [
+    assert set(requests) == {
         "http://local-ai.test/models/status",
         "http://local-ai.test/health/live",
-    ]
+    }
     assert tools["available"] is True
     assert tools["service_available"] is True
     assert tools["model_bundle_available"] is True
-    assert tools["health"]["probe_mode"] == "liveness_fallback"
+    assert tools["health"]["probe_mode"] == "liveness"
+    assert tools["status"]["probe_mode"] == "metadata_status"
 
 
 async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(
@@ -2776,7 +2779,7 @@ async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_set
 
     assert result["local_ai_tools"]["available"] is True
     assert ("GET", "http://local-ai.test/models/status", "Bearer env-tools-key") in requests
-    assert ("GET", "http://local-ai.test/health/live", "Bearer env-tools-key") not in requests
+    assert ("GET", "http://local-ai.test/health/live", "Bearer env-tools-key") in requests
     assert all(method == "GET" for method, _url, _auth in requests)
 
 
@@ -2858,7 +2861,7 @@ async def test_collect_platform_runtime_status_defaults_to_phase3_tunnel_when_un
     assert tools["using_default_phase3_tunnel"] is True
     assert tools["api_base"] == "http://127.0.0.1:18001"
     assert tools["configured_api_base"] == ""
-    assert ("GET", "http://127.0.0.1:18001/health/live") not in requests
+    assert ("GET", "http://127.0.0.1:18001/health/live") in requests
     assert ("GET", "http://127.0.0.1:18001/models/status") in requests
     tunnels = result["model_tunnels"]
     assert result["topology_profile"] == "target_single_model"

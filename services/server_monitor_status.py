@@ -1384,48 +1384,45 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 ONLINE_PHASE3_QUANT_API_PLATFORM_BASE,
             )
             api_key = _local_ai_tools_api_key_for_platform_probe()
-            status_probe = await _probe_platform_json(
-                client,
-                f"{local_base}/models/status",
-                api_key=api_key,
-            )
-            if status_probe.get("ok"):
-                health = {
-                    "ok": True,
-                    "status_code": status_probe.get("status_code"),
-                    "latency_ms": status_probe.get("latency_ms"),
-                    "status_category": status_probe.get("status_category"),
-                    "error": "",
-                    "data": {"service": "phase3_quant_api"},
-                    "probe_mode": "models_status_reachability",
-                }
-            else:
-                # Keep the fallback cheap and contract-complete.  The liveness
-                # endpoint intentionally carries the lightweight child-route
-                # contract so a busy metadata probe cannot turn into a false
-                # "all child endpoints missing" audit blocker.
-                health = await _probe_platform_json(
+            # Keep liveness and metadata probes independent.  The dashboard
+            # must show the real cheap health latency instead of copying the
+            # slower metadata check into the health row.  Running them in
+            # parallel also prevents a busy synchronous `/models/status`
+            # route from delaying the authoritative liveness signal.
+            health_probe, status_probe = await asyncio.gather(
+                _probe_platform_json(
                     client,
                     f"{local_base}/health/live",
                     api_key=api_key,
-                )
-                health["probe_mode"] = "liveness_fallback"
+                ),
+                _probe_platform_json(
+                    client,
+                    f"{local_base}/models/status",
+                    api_key=api_key,
+                ),
+            )
+            health = dict(health_probe)
+            health["probe_mode"] = "liveness"
+            status_probe = dict(status_probe)
+            status_probe["probe_mode"] = "metadata_status"
             metadata = health.get("data") if isinstance(health.get("data"), dict) else {}
             status_metadata = (
                 status_probe.get("data") if isinstance(status_probe.get("data"), dict) else {}
             )
-            is_phase3_quant_api = metadata.get("service") == "phase3_quant_api"
+            is_phase3_quant_api = bool(
+                metadata.get("service") == "phase3_quant_api"
+                or status_metadata.get("service") == "phase3_quant_api"
+            )
             service_available = bool(
                 tunnel_contract.get("ok")
                 and (
-                    status_probe.get("ok")
-                    or (health.get("ok") and is_phase3_quant_api)
+                    (health.get("ok") and is_phase3_quant_api)
+                    or status_probe.get("ok")
                 )
             )
-            # `/health/live` is the authoritative fallback when the heavier
-            # `/models/status` probe is busy. Preserve the explicit artifact
-            # readiness field so a healthy quant service is not shown as
-            # "model unavailable" merely because metadata timed out.
+            # Preserve artifact readiness from either response so a healthy
+            # quant service is not shown as "model unavailable" merely because
+            # the heavier metadata probe is temporarily busy.
             model_bundle_available = bool(
                 status_metadata.get("model_bundle_available")
                 or status_metadata.get("available")
@@ -1535,6 +1532,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         "latency_ms": status_probe.get("latency_ms"),
                         "status_category": status_probe.get("status_category"),
                         "error": status_probe.get("error", ""),
+                        "probe_mode": status_probe.get("probe_mode"),
                     },
                     "model_bundle_available": model_bundle_available,
                     "trained_models_available": model_bundle_available,
