@@ -6240,14 +6240,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 *bootstrap_major_symbols,
             ]
         )
-        # Deferred retries are important, but cannot consume the whole fetch
-        # budget. Reserve at least half of the market slots for a rotating slice
-        # of the broader OKX universe so repeated failures do not monopolize
-        # expert analysis.
+        # Deferred/verified retries are important, but cannot consume the whole
+        # fetch budget.  Always reserve half of the market slots for a rotating
+        # slice of the broader OKX universe.  The previous ``max(configured,
+        # half)`` rule made an eight-symbol runtime cap allocate all eight slots
+        # to the priority queue, so the same verified symbols were analyzed on
+        # every round and the rotation cursor never had a chance to advance.
         priority_budget = (
             market_budget
-            if market_budget < 8
-            else min(market_budget, max(int(configured_limit), market_budget // 2, 1))
+            if market_budget < 2
+            else max(1, market_budget // 2)
         )
         priority_limit = min(
             priority_budget,
@@ -6282,10 +6284,47 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if market_budget <= 0:
             return self.entry_symbol_universe.dedupe_symbols(position_symbols)
 
-        selected_verified_set = set(selected_verified)
-        rotating_market_symbols = [
-            symbol for symbol in market_symbols if symbol not in selected_verified_set
+        selected_verified_keys = {
+            self._normalize_position_symbol(symbol) for symbol in selected_verified
+        }
+        priority_symbol_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in priority_market_symbols
+            if self._normalize_position_symbol(symbol)
+        }
+        deferred_symbol_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in deferred_market_symbols
+            if self._normalize_position_symbol(symbol)
+        }
+        # Keep unfinished retries first, then use genuinely new symbols for
+        # the rotating slice. Unselected verified/major symbols are appended
+        # last so they remain discoverable without starving the wider universe.
+        deferred_rotation_symbols = [
+            symbol
+            for symbol in deferred_market_symbols
+            if self._normalize_position_symbol(symbol) not in selected_verified_keys
         ]
+        non_priority_rotation_symbols = [
+            symbol
+            for symbol in market_symbols
+            if self._normalize_position_symbol(symbol) not in priority_symbol_keys
+        ]
+        remaining_priority_symbols = [
+            symbol
+            for symbol in priority_market_symbols
+            if (
+                self._normalize_position_symbol(symbol) not in selected_verified_keys
+                and self._normalize_position_symbol(symbol) not in deferred_symbol_keys
+            )
+        ]
+        rotating_market_symbols = self.entry_symbol_universe.dedupe_symbols(
+            [
+                *deferred_rotation_symbols,
+                *non_priority_rotation_symbols,
+                *remaining_priority_symbols,
+            ]
+        )
         rotating_budget = max(market_budget - len(selected_verified), 0)
         cursor = int(getattr(self, "_auto_scan_feature_cursor", 0) or 0)
         start = cursor % len(rotating_market_symbols) if rotating_market_symbols else 0

@@ -5904,6 +5904,37 @@ def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
     )
 
 
+def test_auto_scan_feature_budget_reserves_rotation_when_verified_pool_fills_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified symbols must not consume the whole small runtime fetch cap."""
+
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._auto_scan_feature_cursor = 0
+    service._verified_entry_symbols_by_mode = {
+        "paper": {f"S{i}/USDT" for i in range(8)},
+    }
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 1)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 8)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 8)
+    symbols = [f"S{i}/USDT" for i in range(20)]
+
+    first = service._budget_auto_scan_feature_symbols(symbols, [], configured_limit=8)
+    second = service._budget_auto_scan_feature_symbols(symbols, [], configured_limit=8)
+
+    assert first[:4] == ["S0/USDT", "S1/USDT", "S2/USDT", "S3/USDT"]
+    assert first[4:] == ["S8/USDT", "S9/USDT", "S10/USDT", "S11/USDT"]
+    assert second[:4] == first[:4]
+    assert second[4:] == ["S12/USDT", "S13/USDT", "S14/USDT", "S15/USDT"]
+    assert service._last_auto_feature_fetch_budget_diagnostics["priority_budget"] == 4
+    assert service._last_auto_feature_fetch_budget_diagnostics["rotating_symbol_reserve"] == 4
+
+
 def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
