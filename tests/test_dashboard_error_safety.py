@@ -369,6 +369,33 @@ def test_dashboard_execution_account_keeps_stale_cached_balance_usable(
     assert payload["risk_paused"] is False
 
 
+def test_dashboard_execution_account_classifies_okx_50001_as_temporary_warning(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+
+    payload = dashboard._build_execution_account_status(
+        "paper",
+        okx_account={
+            "free": 200.0,
+            "used": 10.0,
+            "total": 250.0,
+            "cash": 250.0,
+            "equity": 260.0,
+            "allocatable": 260.0,
+            "error": "OKX API error [50001]: Service temporarily unavailable. Please try again later.",
+            "stale": True,
+        },
+        pnl_summary={},
+    )
+
+    assert payload["account_equity"] == 260.0
+    assert payload["balance_error"] is None
+    assert "50001" in payload["balance_warning"]
+    assert "自动重试" in payload["balance_warning"]
+    assert payload["risk_paused"] is False
+
+
 def test_analysis_ml_signal_summary_excludes_heavy_diagnostics() -> None:
     summary = dashboard._analysis_ml_signal_summary(
         {

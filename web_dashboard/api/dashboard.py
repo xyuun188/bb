@@ -85,6 +85,7 @@ from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_ord
 from services.model_training_registry import build_model_training_registry
 from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
 from services.observability_contract import build_snapshot, status_from_sections
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
 from services.server_monitor_status import get_server_monitor_status_async
@@ -720,6 +721,11 @@ def _dashboard_okx_account_label(mode: str) -> str:
 def _dashboard_okx_error_text(exc: Exception, *, resource: str) -> str:
     error = safe_error_text(exc)
     lower = error.lower()
+    if is_okx_temporary_service_error(error):
+        return (
+            f"OKX 返回错误码 50001：{resource}接口临时不可用，"
+            "当前优先显示最近一次成功快照，系统会自动重试。"
+        )
     if isinstance(exc, TimeoutError) or error in ("TimeoutError", "") or "timed out" in lower:
         return f"OKX {resource}响应超时，已优先返回缓存数据"
     if "authorization" in lower or "api key" in lower or "signature" in lower:
@@ -2538,7 +2544,18 @@ def _build_execution_account_status(
     mode = "live" if mode == "live" else "paper"
     cfg = settings.get_execution_account_config(mode)
     pnl_summary = pnl_summary or {}
-    okx_error = str(okx_account.get("error")) if okx_account and okx_account.get("error") else None
+    okx_error_value = (
+        (
+            okx_account.get("error")
+            or okx_account.get("balance_error")
+            or okx_account.get("balance_warning")
+        )
+        if okx_account
+        else None
+    )
+    okx_error = str(okx_error_value) if okx_error_value else None
+    if okx_error and is_okx_temporary_service_error(okx_error):
+        okx_error = _dashboard_okx_error_text(RuntimeError(okx_error), resource="余额")
     raw_okx_available = _safe_float(okx_account.get("free"), None) if okx_account else None
     raw_okx_used = _safe_float(okx_account.get("used"), 0.0) if okx_account else None
     raw_okx_total = (

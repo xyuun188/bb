@@ -45,6 +45,7 @@ from services.model_server_config import (
     load_model_server_info_from_secure_settings,
     save_model_server_settings,
 )
+from services.okx_error_classifier import is_okx_temporary_service_error
 from services.secure_runtime_config import (
     scrub_ai_model_env,
     secure_ai_model_key,
@@ -272,6 +273,11 @@ def _empty_okx_snapshot(mode: str) -> dict[str, Any]:
 def _okx_balance_error_text(exc: Exception) -> str:
     error = _connection_error_text(exc)
     lower = error.lower()
+    if is_okx_temporary_service_error(error):
+        return (
+            "OKX 返回错误码 50001：余额接口临时不可用，"
+            "当前优先显示最近一次成功快照，系统会自动重试。"
+        )
     if isinstance(exc, TimeoutError) or error in ("TimeoutError", "") or "timed out" in lower:
         return "OKX 余额响应超时，已优先返回缓存数据"
     return f"OKX 余额查询失败: {error}"

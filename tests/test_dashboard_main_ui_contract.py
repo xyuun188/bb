@@ -1282,6 +1282,9 @@ def test_dashboard_balance_error_keeps_last_successful_numeric_snapshot() -> Non
     assert "account.balance_snapshot_age_seconds" in script
     assert "if (account && account.balance_error) return '--';" not in script
     assert "account.balance_error && account.balance_snapshot_stale !== true" in script
+    assert "function downgradeTemporaryBalanceError" in script
+    assert "function temporaryBalanceWarningText" in script
+    assert "account.balance_recovery_pending = true;" in script
 
 
 def test_local_ml_loss_filter_uses_backend_model_contract() -> None:

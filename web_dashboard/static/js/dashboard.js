@@ -563,6 +563,39 @@ function preserveLastGoodAccountBalance(rawAccount, fallbackMode = 'paper') {
                 : 'OKX 模拟盘最近成功快照';
         }
     }
+    downgradeTemporaryBalanceError(account);
+    return account;
+}
+
+function isTemporaryBalanceError(value) {
+    const text = String(value || '').toLowerCase();
+    return [
+        '50001',
+        '50013',
+        '50026',
+        'temporarily unavailable',
+        'systems are busy',
+        'system error',
+        'timed out',
+        'timeout',
+        '\u8d85\u65f6',
+        '\u6682\u65f6\u4e0d\u53ef\u7528',
+    ].some(marker => text.includes(marker));
+}
+
+function temporaryBalanceWarningText(value) {
+    if (isTemporaryBalanceError(value)) {
+        return '\u4ea4\u6613\u6240\u4f59\u989d\u63a5\u53e3\u4e34\u65f6\u4e0d\u53ef\u7528\uff0c\u5f53\u524d\u663e\u793a\u6700\u8fd1\u4e00\u6b21\u6210\u529f\u4f59\u989d\uff0c\u7cfb\u7edf\u5c06\u81ea\u52a8\u91cd\u8bd5\u3002';
+    }
+    return String(value || '');
+}
+
+function downgradeTemporaryBalanceError(account) {
+    if (!account || account.balance_snapshot_stale !== true) return account;
+    if (!account.balance_error || !isTemporaryBalanceError(account.balance_error)) return account;
+    account.balance_warning = account.balance_warning || temporaryBalanceWarningText(account.balance_error);
+    account.balance_error = null;
+    account.balance_recovery_pending = true;
     return account;
 }
 
@@ -9072,13 +9105,20 @@ function renderExecutionAccountSettings(data) {
     ].forEach(([mode, account]) => {
         const displayAvailable = valueNumber(account.okx_available_balance ?? account.available_balance);
         const displayEquity = valueNumber(account.okx_equity_balance ?? account.equity ?? account.account_equity ?? account.okx_total_balance);
-        const availableText = account.balance_error
+        const temporaryStaleError = account.balance_snapshot_stale === true
+            && isTemporaryBalanceError(account.balance_error)
             ? account.balance_error
+            : '';
+        const displayBalanceError = account.balance_error && !temporaryStaleError
+            ? account.balance_error
+            : '';
+        const availableText = displayBalanceError
+            ? displayBalanceError
             : `${fmtMoney(displayAvailable)} USDT`;
         setText(`${mode}-current-available`, availableText);
         setText(
             `${mode}-account-equity`,
-            account.balance_error ? '-- USDT' : `${fmtMoney(displayEquity)} USDT`
+            displayBalanceError ? '-- USDT' : `${fmtMoney(displayEquity)} USDT`
         );
         setText(`${mode}-cumulative-loss`, `${fmtMoney(account.cumulative_loss ?? account.realized_loss)} USDT`);
         setText(`${mode}-cumulative-profit`, `${fmtMoney(account.cumulative_profit ?? account.realized_profit)} USDT`);
