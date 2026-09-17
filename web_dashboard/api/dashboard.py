@@ -10465,7 +10465,7 @@ async def get_decisions(
                     "decision_type": decision_type,
                     "decision_type_label": decision_type_label,
                     "confidence": d.confidence,
-                    "reasoning": sanitize_text(d.reasoning),
+                    "reasoning": sanitize_text(localize_execution_reason(d.reasoning)),
                     "position_size_pct": d.position_size_pct,
                     "position_size_pct_basis": "execution_account_available_margin",
                     "position_size_pct_label": "保证金占当前执行账户可用余额比例",
@@ -11522,6 +11522,7 @@ async def get_analysis_records(
             analysis_type,
             display_execution_reason,
         )
+        localized_stored_reasoning = sanitize_text(localize_execution_reason(d.reasoning))
         display_trade_confidence = 0.0 if observed_action else trade_confidence
         display_confidence = _analysis_display_confidence(
             display_action,
@@ -11692,8 +11693,8 @@ async def get_analysis_records(
                 if display_action == "hold" and display_trade_confidence == 0.0
                 else "信心度来自最终可执行裁决。"
             ),
-            "final_reasoning": display_reasoning or sanitize_text(d.reasoning),
-            "observed_reasoning": (sanitize_text(d.reasoning) if observed_action else None),
+            "final_reasoning": display_reasoning or localized_stored_reasoning,
+            "observed_reasoning": (localized_stored_reasoning if observed_action else None),
             "position_size_pct": d.position_size_pct,
             "weighted_score": raw.get("weighted_score"),
             "disagreement": raw.get("disagreement"),

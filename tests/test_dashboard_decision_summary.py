@@ -70,7 +70,7 @@ async def test_decisions_endpoint_preserves_list_contract_with_large_stored_payl
                 symbol="BTC/USDT",
                 action="close_long",
                 confidence=0.91,
-                reasoning="risk reduced",
+                reasoning="dynamic_exit_policy_passed",
                 position_size_pct=0.1,
                 suggested_leverage=2.0,
                 feature_snapshot={"unused_training_payload": "x" * 200_000},
@@ -121,5 +121,8 @@ async def test_decisions_endpoint_preserves_list_contract_with_large_stored_payl
         assert item["order_quantity"] == 0.25
         assert item["order_status"] == "rejected"
         assert "51028" in item["execution_reason"]
+        assert item["reasoning"] == (
+            "动态退出策略初步检查已通过，正在继续校验减仓比例、费用和交易规则。"
+        )
     finally:
         await close_db()

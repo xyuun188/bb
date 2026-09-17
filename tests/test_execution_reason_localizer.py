@@ -7,6 +7,26 @@ def test_localize_unknown_reason_preserves_text() -> None:
     assert localize_execution_reason("自定义中文原因") == "自定义中文原因"
 
 
+def test_localize_dynamic_exit_dashboard_codes() -> None:
+    assert localize_execution_reason("dynamic_exit_policy_passed") == (
+        "动态退出策略初步检查已通过，正在继续校验减仓比例、费用和交易规则。"
+    )
+    assert localize_execution_reason("dynamic_exit_fraction_below_execution_minimum") == (
+        "建议减仓比例低于系统最小自动减仓比例 5%，本轮不提交平仓订单，继续持有。"
+    )
+
+
+def test_localize_multiple_dynamic_exit_codes() -> None:
+    localized = localize_execution_reason(
+        "dynamic_exit_fraction_below_execution_minimum,minimum_position_observation_not_elapsed"
+    )
+
+    assert localized == (
+        "建议减仓比例低于系统最小自动减仓比例 5%，本轮不提交平仓订单，继续持有；"
+        "持仓观察时间尚未达到最小要求，本轮继续观察。"
+    )
+
+
 def test_localize_legacy_final_override_observation_note() -> None:
     localized = localize_execution_reason(
         "Production permission belongs to the authoritative fee-after return policy; "
