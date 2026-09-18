@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
 from core.model_candidate_manifest import MANIFEST_VERSION, ModelCandidateManifest
 from core.model_topology import target_topology_ready
+
+
+def _fresh_validated_at() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _manifest(**overrides):
@@ -35,7 +40,7 @@ def _manifest(**overrides):
         "max_concurrency": 1,
         "storage_available_gib": 85.0,
         "storage_required_free_gib": 20.0,
-        "validated_at": "2026-09-10T08:00:00Z",
+        "validated_at": _fresh_validated_at(),
         "validator_version": "bb-model-validator.v1",
     }
     value.update(overrides)

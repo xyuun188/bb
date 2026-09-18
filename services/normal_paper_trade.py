@@ -10,7 +10,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
+NORMAL_PAPER_TRADE_VERSION = "2026-09-18.normal-paper-strategy-trade.v10"
+LEGACY_NORMAL_PAPER_TRADE_V9_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
 LEGACY_NORMAL_PAPER_TRADE_V8_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
 LEGACY_NORMAL_PAPER_TRADE_V7_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
 LEGACY_NORMAL_PAPER_TRADE_V6_VERSION = "2026-08-19.normal-paper-strategy-trade.v6"
@@ -377,7 +378,10 @@ def select_normal_paper_trade_side(
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
         and item["objective_net_return_pct"] is not None
-        and float(item["objective_net_return_pct"]) > 0.0
+        and (
+            float(item["objective_net_return_pct"]) > 0.0
+            or item["selection_reason"] == "paper_quality_observation"
+        )
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -455,7 +459,10 @@ def build_normal_paper_trade_contract(
         or expected_net is None
         or expected_net <= 0.0
         or objective_net is None
-        or objective_net <= 0.0
+        or (
+            objective_net <= 0.0
+            and selection_reason != "paper_quality_observation"
+        )
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
@@ -652,6 +659,7 @@ def _normal_strategy_trade_contract_reasons(
     ]
     if expected_version in {
         NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     }:
         if contract.get("paper_quality_observation_only") is not observation_mode:
@@ -694,6 +702,7 @@ def _normal_strategy_trade_contract_reasons(
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     graduated_observation_version = expected_version in {
         NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     }
     expected_single_cap = (
@@ -742,6 +751,18 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     return _normal_strategy_trade_contract_reasons(
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+        require_quality_permission=True,
+        allow_non_positive_objective_observation=True,
+    )
+
+
+def legacy_normal_paper_v9_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v9 envelopes for settlement and recovery only."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
     )
@@ -971,6 +992,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V9_VERSION:
+        return legacy_normal_paper_v9_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V8_VERSION:
         return legacy_normal_paper_v8_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION:

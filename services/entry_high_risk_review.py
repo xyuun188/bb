@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.safe_output import safe_error_text
+from services.entry_direction_metrics import selected_entry_metrics
 from services.trading_policies import PolicyGateResult
 
 _DEFAULT_DISAGREEMENT_THRESHOLD = 1 / 3
@@ -154,6 +155,7 @@ class EntryHighRiskReviewGatePolicy:
         raw = _safe_dict(decision.raw_response)
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
         sizing = _safe_dict(raw.get("profit_risk_sizing"))
+        selected_metrics = selected_entry_metrics(decision, model_mode)
         normal_risk_cap = _safe_float(
             normal_trade.get("single_trade_risk_fraction_cap"), -1.0
         )
@@ -164,6 +166,11 @@ class EntryHighRiskReviewGatePolicy:
         violations: list[str] = []
         if str(model_mode or "").lower() != "paper":
             violations.append("execution_mode_not_paper")
+        if not (
+            selected_metrics.source == "normal_paper_trade_contract"
+            and selected_metrics.quality_observation
+        ):
+            violations.append("paper_quality_observation_contract_invalid")
         if normal_trade.get("execution_scope") != "paper_only":
             violations.append("normal_trade_scope_invalid")
         if normal_trade.get("production_permission") is not False:
@@ -231,12 +238,17 @@ class EntryHighRiskReviewGatePolicy:
         self._annotate(decision, payload)
         return PolicyGateResult.allow({"high_risk_review": payload})
 
-    def trigger_reasons(self, decision: DecisionOutput) -> list[str]:
+    def trigger_reasons(
+        self,
+        decision: DecisionOutput,
+        model_mode: str = "",
+    ) -> list[str]:
         """Return deterministic reasons that require a second risk opinion."""
         if not decision.is_entry:
             return []
         raw = _safe_dict(decision.raw_response)
         opportunity = _safe_dict(raw.get("opportunity_score"))
+        metrics = selected_entry_metrics(decision, model_mode)
         reasons: list[str] = []
         if entry_expert_disagreement(decision) >= self._threshold(
             "high_risk_review_disagreement_threshold", _DEFAULT_DISAGREEMENT_THRESHOLD
@@ -245,15 +257,17 @@ class EntryHighRiskReviewGatePolicy:
         if ml_ai_direction_conflict(decision):
             reasons.append("ml_ai_direction_conflict")
         tail_risk = max(
-            _safe_float(opportunity.get("tail_risk_score")),
+            metrics.tail_risk_score,
             _safe_float(raw.get("tail_risk_score")),
         )
         if tail_risk >= self._threshold(
             "high_risk_review_tail_risk_threshold", _DEFAULT_TAIL_RISK_THRESHOLD
         ):
             reasons.append("tail_risk")
-        expected_net = opportunity.get("expected_net_return_pct")
-        if expected_net is not None and _safe_float(expected_net, 0.0) <= 0:
+        if (
+            metrics.expected_net_return_available
+            and metrics.expected_net_return_pct <= 0
+        ):
             reasons.append("non_positive_expected_net")
         sizing = _safe_dict(raw.get("profit_risk_sizing"))
         leverage = max(
@@ -293,6 +307,7 @@ class EntryHighRiskReviewGatePolicy:
         raw = _safe_dict(decision.raw_response)
         opportunity = _safe_dict(raw.get("opportunity_score"))
         sizing = _safe_dict(raw.get("profit_risk_sizing"))
+        metrics = selected_entry_metrics(decision, model_mode)
         return {
             "symbol": decision.symbol,
             "side": entry_side_value(decision),
@@ -308,9 +323,23 @@ class EntryHighRiskReviewGatePolicy:
             "ml_ai_direction_conflict": ml_ai_direction_conflict(decision),
             "opportunity_score": {
                 "score": opportunity.get("score"),
-                "expected_net_return_pct": opportunity.get("expected_net_return_pct"),
-                "tail_risk_score": opportunity.get("tail_risk_score"),
+                "side": metrics.side,
+                "source": metrics.source,
+                "expected_net_return_pct": (
+                    metrics.expected_net_return_pct
+                    if metrics.expected_net_return_available
+                    else None
+                ),
+                "objective_net_return_pct": metrics.objective_net_return_pct,
+                "profit_quality_ratio": metrics.profit_quality_ratio,
+                "loss_probability": (
+                    metrics.loss_probability
+                    if metrics.loss_probability_available
+                    else None
+                ),
+                "tail_risk_score": metrics.tail_risk_score,
                 "reward_risk_ratio": opportunity.get("reward_risk_ratio"),
+                "paper_quality_observation": metrics.quality_observation,
             },
             "sizing": {
                 "final_notional_usdt": sizing.get("final_notional_usdt"),
@@ -338,7 +367,7 @@ class EntryHighRiskReviewGatePolicy:
         if not decision.is_entry:
             return None
         positions = open_positions or []
-        reasons = self.trigger_reasons(decision)
+        reasons = self.trigger_reasons(decision, model_mode)
         base_review = {
             "read_only": False,
             "production_permission": False,
@@ -521,6 +550,22 @@ class EntryHighRiskReviewGatePolicy:
             "high_risk_review_min_confidence", _DEFAULT_MIN_APPROVAL_CONFIDENCE
         ):
             return PolicyGateResult.allow({"high_risk_review": payload})
+        advisory = self._allow_paper_advisory_only(
+            decision,
+            model_mode,
+            base_review,
+            status="rejected_advisory_only",
+            unavailable_reason=(
+                "reviewer_rejection_is_advisory_for_bounded_paper_observation"
+            ),
+            extra={
+                **payload,
+                "reviewer_approved": approved,
+                "reviewer_confidence": round(confidence, 6),
+            },
+        )
+        if advisory is not None:
+            return advisory
         if approved:
             payload["status"] = "invalid_response_blocked"
             payload["error_code"] = "approval_confidence_below_floor"

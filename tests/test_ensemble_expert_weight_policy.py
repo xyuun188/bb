@@ -190,9 +190,17 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
         "information_value_score": 0.04,
         "policy_provenance": provenance,
     }
+    quality_observation_governance = {
+        "paper_execution_permission": False,
+        "paper_execution_reason": "fee_after_return_lcb_not_positive",
+        "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+        "paper_execution_evidence_source": "trusted_settlement",
+        "paper_execution_evidence": {"sample_count": 0},
+        "break_even_contract": {"return_lcb_above_zero": False},
+    }
     evidence = {
         "preferred_side_by_evidence": "neutral",
-        "preferred_exploration_side": "long",
+        "preferred_paper_observation_side": "long",
         "feature_opportunity_score": 8.0,
         "long": {
             "production_eligible": False,
@@ -219,12 +227,30 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
                         "source": "local_ml",
                         "decision_eligible": True,
                         "raw_expected_return_pct": 0.3,
-                        "objective_expected_return_pct": 0.1,
+                        "objective_expected_return_pct": -0.1,
                         "horizon_minutes": 30,
+                        "return_distribution_contract": {
+                            "tail_loss_probability": 0.3,
+                        },
+                        "paper_return_quality_governance": quality_observation_governance,
                     }
                 ]
             },
-            "short": {"evidence": []},
+            "short": {
+                "evidence": [
+                    {
+                        "source": "local_ml",
+                        "decision_eligible": True,
+                        "raw_expected_return_pct": -0.2,
+                        "objective_expected_return_pct": -0.4,
+                        "horizon_minutes": 30,
+                        "return_distribution_contract": {
+                            "tail_loss_probability": 0.4,
+                        },
+                        "paper_return_quality_governance": quality_observation_governance,
+                    }
+                ]
+            },
         },
         "entry_candidate_evidence": evidence,
     }
@@ -347,17 +373,23 @@ def test_live_entry_keeps_legacy_execution_values() -> None:
     assert "multidimensional_recommendation" not in decision.raw_response
 
 
-def test_positive_mean_uncertain_candidate_remains_shadow_only() -> None:
+def test_positive_mean_uncertain_candidate_becomes_bounded_paper_observation() -> None:
     decision = _coordinator().combine(
         _features(),
         _paper_exploration_context("paper"),
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.HOLD
-    assert "normal_paper_trade" not in decision.raw_response
-    assert decision.raw_response["paper_trade_selection"]["selected"] is False
-    assert decision.raw_response["entry_permission"]["granted"] is False
+    assert decision.action == Action.LONG
+    contract = decision.raw_response["normal_paper_trade"]
+    assert contract["selection_reason"] == "paper_quality_observation"
+    assert contract["expected_net_return_pct"] > 0.0
+    assert contract["objective_net_return_pct"] < 0.0
+    assert contract["execution_scope"] == "paper_only"
+    assert contract["production_permission"] is False
+    assert contract["single_trade_risk_fraction_cap"] <= 0.0003
+    assert decision.raw_response["paper_trade_selection"]["selected"] is True
+    assert decision.raw_response["entry_permission"]["granted"] is True
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:

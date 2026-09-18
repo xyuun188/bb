@@ -17,6 +17,8 @@ from services.high_risk_review_service import (
     HighRiskReviewGatewayError,
     HighRiskReviewService,
 )
+from services.normal_paper_trade import build_normal_paper_trade_contract
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 from web_dashboard.api import settings_api
 
 
@@ -34,6 +36,35 @@ def high_risk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _paper_quality_observation_decision() -> DecisionOutput:
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "average_fee_after_return_not_positive",
+            "paper_execution_blockers": ["average_fee_after_return_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    contract = build_normal_paper_trade_contract(
+        symbol="ETH/USDT",
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.2,
+            "objective_net_return_pct": -0.1,
+            "loss_probability": 0.4,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": [
+                "average_fee_after_return_not_positive"
+            ],
+            "strong_expert_opposition": False,
+        },
+    )
     return DecisionOutput(
         model_name="ensemble_trader",
         symbol="ETH/USDT",
@@ -44,19 +75,85 @@ def _paper_quality_observation_decision() -> DecisionOutput:
         suggested_leverage=1.0,
         raw_response={
             "opinions": [{"action": "long"}, {"action": "short"}],
-            "normal_paper_trade": {
-                "execution_scope": "paper_only",
-                "production_permission": False,
-                "paper_quality_observation_only": True,
-                "single_trade_risk_fraction_cap": 0.0002,
-            },
+            "normal_paper_trade": contract,
             "profit_risk_sizing": {
                 "execution_scope": "paper_only",
                 "production_permission": False,
                 "production_eligible": True,
                 "paper_quality_observation_mode": True,
-                "single_trade_risk_fraction_cap": 0.0002,
+                "single_trade_risk_fraction_cap": contract[
+                    "single_trade_risk_fraction_cap"
+                ],
                 "final_leverage": 1.0,
+            },
+        },
+    )
+
+
+def _v10_quality_observation_decision() -> DecisionOutput:
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "average_fee_after_return_not_positive",
+            "paper_execution_blockers": ["average_fee_after_return_not_positive"],
+            "paper_execution_evidence": {"sample_count": 0},
+        }
+    )
+    contract = build_normal_paper_trade_contract(
+        symbol="ARB/USDT",
+        side="short",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.0241367,
+            "objective_net_return_pct": -0.686895,
+            "loss_probability": 0.4851,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": [
+                "average_fee_after_return_not_positive"
+            ],
+            "strong_expert_opposition": False,
+        },
+    )
+    return DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="ARB/USDT",
+        action=Action.SHORT,
+        confidence=0.5149,
+        reasoning="bounded paper observation",
+        position_size_pct=0.015,
+        suggested_leverage=1.0,
+        raw_response={
+            "opinions": [{"action": "short"}, {"action": "long"}],
+            "opportunity_score": {
+                "expected_net_return_pct": -0.1278,
+                "return_lcb_pct": -0.9,
+                "server_profit_loss_probability": 0.0,
+                "tail_risk_score": 0.0,
+            },
+            "entry_candidate_evidence": {
+                "short": {
+                    "expected_net_return_pct": -0.1278,
+                    "return_lcb_pct": -0.9,
+                    "loss_probability": 0.0,
+                }
+            },
+            "normal_paper_trade": contract,
+            "profit_risk_sizing": {
+                "execution_scope": "paper_only",
+                "production_permission": False,
+                "production_eligible": True,
+                "paper_quality_observation_mode": True,
+                "single_trade_risk_fraction_cap": contract[
+                    "single_trade_risk_fraction_cap"
+                ],
+                "final_leverage": 1.0,
+                "final_notional_usdt": 151.48378364,
             },
         },
     )
@@ -822,6 +919,52 @@ async def test_entry_high_risk_review_does_not_call_reviewer_for_ordinary_entry(
     assert decision.raw_response["high_risk_review"]["approved"] is None
 
 
+def test_v10_quality_observation_review_uses_signed_contract_metrics() -> None:
+    decision = _v10_quality_observation_decision()
+    policy = EntryHighRiskReviewGatePolicy()
+
+    reasons = policy.trigger_reasons(decision, "paper")
+    prompt = policy._prompt(decision, "paper", [], reasons, None)
+    metrics = prompt["opportunity_score"]
+
+    assert "non_positive_expected_net" not in reasons
+    assert metrics["source"] == "normal_paper_trade_contract"
+    assert metrics["side"] == "short"
+    assert metrics["expected_net_return_pct"] == 0.0241367
+    assert metrics["objective_net_return_pct"] == -0.686895
+    assert metrics["loss_probability"] == 0.4851
+    assert metrics["paper_quality_observation"] is True
+
+
+def test_live_review_never_uses_normal_paper_contract_metrics() -> None:
+    decision = _v10_quality_observation_decision()
+    policy = EntryHighRiskReviewGatePolicy()
+
+    reasons = policy.trigger_reasons(decision, "live")
+    prompt = policy._prompt(decision, "live", [], reasons, None)
+    metrics = prompt["opportunity_score"]
+
+    assert "non_positive_expected_net" in reasons
+    assert metrics["source"] == "entry_candidate_evidence"
+    assert metrics["expected_net_return_pct"] == -0.1278
+    assert metrics["paper_quality_observation"] is False
+
+
+def test_tampered_v10_contract_cannot_override_review_metrics() -> None:
+    decision = _v10_quality_observation_decision()
+    decision.raw_response["normal_paper_trade"]["loss_probability"] = 0.1
+    policy = EntryHighRiskReviewGatePolicy()
+
+    reasons = policy.trigger_reasons(decision, "paper")
+    prompt = policy._prompt(decision, "paper", [], reasons, None)
+    metrics = prompt["opportunity_score"]
+
+    assert "non_positive_expected_net" in reasons
+    assert metrics["source"] == "entry_candidate_evidence"
+    assert metrics["expected_net_return_pct"] == -0.1278
+    assert metrics["loss_probability"] == 0.0
+
+
 @pytest.mark.asyncio
 async def test_entry_high_risk_review_does_not_annotate_non_entry() -> None:
     decision = DecisionOutput(
@@ -908,3 +1051,97 @@ async def test_paper_quality_observation_records_reviewer_error_as_advisory(
     assert review["status"] == "error_advisory_only"
     assert review["approved"] is None
     assert review["error_code"] == "reviewer_call_failed"
+
+
+@pytest.mark.asyncio
+async def test_v10_quality_observation_records_reviewer_rejection_as_advisory(
+    high_risk_settings: None,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class ReviewerRejects:
+        async def review_trade(self, prompt: dict[str, Any], **_kwargs: Any) -> Any:
+            captured.update(prompt)
+            return type(
+                "Review",
+                (),
+                {
+                    "approved": False,
+                    "confidence": 0.92,
+                    "reason": "稳健下界仍为负，建议继续观察",
+                    "attempts": [],
+                },
+            )()
+
+    decision = _v10_quality_observation_decision()
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerRejects()).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+
+    assert result is not None and result.passed is True
+    assert captured["opportunity_score"]["expected_net_return_pct"] == 0.0241367
+    review = decision.raw_response["high_risk_review"]
+    assert review["status"] == "rejected_advisory_only"
+    assert review["approved"] is None
+    assert review["hard_review_required"] is False
+    assert review["reviewer_approved"] is False
+    assert review["reviewer_confidence"] == 0.92
+
+
+@pytest.mark.asyncio
+async def test_tampered_quality_observation_reviewer_rejection_remains_blocking(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerRejects:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            return type(
+                "Review",
+                (),
+                {
+                    "approved": False,
+                    "confidence": 0.92,
+                    "reason": "合同无效",
+                    "attempts": [],
+                },
+            )()
+
+    decision = _v10_quality_observation_decision()
+    decision.raw_response["normal_paper_trade"]["loss_probability"] = 0.1
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerRejects()).evaluate(
+        decision,
+        "paper",
+        [],
+    )
+
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_rejected"
+
+
+@pytest.mark.asyncio
+async def test_live_quality_observation_reviewer_rejection_remains_blocking(
+    high_risk_settings: None,
+) -> None:
+    class ReviewerRejects:
+        async def review_trade(self, *_args: Any, **_kwargs: Any) -> Any:
+            return type(
+                "Review",
+                (),
+                {
+                    "approved": False,
+                    "confidence": 0.92,
+                    "reason": "实盘风险不通过",
+                    "attempts": [],
+                },
+            )()
+
+    decision = _v10_quality_observation_decision()
+    result = await EntryHighRiskReviewGatePolicy(reviewer=ReviewerRejects()).evaluate(
+        decision,
+        "live",
+        [],
+    )
+
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_rejected"

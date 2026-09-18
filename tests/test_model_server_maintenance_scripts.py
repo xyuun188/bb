@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fresh_validated_at() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 @pytest.fixture
@@ -271,7 +276,7 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
                 "max_concurrency": 1,
                 "storage_available_gib": 85.0,
                 "storage_required_free_gib": 20.0,
-                "validated_at": "2026-09-10T08:00:00Z",
+                "validated_at": _fresh_validated_at(),
                 "validator_version": "bb-model-validator.v1",
             }
         ),

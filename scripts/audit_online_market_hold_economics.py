@@ -91,16 +91,26 @@ async def main():
         rows = list(
             (
                 await session.execute(
-                    select(AIDecision)
+                    select(
+                        AIDecision.id,
+                        AIDecision.analysis_type,
+                        AIDecision.symbol,
+                        AIDecision.action,
+                        AIDecision.created_at,
+                        AIDecision.execution_reason,
+                        AIDecision.was_executed,
+                        AIDecision.raw_llm_response,
+                        AIDecision.model_health_opinions,
+                        AIDecision.model_health_timings,
+                    )
                     .where(*filters)
                     .order_by(AIDecision.id.desc())
                     .limit(LIMIT)
                 )
             )
-            .scalars()
             .all()
         )
-        consultation_rows = list(
+        non_market_consultation_rows = list(
             (
                 await session.execute(
                     select(
@@ -112,6 +122,7 @@ async def main():
                     )
                     .where(
                         AIDecision.is_paper.is_(True),
+                        AIDecision.analysis_type != "market",
                         *([AIDecision.created_at >= since] if since is not None else []),
                     )
                     .order_by(AIDecision.id.desc())
@@ -120,13 +131,17 @@ async def main():
             )
             .all()
         )
+        consultation_rows = [*rows, *non_market_consultation_rows]
         duplicate_rows = (
             await session.execute(
                 select(
                     AIDecision.analysis_idempotency_key,
                     func.count(AIDecision.id),
                 )
-                .where(AIDecision.analysis_idempotency_key.is_not(None))
+                .where(
+                    *filters,
+                    AIDecision.analysis_idempotency_key.is_not(None),
+                )
                 .group_by(AIDecision.analysis_idempotency_key)
                 .having(func.count(AIDecision.id) > 1)
             )
@@ -155,14 +170,34 @@ async def main():
         "all_experts_hold": 0,
         "evidence_present": 0,
         "preferred_side": Counter(),
+        "preferred_paper_observation_side": Counter(),
         "side": {
             "long": Counter(),
             "short": Counter(),
         },
         "side_metric_values": {
-            "long": {"expected_net_return_pct": [], "return_lcb_pct": []},
-            "short": {"expected_net_return_pct": [], "return_lcb_pct": []},
+            "long": {
+                "gross_expected_return_pct": [],
+                "execution_cost_pct": [],
+                "expected_net_return_pct": [],
+                "return_lcb_pct": [],
+                "lcb_penalty_pct": [],
+                "return_uncertainty_pct": [],
+                "loss_probability": [],
+                "tail_risk_score": [],
+            },
+            "short": {
+                "gross_expected_return_pct": [],
+                "execution_cost_pct": [],
+                "expected_net_return_pct": [],
+                "return_lcb_pct": [],
+                "lcb_penalty_pct": [],
+                "return_uncertainty_pct": [],
+                "loss_probability": [],
+                "tail_risk_score": [],
+            },
         },
+        "quality_permission_blockers": Counter(),
         "authoritative_candidate": Counter(),
         "cross_validation_count_distribution": Counter(),
         "consultation": Counter(),
@@ -174,6 +209,8 @@ async def main():
         "positive_all_hold_examples": [],
         "positive_not_selected_examples": [],
         "positive_production_examples": [],
+        "positive_mean_non_positive_lcb_examples": [],
+        "directional_decision_examples": [],
         "symbol_counts": Counter(),
         "duplicate_idempotency_key_count": len(duplicate_rows),
     }
@@ -247,6 +284,28 @@ async def main():
             evidence.get("preferred_side_by_evidence") or "missing"
         ).lower()
         summary["preferred_side"][preferred] += 1
+        preferred_observation = str(
+            evidence.get("preferred_paper_observation_side") or "missing"
+        ).lower()
+        summary["preferred_paper_observation_side"][preferred_observation] += 1
+
+        competition = _dict(raw.get("direction_competition"))
+        for competition_side in ("long", "short"):
+            competition_evidence = _list(
+                _dict(competition.get(competition_side)).get("evidence")
+            )
+            for item in competition_evidence:
+                if not isinstance(item, dict):
+                    continue
+                permission = _dict(item.get("paper_return_quality_governance"))
+                if not permission or permission.get("paper_execution_permission") is True:
+                    continue
+                blockers = _list(permission.get("paper_execution_blockers")) or [
+                    permission.get("paper_execution_reason")
+                ]
+                for blocker in blockers:
+                    if str(blocker or "").strip():
+                        summary["quality_permission_blockers"][str(blocker)] += 1
 
         positive_sides = []
         production_sides = []
@@ -270,12 +329,59 @@ async def main():
 
             expected_return = _float(side_evidence.get("expected_net_return_pct"))
             return_lcb = _float(side_evidence.get("return_lcb_pct"))
-            if expected_return is not None:
-                summary["side_metric_values"][side]["expected_net_return_pct"].append(
-                    expected_return
-                )
-            if return_lcb is not None:
-                summary["side_metric_values"][side]["return_lcb_pct"].append(return_lcb)
+            execution_cost = _float(
+                _dict(side_evidence.get("execution_cost")).get("total_pct")
+            )
+            gross_expected_return = (
+                expected_return + execution_cost
+                if expected_return is not None and execution_cost is not None
+                else None
+            )
+            lcb_penalty = (
+                expected_return - return_lcb
+                if expected_return is not None and return_lcb is not None
+                else None
+            )
+            return_uncertainty = _float(side_evidence.get("return_uncertainty_pct"))
+            loss_probability = _float(side_evidence.get("loss_probability"))
+            tail_risk_score = _float(side_evidence.get("tail_risk_score"))
+            for metric, value in (
+                ("gross_expected_return_pct", gross_expected_return),
+                ("execution_cost_pct", execution_cost),
+                ("expected_net_return_pct", expected_return),
+                ("return_lcb_pct", return_lcb),
+                ("lcb_penalty_pct", lcb_penalty),
+                ("return_uncertainty_pct", return_uncertainty),
+                ("loss_probability", loss_probability),
+                ("tail_risk_score", tail_risk_score),
+            ):
+                if value is not None:
+                    summary["side_metric_values"][side][metric].append(value)
+            if expected_return is not None and expected_return > 0.0:
+                side_summary["positive_expected_mean"] += 1
+                if return_lcb is not None and return_lcb <= 0.0:
+                    side_summary["positive_mean_non_positive_lcb"] += 1
+                    if side_evidence.get("paper_eligible") is True:
+                        side_summary["positive_mean_non_positive_lcb_paper_eligible"] += 1
+                    if len(summary["positive_mean_non_positive_lcb_examples"]) < 20:
+                        summary["positive_mean_non_positive_lcb_examples"].append(
+                            {
+                                "id": row.id,
+                                "symbol": row.symbol,
+                                "side": side,
+                                "preferred_paper_observation_side": preferred_observation,
+                                "gross_expected_return_pct": gross_expected_return,
+                                "execution_cost_pct": execution_cost,
+                                "expected_net_return_pct": expected_return,
+                                "return_lcb_pct": return_lcb,
+                                "lcb_penalty_pct": lcb_penalty,
+                                "return_uncertainty_pct": return_uncertainty,
+                                "loss_probability": loss_probability,
+                                "tail_risk_score": tail_risk_score,
+                            }
+                        )
+            else:
+                side_summary["non_positive_expected_mean"] += 1
             positive = bool(
                 expected_return is not None
                 and return_lcb is not None
@@ -313,6 +419,63 @@ async def main():
             reason=row.execution_reason,
         )
         summary["funnel_reasons"][str(funnel_reason or "executed")] += 1
+        if action in {"long", "short"} and len(summary["directional_decision_examples"]) < 20:
+            normal_trade = _dict(raw.get("normal_paper_trade"))
+            sizing = _dict(raw.get("profit_risk_sizing"))
+            high_risk_review = _dict(raw.get("high_risk_review"))
+            execution_result = _dict(raw.get("execution_result"))
+            summary["directional_decision_examples"].append(
+                {
+                    "id": row.id,
+                    "symbol": row.symbol,
+                    "action": action,
+                    "created_at": row.created_at,
+                    "was_executed": bool(row.was_executed),
+                    "execution_reason": row.execution_reason,
+                    "funnel_reason": funnel_reason,
+                    "entry_permission": _dict(raw.get("entry_permission")),
+                    "paper_trade_selection": _dict(raw.get("paper_trade_selection")),
+                    "normal_paper_trade": normal_trade,
+                    "high_risk_review": {
+                        key: high_risk_review.get(key)
+                        for key in (
+                            "triggered",
+                            "status",
+                            "approved",
+                            "hard_review_required",
+                            "advisory_review_required",
+                            "reasons",
+                            "unavailable_reason",
+                        )
+                    },
+                    "execution_result": {
+                        key: execution_result.get(key)
+                        for key in (
+                            "success",
+                            "status",
+                            "order_id",
+                            "exchange_order_id",
+                            "filled_quantity",
+                            "average_price",
+                        )
+                    },
+                    "profit_risk_sizing": {
+                        key: sizing.get(key)
+                        for key in (
+                            "production_eligible",
+                            "reason",
+                            "risk_budget_usdt",
+                            "planned_stressed_loss_usdt",
+                            "target_notional_usdt",
+                            "final_notional_usdt",
+                            "final_margin_usdt",
+                            "final_leverage",
+                            "paper_quality_observation_mode",
+                            "single_trade_risk_fraction_cap",
+                        )
+                    },
+                }
+            )
 
         if (
             quality.get("analysis_complete") is not True

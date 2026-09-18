@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-09-17.paper-model-direction.v12"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-09-18.paper-model-direction.v13"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
@@ -431,7 +431,10 @@ def assess_directional_entry_support(
             positive_objective_net = bool(
                 (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
             )
-            current_contract_ready = bool(positive_expected_net and positive_objective_net)
+            current_contract_ready = bool(
+                positive_expected_net
+                and (positive_objective_net or quality_observation_only)
+            )
             if aligned and current_contract_ready:
                 directional_families.append(item)
             elif current_contract_ready:
@@ -498,7 +501,11 @@ def assess_directional_entry_support(
         blockers.append("direction_support_expected_net_not_positive")
     if paper_scope and objective_net_return_pct is None:
         blockers.append("direction_support_objective_net_missing")
-    elif paper_scope and objective_net_return_pct <= 0.0:
+    elif (
+        paper_scope
+        and objective_net_return_pct <= 0.0
+        and not quality_observation_only
+    ):
         blockers.append("direction_support_objective_net_not_positive")
     if (
         paper_scope
@@ -624,9 +631,10 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         if expected_net is None or expected_net <= 0.0:
             reasons.append("direction_support_expected_net_not_positive")
         objective_net = _float(support.get("objective_net_return_pct"))
+        observation_only = support.get("paper_quality_observation_only") is True
         if objective_net is None:
             reasons.append("direction_support_objective_net_missing")
-        elif objective_net <= 0.0:
+        elif objective_net <= 0.0 and not observation_only:
             reasons.append("direction_support_objective_net_not_positive")
     if not support.get("quant_evidence_families"):
         reasons.append("direction_support_quant_evidence_missing")
@@ -638,7 +646,6 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             reasons.append("direction_support_quant_family_conflict")
         if support.get("strong_expert_opposition") is True:
             reasons.append("direction_support_strong_expert_opposition")
-        observation_only = support.get("paper_quality_observation_only") is True
         observation_reasons = [
             str(reason)
             for reason in support.get("paper_quality_observation_reasons") or []

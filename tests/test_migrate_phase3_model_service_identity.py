@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -11,6 +12,10 @@ from scripts.migrate_phase3_model_service_identity import (
     render_target_migration,
     target_service_manifest,
 )
+
+
+def _fresh_validated_at() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _candidate() -> ModelCandidateManifest:
@@ -50,7 +55,7 @@ def _candidate() -> ModelCandidateManifest:
             "max_concurrency": 1,
             "storage_available_gib": 85.0,
             "storage_required_free_gib": 20.0,
-            "validated_at": "2026-09-10T08:00:00Z",
+            "validated_at": _fresh_validated_at(),
             "validator_version": "bb-model-validator.v1",
         }
     )
