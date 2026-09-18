@@ -183,6 +183,58 @@ def test_warming_snapshot_is_not_reused_as_a_durable_result(
     assert system_audit._load_latest_audit_snapshot() is None
 
 
+def test_deferred_snapshot_is_not_reused_as_a_durable_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_path = tmp_path / "system_audit_latest.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "checked_at": datetime.now(UTC).isoformat(),
+                "status": "deferred",
+                "summary": {"cards": 27},
+                "cards": [{"key": "trade_execution_contract", "status": "critical"}],
+                "schema_version": system_audit.SYSTEM_AUDIT_SCHEMA_VERSION,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(system_audit, "_latest_audit_path", lambda: snapshot_path)
+
+    assert system_audit._load_latest_audit_snapshot() is None
+
+
+@pytest.mark.asyncio
+async def test_deferred_refresh_does_not_overwrite_last_completed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_path = tmp_path / "system_audit_latest.json"
+    completed = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "status": "ok",
+        "summary": {"cards": 27},
+        "cards": [{"key": "trade_execution_contract", "status": "ok"}],
+        "schema_version": system_audit.SYSTEM_AUDIT_SCHEMA_VERSION,
+    }
+    snapshot_path.write_text(json.dumps(completed), encoding="utf-8")
+
+    async def fail_refresh(**_kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("audit refresh timed out")
+
+    monkeypatch.setattr(system_audit, "_latest_audit_path", lambda: snapshot_path)
+    monkeypatch.setattr(system_audit, "_run_system_audit_subprocess_once", fail_refresh)
+
+    deferred = await system_audit.refresh_system_audit_snapshot(
+        record_history=False,
+        source="deferred_persistence_test",
+    )
+
+    assert deferred["status"] == "deferred"
+    assert json.loads(snapshot_path.read_text(encoding="utf-8")) == completed
+
+
 class _CompletedProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
         self.returncode: int | None = 0

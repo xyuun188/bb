@@ -2116,7 +2116,43 @@ def test_analysis_detail_renders_market_and_position_funding_contracts() -> None
     assert "record.direction_competition" in detail_block
 
 
+def test_dashboard_status_uses_backend_market_expert_count() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    status_start = script.index("function updateAutoStatus")
+    status_end = script.index("function setSettingsStatus", status_start)
+    status_block = script[status_start:status_end]
+
+    assert "stats?.expected_expert_count" in status_block
+    assert "state.lastStats?.expected_expert_count" in status_block
+    assert "DEFAULT_MARKET_EXPERT_COUNT" in status_block
+    assert "Array.isArray(state.aiExpertModels) ? state.aiExpertModels.length : 0" not in status_block
+    assert "市场专家 / 执行账户" in script
+    assert "statusLabelEl.textContent" in status_block
+
+
 def test_analysis_detail_uses_expected_cross_validation_denominator() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "crossSummary.expected ?? record.cross_requested" in script
+    assert "expertRequestedCross" in script
+    assert "automaticCross" in script
+
+
+def test_analysis_weighted_score_explains_neutral_zero() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    score_start = script.index("function analysisWeightedScoreValue")
+    score_end = script.index("function signedPctValueLabel", score_start)
+    score_block = script[score_start:score_end]
+
+    assert "function analysisWeightedScoreDisplay" in score_block
+    assert "${formatted}（中性观望）" in score_block
+    assert "不代表专家未调用" in score_block
+    assert 'title="${escHtml(analysisWeightedScoreTitle(r))}"' in script
+    assert '综合方向分：${escHtml(analysisWeightedScoreDisplay(record))}' in script
+    assert "return expertCount > 0;" in score_block
+    assert "return expertCount > 0 || expectedCount > 0;" not in score_block
+
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
     assert "crossSummary.expected ?? record.cross_requested" in script

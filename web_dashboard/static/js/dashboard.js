@@ -87,6 +87,7 @@ const state = {
     lastStatsAt: 0,
     lastModeCountsAt: 0,
 };
+const DEFAULT_MARKET_EXPERT_COUNT = 4;
 const PAGE_SIZE = 20;
 const EXPERT_MEMORY_PAGE_SIZE = 10;
 const RISK_ALERT_PAGE_SIZE = 10;
@@ -122,6 +123,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initModalActionButtons();
     initServerMonitorTabs();
     initPaginationControls();
+    updateAutoStatus({});
     fetchDashboardSummary();
     fetchPnlHistory();
     fetchRecentDecisions();
@@ -2860,6 +2862,43 @@ function pctLabel(value, digits = 0) {
     return `${(num * 100).toFixed(digits)}%`;
 }
 
+function analysisWeightedScoreValue(record) {
+    if (record?.weighted_score === null || record?.weighted_score === undefined || record?.weighted_score === '') {
+        return null;
+    }
+    const value = Number(record.weighted_score);
+    return Number.isFinite(value) ? value : null;
+}
+
+function analysisWeightedScoreIsNeutral(record, value = analysisWeightedScoreValue(record)) {
+    if (value === null || Math.abs(value) >= 1e-9 || record?.analysis_complete === false) return false;
+    const expertCount = Number(
+        record?.returned_expert_count
+        ?? record?.expert_count
+        ?? (Array.isArray(record?.experts) ? record.experts.length : 0)
+        ?? 0,
+    );
+    // A zero score is only "neutral" when at least one usable expert result
+    // actually came back. An expected slot count alone cannot prove that the
+    // ensemble ran successfully; failed or skipped calls must stay explicit.
+    return expertCount > 0;
+}
+
+function analysisWeightedScoreDisplay(record) {
+    const value = analysisWeightedScoreValue(record);
+    if (value === null) return '-';
+    const formatted = Math.abs(value) < 0.0005 ? '0.00' : value.toFixed(2);
+    return analysisWeightedScoreIsNeutral(record, value) ? `${formatted}（中性观望）` : formatted;
+}
+
+function analysisWeightedScoreTitle(record) {
+    const value = analysisWeightedScoreValue(record);
+    if (analysisWeightedScoreIsNeutral(record, value)) {
+        return '综合方向分：做多为正、做空为负；本轮有效专家均判断观望，因此为 0，不代表专家未调用。';
+    }
+    return '综合方向分：做多为正、做空为负、观望为 0。';
+}
+
 function signedPctValueLabel(value, digits = 2) {
     const num = Number(value);
     if (!Number.isFinite(num)) return '-';
@@ -3692,7 +3731,7 @@ function renderAnalysisPage() {
 
     tbody.innerHTML = pageData.map(r => {
         const conf = Number(r.final_confidence || 0);
-        const score = r.weighted_score === null || r.weighted_score === undefined ? '-' : Number(r.weighted_score).toFixed(2);
+        const score = analysisWeightedScoreDisplay(r);
         const cross = r.cross_summary || {};
         const preExpertSkip = analysisPreExpertSkip(r);
         const expertCount = Number(r.expert_count || (r.experts || []).length || 0); 
@@ -3725,7 +3764,7 @@ function renderAnalysisPage() {
             <td style="font-size:11px;color:var(--text-muted);">${analysisConsultationLabel(r.consultation_status, hasMajorConflict)}</td>
             <td><span class="badge badge-${analysisDisplayAction(r.final_action, r)}">${analysisActionLabel(r.final_action, r)}</span></td>
             <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${(conf * 100).toFixed(0)}%</td>
-            <td>${score}</td>
+            <td title="${escHtml(analysisWeightedScoreTitle(r))}">${escHtml(score)}</td>
             <td>
                 <button
                     type="button"
@@ -4289,7 +4328,7 @@ function renderAnalysisReasonModal(record) {
                     </div>
                     <div class="analysis-card-text">
                         <div class="analysis-final-metrics">
-                            <span>综合分：${escHtml(record.weighted_score ?? '-')}</span>
+                            <span title="${escHtml(analysisWeightedScoreTitle(record))}">综合方向分：${escHtml(analysisWeightedScoreDisplay(record))}</span>
                             <span>分歧度：${escHtml(record.disagreement ?? '-')}</span>
                         </div>
                         ${analysisOpportunityScoreHtml(record.opportunity_score, record)}
@@ -8675,7 +8714,19 @@ function updateAutoStatus(stats) {
 
     const modelCountEl = document.getElementById('status-model-count');
     if (modelCountEl) {
-        const expertCount = Array.isArray(state.aiExpertModels) ? state.aiExpertModels.length : 0;
+        const statusLabelEl = modelCountEl
+            .closest('.auto-status-item')
+            ?.querySelector('.auto-status-label');
+        if (statusLabelEl) statusLabelEl.textContent = '市场专家 / 执行账户';
+        const expertCountCandidates = [
+            stats?.expected_expert_count,
+            stats?.analysis_quality?.expected_expert_count,
+            state.lastStats?.expected_expert_count,
+        ];
+        const expertCount = expertCountCandidates
+            .map(value => Number(value))
+            .find(value => Number.isFinite(value) && value > 0)
+            || DEFAULT_MARKET_EXPERT_COUNT;
         modelCountEl.textContent = `${expertCount} / 1`;
     }
 

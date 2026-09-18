@@ -6470,10 +6470,11 @@ def _load_latest_audit_snapshot() -> tuple[datetime, dict[str, Any]] | None:
     checked_at = _parse_utc_datetime(payload.get("checked_at"))
     if checked_at is None:
         return None
-    # ``warming`` is only a transient API response.  It must never become a
-    # durable snapshot, otherwise every subsequent request can keep replaying
-    # the placeholder instead of scheduling/reading a real audit result.
-    if str(payload.get("status") or "").lower() == "warming":
+    # ``warming`` and ``deferred`` are transient API responses.  They must
+    # never become durable snapshots, otherwise a subsequent request can keep
+    # replaying a placeholder/failed refresh instead of scheduling or reading
+    # a completed audit result.
+    if str(payload.get("status") or "").lower() in {"warming", "deferred"}:
         return None
     return checked_at, payload
 
@@ -6791,13 +6792,12 @@ async def refresh_system_audit_snapshot(
         global _system_audit_status_cache
         checked_at = _parse_utc_datetime(deferred.get("checked_at")) or _now()
         _system_audit_status_cache = (checked_at, copy.deepcopy(deferred))
-        try:
-            _store_latest_audit_snapshot(deferred)
-        except OSError as persist_exc:
-            logger.warning(
-                "failed to store deferred system audit snapshot",
-                error=safe_error_text(persist_exc, limit=240),
-            )
+        # A deferred result describes this refresh attempt, not a completed
+        # audit.  Keep it in the process cache so the current caller can see
+        # the failure, but never replace the last completed durable snapshot.
+        # Otherwise a timeout/restart loop replays stale cards as if they were
+        # the latest audit and hides the distinction between current facts and
+        # an unavailable refresh.
         return deferred
     finally:
         if task.done() and _system_audit_subprocess_task is task:
