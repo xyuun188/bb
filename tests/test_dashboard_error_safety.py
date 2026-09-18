@@ -1638,6 +1638,8 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
     assert today["okx_cumulative_equity_pnl"] == pytest.approx(-1.63)
     assert today["total_pnl"] == pytest.approx(-1.63)
     assert today["daily_total_pnl"] == pytest.approx(-1.63)
+    assert today["daily_settled_profit"] == pytest.approx(0.0)
+    assert today["daily_settled_loss"] == pytest.approx(0.0)
     assert today["daily_settled_pnl"] == pytest.approx(0.0)
     assert today["current_unsettled_pnl"] == pytest.approx(0.0)
     assert today["unrealized_pnl"] == pytest.approx(0.0)
@@ -2110,11 +2112,11 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
                 "posId": "met-pos",
                 "posSide": "net",
                 "openAvgPx": "10.0",
-                "closeAvgPx": "9.0",
+                "closeAvgPx": "11.0",
                 "openMaxPos": "3",
                 "closeTotalPos": "3",
-                "realizedPnl": "2.7",
-                "pnl": "3.0",
+                "realizedPnl": "-3.3",
+                "pnl": "-3.0",
                 "fundingFee": "0",
                 "type": "2",
                 "cTime": str(int(met_opened.timestamp() * 1000)),
@@ -2163,10 +2165,10 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
                         side="short",
                         quantity=3.0,
                         entry_price=10.0,
-                        current_price=9.0,
+                        current_price=11.0,
                         leverage=1.0,
-                        realized_pnl=2.7,
-                        close_fill_pnl=3.0,
+                        realized_pnl=-3.3,
+                        close_fill_pnl=-3.0,
                         entry_fee=0.1,
                         close_fee=0.2,
                         funding_fee=0.0,
@@ -2219,7 +2221,7 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
                         side="buy",
                         order_type="market",
                         quantity=3.0,
-                        price=9.0,
+                        price=11.0,
                         status="filled",
                         fee=0.0,
                         exchange_order_id="met-close",
@@ -2238,8 +2240,14 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
 
     day = next(row for row in payload["records"] if row["date"] == "2026-07-05")
     assert day["trade_count"] == 2
-    assert day["realized_profit"] == pytest.approx(7.0971172)
-    assert day["realized_pnl"] == pytest.approx(7.0971172)
+    assert day["win_count"] == 1
+    assert day["loss_count"] == 1
+    assert day["realized_profit"] == pytest.approx(4.3971172)
+    assert day["realized_loss"] == pytest.approx(3.3)
+    assert day["realized_pnl"] == pytest.approx(1.0971172)
+    assert day["daily_settled_profit"] == pytest.approx(4.3971172)
+    assert day["daily_settled_loss"] == pytest.approx(-3.3)
+    assert day["daily_settled_pnl"] == pytest.approx(1.0971172)
     assert day["symbols"] == ["MET/USDT", "PROS/USDT"]
     assert {item["symbol"] for item in day["position_details"]} == {"MET/USDT", "PROS/USDT"}
     assert all(item["symbol"] != "FAKE/USDT" for item in day["position_details"])

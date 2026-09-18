@@ -921,13 +921,27 @@ function dailyPnlUnsettledDisplay(row) {
     return `<span style="color:${signedMoneyColor(value)};">${signedMoneyWithUnit(value)}</span>`;
 }
 
+function dailyPnlSettledProfitValue(row) {
+    const value = valueNumber(row?.daily_settled_profit ?? row?.realized_profit);
+    return value === null ? 0 : Math.max(value, 0);
+}
+
+function dailyPnlSettledLossValue(row) {
+    const explicitValue = valueNumber(row?.daily_settled_loss);
+    if (explicitValue !== null) return Math.min(explicitValue, 0);
+    const legacyValue = valueNumber(row?.realized_loss);
+    return legacyValue === null ? 0 : -Math.abs(legacyValue);
+}
+
 function dailyPnlSummaryHtml(row, activityMarkup = '') {
-    const settled = row?.daily_settled_pnl ?? row?.realized_pnl;
+    const settledProfit = dailyPnlSettledProfitValue(row);
+    const settledLoss = dailyPnlSettledLossValue(row);
     return `
         <div class="daily-pnl-modal-summary">
-            <div><span>当日总盈亏</span><strong>${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</strong></div>
-            <div><span>当日已结算盈亏</span><strong style="color:${signedMoneyColor(settled)};">${signedMoneyWithUnit(settled)}</strong></div>
-            <div><span>当前未结算盈亏</span><strong>${dailyPnlUnsettledDisplay(row)}</strong></div>
+            <div><span>今日已结算盈利</span><strong style="color:${signedMoneyColor(settledProfit)};">${signedMoneyWithUnit(settledProfit)}</strong></div>
+            <div><span>今日已结算亏损</span><strong style="color:${signedMoneyColor(settledLoss)};">${signedMoneyWithUnit(settledLoss)}</strong></div>
+            <div><span>今日未结算盈亏</span><strong>${dailyPnlUnsettledDisplay(row)}</strong></div>
+            <div><span>今日总盈亏</span><strong>${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</strong></div>
             <div><span>累计总盈亏</span><strong>${dailyPnlEquityDisplay(row, 'cumulative_total_pnl', 'okx_cumulative_equity_pnl')}</strong></div>
             ${activityMarkup}
         </div>
@@ -938,7 +952,7 @@ function dailyPnlMissingSnapshotNotice(row) {
     if (!dailyPnlOkxSnapshotMissing(row)) return '';
     return `
         <div class="info-banner" style="margin:8px 0;">
-            当日没有 OKX 账户权益快照，所以总盈亏和累计总盈亏暂不显示；已结算盈亏仍按已确认的平仓记录展示。
+            当日没有 OKX 账户权益快照，所以今日总盈亏和累计总盈亏暂不显示；今日已结算盈利和亏损仍按已确认的平仓记录分别展示。
         </div>
     `;
 }
@@ -10086,11 +10100,12 @@ function renderDailyPnlRecords(records) {
     const tbody = document.getElementById('daily-pnl-tbody');
     if (!tbody) return;
     if (!records.length) {
-        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">暂无每日盈亏记录</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">暂无每日盈亏记录</td></tr>';
         return;
     }
     tbody.innerHTML = records.map(row => {
-        const settled = row.daily_settled_pnl ?? row.realized_pnl;
+        const settledProfit = dailyPnlSettledProfitValue(row);
+        const settledLoss = dailyPnlSettledLossValue(row);
         const winLoss = `${Number(row.win_count || 0)}胜 / ${Number(row.loss_count || 0)}亏`;
         const symbolCount = Array.isArray(row.symbol_pnl)
             ? row.symbol_pnl.length
@@ -10107,9 +10122,10 @@ function renderDailyPnlRecords(records) {
         return `
         <tr>
             <td style="font-weight:700;white-space:nowrap;">${escHtml(row.date || '-')}</td>
-            <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</td>
-            <td style="color:${signedMoneyColor(settled)};font-weight:700;">${signedMoneyWithUnit(settled)}</td>
+            <td style="color:${signedMoneyColor(settledProfit)};font-weight:700;">${signedMoneyWithUnit(settledProfit)}</td>
+            <td style="color:${signedMoneyColor(settledLoss)};font-weight:700;">${signedMoneyWithUnit(settledLoss)}</td>
             <td>${dailyPnlUnsettledDisplay(row)}</td>
+            <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</td>
             <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'cumulative_total_pnl', 'okx_cumulative_equity_pnl')}</td>
             <td>${orderCount} <span style="color:var(--text-muted);font-size:10px;">${orderWinLoss}</span></td>
             <td>

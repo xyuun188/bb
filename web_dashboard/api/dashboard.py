@@ -190,7 +190,7 @@ _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS = 20000
 _DASHBOARD_PROFIT_ATTRIBUTION_MAX_ORDER_ROWS = 6000
 _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS = 5000
-_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 1
+_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 2
 _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 3600
 _dashboard_daily_pnl_refresh_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
@@ -14046,8 +14046,10 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
         else:
             row["total_pnl"] = row["okx_equity_pnl"]
             row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
-        # Stable API names for the four values shown in the dashboard.  Keep
+        # Stable API names for the five values shown in the dashboard.  Keep
         # the legacy fields above for existing consumers and cached payloads.
+        row["daily_settled_profit"] = row["realized_profit"]
+        row["daily_settled_loss"] = round(-row["realized_loss"], 8)
         row["daily_total_pnl"] = row["total_pnl"]
         row["daily_settled_pnl"] = row["realized_pnl"]
         row["current_unsettled_pnl"] = row["unrealized_pnl"]

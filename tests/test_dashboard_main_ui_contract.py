@@ -121,19 +121,26 @@ def test_daily_pnl_table_uses_plain_language_metrics() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    for label in (
-        "当日总盈亏",
-        "当日已结算盈亏",
-        "当前未结算盈亏",
+    labels = (
+        "今日已结算盈利",
+        "今日已结算亏损",
+        "今日未结算盈亏",
+        "今日总盈亏",
         "累计总盈亏",
-    ):
+    )
+    for label in labels:
         assert f"<th>{label}</th>" in html
         assert label in script
-    assert "<th>亏损合计</th>" not in html
-    assert "<th>盈利合计</th>" not in html
+    assert [html.index(f"<th>{label}</th>") for label in labels] == sorted(
+        html.index(f"<th>{label}</th>") for label in labels
+    )
+    assert "<th>当日已结算盈亏</th>" not in html
     assert "<th>OKX权益变化</th>" not in html
     assert "function dailyPnlUnsettledDisplay(row)" in script
-    assert '<td colspan="7"' in script
+    assert "function dailyPnlSettledProfitValue(row)" in script
+    assert "function dailyPnlSettledLossValue(row)" in script
+    assert '<td colspan="8"' in script
+    assert "daily-pnl-split-v1" in html
 
 
 def test_ai_model_settings_recognize_keyless_loopback_configuration() -> None:
