@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import io
+import json
+from unittest.mock import Mock
+
+import pytest
+
 from scripts import audit_online_market_hold_economics as audit
 
 
@@ -46,3 +52,58 @@ def test_remote_audit_reports_observation_starvation_economics() -> None:
     assert "hard_review_required" in audit.REMOTE_SCRIPT
     assert "execution_result" in audit.REMOTE_SCRIPT
     assert "exchange_order_id" in audit.REMOTE_SCRIPT
+
+
+def test_remote_audit_reads_large_json_without_log_truncation(monkeypatch) -> None:
+    expected = {"row_count": 500, "evidence": "x" * 150_000}
+    sftp = Mock()
+    sftp.file.return_value = io.BytesIO(json.dumps(expected).encode("utf-8"))
+    ssh = Mock()
+    ssh.open_sftp.return_value = sftp
+    run = Mock(return_value="diagnostic output is not the report")
+    monkeypatch.setattr(audit, "run_remote_text", run)
+    monkeypatch.setattr(audit.secrets, "token_hex", lambda _: "testtoken")
+
+    assert audit._read_remote_report(ssh, 500, 90) == expected
+
+    path = "/data/bb/app/tmp/codex-market-hold-economics/result_testtoken.json"
+    command = run.call_args.args[1]
+    assert command.endswith(f"> {path}")
+    assert "umask 077" in command
+    assert "install -d -m 0700" in command
+    assert run.call_args.kwargs["max_output_chars"] == 4000
+    sftp.file.assert_called_once_with(path, "r")
+    sftp.remove.assert_called_once_with(path)
+    sftp.close.assert_called_once()
+
+
+@pytest.mark.parametrize("output", [b"not-json", b"[]"])
+def test_remote_audit_cleans_up_invalid_report(monkeypatch, output) -> None:
+    sftp = Mock()
+    sftp.file.return_value = io.BytesIO(output)
+    ssh = Mock()
+    ssh.open_sftp.return_value = sftp
+    monkeypatch.setattr(audit, "run_remote_text", Mock(return_value=""))
+
+    with pytest.raises(ValueError):
+        audit._read_remote_report(ssh, 500, 90)
+
+    sftp.remove.assert_called_once()
+    sftp.close.assert_called_once()
+
+
+def test_remote_audit_preserves_execution_failure_during_cleanup(monkeypatch) -> None:
+    sftp = Mock()
+    sftp.remove.side_effect = FileNotFoundError
+    ssh = Mock()
+    ssh.open_sftp.return_value = sftp
+    monkeypatch.setattr(
+        audit, "run_remote_text", Mock(side_effect=RuntimeError("remote audit failed"))
+    )
+
+    with pytest.raises(RuntimeError, match="remote audit failed"):
+        audit._read_remote_report(ssh, 500, 90)
+
+    sftp.file.assert_not_called()
+    sftp.remove.assert_called_once()
+    sftp.close.assert_called_once()

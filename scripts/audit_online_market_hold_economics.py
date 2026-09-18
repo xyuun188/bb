@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import secrets
 import shlex
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -669,6 +671,29 @@ def _build_remote_command(limit: int, since_minutes: int) -> str:
     )
 
 
+def _read_remote_report(ssh, limit: int, since_minutes: int) -> dict:
+    directory = "/data/bb/app/tmp/codex-market-hold-economics"
+    result_path = f"{directory}/result_{secrets.token_hex(12)}.json"
+    sftp = ssh.open_sftp()
+    try:
+        # Structured results must not pass through the bounded SSH log reader.
+        command = (
+            "set -e\numask 077\n"
+            f"install -d -m 0700 {shlex.quote(directory)}\n"
+            f"{_build_remote_command(limit, since_minutes)} > {shlex.quote(result_path)}"
+        )
+        run_remote_text(ssh, command, timeout=180, max_output_chars=4000)
+        with sftp.file(result_path, "r") as remote_file:
+            payload = json.loads(remote_file.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("online market hold audit output must be a JSON object")
+        return payload
+    finally:
+        with suppress(OSError):
+            sftp.remove(result_path)
+        sftp.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Audit whether recent online market holds suppress positive evidence."
@@ -680,15 +705,9 @@ def main() -> None:
     since_minutes = max(0, min(int(args.minutes or 0), 7 * 24 * 60))
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
-        output = run_remote_text(
-            ssh,
-            _build_remote_command(limit, since_minutes),
-            timeout=180,
-            max_output_chars=100_000,
-        )
+        payload = _read_remote_report(ssh, limit, since_minutes)
     finally:
         ssh.close()
-    payload = json.loads(output)
     safe_print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
