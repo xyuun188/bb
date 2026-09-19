@@ -16,7 +16,7 @@ from services.decision_state import (
     DecisionStageStatus,
     append_decision_stage,
 )
-from services.entry_execution_handoff import await_entry_execution_handoff
+from services.entry_execution_handoff import HandoffTimeoutError, await_entry_execution_handoff
 from services.entry_immediate_execution import EntryImmediateExecutionPlanner
 from services.market_decision_result_recorder import MarketDecisionResultRecorder
 
@@ -192,6 +192,63 @@ class MarketAutoEntryProcessor:
                 execution_attempted=True,
                 execution_confirmed=execution_confirmed,
                 reason=immediate_plan.reason,
+            )
+        except HandoffTimeoutError as exc:
+            self._release_capacity(model_name, decision, staged_entry_counts)
+            reason = (
+                "本轮执行仍在处理中：开仓执行交接在 "
+                f"{exc.timeout_seconds:.0f} 秒硬期限内未收口，交易所/本地订单结果未知；"
+                "系统已释放本轮调度并保留 pending/unknown 状态，后续对账继续确认。"
+            )
+            logger.error(
+                "entry execution handoff timed out",
+                symbol=symbol,
+                model=model_name,
+                action=decision.action.value,
+                timeout_seconds=exc.timeout_seconds,
+            )
+            if decision_db_id is not None:
+                raw_response = append_decision_stage(
+                    decision.raw_response if isinstance(decision.raw_response, dict) else {},
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.PENDING,
+                    reason,
+                    {
+                        "skip_kind": "entry_execution_handoff_timeout",
+                        "result_status": "unknown",
+                        "handoff_timeout_seconds": exc.timeout_seconds,
+                    },
+                )
+                raw_response = append_decision_stage(
+                    raw_response,
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.UNKNOWN,
+                    "本轮已停止等待执行交接，交易所回报仍待后续对账确认。",
+                    {
+                        "skip_kind": "entry_execution_handoff_timeout",
+                        "result_status": "unknown",
+                        "handoff_timeout_seconds": exc.timeout_seconds,
+                    },
+                )
+                decision.raw_response = raw_response
+                await self.mark_decision_raw_response(decision_db_id, raw_response)
+                await self.mark_decision_reason(decision_db_id, reason)
+            self.result_recorder.append_result(
+                results=results,
+                model_name=model_name,
+                symbol=symbol,
+                decision_or_action=decision,
+                model_mode=model_mode,
+                approved=True,
+                execution_status="unknown",
+                reason=reason,
+            )
+            return MarketAutoEntryProcessResult(
+                handled=True,
+                execution_attempted=True,
+                execution_confirmed=False,
+                execution_error="handoff_timeout",
+                reason=reason,
             )
         except asyncio.CancelledError:
             self._release_capacity(model_name, decision, staged_entry_counts)

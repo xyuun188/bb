@@ -1427,9 +1427,6 @@ class EntryProfitRiskSizingPolicy:
             ),
             1.0,
         )
-        if quality_observation_mode:
-            model_requested_leverage = 1.0
-            model_leverage_is_explicit = True
         model_position_fraction = _clamp(
             _safe_float(
                 prior_sizing.get("model_requested_position_fraction")
@@ -1562,9 +1559,7 @@ class EntryProfitRiskSizingPolicy:
             0.0,
         )
         requested_leverage = (
-            1.0
-            if quality_observation_mode
-            else min(model_requested_leverage, max_leverage)
+            min(model_requested_leverage, max_leverage)
             if model_leverage_is_explicit and max_leverage >= 1.0
             else max(max_leverage, 1.0)
         )
@@ -1710,8 +1705,6 @@ class EntryProfitRiskSizingPolicy:
             reasons.extend(leverage_decision.reasons)
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
-        if quality_observation_mode and abs(final_leverage - 1.0) > 1e-8:
-            reasons.append("paper_quality_observation_leverage_not_one_x")
         if final_notional <= 0:
             reasons.append("normal_paper_notional_zero")
         if minimum_order_notional <= 0.0:
@@ -1744,9 +1737,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_observation_leverage_cap": (
-                1.0 if quality_observation_mode else None
-            ),
+            "paper_quality_observation_leverage_cap": None,
             "target_notional_usdt": target_notional,
             "minimum_order_notional_usdt": minimum_order_notional,
             "minimum_order_supported": minimum_order_supported,
@@ -1847,9 +1838,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_observation_leverage_cap": (
-                1.0 if quality_observation_mode else None
-            ),
+            "paper_quality_observation_leverage_cap": None,
             "dynamic_leverage_decision": leverage_decision.to_dict(),
             "existing_position_leverage": (
                 round(existing_position_leverage, 8)

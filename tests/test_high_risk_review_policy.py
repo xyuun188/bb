@@ -17,7 +17,10 @@ from services.high_risk_review_service import (
     HighRiskReviewGatewayError,
     HighRiskReviewService,
 )
-from services.normal_paper_trade import build_normal_paper_trade_contract
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    build_normal_paper_trade_contract,
+)
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 from web_dashboard.api import settings_api
 
@@ -982,7 +985,7 @@ async def test_entry_high_risk_review_does_not_annotate_non_entry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_quality_observation_uses_bounded_advisory_when_cloud_is_disabled(
+async def test_paper_quality_observation_uses_current_paper_advisory_when_cloud_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "high_risk_review_enabled", False)
@@ -998,8 +1001,29 @@ async def test_paper_quality_observation_uses_bounded_advisory_when_cloud_is_dis
     assert review["review_required_for_live"] is True
     contract = review["paper_advisory_contract"]
     assert contract["eligible"] is True
-    assert contract["single_trade_risk_fraction_cap"] <= 0.0002
+    assert (
+        contract["single_trade_risk_fraction_cap"]
+        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
     assert contract["final_leverage"] == 1.0
+    assert contract["dynamic_leverage_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_current_paper_advisory_accepts_dynamic_leverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "high_risk_review_enabled", False)
+    decision = _paper_quality_observation_decision()
+    decision.suggested_leverage = 2.0
+    decision.raw_response["profit_risk_sizing"]["final_leverage"] = 2.0
+
+    result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
+
+    assert result is not None and result.passed is True
+    contract = decision.raw_response["high_risk_review"]["paper_advisory_contract"]
+    assert contract["final_leverage"] == 2.0
+    assert contract["dynamic_leverage_allowed"] is True
 
 
 @pytest.mark.asyncio
@@ -1016,14 +1040,14 @@ async def test_live_never_uses_paper_advisory_fallback(
 
 
 @pytest.mark.asyncio
-async def test_paper_advisory_fallback_rejects_contract_above_risk_cap(
+async def test_paper_advisory_fallback_rejects_contract_above_current_risk_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "high_risk_review_enabled", False)
     decision = _paper_quality_observation_decision()
     decision.raw_response["profit_risk_sizing"][
         "single_trade_risk_fraction_cap"
-    ] = 0.00021
+    ] = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION + 0.00001
 
     result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
 

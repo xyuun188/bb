@@ -504,7 +504,7 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_negative_lcb_quality_observation_stays_one_x() -> None:
+async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
@@ -513,11 +513,12 @@ async def test_negative_lcb_quality_observation_stays_one_x() -> None:
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is True
     assert sizing["paper_quality_observation_mode"] is True
-    assert sizing["final_leverage"] == 1.0
-    assert decision.suggested_leverage == 1.0
+    assert sizing["model_requested_leverage"] == 20.0
+    assert sizing["model_leverage_is_explicit"] is False
+    assert sizing["final_leverage"] > 1.0
+    assert sizing["paper_quality_observation_leverage_cap"] is None
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
-    assert sizing["risk_budget_usdt"] <= 0.3 + 1e-8
-    assert sizing["risk_budget_usdt"] > 0.1
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assessment = RiskEngine().assess(decision, [], _balance)
     assert assessment.approved is True, assessment.rejection_reason

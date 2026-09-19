@@ -35,6 +35,106 @@ def test_local_model_diagnostic_budget_fits_dashboard_light_request_budget() -> 
         model_training_status._FAST_OBSERVABILITY_TIMEOUT_SECONDS
         < app.DASHBOARD_API_TIMEOUT_SECONDS["light"]
     )
+def test_dashboard_diagnostic_routes_have_internal_deadline_headroom() -> None:
+    from web_dashboard import app
+
+    assert app._dashboard_api_timeout("/api/local-ai-tools/status") == 12.0
+    assert app._dashboard_api_timeout("/api/ml-signal/status") == 12.0
+    assert app._dashboard_api_timeout("/api/analysis-records?limit=20") == 15.0
+    assert (
+        dashboard._DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS
+        < app._dashboard_api_timeout("/api/local-ai-tools/status")
+    )
+    assert (
+        dashboard._DASHBOARD_ML_STATUS_TIMEOUT_SECONDS
+        < app._dashboard_api_timeout("/api/ml-signal/status")
+    )
+    assert (
+        dashboard._DASHBOARD_ANALYSIS_RECORDS_TIMEOUT_SECONDS
+        < app._dashboard_api_timeout("/api/analysis-records")
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_ai_status_timeout_is_structured_and_supports_legacy_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowLegacyClient:
+        async def status(self) -> dict[str, Any]:
+            await asyncio.sleep(0.05)
+            return {"available": True}
+
+    monkeypatch.setattr(dashboard, "_local_ai_tools_status_client", SlowLegacyClient())
+    monkeypatch.setattr(dashboard, "_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS", 0.001)
+
+    payload = await dashboard.get_local_ai_tools_status()
+
+    assert payload["status"] == "status_timeout"
+    assert payload["error"] == "local_ai_tools_status_timeout"
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_status_timeout_returns_degraded_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_builder() -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {"available": True, "status": "ready"}
+
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_build_ml_signal_status", slow_builder)
+    monkeypatch.setattr(dashboard, "_DASHBOARD_ML_STATUS_TIMEOUT_SECONDS", 0.001)
+
+    payload = await dashboard.get_ml_signal_status()
+
+    assert payload["status"] == "status_timeout"
+    assert payload["degraded_reason"] == "ml_status_timeout"
+
+
+@pytest.mark.asyncio
+async def test_ml_signal_status_does_not_cache_transient_failure_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def recovering_builder() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"available": False, "status": "status_error"}
+        return {"available": True, "status": "ready"}
+
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_build_ml_signal_status", recovering_builder)
+
+    first = await dashboard.get_ml_signal_status()
+    second = await dashboard.get_ml_signal_status()
+
+    assert first["status"] == "status_error"
+    assert second["status"] == "ready"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_analysis_records_timeout_returns_empty_degraded_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_records(**_kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {"records": [{"id": "1"}]}
+
+    monkeypatch.setattr(dashboard, "_get_analysis_records_uncached", slow_records)
+    monkeypatch.setattr(dashboard, "_DASHBOARD_ANALYSIS_RECORDS_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+
+    payload = await dashboard.get_analysis_records(limit=20, is_paper=True)
+
+    assert payload["records"] == []
+    assert payload["status"] == "timeout"
+    assert payload["degraded_reason"] == "analysis_records_timeout"
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,9 @@ from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from services.profit_training_contract import PROFIT_TRAINING_TARGET  # noqa: E402
 
+REMOTE_RESULT_READ_TIMEOUT_SECONDS = 45.0
+REMOTE_RESULT_MAX_BYTES = 32 * 1024 * 1024
+
 REMOTE_SCRIPT_TEMPLATE = r'''
 import asyncio
 import json
@@ -1323,6 +1326,35 @@ def _decode_remote_json(output: str) -> dict:
     return payload
 
 
+def _read_remote_result(result_path: str) -> str:
+    """Read a bounded result over a fresh SSH channel after a long remote run."""
+
+    ssh = connect_remote_ssh(ROOT, timeout=25)
+    try:
+        sftp = ssh.open_sftp()
+        try:
+            result_size = int(sftp.stat(result_path).st_size)
+            if result_size > REMOTE_RESULT_MAX_BYTES:
+                raise RuntimeError(
+                    "online strategy health result exceeds the bounded download size: "
+                    f"{result_size} bytes"
+                )
+            with sftp.file(result_path, "r") as remote_file:
+                remote_file.settimeout(REMOTE_RESULT_READ_TIMEOUT_SECONDS)
+                output = remote_file.read(REMOTE_RESULT_MAX_BYTES + 1)
+            if len(output) > REMOTE_RESULT_MAX_BYTES:
+                raise RuntimeError("online strategy health result exceeded its read limit")
+            return output.decode("utf-8", errors="replace")
+        finally:
+            try:
+                sftp.remove(result_path)
+            except OSError:
+                pass
+            sftp.close()
+    finally:
+        ssh.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect online dynamic return contracts.")
     parser.add_argument("--minutes", type=int, default=480)
@@ -1348,30 +1380,20 @@ def main() -> None:
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
         run_remote_text(ssh, command, timeout=220, max_output_chars=4000)
-        sftp = ssh.open_sftp()
-        try:
-            with sftp.file(result_path, "r") as remote_file:
-                output = remote_file.read().decode("utf-8", errors="replace")
-            try:
-                sftp.remove(result_path)
-            except OSError:
-                pass
-        finally:
-            sftp.close()
-        payload = _decode_remote_json(output)
-        safe_print(
-            json.dumps(
-                _summarize_entry_report(payload)
-                if args.summary and args.entry_only and not args.replay_only
-                else _summarize_report(payload)
-                if args.summary and not args.replay_only
-                else payload,
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
     finally:
         ssh.close()
+    payload = _decode_remote_json(_read_remote_result(result_path))
+    safe_print(
+        json.dumps(
+            _summarize_entry_report(payload)
+            if args.summary and args.entry_only and not args.replay_only
+            else _summarize_report(payload)
+            if args.summary and not args.replay_only
+            else payload,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

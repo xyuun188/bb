@@ -25,6 +25,7 @@ class DecisionStage:
 
 class DecisionStageStatus:
     PENDING = "pending"
+    UNKNOWN = "unknown"
     PASSED = "passed"
     BLOCKED = "blocked"
     FAILED = "failed"
@@ -44,6 +45,7 @@ STAGE_LABELS = {
 
 STATUS_LABELS = {
     DecisionStageStatus.PENDING: "处理中",
+    DecisionStageStatus.UNKNOWN: "结果未知",
     DecisionStageStatus.PASSED: "通过",
     DecisionStageStatus.BLOCKED: "拦截",
     DecisionStageStatus.FAILED: "失败",

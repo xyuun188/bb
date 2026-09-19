@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,6 +29,19 @@ TimeoutProvider = Callable[[], float]
 TimeBudgetProvider = Callable[[], float]
 DecisionStageRecorder = Callable[..., Awaitable[dict[str, Any]]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
+
+
+@dataclass
+class _RoundCancellationState:
+    """Mutable cancellation metadata shared with the run_once task."""
+
+    reason: str | None = None
+
+
+round_cancellation_state: ContextVar[_RoundCancellationState | None] = ContextVar(
+    "round_cancellation_state",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -90,7 +104,7 @@ class _ScopedAnalysisService:
                     scope=self.scope,
                 )
             except TimeoutError:
-                logger.error(
+                logger.warning(
                     "analysis service loop timed out",
                     scope=self.scope,
                     timeout_seconds=self._time_budget_seconds(),
@@ -114,8 +128,29 @@ class _ScopedAnalysisService:
         time_budget = self._time_budget_seconds()
         if time_budget is None:
             await self.run_once()
-        else:
-            await asyncio.wait_for(self.run_once(), timeout=time_budget)
+            return
+
+        # Keep the task separate from the watchdog.  This lets us annotate the
+        # cancellation before propagating it into TradingService.run_once,
+        # while preserving the hard boundary that prevents a stuck round from
+        # blocking the scheduler forever.
+        cancellation_state = _RoundCancellationState()
+        state_token = round_cancellation_state.set(cancellation_state)
+        round_task = asyncio.create_task(self.run_once())
+        try:
+            await asyncio.wait_for(asyncio.shield(round_task), timeout=time_budget)
+        except TimeoutError:
+            cancellation_state.reason = "watchdog"
+            round_task.cancel()
+            await asyncio.gather(round_task, return_exceptions=True)
+            raise
+        except asyncio.CancelledError:
+            cancellation_state.reason = "shutdown" if not self.is_running() else "external"
+            round_task.cancel()
+            await asyncio.gather(round_task, return_exceptions=True)
+            raise
+        finally:
+            round_cancellation_state.reset(state_token)
 
 
 class MarketAnalysisService(_ScopedAnalysisService):

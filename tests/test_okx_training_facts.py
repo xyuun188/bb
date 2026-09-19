@@ -1098,7 +1098,7 @@ def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
     assert len(payload["trade_samples"]) == 1
 
 
-def test_current_quality_observation_is_explicitly_trainable_as_v11() -> None:
+def test_current_quality_observation_is_explicitly_trainable_as_v12() -> None:
     lineage = _complete_lineage()
     permissions = paper_quality_permissions()
     permissions["local_ml"].update(
@@ -1142,10 +1142,10 @@ def test_current_quality_observation_is_explicitly_trainable_as_v11() -> None:
         text_sentiment_samples=[],
     )
 
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v11"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_v12"
     assert sample["strategy_selection_reason"] == "paper_quality_observation"
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
-        "current_quality_observation_v11"
+        "current_quality_observation_v12"
     )
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True

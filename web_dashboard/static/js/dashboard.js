@@ -8518,6 +8518,18 @@ function loopErrorLabel(message) {
     if (text.includes('position analysis round cancelled by hard watchdog')) {
         return '持仓复盘整轮超时：本轮已被保护性中断，通常是 OKX 同步、行情刷新或持仓复盘阶段累计过慢；系统会进入下一轮继续处理。';
     }
+    if (text.includes('position analysis round exceeded its watchdog')) {
+        return '持仓复盘达到保护性时限：本轮未完成的工作已顺延到下一轮，不会把它误判成 OKX 或模型故障。';
+    }
+    if (text.includes('position analysis round stopped during')) {
+        return '持仓复盘随服务停止而结束，属于正常生命周期操作。';
+    }
+    if (text.includes('market analysis round exceeded its watchdog')) {
+        return '市场分析达到保护性时限：本轮未完成的工作已顺延到下一轮，不会把它误判成 OKX 或模型故障。';
+    }
+    if (text.includes('market analysis round stopped during')) {
+        return '市场分析随服务停止而结束，属于正常生命周期操作。';
+    }
     if (text.includes('market analysis round cancelled by hard watchdog')) {
         return '市场分析曾被旧版整轮保护取消；当前版本会按具体阶段预算降级。请刷新后查看最新阶段耗时。';
     }

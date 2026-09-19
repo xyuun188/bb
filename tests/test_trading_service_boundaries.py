@@ -21,7 +21,11 @@ from core.trading_mode import mode_manager
 from executor.base_executor import ExecutionResult, OrderStatus
 from risk_manager.engine import RiskEngine
 from services.account_accounting_service import AccountAccountingService
-from services.analysis_services import MarketAnalysisService, PositionReviewService
+from services.analysis_services import (
+    MarketAnalysisService,
+    PositionReviewService,
+    round_cancellation_state,
+)
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.entry_fee_provider import EntryFeeProvider
@@ -2273,6 +2277,70 @@ async def test_analysis_loop_cancels_a_stuck_round_and_releases_scheduler(monkey
 
 
 @pytest.mark.asyncio
+async def test_analysis_loop_marks_watchdog_cancellation_before_canceling_round(monkeypatch):
+    running = True
+    reasons: list[str | None] = []
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def run_once(_scope: str) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            state = round_cancellation_state.get()
+            reasons.append(state.reason if state else None)
+            raise
+
+    service = PositionReviewService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        round_watchdog_provider=lambda: 0.01,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert reasons == ["watchdog"]
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_analysis_loop_marks_shutdown_cancellation_without_reporting_external_cancel():
+    running = True
+    started = asyncio.Event()
+    reasons: list[str | None] = []
+
+    async def run_once(_scope: str) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            state = round_cancellation_state.get()
+            reasons.append(state.reason if state else None)
+            raise
+
+    service = PositionReviewService(
+        run_once_provider=run_once,
+        is_running_provider=lambda: running,
+        round_watchdog_provider=lambda: 30.0,
+    )
+    service.initial_delay_seconds = 0.0
+    task = asyncio.create_task(service.loop(lambda: 30.0))
+    await started.wait()
+    running = False
+    task.cancel()
+    await task
+
+    assert reasons == ["shutdown"]
+
+
+@pytest.mark.asyncio
 async def test_analysis_service_loop_continues_after_internal_round_cancellation(monkeypatch):
     calls: list[str] = []
     running = True
@@ -2696,6 +2764,64 @@ async def test_production_trade_gate_does_not_promote_model_from_live_mode_alone
         gate["evidence"]["training"]["current_decision_return_evidence"]["expected_net_return_pct"]
         == 1.0
     )
+
+
+@pytest.mark.asyncio
+async def test_production_trade_gate_uses_configured_live_canary_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_key", "key")
+    monkeypatch.setattr(trading_service.settings, "okx_live_api_secret", "secret")
+    monkeypatch.setattr(trading_service.settings, "okx_live_passphrase", "pass")
+    monkeypatch.setattr(trading_service.settings, "live_rules_canary_enabled", True)
+    monkeypatch.setattr(
+        trading_service.settings, "live_rules_canary_max_notional_usdt", 250.0
+    )
+    monkeypatch.setattr(
+        trading_service.settings, "live_rules_canary_max_open_positions", 4
+    )
+    monkeypatch.setattr(
+        trading_service.settings, "live_rules_canary_max_daily_loss_usdt", 75.0
+    )
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(
+            is_open=False,
+            get_state=lambda: {"daily_pnl": 0.0},
+        ),
+    )
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service._okx_authoritative_sync_status_payload = lambda: {"status": "ok"}
+    service.ml_signal_service = SimpleNamespace(
+        status=lambda: {
+            "available": True,
+            "live_ml_ready": False,
+            "artifact_activation_manifest": {"live_ml_ready": False},
+            "metrics": {},
+        }
+    )
+    decision = DecisionOutput(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action=Action.LONG,
+        confidence=0.8,
+        reasoning="configured live canary",
+        raw_response={},
+    )
+
+    gate = await service.production_trade_gate_snapshot(
+        decision,
+        "ensemble_trader",
+        "live",
+        open_positions=[],
+    )
+
+    assert gate["mode"] == "live_rules_canary"
+    assert gate["risk"] == {
+        "max_notional_usdt": 250.0,
+        "max_open_positions": 4,
+        "max_daily_loss_usdt": 75.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -7801,6 +7927,11 @@ def test_position_round_watchdog_follows_position_review_cadence(
     assert service.position_review_stage_timeout_seconds() == 58.0
     assert service.position_loop_interval_seconds() == pytest.approx(30.0)
     assert service.position_round_watchdog_seconds() == pytest.approx(180.0)
+    assert service.position_round_work_budget_seconds() == pytest.approx(165.0)
+    assert (
+        service.position_round_work_budget_seconds()
+        < service.position_round_watchdog_seconds()
+    )
 
 
 @pytest.mark.asyncio
@@ -12596,6 +12727,54 @@ async def test_position_review_post_decision_handoff_finishes_after_stage_timeou
     assert stage_calls[0][3] == DecisionStage.RISK_CHECK
     assert stage_calls[0][4] == DecisionStageStatus.PENDING
     assert stage_calls[0][6]["source"] == "position_review_post_decision_handoff"
+
+
+@pytest.mark.asyncio
+async def test_position_review_post_decision_handoff_stops_at_hard_deadline(monkeypatch):
+    service = TradingService.__new__(TradingService)
+    calls: list[tuple[Any, ...]] = []
+    decision = _decision(Action.LONG)
+
+    async def timeout_handoff(awaitable, **kwargs):
+        awaitable.close()
+        assert kwargs["timeout_seconds"] == 90.0
+        raise trading_service.HandoffTimeoutError(timeout_seconds=90.0)
+
+    async def record_stage(
+        decision_id,
+        decision_arg,
+        stage,
+        status,
+        reason,
+        data,
+    ):
+        calls.append(("stage", decision_id, stage, status, reason, data))
+        return {}
+
+    async def mark_reason(decision_id, reason):
+        calls.append(("reason", decision_id, reason))
+
+    monkeypatch.setattr(trading_service, "await_entry_execution_handoff", timeout_handoff)
+    service._record_and_persist_decision_stage = record_stage  # type: ignore[method-assign]
+    service._mark_decision_reason = mark_reason  # type: ignore[method-assign]
+
+    async def unused():
+        return None
+
+    result = await service._await_position_review_post_decision_handoff(
+        unused(),
+        symbol="BTC/USDT",
+        model_name="ensemble_trader",
+        decision=decision,
+        decision_db_id=903,
+    )
+
+    assert result.handled is True
+    assert result.candidate is None
+    stage_call = next(call for call in calls if call[0] == "stage")
+    assert stage_call[2] == DecisionStage.RISK_CHECK
+    assert stage_call[3] == DecisionStageStatus.UNKNOWN
+    assert stage_call[5]["result_status"] == "unknown"
 
 
 @pytest.mark.asyncio

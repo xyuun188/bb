@@ -34,11 +34,12 @@ from services.decision_state import (
     is_decision_terminal_state,
 )
 from services.entry_direction_metrics import entry_side_from_action, selected_side_evidence
+from services.entry_execution_handoff import ENTRY_EXECUTION_PENDING_RECOVERY_SECONDS
 from web_dashboard.api.text_sanitize import sanitize_text
 
 logger = structlog.get_logger(__name__)
 
-ENTRY_PENDING_EXECUTION_MAX_SECONDS = 45.0
+ENTRY_PENDING_EXECUTION_MAX_SECONDS = ENTRY_EXECUTION_PENDING_RECOVERY_SECONDS
 STALE_ENTRY_MAINTENANCE_BATCH_LIMIT = 250
 STALE_ENTRY_MAINTENANCE_LOOKBACK = timedelta(hours=24)
 STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS = 60.0

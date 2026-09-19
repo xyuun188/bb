@@ -54,7 +54,11 @@ from services.account_accounting_service import (
     tradeable_balance_from_snapshot,
 )
 from services.analysis_budget import POSITION_REVIEW_MAX_GROUPS_PER_ROUND, AnalysisBudgetPolicy
-from services.analysis_services import MarketAnalysisService, PositionReviewService
+from services.analysis_services import (
+    MarketAnalysisService,
+    PositionReviewService,
+    round_cancellation_state,
+)
 from services.continuous_model_weight import (
     ContinuousModelWeightEvidenceService,
     ContinuousModelWeightPolicy,
@@ -83,7 +87,10 @@ from services.entry_candidate_filter import EntryCandidateFilterPolicy
 from services.entry_candidate_queue import EntryCandidateQueuePolicy
 from services.entry_capacity import EntryCapacityPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
-from services.entry_execution_handoff import await_entry_execution_handoff
+from services.entry_execution_handoff import (
+    HandoffTimeoutError,
+    await_entry_execution_handoff,
+)
 from services.entry_feature_ranker import EntryFeatureRankerPolicy
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_funnel_diagnostics import build_entry_funnel_report
@@ -177,7 +184,10 @@ from services.position_replacement_opportunity import (
     load_position_replacement_opportunity,
 )
 from services.position_review_batch import PositionReviewBatchPolicy
-from services.position_review_decision_processor import PositionReviewDecisionProcessor
+from services.position_review_decision_processor import (
+    PositionReviewDecisionProcessor,
+    PositionReviewProcessResult,
+)
 from services.position_review_decision_service import (
     PositionReviewDecisionRequest,
     PositionReviewDecisionService,
@@ -1479,6 +1489,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             or 180
         )
         return max(configured_watchdog, interval * 4.0, stage_budget * 2.0)
+
+    def position_round_work_budget_seconds(self) -> float:
+        """Leave enough time for a position round to finalize before its watchdog."""
+
+        watchdog_seconds = self.position_round_watchdog_seconds()
+        finalization_reserve = min(15.0, max(5.0, watchdog_seconds * 0.1))
+        return max(1.0, watchdog_seconds - finalization_reserve)
 
     def round_start_reconcile_timeout_seconds(self) -> float:
         """Return the short OKX sync boundary used at analysis round start."""
@@ -3882,6 +3899,56 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 action=decision.action.value,
                 source="position_review_candidate",
             )
+        except HandoffTimeoutError as exc:
+            reason = (
+                "本轮执行仍在处理中：持仓复盘执行交接在 "
+                f"{exc.timeout_seconds:.0f} 秒硬期限内未收口，交易所/本地订单结果未知；"
+                "系统已释放本轮调度并保留 pending/unknown 状态，后续对账继续确认。"
+            )
+            logger.error(
+                "position review execution handoff timed out",
+                symbol=symbol,
+                model=model_name,
+                action=decision.action.value,
+                decision_id=decision_db_id,
+                timeout_seconds=exc.timeout_seconds,
+            )
+            if decision_db_id is not None:
+                timeout_data = {
+                    "skip_kind": "position_review_execution_handoff_timeout",
+                    "result_status": "unknown",
+                    "handoff_timeout_seconds": exc.timeout_seconds,
+                    "source": "position_review_candidate",
+                }
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.PENDING,
+                    reason,
+                    timeout_data,
+                )
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.EXCHANGE_SUBMIT,
+                    DecisionStageStatus.UNKNOWN,
+                    "本轮已停止等待执行交接，交易所回报仍待后续对账确认。",
+                    timeout_data,
+                )
+                await self._mark_decision_reason(decision_db_id, reason)
+            results.setdefault("decisions", []).append(
+                {
+                    "model": model_name,
+                    "symbol": symbol,
+                    "action": decision.action.value,
+                    "approved": True,
+                    "executed": False,
+                    "execution_status": "unknown",
+                    "reason": reason,
+                }
+            )
+            return None
         except asyncio.CancelledError:
             reason = (
                 "持仓复盘候选已经进入执行链路，但本轮任务被外层超时保护取消；"
@@ -4471,7 +4538,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "current_decision_return_evidence": current_decision_metrics,
                 "quality_report": self._safe_dict(raw.get("quality_report")),
             },
-            settings={"rules_canary_enabled": True},
+            settings={
+                "rules_canary_enabled": settings.live_rules_canary_enabled,
+                "rules_canary_risk": {
+                    "max_notional_usdt": settings.live_rules_canary_max_notional_usdt,
+                    "max_open_positions": settings.live_rules_canary_max_open_positions,
+                    "max_daily_loss_usdt": settings.live_rules_canary_max_daily_loss_usdt,
+                },
+            },
         )
         return gate.to_dict()
 
@@ -9437,7 +9511,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         round_deadline_monotonic: float | None = None
         if analysis_scope == "position":
             round_deadline_monotonic = (
-                asyncio.get_running_loop().time() + self.position_round_watchdog_seconds()
+                asyncio.get_running_loop().time() + self.position_round_work_budget_seconds()
             )
         results: dict[str, Any] = {
             "status": "ok",
@@ -11031,30 +11105,62 @@ class TradingService(ModelTrainingCoordinatorMixin):
         except asyncio.CancelledError:
             active_stage = self._runtime_state(analysis_scope).current_stage
             elapsed_seconds = round(self._round_elapsed_seconds(round_start), 3)
-            error_text = (
-                f"{analysis_scope} analysis task cancelled during {active_stage} "
-                f"after {elapsed_seconds} seconds."
-            )
+            cancellation_state = round_cancellation_state.get()
+            cancellation_reason = cancellation_state.reason if cancellation_state else None
+            stopping = not self._running
+            if stopping or cancellation_reason == "shutdown":
+                outcome = "shutdown"
+                error_text = (
+                    f"{analysis_scope} analysis round stopped during {active_stage} "
+                    f"after {elapsed_seconds} seconds while the service was stopping."
+                )
+            elif cancellation_reason == "watchdog":
+                outcome = "watchdog_timeout"
+                error_text = (
+                    f"{analysis_scope} analysis round exceeded its watchdog during {active_stage} "
+                    f"after {elapsed_seconds} seconds; remaining work was deferred to the next round."
+                )
+            else:
+                outcome = "external_cancel"
+                error_text = (
+                    f"{analysis_scope} analysis task cancelled during {active_stage} "
+                    f"after {elapsed_seconds} seconds."
+                )
             results["cancellation_diagnostic"] = {
                 "scope": analysis_scope,
                 "active_stage": active_stage,
                 "elapsed_seconds": elapsed_seconds,
+                "reason": outcome,
                 "stage_durations": self._stage_durations_for_scope(analysis_scope),
             }
-            self._set_loop_stage("task_cancelled", error_text)
-            results["status"] = "error"
-            results["error"] = error_text
-            logger.error(
+            self._set_loop_stage("task_cancelled", None if outcome != "external_cancel" else error_text)
+            # Watchdog and shutdown cancellation are controlled lifecycle
+            # outcomes, not infrastructure failures. Keep the scheduler and
+            # dashboard from turning these bounded outcomes into a red error.
+            results["round_outcome"] = outcome
+            results["status"] = "ok" if outcome != "external_cancel" else "error"
+            if outcome == "external_cancel":
+                results["error"] = error_text
+            else:
+                results["message"] = error_text
+            logger.warning(
                 "trading loop iteration cancelled",
                 scope=analysis_scope,
                 active_stage=active_stage,
                 elapsed_seconds=elapsed_seconds,
+                reason=outcome,
             )
             await self._finalize_round_unresolved_decisions(
                 round_decision_ids,
                 round_decisions,
-                "本轮分析/执行任务被外层超时保护取消；尚未进入 OKX 提交阶段的旧候选已写入终态，"
-                "下一轮会用最新行情重新分析和排序。",
+                (
+                    "本轮分析/执行任务在服务停止时结束；尚未进入 OKX 提交阶段的旧候选已写入终态。"
+                    if outcome == "shutdown"
+                    else "本轮分析/执行任务被外层 watchdog 保护性中断；尚未进入 OKX 提交阶段的旧候选已写入终态，"
+                    "下一轮会用最新行情重新分析和排序。"
+                    if outcome == "watchdog_timeout"
+                    else "本轮分析/执行任务被外部取消；尚未进入 OKX 提交阶段的旧候选已写入终态。"
+                ),
             )
             raise
         except Exception as e:
@@ -12892,49 +12998,66 @@ class TradingService(ModelTrainingCoordinatorMixin):
         blocking reason.
         """
 
-        task = asyncio.create_task(awaitable)
-        cancellation_count = 0
-        while True:
-            try:
-                result = await asyncio.shield(task)
-                if cancellation_count:
-                    logger.info(
-                        "position review post-decision processing completed after outer cancellation",
-                        symbol=symbol,
-                        model=model_name,
-                        action=decision.action.value,
-                        decision_id=decision_db_id,
-                        outer_cancellations=cancellation_count,
-                    )
-                return result
-            except asyncio.CancelledError:
-                if task.done():
-                    return task.result()
-                cancellation_count += 1
-                reason = (
-                    "持仓复盘已经生成明确裁决，外层阶段超时保护已触发；"
-                    "系统继续完成风控复核和执行交接，避免已通过条件的开仓/平仓信号被中途丢弃。"
+        timeout_seconds = 90.0
+
+        async def record_outer_cancellation(cancellation_count: int) -> None:
+            reason = (
+                "持仓复盘已经生成明确裁决，外层阶段超时保护已触发；"
+                "系统继续完成风控复核和执行交接，避免已通过条件的开仓/平仓信号被中途丢弃。"
+            )
+            if decision_db_id is not None:
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.PENDING,
+                    reason,
+                    {
+                        "source": "position_review_post_decision_handoff",
+                        "outer_cancellations": cancellation_count,
+                    },
                 )
-                logger.warning(
-                    "position review post-decision processing is waiting for terminal result after outer cancellation",
-                    symbol=symbol,
-                    model=model_name,
-                    action=decision.action.value,
-                    decision_id=decision_db_id,
-                    outer_cancellations=cancellation_count,
+
+        try:
+            return await await_entry_execution_handoff(
+                awaitable,
+                symbol=symbol,
+                model_name=model_name,
+                action=decision.action.value,
+                source="position_review_post_decision_handoff",
+                timeout_seconds=timeout_seconds,
+                on_outer_cancellation=record_outer_cancellation,
+            )
+        except HandoffTimeoutError as exc:
+            reason = (
+                "持仓复盘已生成明确裁决，但风控/执行交接在 "
+                f"{exc.timeout_seconds:.0f} 秒内未收口；系统已释放本轮调度，"
+                "不会继续无期等待，后续由订单对账确认最终结果。"
+            )
+            logger.error(
+                "position review post-decision handoff timed out",
+                symbol=symbol,
+                model=model_name,
+                action=decision.action.value,
+                decision_id=decision_db_id,
+                timeout_seconds=exc.timeout_seconds,
+            )
+            if decision_db_id is not None:
+                timeout_data = {
+                    "source": "position_review_post_decision_handoff",
+                    "result_status": "unknown",
+                    "handoff_timeout_seconds": exc.timeout_seconds,
+                }
+                await self._record_and_persist_decision_stage(
+                    decision_db_id,
+                    decision,
+                    DecisionStage.RISK_CHECK,
+                    DecisionStageStatus.UNKNOWN,
+                    reason,
+                    timeout_data,
                 )
-                if decision_db_id is not None:
-                    await self._record_and_persist_decision_stage(
-                        decision_db_id,
-                        decision,
-                        DecisionStage.RISK_CHECK,
-                        DecisionStageStatus.PENDING,
-                        reason,
-                        {
-                            "source": "position_review_post_decision_handoff",
-                            "outer_cancellations": cancellation_count,
-                        },
-                    )
+                await self._mark_decision_reason(decision_db_id, reason)
+            return PositionReviewProcessResult(handled=True)
 
     def _position_review_priority_policy(self) -> PositionReviewPriorityPolicy:
         policy = getattr(self, "position_review_priority", None)

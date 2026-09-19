@@ -18,7 +18,6 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
-    quality_observation_risk_fraction,
 )
 
 logger = structlog.get_logger(__name__)
@@ -196,22 +195,6 @@ class RiskEngine:
                 reason = str(sizing.get("reason") or "normal_paper_risk_budget_ineligible")
                 return f"Normal paper risk budget is not eligible: {reason}."
             expected_single_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            quality_observation = (
-                normal_trade.get("selection_reason")
-                == "paper_quality_observation"
-            )
-            if quality_observation:
-                expected_single_cap = (
-                    quality_observation_risk_fraction(
-                        expected_net_return_pct=normal_trade.get(
-                            "expected_net_return_pct"
-                        ),
-                        objective_net_return_pct=normal_trade.get(
-                            "objective_net_return_pct"
-                        ),
-                        loss_probability=normal_trade.get("loss_probability"),
-                    )
-                )
             if equity <= 0 or risk_budget > (
                 equity * expected_single_cap + 1e-8
             ):
@@ -225,8 +208,6 @@ class RiskEngine:
             )
             if leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
                 return "Normal paper leverage must be a positive exchange integer."
-            if quality_observation and not isclose(leverage, 1.0, abs_tol=1e-8):
-                return "Paper quality observation leverage must remain one x."
             if tier_max < 1.0 or leverage > tier_max + 1e-8:
                 return "Normal paper leverage exceeds the selected OKX tier."
             if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v5":

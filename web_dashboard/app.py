@@ -66,6 +66,13 @@ DASHBOARD_API_TIMEOUT_SECONDS = {
     "standard": 15.0,
     "heavy": 20.0,
 }
+# Diagnostic endpoints own their internal deadlines and need a small amount
+# of middleware headroom for serialization and response sanitization.
+DASHBOARD_API_PATH_TIMEOUT_SECONDS = {
+    "/api/local-ai-tools/status": 12.0,
+    "/api/ml-signal/status": 12.0,
+    "/api/analysis-records": 15.0,
+}
 _HEAVY_API_PATH_MARKERS = (
     "/system-audit/",
     "/system/self-check",
@@ -261,6 +268,10 @@ def _dashboard_api_pool(path: str) -> str:
 
 
 def _dashboard_api_timeout(path: str) -> float:
+    normalized = str(path or "").lower()
+    for marker, timeout_seconds in DASHBOARD_API_PATH_TIMEOUT_SECONDS.items():
+        if normalized == marker or normalized.startswith(f"{marker}?"):
+            return timeout_seconds
     if str(path or "").lower().endswith("/settings/high-risk-review/test"):
         reviewer_timeout = max(
             10.0,

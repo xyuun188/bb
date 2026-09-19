@@ -7,8 +7,8 @@ from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
-    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     _contract_fingerprint_payload,
     _fingerprint,
@@ -19,6 +19,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v8_trade_contract_reasons,
     legacy_normal_paper_v9_trade_contract_reasons,
     legacy_normal_paper_v10_trade_contract_reasons,
+    legacy_normal_paper_v11_trade_contract_reasons,
     normal_paper_decision_id_from_client_order_id,
     normal_paper_order_identity_reasons,
     normal_paper_settlement_contract_reasons,
@@ -171,7 +172,7 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
     ) == {}
 
 
-def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> None:
+def test_unpromoted_quality_model_builds_normal_risk_paper_contract() -> None:
     support = _quality_observation_support("short")
 
     selection = select_normal_paper_trade_side({"short": support})
@@ -187,13 +188,9 @@ def test_unpromoted_quality_model_builds_lower_risk_observation_contract() -> No
     assert contract["paper_quality_mode"] == "quality_observation"
     assert contract["paper_quality_observation_only"] is True
     assert contract["production_permission"] is False
-    assert contract["single_trade_risk_fraction_cap"] == quality_observation_risk_fraction(
-        expected_net_return_pct=0.4,
-        objective_net_return_pct=0.2,
-        loss_probability=0.4,
-    )
-    assert contract["single_trade_risk_fraction_cap"] > (
-        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
+    assert (
+        contract["single_trade_risk_fraction_cap"]
+        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
 
 
@@ -218,10 +215,9 @@ def test_negative_lcb_quality_observation_authorizes_only_bounded_paper_sampling
     assert contract["production_permission"] is False
     assert contract["execution_scope"] == "paper_only"
     assert normal_paper_trade_contract_reasons(contract) == []
-    assert contract["single_trade_risk_fraction_cap"] == quality_observation_risk_fraction(
-        expected_net_return_pct=0.35,
-        objective_net_return_pct=-3.2,
-        loss_probability=0.4,
+    assert (
+        contract["single_trade_risk_fraction_cap"]
+        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
 
 
@@ -231,6 +227,11 @@ def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None
         side="long",
         selection_reason="paper_quality_observation",
         direction_support=_quality_observation_support("long", objective_net=0.2),
+    )
+    legacy["single_trade_risk_fraction_cap"] = quality_observation_risk_fraction(
+        expected_net_return_pct=legacy["expected_net_return_pct"],
+        objective_net_return_pct=legacy["objective_net_return_pct"],
+        loss_probability=legacy["loss_probability"],
     )
     legacy["version"] = LEGACY_NORMAL_PAPER_TRADE_V9_VERSION
     legacy["contract_fingerprint"] = _fingerprint(
@@ -242,6 +243,27 @@ def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None
     assert "normal_paper_trade_version_invalid" in normal_paper_trade_contract_reasons(
         legacy
     )
+
+
+def test_legacy_v11_quality_observation_contract_remains_settlement_compatible() -> None:
+    legacy = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support=_quality_observation_support("long", objective_net=0.2),
+    )
+    legacy["single_trade_risk_fraction_cap"] = quality_observation_risk_fraction(
+        expected_net_return_pct=legacy["expected_net_return_pct"],
+        objective_net_return_pct=legacy["objective_net_return_pct"],
+        loss_probability=legacy["loss_probability"],
+    )
+    legacy["version"] = LEGACY_NORMAL_PAPER_TRADE_V11_VERSION
+    legacy["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(legacy)
+    )
+
+    assert legacy_normal_paper_v11_trade_contract_reasons(legacy) == []
+    assert normal_paper_settlement_contract_reasons(legacy) == []
 
 
 def test_legacy_v10_validated_contract_remains_settlement_compatible() -> None:

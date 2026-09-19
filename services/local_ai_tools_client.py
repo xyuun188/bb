@@ -58,7 +58,9 @@ _HTTP_MAX_CONNECTIONS = 8
 _HTTP_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
 _BATCH_COMPLETION_RESERVE_MAX_SECONDS = 0.4
 _MIN_INFERENCE_ATTEMPT_SECONDS = 0.05
-_MAX_CONCURRENT_INFERENCE_BATCHES = 2
+# The quant API is a single-worker service. Keep one complete inference batch
+# in flight so market and position review cannot multiply CPU-heavy routes.
+_MAX_CONCURRENT_INFERENCE_BATCHES = 1
 # Sentiment is an optional shadow signal. It must not hold the
 # profit/time-series evidence batch open while position review uses the same queue.
 _OPTIONAL_SENTIMENT_ROUTE_TIMEOUT_SECONDS = 5.0
@@ -242,6 +244,10 @@ class LocalAIToolsClient:
                     "path": path,
                     "allocated_timeout_sec": round(effective_timeout, 4),
                     "http_connection_reset": False,
+                    # A local deadline does not prove that the remote POST was
+                    # never accepted. Retrying it could duplicate expensive
+                    # inference while the single-worker service is still busy.
+                    "transport_error": False,
                     "duration_sec": round(
                         max((datetime.now(UTC) - tool_started).total_seconds(), 0.0001),
                         4,
@@ -273,9 +279,8 @@ class LocalAIToolsClient:
             )
             return item
 
-        # Run a small bounded number of complete batches while keeping routes
-        # concurrent inside each batch. Market analysis and position review can
-        # overlap without letting a burst build an unbounded inference queue.
+        # Keep routes concurrent inside one complete batch, but never overlap
+        # separate market/position batches against the single-worker service.
         results: list[dict[str, Any]] = []
         inference_slot: int | None = None
         queue_started = monotonic()

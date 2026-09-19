@@ -706,7 +706,7 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
     assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
 
 
-def test_quality_observation_contract_passes_entry_gate_only_at_one_x() -> None:
+def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -774,7 +774,7 @@ def test_quality_observation_contract_passes_entry_gate_only_at_one_x() -> None:
         }
     )
     _contract, reasons = validate_entry_execution_contract(raw)
-    assert "paper_quality_observation_leverage_not_one_x" in reasons
+    assert reasons == []
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:

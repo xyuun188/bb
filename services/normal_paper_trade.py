@@ -10,7 +10,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-09-19.normal-paper-strategy-trade.v11"
+NORMAL_PAPER_TRADE_VERSION = "2026-09-19.normal-paper-strategy-trade.v12"
+LEGACY_NORMAL_PAPER_TRADE_V11_VERSION = "2026-09-19.normal-paper-strategy-trade.v11"
 LEGACY_NORMAL_PAPER_TRADE_V10_VERSION = "2026-09-18.normal-paper-strategy-trade.v10"
 LEGACY_NORMAL_PAPER_TRADE_V9_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
 LEGACY_NORMAL_PAPER_TRADE_V8_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
@@ -41,9 +42,9 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
 LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
-# Legacy floor retained so historical v8 contracts remain verifiable. New
-# quality-observation contracts graduate between this floor and the bounded
-# v2 ceiling below; validated strategy trades still use the normal cap above.
+# Legacy floors retained so historical v8-v11 contracts remain verifiable.
+# Current paper trades use the normal cap above regardless of whether their
+# model evidence is still tagged for quality observation.
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION = 0.0001
 NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT = 0.0003
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
@@ -505,15 +506,7 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        "single_trade_risk_fraction_cap": (
-            quality_observation_risk_fraction(
-                expected_net_return_pct=expected_net,
-                objective_net_return_pct=objective_net,
-                loss_probability=loss_probability,
-            )
-            if quality_observation_only
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
+        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -661,6 +654,7 @@ def _normal_strategy_trade_contract_reasons(
     ]
     if expected_version in {
         NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
@@ -676,6 +670,7 @@ def _normal_strategy_trade_contract_reasons(
         if (
             expected_version in {
                 NORMAL_PAPER_TRADE_VERSION,
+                LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
                 LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
             }
             and observation_mode
@@ -707,13 +702,15 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_horizon_invalid")
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     graduated_observation_version = expected_version in {
-        NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     }
     expected_single_cap = (
-        quality_observation_risk_fraction(
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        if expected_version == NORMAL_PAPER_TRADE_VERSION
+        else quality_observation_risk_fraction(
             expected_net_return_pct=contract.get("expected_net_return_pct"),
             objective_net_return_pct=contract.get("objective_net_return_pct"),
             loss_probability=contract.get("loss_probability"),
@@ -760,6 +757,18 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     return _normal_strategy_trade_contract_reasons(
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+        require_quality_permission=True,
+        allow_non_positive_objective_observation=True,
+    )
+
+
+def legacy_normal_paper_v11_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v11 envelopes for settlement and recovery only."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
@@ -1013,6 +1022,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V11_VERSION:
+        return legacy_normal_paper_v11_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V10_VERSION:
         return legacy_normal_paper_v10_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V9_VERSION:

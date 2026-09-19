@@ -144,7 +144,7 @@ async def test_local_ai_tools_enrich_shares_batch_deadline_across_concurrent_rou
     assert timeouts[1] <= 5.0
     assert 7.5 < timeouts[2] <= 8.0
     assert result["execution_mode"] == "concurrent_routes_bounded_batches"
-    assert result["max_concurrent_batches"] == 2
+    assert result["max_concurrent_batches"] == 1
     assert result["batch_budget_policy"] == (
         "shared_batch_deadline_concurrent_routes"
     )
@@ -233,7 +233,7 @@ async def test_local_ai_tools_recovers_transport_route_after_batch_drains(
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
+async def test_local_ai_tools_defers_excess_capacity_for_single_worker_backend(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -241,8 +241,7 @@ async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
     active_calls = 0
     max_active_calls = 0
     calls: list[tuple[str, str]] = []
-    started_symbols: set[str] = set()
-    two_batches_started = asyncio.Event()
+    first_batch_started = asyncio.Event()
     release_calls = asyncio.Event()
 
     async def succeed(
@@ -255,9 +254,8 @@ async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
         max_active_calls = max(max_active_calls, active_calls)
         symbol = str(payload.get("symbol") or "")
         calls.append((symbol, path))
-        started_symbols.add(symbol)
-        if len(started_symbols) == 2:
-            two_batches_started.set()
+        if symbol == "BTC/USDT":
+            first_batch_started.set()
         await release_calls.wait()
         active_calls -= 1
         return {"available": True, "path": path, "best_side": "long"}
@@ -270,23 +268,21 @@ async def test_local_ai_tools_runs_two_batches_and_defers_excess_capacity(
     second_task = asyncio.create_task(
         client.enrich_with_context({"symbol": "ETH/USDT"})
     )
-    await asyncio.wait_for(two_batches_started.wait(), timeout=0.5)
-
-    third = await client.enrich_with_context({"symbol": "SOL/USDT"})
+    await asyncio.wait_for(first_batch_started.wait(), timeout=0.5)
+    second = await second_task
     release_calls.set()
-    first, second = await asyncio.gather(first_task, second_task)
+    first = await first_task
 
     assert first["status"] == "completed"
-    assert second["status"] == "completed"
-    assert third["status"] == "analysis_budget_deferred"
-    assert third["deferred_tools"] == [
+    assert second["status"] == "analysis_budget_deferred"
+    assert second["deferred_tools"] == [
         "profit_prediction",
         "sentiment_analysis",
         "time_series_prediction",
     ]
-    assert max_active_calls == 6
-    assert len(calls) == 6
-    assert {symbol for symbol, _path in calls} == {"BTC/USDT", "ETH/USDT"}
+    assert max_active_calls == 3
+    assert len(calls) == 3
+    assert {symbol for symbol, _path in calls} == {"BTC/USDT"}
 
 
 @pytest.mark.asyncio

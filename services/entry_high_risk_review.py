@@ -16,6 +16,10 @@ from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
 from core.safe_output import safe_error_text
 from services.entry_direction_metrics import selected_entry_metrics
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_VERSION,
+)
 from services.trading_policies import PolicyGateResult
 
 _DEFAULT_DISAGREEMENT_THRESHOLD = 1 / 3
@@ -185,18 +189,27 @@ class EntryHighRiskReviewGatePolicy:
             violations.append("sizing_not_eligible")
         if sizing.get("paper_quality_observation_mode") is not True:
             violations.append("paper_quality_observation_sizing_missing")
-        if not 0.0 < normal_risk_cap <= _PAPER_ADVISORY_RISK_FRACTION_CAP:
+        current_normal_paper = normal_trade.get("version") == NORMAL_PAPER_TRADE_VERSION
+        advisory_risk_cap = (
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            if current_normal_paper
+            else _PAPER_ADVISORY_RISK_FRACTION_CAP
+        )
+        if not 0.0 < normal_risk_cap <= advisory_risk_cap:
             violations.append("normal_trade_risk_cap_exceeded")
-        if not 0.0 < sizing_risk_cap <= _PAPER_ADVISORY_RISK_FRACTION_CAP:
+        if not 0.0 < sizing_risk_cap <= advisory_risk_cap:
             violations.append("sizing_risk_cap_exceeded")
-        if not 0.0 < final_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
-            violations.append("final_leverage_exceeded")
-        if not (
-            0.0
-            < _safe_float(decision.suggested_leverage, -1.0)
-            <= _PAPER_ADVISORY_LEVERAGE_CAP
-        ):
-            violations.append("decision_leverage_exceeded")
+        decision_leverage = _safe_float(decision.suggested_leverage, -1.0)
+        if current_normal_paper:
+            if final_leverage < 1.0 or abs(final_leverage - round(final_leverage)) > 1e-8:
+                violations.append("final_leverage_invalid")
+            if decision_leverage < 1.0 or abs(decision_leverage - final_leverage) > 1e-8:
+                violations.append("decision_leverage_invalid")
+        else:
+            if not 0.0 < final_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
+                violations.append("final_leverage_exceeded")
+            if not 0.0 < decision_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
+                violations.append("decision_leverage_exceeded")
         return {
             "eligible": not violations,
             "execution_scope": "paper_only",
@@ -207,6 +220,8 @@ class EntryHighRiskReviewGatePolicy:
             is True,
             "single_trade_risk_fraction_cap": sizing_risk_cap,
             "final_leverage": final_leverage,
+            "risk_fraction_limit": advisory_risk_cap,
+            "dynamic_leverage_allowed": current_normal_paper,
             "violations": violations,
         }
 

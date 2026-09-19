@@ -325,6 +325,10 @@ def test_dashboard_runtime_stats_do_not_regress_from_ws_packets() -> None:
     assert "市场分析线程：" in script
     assert "持仓复盘线程：" in script
     assert "position analysis task cancelled during" in script
+    assert "position analysis round exceeded its watchdog" in script
+    assert "持仓复盘达到保护性时限" in script
+    assert "position analysis round stopped during" in script
+    assert "持仓复盘随服务停止而结束" in script
     assert "持仓复盘任务被外部取消" in script
     assert "market_current_stage" in script
     assert "position_current_stage" in script

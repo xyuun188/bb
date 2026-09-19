@@ -282,6 +282,10 @@ class Settings(BaseSettings):
     model_initial_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
     execution_account_name: str = "多专家执行账户"
     execution_account_balances: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
+    live_rules_canary_enabled: bool = True
+    live_rules_canary_max_notional_usdt: float = 10.0
+    live_rules_canary_max_open_positions: int = 1
+    live_rules_canary_max_daily_loss_usdt: float = 3.0
     decision_interval_seconds: int = 60
     auto_scan_symbol_limit: int = 20
     market_analysis_watchdog_seconds: int = 180

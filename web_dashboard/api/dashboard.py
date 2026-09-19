@@ -174,6 +174,11 @@ _DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS = 8.0
 _DASHBOARD_LOCAL_AI_STATUS_STALE_MAX_AGE_SECONDS = 15 * 60.0
 _DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS = 1.0
 _DASHBOARD_ML_SHADOW_COUNT_TIMEOUT_SECONDS = 1.5
+_DASHBOARD_ML_STATUS_TIMEOUT_SECONDS = 8.0
+_DASHBOARD_ML_STATUS_STALE_TTL_SECONDS = 15 * 60.0
+_DASHBOARD_ANALYSIS_RECORDS_TIMEOUT_SECONDS = 12.0
+_DASHBOARD_ANALYSIS_RECORDS_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_ANALYSIS_RECORDS_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_MODEL_CONTRIBUTION_CACHE_TTL_SECONDS = 120.0
 _DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_MODEL_CONTRIBUTION_STATS_TIMEOUT_SECONDS = 12.0
@@ -669,6 +674,7 @@ async def _dashboard_heavy_cached(
     key: tuple[Any, ...],
     builder: Callable[[], Awaitable[Any]],
     ttl_seconds: float = _DASHBOARD_HEAVY_CACHE_TTL_SECONDS,
+    cache_if: Callable[[Any], bool] | None = None,
 ) -> Any:
     cached = _dashboard_heavy_cache_get(key, ttl_seconds)
     if cached is not None:
@@ -679,6 +685,8 @@ async def _dashboard_heavy_cached(
         if cached is not None:
             return cached
         payload = await builder()
+        if cache_if is not None and not cache_if(payload):
+            return payload
         return _dashboard_heavy_cache_set(key, payload)
 
 
@@ -785,7 +793,10 @@ async def _await_dashboard_operation_bounded(
 ) -> Any:
     """Return or fail on deadline without waiting for cancellation cleanup."""
 
-    task = asyncio.create_task(operation)
+    # ``ensure_future`` accepts both coroutine objects and already-created
+    # Futures (for example ``asyncio.gather``), keeping the bounded helper
+    # usable for composite diagnostics as well as single calls.
+    task = asyncio.ensure_future(operation)
     done, _pending = await asyncio.wait({task}, timeout=max(float(timeout_seconds), 0.01))
     if task in done:
         return task.result()
@@ -8259,17 +8270,97 @@ def _ml_signal_status_cache_key() -> tuple[Any, ...]:
     )
 
 
+def _ml_signal_status_is_cacheable(payload: Any) -> bool:
+    """Cache only verified ML snapshots, never transient failure placeholders."""
+
+    if not isinstance(payload, dict) or payload.get("available") is False:
+        return False
+    return str(payload.get("status") or "").lower() not in {
+        "client_error",
+        "service_not_ready",
+        "status_error",
+        "status_timeout",
+    }
+
+
 @router.get("/ml-signal/status")
 async def get_ml_signal_status():
     """Return a cached, bounded ML status snapshot for browser diagnostics."""
-
-    return sanitize_payload(
-        await _dashboard_heavy_cached(
-            _ml_signal_status_cache_key(),
-            _build_ml_signal_status,
-            ttl_seconds=_DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS,
-        )
+    cache_key = _ml_signal_status_cache_key()
+    stale_snapshot = _dashboard_heavy_cache_peek(
+        cache_key,
+        max_age_seconds=_DASHBOARD_ML_STATUS_STALE_TTL_SECONDS,
     )
+    try:
+        payload = await _await_dashboard_operation_bounded(
+            _dashboard_heavy_cached(
+                cache_key,
+                _build_ml_signal_status,
+                ttl_seconds=_DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS,
+                cache_if=_ml_signal_status_is_cacheable,
+            ),
+            timeout_seconds=_DASHBOARD_ML_STATUS_TIMEOUT_SECONDS,
+            label="dashboard ML status",
+        )
+        if not _ml_signal_status_is_cacheable(payload) and isinstance(
+            stale_snapshot, dict
+        ):
+            stale = dict(stale_snapshot)
+            stale.update(
+                {
+                    "status": "status_stale",
+                    "stale": True,
+                    "stale_reason": "ml_status_degraded",
+                    "degraded_reason": str(
+                        _safe_dict(payload).get("status") or "ml_status_degraded"
+                    ),
+                    "refresh_in_background": True,
+                }
+            )
+            return sanitize_payload(stale)
+        return sanitize_payload(payload)
+    except TimeoutError:
+        stale = stale_snapshot
+        if isinstance(stale, dict):
+            stale.update(
+                {
+                    "status": "status_stale",
+                    "stale": True,
+                    "stale_reason": "ml_status_timeout",
+                    "degraded_reason": "ml_status_timeout",
+                    "refresh_in_background": True,
+                }
+            )
+            return sanitize_payload(stale)
+        return {
+            "available": False,
+            "status": "status_timeout",
+            "stale": False,
+            "degraded_reason": "ml_status_timeout",
+            "message": "本地 ML 状态刷新超时，页面已保留其它诊断数据。",
+        }
+    except Exception as exc:
+        _log_dashboard_fallback("dashboard ML status fallback", exc)
+        if isinstance(stale_snapshot, dict):
+            stale = dict(stale_snapshot)
+            stale.update(
+                {
+                    "status": "status_stale",
+                    "stale": True,
+                    "stale_reason": "ml_status_error",
+                    "degraded_reason": "ml_status_error",
+                    "refresh_in_background": True,
+                }
+            )
+            return sanitize_payload(stale)
+        return {
+            "available": False,
+            "status": "status_error",
+            "stale": False,
+            "degraded_reason": "ml_status_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "本地 ML 状态暂时不可用，页面已保留其它诊断数据。",
+        }
 
 
 def _trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
@@ -8306,9 +8397,20 @@ async def get_local_ai_tools_status():
         # The model service status is a page diagnostic. Keep its transport
         # budget independent from training-data counters so a stalled probe
         # cannot make the whole dashboard endpoint hang indefinitely.
-        status = await asyncio.wait_for(
-            local_ai_tools.status(),
-            timeout=_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS,
+        try:
+            status_operation = local_ai_tools.status(
+                request_timeout=_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS
+            )
+        except TypeError as exc:
+            # Keep compatibility with lightweight test doubles and older
+            # clients that predate the optional request_timeout keyword.
+            if "request_timeout" not in str(exc):
+                raise
+            status_operation = local_ai_tools.status()
+        status = await _await_dashboard_operation_bounded(
+            status_operation,
+            timeout_seconds=_DASHBOARD_LOCAL_AI_STATUS_TIMEOUT_SECONDS,
+            label="dashboard local AI tools status",
         )
     except TimeoutError:
         stale_snapshot = getattr(local_ai_tools, "stale_status_snapshot", None)
@@ -8376,12 +8478,13 @@ async def get_local_ai_tools_status():
                     _log_dashboard_fallback("local ai trade cursor fallback", exc)
                     return 0
 
-            completed_shadow_count, completed_trade_count = await asyncio.wait_for(
+            completed_shadow_count, completed_trade_count = await _await_dashboard_operation_bounded(
                 asyncio.gather(
                     _shadow_count_for_dashboard(),
                     _trade_count_for_dashboard(),
                 ),
-                timeout=_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS,
+                timeout_seconds=_DASHBOARD_LOCAL_AI_CURSOR_TIMEOUT_SECONDS,
+                label="local AI training cursor",
             )
             artifact_shadow_count = _safe_int_value(
                 status.get("shadow_sample_count") or status.get("training_shadow_sample_count"),
@@ -11194,8 +11297,7 @@ async def _safe_analysis_detail_vector_memory_context(
     }
 
 
-@router.get("/analysis-records")
-async def get_analysis_records(
+async def _get_analysis_records_uncached(
     limit: int = 50,
     page: int = 1,
     page_size: int | None = None,
@@ -11759,6 +11861,129 @@ async def get_analysis_records(
             needs_server_filter and len(all_rows) >= _DASHBOARD_ANALYSIS_SERVER_SCAN_LIMIT
         ),
     }
+
+
+@router.get("/analysis-records")
+async def get_analysis_records(
+    limit: int = 50,
+    page: int = 1,
+    page_size: int | None = None,
+    decision_id: int | None = None,
+    analysis_type: str | None = None,
+    include_detail: bool = False,
+    include_ml_summary: bool = False,
+    symbol: str | None = None,
+    expert_name: str | None = None,
+    is_paper: bool | None = None,
+):
+    """Return analysis records without allowing a cold read to become HTTP 504."""
+
+    cache_key = (
+        "analysis-records",
+        str(settings.database_url),
+        int(limit or 50),
+        int(page or 1),
+        int(page_size) if page_size is not None else None,
+        int(decision_id) if decision_id is not None else None,
+        str(analysis_type or ""),
+        bool(include_detail),
+        bool(include_ml_summary),
+        str(symbol or ""),
+        str(expert_name or ""),
+        is_paper,
+        mode_manager.mode.value if is_paper is None else None,
+    )
+    stale_snapshot = _dashboard_heavy_cache_peek(
+        cache_key,
+        max_age_seconds=_DASHBOARD_ANALYSIS_RECORDS_STALE_TTL_SECONDS,
+    )
+    cached = _dashboard_heavy_cache_get(
+        cache_key,
+        ttl_seconds=_DASHBOARD_ANALYSIS_RECORDS_CACHE_TTL_SECONDS,
+    )
+    if isinstance(cached, dict):
+        cached = dict(cached)
+        cached["cache"] = {"hit": True, "stale": False}
+        return sanitize_payload(cached)
+    try:
+        payload = await _await_dashboard_operation_bounded(
+            _get_analysis_records_uncached(
+                limit=limit,
+                page=page,
+                page_size=page_size,
+                decision_id=decision_id,
+                analysis_type=analysis_type,
+                include_detail=include_detail,
+                include_ml_summary=include_ml_summary,
+                symbol=symbol,
+                expert_name=expert_name,
+                is_paper=is_paper,
+            ),
+            timeout_seconds=_DASHBOARD_ANALYSIS_RECORDS_TIMEOUT_SECONDS,
+            label="dashboard analysis records",
+        )
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload["cache"] = {"hit": False, "stale": False}
+            _dashboard_heavy_cache_set(cache_key, payload)
+        return sanitize_payload(payload)
+    except TimeoutError:
+        stale = stale_snapshot
+        if isinstance(stale, dict):
+            stale = dict(stale)
+            stale.update(
+                {
+                    "status": "stale",
+                    "stale": True,
+                    "stale_reason": "analysis_records_timeout",
+                    "degraded_reason": "analysis_records_timeout",
+                    "refresh_in_background": True,
+                    "cache": {"hit": True, "stale": True},
+                }
+            )
+            return sanitize_payload(stale)
+        effective_page_size = max(1, min(int(page_size or limit or 50), 200))
+        return {
+            "records": [],
+            "count": 0,
+            "total": 0,
+            "page": max(int(page or 1), 1),
+            "page_size": effective_page_size,
+            "total_pages": 1,
+            "status": "timeout",
+            "stale": False,
+            "degraded_reason": "analysis_records_timeout",
+            "message": "分析记录正在刷新，暂时没有可用的最新列表。",
+        }
+    except Exception as exc:
+        _log_dashboard_fallback("dashboard analysis records fallback", exc)
+        if isinstance(stale_snapshot, dict):
+            stale = dict(stale_snapshot)
+            stale.update(
+                {
+                    "status": "stale",
+                    "stale": True,
+                    "stale_reason": "analysis_records_error",
+                    "degraded_reason": "analysis_records_error",
+                    "refresh_in_background": True,
+                    "cache": {"hit": True, "stale": True},
+                }
+            )
+            return sanitize_payload(stale)
+        effective_page_size = max(1, min(int(page_size or limit or 50), 200))
+        return {
+            "records": [],
+            "count": 0,
+            "total": 0,
+            "page": max(int(page or 1), 1),
+            "page_size": effective_page_size,
+            "total_pages": 1,
+            "status": "error",
+            "stale": False,
+            "degraded_reason": "analysis_records_error",
+            "error": safe_error_text(exc, limit=180),
+            "message": "分析记录暂时不可用，页面已保留其它诊断数据。",
+        }
 
 
 def _strategy_learning_candidate_summary(value: Any) -> dict[str, Any]:
