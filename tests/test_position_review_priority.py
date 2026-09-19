@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from data_feed.feature_vector import FeatureVector
 from services.current_position_management import build_current_position_management_contract
 from services.position_review_priority import PositionReviewPriorityPolicy
 
@@ -83,7 +84,15 @@ def test_priority_is_continuous_dynamic_exit_fraction() -> None:
                 ],
             )
         ],
-        {},
+        {
+            "BTC/USDT": FeatureVector(
+                symbol="BTC/USDT",
+                current_price=99.0,
+                returns_1=-0.01,
+                returns_5=-0.008,
+                returns_20=-0.005,
+            )
+        },
         {},
         aggregate_position_group=_aggregate,
     )

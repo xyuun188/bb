@@ -122,6 +122,25 @@ def _is_transient_batch_transport_failure(exc: BaseException, error_text: str) -
     return any(marker in class_name or marker in lowered for marker in markers)
 
 
+def _is_retryable_batch_connection_failure(
+    exc: BaseException,
+    error_text: str,
+) -> bool:
+    """Retry only connection-establishment failures, never timeouts or bad output."""
+
+    if _is_timeout_error(exc) or _is_batch_format_failure(exc, error_text):
+        return False
+    class_name = exc.__class__.__name__.lower()
+    lowered = str(error_text or "").lower()
+    markers = (
+        "connection error",
+        "connection refused",
+        "connecterror",
+        "apiconnectionerror",
+    )
+    return any(marker in class_name or marker in lowered for marker in markers)
+
+
 def _batch_failure_breaker_seconds(
     exc: BaseException,
     error_text: str,
@@ -661,6 +680,8 @@ class ModelRegistry:
                 status="circuit_breaker_independent",
             )
 
+        transport_retry_attempted = False
+        transport_retry_error = ""
         try:
             requested_batch_timeout = float(
                 settings.ai_batch_expert_timeout_seconds or 18.0
@@ -709,10 +730,48 @@ class ModelRegistry:
                 )
                 return {}, timings
 
-            result = await asyncio.wait_for(
-                batch_decider(features, context, expert_names),
-                timeout=batch_timeout,
-            )
+            try:
+                result = await asyncio.wait_for(
+                    batch_decider(features, context, expert_names),
+                    timeout=batch_timeout,
+                )
+            except Exception as first_exc:
+                first_error_text = safe_error_text(first_exc, limit=240)
+                retry_timeout, retry_budget = _bounded_analysis_timeout(
+                    context,
+                    min(batch_timeout, 4.0),
+                )
+                if (
+                    not _is_target_qwen_provider(batch_model)
+                    or not _is_retryable_batch_connection_failure(
+                        first_exc,
+                        first_error_text,
+                    )
+                    or retry_timeout < 0.75
+                ):
+                    raise
+                transport_retry_attempted = True
+                transport_retry_error = first_error_text
+                context.setdefault("_model_transport_retries", []).append(
+                    {
+                        "provider_model": _provider_model_name(batch_model),
+                        "experts": list(expert_names),
+                        "reason": first_error_text,
+                        "retry_timeout_seconds": round(retry_timeout, 3),
+                        "analysis_budget": retry_budget,
+                    }
+                )
+                context["_batch_transport_retry_active"] = True
+                context["_batch_transport_retry_limit"] = 1
+                try:
+                    await asyncio.sleep(min(0.1, retry_timeout / 10.0))
+                    result = await asyncio.wait_for(
+                        batch_decider(features, context, expert_names),
+                        timeout=retry_timeout,
+                    )
+                finally:
+                    context.pop("_batch_transport_retry_active", None)
+                    context.pop("_batch_transport_retry_limit", None)
             self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
             self._batch_expert_last_error_by_provider.pop(provider_key, None)
             duration = round(time.perf_counter() - perf_started, 3)
@@ -748,6 +807,9 @@ class ModelRegistry:
                             and isinstance(batch_decision.raw_response, dict)
                             else _provider_model_name(batch_model)
                         ),
+                        "transport_retry_attempted": transport_retry_attempted,
+                        "transport_retry_recovered": transport_retry_attempted,
+                        "transport_retry_reason": transport_retry_error or None,
                     }
                 )
             decisions = {
@@ -786,12 +848,22 @@ class ModelRegistry:
                 }
             )
             if _is_target_qwen_provider(batch_model):
+                failure_status = (
+                    "batch_connection_retry_failed"
+                    if transport_retry_attempted
+                    else "batch_failure_no_retry"
+                )
+                failure_reason = (
+                    f"共享模型连接重试后仍失败：{error_text}"
+                    if transport_retry_attempted
+                    else "Qwen3.8-27B batch failure is fail-closed; no independent retry"
+                )
                 context.setdefault("_model_failures", []).extend(
                     {
                         "expert_name": model.name,
                         "provider_model": _provider_model_name(batch_model),
                         "reason": error_text,
-                        "status": "batch_failure_no_retry",
+                        "status": failure_status,
                     }
                     for model in provider_group
                 )
@@ -799,14 +871,20 @@ class ModelRegistry:
                     {
                         "stage": "expert_initial",
                         "name": model.name,
-                        "status": "failed_no_retry",
+                        "status": (
+                            "failed_after_transport_retry"
+                            if transport_retry_attempted
+                            else "failed_no_retry"
+                        ),
                         "started_at": started_at.isoformat(),
                         "duration_sec": duration,
                         "batch_expert": True,
                         "shared_batch_call": True,
                         "batch_model_count": len(provider_group),
                         "provider_model": _provider_model_name(batch_model),
-                        "reason": "Qwen3.8-27B batch failure is fail-closed; no independent retry",
+                        "reason": failure_reason,
+                        "transport_retry_attempted": transport_retry_attempted,
+                        "transport_retry_reason": transport_retry_error or None,
                     }
                     for model in provider_group
                 ]

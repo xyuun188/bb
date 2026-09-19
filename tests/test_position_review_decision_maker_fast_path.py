@@ -3,8 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-import pytest
-
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from data_feed.feature_vector import FeatureVector
@@ -162,9 +160,9 @@ def test_position_close_evidence_executes_dynamic_loss_reduction() -> None:
                 "symbol": "YB/USDT",
                 "side": "long",
                 "entry_price": 100.0,
-                "current_price": 99.2,
+                "current_price": 99.0,
                 "quantity": 10.0,
-                "unrealized_pnl": -8.0,
+                "unrealized_pnl": -10.0,
                 "entry_fee_usdt": 0.05,
                 "stop_loss": 98.0,
                 "take_profit": 110.0,
@@ -175,7 +173,7 @@ def test_position_close_evidence_executes_dynamic_loss_reduction() -> None:
                         "quantity": 10.0,
                         "contracts": 10.0,
                         "entry_price": 100.0,
-                        "current_price": 99.2,
+                        "current_price": 99.0,
                         "entry_fee_usdt": 0.05,
                         "full_entry_fee_usdt": 0.05,
                         "full_entry_notional_usdt": 1_000.0,
@@ -196,7 +194,7 @@ def test_position_close_evidence_executes_dynamic_loss_reduction() -> None:
                         ],
                         "position_stressed_loss_usdt": 20.0,
                         "portfolio_stressed_loss_usdt": 20.0,
-                        "portfolio_gross_notional_usdt": 992.0,
+                        "portfolio_gross_notional_usdt": 990.0,
                         "account_equity_usdt": 10_000.0,
                         "open_position_count": 1,
                         "entry_order_ids": ["entry-yb"],
@@ -208,14 +206,18 @@ def test_position_close_evidence_executes_dynamic_loss_reduction() -> None:
                 "created_at": datetime.now(UTC) - timedelta(hours=2),
             }
         ],
-        features=FeatureVector(symbol="YB/USDT", current_price=99.2),
+        features=FeatureVector(
+            symbol="YB/USDT",
+            current_price=99.0,
+            returns_1=-0.01,
+            returns_5=-0.008,
+            returns_20=-0.005,
+        ),
         context={},
     )
 
     assert evidence["position_loss"] is True
     assert evidence["should_close"] is True
     assert evidence["action_plan"] == "reduce"
-    assert evidence["position_size_pct"] == pytest.approx(
-        evidence["dynamic_loss_reduce_fraction"]
-    )
+    assert evidence["position_size_pct"] > evidence["dynamic_loss_reduce_fraction"]
     assert 0.0 < evidence["position_size_pct"] < 1.0

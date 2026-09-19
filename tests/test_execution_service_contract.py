@@ -188,6 +188,8 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "final_notional_usdt": 40.0,
             "fill_notional_ceiling_usdt": 50.0,
             "minimum_order_notional_usdt": 1.0,
+            "expected_net_return_pct": 0.8,
+            "return_lcb_pct": 0.4,
             "final_margin_usdt": 40.0,
             "final_leverage": 1.0,
             "model_requested_leverage": 1.0,
@@ -704,6 +706,18 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
     assert entry_gate.passed is False
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
     assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
+
+
+def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> None:
+    decision = _profit_first_ready_position_review_decision()
+    decision.raw_response["profit_risk_sizing"]["expected_net_return_pct"] = 0.0
+
+    _contract, reasons = validate_entry_execution_contract(decision.raw_response)
+
+    assert "normal_paper_size_aware_expected_net_not_positive" in reasons
+    entry_gate = _return_entry_contract_result(decision, "paper")
+    assert entry_gate.passed is False
+    assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
 
 
 def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:

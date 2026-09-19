@@ -1308,6 +1308,28 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_production_permission_invalid")
     if sizing.get("production_eligible") is not True:
         reasons.append("normal_paper_sizing_ineligible")
+    legacy_settlement = bool(
+        allow_legacy_settlement
+        and (
+            legacy_fixed_leverage
+            or legacy_dynamic_v3
+            or legacy_objective_v4
+            or legacy_quality_v5
+            or legacy_quality_v6
+            or legacy_quality_v7
+            or legacy_quality_v8
+            or legacy_quality_v9
+            or legacy_quality_v10
+            or legacy_quality_v11
+        )
+    )
+    quality_observation = normal_trade.get("selection_reason") == "paper_quality_observation"
+    if (
+        not legacy_settlement
+        and not quality_observation
+        and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
+    ):
+        reasons.append("normal_paper_size_aware_expected_net_not_positive")
     if not _provenance_complete(sizing.get("policy_provenance")):
         reasons.append("normal_paper_sizing_provenance_incomplete")
     if not str(

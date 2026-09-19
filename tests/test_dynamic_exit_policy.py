@@ -261,7 +261,9 @@ def test_explicit_model_close_recommendation_enters_risk_comparison() -> None:
     assert result.model_requested_close_fraction == pytest.approx(0.25)
     assert result.model_exit_confidence == pytest.approx(0.8)
     assert result.model_exit_pressure == pytest.approx(0.2)
-    assert result.close_fraction == pytest.approx(0.2)
+    assert result.profit_lock_pressure > 0.0
+    assert result.close_fraction > result.profit_lock_pressure
+    assert result.close_fraction < 1.0
 
 
 def test_repeated_dynamic_exit_evaluation_reuses_original_model_request() -> None:
@@ -330,7 +332,7 @@ def test_profitable_exit_without_execution_cost_fails_closed() -> None:
     assert "exit_execution_cost_missing" in result.reason
 
 
-def test_loss_uses_planned_stop_budget_continuously() -> None:
+def test_loss_alone_cannot_trigger_system_reduction_before_planned_stop() -> None:
     decision = _decision()
     position = _position(
         current_price=99.0,
@@ -341,9 +343,11 @@ def test_loss_uses_planned_stop_budget_continuously() -> None:
 
     result = apply_dynamic_exit(decision, [position])
 
-    assert result.eligible is True
+    assert result.eligible is False
     assert 0.0 < result.stop_risk_usage < 1.0
-    assert result.close_fraction == pytest.approx(result.stop_risk_usage)
+    assert result.loss_reduction_evidence_complete is False
+    assert result.close_fraction == 0.0
+    assert "loss_reduction_evidence_insufficient" in result.reason
 
 
 def test_fee_only_loss_does_not_consume_planned_stop_budget() -> None:
@@ -396,6 +400,25 @@ def test_trusted_funding_profit_adds_lifecycle_profit_lock_pressure() -> None:
     assert result.profit_lock_pressure == pytest.approx(0.45)
     assert result.eligible is True
     assert result.close_fraction == pytest.approx(0.45)
+
+
+def test_fee_after_price_profit_adds_profit_lock_without_funding_income() -> None:
+    position = _position(
+        current_price=100.5,
+        notional_usdt=1005.0,
+        unrealized_pnl=5.0,
+        peak_unrealized_pnl=5.0,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.funding_fee_usdt == 0.0
+    assert result.settled_funding_fee == 0.0
+    assert result.current_lifecycle_net_pnl > 0.0
+    assert result.profit_retrace_ratio == 0.0
+    assert result.profit_lock_pressure > 0.0
+    assert result.eligible is True
+    assert result.close_fraction == pytest.approx(result.profit_lock_pressure)
 
 
 def test_untrusted_funding_is_audited_but_cannot_drive_exit() -> None:
@@ -626,9 +649,9 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
         "returns_20": -0.0008,
     }
     position = _position(
-        current_price=99.9,
-        notional_usdt=999.0,
-        unrealized_pnl=-1.0,
+        current_price=99.0,
+        notional_usdt=990.0,
+        unrealized_pnl=-10.0,
         peak_unrealized_pnl=0.0,
     )
 
@@ -639,10 +662,11 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.continuation_deterioration == pytest.approx(
         result.stop_risk_usage
     )
+    assert result.loss_reduction_evidence_complete is True
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-08-19.dynamic-exit-cumulative-budget.v16"
+        "2026-09-19.dynamic-exit-balanced-profit-lock.v17"
     )
 
 
@@ -806,10 +830,10 @@ def test_expired_paper_canary_horizon_does_not_force_full_close() -> None:
 
     result = apply_dynamic_exit(_decision(), [position])
 
-    assert result.eligible is False
+    assert result.eligible is True
     assert result.paper_canary_horizon_elapsed is True
-    assert result.close_fraction == 0.0
-    assert "dynamic_exit_pressure_zero" in result.reason
+    assert result.close_fraction == pytest.approx(result.profit_lock_pressure)
+    assert 0.0 < result.close_fraction < 1.0
 
 
 def test_expired_paper_training_horizon_cannot_bypass_incomplete_takeover_evidence() -> None:
@@ -922,11 +946,14 @@ def test_ordinary_position_is_not_closed_only_because_it_is_old() -> None:
     result = apply_dynamic_exit(
         _decision(),
         [
-            _position(
-                execution_mode="paper",
-                created_at=datetime.now(UTC) - timedelta(days=1),
-                peak_unrealized_pnl=10.0,
-            )
+                _position(
+                    execution_mode="paper",
+                    created_at=datetime.now(UTC) - timedelta(days=1),
+                    current_price=100.0,
+                    notional_usdt=1000.0,
+                    unrealized_pnl=0.0,
+                    peak_unrealized_pnl=0.0,
+                )
         ],
     )
 

@@ -22,6 +22,8 @@ from services.paper_training import assess_paper_training_position_horizon
 EARLY_EXIT_OBSERVATION_MINUTES = 10.0
 MIN_AUTOMATED_EXIT_FRACTION = 0.05
 MIN_EARLY_MODEL_EXIT_PRESSURE = MIN_AUTOMATED_EXIT_FRACTION * 2.0
+MIN_LOSS_REDUCTION_STOP_USAGE = 0.50
+MIN_LOSS_CONTINUATION_EVIDENCE = 0.25
 DYNAMIC_EXIT_EXECUTION_CONTRACT_VERSION = "2026-08-24.dynamic-exit-execution-contract.v1"
 
 
@@ -156,6 +158,7 @@ class DynamicExitAssessment:
     model_requested_close_fraction: float
     model_exit_confidence: float
     model_exit_pressure: float
+    loss_reduction_evidence_complete: bool
     planned_stop_crossed: bool
     position_age_minutes: float | None
     position_age_evidence_complete: bool
@@ -685,13 +688,32 @@ def assess_dynamic_exit(
         if current_management_contract_complete
         else 0.0
     )
-    funding_profit_lock_eligible = bool(
-        funding_fee_included and abs(included_funding_fee) > 1e-12
+    profit_lock_eligible = bool(
+        current_management_contract_complete
+        and execution_cost_complete
+        and lifecycle_net_pnl > 0.0
     )
     profit_lock_pressure = (
         _clamp(max(lifecycle_net_pnl, 0.0) / planned_risk)
-        if funding_profit_lock_eligible and planned_risk > 0.0
+        if profit_lock_eligible and planned_risk > 0.0
         else 0.0
+    )
+    profit_management_pressure = max(retrace, profit_lock_pressure)
+    position_loss = lifecycle_net_pnl < 0.0
+    market_loss_reduction_evidence = bool(
+        stop_usage + 1e-9 >= MIN_LOSS_REDUCTION_STOP_USAGE
+        and continuation + 1e-9 >= MIN_LOSS_CONTINUATION_EVIDENCE
+    )
+    independent_loss_reduction_evidence = bool(
+        model_exit_pressure + 1e-9 >= MIN_AUTOMATED_EXIT_FRACTION
+        or opposite > 0.0
+        or portfolio_pressure > 0.0
+    )
+    loss_reduction_evidence_complete = bool(
+        not position_loss
+        or hard_risk
+        or market_loss_reduction_evidence
+        or independent_loss_reduction_evidence
     )
     # The prediction horizon is a label deadline, not position-exit authority.
     # Keep its elapsed state in the assessment for audit and training only.
@@ -699,13 +721,12 @@ def assess_dynamic_exit(
         1.0
         if hard_risk
         else continuous_budget_fraction(
-            retrace,
+            profit_management_pressure,
             stop_usage,
             continuation,
             opposite,
             portfolio_pressure,
             model_exit_pressure,
-            profit_lock_pressure,
         )
     )
     lifecycle_closed_fraction = (
@@ -747,6 +768,8 @@ def assess_dynamic_exit(
         reasons.append("dynamic_exit_pressure_zero")
     elif not hard_risk and close_fraction <= 0:
         reasons.append("dynamic_exit_target_already_realized")
+    if not hard_risk and position_loss and not loss_reduction_evidence_complete:
+        reasons.append("loss_reduction_evidence_insufficient")
     if (
         not hard_risk
         and 0.0 < close_fraction
@@ -775,11 +798,13 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-08-19.dynamic-exit-cumulative-budget.v16",
+        "strategy_version": "2026-09-19.dynamic-exit-balanced-profit-lock.v17",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
+        "minimum_loss_reduction_stop_usage": MIN_LOSS_REDUCTION_STOP_USAGE,
+        "minimum_loss_continuation_evidence": MIN_LOSS_CONTINUATION_EVIDENCE,
         "close_fraction_basis": "lifecycle_cumulative_target_minus_realized_exit",
         "funding_fee_source": "current_position_management_contract",
         "funding_cost_projection_source": "current_okx_funding_rate_next_interval",
@@ -838,6 +863,7 @@ def assess_dynamic_exit(
         model_requested_close_fraction=round(model_requested_close_fraction, 8),
         model_exit_confidence=round(model_exit_confidence, 8),
         model_exit_pressure=round(model_exit_pressure, 8),
+        loss_reduction_evidence_complete=loss_reduction_evidence_complete,
         planned_stop_crossed=planned_stop_crossed,
         position_age_minutes=(
             round(position_age_minutes, 8) if position_age_minutes is not None else None

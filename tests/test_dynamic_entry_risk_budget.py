@@ -9,7 +9,9 @@ from services.entry_profit_risk_sizing import (
     build_portfolio_correlation_context,
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
+    solve_size_aware_positive_expected_net,
 )
+from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from tests.normal_paper_test_fixtures import paper_quality_permissions
@@ -241,6 +243,69 @@ def test_multiple_okx_leverage_tiers_without_bounds_fail_closed() -> None:
 
     assert selection["production_eligible"] is False
     assert selection["reason"] == "okx_leverage_tier_bounds_missing"
+
+
+def _size_aware_book_snapshot(notional: float) -> dict:
+    return {
+        "bid": 99.99,
+        "ask": 100.01,
+        "orderbook_bid_depth": 10_000.0,
+        "orderbook_ask_depth": 10_000.0,
+        "orderbook_imbalance": 0.0,
+        "contract_value_base": 1.0,
+        "orderbook_bids": [[99.99, 100.0]],
+        "orderbook_asks": [[100.01, 5.0], [100.40, 100.0]],
+        "taker_fee_rate": 0.0004,
+        "planned_order_notional_usdt": notional,
+        "planned_order_side": "long",
+    }
+
+
+def test_size_aware_profit_solver_reduces_large_negative_net_order() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+    gross_expected = 0.30
+    gross_lcb = 0.35
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=gross_expected - original_cost["total_pct"],
+        return_lcb_pct=gross_lcb - original_cost["total_pct"],
+        execution_cost=original_cost,
+    )
+
+    assert solved["production_eligible"] is True
+    assert 100.0 <= solved["selected_notional_usdt"] < 5_000.0
+    assert solved["expected_net_return_pct"] > 0.0
+    assert solved["return_lcb_pct"] > 0.0
+    assert solved["execution_cost"]["order_size_complete"] is True
+    assert solved["reduced"] is True
+
+
+def test_size_aware_profit_solver_rejects_when_minimum_order_still_loses() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+    gross_expected = 0.05
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=gross_expected - original_cost["total_pct"],
+        return_lcb_pct=gross_expected - original_cost["total_pct"],
+        execution_cost=original_cost,
+    )
+
+    assert solved["production_eligible"] is False
+    assert solved["reason"] == "minimum_order_expected_net_not_positive"
+    assert solved["selected_notional_usdt"] == pytest.approx(100.0)
+    assert solved["expected_net_return_pct"] <= 0.0
 
 
 @pytest.mark.asyncio

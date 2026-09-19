@@ -104,6 +104,26 @@ def _claim_llm_call(context: dict[str, Any] | None, stage: str) -> None:
     """Claim one provider call without awaiting, so concurrent calls cannot oversubscribe."""
 
     budget = ensure_llm_call_budget(context)
+    transport_retry = bool(
+        isinstance(context, dict)
+        and context.get("_batch_transport_retry_active") is True
+        and stage == "batch_expert"
+    )
+    if transport_retry:
+        retry_limit = max(
+            int(context.get("_batch_transport_retry_limit") or 1),
+            1,
+        )
+        retries_used = max(int(budget.get("transport_retries_used") or 0), 0)
+        if retries_used >= retry_limit:
+            raise LLMCallBudgetExceeded(
+                f"batch transport retry budget exhausted ({retries_used}/{retry_limit})"
+            )
+        budget["transport_retries_used"] = retries_used + 1
+        calls = budget.setdefault("calls", [])
+        if isinstance(calls, list):
+            calls.append("batch_expert_transport_retry")
+        return
     maximum = max(int(budget.get("max_calls") or 1), 1)
     used = max(int(budget.get("used") or 0), 0)
     if used >= maximum:

@@ -10,6 +10,7 @@ from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.llm_agent import (
     LLMAgent,
+    _claim_llm_call,
 )
 from ai_brain.model_registry import ModelRegistry, _batch_failure_breaker_seconds
 from ai_brain.prompts import build_batch_experts_user_prompt
@@ -51,6 +52,97 @@ def test_target_qwen_timeout_uses_short_recovery_breaker(
         == 3.0
     )
     assert _batch_failure_breaker_seconds(error, str(error)) == 60.0
+
+
+def test_batch_transport_retry_has_separate_single_use_budget() -> None:
+    context: dict[str, Any] = {
+        "_llm_call_budget": {"max_calls": 1, "used": 0, "calls": []}
+    }
+
+    _claim_llm_call(context, "batch_expert")
+    context["_batch_transport_retry_active"] = True
+    context["_batch_transport_retry_limit"] = 1
+    _claim_llm_call(context, "batch_expert")
+
+    budget = context["_llm_call_budget"]
+    assert budget["used"] == 1
+    assert budget["transport_retries_used"] == 1
+    assert budget["calls"] == ["batch_expert", "batch_expert_transport_retry"]
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_retries_one_shared_batch_after_connection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+
+    class TransientConnectionExpert(AbstractAIModel):
+        batch_calls = 0
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self._llm = object()
+            self._base_url = LOCAL_QWEN_TEST_BASE
+            self._model_name = "qwen3.8-27b"
+
+        async def initialize(self) -> None:
+            return None
+
+        async def decide(
+            self,
+            features: FeatureVector,
+            context: dict[str, Any],
+        ) -> DecisionOutput:
+            raise AssertionError("transport recovery must stay on one shared batch")
+
+        async def decide_batch_experts(
+            self,
+            features: FeatureVector,
+            context: dict[str, Any],
+            expert_names: list[str],
+        ) -> dict[str, DecisionOutput]:
+            type(self).batch_calls += 1
+            if type(self).batch_calls == 1:
+                raise RuntimeError("Connection error.")
+            return {
+                name: DecisionOutput(
+                    model_name=name,
+                    symbol=features.symbol,
+                    action=Action.HOLD,
+                    confidence=0.6,
+                    reasoning="recovered shared batch",
+                    raw_response={"provider_model": self._model_name},
+                    feature_snapshot=features.to_dict(),
+                )
+                for name in expert_names
+            }
+
+        async def shutdown(self) -> None:
+            return None
+
+    registry = ModelRegistry()
+    names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in names:
+        registry.register(TransientConnectionExpert(name))
+
+    context: dict[str, Any] = {}
+    decisions = await registry.decide_all(FeatureVector(symbol="HBAR/USDT"), context)
+
+    assert set(decisions) == set(names)
+    assert TransientConnectionExpert.batch_calls == 2
+    assert {row["status"] for row in context["_model_timings"]} == {
+        "completed"
+    }
+    assert all(
+        row["transport_retry_recovered"] is True
+        for row in context["_model_timings"]
+    )
+    assert len(context["_model_transport_retries"]) == 1
 
 
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
