@@ -9,9 +9,9 @@ from math import sqrt
 from typing import Any
 
 from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
-    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
 )
 from services.normal_paper_trade import (
     _contract_fingerprint_payload as _normal_v4_fingerprint_payload,
@@ -71,7 +71,7 @@ def build_legacy_normal_paper_v4_trade_contract(
         "quant_evidence_families": ["local_ml"],
         "strong_expert_opposition": False,
         "single_trade_risk_fraction_cap": (
-            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         ),
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",

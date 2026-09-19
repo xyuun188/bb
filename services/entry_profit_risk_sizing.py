@@ -1405,6 +1405,9 @@ class EntryProfitRiskSizingPolicy:
         leverage_contributors = _safe_list(
             _safe_dict(recommendation.get("contributors")).get("suggested_leverage")
         )
+        position_contributors = _safe_list(
+            _safe_dict(recommendation.get("contributors")).get("position_size_pct")
+        )
         model_leverage_is_explicit = (
             bool(prior_sizing.get("model_leverage_is_explicit"))
             if reuse_model_request
@@ -1435,7 +1438,19 @@ class EntryProfitRiskSizingPolicy:
                 0.0,
             )
         )
-        model_position_cap_applied = model_position_fraction > 0.0
+        model_position_is_explicit = (
+            bool(prior_sizing.get("model_position_is_explicit"))
+            if reuse_model_request
+            else (
+                bool(position_contributors)
+                and "position_size_pct" not in recommendation_fallback_fields
+                if recommendation
+                else False
+            )
+        )
+        model_position_cap_applied = bool(
+            model_position_fraction > 0.0 and model_position_is_explicit
+        )
         contract_specs = _safe_dict(facts.get("contract_specs"))
         target_inst_id = str(
             facts.get("target_inst_id") or okx_inst_id_from_symbol(decision.symbol)
@@ -1724,6 +1739,7 @@ class EntryProfitRiskSizingPolicy:
             "dynamic_leverage_limit": dynamic_leverage_limit,
             "existing_position_leverage": existing_position_leverage,
             "model_requested_position_fraction": model_position_fraction,
+            "model_position_is_explicit": model_position_is_explicit,
             "model_requested_notional_cap_usdt": model_requested_notional_cap,
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
@@ -1813,6 +1829,7 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "model_requested_position_fraction": round(model_position_fraction, 8),
+            "model_position_is_explicit": model_position_is_explicit,
             "model_requested_leverage": round(model_requested_leverage, 8),
             "model_leverage_is_explicit": model_leverage_is_explicit,
             "leverage_candidate_cap": round(requested_leverage, 8),

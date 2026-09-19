@@ -577,6 +577,36 @@ async def test_validate_all_keeps_real_consultation_timeout_as_failed(
 
 
 @pytest.mark.asyncio
+async def test_validate_all_forwards_provider_call_budget_to_consultation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = CrossValidator()
+    captured: dict[str, Any] = {}
+
+    async def capture_consultation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args
+        captured["capacity_context"] = kwargs["capacity_context"]
+        return {"status": "completed", "production_permission": False}
+
+    monkeypatch.setattr(validator, "consult_if_needed", capture_consultation)
+    budget = {"max_calls": 1, "used": 1, "calls": ["batch_expert"]}
+    timing: dict[str, Any] = {
+        "_target_qwen_batch": False,
+        "_analysis_budget_scope": "market_symbol_ai",
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 10.0,
+        "_llm_call_budget": budget,
+    }
+
+    _validations, consultation = await validator.validate_all(
+        _conflicting_opinions(),
+        timing,
+    )
+
+    assert consultation["status"] == "completed"
+    assert captured["capacity_context"]["_llm_call_budget"] is budget
+
+
+@pytest.mark.asyncio
 async def test_position_consultation_reuses_completed_result_for_same_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10,7 +10,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-09-18.normal-paper-strategy-trade.v10"
+NORMAL_PAPER_TRADE_VERSION = "2026-09-19.normal-paper-strategy-trade.v11"
+LEGACY_NORMAL_PAPER_TRADE_V10_VERSION = "2026-09-18.normal-paper-strategy-trade.v10"
 LEGACY_NORMAL_PAPER_TRADE_V9_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
 LEGACY_NORMAL_PAPER_TRADE_V8_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
 LEGACY_NORMAL_PAPER_TRADE_V7_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
@@ -38,7 +39,8 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "strategy_edge_selected",
     "paper_quality_observation",
 }
-NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
+NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
+LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
 # Legacy floor retained so historical v8 contracts remain verifiable. New
 # quality-observation contracts graduate between this floor and the bounded
 # v2 ceiling below; validated strategy trades still use the normal cap above.
@@ -659,6 +661,7 @@ def _normal_strategy_trade_contract_reasons(
     ]
     if expected_version in {
         NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     }:
@@ -671,7 +674,10 @@ def _normal_strategy_trade_contract_reasons(
             reasons.append("normal_paper_trade_quality_observation_reason_missing")
         loss_probability = _float(contract.get("loss_probability"), None)
         if (
-            expected_version == NORMAL_PAPER_TRADE_VERSION
+            expected_version in {
+                NORMAL_PAPER_TRADE_VERSION,
+                LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
+            }
             and observation_mode
             and (
             loss_probability is None
@@ -702,6 +708,7 @@ def _normal_strategy_trade_contract_reasons(
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     graduated_observation_version = expected_version in {
         NORMAL_PAPER_TRADE_VERSION,
+        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
         LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     }
@@ -715,6 +722,8 @@ def _normal_strategy_trade_contract_reasons(
         else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
         if observation_mode
         else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        if expected_version == NORMAL_PAPER_TRADE_VERSION
+        else LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
     if observation_mode and graduated_observation_version:
         legacy_floor = isclose(
@@ -751,6 +760,18 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
     return _normal_strategy_trade_contract_reasons(
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=True,
+        require_quality_permission=True,
+        allow_non_positive_objective_observation=True,
+    )
+
+
+def legacy_normal_paper_v10_trade_contract_reasons(value: Any) -> list[str]:
+    """Validate v10 envelopes for settlement and recovery only."""
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
@@ -992,6 +1013,8 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
         return normal_paper_trade_contract_reasons(contract)
+    if version == LEGACY_NORMAL_PAPER_TRADE_V10_VERSION:
+        return legacy_normal_paper_v10_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V9_VERSION:
         return legacy_normal_paper_v9_trade_contract_reasons(contract)
     if version == LEGACY_NORMAL_PAPER_TRADE_V8_VERSION:

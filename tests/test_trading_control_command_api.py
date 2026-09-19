@@ -54,7 +54,7 @@ class _QueuedCloseCommands:
 async def test_split_dashboard_enqueues_close_all_and_exposes_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token = "unit-dashboard-write-token"
+    token = "test"
     monkeypatch.setattr(settings, "dashboard_admin_api_key", token)
     monkeypatch.setattr(dashboard_api, "_trading_service", None)
     monkeypatch.setattr(control, "trading_control_commands", _QueuedCloseCommands())

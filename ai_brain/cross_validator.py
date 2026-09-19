@@ -452,7 +452,16 @@ class CrossValidator:
                                     timing_context.get("_analysis_budget_scope", "shared")
                                     if isinstance(timing_context, dict)
                                     else "shared"
-                                )
+                                ),
+                                # Preserve the per-analysis provider-call budget
+                                # across the consultation boundary. Without this
+                                # the consultation creates a fresh default budget
+                                # and can bypass the single-call Qwen contract.
+                                "_llm_call_budget": (
+                                    timing_context.get("_llm_call_budget")
+                                    if isinstance(timing_context, dict)
+                                    else None
+                                ),
                             },
                         ),
                         max(consultation_timeout, 0.1),

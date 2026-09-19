@@ -8,8 +8,10 @@ import pytest
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.entry_direction_support import assess_directional_entry_support
 from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
     _contract_fingerprint_payload,
     _fingerprint,
     build_normal_paper_trade_contract,
@@ -1096,7 +1098,7 @@ def test_normal_paper_profit_and_loss_are_authoritative_training_samples(
     assert len(payload["trade_samples"]) == 1
 
 
-def test_current_quality_observation_is_explicitly_trainable_as_v10() -> None:
+def test_current_quality_observation_is_explicitly_trainable_as_v11() -> None:
     lineage = _complete_lineage()
     permissions = paper_quality_permissions()
     permissions["local_ml"].update(
@@ -1140,14 +1142,50 @@ def test_current_quality_observation_is_explicitly_trainable_as_v10() -> None:
         text_sentiment_samples=[],
     )
 
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v10"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_v11"
     assert sample["strategy_selection_reason"] == "paper_quality_observation"
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
-        "current_quality_observation_v10"
+        "current_quality_observation_v11"
     )
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True
     assert len(payload["trade_samples"]) == 1
+
+
+def test_legacy_v10_validated_contract_remains_historical_training_eligible() -> None:
+    lineage = _complete_lineage()
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.35,
+            "objective_net_return_pct": 0.2,
+            "loss_probability": 0.3,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "strong_expert_opposition": False,
+        },
+    )
+    contract["version"] = LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
+    contract["single_trade_risk_fraction_cap"] = (
+        LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    lineage["decision_raw_by_order_id"]["entry-1"] = {
+        "normal_paper_trade": contract
+    }
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
+    assert sample["historical_entry_contract_kind"] == "normal_paper_v10"
+    assert sample["strategy_entry_supervision_eligible"] is True
 
 
 def test_legacy_v8_negative_lcb_observation_remains_trainable() -> None:
@@ -1265,6 +1303,7 @@ def test_v7_quality_contract_remains_historical_training_eligible() -> None:
         },
     )
     contract["version"] = LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
+    contract["single_trade_risk_fraction_cap"] = 0.0005
     contract["contract_fingerprint"] = _fingerprint(
         _contract_fingerprint_payload(contract)
     )

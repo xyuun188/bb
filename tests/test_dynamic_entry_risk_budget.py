@@ -340,7 +340,10 @@ async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
     for decision in (small, large):
         decision.raw_response["multidimensional_recommendation"] = {
             "fallback_fields": [],
-            "contributors": {"suggested_leverage": ["risk_expert"]},
+            "contributors": {
+                "position_size_pct": ["risk_expert"],
+                "suggested_leverage": ["risk_expert"],
+            },
         }
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
@@ -353,7 +356,33 @@ async def test_model_position_and_leverage_are_strict_upper_bounds() -> None:
     assert large.position_size_pct <= 0.9
     assert large.suggested_leverage <= 12.0
     assert small_sizing["model_position_cap_applied"] is True
+    assert small_sizing["model_position_is_explicit"] is True
     assert small_sizing["final_notional_usdt"] <= small_sizing["model_final_notional_cap_usdt"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_position_does_not_cap_authoritative_risk_sizing() -> None:
+    decision = _decision()
+    decision.position_size_pct = 0.005
+    decision.raw_response["multidimensional_recommendation"] = {
+        "fallback_fields": ["position_size_pct", "suggested_leverage"],
+        "contributors": {
+            "position_size_pct": [],
+            "suggested_leverage": [],
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(0.005)
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    assert sizing["model_requested_position_fraction"] == pytest.approx(0.005)
+    assert sizing["model_position_is_explicit"] is False
+    assert sizing["model_position_cap_applied"] is False
+    assert sizing["final_notional_usdt"] > 25.0
 
 
 @pytest.mark.asyncio
@@ -413,7 +442,10 @@ async def test_sub_minimum_bounded_target_is_not_promoted_to_exchange_minimum() 
     decision.position_size_pct = 1e-9
     decision.raw_response["multidimensional_recommendation"] = {
         "fallback_fields": ["suggested_leverage"],
-        "contributors": {"suggested_leverage": []},
+        "contributors": {
+            "position_size_pct": ["risk_expert"],
+            "suggested_leverage": [],
+        },
     }
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
@@ -16,6 +18,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v4_trade_contract_reasons,
     legacy_normal_paper_v8_trade_contract_reasons,
     legacy_normal_paper_v9_trade_contract_reasons,
+    legacy_normal_paper_v10_trade_contract_reasons,
     normal_paper_decision_id_from_client_order_id,
     normal_paper_order_identity_reasons,
     normal_paper_settlement_contract_reasons,
@@ -235,6 +238,28 @@ def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None
     )
 
     assert legacy_normal_paper_v9_trade_contract_reasons(legacy) == []
+    assert normal_paper_settlement_contract_reasons(legacy) == []
+    assert "normal_paper_trade_version_invalid" in normal_paper_trade_contract_reasons(
+        legacy
+    )
+
+
+def test_legacy_v10_validated_contract_remains_settlement_compatible() -> None:
+    legacy = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.4, objective_net=0.2),
+    )
+    legacy["version"] = LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
+    legacy["single_trade_risk_fraction_cap"] = (
+        LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
+    legacy["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(legacy)
+    )
+
+    assert legacy_normal_paper_v10_trade_contract_reasons(legacy) == []
     assert normal_paper_settlement_contract_reasons(legacy) == []
     assert "normal_paper_trade_version_invalid" in normal_paper_trade_contract_reasons(
         legacy
