@@ -459,7 +459,7 @@
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
-                    今日已结算盈利和亏损分别汇总已完成平仓结果；今日未结算盈亏是当前持仓浮动盈亏；今日总盈亏按 OKX 账户权益今日变化计算；累计总盈亏从首个有效权益快照累计计算。
+                    今日总盈亏 = 今日已结算盈利 + 今日已结算亏损 + 今日未结算盈亏；累计总盈亏 = 累计已结算净盈亏 + 当前未结算盈亏。历史日期没有当前持仓浮动值，按已结算净盈亏计算。
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -1844,7 +1844,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20260528theme"></script>
-                    <script src="/static/js/dashboard.js?v=20260915-local-ml-stable-config-v2&cache-bust=20260918-dashboard-copy-v3&quality-contract-v6&opening-funnel-copy-v1&daily-pnl-split-v1"></script>
+                    <script src="/static/js/dashboard.js?v=20260915-local-ml-stable-config-v2&cache-bust=20260919-daily-pnl-accounting-v1&quality-contract-v6&opening-funnel-copy-v1&daily-pnl-split-v2"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260714-runtime-prior-clarity"></script>
 </body>
 </html>

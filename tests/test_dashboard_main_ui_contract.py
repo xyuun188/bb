@@ -139,8 +139,11 @@ def test_daily_pnl_table_uses_plain_language_metrics() -> None:
     assert "function dailyPnlUnsettledDisplay(row)" in script
     assert "function dailyPnlSettledProfitValue(row)" in script
     assert "function dailyPnlSettledLossValue(row)" in script
+    assert "function dailyPnlValueDisplay(row, field, fallbackField = null)" in script
+    assert "function dailyPnlEquityDisplay" not in script
+    assert "今日总盈亏 = 今日已结算盈利 + 今日已结算亏损 + 今日未结算盈亏" in html
     assert '<td colspan="8"' in script
-    assert "daily-pnl-split-v1" in html
+    assert "daily-pnl-split-v2" in html
 
 
 def test_ai_model_settings_recognize_keyless_loopback_configuration() -> None:

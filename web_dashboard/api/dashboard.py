@@ -190,7 +190,7 @@ _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS = 20000
 _DASHBOARD_PROFIT_ATTRIBUTION_MAX_ORDER_ROWS = 6000
 _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS = 5000
-_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 2
+_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 3
 _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 3600
 _dashboard_daily_pnl_refresh_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
@@ -13649,6 +13649,19 @@ def _start_dashboard_daily_pnl_refresh(mode: str, days: int) -> None:
     _dashboard_daily_pnl_refresh_tasks[key] = asyncio.create_task(refresh())
 
 
+def _daily_pnl_component_totals(
+    *,
+    daily_settled_pnl: float,
+    cumulative_settled_pnl: float,
+    current_unsettled_pnl: float | None,
+) -> tuple[float, float]:
+    unsettled = float(current_unsettled_pnl or 0.0)
+    return (
+        round(float(daily_settled_pnl) + unsettled, 8),
+        round(float(cumulative_settled_pnl) + unsettled, 8),
+    )
+
+
 async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
     """Daily execution PnL grouped by Beijing calendar day."""
     from sqlalchemy import select
@@ -14005,7 +14018,8 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
             row["okx_cumulative_equity_change"] = None
         row["trade_realized_pnl"] = row["realized_pnl"]
         row["trade_cumulative_realized_pnl"] = round(cumulative, 8)
-        if date_key == today_local.isoformat():
+        is_today = date_key == today_local.isoformat()
+        if is_today:
             if (
                 current_okx_equity is not None
                 and current_okx_equity > 0
@@ -14045,18 +14059,21 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
                 row["okx_cumulative_equity_pnl"] = round(latest_equity - first_okx_equity, 8)
                 row["okx_cumulative_equity_change"] = row["okx_cumulative_equity_pnl"]
             row["unrealized_pnl"] = round(open_unrealized, 8)
-            row["total_pnl"] = row["okx_equity_pnl"]
-            row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
-        else:
-            row["total_pnl"] = row["okx_equity_pnl"]
-            row["cumulative_total_pnl"] = row["okx_cumulative_equity_pnl"]
+
+        current_unsettled_pnl = row["unrealized_pnl"] if is_today else None
+        row["total_pnl"], row["cumulative_total_pnl"] = _daily_pnl_component_totals(
+            daily_settled_pnl=row["realized_pnl"],
+            cumulative_settled_pnl=cumulative,
+            current_unsettled_pnl=current_unsettled_pnl,
+        )
         # Stable API names for the five values shown in the dashboard.  Keep
-        # the legacy fields above for existing consumers and cached payloads.
+        # the OKX equity fields above as diagnostics, but keep the displayed
+        # totals arithmetically consistent with the three visible components.
         row["daily_settled_profit"] = row["realized_profit"]
         row["daily_settled_loss"] = round(-row["realized_loss"], 8)
         row["daily_total_pnl"] = row["total_pnl"]
         row["daily_settled_pnl"] = row["realized_pnl"]
-        row["current_unsettled_pnl"] = row["unrealized_pnl"]
+        row["current_unsettled_pnl"] = current_unsettled_pnl
         row["cumulative_realized_pnl"] = round(cumulative, 8)
         row["settled_close_count"] = int(row["trade_count"] or 0)
         row["pending_settlement_close_count"] = int(pending_settlement_by_date.get(date_key, 0))
@@ -14099,7 +14116,14 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
         "okx_cumulative_equity_scope": (
             "phase3" if equity_series_complete else "first_observed_okx_snapshot"
         ),
-        "pnl_source": "okx_equity_snapshots_and_okx_position_ledger",
+        "pnl_source": "okx_position_ledger_plus_current_unrealized",
+        "equity_diagnostic_source": "okx_equity_snapshots",
+        "daily_total_pnl_formula": (
+            "daily_settled_profit + daily_settled_loss + current_unsettled_pnl"
+        ),
+        "cumulative_total_pnl_formula": (
+            "cumulative_realized_pnl + current_unsettled_pnl"
+        ),
         "read_scope": {
             "order_window_start": start_utc.isoformat(),
             "order_scan_limit": _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS,

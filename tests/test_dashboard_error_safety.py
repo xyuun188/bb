@@ -1587,7 +1587,7 @@ async def test_daily_pnl_records_do_not_emit_future_rows_after_phase3_clamp(
 
 
 @pytest.mark.asyncio
-async def test_daily_pnl_today_row_uses_current_okx_equity(
+async def test_daily_pnl_today_row_keeps_okx_equity_as_diagnostic_only(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1608,7 +1608,19 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
         return {"equity": 4997.95, "total": 4997.95, "free": 4931.0}
 
     monkeypatch.setattr(dashboard, "datetime", FrozenDatetime)
-    monkeypatch.setattr(dashboard, "_get_exchange_position_mark_map", lambda _mode: _async_value({}))
+    exchange_marks = {
+        ("BTC/USDT", "long"): {
+            "quantity": 1.0,
+            "entry_price": 100.0,
+            "mark_price": 92.25,
+            "unrealized_pnl": -7.75,
+        }
+    }
+    monkeypatch.setattr(
+        dashboard,
+        "_get_exchange_position_mark_map",
+        lambda _mode: _async_value(exchange_marks),
+    )
     monkeypatch.setattr(dashboard, "_get_exchange_open_position_symbols", lambda _mode: _async_value(set()))
     monkeypatch.setattr(dashboard, "_get_dashboard_okx_account_snapshot", okx_snapshot)
 
@@ -1636,13 +1648,29 @@ async def test_daily_pnl_today_row_uses_current_okx_equity(
     assert today["okx_equity_pnl_source"] == "current_equity_minus_today_baseline"
     assert today["okx_equity_pnl"] == pytest.approx(-1.63)
     assert today["okx_cumulative_equity_pnl"] == pytest.approx(-1.63)
-    assert today["total_pnl"] == pytest.approx(-1.63)
-    assert today["daily_total_pnl"] == pytest.approx(-1.63)
+    assert today["total_pnl"] == pytest.approx(-7.75)
+    assert today["daily_total_pnl"] == pytest.approx(-7.75)
+    assert today["cumulative_total_pnl"] == pytest.approx(-7.75)
     assert today["daily_settled_profit"] == pytest.approx(0.0)
     assert today["daily_settled_loss"] == pytest.approx(0.0)
     assert today["daily_settled_pnl"] == pytest.approx(0.0)
-    assert today["current_unsettled_pnl"] == pytest.approx(0.0)
-    assert today["unrealized_pnl"] == pytest.approx(0.0)
+    assert today["current_unsettled_pnl"] == pytest.approx(-7.75)
+    assert today["unrealized_pnl"] == pytest.approx(-7.75)
+
+
+def test_daily_pnl_displayed_total_matches_visible_components() -> None:
+    settled_profit = 45.21
+    settled_loss = -16.78
+    current_unsettled = -7.75
+
+    daily_total, cumulative_total = dashboard._daily_pnl_component_totals(
+        daily_settled_pnl=settled_profit + settled_loss,
+        cumulative_settled_pnl=-10.83 + settled_profit + settled_loss,
+        current_unsettled_pnl=current_unsettled,
+    )
+
+    assert daily_total == pytest.approx(20.68)
+    assert cumulative_total == pytest.approx(9.85)
 
 
 @pytest.mark.asyncio
@@ -2248,6 +2276,8 @@ async def test_daily_pnl_records_include_final_settlement_snapshots(
     assert day["daily_settled_profit"] == pytest.approx(4.3971172)
     assert day["daily_settled_loss"] == pytest.approx(-3.3)
     assert day["daily_settled_pnl"] == pytest.approx(1.0971172)
+    assert day["daily_total_pnl"] == pytest.approx(1.0971172)
+    assert day["cumulative_total_pnl"] == pytest.approx(1.0971172)
     assert day["symbols"] == ["MET/USDT", "PROS/USDT"]
     assert {item["symbol"] for item in day["position_details"]} == {"MET/USDT", "PROS/USDT"}
     assert all(item["symbol"] != "FAKE/USDT" for item in day["position_details"])

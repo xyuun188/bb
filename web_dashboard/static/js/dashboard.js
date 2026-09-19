@@ -899,14 +899,7 @@ function dailyPnlOkxSnapshotMissing(row) {
         || (row?.okx_equity == null && row?.okx_equity_pnl == null);
 }
 
-function dailyPnlEquityDisplay(row, field, fallbackField = null) {
-    if (dailyPnlOkxSnapshotMissing(row)) {
-        const startDate = row?.okx_equity_series_start_date;
-        const message = startDate && String(row?.date || '') < String(startDate)
-            ? `\u672a\u7559\u5b58 ${startDate} \u4e4b\u524d\u7684\u771f\u5b9e OKX \u6743\u76ca\u5feb\u7167`
-            : '\u5f53\u65e5\u771f\u5b9e OKX \u6743\u76ca\u5feb\u7167\u7f3a\u5931';
-        return `<span style="color:var(--text-muted);" title="${escHtml(message)}">—</span>`;
-    }
+function dailyPnlValueDisplay(row, field, fallbackField = null) {
     const rawValue = row?.[field] ?? (fallbackField ? row?.[fallbackField] : null);
     const value = valueNumber(rawValue);
     if (value === null) return '<span style="color:var(--text-muted);">—</span>';
@@ -943,8 +936,8 @@ function dailyPnlSummaryHtml(row, activityMarkup = '') {
             <div><span>今日已结算盈利</span><strong style="color:${signedMoneyColor(settledProfit)};">${signedMoneyWithUnit(settledProfit)}</strong></div>
             <div><span>今日已结算亏损</span><strong style="color:${signedMoneyColor(settledLoss)};">${signedMoneyWithUnit(settledLoss)}</strong></div>
             <div><span>今日未结算盈亏</span><strong>${dailyPnlUnsettledDisplay(row)}</strong></div>
-            <div><span>今日总盈亏</span><strong>${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</strong></div>
-            <div><span>累计总盈亏</span><strong>${dailyPnlEquityDisplay(row, 'cumulative_total_pnl', 'okx_cumulative_equity_pnl')}</strong></div>
+            <div><span>今日总盈亏</span><strong>${dailyPnlValueDisplay(row, 'daily_total_pnl', 'total_pnl')}</strong></div>
+            <div><span>累计总盈亏</span><strong>${dailyPnlValueDisplay(row, 'cumulative_total_pnl', 'cumulative_realized_pnl')}</strong></div>
             ${activityMarkup}
         </div>
     `;
@@ -954,7 +947,7 @@ function dailyPnlMissingSnapshotNotice(row) {
     if (!dailyPnlOkxSnapshotMissing(row)) return '';
     return `
         <div class="info-banner" style="margin:8px 0;">
-            当日没有 OKX 账户权益快照，所以今日总盈亏和累计总盈亏暂不显示；今日已结算盈利和亏损仍按已确认的平仓记录分别展示。
+            当日没有 OKX 账户权益快照；这只影响权益变化诊断，不影响以上按交易账本汇总的盈亏。
         </div>
     `;
 }
@@ -10176,8 +10169,8 @@ function renderDailyPnlRecords(records) {
             <td style="color:${signedMoneyColor(settledProfit)};font-weight:700;">${signedMoneyWithUnit(settledProfit)}</td>
             <td style="color:${signedMoneyColor(settledLoss)};font-weight:700;">${signedMoneyWithUnit(settledLoss)}</td>
             <td>${dailyPnlUnsettledDisplay(row)}</td>
-            <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'daily_total_pnl', 'total_pnl')}</td>
-            <td style="font-weight:700;">${dailyPnlEquityDisplay(row, 'cumulative_total_pnl', 'okx_cumulative_equity_pnl')}</td>
+            <td style="font-weight:700;">${dailyPnlValueDisplay(row, 'daily_total_pnl', 'total_pnl')}</td>
+            <td style="font-weight:700;">${dailyPnlValueDisplay(row, 'cumulative_total_pnl', 'cumulative_realized_pnl')}</td>
             <td>${orderCount} <span style="color:var(--text-muted);font-size:10px;">${orderWinLoss}</span></td>
             <td>
                 <button class="btn btn-sm js-daily-pnl-detail" data-date="${escHtml(row.date || '')}">
@@ -10230,7 +10223,7 @@ function openDailyPnlModal(date) {
         const hasOverview = orderCount > 0
             || Number(row.realized_pnl || 0) !== 0
             || Number(row.unrealized_pnl || 0) !== 0
-            || valueNumber(row.okx_equity_pnl ?? row.total_pnl) !== null;
+            || valueNumber(row.daily_total_pnl ?? row.total_pnl) !== null;
         body.innerHTML = hasOverview
             ? `<div style="color:var(--text-muted);font-size:12px;padding:8px;">当日有盈亏汇总，但没有按币种拆分明细。可能是历史记录未保存 symbol_pnl，或该日只保留了总览数据。</div>
                ${dailyPnlSummaryHtml(row, tradeCountMarkup)}`
