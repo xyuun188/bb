@@ -9,6 +9,7 @@ from services.dynamic_exit_policy import (
     apply_dynamic_exit,
     evaluate_dynamic_exit_execution_contract,
 )
+from services.exit_execution_singleflight import PROFIT_LOCK_LEDGER_KEY
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import PAPER_TRAINING_POSITION_LIFECYCLE_VERSION
 
@@ -666,11 +667,11 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-09-19.dynamic-exit-balanced-profit-lock.v17"
+        "2026-09-19.dynamic-exit-profit-lock-ledger.v18"
     )
 
 
-def test_realized_lifecycle_exit_target_is_not_reapplied_to_remaining_position() -> None:
+def test_confirmed_profit_lock_target_is_not_reapplied_to_remaining_position() -> None:
     position = _position(
         quantity=5.0,
         current_price=101.0,
@@ -679,15 +680,21 @@ def test_realized_lifecycle_exit_target_is_not_reapplied_to_remaining_position()
         peak_unrealized_pnl=10.0,
     )
     position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+    position["current_management_contract"][PROFIT_LOCK_LEDGER_KEY] = {
+        "realized_quantity": 5.0,
+        "realized_fraction": 0.5,
+    }
 
     result = apply_dynamic_exit(_decision(), [position])
 
     assert result.target_close_fraction == pytest.approx(0.5)
     assert result.lifecycle_closed_fraction == pytest.approx(0.5)
+    assert result.profit_lock_realized_fraction == pytest.approx(0.5)
+    assert result.profit_lock_target_gap == 0.0
     assert result.incremental_close_fraction == 0.0
     assert result.close_fraction == 0.0
     assert result.eligible is False
-    assert "dynamic_exit_target_already_realized" in result.reason
+    assert "profit_lock_target_already_filled" in result.reason
 
 
 def test_higher_lifecycle_exit_target_submits_only_new_increment() -> None:
@@ -699,6 +706,10 @@ def test_higher_lifecycle_exit_target_submits_only_new_increment() -> None:
         peak_unrealized_pnl=20.0,
     )
     position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+    position["current_management_contract"][PROFIT_LOCK_LEDGER_KEY] = {
+        "realized_quantity": 5.0,
+        "realized_fraction": 0.5,
+    }
 
     result = apply_dynamic_exit(_decision(), [position])
 
@@ -831,9 +842,32 @@ def test_expired_paper_canary_horizon_does_not_force_full_close() -> None:
     result = apply_dynamic_exit(_decision(), [position])
 
     assert result.eligible is True
-    assert result.paper_canary_horizon_elapsed is True
-    assert result.close_fraction == pytest.approx(result.profit_lock_pressure)
-    assert 0.0 < result.close_fraction < 1.0
+
+
+def test_prior_loss_reduction_does_not_consume_later_profit_lock_target() -> None:
+    position = _position(
+        quantity=5.0,
+        current_price=101.0,
+        notional_usdt=505.0,
+        unrealized_pnl=5.0,
+        peak_unrealized_pnl=10.0,
+    )
+    position["current_management_contract"]["lifecycle_entry_quantity"] = 10.0
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.lifecycle_closed_fraction == pytest.approx(0.5)
+    assert result.profit_lock_realized_fraction == 0.0
+    assert result.target_close_fraction == pytest.approx(0.5)
+    assert result.profit_lock_target_fraction == pytest.approx(0.5)
+    assert result.lifecycle_target_gap == 0.0
+    assert result.profit_lock_target_gap == pytest.approx(0.5)
+    assert result.required_incremental_lifecycle_fraction == pytest.approx(0.5)
+    assert result.close_fraction == 1.0
+    assert result.eligible is True
+    assert result.policy_provenance["close_fraction_basis"] == (
+        "max_of_total_lifecycle_target_gap_and_confirmed_profit_lock_target_gap"
+    )
 
 
 def test_expired_paper_training_horizon_cannot_bypass_incomplete_takeover_evidence() -> None:

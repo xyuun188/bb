@@ -9,6 +9,8 @@ _EXACT_TRANSLATIONS = {
     "dynamic_exit_fraction_below_execution_minimum": "建议减仓比例低于系统最小自动减仓比例 5%，本轮不提交平仓订单，继续持有。",
     "dynamic_exit_pressure_zero": "当前没有达到减仓或平仓条件，本轮继续持有。",
     "dynamic_exit_target_already_realized": "计划减仓目标此前已经完成，本轮无需重复提交平仓订单。",
+    "profit_lock_target_already_filled": "本轮盈利锁定目标已经由交易所确认成交，无需重复提交平仓订单。",
+    "dynamic_exit_risk_target_already_realized": "本轮风险减仓目标此前已经完成，无需重复提交平仓订单。",
     "dynamic_exit_policy_not_eligible": "当前动态退出条件未满足，本轮不提交平仓订单。",
     "dynamic_exit_close_fraction_not_positive": "本轮建议减仓比例为 0，不提交平仓订单。",
     "dynamic_exit_fraction_zero": "本轮建议减仓比例为 0，不提交平仓订单。",

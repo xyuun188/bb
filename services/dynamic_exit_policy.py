@@ -12,6 +12,7 @@ from services.current_position_management import (
     ALLOWED_MANAGEMENT_ACTIONS,
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
+    PROFIT_LOCK_LEDGER_KEY,
     current_position_management_contract_complete,
 )
 from services.dynamic_policy_values import continuous_budget_fraction
@@ -117,6 +118,12 @@ class DynamicExitAssessment:
     close_fraction: float
     lifecycle_entry_quantity: float
     lifecycle_closed_fraction: float
+    profit_lock_realized_quantity: float
+    profit_lock_realized_fraction: float
+    profit_lock_target_fraction: float
+    lifecycle_target_gap: float
+    profit_lock_target_gap: float
+    required_incremental_lifecycle_fraction: float
     target_close_fraction: float
     incremental_close_fraction: float
     hard_risk: bool
@@ -302,6 +309,7 @@ def assess_dynamic_exit(
     management_pressure_values: list[float] = []
     current_quantity = 0.0
     lifecycle_entry_quantity = 0.0
+    profit_lock_realized_quantity = 0.0
     funding_fee_observed = 0.0
     funding_fee_eligible = 0.0
     funding_bill_count = 0
@@ -402,6 +410,11 @@ def assess_dynamic_exit(
         )
         management = _safe_dict(position.get("current_management_contract"))
         management_contracts.append(management)
+        profit_lock_ledger = _safe_dict(management.get(PROFIT_LOCK_LEDGER_KEY))
+        profit_lock_realized_quantity = max(
+            profit_lock_realized_quantity,
+            max(_safe_float(profit_lock_ledger.get("realized_quantity"), 0.0), 0.0),
+        )
         current_quantity += qty
         contract_lifecycle_quantity = max(
             _safe_float(management.get("lifecycle_entry_quantity"), 0.0),
@@ -734,13 +747,36 @@ def assess_dynamic_exit(
         if lifecycle_entry_quantity > 0.0
         else 0.0
     )
+    profit_lock_realized_quantity = min(
+        profit_lock_realized_quantity,
+        lifecycle_entry_quantity,
+    )
+    profit_lock_realized_fraction = (
+        _clamp(profit_lock_realized_quantity / lifecycle_entry_quantity)
+        if lifecycle_entry_quantity > 0.0
+        else 0.0
+    )
+    profit_lock_target_fraction = (
+        profit_management_pressure if profit_lock_eligible else 0.0
+    )
+    lifecycle_target_gap = max(
+        target_close_fraction - lifecycle_closed_fraction,
+        0.0,
+    )
+    profit_lock_target_gap = max(
+        profit_lock_target_fraction - profit_lock_realized_fraction,
+        0.0,
+    )
+    required_incremental_lifecycle_fraction = max(
+        lifecycle_target_gap,
+        profit_lock_target_gap,
+    )
     remaining_lifecycle_fraction = max(1.0 - lifecycle_closed_fraction, 0.0)
     close_fraction = (
         1.0
         if hard_risk
         else _clamp(
-            (target_close_fraction - lifecycle_closed_fraction)
-            / remaining_lifecycle_fraction
+            required_incremental_lifecycle_fraction / remaining_lifecycle_fraction
         )
         if remaining_lifecycle_fraction > 0.0
         else 0.0
@@ -767,7 +803,13 @@ def assess_dynamic_exit(
     if not hard_risk and target_close_fraction <= 0:
         reasons.append("dynamic_exit_pressure_zero")
     elif not hard_risk and close_fraction <= 0:
-        reasons.append("dynamic_exit_target_already_realized")
+        if (
+            profit_lock_target_fraction > 0.0
+            and profit_lock_target_gap <= 1e-9
+        ):
+            reasons.append("profit_lock_target_already_filled")
+        else:
+            reasons.append("dynamic_exit_risk_target_already_realized")
     if not hard_risk and position_loss and not loss_reduction_evidence_complete:
         reasons.append("loss_reduction_evidence_insufficient")
     if (
@@ -798,14 +840,16 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-09-19.dynamic-exit-balanced-profit-lock.v17",
+        "strategy_version": "2026-09-19.dynamic-exit-profit-lock-ledger.v18",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
         "minimum_loss_reduction_stop_usage": MIN_LOSS_REDUCTION_STOP_USAGE,
         "minimum_loss_continuation_evidence": MIN_LOSS_CONTINUATION_EVIDENCE,
-        "close_fraction_basis": "lifecycle_cumulative_target_minus_realized_exit",
+        "close_fraction_basis": (
+            "max_of_total_lifecycle_target_gap_and_confirmed_profit_lock_target_gap"
+        ),
         "funding_fee_source": "current_position_management_contract",
         "funding_cost_projection_source": "current_okx_funding_rate_next_interval",
     }
@@ -815,6 +859,15 @@ def assess_dynamic_exit(
         close_fraction=round(close_fraction if eligible else 0.0, 8),
         lifecycle_entry_quantity=round(lifecycle_entry_quantity, 12),
         lifecycle_closed_fraction=round(lifecycle_closed_fraction, 8),
+        profit_lock_realized_quantity=round(profit_lock_realized_quantity, 12),
+        profit_lock_realized_fraction=round(profit_lock_realized_fraction, 8),
+        profit_lock_target_fraction=round(profit_lock_target_fraction, 8),
+        lifecycle_target_gap=round(lifecycle_target_gap, 8),
+        profit_lock_target_gap=round(profit_lock_target_gap, 8),
+        required_incremental_lifecycle_fraction=round(
+            required_incremental_lifecycle_fraction,
+            8,
+        ),
         target_close_fraction=round(target_close_fraction, 8),
         incremental_close_fraction=round(close_fraction, 8),
         hard_risk=hard_risk,

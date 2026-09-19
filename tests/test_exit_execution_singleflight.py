@@ -11,6 +11,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.exit_execution_singleflight import (
     EXIT_INTENT_KEY,
+    PROFIT_LOCK_LEDGER_KEY,
     ExitExecutionSingleFlightService,
     preserve_exit_execution_intent,
 )
@@ -67,6 +68,21 @@ def _decision() -> DecisionOutput:
         reasoning="hard stop",
         position_size_pct=1.0,
     )
+
+
+def _profit_lock_decision() -> DecisionOutput:
+    decision = _decision()
+    decision.position_size_pct = 0.4
+    decision.raw_response = {
+        "dynamic_exit_policy": {
+            "eligible": True,
+            "hard_risk": False,
+            "close_fraction": 0.4,
+            "lifecycle_net_pnl_usdt": 12.0,
+            "profit_lock_pressure": 0.4,
+        }
+    }
+    return decision
 
 
 def _service(
@@ -220,6 +236,10 @@ def test_position_contract_refresh_preserves_exit_lease_without_stale_policy_fie
             "token": "lease-token",
             "state": "submitted_unconfirmed",
         },
+        PROFIT_LOCK_LEDGER_KEY: {
+            "version": "2026-09-19.profit-lock-exit-ledger.v1",
+            "realized_quantity": 3.0,
+        },
     }
     refreshed = {"contract_version": "new", "management_eligible": True}
 
@@ -230,3 +250,79 @@ def test_position_contract_refresh_preserves_exit_lease_without_stale_policy_fie
     assert "stale_field" not in merged
     assert merged[EXIT_INTENT_KEY] == previous[EXIT_INTENT_KEY]
     assert merged[EXIT_INTENT_KEY] is not previous[EXIT_INTENT_KEY]
+    assert merged[PROFIT_LOCK_LEDGER_KEY] == previous[PROFIT_LOCK_LEDGER_KEY]
+    assert merged[PROFIT_LOCK_LEDGER_KEY] is not previous[PROFIT_LOCK_LEDGER_KEY]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_profit_lock_fill_updates_separate_idempotent_ledger() -> None:
+    position = _position()
+    position.current_management_contract["lifecycle_entry_quantity"] = 10.0
+    repo = _Repo([position])
+    session = _Session()
+    now = [datetime(2026, 9, 20, 1, 0, tzinfo=UTC)]
+    service = _service(repo, session, now)
+    decision = _profit_lock_decision()
+
+    lease = await service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=decision,
+        decision_id=509586,
+    )
+    result = ExecutionResult(
+        order_id="profit-lock-fill",
+        exchange_order_id="3938000000000000001",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=4.0,
+        price=0.04,
+        status=OrderStatus.FILLED,
+    )
+
+    await service.finish(lease, result)
+    await service.finish(lease, result)
+
+    intent = position.current_management_contract[EXIT_INTENT_KEY]
+    ledger = position.current_management_contract[PROFIT_LOCK_LEDGER_KEY]
+    assert intent["profit_lock_exit"] is True
+    assert intent["exit_reason_class"] == "profit_lock"
+    assert intent["requested_close_fraction"] == pytest.approx(0.4)
+    assert ledger["realized_quantity"] == pytest.approx(4.0)
+    assert ledger["realized_fraction"] == pytest.approx(0.4)
+    assert ledger["last_decision_id"] == 509586
+    assert ledger["last_exchange_order_id"] == "3938000000000000001"
+    assert len(ledger["intent_fill_quantities"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_risk_reduction_fill_does_not_update_profit_lock_ledger() -> None:
+    position = _position()
+    position.current_management_contract["lifecycle_entry_quantity"] = 10.0
+    repo = _Repo([position])
+    session = _Session()
+    now = [datetime(2026, 9, 20, 2, 0, tzinfo=UTC)]
+    service = _service(repo, session, now)
+
+    lease = await service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=_decision(),
+        decision_id=509600,
+    )
+    result = ExecutionResult(
+        order_id="risk-reduction-fill",
+        exchange_order_id="3938000000000000002",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=5.0,
+        price=0.04,
+        status=OrderStatus.FILLED,
+    )
+
+    await service.finish(lease, result)
+
+    assert position.current_management_contract[EXIT_INTENT_KEY]["profit_lock_exit"] is False
+    assert PROFIT_LOCK_LEDGER_KEY not in position.current_management_contract

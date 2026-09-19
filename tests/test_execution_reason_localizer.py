@@ -14,6 +14,12 @@ def test_localize_dynamic_exit_dashboard_codes() -> None:
     assert localize_execution_reason("dynamic_exit_fraction_below_execution_minimum") == (
         "建议减仓比例低于系统最小自动减仓比例 5%，本轮不提交平仓订单，继续持有。"
     )
+    assert localize_execution_reason("profit_lock_target_already_filled") == (
+        "本轮盈利锁定目标已经由交易所确认成交，无需重复提交平仓订单。"
+    )
+    assert localize_execution_reason("dynamic_exit_risk_target_already_realized") == (
+        "本轮风险减仓目标此前已经完成，无需重复提交平仓订单。"
+    )
 
 
 def test_localize_multiple_dynamic_exit_codes() -> None:

@@ -15,6 +15,10 @@ from core.symbols import normalize_trading_symbol
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.current_position_management import (
+    PROFIT_LOCK_LEDGER_KEY,
+    PROFIT_LOCK_LEDGER_VERSION,
+)
 from services.okx_error_classifier import is_okx_temporary_service_error
 
 EXIT_INTENT_KEY = "exit_execution_intent"
@@ -126,6 +130,7 @@ class ExitExecutionSingleFlightService:
 
             token = secrets.token_hex(12)
             attempt_count = self._safe_int(current.get("attempt_count"), 0) + 1
+            profit_lock_exit = self._is_profit_lock_exit(decision)
             intent = {
                 "version": EXIT_INTENT_VERSION,
                 "key": key,
@@ -133,6 +138,11 @@ class ExitExecutionSingleFlightService:
                 "state": "submitting",
                 "attempt_count": attempt_count,
                 "decision_id": decision_id,
+                "exit_reason_class": (
+                    "profit_lock" if profit_lock_exit else "risk_or_other"
+                ),
+                "requested_close_fraction": self._decision_close_fraction(decision),
+                "profit_lock_exit": profit_lock_exit,
                 "position_ids": list(position_ids),
                 "acquired_at": now.isoformat(),
                 "updated_at": now.isoformat(),
@@ -182,6 +192,23 @@ class ExitExecutionSingleFlightService:
                     ),
                 }
             )
+            if (
+                intent.get("profit_lock_exit") is True
+                and result is not None
+                and result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}
+                and result.quantity > 0
+            ):
+                self._apply_profit_lock_fill(
+                    matching,
+                    intent=intent,
+                    filled_quantity=float(result.quantity),
+                    decision_id=self._safe_int(intent.get("decision_id"), 0) or None,
+                    exchange_order_id=(
+                        str(getattr(result, "exchange_order_id", "") or "").strip()
+                        or None
+                    ),
+                    updated_at=now,
+                )
             self._apply_intent(matching, intent)
             await session.flush()
 
@@ -301,6 +328,120 @@ class ExitExecutionSingleFlightService:
             position.current_management_contract = contract
 
     @staticmethod
+    def _decision_close_fraction(decision: DecisionOutput) -> float:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        policy = raw.get("dynamic_exit_policy")
+        policy = policy if isinstance(policy, dict) else {}
+        value = policy.get("close_fraction", decision.position_size_pct)
+        try:
+            return round(min(max(float(value or 0.0), 0.0), 1.0), 8)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _is_profit_lock_exit(decision: DecisionOutput) -> bool:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        policy = raw.get("dynamic_exit_policy")
+        policy = policy if isinstance(policy, dict) else {}
+        try:
+            lifecycle_net_pnl = float(policy.get("lifecycle_net_pnl_usdt") or 0.0)
+            profit_lock_pressure = float(policy.get("profit_lock_pressure") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            policy.get("eligible") is True
+            and policy.get("hard_risk") is not True
+            and lifecycle_net_pnl > 0.0
+            and profit_lock_pressure > 0.0
+        )
+
+    @classmethod
+    def _apply_profit_lock_fill(
+        cls,
+        positions: list[Any],
+        *,
+        intent: dict[str, Any],
+        filled_quantity: float,
+        decision_id: int | None,
+        exchange_order_id: str | None,
+        updated_at: datetime,
+    ) -> None:
+        ledger = cls._current_group_profit_lock_ledger(positions)
+        token = str(intent.get("token") or "").strip()
+        intent_fills = {
+            str(key): max(cls._safe_float(value, 0.0), 0.0)
+            for key, value in (ledger.get("intent_fill_quantities") or {}).items()
+            if str(key or "").strip()
+        }
+        previous_intent_fill = intent_fills.get(token, 0.0) if token else 0.0
+        observed_intent_fill = max(float(filled_quantity or 0.0), 0.0)
+        incremental_fill = max(observed_intent_fill - previous_intent_fill, 0.0)
+        if incremental_fill <= 0.0:
+            return
+        realized_quantity = max(
+            cls._safe_float(ledger.get("realized_quantity"), 0.0),
+            0.0,
+        ) + incremental_fill
+        lifecycle_entry_quantity = max(
+            (
+                cls._safe_float(
+                    getattr(position, "current_management_contract", {}).get(
+                        "lifecycle_entry_quantity"
+                    ),
+                    0.0,
+                )
+                for position in positions
+                if isinstance(getattr(position, "current_management_contract", None), dict)
+            ),
+            default=0.0,
+        )
+        if token:
+            intent_fills[token] = observed_intent_fill
+        if len(intent_fills) > 32:
+            intent_fills = dict(list(intent_fills.items())[-32:])
+        next_ledger = {
+            "version": PROFIT_LOCK_LEDGER_VERSION,
+            "realized_quantity": round(realized_quantity, 12),
+            "realized_fraction": round(
+                min(realized_quantity / lifecycle_entry_quantity, 1.0)
+                if lifecycle_entry_quantity > 0.0
+                else 0.0,
+                8,
+            ),
+            "last_decision_id": decision_id,
+            "last_exchange_order_id": exchange_order_id,
+            "last_filled_quantity": round(observed_intent_fill, 12),
+            "updated_at": updated_at.isoformat(),
+            "intent_fill_quantities": intent_fills,
+        }
+        for position in positions:
+            contract = getattr(position, "current_management_contract", None)
+            contract = dict(contract) if isinstance(contract, dict) else {}
+            contract[PROFIT_LOCK_LEDGER_KEY] = dict(next_ledger)
+            position.current_management_contract = contract
+
+    @classmethod
+    def _current_group_profit_lock_ledger(cls, positions: list[Any]) -> dict[str, Any]:
+        ledgers: list[dict[str, Any]] = []
+        for position in positions:
+            contract = getattr(position, "current_management_contract", None)
+            if not isinstance(contract, dict):
+                continue
+            ledger = contract.get(PROFIT_LOCK_LEDGER_KEY)
+            if isinstance(ledger, dict):
+                ledgers.append(dict(ledger))
+        if not ledgers:
+            return {}
+        return max(
+            ledgers,
+            key=lambda ledger: (
+                cls._safe_float(ledger.get("realized_quantity"), 0.0),
+                cls._parse_time(ledger.get("updated_at"))
+                or datetime.min.replace(tzinfo=UTC),
+            ),
+        )
+
+    @staticmethod
     def _parse_time(value: Any) -> datetime | None:
         if isinstance(value, datetime):
             return ExitExecutionSingleFlightService._aware(value)
@@ -325,6 +466,13 @@ class ExitExecutionSingleFlightService:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
 
 def preserve_exit_execution_intent(
     previous_contract: Any,
@@ -334,7 +482,8 @@ def preserve_exit_execution_intent(
 
     merged = dict(refreshed_contract)
     previous = previous_contract if isinstance(previous_contract, dict) else {}
-    intent = previous.get(EXIT_INTENT_KEY)
-    if isinstance(intent, dict) and intent:
-        merged[EXIT_INTENT_KEY] = dict(intent)
+    for key in (EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY):
+        value = previous.get(key)
+        if isinstance(value, dict) and value:
+            merged[key] = dict(value)
     return merged

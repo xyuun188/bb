@@ -18,6 +18,8 @@ ALLOWED_MANAGEMENT_ACTIONS = (
     "close",
     "protection_repair",
 )
+PROFIT_LOCK_LEDGER_KEY = "profit_lock_exit_ledger"
+PROFIT_LOCK_LEDGER_VERSION = "2026-09-19.profit-lock-exit-ledger.v1"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -498,6 +500,9 @@ def build_current_position_management_contract(
         contract["paper_canary_lifecycle"] = paper_canary_lifecycle
     if paper_training_lifecycle:
         contract["paper_training_lifecycle"] = paper_training_lifecycle
+    previous_profit_lock_ledger = previous.get(PROFIT_LOCK_LEDGER_KEY)
+    if isinstance(previous_profit_lock_ledger, dict) and previous_profit_lock_ledger:
+        contract[PROFIT_LOCK_LEDGER_KEY] = dict(previous_profit_lock_ledger)
     contract["policy_provenance"]["contract_fingerprint"] = _fingerprint(contract)
     return contract
 
