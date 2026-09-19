@@ -5023,17 +5023,23 @@ def _phase3_model_readiness_probe_failed_before_remote(report: dict[str, Any]) -
     )
 
 
-async def _phase3_paper_resume_preflight_audit() -> dict[str, Any]:
+async def _phase3_paper_resume_preflight_audit(
+    *,
+    force_live: bool = False,
+) -> dict[str, Any]:
     report = _read_latest_phase3_report(PHASE3_PAPER_RESUME_PREFLIGHT_REPORT_REL_PATH)
     checked_at = _report_checked_at(report)
     if checked_at is not None:
         age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
     else:
         age_seconds = None
-    needs_live_refresh, refresh_reason = _phase3_preflight_needs_live_refresh(
-        report,
-        report_age_seconds=age_seconds,
-    )
+    if force_live:
+        needs_live_refresh, refresh_reason = True, "explicit_fresh_system_audit"
+    else:
+        needs_live_refresh, refresh_reason = _phase3_preflight_needs_live_refresh(
+            report,
+            report_age_seconds=age_seconds,
+        )
     if needs_live_refresh:
         global _okx_authoritative_sync_cache
         _okx_authoritative_sync_cache = None
@@ -6891,12 +6897,15 @@ def _append_history_record(payload: dict[str, Any], *, source: str) -> None:
 async def _run_required_audit(
     key: str,
     factory: Any,
+    *,
+    force_fresh: bool = False,
 ) -> dict[str, Any]:
     """Serve a recent required card or run the bounded live audit once."""
 
-    cached = _cached_required_audit_card(key)
-    if cached is not None:
-        return cached
+    if not force_fresh:
+        cached = _cached_required_audit_card(key)
+        if cached is not None:
+            return cached
     result = await _audit_maybe_async(
         factory,
         timeout_seconds=_system_audit_section_timeout_seconds(key),
@@ -6907,17 +6916,24 @@ async def _run_required_audit(
 
 
 async def collect_system_audit_status(
-    *, record_history: bool = True, source: str = "api"
+    *,
+    record_history: bool = True,
+    source: str = "api",
+    fresh_required_audits: bool = False,
 ) -> dict[str, Any]:
     async with _system_audit_lock():
         return await _collect_system_audit_status_unlocked(
             record_history=record_history,
             source=source,
+            fresh_required_audits=fresh_required_audits,
         )
 
 
 async def _collect_system_audit_status_unlocked(
-    *, record_history: bool = True, source: str = "api"
+    *,
+    record_history: bool = True,
+    source: str = "api",
+    fresh_required_audits: bool = False,
 ) -> dict[str, Any]:
     collection_started = time.perf_counter()
     collection_deadline = collection_started + SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS
@@ -6927,7 +6943,12 @@ async def _collect_system_audit_status_unlocked(
         ("okx_trade_fact_integrity", _okx_trade_fact_integrity_audit),
         ("phase3_server_migration", _phase3_server_migration_audit),
         ("phase3_model_server_readiness", _phase3_model_server_readiness_audit),
-        ("phase3_paper_resume_preflight", _phase3_paper_resume_preflight_audit),
+        (
+            "phase3_paper_resume_preflight",
+            lambda: _phase3_paper_resume_preflight_audit(
+                force_live=fresh_required_audits,
+            ),
+        ),
         ("phase3_paper_resume_observation", _phase3_paper_resume_observation_audit),
         ("position_price_integrity", _position_price_integrity_audit),
         ("market_data", _market_data_audit),
@@ -6937,7 +6958,11 @@ async def _collect_system_audit_status_unlocked(
         ("production_source_health", _production_source_health_audit),
         (
             "model_training",
-            lambda: _run_required_audit("model_training", _model_training_audit),
+            lambda: _run_required_audit(
+                "model_training",
+                _model_training_audit,
+                force_fresh=fresh_required_audits,
+            ),
         ),
         ("model_expert_health", _model_expert_health_audit),
         ("model_expert_competition", _model_expert_competition_audit),
@@ -6950,6 +6975,7 @@ async def _collect_system_audit_status_unlocked(
             lambda: _run_required_audit(
                 "position_capacity_release",
                 _position_capacity_release_audit,
+                force_fresh=fresh_required_audits,
             ),
         ),
         ("trade_execution_contract", _trade_execution_contract_audit),

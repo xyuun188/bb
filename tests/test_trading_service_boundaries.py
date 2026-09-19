@@ -4435,6 +4435,53 @@ def test_entry_unavailable_classification_keeps_transient_failures_retryable() -
     )
 
 
+@pytest.mark.asyncio
+async def test_market_shortlist_skips_cached_demo_unavailable_symbols_for_alternates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 4,
+        "ranked_symbol_sample": [
+            {"symbol": symbol, "selected": True}
+            for symbol in ("F/USDT", "CNPY/USDT", "BTC/USDT", "ETH/USDT")
+        ],
+    }
+    service._okx_paper = object()
+    service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT", "ETH/USDT"}}
+    service._unavailable_entry_symbols_by_mode = {
+        "paper": {
+            symbol: {
+                "available": False,
+                "reason": "okx_private_entry_instrument_unavailable",
+                "error_code": "51001",
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            }
+            for symbol in ("F/USDT", "CNPY/USDT")
+        }
+    }
+    service._market_analysis_only_symbols = set()
+    monkeypatch.setattr(
+        service,
+        "_schedule_market_instrument_availability_refresh",
+        lambda *_args, **_kwargs: None,
+    )
+
+    selected = await service._filter_entry_instrument_shortlist(
+        {
+            "F/USDT": object(),
+            "CNPY/USDT": object(),
+            "BTC/USDT": object(),
+            "ETH/USDT": object(),
+        },
+        2,
+        "paper",
+    )
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    assert service._market_analysis_only_symbols == set()
+
+
 def test_entry_unavailable_cache_survives_restart_and_expires(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -419,7 +419,11 @@ async def test_system_audit_runner_closes_database_after_collection(
     closed = False
 
     async def fake_collect(**kwargs: Any) -> dict[str, Any]:
-        assert kwargs == {"record_history": True, "source": "runner_test"}
+        assert kwargs == {
+            "record_history": True,
+            "source": "runner_test",
+            "fresh_required_audits": True,
+        }
         return {
             "checked_at": "2026-08-01T00:00:00+00:00",
             "status": "ok",

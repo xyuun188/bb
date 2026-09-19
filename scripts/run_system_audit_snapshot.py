@@ -46,7 +46,11 @@ async def run_once(
     collector: Callable[..., Awaitable[dict[str, Any]]] = collect_system_audit_status,
 ) -> dict[str, Any]:
     try:
-        payload = await collector(record_history=record_history, source=source)
+        payload = await collector(
+            record_history=record_history,
+            source=source,
+            fresh_required_audits=True,
+        )
         return {
             "ok": True,
             "checked_at": payload.get("checked_at"),

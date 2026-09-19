@@ -6912,6 +6912,86 @@ class OKXExecutor(AbstractExecutor):
         okx_symbol = await self._resolve_swap_symbol(symbol)
         inst_id = okx_inst_id_from_symbol(symbol)
         ccxt = await self._get_ccxt()
+        # Paper analysis can read the live public market, but an order is only
+        # meaningful when the same contract exists in the demo execution
+        # environment. Check that capability before fetching sizing facts so a
+        # demo-only 51001 becomes one explicit blocker instead of misleading
+        # zero-depth/spec errors.
+        if settings.is_okx_demo(self.executor_mode):
+            try:
+                compatibility = await self._entry_environment_compatibility(ccxt, symbol)
+            except Exception as exc:
+                error_text = safe_error_text(exc, limit=220)
+                if "51001" in error_text:
+                    return {
+                        "production_eligible": False,
+                        "reason": "okx_private_entry_instrument_unavailable",
+                        "error_code": "51001",
+                        "symbol": normalize_trading_symbol(symbol),
+                        "side": str(side or "").lower(),
+                        "okx_symbol": okx_symbol,
+                        "inst_id": inst_id,
+                        "feature_snapshot": {},
+                        "environment_compatibility": {
+                            "checked": True,
+                            "compatible": False,
+                            "reason": "okx_paper_execution_instrument_unavailable",
+                            "blockers": ["execution_instrument_missing"],
+                            "error": error_text,
+                        },
+                        "policy_provenance": {
+                            "source": "okx_paper_execution_environment_probe",
+                            "observation_window": "current_immediate_pre_order_refresh",
+                            "sample_count": 0,
+                            "generated_at": datetime.now(UTC).isoformat(),
+                            "strategy_version": "2026-09-19.okx-pre-order-execution-facts.v3",
+                            "fallback_reason": "okx_private_entry_instrument_unavailable",
+                        },
+                    }
+                return {
+                    "production_eligible": False,
+                    "reason": "okx_pre_order_environment_probe_failed",
+                    "symbol": normalize_trading_symbol(symbol),
+                    "side": str(side or "").lower(),
+                    "okx_symbol": okx_symbol,
+                    "inst_id": inst_id,
+                    "feature_snapshot": {},
+                    "environment_compatibility": {
+                        "checked": False,
+                        "compatible": None,
+                        "reason": "okx_pre_order_environment_probe_failed",
+                        "blockers": ["environment_compatibility_probe_failed"],
+                        "error": error_text,
+                    },
+                    "policy_provenance": {
+                        "source": "okx_paper_execution_environment_probe",
+                        "observation_window": "current_immediate_pre_order_refresh",
+                        "sample_count": 0,
+                        "generated_at": datetime.now(UTC).isoformat(),
+                        "strategy_version": "2026-09-19.okx-pre-order-execution-facts.v3",
+                        "fallback_reason": "okx_pre_order_environment_probe_failed",
+                    },
+                }
+            if compatibility.get("compatible") is not True:
+                blockers = list(compatibility.get("blockers") or [])
+                return {
+                    "production_eligible": False,
+                    "reason": "okx_entry_live_execution_environment_incompatible",
+                    "symbol": normalize_trading_symbol(symbol),
+                    "side": str(side or "").lower(),
+                    "okx_symbol": okx_symbol,
+                    "inst_id": inst_id,
+                    "feature_snapshot": {},
+                    "environment_compatibility": compatibility,
+                    "policy_provenance": {
+                        "source": "okx_paper_execution_environment_probe",
+                        "observation_window": "current_immediate_pre_order_refresh",
+                        "sample_count": 0,
+                        "generated_at": datetime.now(UTC).isoformat(),
+                        "strategy_version": "2026-09-19.okx-pre-order-execution-facts.v3",
+                        "fallback_reason": ",".join(blockers),
+                    },
+                }
         fetch_order_book = getattr(ccxt, "fetch_order_book", None)
         if not callable(fetch_order_book):
             fetch_order_book = ccxt.executionFetchOrderBook
@@ -7022,7 +7102,7 @@ class OKXExecutor(AbstractExecutor):
                 "observation_window": "current_immediate_pre_order_refresh",
                 "sample_count": len(bids) + len(asks) + int(mark_price > 0) + int(bool(spec)),
                 "generated_at": generated_at,
-                "strategy_version": "2026-07-28.okx-pre-order-execution-facts.v2",
+                "strategy_version": "2026-09-19.okx-pre-order-execution-facts.v3",
                 "fallback_reason": "" if not reasons else ",".join(reasons),
             },
         }

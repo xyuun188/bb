@@ -52,6 +52,8 @@ class StrategySignalRootCauseAuditService:
                     AIDecision.symbol,
                     AIDecision.action,
                     AIDecision.created_at,
+                    AIDecision.was_executed,
+                    AIDecision.execution_reason,
                     AIDecision.decision_learning_snapshot.label("raw_llm_response"),
                 )
                 .where(
@@ -92,6 +94,7 @@ class StrategySignalRootCauseAuditService:
         entries = [row for row in decisions if str(row.action or "").lower() in ENTRY_ACTIONS]
         blocker_counts: Counter[str] = Counter()
         lifecycle_blocker_counts: Counter[tuple[str, str]] = Counter()
+        pre_sizing_blocker_counts: Counter[str] = Counter()
         expected_returns: list[float] = []
         return_lcbs: list[float] = []
         ready_count = 0
@@ -99,6 +102,10 @@ class StrategySignalRootCauseAuditService:
         lifecycle_ready_counts: Counter[str] = Counter()
         for row in entries:
             raw = _safe_dict(getattr(row, "raw_llm_response", None))
+            pre_sizing_blocker = _pre_sizing_guard_blocker(row)
+            if pre_sizing_blocker is not None:
+                pre_sizing_blocker_counts[pre_sizing_blocker] += 1
+                continue
             lifecycle = entry_contract_lifecycle(raw)
             lifecycle_counts[lifecycle] += 1
             if lifecycle == "live_ml":
@@ -138,10 +145,12 @@ class StrategySignalRootCauseAuditService:
             bool(getattr(row, "missed_opportunity", False)) for row in shadows
         )
         return {
-            "status": "warning" if causes else "ok",
+            "status": "warning" if causes or pre_sizing_blocker_counts else "ok",
             "summary": (
                 "Production return contract gaps were found."
                 if causes
+                else "Entries were stopped by authoritative pre-sizing guards."
+                if pre_sizing_blocker_counts
                 else "审计窗口内的生产收益契约完整。"
             ),
             "audit_only": True,
@@ -154,6 +163,11 @@ class StrategySignalRootCauseAuditService:
             "can_change_ml_readiness": False,
             "can_bypass_risk_controls": False,
             "entry_decision_count": len(entries),
+            "contract_validation_entry_count": (
+                len(entries) - sum(pre_sizing_blocker_counts.values())
+            ),
+            "pre_sizing_guard_blocked_count": sum(pre_sizing_blocker_counts.values()),
+            "pre_sizing_blocker_counts": dict(pre_sizing_blocker_counts),
             "entry_contract_ready_count": ready_count,
             "high_quality_entry_count": lifecycle_ready_counts["live_ml"],
             "live_ml_ready_count": lifecycle_ready_counts["live_ml"],
@@ -245,6 +259,41 @@ def _distribution(values: list[float]) -> dict[str, Any]:
         "max": round(ordered[-1], 8),
         "avg": round(sum(ordered) / len(ordered), 8),
     }
+
+
+def _pre_sizing_guard_blocker(row: Any) -> str | None:
+    """Classify terminal guards that ran before any sizing contract existed."""
+
+    if bool(getattr(row, "was_executed", False)):
+        return None
+    reason = str(getattr(row, "execution_reason", None) or "").strip()
+    lowered = reason.lower()
+    if not lowered:
+        return None
+    markers = (
+        ("authoritative pre-order execution facts are incomplete", "pre_order_execution_facts_incomplete"),
+        ("authoritative pre-order execution facts are unavailable", "pre_order_execution_facts_unavailable"),
+        ("authoritative pre-order execution snapshot is missing", "pre_order_execution_snapshot_missing"),
+        ("pre-order analysis market fact is invalid", "pre_order_analysis_market_fact_invalid"),
+        ("pre-order market fact and execution fact instrument mismatch", "pre_order_instrument_mismatch"),
+        ("fresh pre-order native market fact is incomplete", "pre_order_native_market_fact_incomplete"),
+        ("fresh pre-order native price is unavailable", "pre_order_native_price_unavailable"),
+        ("pre-order analysis price is missing", "pre_order_analysis_price_missing"),
+    )
+    for marker, fallback in markers:
+        if marker not in lowered:
+            continue
+        if marker == "authoritative pre-order execution facts are incomplete":
+            detail = reason.rsplit(":", 1)[-1].strip() if ":" in reason else ""
+            native_reasons = [
+                item.strip()
+                for item in detail.split(",")
+                if item.strip().lower().startswith("okx_")
+            ]
+            if native_reasons:
+                return native_reasons[0]
+        return fallback
+    return None
 
 
 def _cause_message(code: str) -> str:

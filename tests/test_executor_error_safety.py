@@ -2589,8 +2589,9 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                 ]
             }
 
-        async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must use live public ticker")
+        async def executionGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params["instId"] == "BTC-USDT-SWAP"
+            return {"data": [{"instId": "BTC-USDT-SWAP", "last": "100"}]}
 
         async def fetch_order_book(self, symbol: str) -> dict[str, Any]:
             assert symbol == "BTC/USDT:USDT"
@@ -2620,11 +2621,30 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
         async def executionGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
             raise AssertionError("paper execution facts must use live public mark price")
 
-        async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must not use live contract rules")
+        async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params == {"instType": "SWAP", "instId": "BTC-USDT-SWAP"}
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "settleCcy": "USDT",
+                        "uly": "BTC-USDT",
+                        "ctType": "linear",
+                        "ctVal": "0.01",
+                        "ctMult": "1",
+                        "ctValCcy": "BTC",
+                        "minSz": "1",
+                        "lotSz": "1",
+                        "tickSz": "0.1",
+                    }
+                ]
+            }
 
         async def executionGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
-            assert params == {"instType": "SWAP"}
+            assert params in (
+                {"instType": "SWAP"},
+                {"instType": "SWAP", "instId": "BTC-USDT-SWAP"},
+            )
             return {
                 "data": [
                     {
@@ -2636,7 +2656,8 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                         "uly": "BTC-USDT",
                         "ctVal": "0.01",
                         "ctMult": "1",
-                        "ctValCcy": "BTC",
+                            "ctValCcy": "BTC",
+                            "ctType": "linear",
                         "minSz": "1",
                         "lotSz": "1",
                         "tickSz": "0.1",
@@ -2674,7 +2695,42 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
     assert snapshot["mark_price"] == pytest.approx(100.05)
     assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
-    assert exchange.live_market_calls == ["ticker", "orderbook", "mark_price"]
+    assert exchange.live_market_calls == [
+        "ticker",
+        "ticker",
+        "orderbook",
+        "mark_price",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_okx_pre_order_reports_demo_instrument_unavailable_before_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(object())
+
+    async def resolve_symbol(_symbol: str) -> str:
+        return "F/USDT:USDT"
+
+    async def demo_unavailable(_ccxt: Any, _symbol: str) -> dict[str, Any]:
+        raise ExchangeAPIError(
+            "OKX API error [51001]: Instrument ID doesn't exist.",
+            code="51001",
+        )
+
+    monkeypatch.setattr(executor, "_resolve_swap_symbol", resolve_symbol)
+    monkeypatch.setattr(executor, "_entry_environment_compatibility", demo_unavailable)
+
+    facts = await executor.pre_order_execution_facts("F/USDT", "short")
+
+    assert facts["production_eligible"] is False
+    assert facts["reason"] == "okx_private_entry_instrument_unavailable"
+    assert facts["error_code"] == "51001"
+    assert facts["environment_compatibility"]["blockers"] == [
+        "execution_instrument_missing"
+    ]
+    assert "okx_pre_order_contract_spec_missing" not in facts["reason"]
+    assert "okx_pre_order_orderbook_incomplete" not in facts["reason"]
 
 
 class _FloorAmountPrecisionCcxt:

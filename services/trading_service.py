@@ -8118,11 +8118,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in feature_vectors
             if symbol not in selected and symbol not in unavailable_symbols
         )
-        # Keep known-incompatible symbols as an observation fallback only when
-        # there are not enough unknown/verified instruments to fill the budget.
-        # They are marked execution-unavailable below and can never reach the
-        # order path.
-        selected.extend(symbol for symbol in feature_vectors if symbol not in selected)
         selected = selected[:target]
         availability = {
             symbol: {
@@ -8178,10 +8173,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 return "execution_unavailable"
             return "analysis_only_execution_unverified"
 
-        # This shortlist controls observation cost only. Execution eligibility
-        # is carried in diagnostics and enforced by the entry gate; dropping
-        # unavailable symbols here underfilled the market loop and created
-        # long gaps between analyses.
+        # Known execution-incompatible instruments no longer consume an
+        # analysis slot. Continue down the ranked universe so paper training
+        # observes candidates that can actually become orders. Temporarily
+        # unverified instruments stay eligible for analysis and still fail
+        # closed at the composed entry gate.
         availability_selected = [
             str(symbol)
             for symbol in shortlist.get("selected_symbols") or []
@@ -8194,11 +8190,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in feature_vectors
             if str(symbol) not in selected_order
             and candidate_state(str(symbol)) != "execution_unavailable"
-        )
-        selected_order.extend(
-            str(symbol)
-            for symbol in feature_vectors
-            if str(symbol) not in selected_order
         )
         selected_order = selected_order[:target]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}

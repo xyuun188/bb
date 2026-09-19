@@ -238,3 +238,35 @@ def test_root_cause_display_is_bounded_but_raw_counts_are_preserved(
     assert report["root_cause_total_count"] == 20
     assert report["root_cause_overflow_count"] == 8
     assert len(report["contract_blocker_counts"]) == 20
+
+
+def test_pre_sizing_native_fact_block_is_not_reported_as_sizing_contract_failure() -> None:
+    decision = SimpleNamespace(
+        action="short",
+        symbol="F/USDT",
+        created_at=datetime(2026, 9, 20, tzinfo=UTC),
+        was_executed=False,
+        execution_reason=(
+            "Authoritative pre-order execution facts are incomplete; entry fails closed: "
+            "okx_private_entry_instrument_unavailable"
+        ),
+        raw_llm_response={
+            "normal_paper_trade": {"version": "incomplete-before-sizing"},
+            "profit_risk_sizing": {},
+        },
+    )
+
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[decision],
+        shadows=[],
+        ml_status={},
+    )
+
+    assert report["status"] == "warning"
+    assert report["contract_validation_entry_count"] == 0
+    assert report["pre_sizing_guard_blocked_count"] == 1
+    assert report["pre_sizing_blocker_counts"] == {
+        "okx_private_entry_instrument_unavailable": 1
+    }
+    assert report["contract_blocker_counts"] == {}
+    assert report["normal_paper_blocked_count"] == 0

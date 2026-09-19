@@ -87,6 +87,32 @@ def test_required_audit_card_does_not_reuse_deferred_snapshot(
     assert system_audit._cached_required_audit_card("position_capacity_release") is None
 
 
+@pytest.mark.asyncio
+async def test_required_audit_force_fresh_bypasses_completed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        system_audit,
+        "_cached_required_audit_card",
+        lambda _key: {"status": "warning", "details": {"report_source": "persisted_audit"}},
+    )
+    calls = 0
+
+    async def live_audit() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"status": "ok", "details": {"report_source": "live"}}
+
+    card = await system_audit._run_required_audit(
+        "model_training",
+        live_audit,
+        force_fresh=True,
+    )
+
+    assert calls == 1
+    assert card["details"]["report_source"] == "live"
+
+
 def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> None:
     payload = {
         "status": "warning",
@@ -761,6 +787,7 @@ async def test_system_audit_collect_uses_process_lock(
         *,
         record_history: bool = True,
         source: str = "api",
+        fresh_required_audits: bool = False,
     ) -> dict[str, Any]:
         nonlocal running, max_running
         running += 1
@@ -776,6 +803,7 @@ async def test_system_audit_collect_uses_process_lock(
             "nodes": [],
             "source": source,
             "record_history": record_history,
+            "fresh_required_audits": fresh_required_audits,
         }
 
     monkeypatch.setattr(
@@ -1222,6 +1250,75 @@ async def test_phase3_paper_resume_preflight_audit_reuses_fresh_timer_report(
     assert card["details"]["report_source"] == "persisted_timer"
     assert card["details"]["report_age_seconds"] >= 0
     assert card["details"]["consumed_after_resume"] is True
+
+
+@pytest.mark.asyncio
+async def test_phase3_paper_resume_preflight_force_live_ignores_fresh_timer_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted_report = {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "status": "blocked",
+        "can_resume_paper": False,
+        "blockers": [{"code": "stale_preflight_blocker"}],
+        "warnings": [],
+    }
+    live_report = {
+        "status": "blocked",
+        "can_resume_paper": False,
+        "blockers": [
+            {
+                "code": "paper_trading_already_active",
+                "severity": "blocking",
+                "message": "Preflight was already consumed.",
+            }
+        ],
+        "warnings": [],
+        "summary": {
+            "okx_issue_count": 0,
+            "model_server_runtime_ready": True,
+            "phase3_quant_api_available": True,
+        },
+        "inputs": {
+            "platform_server": {
+                "services": [
+                    {"name": "bb-paper-trading.service", "active": True},
+                ]
+            }
+        },
+    }
+
+    class FakePhase3PaperResumePreflightService:
+        calls = 0
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def report(self) -> dict[str, Any]:
+            type(self).calls += 1
+            return dict(live_report)
+
+    monkeypatch.setattr(
+        system_audit,
+        "_read_latest_phase3_report",
+        lambda _relative_path: dict(persisted_report),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumePreflightService",
+        FakePhase3PaperResumePreflightService,
+    )
+
+    card = await system_audit._phase3_paper_resume_preflight_audit(force_live=True)
+
+    assert FakePhase3PaperResumePreflightService.calls == 1
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "live_probe"
+    assert card["details"]["report_refresh_reason"] == (
+        "explicit_fresh_system_audit"
+    )
+    assert card["details"]["consumed_after_resume"] is True
+    assert card["details"]["effective_blockers"] == []
 
 
 @pytest.mark.asyncio
