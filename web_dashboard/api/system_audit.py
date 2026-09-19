@@ -3663,6 +3663,7 @@ async def _production_source_health_audit() -> dict[str, Any]:
             hours=AUDIT_WINDOWS["strategy_hours"],
             limit=300,
             decision_interval_seconds=int(settings.decision_interval_seconds or 60),
+            exhaustive=True,
         )
     except Exception as exc:
         return _audit_card(

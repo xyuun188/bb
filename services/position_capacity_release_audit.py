@@ -70,6 +70,7 @@ class PositionCapacityReleaseAuditService:
                             AIDecision.was_executed,
                         )
                         .where(AIDecision.created_at >= since_naive)
+                        .where(AIDecision.action.in_(EXIT_ACTIONS))
                         .order_by(AIDecision.created_at.desc())
                         # Keep one sentinel row so a bounded exit audit is
                         # explicit about incomplete history coverage.

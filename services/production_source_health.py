@@ -286,32 +286,56 @@ class ProductionSourceHealthService:
         hours: int = 24,
         limit: int = 5000,
         decision_interval_seconds: int = 60,
+        exhaustive: bool = False,
     ) -> dict[str, Any]:
         capped_hours = max(1, min(int(hours or 24), 168))
         capped_limit = max(100, min(int(limit or 5000), 10000))
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         async with get_read_session_ctx() as session:
-            result = await session.execute(
-                select(
-                    AIDecision.created_at,
-                    AIDecision.analysis_type,
-                    AIDecision.was_executed,
-                    AIDecision.decision_learning_snapshot.label("raw_llm_response"),
-                )
-                .where(
+            rows: list[Any] = []
+            last_id: int | None = None
+            page_count = 0
+            truncated = False
+            max_rows = 100_000
+            while True:
+                conditions = [
                     AIDecision.created_at >= since,
                     AIDecision.analysis_type == "market",
                     AIDecision.decision_learning_snapshot_version >= 1,
+                ]
+                if last_id is not None:
+                    conditions.append(AIDecision.id < last_id)
+                statement = (
+                    select(
+                        AIDecision.id,
+                        AIDecision.created_at,
+                        AIDecision.analysis_type,
+                        AIDecision.was_executed,
+                        AIDecision.decision_learning_snapshot.label("raw_llm_response"),
+                    )
+                    .where(*conditions)
+                    .order_by(AIDecision.id.desc())
+                    .limit(capped_limit + 1 if not exhaustive else capped_limit)
                 )
-                .order_by(AIDecision.created_at.desc())
-                # Keep one sentinel row so a bounded report cannot be
-                # mistaken for a complete history window.
-                .limit(capped_limit + 1)
-            )
-        rows = result.mappings().all()
-        truncated = len(rows) > capped_limit
+                result = await session.execute(statement)
+                page = result.mappings().all()
+                page_count += 1
+                if not page:
+                    break
+                if not exhaustive and len(page) > capped_limit:
+                    truncated = True
+                    rows.extend(page[:capped_limit])
+                    break
+                rows.extend(page)
+                if len(rows) >= max_rows:
+                    truncated = True
+                    rows = rows[:max_rows]
+                    break
+                if len(page) < capped_limit:
+                    break
+                last_id = int(page[-1]["id"])
         report = summarize_production_source_health(
-            [SimpleNamespace(**dict(row)) for row in rows[:capped_limit]],
+            [SimpleNamespace(**dict(row)) for row in rows],
             decision_interval_seconds=decision_interval_seconds,
         )
         report["window_hours"] = capped_hours
@@ -320,6 +344,9 @@ class ProductionSourceHealthService:
             "truncated": truncated,
             "requested_limit": capped_limit,
             "window_hours": capped_hours,
+            "exhaustive": bool(exhaustive),
+            "page_count": page_count,
+            "row_count": len(rows),
         }
         report["coverage_complete"] = not truncated
         if truncated:

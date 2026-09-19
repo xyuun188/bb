@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from core.contract_math import persisted_product_isclose
+from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
@@ -144,6 +145,7 @@ class TradeExecutionContractService:
                         .where(
                             AIDecision.created_at >= since_naive,
                             AIDecision.decision_learning_snapshot_version >= 1,
+                            AIDecision.action.in_(ENTRY_ACTIONS | EXIT_ACTIONS),
                         )
                         .order_by(AIDecision.id.desc())
                         # Keep one sentinel row so a bounded report cannot be
@@ -185,12 +187,28 @@ class TradeExecutionContractService:
             # Loading full ORM rows (especially JSON blobs) made this read-only
             # audit contend with the trading loop and occasionally exceed its
             # section deadline.
+            decision_exchange_order_ids = {
+                exchange_order_id
+                for decision in decisions
+                if _action(decision) in EXIT_ACTIONS
+                for exchange_order_id in decision_exit_exchange_order_ids(decision)
+            }
             order_id_rows = [
                 row["id"]
                 for row in (
                     await session.execute(
                         select(Order.id)
                         .where(Order.created_at >= since_naive)
+                        .where(
+                            or_(
+                                Order.decision_id.in_(decision_ids)
+                                if decision_ids
+                                else False,
+                                Order.exchange_order_id.in_(sorted(decision_exchange_order_ids))
+                                if decision_exchange_order_ids
+                                else False,
+                            )
+                        )
                         .order_by(Order.id.desc())
                         .limit(capped_limit + 1)
                     )

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
+from services import production_source_health as production_source_health_module
 from services.production_source_health import summarize_production_source_health
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 
@@ -218,3 +222,65 @@ def test_missing_market_decisions_remain_a_hard_failure() -> None:
     assert report["decision_pipeline_active"] is False
     assert report["observing"] is False
     assert report["hard_failure"] is True
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_report_paginates_market_decisions_without_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    first_page = [
+        {
+            "id": index + 2,
+            "created_at": now - timedelta(minutes=index + 1),
+            "analysis_type": "market",
+            "was_executed": False,
+            "raw_llm_response": {},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 1,
+            "created_at": now - timedelta(minutes=3),
+            "analysis_type": "market",
+            "was_executed": False,
+            "raw_llm_response": {},
+        }
+    ]
+
+    class _Result:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> _Result:
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return self._rows
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _statement: object) -> _Result:
+            self.calls += 1
+            return _Result(first_page if self.calls == 1 else second_page if self.calls == 2 else [])
+
+    session = _Session()
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield session
+
+    monkeypatch.setattr(production_source_health_module, "get_read_session_ctx", _session_factory)
+    report = await production_source_health_module.ProductionSourceHealthService().report(
+        hours=24,
+        limit=100,
+        exhaustive=True,
+    )
+
+    assert report["coverage_complete"] is True
+    assert report["coverage"]["truncated"] is False
+    assert report["coverage"]["row_count"] == 101
+    assert report["coverage"]["page_count"] == 2
