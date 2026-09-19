@@ -304,11 +304,30 @@ class ProductionSourceHealthService:
                     AIDecision.decision_learning_snapshot_version >= 1,
                 )
                 .order_by(AIDecision.created_at.desc())
-                .limit(capped_limit)
+                # Keep one sentinel row so a bounded report cannot be
+                # mistaken for a complete history window.
+                .limit(capped_limit + 1)
             )
+        rows = result.mappings().all()
+        truncated = len(rows) > capped_limit
         report = summarize_production_source_health(
-            [SimpleNamespace(**dict(row)) for row in result.mappings().all()],
+            [SimpleNamespace(**dict(row)) for row in rows[:capped_limit]],
             decision_interval_seconds=decision_interval_seconds,
         )
         report["window_hours"] = capped_hours
+        report["coverage"] = {
+            "complete": not truncated,
+            "truncated": truncated,
+            "requested_limit": capped_limit,
+            "window_hours": capped_hours,
+        }
+        report["coverage_complete"] = not truncated
+        if truncated:
+            report["coverage_warning"] = (
+                "The source-health audit reached its row limit; the displayed "
+                "window is partial and must not be treated as a complete history."
+            )
+            if report.get("status") == "ok":
+                report["status"] = "warning"
+                report["reason"] = "audit_window_truncated"
         return report

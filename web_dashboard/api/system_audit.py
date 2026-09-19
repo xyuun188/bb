@@ -3546,10 +3546,15 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
     economics_pending = int(report.get("position_economics_pending_count") or 0)
     exit_gaps = int(report.get("executed_dynamic_exit_contract_gap_count") or 0)
     violation_count = economics_gaps + exit_gaps
+    coverage_complete = report.get("coverage_complete", True) is True
     return _audit_card(
         "position_capacity_release",
         "持仓经济性与动态退出",
-        "critical" if violation_count else "warning" if economics_pending else "ok",
+        "critical"
+        if violation_count
+        else "warning"
+        if economics_pending or not coverage_complete
+        else "ok",
         (
             "持仓经济性或已执行动态退出契约不完整。"
             if violation_count
@@ -3669,6 +3674,8 @@ async def _production_source_health_audit() -> dict[str, Any]:
             owner_path="services/production_source_health.py",
         )
     status = str(report.get("status") or "warning")
+    if report.get("coverage_complete", True) is not True and status == "ok":
+        status = "warning"
     duration = report.get("continuous_no_source_seconds")
     title = "连续无生产收益源"
     next_actions = [
@@ -4012,7 +4019,13 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
     fill_sync_pending = int(summary.get("entry_authoritative_fill_sync_pending_count") or 0)
     direction_alert = summary.get("direction_concentration_alert") is True
     single_family_count = int(summary.get("single_family_authorized_entry_count") or 0)
-    warning = bool(fill_sync_pending or direction_alert or single_family_count)
+    coverage_complete = report.get("coverage_complete", True) is True
+    warning = bool(
+        fill_sync_pending
+        or direction_alert
+        or single_family_count
+        or not coverage_complete
+    )
     return _audit_card(
         "trade_execution_contract",
         "动态费后收益执行契约",

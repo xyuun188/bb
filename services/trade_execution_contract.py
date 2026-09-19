@@ -136,7 +136,7 @@ class TradeExecutionContractService:
             # Materialize the bounded id set in a separate round trip. PostgreSQL
             # may inline a LIMIT subquery and decompress JSON for every eligible
             # row before limiting it, which caused large-window audits to time out.
-            decision_ids = [
+            decision_id_rows = [
                 row["id"]
                 for row in (
                     await session.execute(
@@ -146,12 +146,16 @@ class TradeExecutionContractService:
                             AIDecision.decision_learning_snapshot_version >= 1,
                         )
                         .order_by(AIDecision.id.desc())
-                        .limit(capped_limit)
+                        # Keep one sentinel row so a bounded report cannot be
+                        # mistaken for a complete history window.
+                        .limit(capped_limit + 1)
                     )
                 )
                 .mappings()
                 .all()
             ]
+            decision_truncated = len(decision_id_rows) > capped_limit
+            decision_ids = decision_id_rows[:capped_limit]
             decisions = []
             if decision_ids:
                 decisions = [
@@ -181,19 +185,21 @@ class TradeExecutionContractService:
             # Loading full ORM rows (especially JSON blobs) made this read-only
             # audit contend with the trading loop and occasionally exceed its
             # section deadline.
-            order_ids = [
+            order_id_rows = [
                 row["id"]
                 for row in (
                     await session.execute(
                         select(Order.id)
                         .where(Order.created_at >= since_naive)
                         .order_by(Order.id.desc())
-                        .limit(capped_limit)
+                        .limit(capped_limit + 1)
                     )
                 )
                 .mappings()
                 .all()
             ]
+            order_truncated = len(order_id_rows) > capped_limit
+            order_ids = order_id_rows[:capped_limit]
             orders = []
             if order_ids:
                 orders = [
@@ -219,7 +225,7 @@ class TradeExecutionContractService:
                     .mappings()
                     .all()
                 ]
-            position_ids = [
+            position_id_rows = [
                 row["id"]
                 for row in (
                     await session.execute(
@@ -231,12 +237,14 @@ class TradeExecutionContractService:
                             )
                         )
                         .order_by(Position.id.desc())
-                        .limit(capped_limit)
+                        .limit(capped_limit + 1)
                     )
                 )
                 .mappings()
                 .all()
             ]
+            position_truncated = len(position_id_rows) > capped_limit
+            position_ids = position_id_rows[:capped_limit]
             positions = []
             if position_ids:
                 positions = [
@@ -263,6 +271,16 @@ class TradeExecutionContractService:
         report["window_start"] = since_utc.isoformat()
         report["training_epoch_started_at"] = epoch_start.isoformat()
         report["pre_epoch_contracts_can_block_entries"] = False
+        report["coverage"] = {
+            "complete": not (decision_truncated or order_truncated or position_truncated),
+            "truncated": bool(decision_truncated or order_truncated or position_truncated),
+            "decision_truncated": decision_truncated,
+            "order_truncated": order_truncated,
+            "position_truncated": position_truncated,
+            "requested_limit": capped_limit,
+            "window_hours": capped_hours,
+        }
+        report["coverage_complete"] = report["coverage"]["complete"]
         return report
 
 

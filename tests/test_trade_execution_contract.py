@@ -41,6 +41,48 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
 
 
 @pytest.mark.asyncio
+async def test_contract_report_marks_bounded_dataset_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Result:
+        def __init__(self, rows: list[dict[str, int]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> _Result:
+            return self
+
+        def all(self) -> list[dict[str, int]]:
+            return self._rows
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _statement: object) -> _Result:
+            self.calls += 1
+            if self.calls == 1:
+                return _Result([{"id": 1}, {"id": 2}])
+            return _Result([])
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield _Session()
+
+    monkeypatch.setattr(
+        trade_execution_contract_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    report = await TradeExecutionContractService(_session_factory).report(
+        limit=1,
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+
+    assert report["coverage_complete"] is False
+    assert report["coverage"]["decision_truncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -50,7 +50,7 @@ class PositionCapacityReleaseAuditService:
                 .scalars()
                 .all()
             )
-            decisions = list(
+            decision_rows = list(
                 SimpleNamespace(
                     id=row.id,
                     symbol=row.symbol,
@@ -71,10 +71,14 @@ class PositionCapacityReleaseAuditService:
                         )
                         .where(AIDecision.created_at >= since_naive)
                         .order_by(AIDecision.created_at.desc())
-                        .limit(self.limit)
+                        # Keep one sentinel row so a bounded exit audit is
+                        # explicit about incomplete history coverage.
+                        .limit(self.limit + 1)
                     )
                 ).all()
             )
+            decisions_truncated = len(decision_rows) > self.limit
+            decisions = decision_rows[: self.limit]
             decision_ids = [
                 int(decision.id)
                 for decision in decisions
@@ -111,7 +115,21 @@ class PositionCapacityReleaseAuditService:
                 if decision_ids or exit_order_ids
                 else []
             )
-        return self._summarize(positions, decisions, orders)
+        report = self._summarize(positions, decisions, orders)
+        report["coverage"] = {
+            "complete": not decisions_truncated,
+            "truncated": decisions_truncated,
+            "decision_truncated": decisions_truncated,
+            "requested_limit": self.limit,
+            "lookback_hours": self.lookback_hours,
+        }
+        report["coverage_complete"] = not decisions_truncated
+        if decisions_truncated:
+            report["coverage_warning"] = (
+                "The dynamic-exit audit reached its decision limit; recent exits "
+                "are complete only for the bounded sample."
+            )
+        return report
 
     def _summarize(
         self,
