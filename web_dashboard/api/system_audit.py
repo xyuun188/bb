@@ -3521,6 +3521,7 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
             await PositionCapacityReleaseAuditService(
                 lookback_hours=POSITION_CAPACITY_RELEASE_AUDIT_HOURS,
                 limit=POSITION_CAPACITY_RELEASE_AUDIT_LIMIT,
+                exhaustive=True,
             ).report()
         )
     except Exception as exc:
@@ -3663,6 +3664,7 @@ async def _production_source_health_audit() -> dict[str, Any]:
             hours=AUDIT_WINDOWS["strategy_hours"],
             limit=300,
             decision_interval_seconds=int(settings.decision_interval_seconds or 60),
+            exhaustive=True,
         )
     except Exception as exc:
         return _audit_card(

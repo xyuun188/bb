@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
+import services.position_capacity_release_audit as position_capacity_release_audit_module
 from services.current_position_management import (
     build_current_position_management_contract,
 )
@@ -397,3 +401,89 @@ def test_capacity_audit_joins_filled_order_by_exact_exit_exchange_id() -> None:
     row = report["dynamic_exit_decisions"][0]
     assert row["filled_order_count"] == 1
     assert row["dynamic_exit_contract_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_capacity_audit_exhaustive_report_paginates_decisions_and_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    first_page = [
+        SimpleNamespace(
+            id=3 - index,
+            symbol="BTC/USDT",
+            action="close_long",
+            raw_llm_response={"dynamic_exit_policy": _dynamic_exit_policy()},
+            created_at=now,
+            was_executed=True,
+        )
+        for index in range(2)
+    ]
+    second_page = [
+        SimpleNamespace(
+            id=1,
+            symbol="BTC/USDT",
+            action="close_long",
+            raw_llm_response={"dynamic_exit_policy": _dynamic_exit_policy()},
+            created_at=now,
+            was_executed=True,
+        )
+    ]
+    orders = [
+        SimpleNamespace(
+            id=index + 1,
+            decision_id=decision_id,
+            status="filled",
+            exchange_order_id=f"close-{decision_id}",
+        )
+        for index, decision_id in enumerate((3, 2, 1))
+    ]
+
+    class _Result:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[object]:
+            return self._rows
+
+        def scalars(self) -> _Result:
+            return self
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _statement: object) -> _Result:
+            self.calls += 1
+            if self.calls == 1:
+                return _Result([_position()])
+            if self.calls == 2:
+                return _Result(first_page)
+            if self.calls == 3:
+                return _Result(second_page)
+            if self.calls == 4:
+                return _Result(orders)
+            return _Result([])
+
+    session = _Session()
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield session
+
+    monkeypatch.setattr(
+        position_capacity_release_audit_module,
+        "get_read_session_ctx",
+        _session_factory,
+    )
+    report = await PositionCapacityReleaseAuditService(
+        limit=2,
+        exhaustive=True,
+    ).report()
+
+    assert report["coverage_complete"] is True
+    assert report["coverage"]["truncated"] is False
+    assert report["coverage"]["decision_row_count"] == 3
+    assert report["coverage"]["page_count"] == 2
+    assert report["coverage"]["order_row_count"] == 3
+    assert report["dynamic_exit_decision_count"] == 3

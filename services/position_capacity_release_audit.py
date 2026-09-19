@@ -35,13 +35,16 @@ class PositionCapacityReleaseAuditService:
         *,
         lookback_hours: int = 24,
         limit: int = 500,
+        exhaustive: bool = False,
         capacity_policy: DynamicPositionCapacityPolicy | None = None,
     ) -> None:
         self.lookback_hours = max(int(lookback_hours or 24), 1)
         self.limit = max(1, min(int(limit or 500), 5000))
+        self.exhaustive = bool(exhaustive)
         self.capacity_policy = capacity_policy or DynamicPositionCapacityPolicy()
 
-    async def report(self) -> dict[str, Any]:
+    async def report(self, *, exhaustive: bool | None = None) -> dict[str, Any]:
+        exhaustive = self.exhaustive if exhaustive is None else bool(exhaustive)
         since = datetime.now(UTC) - timedelta(hours=self.lookback_hours)
         since_naive = since.replace(tzinfo=None)
         async with get_read_session_ctx() as session:
@@ -50,7 +53,48 @@ class PositionCapacityReleaseAuditService:
                 .scalars()
                 .all()
             )
-            decision_rows = list(
+            decision_rows: list[Any] = []
+            last_id: int | None = None
+            page_count = 0
+            decisions_truncated = False
+            max_rows = 100_000
+            while True:
+                conditions = [
+                    AIDecision.created_at >= since_naive,
+                    AIDecision.action.in_(EXIT_ACTIONS),
+                ]
+                if last_id is not None:
+                    conditions.append(AIDecision.id < last_id)
+                statement = (
+                    select(
+                        AIDecision.id,
+                        AIDecision.symbol,
+                        AIDecision.action,
+                        AIDecision.raw_llm_response,
+                        AIDecision.created_at,
+                        AIDecision.was_executed,
+                    )
+                    .where(*conditions)
+                    .order_by(AIDecision.id.desc())
+                    .limit(self.limit + 1 if not exhaustive else self.limit)
+                )
+                page = (await session.execute(statement)).all()
+                page_count += 1
+                if not page:
+                    break
+                if not exhaustive and len(page) > self.limit:
+                    decisions_truncated = True
+                    decision_rows.extend(page[: self.limit])
+                    break
+                decision_rows.extend(page)
+                if len(decision_rows) >= max_rows:
+                    decisions_truncated = True
+                    decision_rows = decision_rows[:max_rows]
+                    break
+                if len(page) < self.limit:
+                    break
+                last_id = int(page[-1].id)
+            decisions = [
                 SimpleNamespace(
                     id=row.id,
                     symbol=row.symbol,
@@ -59,26 +103,8 @@ class PositionCapacityReleaseAuditService:
                     created_at=row.created_at,
                     was_executed=bool(row.was_executed),
                 )
-                for row in (
-                    await session.execute(
-                        select(
-                            AIDecision.id,
-                            AIDecision.symbol,
-                            AIDecision.action,
-                            AIDecision.raw_llm_response,
-                            AIDecision.created_at,
-                            AIDecision.was_executed,
-                        )
-                        .where(AIDecision.created_at >= since_naive)
-                        .order_by(AIDecision.created_at.desc())
-                        # Keep one sentinel row so a bounded exit audit is
-                        # explicit about incomplete history coverage.
-                        .limit(self.limit + 1)
-                    )
-                ).all()
-            )
-            decisions_truncated = len(decision_rows) > self.limit
-            decisions = decision_rows[: self.limit]
+                for row in decision_rows
+            ]
             decision_ids = [
                 int(decision.id)
                 for decision in decisions
@@ -90,44 +116,74 @@ class PositionCapacityReleaseAuditService:
                 if _action(decision) in EXIT_ACTIONS
                 for exchange_order_id in decision_exit_exchange_order_ids(decision)
             }
-            orders = (
-                list(
-                    (
-                        await session.execute(
-                            select(Order)
-                            .where(
-                                or_(
-                                    Order.decision_id.in_(decision_ids)
-                                    if decision_ids
-                                    else False,
-                                    Order.exchange_order_id.in_(sorted(exit_order_ids))
-                                    if exit_order_ids
-                                    else False,
-                                )
-                            )
-                            .order_by(Order.created_at.desc())
-                            .limit(self.limit)
+            orders: list[Order] = []
+            order_page_count = 0
+            order_truncated = False
+            order_last_id: int | None = None
+            if decision_ids or exit_order_ids:
+                while True:
+                    order_conditions = [
+                        or_(
+                            Order.decision_id.in_(decision_ids)
+                            if decision_ids
+                            else False,
+                            Order.exchange_order_id.in_(sorted(exit_order_ids))
+                            if exit_order_ids
+                            else False,
                         )
+                    ]
+                    if order_last_id is not None:
+                        order_conditions.append(Order.id < order_last_id)
+                    order_statement = (
+                        select(Order)
+                        .where(*order_conditions)
+                        .order_by(Order.id.desc())
+                        .limit(self.limit + 1 if not exhaustive else self.limit)
                     )
-                    .scalars()
-                    .all()
-                )
-                if decision_ids or exit_order_ids
-                else []
-            )
+                    order_page = list(
+                        (await session.execute(order_statement)).scalars().all()
+                    )
+                    order_page_count += 1
+                    if not order_page:
+                        break
+                    if not exhaustive and len(order_page) > self.limit:
+                        order_truncated = True
+                        orders.extend(order_page[: self.limit])
+                        break
+                    orders.extend(order_page)
+                    if len(orders) >= max_rows:
+                        order_truncated = True
+                        orders = orders[:max_rows]
+                        break
+                    if len(order_page) < self.limit:
+                        break
+                    order_last_id = int(order_page[-1].id)
         report = self._summarize(positions, decisions, orders)
+        coverage_truncated = decisions_truncated or order_truncated
         report["coverage"] = {
-            "complete": not decisions_truncated,
-            "truncated": decisions_truncated,
+            "complete": not coverage_truncated,
+            "truncated": coverage_truncated,
             "decision_truncated": decisions_truncated,
+            "order_truncated": order_truncated,
             "requested_limit": self.limit,
             "lookback_hours": self.lookback_hours,
+            "exhaustive": bool(exhaustive),
+            "page_count": page_count,
+            "decision_row_count": len(decision_rows),
+            "order_page_count": order_page_count,
+            "order_row_count": len(orders),
         }
-        report["coverage_complete"] = not decisions_truncated
-        if decisions_truncated:
+        report["coverage_complete"] = not coverage_truncated
+        if coverage_truncated:
+            truncated_parts = []
+            if decisions_truncated:
+                truncated_parts.append("decisions")
+            if order_truncated:
+                truncated_parts.append("orders")
             report["coverage_warning"] = (
-                "The dynamic-exit audit reached its decision limit; recent exits "
-                "are complete only for the bounded sample."
+                "The dynamic-exit audit reached its "
+                + " and ".join(truncated_parts)
+                + " limit; recent exits are complete only for the bounded sample."
             )
         return report
 
