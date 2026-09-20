@@ -21,7 +21,10 @@ from services.normal_paper_trade import (
 from services.okx_execution_slippage import build_okx_fill_mark_slippage
 from services.okx_training_facts import build_okx_history_training_sample
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
-from services.trade_execution_contract import validate_entry_execution_contract
+from services.trade_execution_contract import (
+    summarize_trade_execution_contract,
+    validate_entry_execution_contract,
+)
 from services.trade_order_log_service import TradeOrderLogOutcome
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
@@ -214,6 +217,64 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
     decision.position_size_pct = 0.04
     decision.suggested_leverage = 1.0
     return decision
+
+
+def _historical_minimum_fill_decision() -> DecisionOutput:
+    decision = _profit_first_ready_position_review_decision()
+    raw = decision.raw_response
+    sizing = raw["profit_risk_sizing"]
+    sizing.update(
+        {
+            "target_notional_usdt": 1.710,
+            "final_notional_usdt": 1.710,
+            "fill_notional_ceiling_usdt": 1.714275,
+            "minimum_order_notional_usdt": 1.711,
+            "planned_stressed_loss_usdt": 0.0171,
+            "estimated_fill_drift_reserve_fraction": 0.0025,
+            "final_margin_usdt": 1.710,
+        }
+    )
+    raw["opportunity_score"]["execution_cost"]["order_notional_usdt"] = 1.710
+    raw["execution_cost_sizing_pass"].update(
+        {
+            "impact_basis_notional_usdt": 1.710,
+            "final_notional_usdt": 1.710,
+        }
+    )
+    raw["pre_order_execution_facts"].update(
+        {
+            "inst_id": "BTC-USDT-SWAP",
+            "contract_spec": {
+                "ctVal": "1",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        }
+    )
+    return decision
+
+
+def _authoritative_historical_fill_order() -> SimpleNamespace:
+    return SimpleNamespace(
+        decision_id=510818,
+        status="filled",
+        quantity=1.0,
+        price=1.712,
+        exchange_order_id="okx-order-510818",
+        okx_fill_contracts=1.0,
+        okx_raw_fills={
+            "fills_history_confirmed": True,
+            "order_id": "okx-order-510818",
+            "trade_ids": ["okx-trade-510818"],
+            "inst_id": "BTC-USDT-SWAP",
+            "contracts": 1.0,
+            "contract_size": 1.0,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "base_quantity": 1.0,
+            "avg_price": 1.712,
+        },
+    )
 
 
 def test_execution_service_persists_okx_51001_entry_negative_cache() -> None:
@@ -738,6 +799,71 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
     assert entry_gate.passed is False
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
     assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
+
+
+def test_historical_below_minimum_plan_uses_complete_authoritative_fill() -> None:
+    decision = _historical_minimum_fill_decision()
+    audit_decision = SimpleNamespace(
+        id=510818,
+        symbol=decision.symbol,
+        action="short",
+        was_executed=True,
+        raw_llm_response=decision.raw_response,
+    )
+
+    report = summarize_trade_execution_contract(
+        [audit_decision],
+        orders=[_authoritative_historical_fill_order()],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 0
+    contract = report["entry_contracts"][0]
+    assert contract["filled_order_notional_usdt"] == pytest.approx(1.712)
+    assert contract["historical_minimum_fill_settlement_accepted"] is True
+    assert "normal_paper_minimum_order_invalid" not in contract["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("executed", "filled_order_present", "authoritative_fill_complete"),
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_historical_below_minimum_plan_fails_without_complete_executed_fill(
+    executed: bool,
+    filled_order_present: bool,
+    authoritative_fill_complete: bool,
+) -> None:
+    decision = _historical_minimum_fill_decision()
+
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=1.712,
+        executed=executed,
+        filled_order_present=filled_order_present,
+        authoritative_fill_complete=authoritative_fill_complete,
+    )
+
+    assert contract["historical_minimum_fill_settlement_accepted"] is False
+    assert "normal_paper_minimum_order_invalid" in reasons
+
+
+def test_historical_below_minimum_plan_rejects_fill_beyond_reserved_ceiling() -> None:
+    decision = _historical_minimum_fill_decision()
+
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=1.72,
+        executed=True,
+        filled_order_present=True,
+        authoritative_fill_complete=True,
+    )
+
+    assert contract["historical_minimum_fill_settlement_accepted"] is False
+    assert "normal_paper_minimum_order_invalid" in reasons
+    assert "normal_paper_filled_notional_exceeds_risk_budget" in reasons
 
 
 def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> None:

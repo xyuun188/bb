@@ -525,12 +525,19 @@ def _entry_contract_row(
         raw,
         orders,
     )
+    filled_order_present = _has_filled_order(orders)
     contract, reasons = validate_entry_execution_contract(
         raw,
         entry_action=_action(decision),
         filled_notional_usdt=filled_notional,
         executed=executed,
-        filled_order_present=_has_filled_order(orders),
+        filled_order_present=filled_order_present,
+        authoritative_fill_complete=bool(
+            filled_order_present
+            and filled_notional > 0.0
+            and filled_notional_source
+            and not fill_fact_reasons
+        ),
     )
     reasons = list(dict.fromkeys([*reasons, *fill_fact_reasons]))
     contract["contract_complete"] = not reasons
@@ -817,6 +824,7 @@ def validate_entry_execution_contract(
     filled_notional_usdt: float = 0.0,
     executed: bool = False,
     filled_order_present: bool | None = None,
+    authoritative_fill_complete: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate the persisted contract for its declared execution lifecycle."""
 
@@ -827,6 +835,7 @@ def validate_entry_execution_contract(
             filled_notional_usdt=filled_notional_usdt,
             executed=executed,
             filled_order_present=filled_order_present,
+            authoritative_fill_complete=authoritative_fill_complete,
             allow_legacy_settlement=True,
         )
     if lifecycle == "paper_bootstrap_canary":
@@ -1208,12 +1217,69 @@ def _bounded_confirmed_fill_drift(
     }
 
 
+def _authoritative_minimum_fill_settlement(
+    *,
+    sizing: dict[str, Any],
+    filled_notional_usdt: float,
+    executed: bool,
+    filled_order_present: bool | None,
+    authoritative_fill_complete: bool,
+) -> dict[str, Any]:
+    """Accept a historical below-minimum plan only from a bounded OKX fill."""
+
+    final_notional = _safe_float(sizing.get("final_notional_usdt"), 0.0)
+    minimum_notional = _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0)
+    filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
+    fill_ceiling = _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0)
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
+    stress_fraction = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
+    reserve_fraction = max(
+        _safe_float(sizing.get("estimated_fill_drift_reserve_fraction"), 0.0),
+        NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
+    )
+    notional_excess_fraction = (
+        max(filled_notional / final_notional - 1.0, 0.0)
+        if final_notional > 0.0
+        else 0.0
+    )
+    filled_stressed_loss = filled_notional * stress_fraction
+    accepted = bool(
+        executed
+        and filled_order_present is True
+        and authoritative_fill_complete
+        and final_notional > 0.0
+        and minimum_notional > 0.0
+        and final_notional + 1e-8 < minimum_notional
+        and filled_notional + 1e-8 >= minimum_notional
+        and fill_ceiling > 0.0
+        and filled_notional <= fill_ceiling + 1e-8
+        and notional_excess_fraction <= reserve_fraction + 1e-8
+        and risk_budget > 0.0
+        and stress_fraction > 0.0
+        and filled_stressed_loss <= risk_budget + 1e-8
+    )
+    return {
+        "accepted": accepted,
+        "source": "authoritative_okx_historical_fill" if accepted else None,
+        "final_notional_usdt": final_notional,
+        "minimum_order_notional_usdt": minimum_notional,
+        "filled_notional_usdt": filled_notional,
+        "fill_notional_ceiling_usdt": fill_ceiling,
+        "reserve_fraction": reserve_fraction,
+        "notional_excess_fraction": notional_excess_fraction,
+        "filled_stressed_loss_usdt": filled_stressed_loss,
+        "risk_budget_usdt": risk_budget,
+        "authoritative_fill_complete": authoritative_fill_complete,
+    }
+
+
 def validate_normal_paper_entry_contract(
     raw: dict[str, Any],
     *,
     filled_notional_usdt: float = 0.0,
     executed: bool = False,
     filled_order_present: bool | None = None,
+    authoritative_fill_complete: bool = False,
     allow_legacy_settlement: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate a normal paper trade; legacy envelopes are settlement-only."""
@@ -1304,6 +1370,16 @@ def validate_normal_paper_entry_contract(
     )
     bounded_fill_drift_accepted = bool(
         executed and bounded_fill_drift.get("accepted") is True
+    )
+    minimum_fill_settlement = _authoritative_minimum_fill_settlement(
+        sizing=sizing,
+        filled_notional_usdt=filled_notional,
+        executed=executed,
+        filled_order_present=filled_order_present,
+        authoritative_fill_complete=authoritative_fill_complete,
+    )
+    minimum_fill_settlement_accepted = bool(
+        minimum_fill_settlement.get("accepted") is True
     )
 
     expected_sizing_version = (
@@ -1396,7 +1472,10 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_notional_invalid")
     if fill_ceiling <= 0.0 or final_notional > fill_ceiling + 1e-8:
         reasons.append("normal_paper_fill_ceiling_invalid")
-    if minimum_notional <= 0.0 or final_notional + 1e-8 < minimum_notional:
+    if minimum_notional <= 0.0 or (
+        final_notional + 1e-8 < minimum_notional
+        and not minimum_fill_settlement_accepted
+    ):
         reasons.append("normal_paper_minimum_order_invalid")
     tier_max_leverage = _safe_float(
         _safe_dict(sizing.get("leverage_tier_selection")).get("max_leverage"),
@@ -1481,6 +1560,12 @@ def validate_normal_paper_entry_contract(
             "filled_notional_usdt": filled_notional,
             "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
             "fill_drift_evidence": bounded_fill_drift,
+            "historical_minimum_fill_settlement_accepted": (
+                minimum_fill_settlement_accepted
+            ),
+            "historical_minimum_fill_settlement_evidence": (
+                minimum_fill_settlement
+            ),
         },
         reasons,
     )
