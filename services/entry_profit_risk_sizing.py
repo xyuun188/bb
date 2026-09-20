@@ -639,6 +639,10 @@ def reconcile_profit_risk_sizing(
     )
     risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
     stress = max(_safe_float(sizing.get("stressed_loss_fraction"), 0.0), 0.0)
+    minimum_order_notional = max(
+        _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0),
+        0.0,
+    )
     margin_basis = max(_safe_float(sizing.get("available_margin_usdt"), 0.0), 0.0)
     expected_net = max(_safe_float(sizing.get("expected_net_return_pct"), 0.0), 0.0)
     leverage_tier = _safe_dict(sizing.get("leverage_tier_selection"))
@@ -685,6 +689,15 @@ def reconcile_profit_risk_sizing(
         )
     if model_notional_cap > 0.0 and notional > model_notional_cap + 1e-8:
         reasons.append("execution_position_exceeds_model_request")
+    # Amount precision is applied in the executor after sizing.  A one-contract
+    # order can therefore round down below the exchange's notional minimum even
+    # when the pre-submit target was large enough.  Keep the final executable
+    # shape fail-closed so no invalid order can reach OKX.
+    if (
+        minimum_order_notional > 0.0
+        and notional + 1e-8 < minimum_order_notional
+    ):
+        reasons.append("execution_notional_below_exchange_minimum")
     planned_loss = notional * stress
     if risk_budget <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("execution_stressed_loss_exceeds_risk_budget")

@@ -32,6 +32,7 @@ import subprocess
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.runtime_env_bootstrap import (
     drop_privileges_to_runtime_user_if_needed,
@@ -49,6 +50,7 @@ from models.decision import AIDecision
 from models.trade import Position
 
 WINDOW_MINUTES = {max(int(window_minutes), 1)!r}
+RAW_RESPONSE_BATCH_SIZE = 200
 
 
 def service_status(name):
@@ -101,14 +103,17 @@ async def run():
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
     control = mode_manager.get_state()
     async with get_read_session_ctx() as session:
-        rows = (
+        decision_rows = (
             await session.execute(
                 select(
+                    AIDecision.id,
                     AIDecision.analysis_type,
                     AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.was_executed,
+                    AIDecision.execution_reason,
                     AIDecision.created_at,
                     AIDecision.reasoning,
-                    AIDecision.raw_llm_response,
                 )
                 .where(
                     AIDecision.is_paper.is_(True),
@@ -117,6 +122,41 @@ async def run():
                 .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
             )
         ).all()
+        market_ids = [
+            int(row.id)
+            for row in decision_rows
+            if str(row.analysis_type or "") == "market"
+        ]
+        raw_by_id = {{}}
+        for offset in range(0, len(market_ids), RAW_RESPONSE_BATCH_SIZE):
+            batch_ids = market_ids[offset : offset + RAW_RESPONSE_BATCH_SIZE]
+            if not batch_ids:
+                continue
+            raw_rows = (
+                await session.execute(
+                    select(AIDecision.id, AIDecision.raw_llm_response)
+                    .where(AIDecision.id.in_(batch_ids))
+                )
+            ).all()
+            raw_by_id.update(
+                {{
+                    int(row.id): row.raw_llm_response
+                    for row in raw_rows
+                }}
+            )
+        rows = [
+            SimpleNamespace(
+                analysis_type=row.analysis_type,
+                symbol=row.symbol,
+                action=row.action,
+                was_executed=row.was_executed,
+                execution_reason=row.execution_reason,
+                created_at=row.created_at,
+                reasoning=row.reasoning,
+                raw_llm_response=raw_by_id.get(int(row.id)),
+            )
+            for row in decision_rows
+        ]
         open_position_count = int(
             (
                 await session.execute(
@@ -131,6 +171,34 @@ async def run():
 
     market_rows = [row for row in rows if str(row.analysis_type or "") == "market"]
     position_rows = [row for row in rows if str(row.analysis_type or "") == "position"]
+    entry_rows = [
+        row
+        for row in market_rows
+        if str(row.action or "").lower() in {"long", "short"}
+    ]
+    entry_reason_counts = Counter(
+        str(row.execution_reason or "not_executed").strip() or "not_executed"
+        for row in entry_rows
+        if not bool(row.was_executed)
+    )
+
+    def entry_diagnostic(row):
+        raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {{}}
+        execution = raw.get("execution_result") if isinstance(raw.get("execution_result"), dict) else {{}}
+        execution_raw = execution.get("raw_response") if isinstance(execution.get("raw_response"), dict) else {{}}
+        return {{
+            "symbol": str(row.symbol or ""),
+            "action": str(row.action or "").lower(),
+            "created_at": as_utc(row.created_at).isoformat() if as_utc(row.created_at) else None,
+            "was_executed": bool(row.was_executed),
+            "execution_reason": str(row.execution_reason or "")[:240],
+            "execution_status": execution.get("status"),
+            "execution_blocker": execution_raw.get("execution_blocker"),
+            "okx_rejection": execution_raw.get("okx_rejection"),
+            "okx_error_code": execution_raw.get("okx_error_code"),
+            "raw_error": str(execution_raw.get("raw_error") or "")[:240],
+            "order_id": execution.get("exchange_order_id") or execution.get("order_id"),
+        }}
     market_times = [as_utc(row.created_at) for row in market_rows]
     position_times = [as_utc(row.created_at) for row in position_rows]
     activity_points = [since, *market_times, now]
@@ -279,6 +347,25 @@ async def run():
             "top_symbol_share": round(top_count / len(market_rows), 6) if market_rows else None,
             "symbol_counts": dict(market_symbol_counts.most_common()),
             "analysis_status_counts": dict(analysis_status_counts),
+            "entry_funnel": {{
+                "signal_count": len(entry_rows),
+                "executed_count": sum(1 for row in entry_rows if bool(row.was_executed)),
+                "not_executed_count": sum(1 for row in entry_rows if not bool(row.was_executed)),
+                "action_counts": dict(Counter(str(row.action or "").lower() for row in entry_rows)),
+                "executed_action_counts": dict(
+                    Counter(
+                        str(row.action or "").lower()
+                        for row in entry_rows
+                        if bool(row.was_executed)
+                    )
+                ),
+                "not_executed_reason_counts": dict(entry_reason_counts.most_common(20)),
+                "not_executed_samples": [
+                    entry_diagnostic(row)
+                    for row in entry_rows
+                    if not bool(row.was_executed)
+                ][:20],
+            }},
             "incomplete_analysis_count": sum(
                 count
                 for status, count in analysis_status_counts.items()

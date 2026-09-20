@@ -381,9 +381,19 @@ class ExecutionService:
         if self.entry_instrument_unavailable_marker is None:
             return
         error_text = safe_error_text(error, limit=220)
-        if self._exchange_error_code(error) != "51001" and (
-            "instrument id doesn't exist" not in error_text.lower()
-        ):
+        lowered = error_text.lower()
+        error_code = self._exchange_error_code(error)
+        missing_market = any(
+            marker in lowered
+            for marker in (
+                "instrument id doesn't exist",
+                "market is not loaded",
+                "market not loaded",
+                "does not have market symbol",
+                "bad symbol",
+            )
+        )
+        if error_code != "51001" and not missing_market:
             return
         try:
             self.entry_instrument_unavailable_marker(
@@ -392,7 +402,7 @@ class ExecutionService:
                 {
                     "available": False,
                     "reason": "okx_private_entry_instrument_unavailable",
-                    "error_code": "51001",
+                    "error_code": error_code or "execution_instrument_missing",
                     "error": error_text,
                     "source": "execution_service_order_submit",
                     "analysis_only": True,
@@ -1645,6 +1655,16 @@ class ExecutionService:
                 if isinstance(execution_result.raw_response, dict)
                 else {}
             )
+            if decision.is_entry:
+                self._remember_entry_instrument_failure(
+                    mode=model_mode,
+                    symbol=symbol,
+                    error=(
+                        execution_raw.get("raw_error")
+                        or execution_raw.get("error")
+                        or ""
+                    ),
+                )
             entry_recovery_only = bool(
                 decision.is_entry
                 and execution_raw.get("entry_recovery_only") is True

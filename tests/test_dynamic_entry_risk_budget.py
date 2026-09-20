@@ -977,6 +977,28 @@ async def test_execution_reconciliation_rebuilds_every_notional_dependent_field(
 
 
 @pytest.mark.asyncio
+async def test_execution_reconciliation_rejects_rounding_below_exchange_minimum() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    final_notional = sizing["final_notional_usdt"]
+    sizing["minimum_order_notional_usdt"] = final_notional + 0.001
+    decision.raw_response["profit_risk_sizing"] = sizing
+
+    result = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=final_notional,
+        final_leverage=decision.suggested_leverage,
+        source="test_exchange_amount_rounding",
+    )
+
+    assert result["eligible"] is False
+    assert "execution_notional_below_exchange_minimum" in result["reasons"]
+    assert decision.position_size_pct == 0.0
+
+
+@pytest.mark.asyncio
 async def test_execution_leverage_change_updates_margin_without_changing_notional() -> None:
     decision = _decision()
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)

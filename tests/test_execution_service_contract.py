@@ -253,6 +253,38 @@ def test_execution_service_persists_okx_51001_entry_negative_cache() -> None:
     ]
 
 
+def test_execution_service_persists_missing_loaded_market_negative_cache() -> None:
+    marked: list[tuple[str, str, dict[str, Any]]] = []
+    service = _test_execution_service(
+        okx_executor_provider=lambda _mode: _noop_async(),
+        entry_instrument_unavailable_marker=lambda mode, symbol, facts: marked.append(
+            (mode, symbol, facts)
+        ),
+    )
+
+    service._remember_entry_instrument_failure(
+        mode="paper",
+        symbol="LINEA/USDT",
+        error="OKX SDK market is not loaded: LINEA/USDT:USDT",
+    )
+
+    assert marked == [
+        (
+            "paper",
+            "LINEA/USDT",
+            {
+                "available": False,
+                "reason": "okx_private_entry_instrument_unavailable",
+                "error_code": "execution_instrument_missing",
+                "error": "OKX SDK market is not loaded: LINEA/USDT:USDT",
+                "source": "execution_service_order_submit",
+                "analysis_only": True,
+                "execution_verified": False,
+            },
+        )
+    ]
+
+
 def _dynamic_return_ready_decision() -> DecisionOutput:
     decision = _entry_decision("BTC/USDT")
     provenance = {
