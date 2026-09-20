@@ -28,6 +28,8 @@ EnvironmentFile=-{app_root / '.env'}
 EnvironmentFile=-/etc/bb/bb-runtime.env
 Environment=PYTHONUNBUFFERED=1
 Environment=LOCAL_AI_TOOLS_TRAINING_MEMORY_LIMIT_BYTES=6442450944
+Environment=BB_TRAINING_READ_STATEMENT_TIMEOUT_MS=120000
+Environment=BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS=180000
 ExecStart={python} {app_root / 'scripts' / 'run_local_ai_tools_auto_train.py'}
 Nice=10
 IOSchedulingClass=best-effort

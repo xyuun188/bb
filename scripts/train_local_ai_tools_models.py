@@ -137,6 +137,8 @@ _LOCAL_AI_TOOLS_MAX_SEQUENCE_LENGTH = 80
 _LOCAL_AI_TOOLS_MAX_TEXT_ITEMS = 12
 _LOCAL_AI_TOOLS_MAX_TEXT_CHARS = 220
 _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE = 500
+_TRAINING_READ_STATEMENT_TIMEOUT_MS = 120_000
+_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS = 180_000
 _TRAINING_LOCK_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "local_ai_tools_training.lock"
 )
@@ -185,6 +187,13 @@ _LOCAL_AI_TOOLS_SHADOW_PROFESSIONAL_KEYS = {
     "activation_blocker",
     "promotion_flow",
 }
+
+
+def _training_read_session_ctx():
+    return get_read_session_ctx(
+        statement_timeout_ms=_TRAINING_READ_STATEMENT_TIMEOUT_MS,
+        idle_transaction_timeout_ms=_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS,
+    )
 
 
 async def _refresh_paper_observation_report_for_training() -> dict[str, Any]:
@@ -841,7 +850,7 @@ async def _load_shadow_samples(
     )
     requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
     if requested_limit:
-        async with get_read_session_ctx() as session:
+        async with _training_read_session_ctx() as session:
             total_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(*filters)
             )
@@ -883,7 +892,7 @@ async def _load_shadow_samples(
 
     while True:
         page_limit = _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE
-        async with get_read_session_ctx() as session:
+        async with _training_read_session_ctx() as session:
             stmt = (
                 select(*_shadow_sample_columns())
                 .where(*filters)
@@ -911,6 +920,7 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
         since=load_training_data_start(),
         compact=compact,
         include_training_features=compact,
+        session_factory=_training_read_session_ctx,
     )
     for sample in samples:
         features = _compact_local_ai_tools_features(_snapshot(sample.get("features")))
@@ -996,7 +1006,7 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
         first_open_time = None
         last_open_time = None
 
-    async with get_read_session_ctx() as session:
+    async with _training_read_session_ctx() as session:
         epoch_start = load_training_data_start()
         ranked = (
             select(
@@ -1217,7 +1227,7 @@ async def _main() -> None:
             + json.dumps(label_consistency, ensure_ascii=False)
         )
     completed_shadow_count = await _completed_shadow_sample_count()
-    completed_trade_count = await _completed_trade_sample_count()
+    completed_trade_count = len(training_payload["trade_samples"])
     paper_observation_report = await _refresh_paper_observation_report_for_training()
     return_objective_report = build_return_objective_report(
         trade_samples=training_payload["trade_samples"],

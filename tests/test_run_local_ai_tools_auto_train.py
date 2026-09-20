@@ -40,6 +40,10 @@ def test_shadow_trainer_uses_isolated_child_process(monkeypatch: pytest.MonkeyPa
     ]
     assert captured["capture_output"] is True
     assert captured["check"] is False
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["BB_TRAINING_READ_STATEMENT_TIMEOUT_MS"] == "120000"
+    assert child_env["BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS"] == "180000"
 
 
 @pytest.mark.asyncio

@@ -241,6 +241,7 @@ async def test_trade_loader_requests_compact_authoritative_view(
 
     assert captured["compact"] is True
     assert captured["include_training_features"] is True
+    assert captured["session_factory"] is train_script._training_read_session_ctx
     assert samples[0]["features"] == {
         "symbol": "BTC/USDT",
         "current_price": 100.0,

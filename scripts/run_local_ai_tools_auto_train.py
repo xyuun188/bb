@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import uuid
@@ -41,6 +42,8 @@ CHECK_INTERVAL_SECONDS = float(
     DEFAULT_TRADING_PARAMS.local_ml_training.auto_train_check_interval_seconds
 )
 TRAINING_TIMEOUT_SECONDS = 2 * 60 * 60
+TRAINING_READ_STATEMENT_TIMEOUT_MS = 120_000
+TRAINING_IDLE_TRANSACTION_TIMEOUT_MS = 180_000
 logger = logging.getLogger(__name__)
 STATE_STORE = ModelTrainingStateStore(
     settings.data_dir / "model_training_scheduler_state.json"
@@ -90,10 +93,18 @@ def _run_shadow_trainer() -> dict[str, Any]:
         "--persist-artifact",
         "--confirm-phase3-rebuild",
     ]
+    child_env = dict(os.environ)
+    child_env["BB_TRAINING_READ_STATEMENT_TIMEOUT_MS"] = str(
+        TRAINING_READ_STATEMENT_TIMEOUT_MS
+    )
+    child_env["BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS"] = str(
+        TRAINING_IDLE_TRANSACTION_TIMEOUT_MS
+    )
     try:
         completed = subprocess.run(
             command,
             cwd=ROOT,
+            env=child_env,
             text=True,
             capture_output=True,
             timeout=TRAINING_TIMEOUT_SECONDS,
