@@ -6077,6 +6077,34 @@ def test_auto_scan_feature_budget_rotates_market_pool_and_keeps_positions(
     )
 
 
+def test_runtime_market_fetch_limit_preserves_expanded_rotation_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 64)
+
+    assert service._runtime_market_fetch_limit(8, {
+        "selected_market_feature_fetch_count": 48,
+    }) == 48
+    assert service._runtime_market_fetch_limit(8, {
+        "target_market_feature_fetch_count": 32,
+    }) == 32
+
+
+def test_runtime_market_fetch_limit_falls_back_to_configured_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 16)
+
+    assert service._runtime_market_fetch_limit(8, {}) == 8
+    assert service._runtime_market_fetch_limit(8, {
+        "selected_market_feature_fetch_count": 48,
+    }) == 16
+
+
 def test_auto_scan_feature_budget_reserves_rotation_when_verified_pool_fills_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

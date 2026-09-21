@@ -6487,6 +6487,33 @@ class TradingService(ModelTrainingCoordinatorMixin):
             ),
         }
 
+    def _runtime_market_fetch_limit(
+        self,
+        configured_limit: int,
+        feature_fetch_budget_diagnostics: dict[str, Any] | None = None,
+    ) -> int:
+        """Keep the runtime cap aligned with the already-budgeted discovery pool.
+
+        ``_budget_auto_scan_feature_symbols`` deliberately expands the expensive
+        feature-fetch pool so cooldown scheduling can rotate beyond the most
+        recent symbols.  A second cap based only on ``auto_scan_symbol_limit``
+        would silently discard that rotation and can leave every remaining
+        candidate inside the analysis cooldown.
+        """
+
+        configured = max(1, int(configured_limit or 0))
+        diagnostics = self._safe_dict(feature_fetch_budget_diagnostics)
+        planned = int(
+            diagnostics.get("selected_market_feature_fetch_count")
+            or diagnostics.get("target_market_feature_fetch_count")
+            or configured
+        )
+        # The budget helper already applies the configured pool max. Keep the
+        # same bound here for defensive callers that construct diagnostics
+        # manually or carry a stale value across rounds.
+        pool_max = max(int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX), configured)
+        return min(max(configured, planned), pool_max)
+
     def _feature_opportunity_score(self, fv: Any) -> float:
         """Compatibility delegate for feature-based auto-scan opportunity score."""
 
@@ -9707,7 +9734,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 # trading process.  Open-position symbols always win this
                 # budget because position review is a separate safety path.
                 configured_market_limit = max(1, int(settings.auto_scan_symbol_limit))
-                runtime_market_fetch_limit = configured_market_limit
+                runtime_market_fetch_limit = self._runtime_market_fetch_limit(
+                    configured_market_limit,
+                    feature_fetch_budget_diagnostics,
+                )
                 position_keys = {
                     self._normalize_position_symbol(symbol)
                     for symbol in position_scan_symbols
@@ -9739,8 +9769,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
                                 0,
                             ),
                             "runtime_cap_reason": (
-                                "bounded complete feature snapshots before analysis; "
-                                "deferred market symbols remain in the rotating discovery pool"
+                                "aligned with the bounded rotating feature-fetch pool; "
+                                "deferred market symbols remain in the broader discovery universe"
                             ),
                             "selected_market_feature_fetch_count": int(
                                 runtime_market_fetch_limit
