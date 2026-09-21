@@ -2555,6 +2555,15 @@ def _build_execution_account_status(
     mode = "live" if mode == "live" else "paper"
     cfg = settings.get_execution_account_config(mode)
     pnl_summary = pnl_summary or {}
+    open_positions = max(int(pnl_summary.get("open_positions") or 0), 0)
+    # OKX account `used` is an account-level balance field, not position margin.
+    # Position margin must come from the exchange position summary and is zero
+    # whenever the authoritative position count is zero.
+    position_margin_used = (
+        max(_safe_float(pnl_summary.get("used_margin"), 0.0) or 0.0, 0.0)
+        if open_positions > 0
+        else 0.0
+    )
     okx_error_value = (
         (
             okx_account.get("error")
@@ -2675,7 +2684,7 @@ def _build_execution_account_status(
         ),
         "local_trade_today_pnl": _safe_float(pnl_summary.get("today_closed_realized_pnl"), 0.0),
         "positions": [],
-        "open_positions": int(pnl_summary.get("open_positions") or 0),
+        "open_positions": open_positions,
         "realized_profit": _safe_float(pnl_summary.get("realized_profit"), 0.0),
         "realized_loss": _safe_float(pnl_summary.get("realized_loss"), 0.0),
         "realized_pnl": _safe_float(pnl_summary.get("realized_pnl"), 0.0),
@@ -2738,7 +2747,7 @@ def _build_execution_account_status(
             okx_total=okx_total,
             fallback_available=None,
         )
-        used_margin = okx_used
+        used_margin = position_margin_used
         wallet = (
             okx_cash if okx_cash is not None else (okx_total if okx_total is not None else None)
         )
@@ -2766,7 +2775,7 @@ def _build_execution_account_status(
                 ),
                 "paper_execution_used_margin": used_margin,
                 "positions": summary.get("positions", []),
-                "open_positions": int(pnl_summary.get("open_positions") or 0),
+                "open_positions": open_positions,
                 "balance_snapshot_stale": bool(okx_account and okx_account.get("stale") is True),
                 "balance_snapshot_age_seconds": (
                     _safe_float(okx_account.get("stale_age_seconds"), None) if okx_account else None
@@ -2784,9 +2793,7 @@ def _build_execution_account_status(
             okx_total=okx_total,
             fallback_available=None,
         ) or (okx_available if okx_available is not None else okx_allocatable)
-        used_margin = (
-            okx_used if okx_used is not None else _safe_float(pnl_summary.get("used_margin"), 0.0)
-        )
+        used_margin = position_margin_used
         total = okx_total
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0)
         payload.update(

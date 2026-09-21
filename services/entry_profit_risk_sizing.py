@@ -12,7 +12,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import floor, isfinite, sqrt
+from math import isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -88,11 +88,18 @@ def solve_size_aware_positive_expected_net(
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
 ) -> dict[str, Any]:
-    """Find the largest executable notional whose fee-after return stays positive."""
+    """Validate the full risk-sized order without shrinking a losing trade.
+
+    A previous implementation binary-searched down to the exchange minimum when
+    the full risk-sized order had a negative expected return.  That produced
+    tiny probe fills which looked like normal paper trading while hiding a
+    negative edge.  The current contract either keeps the complete risk-sized
+    order or rejects the entry; quality observation remains an audit signal,
+    never a reason to execute a known losing minimum-size order.
+    """
 
     maximum = max(_safe_float(maximum_notional_usdt, 0.0), 0.0)
     minimum = max(_safe_float(minimum_notional_usdt, 0.0), 0.0)
-    step = max(_safe_float(contract_step_notional_usdt, 0.0), 0.0)
     original_cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
     original_expected = _safe_float(expected_net_return_pct, float("nan"))
     original_lcb = _safe_float(return_lcb_pct, float("nan"))
@@ -122,15 +129,8 @@ def solve_size_aware_positive_expected_net(
     ):
         return result
 
-    def quantize(value: float) -> float:
-        bounded = min(max(value, minimum), maximum)
-        if step <= 0.0:
-            return bounded
-        units = floor((bounded + 1e-12) / step)
-        return min(max(units * step, minimum), maximum)
-
     def evaluate(notional: float) -> dict[str, Any] | None:
-        candidate_notional = quantize(notional)
+        candidate_notional = min(max(notional, minimum), maximum)
         snapshot = dict(feature_snapshot)
         snapshot["planned_order_notional_usdt"] = candidate_notional
         snapshot["planned_order_side"] = normalized_side
@@ -153,54 +153,53 @@ def solve_size_aware_positive_expected_net(
         }
 
     upper = evaluate(maximum)
-    if upper is not None and upper["expected"] > 0.0:
-        selected = upper
-        iterations = 1
-    else:
-        lower = evaluate(minimum)
-        if lower is None:
-            result["reason"] = "minimum_order_size_cost_incomplete"
-            return result
-        if lower["expected"] <= 0.0:
+    if upper is None:
+        # Some paper snapshots only contain the pre-sizing spread/fee facts,
+        # without enough native order-book levels for a second size-specific
+        # VWAP pass.  Preserve that existing audited cost contract when its
+        # expected return and lower bound are already positive; never use this
+        # fallback to authorize a negative opportunity.
+        if (
+            execution_cost.get("production_eligible") is True
+            and original_expected > 0.0
+            and original_lcb > 0.0
+        ):
             result.update(
                 {
-                    "reason": "minimum_order_expected_net_not_positive",
-                    "selected_notional_usdt": lower["notional"],
-                    "expected_net_return_pct": lower["expected"],
-                    "return_lcb_pct": lower["lcb"],
-                    "execution_cost": lower["cost"],
-                    "iterations": 1,
-                    "reduced": lower["notional"] + 1e-9 < maximum,
+                    "production_eligible": True,
+                    "reason": "positive_pre_sizing_cost_at_full_risk_size",
+                    "selected_notional_usdt": maximum,
+                    "expected_net_return_pct": original_expected,
+                    "return_lcb_pct": original_lcb,
+                    "execution_cost": dict(execution_cost),
+                    "iterations": 0,
                 }
             )
             return result
+        result["reason"] = "full_risk_size_cost_incomplete"
+        return result
 
-        selected = lower
-        low = minimum
-        high = maximum
-        iterations = 1
-        for _ in range(14):
-            if high - low <= max(step, minimum * 0.001, 1e-8):
-                break
-            probe_value = (low + high) / 2.0
-            probe = evaluate(probe_value)
-            iterations += 1
-            if probe is not None and probe["expected"] > 0.0:
-                selected = probe
-                low = max(probe["notional"], low)
-            else:
-                high = probe_value
+    result.update(
+        {
+            "selected_notional_usdt": upper["notional"],
+            "expected_net_return_pct": upper["expected"],
+            "return_lcb_pct": upper["lcb"],
+            "execution_cost": upper["cost"],
+            "iterations": 1,
+            "reduced": False,
+        }
+    )
+    if upper["expected"] <= 0.0:
+        result["reason"] = "full_risk_size_expected_net_not_positive"
+        return result
+    if upper["lcb"] <= 0.0:
+        result["reason"] = "full_risk_size_return_lcb_not_positive"
+        return result
 
     result.update(
         {
             "production_eligible": True,
-            "reason": "positive_fee_after_notional_selected",
-            "selected_notional_usdt": selected["notional"],
-            "expected_net_return_pct": selected["expected"],
-            "return_lcb_pct": selected["lcb"],
-            "execution_cost": selected["cost"],
-            "iterations": iterations,
-            "reduced": selected["notional"] + 1e-9 < maximum,
+            "reason": "positive_fee_after_full_risk_size",
         }
     )
     return result
@@ -632,6 +631,7 @@ def reconcile_profit_risk_sizing(
 
     raw = _safe_dict(decision.raw_response)
     sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))
+    facts = dict(execution_facts or {})
     original_target = max(_safe_float(sizing.get("target_notional_usdt"), 0.0), 0.0)
     fill_notional_ceiling = max(
         _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
@@ -643,6 +643,13 @@ def reconcile_profit_risk_sizing(
         _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0),
         0.0,
     )
+    latest_order_rules = _safe_dict(facts.get("okx_order_rules"))
+    latest_minimum_order_notional = max(
+        _safe_float(latest_order_rules.get("min_notional_usdt"), 0.0),
+        0.0,
+    )
+    if source == "okx_pre_submit_order_shape" and latest_minimum_order_notional > 0.0:
+        minimum_order_notional = latest_minimum_order_notional
     margin_basis = max(_safe_float(sizing.get("available_margin_usdt"), 0.0), 0.0)
     expected_net = max(_safe_float(sizing.get("expected_net_return_pct"), 0.0), 0.0)
     leverage_tier = _safe_dict(sizing.get("leverage_tier_selection"))
@@ -703,7 +710,6 @@ def reconcile_profit_risk_sizing(
         reasons.append("execution_stressed_loss_exceeds_risk_budget")
     eligible = not reasons
     generated_at = datetime.now(UTC).isoformat()
-    facts = dict(execution_facts or {})
     history = _reconciliation_history(sizing)
     history.append(
         {
@@ -711,6 +717,7 @@ def reconcile_profit_risk_sizing(
             "generated_at": generated_at,
             "final_notional_usdt": round(notional, 8),
             "final_leverage": round(leverage, 8),
+            "minimum_order_notional_usdt": round(minimum_order_notional, 8),
             "facts": facts,
             "facts_fingerprint": _fingerprint(facts),
             "eligible": eligible,
@@ -726,6 +733,7 @@ def reconcile_profit_risk_sizing(
             "final_notional_usdt": round(notional, 8),
             "final_margin_usdt": round(notional / leverage, 8) if leverage > 0 else 0.0,
             "final_leverage": round(leverage, 8),
+            "minimum_order_notional_usdt": round(minimum_order_notional, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "expected_profit_usdt": round(notional * expected_net / 100.0, 8),
             "execution_reconciliations": history,
@@ -1639,9 +1647,12 @@ class EntryProfitRiskSizingPolicy:
             normal_trade.get("objective_net_return_pct"),
             0.0,
         )
+        shadow_only_observation = bool(
+            quality_observation_mode and contract_return_lcb_pct <= 0.0
+        )
         negative_lcb_stress_fraction = (
             max(-contract_return_lcb_pct / 100.0, 0.0)
-            if quality_observation_mode
+            if shadow_only_observation
             else 0.0
         )
         stress_fraction = max(
@@ -1658,7 +1669,10 @@ class EntryProfitRiskSizingPolicy:
             NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        risk_budget = single_trade_risk_budget
+        # A positive-LCB paper observation is the training trade that breaks the
+        # cold-start loop and therefore uses the normal dynamic risk budget.
+        # Negative-LCB observations remain audit-only and can never submit.
+        risk_budget = 0.0 if shadow_only_observation else single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
@@ -1765,14 +1779,10 @@ class EntryProfitRiskSizingPolicy:
             execution_cost=execution_cost,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
+        size_aware_solution_eligible = (
+            size_aware_solution.get("production_eligible") is True
+        )
         if selected_size_cost.get("order_size_complete") is True:
-            target_notional = max(
-                _safe_float(
-                    size_aware_solution.get("selected_notional_usdt"),
-                    target_notional,
-                ),
-                0.0,
-            )
             expected_net = _safe_float(
                 size_aware_solution.get("expected_net_return_pct"),
                 expected_net,
@@ -1782,9 +1792,6 @@ class EntryProfitRiskSizingPolicy:
                 return_lcb,
             )
             execution_cost = selected_size_cost
-            snapshot["planned_order_notional_usdt"] = target_notional
-            snapshot["planned_order_side"] = side
-            decision.feature_snapshot = snapshot
             opportunity["execution_cost"] = execution_cost
             opportunity["expected_net_return_pct"] = expected_net
             opportunity["return_lcb_pct"] = return_lcb
@@ -1792,33 +1799,44 @@ class EntryProfitRiskSizingPolicy:
             distribution["objective_expected_return_pct"] = return_lcb
             opportunity["return_distribution_contract"] = distribution
             raw["opportunity_score"] = opportunity
-            leverage_tier_selection = select_okx_leverage_tier(
-                facts.get("leverage_tiers"),
-                target_notional_usdt=target_notional,
-                mark_price=target_price,
-                contract_spec=target_contract_spec,
-                current_position_notional_usdt=existing_exposure["notional_usdt"],
-                current_position_contracts=existing_exposure["contracts"],
-            )
-            max_leverage = max(
-                _safe_float(leverage_tier_selection.get("max_leverage"), 0.0),
-                0.0,
-            )
-            requested_leverage = (
-                min(model_requested_leverage, max_leverage)
-                if model_leverage_is_explicit and max_leverage >= 1.0
-                else max(max_leverage, 1.0)
-            )
-            model_requested_notional_cap = (
-                available_margin * model_position_fraction * requested_leverage
-                if model_position_cap_applied
-                else risk_and_liquidity_ceiling
-            )
-            fill_notional_ceiling = min(
-                available_margin * requested_leverage,
-                risk_and_liquidity_ceiling,
-                model_requested_notional_cap,
-            )
+            if size_aware_solution_eligible:
+                target_notional = max(
+                    _safe_float(
+                        size_aware_solution.get("selected_notional_usdt"),
+                        target_notional,
+                    ),
+                    0.0,
+                )
+                snapshot["planned_order_notional_usdt"] = target_notional
+                snapshot["planned_order_side"] = side
+                decision.feature_snapshot = snapshot
+                leverage_tier_selection = select_okx_leverage_tier(
+                    facts.get("leverage_tiers"),
+                    target_notional_usdt=target_notional,
+                    mark_price=target_price,
+                    contract_spec=target_contract_spec,
+                    current_position_notional_usdt=existing_exposure["notional_usdt"],
+                    current_position_contracts=existing_exposure["contracts"],
+                )
+                max_leverage = max(
+                    _safe_float(leverage_tier_selection.get("max_leverage"), 0.0),
+                    0.0,
+                )
+                requested_leverage = (
+                    min(model_requested_leverage, max_leverage)
+                    if model_leverage_is_explicit and max_leverage >= 1.0
+                    else max(max_leverage, 1.0)
+                )
+                model_requested_notional_cap = (
+                    available_margin * model_position_fraction * requested_leverage
+                    if model_position_cap_applied
+                    else risk_and_liquidity_ceiling
+                )
+                fill_notional_ceiling = min(
+                    available_margin * requested_leverage,
+                    risk_and_liquidity_ceiling,
+                    model_requested_notional_cap,
+                )
         expected_loss = max(
             _safe_float(opportunity.get("expected_loss_pct"), 0.0),
             _safe_float(distribution.get("tail_loss_penalty_pct"), 0.0),
@@ -1911,10 +1929,13 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_leverage_tier_incomplete")
         if leverage_decision.policy_provenance.get("production_eligible") is not True:
             reasons.extend(leverage_decision.reasons)
-        if (
-            not quality_observation_mode
-            and (not isfinite(expected_net) or expected_net <= 0.0)
-        ):
+        if not size_aware_solution_eligible:
+            size_reason = str(
+                size_aware_solution.get("reason")
+                or "full_risk_size_profitability_not_proven"
+            )
+            reasons.append(f"normal_paper_size_aware_{size_reason}")
+        if not isfinite(expected_net) or expected_net <= 0.0:
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
@@ -1950,6 +1971,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
+            "paper_quality_shadow_only": shadow_only_observation,
             "paper_quality_observation_leverage_cap": None,
             "target_notional_usdt": target_notional,
             "minimum_order_notional_usdt": minimum_order_notional,
@@ -2052,6 +2074,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
+            "paper_quality_shadow_only": shadow_only_observation,
             "paper_quality_observation_leverage_cap": None,
             "dynamic_leverage_decision": leverage_decision.to_dict(),
             "existing_position_leverage": (

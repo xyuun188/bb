@@ -454,7 +454,7 @@ def summarize_trade_execution_contract(
             "paper_entry_requires_model_promotion": False,
             "paper_normal_entry_requires_positive_return_lcb": True,
             "paper_quality_observation_requires_positive_expected_net_return": True,
-            "paper_quality_observation_allows_non_positive_return_lcb": True,
+            "paper_quality_observation_allows_non_positive_return_lcb": False,
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
@@ -1435,10 +1435,8 @@ def validate_normal_paper_entry_contract(
             or legacy_quality_v11
         )
     )
-    quality_observation = normal_trade.get("selection_reason") == "paper_quality_observation"
     if (
         not legacy_settlement
-        and not quality_observation
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")

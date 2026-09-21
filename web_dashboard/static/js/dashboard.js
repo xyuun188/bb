@@ -988,9 +988,12 @@ function updateExecutionAccountPanel(account) {
     const todayTotalPnl = valueNumber(account.today_equity_pnl);
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
-    const positionMarginUsed = valueNumber(
-        account.used_margin ?? account.okx_used_balance ?? account.position_margin_used ?? account.paper_execution_used_margin
-    ) || 0;
+    const openPositionCount = Math.max(valueNumber(account.open_positions) || 0, 0);
+    const positionMarginUsed = openPositionCount > 0
+        ? (valueNumber(
+            account.position_margin_used ?? account.paper_execution_used_margin ?? account.used_margin
+        ) || 0)
+        : 0;
     const balanceSource = account.balance_source || (account.balance_snapshot_stale ? 'OKX 缓存快照' : 'OKX 权威账户');
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     const pauseNote = account.risk_paused

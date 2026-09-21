@@ -583,6 +583,12 @@ async def _execution_account_status(mode: str) -> dict:
         current_equity=account_equity if okx_balance_available else None,
         pnl_summary=pnl_summary,
     )
+    open_positions = max(int(pnl_summary.get("open_positions") or 0), 0)
+    position_margin_used = (
+        max(float(pnl_summary.get("used_margin") or 0.0), 0.0)
+        if open_positions > 0
+        else 0.0
+    )
     pause_reason = None
     entry_pause_reason = None
     market_analysis_pause_reason = None
@@ -616,7 +622,9 @@ async def _execution_account_status(mode: str) -> dict:
             "account_equity": account_equity,
             "available_balance": okx_available,
             "equity": okx_snapshot.get("total_balance"),
-            "used_margin": okx_snapshot.get("used_balance"),
+            "used_margin": position_margin_used,
+            "position_margin_used": position_margin_used,
+            "open_positions": open_positions,
             "unrealized_pnl": pnl_summary.get("unrealized_pnl", 0.0),
             "realized_profit": pnl_summary.get("realized_profit", 0.0),
             "realized_loss": pnl_summary.get("realized_loss", 0.0),
@@ -670,7 +678,7 @@ async def _execution_account_status(mode: str) -> dict:
             {
                 "paper_execution_available_balance": okx_available,
                 "paper_execution_equity": summary.get("equity"),
-                "paper_execution_used_margin": summary.get("used_margin"),
+                "paper_execution_used_margin": position_margin_used,
                 "paper_execution_unrealized_pnl": pnl_summary.get("unrealized_pnl"),
                 "initial_balance": None,
             }

@@ -13,7 +13,14 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
-from services.normal_paper_trade import normal_paper_trade_contract_reasons
+from services.normal_paper_trade import (
+    LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
+    LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
+    legacy_normal_paper_v10_trade_contract_reasons,
+    legacy_normal_paper_v11_trade_contract_reasons,
+    normal_paper_trade_contract_reasons,
+    normal_paper_trade_observation_contract_reasons,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +121,27 @@ def selected_entry_metrics(
     normal_paper = safe_dict(raw.get("normal_paper_trade"))
     contract_symbol = normalize_trading_symbol(normal_paper.get("symbol"))
     decision_symbol = normalize_trading_symbol(decision.symbol)
+    contract_reasons = normal_paper_trade_contract_reasons(normal_paper)
+    observation_contract = False
+    if (
+        contract_reasons
+        and str(model_mode or "").lower() == "paper"
+        and normal_paper.get("selection_reason") == "paper_quality_observation"
+    ):
+        observation_contract = not normal_paper_trade_observation_contract_reasons(
+            normal_paper
+        )
+    if contract_reasons and str(model_mode or "").lower() == "paper":
+        contract_reasons = (
+            legacy_normal_paper_v11_trade_contract_reasons(normal_paper)
+            if normal_paper.get("version") == LEGACY_NORMAL_PAPER_TRADE_V11_VERSION
+            else legacy_normal_paper_v10_trade_contract_reasons(normal_paper)
+            if normal_paper.get("version") == LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
+            else contract_reasons
+        )
     valid_selected_contract = bool(
         str(model_mode or "").lower() == "paper"
-        and not normal_paper_trade_contract_reasons(normal_paper)
+        and (not contract_reasons or observation_contract)
         and str(normal_paper.get("side") or "").lower() == side
         and contract_symbol
         and contract_symbol == decision_symbol

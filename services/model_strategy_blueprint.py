@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-07-27.paper-live-permission.v3"
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-09-21.paper-training-permission.v4"
 MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE = "local_ml"
 
 
@@ -116,8 +116,23 @@ def build_model_strategy_blueprint(
         )
         else set()
     )
+    # A complete paper artifact must be able to collect new, settled examples
+    # even while its aggregate historical quality remains below promotion.  The
+    # blueprint only admits the side into current-signal evaluation; the normal
+    # paper contract still requires positive fee-after expected return, positive
+    # LCB, complete execution cost, dynamic risk sizing, and exchange rules.
+    paper_training_sides = sorted(
+        artifact_sides
+        if (
+            artifact_complete
+            and stage in {"candidate", "shadow", "canary", "active"}
+        )
+        else set()
+    )
     paper_execution_sides = sorted(
-        set(production_eligible_sides) | set(paper_bootstrap_sides)
+        set(production_eligible_sides)
+        | set(paper_bootstrap_sides)
+        | set(paper_training_sides)
     )
     paper_execution_eligible = bool(
         artifact_complete
@@ -176,6 +191,7 @@ def build_model_strategy_blueprint(
         "eligible_sides": production_eligible_sides,
         "production_eligible_sides": production_eligible_sides,
         "paper_bootstrap_sides": paper_bootstrap_sides,
+        "paper_training_sides": paper_training_sides,
         "paper_execution_sides": paper_execution_sides,
         "paper_execution_eligible": paper_execution_eligible,
         "live_execution_permission": False,
@@ -184,6 +200,7 @@ def build_model_strategy_blueprint(
             "eligible_sides": model_quality,
             "production_eligible_sides": production_eligible_sides,
             "paper_bootstrap_sides": paper_bootstrap_sides,
+            "paper_training_sides": paper_training_sides,
             "paper_execution_sides": paper_execution_sides,
             "evaluated_sides": evaluated_sides,
             "champion_comparison": champion_comparison,
@@ -273,6 +290,16 @@ def model_strategy_side_authorization(
             if str(value).lower() in {"long", "short"}
         }
     )
+    paper_bootstrap_sides = {
+        str(value).lower()
+        for value in _safe_list(blueprint.get("paper_bootstrap_sides"))
+        if str(value).lower() in {"long", "short"}
+    }
+    paper_training_sides = {
+        str(value).lower()
+        for value in _safe_list(blueprint.get("paper_training_sides"))
+        if str(value).lower() in {"long", "short"}
+    }
     result = {
         "enforced": bool(blueprint),
         "eligible": True,
@@ -281,6 +308,7 @@ def model_strategy_side_authorization(
         "side": normalized_side,
         "eligible_sides": production_eligible_sides,
         "paper_execution_sides": paper_execution_sides,
+        "paper_training_sides": sorted(paper_training_sides),
         "blueprint_version": blueprint.get("version"),
         "model_version": blueprint.get("model_version"),
         "source": normalized_source,
@@ -343,12 +371,20 @@ def model_strategy_side_authorization(
         "reason": (
             "paper_bootstrap_direction_authorized"
             if normalized_scope == "paper"
+            and normalized_side in paper_bootstrap_sides
+            else "paper_training_direction_authorized"
+            if normalized_scope == "paper"
+            and normalized_side in paper_training_sides
             and normalized_side not in production_eligible_sides
             else "direction_authorized_by_model_blueprint"
         ),
         "authorization_basis": (
             "paper_bootstrap_canary"
             if normalized_scope == "paper"
+            and normalized_side in paper_bootstrap_sides
+            else "paper_current_signal_training"
+            if normalized_scope == "paper"
+            and normalized_side in paper_training_sides
             and normalized_side not in production_eligible_sides
             else "production_quality"
         ),

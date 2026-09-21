@@ -251,6 +251,30 @@ def test_dashboard_execution_account_payload_separates_allocation_from_okx_equit
     assert payload["allocated_balance"] is None
     assert payload["account_balance_source_value"] == 260.0
     assert payload["account_equity"] == 260.0
+    assert payload["okx_used_balance"] == pytest.approx(10.0)
+    assert payload["open_positions"] == 0
+    assert payload["used_margin"] == pytest.approx(0.0)
+    assert payload["position_margin_used"] == pytest.approx(0.0)
+    assert payload["paper_execution_used_margin"] == pytest.approx(0.0)
+
+
+def test_dashboard_execution_account_uses_position_margin_not_account_used_balance(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+
+    payload = dashboard._build_execution_account_status(
+        "paper",
+        paper_summary={"available_balance": 100.0, "positions": [{}]},
+        okx_account={"free": 200.0, "used": 23.74, "total": 250.0, "equity": 260.0},
+        pnl_summary={"open_positions": 1, "used_margin": 7.5},
+    )
+
+    assert payload["okx_used_balance"] == pytest.approx(23.74)
+    assert payload["open_positions"] == 1
+    assert payload["used_margin"] == pytest.approx(7.5)
+    assert payload["position_margin_used"] == pytest.approx(7.5)
+    assert payload["paper_execution_used_margin"] == pytest.approx(7.5)
 
 
 def test_dashboard_execution_account_refuses_synthetic_balance_when_okx_missing(

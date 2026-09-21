@@ -381,10 +381,7 @@ def select_normal_paper_trade_side(
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
         and item["objective_net_return_pct"] is not None
-        and (
-            float(item["objective_net_return_pct"]) > 0.0
-            or item["selection_reason"] == "paper_quality_observation"
-        )
+        and float(item["objective_net_return_pct"]) > 0.0
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -489,6 +486,9 @@ def build_normal_paper_trade_contract(
 
     contract = {
         "version": NORMAL_PAPER_TRADE_VERSION,
+        # The envelope remains auditable for training/history.  The current
+        # execution validator still rejects non-positive objective return and
+        # the selector never chooses such a payload for a new entry.
         "authorized": True,
         "trade_mode": "paper",
         "execution_scope": "paper_only",
@@ -758,6 +758,23 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
         value,
         expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=True,
+        require_quality_permission=True,
+        allow_non_positive_objective_observation=False,
+    )
+
+
+def normal_paper_trade_observation_contract_reasons(value: Any) -> list[str]:
+    """Validate a current observation envelope for audit/training only.
+
+    This helper is intentionally not used by entry authorization.  It keeps
+    already-recorded quality observations readable after the execution policy
+    stops admitting negative lower-bound returns.
+    """
+
+    return _normal_strategy_trade_contract_reasons(
+        value,
+        expected_version=NORMAL_PAPER_TRADE_VERSION,
+        require_positive_objective=False,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
     )

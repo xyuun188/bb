@@ -139,7 +139,7 @@ def test_trained_artifact_generates_bounded_paper_only_blueprint() -> None:
     assert "leverage" not in blueprint
 
 
-def test_negative_quality_shadow_artifact_is_replay_only_without_execution() -> None:
+def test_negative_quality_shadow_artifact_can_collect_strict_paper_training_trades() -> None:
     blueprint = build_model_strategy_blueprint(
         metadata={
             "artifact_version": "shadow-v1",
@@ -159,9 +159,11 @@ def test_negative_quality_shadow_artifact_is_replay_only_without_execution() -> 
     )
 
     assert blueprint["artifact_stage"] == "shadow"
-    assert blueprint["paper_execution_eligible"] is False
+    assert blueprint["paper_execution_eligible"] is True
     assert blueprint["live_execution_permission"] is False
     assert blueprint["eligible_sides"] == []
+    assert blueprint["paper_training_sides"] == ["long", "short"]
+    assert blueprint["paper_execution_sides"] == ["long", "short"]
     assert blueprint["model_quality"]["evaluated_sides"] == ["long", "short"]
     assert blueprint["entry_policy"][
         "require_current_fee_after_return_lcb_positive"
@@ -170,6 +172,19 @@ def test_negative_quality_shadow_artifact_is_replay_only_without_execution() -> 
     assert "trained_model_has_no_positive_fee_after_side" in blueprint[
         "blocking_reasons"
     ]
+    assert "trained_model_not_authorized_for_paper_strategy" not in blueprint[
+        "blocking_reasons"
+    ]
+    authorization = model_strategy_side_authorization(
+        {
+            "model_version": "shadow-v1",
+            "strategy_blueprint": blueprint,
+        },
+        execution_scope="paper",
+        side="long",
+    )
+    assert authorization["eligible"] is True
+    assert authorization["authorization_basis"] == "paper_current_signal_training"
 
 
 def test_authorized_paper_canary_bootstraps_without_production_profitability() -> None:

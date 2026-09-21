@@ -6,7 +6,6 @@ from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.model_registry import ModelRegistry
 from data_feed.feature_vector import FeatureVector
-from services.normal_paper_trade import NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
 
 SYMBOL = "BTC/USDT"
 
@@ -381,19 +380,11 @@ def test_positive_mean_uncertain_candidate_becomes_bounded_paper_observation() -
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.LONG
-    contract = decision.raw_response["normal_paper_trade"]
-    assert contract["selection_reason"] == "paper_quality_observation"
-    assert contract["expected_net_return_pct"] > 0.0
-    assert contract["objective_net_return_pct"] < 0.0
-    assert contract["execution_scope"] == "paper_only"
-    assert contract["production_permission"] is False
-    assert (
-        contract["single_trade_risk_fraction_cap"]
-        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
-    assert decision.raw_response["paper_trade_selection"]["selected"] is True
-    assert decision.raw_response["entry_permission"]["granted"] is True
+    assert decision.action == Action.HOLD
+    contract = decision.raw_response.get("normal_paper_trade", {})
+    assert contract == {}
+    assert decision.raw_response["paper_trade_selection"]["selected"] is False
+    assert decision.raw_response["entry_permission"]["granted"] is False
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:

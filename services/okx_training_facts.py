@@ -32,6 +32,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v10_trade_contract_reasons,
     legacy_normal_paper_v11_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
+    normal_paper_trade_observation_contract_reasons,
 )
 from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_SOURCE,
@@ -1427,6 +1428,12 @@ def build_okx_history_training_sample(
     normal_paper_gaps = []
     if current_normal_paper:
         normal_paper_gaps = normal_paper_trade_contract_reasons(normal_paper)
+        if (
+            normal_paper_gaps
+            and normal_paper.get("selection_reason") == "paper_quality_observation"
+            and not normal_paper_trade_observation_contract_reasons(normal_paper)
+        ):
+            normal_paper_gaps = []
     elif legacy_v11_normal_paper:
         normal_paper_gaps = legacy_normal_paper_v11_trade_contract_reasons(normal_paper)
     elif legacy_v10_normal_paper:
