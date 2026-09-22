@@ -145,7 +145,9 @@ _DASHBOARD_OKX_POSITION_READ_TIMEOUT_SECONDS = 3.0
 _DASHBOARD_OKX_POSITION_INITIALIZE_TIMEOUT_SECONDS = 3.0
 _DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS = 12.0
 _DASHBOARD_OKX_BALANCE_INITIALIZE_TIMEOUT_SECONDS = 5.0
-_DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 60.0
+_DASHBOARD_OKX_BALANCE_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OKX_POSITION_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS = 2.5
 _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS = 300.0
 _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS = 180.0
 _DASHBOARD_OPEN_POSITION_SNAPSHOT_CACHE_TTL_SECONDS = 5.0
@@ -242,6 +244,7 @@ _STRATEGY_LEARNING_SNAPSHOT_DIR = settings.data_dir / "dashboard_strategy_learni
 _dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _DASHBOARD_ML_STATUS_CACHE_TTL_SECONDS = 20.0
 _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_SUMMARY_REFRESH_WAIT_SECONDS = 3.0
 _DECISION_REASON_RECOVERY = DecisionReasonRecoveryPolicy()
 _model_observability_refresh_task: asyncio.Task[Any] | None = None
 _dashboard_model_observability_section_refresh_tasks: dict[
@@ -785,6 +788,28 @@ def _consume_detached_dashboard_task(task: asyncio.Task[Any]) -> None:
         return
 
 
+async def _wait_for_dashboard_refresh(
+    task: asyncio.Task[Any],
+    *,
+    timeout_seconds: float,
+) -> bool:
+    """Wait briefly for a shared refresh without cancelling it on timeout."""
+
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=max(float(timeout_seconds), 0.01),
+    )
+    if task not in done:
+        return False
+    if task.cancelled():
+        return False
+    try:
+        task.result()
+    except Exception:
+        return False
+    return True
+
+
 async def _await_dashboard_operation_bounded(
     operation: Awaitable[Any],
     *,
@@ -838,24 +863,65 @@ async def _acquire_dashboard_lock(
         ) from exc
 
 
+def _store_dashboard_okx_position_cache(
+    selected_mode: str,
+    positions: list[dict[str, Any]],
+    *,
+    executor_identity: Any | None,
+) -> list[dict[str, Any]]:
+    selected_mode = "live" if selected_mode == "live" else "paper"
+    normalized_positions = [dict(position) for position in positions or []]
+    cached_at = datetime.now(UTC)
+    _dashboard_okx_position_cache[selected_mode] = (
+        cached_at,
+        copy.deepcopy(normalized_positions),
+        executor_identity,
+    )
+
+    open_symbols: set[str] = set()
+    mark_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+    for position in normalized_positions:
+        if _is_live_position_open(position):
+            symbol = _normalize_dashboard_symbol(position.get("symbol"))
+            if symbol:
+                open_symbols.add(symbol)
+        snapshot = parse_exchange_position_snapshot(
+            position,
+            symbol_normalizer=_normalize_dashboard_symbol,
+        )
+        if snapshot:
+            mark_snapshots[(str(snapshot["symbol"]), str(snapshot["side"]))] = dict(snapshot)
+
+    _exchange_open_symbol_cache[selected_mode] = (cached_at, open_symbols)
+    _exchange_mark_cache[selected_mode] = (cached_at, mark_snapshots)
+    _dashboard_okx_position_error_cache.pop(selected_mode, None)
+    return normalized_positions
+
+
 async def _refresh_dashboard_okx_position_cache(selected_mode: str) -> None:
     selected_mode = "live" if selected_mode == "live" else "paper"
     executor = _dashboard_okx_executor_for_mode(selected_mode)
     executor_identity = executor
-    positions = await _fetch_dashboard_okx_positions_uncached(selected_mode, executor=executor)
-    normalized_positions = [dict(position) for position in positions or []]
-    _dashboard_okx_position_cache[selected_mode] = (
-        datetime.now(UTC),
-        copy.deepcopy(normalized_positions),
-        executor_identity,
-    )
-    _dashboard_okx_position_error_cache.pop(selected_mode, None)
+    try:
+        positions = await _fetch_dashboard_okx_positions_uncached(selected_mode, executor=executor)
+        _store_dashboard_okx_position_cache(
+            selected_mode,
+            positions,
+            executor_identity=executor_identity,
+        )
+    except Exception as exc:
+        _dashboard_okx_position_error_cache[selected_mode] = (
+            datetime.now(UTC),
+            _dashboard_okx_error_text(exc, resource="positions"),
+            executor_identity,
+        )
+        raise
 
 
-def _start_dashboard_okx_position_refresh(selected_mode: str) -> None:
+def _start_dashboard_okx_position_refresh(selected_mode: str) -> asyncio.Task[Any]:
     task = _dashboard_okx_position_refresh_tasks.get(selected_mode)
     if task is not None and not task.done():
-        return
+        return task
     task = asyncio.create_task(_refresh_dashboard_okx_position_cache(selected_mode))
     _dashboard_okx_position_refresh_tasks[selected_mode] = task
     task.add_done_callback(
@@ -865,6 +931,7 @@ def _start_dashboard_okx_position_refresh(selected_mode: str) -> None:
             label="okx position",
         )
     )
+    return task
 
 
 async def _fetch_dashboard_okx_balance_uncached(selected_mode: str) -> dict[str, Any] | None:
@@ -954,10 +1021,10 @@ async def _refresh_dashboard_okx_balance_cache(selected_mode: str) -> None:
         lock.release()
 
 
-def _start_dashboard_okx_balance_refresh(selected_mode: str) -> None:
+def _start_dashboard_okx_balance_refresh(selected_mode: str) -> asyncio.Task[Any]:
     task = _dashboard_okx_balance_refresh_tasks.get(selected_mode)
     if task is not None and not task.done():
-        return
+        return task
     task = asyncio.create_task(_refresh_dashboard_okx_balance_cache(selected_mode))
     _dashboard_okx_balance_refresh_tasks[selected_mode] = task
     task.add_done_callback(
@@ -967,6 +1034,7 @@ def _start_dashboard_okx_balance_refresh(selected_mode: str) -> None:
             label="okx balance",
         )
     )
+    return task
 
 
 def _dashboard_okx_position_error_state(mode: str | None = None) -> dict[str, Any] | None:
@@ -3986,31 +4054,39 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
     executor_identity = executor
     now = datetime.now(UTC)
     cached = _dashboard_okx_position_cache.get(selected_mode)
+    cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
+    if cached_error:
+        cached_at, cached_text, cached_executor_identity = cached_error
+        if (
+            cached_executor_identity is executor_identity
+            and (now - cached_at).total_seconds()
+            <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
+        ):
+            if cached:
+                return copy.deepcopy(cached[1])
+            raise RuntimeError(cached_text)
     if cached:
         cached_at, cached_value, cached_executor_identity = cached
         cache_age_seconds = (now - cached_at).total_seconds()
         if (
             cached_executor_identity is executor_identity
-            and cache_age_seconds <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
+            and cache_age_seconds <= _DASHBOARD_OKX_POSITION_CACHE_TTL_SECONDS
         ):
             return copy.deepcopy(cached_value)
         if (
             cached_executor_identity is executor_identity
             and cache_age_seconds <= _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS
         ):
-            _start_dashboard_okx_position_refresh(selected_mode)
+            refresh_task = _start_dashboard_okx_position_refresh(selected_mode)
+            refreshed = await _wait_for_dashboard_refresh(
+                refresh_task,
+                timeout_seconds=_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS,
+            )
+            if refreshed:
+                refreshed_cached = _dashboard_okx_position_cache.get(selected_mode)
+                if refreshed_cached and refreshed_cached[2] is executor_identity:
+                    return copy.deepcopy(refreshed_cached[1])
             return copy.deepcopy(cached_value)
-
-    cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
-    if cached_error:
-        cached_at, cached_text, cached_executor_identity = cached_error
-        if (
-            cached_executor_identity is executor_identity
-            and (now - cached_at).total_seconds() <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
-        ):
-            if cached:
-                return copy.deepcopy(cached[1])
-            raise RuntimeError(cached_text)
 
     lock = _dashboard_okx_position_locks.setdefault(selected_mode, asyncio.Lock())
     try:
@@ -4032,14 +4108,8 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             cache_age_seconds = (now - cached_at).total_seconds()
             if (
                 cached_executor_identity is executor_identity
-                and cache_age_seconds <= _EXCHANGE_MARK_CACHE_TTL_SECONDS
+                and cache_age_seconds <= _DASHBOARD_OKX_POSITION_CACHE_TTL_SECONDS
             ):
-                return copy.deepcopy(cached_value)
-            if (
-                cached_executor_identity is executor_identity
-                and cache_age_seconds <= _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS
-            ):
-                _start_dashboard_okx_position_refresh(selected_mode)
                 return copy.deepcopy(cached_value)
         cached_error = _dashboard_okx_position_error_cache.get(selected_mode)
         if cached_error:
@@ -4068,14 +4138,11 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
                 return copy.deepcopy(cached[1])
             raise
 
-        normalized_positions = [dict(position) for position in positions or []]
-        _dashboard_okx_position_cache[selected_mode] = (
-            datetime.now(UTC),
-            copy.deepcopy(normalized_positions),
-            executor_identity,
+        return _store_dashboard_okx_position_cache(
+            selected_mode,
+            positions,
+            executor_identity=executor_identity,
         )
-        _dashboard_okx_position_error_cache.pop(selected_mode, None)
-        return normalized_positions
     finally:
         lock.release()
 
@@ -7246,8 +7313,19 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         return shared_snapshot
     stale_cached = cached_success(datetime.now(UTC), fresh_only=False)
     if stale_cached:
-        stale_cached["refresh_in_progress"] = True
-        _start_dashboard_okx_balance_refresh(selected_mode)
+        refresh_task = _start_dashboard_okx_balance_refresh(selected_mode)
+        refreshed = await _wait_for_dashboard_refresh(
+            refresh_task,
+            timeout_seconds=_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS,
+        )
+        if refreshed:
+            refreshed_snapshot = cached_success(datetime.now(UTC), fresh_only=True)
+            if refreshed_snapshot:
+                return refreshed_snapshot
+        refreshed_failure = cached_failure(datetime.now(UTC))
+        if refreshed_failure:
+            return refreshed_failure
+        stale_cached["refresh_in_progress"] = not refresh_task.done()
         return stale_cached
 
     def cache_failure(
@@ -7273,6 +7351,19 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
 
     lock = _dashboard_okx_balance_locks.setdefault(selected_mode, asyncio.Lock())
     if lock.locked():
+        refresh_task = _dashboard_okx_balance_refresh_tasks.get(selected_mode)
+        if refresh_task is not None and not refresh_task.done():
+            refreshed = await _wait_for_dashboard_refresh(
+                refresh_task,
+                timeout_seconds=_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS,
+            )
+            if refreshed:
+                refreshed_snapshot = cached_success(datetime.now(UTC), fresh_only=True)
+                if refreshed_snapshot:
+                    return refreshed_snapshot
+                refreshed_failure = cached_failure(datetime.now(UTC))
+                if refreshed_failure:
+                    return refreshed_failure
         stale_cached = cached_success(now, fresh_only=False)
         if stale_cached:
             stale_cached["stale"] = True
@@ -7301,11 +7392,6 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
                 )
                 _dashboard_okx_balance_error_cache.pop(selected_mode, None)
             return shared_snapshot
-        stale_cached = cached_success(datetime.now(UTC), fresh_only=False)
-        if stale_cached:
-            stale_cached["refresh_in_progress"] = True
-            _start_dashboard_okx_balance_refresh(selected_mode)
-            return stale_cached
 
         try:
             # A cold cache must perform one bounded foreground read.  Returning
@@ -9658,21 +9744,41 @@ async def get_server_monitor_status():
 
 async def _build_dashboard_summary() -> dict[str, Any]:
     """Build the dashboard summary once per short cache window."""
-    market_state = await _build_open_position_market_snapshot(mode_manager.mode.value)
+    selected_mode = mode_manager.mode.value
+    okx_account_result, positions_result = await asyncio.gather(
+        _get_dashboard_okx_account_snapshot(selected_mode),
+        _fetch_dashboard_okx_positions(selected_mode),
+        return_exceptions=True,
+    )
+    if isinstance(okx_account_result, Exception):
+        _log_dashboard_fallback(
+            "dashboard summary realtime balance refresh failed",
+            okx_account_result,
+            mode=selected_mode,
+        )
+        okx_account = None
+    else:
+        okx_account = okx_account_result
+    if isinstance(positions_result, Exception):
+        _log_dashboard_fallback(
+            "dashboard summary realtime position refresh failed",
+            positions_result,
+            mode=selected_mode,
+        )
 
-    okx_account = await _get_dashboard_okx_account_snapshot(mode_manager.mode.value)
+    market_state = await _build_open_position_market_snapshot(selected_mode)
 
-    pnl_summary = await _get_execution_pnl_summary(mode_manager.mode.value)
+    pnl_summary = await _get_execution_pnl_summary(selected_mode)
     execution_account = _build_execution_account_status(
-        mode_manager.mode.value,
+        selected_mode,
         paper_summary=None,
         okx_account=okx_account,
         pnl_summary=pnl_summary,
     )
     account_summaries = [execution_account]
 
-    trading_stats = await _trading_stats_with_runtime_heartbeat(mode_manager.mode.value)
-    today_decisions_total = await _get_today_ai_decision_count(mode_manager.mode.value)
+    trading_stats = await _trading_stats_with_runtime_heartbeat(selected_mode)
+    today_decisions_total = await _get_today_ai_decision_count(selected_mode)
 
     return {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -9684,7 +9790,7 @@ async def _build_dashboard_summary() -> dict[str, Any]:
         "accounts": account_summaries,
         "okx_account": okx_account,
         **trading_stats,
-        "mode": mode_manager.mode.value,
+        "mode": selected_mode,
         "paused": mode_manager.is_paused,
         "today_decisions_total": today_decisions_total,
         "today_decisions_timezone": "Asia/Shanghai",
@@ -9704,6 +9810,15 @@ async def _refresh_dashboard_summary_cache(key: tuple[Any, ...]) -> None:
         _log_dashboard_fallback("dashboard summary background refresh failed", exc)
     finally:
         _dashboard_summary_refresh_tasks.pop(key, None)
+
+
+def _start_dashboard_summary_refresh(key: tuple[Any, ...]) -> asyncio.Task[Any]:
+    task = _dashboard_summary_refresh_tasks.get(key)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(_refresh_dashboard_summary_cache(key))
+    _dashboard_summary_refresh_tasks[key] = task
+    return task
 
 
 def _dashboard_summary_warming_payload() -> dict[str, Any]:
@@ -9731,7 +9846,7 @@ def _dashboard_summary_warming_payload() -> dict[str, Any]:
 
 @router.get("/dashboard/summary")
 async def get_dashboard_summary(request: Request = None):
-    """Return the latest summary immediately while refreshing slow reads in background."""
+    """Return a bounded-fresh summary, with stale data only as a fallback."""
 
     key = ("dashboard-summary", mode_manager.mode.value)
     if request is None:
@@ -9746,22 +9861,32 @@ async def get_dashboard_summary(request: Request = None):
         age = max((datetime.now(UTC) - cached_at).total_seconds(), 0.0)
         if age <= _DASHBOARD_SUMMARY_CACHE_TTL_SECONDS:
             return sanitize_payload(cached_payload)
-        if key not in _dashboard_summary_refresh_tasks:
-            _dashboard_summary_refresh_tasks[key] = asyncio.create_task(
-                _refresh_dashboard_summary_cache(key)
-            )
+        refresh_task = _start_dashboard_summary_refresh(key)
+        refreshed = await _wait_for_dashboard_refresh(
+            refresh_task,
+            timeout_seconds=_DASHBOARD_SUMMARY_REFRESH_WAIT_SECONDS,
+        )
+        if refreshed:
+            refreshed_entry = _dashboard_heavy_cache.get(key)
+            if refreshed_entry is not None and refreshed_entry[0] > cached_at:
+                return sanitize_payload(refreshed_entry[1])
         stale_payload = copy.deepcopy(cached_payload)
         stale_payload["cache"] = {
             "hit": True,
             "stale": True,
-            "refresh_in_background": True,
+            "refresh_in_background": not refresh_task.done(),
             "age_seconds": round(age, 3),
         }
         return sanitize_payload(stale_payload)
-    if key not in _dashboard_summary_refresh_tasks:
-        _dashboard_summary_refresh_tasks[key] = asyncio.create_task(
-            _refresh_dashboard_summary_cache(key)
-        )
+    refresh_task = _start_dashboard_summary_refresh(key)
+    refreshed = await _wait_for_dashboard_refresh(
+        refresh_task,
+        timeout_seconds=_DASHBOARD_SUMMARY_REFRESH_WAIT_SECONDS,
+    )
+    if refreshed:
+        refreshed_entry = _dashboard_heavy_cache.get(key)
+        if refreshed_entry is not None:
+            return sanitize_payload(refreshed_entry[1])
     return sanitize_payload(_dashboard_summary_warming_payload())
 
 

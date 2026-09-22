@@ -629,11 +629,20 @@ async def test_dashboard_okx_balance_background_and_foreground_share_singlefligh
     assert completed["equity"] == 7.0
 
 
-async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
+async def test_dashboard_okx_balance_stale_cache_waits_for_fast_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    refresh_calls: list[str] = []
     stale_at = datetime.now(UTC) - timedelta(seconds=90)
+
+    async def fresh_balance(_mode: str) -> dict[str, Any]:
+        return {
+            "free": 8.0,
+            "used": 2.0,
+            "total": 10.0,
+            "cash": 10.0,
+            "equity": 12.0,
+            "allocatable": 12.0,
+        }
 
     monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
     monkeypatch.setattr(
@@ -655,10 +664,63 @@ async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
     )
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
     monkeypatch.setattr(dashboard, "_dashboard_okx_balance_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_refresh_tasks", {})
     monkeypatch.setattr(
         dashboard,
-        "_start_dashboard_okx_balance_refresh",
-        lambda mode: refresh_calls.append(mode),
+        "_fetch_dashboard_okx_balance_uncached_with_total_budget",
+        fresh_balance,
+    )
+
+    result = await dashboard._get_dashboard_okx_account_snapshot("paper")
+
+    assert result["equity"] == 12.0
+    assert result.get("stale") is not True
+    assert dashboard._dashboard_okx_balance_cache["paper"][1]["free"] == 8.0
+
+
+async def test_dashboard_okx_balance_stale_cache_returns_on_refresh_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    stale_at = datetime.now(UTC) - timedelta(seconds=90)
+
+    async def slow_balance(_mode: str) -> dict[str, Any]:
+        await release.wait()
+        return {
+            "free": 8.0,
+            "used": 2.0,
+            "total": 10.0,
+            "cash": 10.0,
+            "equity": 12.0,
+            "allocatable": 12.0,
+        }
+
+    monkeypatch.setattr(dashboard, "_trading_service", FakeBalanceTradingService())
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_balance_cache",
+        {
+            "paper": (
+                stale_at,
+                {
+                    "free": 5.0,
+                    "used": 1.0,
+                    "total": 6.0,
+                    "cash": 6.0,
+                    "equity": 7.0,
+                    "allocatable": 7.0,
+                },
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_balance_refresh_tasks", {})
+    monkeypatch.setattr(dashboard, "_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        dashboard,
+        "_fetch_dashboard_okx_balance_uncached_with_total_budget",
+        slow_balance,
     )
 
     result = await dashboard._get_dashboard_okx_account_snapshot("paper")
@@ -666,7 +728,9 @@ async def test_dashboard_okx_balance_stale_cache_returns_before_refresh(
     assert result["equity"] == 7.0
     assert result["stale"] is True
     assert result["refresh_in_progress"] is True
-    assert refresh_calls == ["paper"]
+    refresh_task = dashboard._dashboard_okx_balance_refresh_tasks["paper"]
+    release.set()
+    await refresh_task
 
 
 async def test_dashboard_okx_balance_uncached_splits_initialize_and_read_timeouts(
@@ -872,10 +936,9 @@ async def test_dashboard_okx_position_cache_is_bound_to_executor(
     assert second == {"NEW/USDT"}
 
 
-async def test_dashboard_okx_positions_stale_cache_returns_before_refresh(
+async def test_dashboard_okx_positions_stale_cache_waits_for_fast_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    refresh_calls: list[str] = []
     executor = object()
 
     class StableTradingService:
@@ -897,16 +960,69 @@ async def test_dashboard_okx_positions_stale_cache_returns_before_refresh(
     )
     monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
     monkeypatch.setattr(dashboard, "_dashboard_okx_position_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_refresh_tasks", {})
+    monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+    monkeypatch.setattr(dashboard, "_exchange_mark_cache", {})
+
+    async def fresh_positions(_mode: str, executor: Any | None = None) -> list[dict[str, Any]]:
+        assert executor is not None
+        return [{"symbol": "NEW/USDT:USDT", "side": "short", "contracts": 2}]
+
     monkeypatch.setattr(
         dashboard,
-        "_start_dashboard_okx_position_refresh",
-        lambda mode: refresh_calls.append(mode),
+        "_fetch_dashboard_okx_positions_uncached",
+        fresh_positions,
     )
 
     result = await dashboard._fetch_dashboard_okx_positions("paper")
 
-    assert result == [{"symbol": "OLD/USDT:USDT", "side": "long", "contracts": 1}]
-    assert refresh_calls == ["paper"]
+    assert result == [{"symbol": "NEW/USDT:USDT", "side": "short", "contracts": 2}]
+    assert dashboard._exchange_open_symbol_cache["paper"][1] == {"NEW/USDT"}
+
+
+async def test_dashboard_okx_positions_stale_cache_returns_on_refresh_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    executor = object()
+
+    class StableTradingService:
+        def okx_executor_for_dashboard(self, mode: str) -> object:
+            assert mode == "paper"
+            return executor
+
+    async def slow_positions(_mode: str, executor: Any | None = None) -> list[dict[str, Any]]:
+        assert executor is not None
+        await release.wait()
+        return [{"symbol": "NEW/USDT:USDT", "side": "short", "contracts": 2}]
+
+    old_positions = [{"symbol": "OLD/USDT:USDT", "side": "long", "contracts": 1}]
+    monkeypatch.setattr(dashboard, "_trading_service", StableTradingService())
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_okx_position_cache",
+        {
+            "paper": (
+                datetime.now(UTC) - timedelta(seconds=20),
+                old_positions,
+                executor,
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_error_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_okx_position_refresh_tasks", {})
+    monkeypatch.setattr(dashboard, "_exchange_open_symbol_cache", {})
+    monkeypatch.setattr(dashboard, "_exchange_mark_cache", {})
+    monkeypatch.setattr(dashboard, "_DASHBOARD_OKX_REALTIME_REFRESH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(dashboard, "_fetch_dashboard_okx_positions_uncached", slow_positions)
+
+    result = await dashboard._fetch_dashboard_okx_positions("paper")
+
+    assert result == old_positions
+    refresh_task = dashboard._dashboard_okx_position_refresh_tasks["paper"]
+    release.set()
+    await refresh_task
 
 
 async def test_dashboard_okx_position_lock_timeout_returns_stale_cache(
@@ -947,3 +1063,68 @@ async def test_dashboard_okx_position_lock_timeout_returns_stale_cache(
 
     assert result == [{"symbol": "STALE/USDT:USDT", "side": "short", "contracts": 2}]
     assert "paper" in dashboard._dashboard_okx_position_error_cache
+
+
+async def test_dashboard_summary_stale_cache_waits_for_fast_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("dashboard-summary", dashboard.mode_manager.mode.value)
+
+    async def fresh_summary() -> dict[str, Any]:
+        return {"status": "ready", "version": "fresh"}
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_heavy_cache",
+        {
+            key: (
+                datetime.now(UTC)
+                - timedelta(seconds=dashboard._DASHBOARD_SUMMARY_CACHE_TTL_SECONDS + 1),
+                {"status": "ready", "version": "stale"},
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_summary_refresh_tasks", {})
+    monkeypatch.setattr(dashboard, "_build_dashboard_summary", fresh_summary)
+
+    result = await dashboard.get_dashboard_summary(request=object())
+
+    assert result["version"] == "fresh"
+    assert "cache" not in result
+
+
+async def test_dashboard_summary_stale_cache_returns_on_refresh_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    key = ("dashboard-summary", dashboard.mode_manager.mode.value)
+
+    async def slow_summary() -> dict[str, Any]:
+        await release.wait()
+        return {"status": "ready", "version": "fresh"}
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_heavy_cache",
+        {
+            key: (
+                datetime.now(UTC)
+                - timedelta(seconds=dashboard._DASHBOARD_SUMMARY_CACHE_TTL_SECONDS + 1),
+                {"status": "ready", "version": "stale"},
+            )
+        },
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    monkeypatch.setattr(dashboard, "_dashboard_summary_refresh_tasks", {})
+    monkeypatch.setattr(dashboard, "_DASHBOARD_SUMMARY_REFRESH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(dashboard, "_build_dashboard_summary", slow_summary)
+
+    result = await dashboard.get_dashboard_summary(request=object())
+
+    assert result["version"] == "stale"
+    assert result["cache"]["stale"] is True
+    assert result["cache"]["refresh_in_background"] is True
+    refresh_task = dashboard._dashboard_summary_refresh_tasks[key]
+    release.set()
+    await refresh_task
