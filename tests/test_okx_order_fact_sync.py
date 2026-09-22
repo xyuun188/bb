@@ -1112,6 +1112,104 @@ async def test_order_fact_sync_only_calls_order_fact_endpoints_and_confirms_fill
 
 
 @pytest.mark.asyncio
+async def test_order_fact_sync_repairs_account_fill_group_truncated_by_pagination(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "order-fact-truncated-account-fill.db")
+    now = datetime.now(UTC)
+    order_id = "okx-truncated-order"
+    partial_row = {
+        **_fill_row(now, order_id=order_id),
+        "tradeId": "trade-partial",
+        "fillSz": "2",
+    }
+    complete_rows = [
+        partial_row,
+        {
+            **_fill_row(now + timedelta(seconds=1), order_id=order_id),
+            "tradeId": "trade-rest",
+            "fillSz": "4",
+        },
+    ]
+
+    class _TruncatedAccountFillCcxt(_FakeCcxt):
+        async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append("fills_targeted" if params.get("ordId") else "fills_account")
+            if params.get("ordId"):
+                return {"data": complete_rows}
+            return {"data": [partial_row]}
+
+    ccxt = _TruncatedAccountFillCcxt(
+        fills=complete_rows,
+        orders=[
+            {
+                **_order_row(now, order_id=order_id),
+                "accFillSz": "6",
+                "sz": "6",
+            }
+        ],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="rule_strategy",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=0.02,
+                    price=60000.0,
+                    status="filled",
+                    fee=0.12,
+                    exchange_order_id=order_id,
+                    okx_inst_id="BTC-USDT-SWAP",
+                    okx_trade_ids="trade-partial",
+                    okx_fill_contracts=2.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        **_confirmed_order_fact(
+                            order_id=order_id,
+                            inst_id="BTC-USDT-SWAP",
+                            quantity=2.0,
+                            price=60000.0,
+                            fee=0.12,
+                        ),
+                        "rows": [partial_row],
+                        "execution_slippage": {
+                            "version": OKX_FILL_MARK_SLIPPAGE_VERSION,
+                            "complete": True,
+                            "recovery_terminal": False,
+                        },
+                    },
+                    created_at=now,
+                    filled_at=now,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=5.0,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert report["status"] == "ok"
+        assert "fills_history_targeted_incomplete" in report["completed_stages"]
+        assert "fills_account" in ccxt.calls
+        assert "fills_targeted" in ccxt.calls
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert order.quantity == pytest.approx(0.06)
+        assert order.okx_fill_contracts == pytest.approx(6.0)
+        assert set(str(order.okx_trade_ids).split(",")) == {"trade-partial", "trade-rest"}
+        assert order.okx_raw_fills["base_quantity"] == pytest.approx(0.06)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_recovery_order_continues_through_protection_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1513,6 +1611,74 @@ async def test_recovery_order_id_backfills_okx_only_fill_before_account_history(
         assert order.model_name == "okx_authoritative_sync"
         assert order.decision_id is None
         assert order.okx_raw_fills["contract_size_verified"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_order_uses_historical_fills_for_recent_large_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-recovery-historical-fill.db")
+    now = datetime.now(UTC)
+    recovery_order_id = "3785286327831597058"
+    ccxt = _HistoricalOnlyTargetCcxt(
+        fills=[
+            {
+                **_fill_row(now, order_id=recovery_order_id),
+                "fillSz": "6",
+                "tradeId": "trade-full-recovery",
+            }
+        ],
+        orders=[_order_row(now, order_id=recovery_order_id)],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(
+                Order(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol="BTC/USDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=0.02,
+                    price=60000.0,
+                    status="filled",
+                    fee=0.12,
+                    exchange_order_id=recovery_order_id,
+                    okx_inst_id="BTC-USDT-SWAP",
+                    okx_fill_contracts=2.0,
+                    okx_fill_pnl=0.0,
+                    okx_sync_status=OKX_SYNC_CONFIRMED,
+                    okx_raw_fills={
+                        **_confirmed_order_fact(
+                            order_id=recovery_order_id,
+                            inst_id="BTC-USDT-SWAP",
+                            quantity=2.0,
+                            price=60000.0,
+                            fee=0.12,
+                        ),
+                        "rows": [],
+                    },
+                    created_at=now,
+                    filled_at=now,
+                )
+            )
+
+        report = await OkxOrderFactSyncService(
+            mode="paper",
+            timeout_seconds=5.0,
+            recovery_order_ids=(recovery_order_id,),
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert report["confirmed_count"] == 1
+        assert ccxt.calls[0] == "fills_historical_targeted"
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert order.quantity == pytest.approx(0.06)
+        assert order.okx_fill_contracts == pytest.approx(6.0)
     finally:
         await close_db()
 

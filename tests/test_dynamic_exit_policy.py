@@ -406,6 +406,7 @@ def test_loss_alone_cannot_trigger_system_reduction_before_planned_stop() -> Non
     result = apply_dynamic_exit(decision, [position])
 
     assert result.eligible is False
+    assert result.funding_loss_budget_crossed is False
     assert 0.0 < result.stop_risk_usage < 1.0
     assert result.loss_reduction_evidence_complete is False
     assert result.close_fraction == 0.0

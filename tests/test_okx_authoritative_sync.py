@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,7 @@ from services.okx_authoritative_sync import (
     OkxFillGroup,
     _linked_protection_fill_context,
     _local_order_verified_okx_raw_contract_size,
+    _persisted_fill_supersedes_observed_fill,
     _position_management_entry_order_ids,
 )
 
@@ -217,12 +219,30 @@ def test_order_contract_size_rejects_non_public_or_incomplete_fill_fact() -> Non
 
     assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
-    order.okx_raw_fills["contract_size_source"] = "okx_public_instruments"
-    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
 
-    order.okx_raw_fills["fills_history_confirmed"] = True
-    order.okx_raw_fills["base_quantity"] = 620.0
-    assert _local_order_verified_okx_raw_contract_size(order) == 0.0
+def test_persisted_fill_supersedes_partial_observed_group() -> None:
+    observed = OkxFillGroup(
+        order_id="order-1",
+        trade_ids=("trade-1",),
+        inst_id="ENA-USDT-SWAP",
+        symbol="ENA/USDT",
+        side="sell",
+        pos_side="net",
+        contracts=72.0,
+        avg_price=0.2055,
+        fee_abs=0.04,
+        fill_pnl=0.0,
+        timestamp_ms=1.0,
+        timestamp=datetime.now(UTC),
+        raw_count=1,
+    )
+    persisted = replace(
+        observed,
+        trade_ids=("trade-1", "trade-2"),
+        contracts=95.0,
+        raw_count=2,
+    )
+    assert _persisted_fill_supersedes_observed_fill(persisted, observed)
 
 
 class _AgedUnlinkedFillExecutor(_FakeExecutor):

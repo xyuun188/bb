@@ -4092,6 +4092,43 @@ async def test_entry_execution_policy_allows_degraded_okx_sync_with_fresh_snapsh
 
 
 @pytest.mark.asyncio
+async def test_entry_execution_policy_refreshes_positions_and_blocks_same_symbol() -> None:
+    service = TradingService.__new__(TradingService)
+    service.okx_sync_service = SimpleNamespace()
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    service.open_positions_context_for_execution = lambda: _async_value(
+        [
+            {
+                "symbol": "BTC/USDT",
+                "side": "short",
+                "quantity": 1.0,
+                "is_open": True,
+            }
+        ]
+    )
+    service.entry_capacity = trading_service.EntryCapacityPolicy(
+        normalize_symbol=normalize_trading_symbol
+    )
+    service.entry_execution_pipeline = SimpleNamespace(
+        evaluate=lambda *_args, **_kwargs: _async_value(
+            PolicyGateResult.allow({"intent": "entry-passthrough"})
+        )
+    )
+
+    open_positions: list[dict[str, Any]] = []
+    result = await service.evaluate_entry_execution_policy(
+        _decision(Action.LONG),
+        "ensemble_trader",
+        "paper",
+        open_positions,
+    )
+
+    assert result.passed is False
+    assert result.blocker == "entry_capacity"
+    assert open_positions[0]["symbol"] == "BTC/USDT"
+
+
+@pytest.mark.asyncio
 async def test_entry_execution_policy_does_not_block_exit_on_okx_sync_warning() -> None:
     service = TradingService.__new__(TradingService)
     service._refresh_entry_symbol_blocks_if_stale = lambda **_kwargs: _async_value(None)

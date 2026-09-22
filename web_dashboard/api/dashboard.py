@@ -2347,8 +2347,14 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         exchange_symbols = None
     else:
         exchange_symbols = symbols_result
+    # An explicit symbol snapshot of ``set()`` is a successful authoritative
+    # answer: the account currently has no open positions.  Only a missing
+    # snapshot (``None``) may activate the local-position fallback; otherwise
+    # stale error-cache state could resurrect already-closed local rows.
     exchange_temporarily_unavailable = bool(
-        not exchange_marks and _dashboard_okx_positions_temporarily_unavailable(selected_mode)
+        exchange_symbols is None
+        and not exchange_marks
+        and _dashboard_okx_positions_temporarily_unavailable(selected_mode)
     )
 
     try:

@@ -1,4 +1,5 @@
 import copy
+import json
 from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, event
@@ -185,6 +186,23 @@ def _compact_profit_risk_sizing_snapshot(value: object) -> object:
     return compact if compact else _MISSING_LEARNING_VALUE
 
 
+def _exact_bounded_learning_contract(value: object) -> object:
+    if not isinstance(value, dict):
+        return _MISSING_LEARNING_VALUE
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return _MISSING_LEARNING_VALUE
+    if len(encoded) > _LEARNING_SNAPSHOT_MAX_CONTAINER_BYTES:
+        return _MISSING_LEARNING_VALUE
+    return copy.deepcopy(value)
+
+
 def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
@@ -195,6 +213,8 @@ def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
         compact_value = (
             _compact_profit_risk_sizing_snapshot(value)
             if key == "profit_risk_sizing"
+            else _exact_bounded_learning_contract(value)
+            if key == "normal_paper_trade"
             else _compact_learning_value(value)
         )
         if compact_value is not _MISSING_LEARNING_VALUE:
@@ -219,4 +239,4 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     target.model_health_has_local_ai_tools = _model_health_snapshot_present(raw, "local_ai_tools")
     target.model_health_snapshot_version = 1
     target.decision_learning_snapshot = _compact_decision_learning_snapshot(raw)
-    target.decision_learning_snapshot_version = 4
+    target.decision_learning_snapshot_version = 5

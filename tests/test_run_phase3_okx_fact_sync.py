@@ -170,11 +170,55 @@ async def test_phase3_okx_fact_sync_apply_runs_order_fact_sync(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_phase3_order_fact_sync_retries_writer_lock_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_collect_report(*, allow_cache: bool = False) -> dict:
+        return _report()
+
+    async def fake_equity_snapshot(*, mode: str) -> dict:
+        return {"status": "created", "mode": mode}
+
+    class FakeOrderSync:
+        attempts = 0
+
+        def __init__(self, *, mode: str, timeout_seconds: float) -> None:
+            self.mode = mode
+            assert timeout_seconds == script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS
+
+        async def sync(self) -> dict:
+            type(self).attempts += 1
+            calls.append(f"sync:{type(self).attempts}")
+            if type(self).attempts == 1:
+                return {
+                    "status": "deferred",
+                    "deferred_stages": ["single_writer_lock"],
+                    "samples": [{"kind": "order_fact_sync_writer_busy"}],
+                }
+            return {"status": "ok", "confirmed_count": 1}
+
+    monkeypatch.setattr(script, "collect_report", fake_collect_report)
+    monkeypatch.setattr(script, "_sync_okx_equity_snapshot", fake_equity_snapshot)
+    monkeypatch.setattr(script, "OkxOrderFactSyncService", FakeOrderSync)
+    monkeypatch.setattr(script, "PHASE3_ORDER_FACT_SYNC_RETRY_DELAYS_SECONDS", (0.0,))
+
+    result = await script.run(mode="paper", apply_order_sync=True, allow_cache=False)
+
+    assert calls == ["sync:1", "sync:2"]
+    assert result["order_sync_retry_count"] == 1
+    assert result["order_sync_result"]["status"] == "ok"
+    assert result["order_sync_result"]["lock_retry_exhausted"] is False
+
+
+@pytest.mark.asyncio
 async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recovery_order_id = "3785286327831597056"
     protection_order_id = "3786076389078962176"
+    quantity_mismatch_order_id = "3944894809684815874"
     reports = [
         {
             **_report("warning"),
@@ -191,6 +235,10 @@ async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
                                 {
                                     "kind": "okx_linked_protection_fill_missing_local_order",
                                     "exchange_order_id": protection_order_id,
+                                },
+                                {
+                                    "kind": "local_order_quantity_differs_from_okx_fill",
+                                    "exchange_order_id": quantity_mismatch_order_id,
                                 },
                                 {
                                     "kind": "unrelated_issue",
@@ -231,10 +279,18 @@ async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
 
     assert captured == {
         "mode": "paper",
-        "recovery_order_ids": (recovery_order_id, protection_order_id),
+        "recovery_order_ids": (
+            recovery_order_id,
+            protection_order_id,
+            quantity_mismatch_order_id,
+        ),
         "timeout_seconds": script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS,
     }
-    assert result["recovery_order_ids"] == [recovery_order_id, protection_order_id]
+    assert result["recovery_order_ids"] == [
+        recovery_order_id,
+        protection_order_id,
+        quantity_mismatch_order_id,
+    ]
     assert result["order_sync_result"]["backfilled_count"] == 1
 
 

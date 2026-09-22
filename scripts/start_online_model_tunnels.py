@@ -63,7 +63,10 @@ FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS = 15.0
 FORWARD_CHANNELS_PER_TRANSPORT = 5
 FORWARD_TRANSPORT_POOL_SIZES = {
     "target-single-model": 3,
-    "phase3-quant-api": 2,
+    # Quant training/status calls can hold a forwarded channel for several
+    # minutes. Keep a third isolated SSH transport so those calls cannot
+    # consume every channel needed by live paper execution and health checks.
+    "phase3-quant-api": 3,
 }
 FORWARD_DEFAULT_MAX_CONNECTION_SECONDS = 600.0
 FORWARD_QUANT_MAX_CONNECTION_SECONDS = 1_800.0

@@ -847,14 +847,14 @@ def test_start_online_model_tunnels_isolate_every_endpoint_transport(monkeypatch
 
     assert opened_clients == clients
     assert len(transport_pools) == len(specs) == 2
-    assert len(clients) == 5
+    assert len(clients) == 6
     transports = [transport for pool in transport_pools for transport in pool]
     assert len({id(transport) for transport in transports}) == len(transports)
     assert all(
         transport.keepalive == tunnels.TRANSPORT_KEEPALIVE_SECONDS for transport in transports
     )
     assert len(transport_pools[0]) == 3
-    assert len(transport_pools[1]) == 2
+    assert len(transport_pools[1]) == 3
 
 
 def test_start_online_model_tunnel_pool_replaces_only_failed_transport() -> None:

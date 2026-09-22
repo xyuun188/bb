@@ -535,7 +535,9 @@ class OkxOrderFactSyncService:
                 overlap_hours=max(self.lookback_hours, ACCOUNT_HISTORY_OVERLAP_HOURS),
             )
             if priority_target_order_ids:
-                priority_include_historical = _target_fill_query_requires_historical(
+                priority_include_historical = bool(
+                    set(priority_target_order_ids) & set(self.recovery_order_ids)
+                ) or _target_fill_query_requires_historical(
                     priority_target_order_ids,
                     orders=[*local_orders, *submit_recovery_orders],
                     now=datetime.now(UTC),
@@ -546,7 +548,7 @@ class OkxOrderFactSyncService:
                         order_ids=priority_target_order_ids,
                         since=since,
                         limit=100,
-                        max_pages=1,
+                        max_pages=5 if priority_include_historical else 1,
                         target_orders_only=True,
                         target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
                         include_historical=False,
@@ -725,13 +727,16 @@ class OkxOrderFactSyncService:
                     orders=[*local_orders, *submit_recovery_orders],
                     now=datetime.now(UTC),
                 )
+                missing_include_historical = bool(
+                    set(missing_priority_ids) & set(self.recovery_order_ids)
+                ) or missing_include_historical
                 target_fills, target_fills_complete = await run_stage(
                     "fills_history_targeted",
                     lambda: native_facts.fetch_fill_groups(
                         order_ids=missing_priority_ids,
                         since=since,
                         limit=100,
-                        max_pages=1,
+                        max_pages=5 if missing_include_historical else 1,
                         target_orders_only=True,
                         target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
                         include_historical=False,
@@ -777,6 +782,40 @@ class OkxOrderFactSyncService:
                 )
                 target_order_rows = list(target_order_rows or [])
             order_rows = _dedupe_order_rows([*account_order_rows, *target_order_rows])
+            order_rows_by_id = _order_rows_by_id(order_rows)
+            incomplete_fill_order_ids = _fills_underreport_order_history(
+                fills,
+                order_rows_by_id,
+            )
+            if incomplete_fill_order_ids:
+                incomplete_include_historical = _target_fill_query_requires_historical(
+                    incomplete_fill_order_ids,
+                    orders=[*local_orders, *submit_recovery_orders],
+                    now=datetime.now(UTC),
+                )
+                incomplete_include_historical = bool(
+                    set(incomplete_fill_order_ids) & set(self.recovery_order_ids)
+                ) or incomplete_include_historical
+                incomplete_target_fills, incomplete_target_complete = await run_stage(
+                    "fills_history_targeted_incomplete",
+                    lambda: native_facts.fetch_fill_groups(
+                        order_ids=sorted(incomplete_fill_order_ids)[
+                            :DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC
+                        ],
+                        since=since,
+                        limit=100,
+                        max_pages=5 if incomplete_include_historical else 1,
+                        target_orders_only=True,
+                        target_order_query_limit=DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
+                        include_historical=False,
+                        historical_only=incomplete_include_historical,
+                        strict=True,
+                    ),
+                    cap_seconds=4.0 if incomplete_include_historical else 2.0,
+                )
+                fills = _dedupe_fills_by_order_id([*fills, *(incomplete_target_fills or [])])
+                if incomplete_target_complete:
+                    target_fill_order_ids.update(incomplete_fill_order_ids)
             protection_algo_rows, protection_complete = await run_stage(
                 "protection_algo_history",
                 lambda: native_facts.fetch_protection_algo_history_rows(
@@ -3397,6 +3436,32 @@ def _order_rows_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if order_id:
             result.setdefault(order_id, row)
     return result
+
+
+def _fills_underreport_order_history(
+    fills: Iterable[OkxNativeFillGroup],
+    order_rows_by_id: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Find non-empty fill groups truncated by account-level pagination."""
+
+    fills_by_order_id = {
+        str(fill.order_id or "").strip(): fill
+        for fill in fills
+        if str(fill.order_id or "").strip()
+    }
+    incomplete: set[str] = set()
+    for order_id, row in order_rows_by_id.items():
+        expected_contracts = _order_row_contracts(row)
+        observed = fills_by_order_id.get(order_id)
+        observed_contracts = _safe_float(getattr(observed, "contracts", 0.0), 0.0)
+        if (
+            expected_contracts > 0
+            and observed_contracts > 0
+            and expected_contracts > observed_contracts
+            and not _relative_close_enough(observed_contracts, expected_contracts, 0.001)
+        ):
+            incomplete.add(order_id)
+    return incomplete
 
 
 def _order_row_id(row: dict[str, Any] | None) -> str:

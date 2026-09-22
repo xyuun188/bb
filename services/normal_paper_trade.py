@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from math import isclose, isfinite
 from typing import Any
@@ -432,7 +433,7 @@ def build_normal_paper_trade_contract(
     expected_net = _float(support.get("expected_net_return_pct"), None)
     objective_net = _float(support.get("objective_net_return_pct"), None)
     quality_permissions = {
-        str(source): _dict(permission)
+        str(source): deepcopy(permission)
         for source, permission in _dict(
             support.get("quant_quality_permissions")
         ).items()

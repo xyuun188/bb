@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional ISO-8601 lower bound for a one-off historical fact recovery.",
     )
     parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument(
+        "--order-id",
+        action="append",
+        default=[],
+        help="Target one exchange order id for historical fill recovery; repeatable.",
+    )
     return parser.parse_args()
 
 
@@ -59,6 +65,7 @@ async def main():
         limit={max(int(args.limit or 1), 1)!r},
         timeout_seconds={max(float(args.timeout or 1), 1.0)!r},
         phase3_order_sync_start=historical_since,
+        recovery_order_ids={tuple(str(value).strip() for value in args.order_id if str(value).strip())!r},
     ).sync()
     status_path = root / "data" / "trading_runtime_status.json"
     status = {{}}

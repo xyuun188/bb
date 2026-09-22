@@ -25,20 +25,31 @@ def _decision(action: Action) -> DecisionOutput:
 
 
 class _RiskAssessment:
-    def __init__(self, calls: list[tuple[str, Any]], approved: bool = True) -> None:
+    def __init__(
+        self,
+        calls: list[tuple[str, Any]],
+        approved: bool = True,
+        adjusted_decision: DecisionOutput | None = None,
+    ) -> None:
         self.calls = calls
         self.approved = approved
+        self.adjusted_decision = adjusted_decision
 
     async def assess(self, **kwargs: Any) -> Any:
         self.calls.append(("assess", kwargs["decision"].action.value))
         return SimpleNamespace(
             approved=self.approved,
-            decision=None,
+            decision=self.adjusted_decision,
             rejection_reason="risk_rejected" if not self.approved else "",
         )
 
 
-def _processor(calls: list[tuple[str, Any]]) -> PositionReviewDecisionProcessor:
+def _processor(
+    calls: list[tuple[str, Any]],
+    *,
+    adjusted_decision: DecisionOutput | None = None,
+    open_positions_refresher: Any = None,
+) -> PositionReviewDecisionProcessor:
     async def mark_reason(decision_id: int, reason: str) -> None:
         calls.append(("reason", decision_id, reason))
 
@@ -80,12 +91,13 @@ def _processor(calls: list[tuple[str, Any]]) -> PositionReviewDecisionProcessor:
     return PositionReviewDecisionProcessor(
         entry_guard=PositionReviewEntryGuardPolicy(),
         entry_capacity=EntryCapacityPolicy(lambda symbol: str(symbol)),
-        risk_assessment=_RiskAssessment(calls),
+        risk_assessment=_RiskAssessment(calls, adjusted_decision=adjusted_decision),
         result_recorder=recorder,
         candidate_executor=execute_candidate,
         final_state_ensurer=ensure_final,
         account_balance_provider=account_balance,
         entry_risk_contract_preparer=prepare_entry_risk,
+        open_positions_refresher=open_positions_refresher,
     )
 
 
@@ -249,6 +261,82 @@ async def test_entry_pause_blocks_before_risk_assessment() -> None:
 
     assert result.handled is True
     assert not any(call[0] == "assess" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_position_review_entry_refreshes_snapshot_before_capacity_guard() -> None:
+    calls: list[tuple[str, Any]] = []
+    refreshed = [
+        {
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "quantity": 1.0,
+            "is_open": True,
+        }
+    ]
+
+    async def refresh() -> list[dict[str, Any]]:
+        calls.append(("refresh",))
+        return refreshed
+
+    open_positions: list[dict[str, Any]] = []
+    result = await _processor(calls, open_positions_refresher=refresh).process(
+        decision=_decision(Action.LONG),
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=21,
+        open_positions=open_positions,
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    assert result.handled is True
+    assert open_positions == refreshed
+    assert calls[0][0] == "refresh"
+    assert "BTC/USDT" in str(calls[-1])
+    assert not any(call[0] == "assess" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_risk_adjusted_entry_rechecks_capacity_after_snapshot_refresh() -> None:
+    calls: list[tuple[str, Any]] = []
+    adjusted = _decision(Action.LONG)
+
+    async def refresh() -> list[dict[str, Any]]:
+        calls.append(("refresh",))
+        return [
+            {
+                "symbol": "BTC/USDT",
+                "side": "short",
+                "quantity": 2.0,
+                "is_open": True,
+            }
+        ]
+
+    result = await _processor(
+        calls,
+        adjusted_decision=adjusted,
+        open_positions_refresher=refresh,
+    ).process(
+        decision=_decision(Action.CLOSE_LONG),
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        model_mode="paper",
+        decision_db_id=22,
+        open_positions=[],
+        feature_vector=SimpleNamespace(),
+        position_entry_pause_reason=None,
+        risk_alert=None,
+        results={"decisions": []},
+    )
+
+    assert result.handled is True
+    assert any(call[0] == "refresh" for call in calls)
+    assert not any(call[0] == "prepare" for call in calls)
+    assert not any(call[0] == "execute" for call in calls)
 
 
 @pytest.mark.asyncio

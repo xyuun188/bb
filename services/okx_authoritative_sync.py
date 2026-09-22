@@ -1067,6 +1067,37 @@ class OkxAuthoritativeSyncService:
                 continue
             for exchange_order_id in exchange_ids:
                 fill = fills_by_order_id.get(exchange_order_id)
+                persisted_fill = _local_order_persisted_confirmed_okx_fill(
+                    order,
+                    exchange_order_id=exchange_order_id,
+                )
+                if fill is not None and _persisted_fill_supersedes_observed_fill(
+                    persisted_fill,
+                    fill,
+                ):
+                    observed_fill = fill
+                    fill = persisted_fill
+                    issues.append(
+                        OkxAuthoritativeIssue(
+                            kind="local_order_verified_from_persisted_okx_fills",
+                            classification="observation",
+                            severity="info",
+                            reason=(
+                                "The bounded OKX fill pull returned a partial group; the "
+                                "identity-complete persisted OKX fill rows contain the "
+                                "larger cumulative fill and are used for comparison."
+                            ),
+                            symbol=order_symbol,
+                            side=str(order.side or "").lower(),
+                            local_order_id=int(order.id),
+                            exchange_order_id=exchange_order_id,
+                            local_quantity=_safe_float(order.quantity),
+                            okx_contracts=fill.contracts,
+                            local_price=_safe_float(order.price),
+                            okx_price=fill.avg_price,
+                            okx_timestamp=fill.timestamp or observed_fill.timestamp,
+                        )
+                    )
                 if fill is None:
                     if order_has_current_position_snapshot_confirmation(
                         order,
@@ -1082,10 +1113,7 @@ class OkxAuthoritativeSyncService:
                     )
                     if current_position_confirmation is not None:
                         continue
-                    fill = _local_order_persisted_confirmed_okx_fill(
-                        order,
-                        exchange_order_id=exchange_order_id,
-                    )
+                    fill = persisted_fill
                     if fill is None:
                         issues.append(
                             OkxAuthoritativeIssue(
@@ -1992,6 +2020,24 @@ def _local_order_persisted_confirmed_okx_fill(
         timestamp=group.timestamp,
         raw_count=group.raw_count,
         rows=group.rows,
+    )
+
+
+def _persisted_fill_supersedes_observed_fill(
+    persisted: OkxFillGroup | None,
+    observed: OkxFillGroup,
+) -> bool:
+    """Recognize account-wide pagination truncation without weakening identity checks."""
+
+    if persisted is None or persisted.order_id != observed.order_id:
+        return False
+    persisted_trade_ids = set(persisted.trade_ids)
+    observed_trade_ids = set(observed.trade_ids)
+    return bool(
+        persisted.contracts > observed.contracts
+        and persisted.raw_count >= observed.raw_count
+        and observed_trade_ids
+        and observed_trade_ids.issubset(persisted_trade_ids)
     )
 
 

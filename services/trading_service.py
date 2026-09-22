@@ -975,6 +975,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             final_state_ensurer=self.decision_final_state_ensurer.ensure,
             account_balance_provider=self.get_account_balance,
             entry_risk_contract_preparer=self._prepare_entry_for_hard_risk,
+            open_positions_refresher=self.open_positions_context_for_execution,
         )
 
         # Executors: paper routes to OKX demo, live routes to OKX real.
@@ -4363,6 +4364,54 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Apply current exchange/account safety before the return policy."""
 
         if decision.is_entry:
+            # Market analysis can take longer than one position-sync interval.
+            # Refresh the authoritative snapshot immediately before the final
+            # entry policy so a position opened by another round cannot be
+            # mistaken for an empty account.
+            if getattr(self, "okx_sync_service", None) is not None:
+                try:
+                    refreshed_positions = await self.open_positions_context_for_execution()
+                except Exception as exc:
+                    return PolicyGateResult.block(
+                        "entry_position_snapshot_unavailable",
+                        f"entry execution position snapshot refresh failed: {safe_error_text(exc, limit=160)}",
+                        {
+                            "stage_status": "blocked",
+                            "execution_blocker": "entry_position_snapshot_unavailable",
+                        },
+                    )
+                if not isinstance(refreshed_positions, list):
+                    return PolicyGateResult.block(
+                        "entry_position_snapshot_unavailable",
+                        "entry execution position snapshot refresh returned invalid data",
+                        {
+                            "stage_status": "blocked",
+                            "execution_blocker": "entry_position_snapshot_unavailable",
+                        },
+                    )
+                if open_positions is None:
+                    open_positions = refreshed_positions
+                else:
+                    open_positions[:] = refreshed_positions
+
+                entry_capacity = getattr(self, "entry_capacity", None)
+                if entry_capacity is not None:
+                    capacity_reason = entry_capacity.reason(
+                        model_name,
+                        decision,
+                        refreshed_positions,
+                        entry_capacity.empty_staged_counts(),
+                    )
+                    if capacity_reason:
+                        return PolicyGateResult.block(
+                            "entry_capacity",
+                            capacity_reason,
+                            {
+                                "stage_status": "blocked",
+                                "execution_blocker": "entry_capacity",
+                                "open_positions_refreshed": True,
+                            },
+                        )
             okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
             if okx_sync_reason:
                 return PolicyGateResult.block(

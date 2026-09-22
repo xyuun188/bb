@@ -1442,6 +1442,10 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                                         THEN bb_project_profit_risk_sizing_snapshot(
                                             item.value
                                         )
+                                        WHEN item.key = 'normal_paper_trade'
+                                             AND jsonb_typeof(item.value) = 'object'
+                                             AND pg_column_size(item.value) <= 16384
+                                        THEN item.value
                                         WHEN jsonb_typeof(item.value) IN ('object', 'array')
                                              AND pg_column_size(item.value) <= 16384
                                         THEN item.value
@@ -1459,7 +1463,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         ),
                         '{}'::JSONB
                     );
-                    NEW.decision_learning_snapshot_version := 4;
+                    NEW.decision_learning_snapshot_version := 5;
                     RETURN NEW;
                 END;
                 $$
@@ -1494,7 +1498,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                     SELECT id
                     FROM ai_decisions
                     WHERE model_health_snapshot_version < 1
-                       OR decision_learning_snapshot_version < 4
+                       OR decision_learning_snapshot_version < 5
                     ORDER BY created_at DESC NULLS LAST, id DESC
                     LIMIT 1500
                 )

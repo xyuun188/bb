@@ -49,6 +49,7 @@ from services.okx_order_fact_sync import (  # noqa: E402
 
 PHASE3_CLEAN_SNAPSHOT_DATE = "2026-06-28"
 PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS = 60.0
+PHASE3_ORDER_FACT_SYNC_RETRY_DELAYS_SECONDS = (1.0, 3.0, 6.0)
 BEIJING_TZ = timezone(timedelta(hours=8))
 logger = logging.getLogger(__name__)
 OKX_ORDER_RECOVERY_ISSUE_KINDS = frozenset(
@@ -56,6 +57,7 @@ OKX_ORDER_RECOVERY_ISSUE_KINDS = frozenset(
         "okx_fill_missing_local_order",
         "okx_linked_protection_fill_missing_local_order",
         "okx_fill_not_linked_to_position",
+        "local_order_quantity_differs_from_okx_fill",
     }
 )
 
@@ -166,7 +168,7 @@ async def run(
             }
             if recovery_order_ids:
                 sync_kwargs["recovery_order_ids"] = recovery_order_ids
-            sync_result = await OkxOrderFactSyncService(**sync_kwargs).sync()
+            sync_result = await _sync_order_facts_with_lock_retry(sync_kwargs)
         except Exception as exc:  # pragma: no cover - defensive operator output
             sync_error = f"{type(exc).__name__}: {safe_error_text(exc, limit=240)}"
     after_report = await collect_report(allow_cache=False)
@@ -182,6 +184,11 @@ async def run(
             "equity_snapshot_result": equity_snapshot_result,
             "recovery_order_ids": recovery_order_ids,
             "order_sync_result": sync_result,
+            "order_sync_retry_count": int(
+                sync_result.get("retry_count") or 0
+                if isinstance(sync_result, dict)
+                else 0
+            ),
             "order_sync_error": sync_error,
             "before_reconciliation": {
                 "status": before_report.get("status"),
@@ -200,6 +207,43 @@ async def run(
             "after_report": after_report,
         }
     )
+
+
+async def _sync_order_facts_with_lock_retry(
+    sync_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry a short-lived PostgreSQL writer-lock collision before reporting stale facts.
+
+    The scheduled Phase 3 reconciliation runs beside the trading loop. A busy
+    advisory lock is a temporary scheduling collision, not evidence that OKX
+    facts are unavailable. Retrying here closes the loop so a single collision
+    cannot leave the daily report blocked until the next calendar run.
+    """
+
+    retry_count = 0
+    result: dict[str, Any] = {}
+    for attempt_index, delay in enumerate(
+        (0.0, *PHASE3_ORDER_FACT_SYNC_RETRY_DELAYS_SECONDS)
+    ):
+        if attempt_index > 0:
+            retry_count += 1
+        if delay > 0:
+            await asyncio.sleep(delay)
+        result = dict(await OkxOrderFactSyncService(**sync_kwargs).sync())
+        deferred_stages = result.get("deferred_stages")
+        lock_busy = (
+            str(result.get("status") or "").lower() == "deferred"
+            and isinstance(deferred_stages, list)
+            and "single_writer_lock" in deferred_stages
+        )
+        if not lock_busy:
+            break
+    result["retry_count"] = retry_count
+    result["lock_retry_exhausted"] = bool(
+        str(result.get("status") or "").lower() == "deferred"
+        and "single_writer_lock" in (result.get("deferred_stages") or [])
+    )
+    return result
 
 
 async def _cleanup_phase3_local_okx_cache(*, mode: str) -> dict[str, Any]:

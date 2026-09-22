@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_brain.base_model import Action, DecisionOutput
+from models.decision import _compact_decision_learning_snapshot
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
@@ -142,6 +143,51 @@ def test_positive_net_direction_builds_normal_policy_trade() -> None:
     assert contract["leverage_policy"] == "dynamic_risk_and_okx_tier"
     assert contract["model_leverage_role"] == "upper_bound_when_explicit"
     assert "leverage_cap" not in contract
+
+
+def test_normal_paper_contract_keeps_an_immutable_quality_evidence_snapshot() -> None:
+    support = _support("long", expected_net=0.2)
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    )
+
+    support_permission = support["quant_quality_permissions"]["local_ml"]
+    support_permission["paper_execution_reason"] = "mutated_after_contract_build"
+    support_permission["paper_execution_evidence"]["sample_count"] = 999
+    support_permission["paper_execution_blockers"] = ["late_mutation"]
+
+    contract_permission = contract["quant_quality_permissions"]["local_ml"]
+    assert contract_permission["paper_execution_reason"] == (
+        "authoritative_fee_after_quality_above_break_even"
+    )
+    assert contract_permission["paper_execution_evidence"]["sample_count"] == 20
+    assert "paper_execution_blockers" not in contract_permission
+    assert normal_paper_trade_contract_reasons(contract) == []
+
+
+def test_learning_snapshot_preserves_exact_fingerprinted_normal_paper_contract() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="short",
+        selection_reason="paper_quality_observation",
+        direction_support=_quality_observation_support(
+            "short",
+            expected_net=0.2,
+            objective_net=-0.3,
+        ),
+    )
+
+    compact = _compact_decision_learning_snapshot(
+        {"normal_paper_trade": contract}
+    )
+
+    assert compact["normal_paper_trade"] == contract
+    assert normal_paper_trade_contract_reasons(
+        compact["normal_paper_trade"]
+    ) == []
 
 
 def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:

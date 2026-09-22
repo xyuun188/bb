@@ -24,6 +24,7 @@ from services.trade_recommendation_contract import attach_risk_adjusted_trade_re
 logger = structlog.get_logger(__name__)
 
 AccountBalanceProvider = Callable[[str], Awaitable[float]]
+OpenPositionsRefresher = Callable[[], Awaitable[list[dict[str, Any]]]]
 EntryRiskContractPreparer = Callable[
     [DecisionOutput, str, list[dict[str, Any]]],
     Awaitable[None],
@@ -56,6 +57,7 @@ class PositionReviewDecisionProcessor:
     final_state_ensurer: FinalStateEnsurer
     account_balance_provider: AccountBalanceProvider
     entry_risk_contract_preparer: EntryRiskContractPreparer | None = None
+    open_positions_refresher: OpenPositionsRefresher | None = None
 
     async def process(
         self,
@@ -80,6 +82,21 @@ class PositionReviewDecisionProcessor:
                 risk_alert=risk_alert,
             )
             return PositionReviewProcessResult(handled=True)
+
+        entry_positions_refreshed = False
+        if decision.is_entry:
+            entry_positions_refreshed = await self._refresh_entry_positions(
+                decision=decision,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                decision_db_id=decision_db_id,
+                open_positions=open_positions,
+                risk_alert=risk_alert,
+                results=results,
+            )
+            if not entry_positions_refreshed:
+                return PositionReviewProcessResult(handled=True)
 
         if await self._record_entry_precheck_block(
             decision=decision,
@@ -209,6 +226,40 @@ class PositionReviewDecisionProcessor:
             )
             return PositionReviewProcessResult(handled=True)
 
+        if executed.is_entry and not entry_positions_refreshed:
+            entry_positions_refreshed = await self._refresh_entry_positions(
+                decision=executed,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                decision_db_id=decision_db_id,
+                open_positions=open_positions,
+                risk_alert=risk_alert,
+                results=results,
+            )
+            if not entry_positions_refreshed:
+                return PositionReviewProcessResult(handled=True)
+
+        if executed.is_entry:
+            capacity_reason = self.entry_capacity.reason(
+                model_name,
+                executed,
+                open_positions,
+                {"model_totals": {}, "symbol_side": {}, "side_totals": {}},
+            )
+            if capacity_reason:
+                await self.result_recorder.record_skip(
+                    decision=executed,
+                    model_name=model_name,
+                    symbol=symbol,
+                    model_mode=model_mode,
+                    reason=capacity_reason,
+                    decision_db_id=decision_db_id,
+                    results=results,
+                    risk_alert=risk_alert,
+                )
+                return PositionReviewProcessResult(handled=True)
+
         if executed.is_exit:
             return await self._process_exit(
                 executed=executed,
@@ -226,6 +277,52 @@ class PositionReviewDecisionProcessor:
             handled=False,
             candidate=(symbol, model_name, executed, assessment, decision_db_id),
         )
+
+    async def _refresh_entry_positions(
+        self,
+        *,
+        decision: DecisionOutput,
+        model_name: str,
+        symbol: str,
+        model_mode: str,
+        decision_db_id: int | None,
+        open_positions: list[dict[str, Any]],
+        risk_alert: str | None,
+        results: dict[str, Any] | None,
+    ) -> bool:
+        """Refresh the authoritative snapshot before a review entry is admitted."""
+
+        if self.open_positions_refresher is None:
+            return True
+        try:
+            refreshed = await self.open_positions_refresher()
+        except Exception as exc:
+            reason = f"position_review_entry_snapshot_refresh_failed:{safe_error_text(exc, limit=160)}"
+            await self.result_recorder.record_skip(
+                decision=decision,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                reason=reason,
+                decision_db_id=decision_db_id,
+                results=results,
+                risk_alert=risk_alert,
+            )
+            return False
+        if not isinstance(refreshed, list):
+            await self.result_recorder.record_skip(
+                decision=decision,
+                model_name=model_name,
+                symbol=symbol,
+                model_mode=model_mode,
+                reason="position_review_entry_snapshot_refresh_invalid",
+                decision_db_id=decision_db_id,
+                results=results,
+                risk_alert=risk_alert,
+            )
+            return False
+        open_positions[:] = [item for item in refreshed if isinstance(item, dict)]
+        return True
 
     async def _record_entry_precheck_block(
         self,

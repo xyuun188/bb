@@ -579,8 +579,16 @@ def assess_dynamic_exit(
         if funding_fee_included
         else "settled_funding_unavailable"
     )
-    funding_adjusted_gross_pnl = gross_pnl + min(included_funding_fee, 0.0)
-    funding_adjusted_loss = max(-funding_adjusted_gross_pnl, 0.0)
+    # Keep price loss and funding loss separate.  The previous implementation
+    # used total negative PnL here, so an ordinary stop-sized price move could
+    # be mislabeled as a funding-budget breach and trigger duplicate hard-exit
+    # diagnostics.
+    adverse_funding_loss = max(-min(included_funding_fee, 0.0), 0.0)
+    # Price movement and confirmed adverse funding both consume the same
+    # planned-risk budget, while the dedicated funding flag below remains
+    # limited to funding itself.
+    price_loss = max(-gross_pnl, 0.0)
+    funding_adjusted_loss = price_loss + adverse_funding_loss
     remaining_planned_risk = max(planned_risk - funding_adjusted_loss, 0.0)
     funding_loss_budget_crossed = bool(
         funding_fee_included
