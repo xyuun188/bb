@@ -1985,6 +1985,22 @@ def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error
     assert "function renderAnalysisReasonModal" in script[detail_start:detail_end]
 
 
+def test_analysis_missing_expert_ui_does_not_infer_configuration_failure() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    reason_start = script.index("function analysisMissingExpertReason")
+    reason_end = script.index("function renderAnalysisPage", reason_start)
+    reason_block = script[reason_start:reason_end]
+
+    assert "missingStatus === 'evidence_missing'" in reason_block
+    assert "这不代表模型不可用" in reason_block
+    assert "configuration_type === 'keyless_loopback'" in reason_block
+    assert "configuration_type === 'target_local'" in reason_block
+    assert "可能原因：系统设置中未启用、未配置 API Key" not in reason_block
+    assert "Number(r.attempted_expert_count ?? 0)" in script
+    assert "Number(record.attempted_expert_count ?? 0)" in script
+    assert "调用证据缺失" in script
+
+
 def test_analysis_model_decision_observation_is_not_rendered_as_failure() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     decision_start = script.index("const decisionMaker = record.decision_maker || null;")

@@ -1376,6 +1376,57 @@ def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
     return {"skipped": False, "kind": "", "label": "", "reason": ""}
 
 
+def _analysis_payload_is_execution_sync(raw: dict[str, Any]) -> bool:
+    """Return whether a decision row only records an exchange-side execution sync."""
+
+    return raw.get("system_sync") is True or str(raw.get("source") or "") == (
+        "okx_position_reconcile"
+    )
+
+
+def _analysis_missing_expert_status(
+    expert_name: str,
+    *,
+    quality_slots: dict[str, dict[str, Any]],
+    timings_by_name: dict[str, dict[str, Any]],
+    failures_by_name: dict[str, str],
+    attempted_names: set[str],
+    pre_expert_skip: dict[str, Any],
+    ensemble_timed_out: bool,
+    attempt_evidence_status: str,
+) -> str:
+    """Classify a missing expert from preserved call evidence only."""
+
+    slot = _safe_dict(quality_slots.get(expert_name))
+    slot_status = str(slot.get("status") or "").lower()
+    timing_status = str(
+        _safe_dict(timings_by_name.get(expert_name)).get("status") or ""
+    ).lower()
+    failure_reason = str(failures_by_name.get(expert_name) or "").lower()
+    attempted = expert_name in attempted_names or slot.get("attempted") is True
+    if pre_expert_skip.get("skipped"):
+        return "pre_expert_skipped"
+    if ensemble_timed_out:
+        return "ensemble_timeout"
+    if slot_status == "timeout" or timing_status in {"timeout", "timeout_fallback"}:
+        return "called_timeout"
+    if slot_status in {"parse_failed", "invalid"} or "json" in failure_reason:
+        return "invalid_response"
+    if slot_status == "empty":
+        return "empty_response"
+    if slot_status in {"failed", "unavailable"} or (attempted and failure_reason):
+        return "call_failed"
+    if slot_status in {"skipped", "not_attempted"} or (
+        "attempted" in slot and slot.get("attempted") is not True
+    ):
+        return "not_attempted"
+    if attempted:
+        return "call_failed"
+    if attempt_evidence_status == "complete":
+        return "not_attempted"
+    return "evidence_missing"
+
+
 def _execution_reason_is_unusable(reason: str | None) -> bool:
     text = str(reason or "").strip()
     if not text:
@@ -11444,7 +11495,6 @@ async def _get_analysis_records_uncached(
     """Return one collaboration record per ensemble decision."""
     from sqlalchemy import func, select
 
-    from db.repositories.decision_repo import DecisionRepository
     from db.session import get_read_session_ctx
     from models.decision import AIDecision
     from models.trade import Position
@@ -11464,7 +11514,6 @@ async def _get_analysis_records_uncached(
         current_position_symbols = await _get_display_open_position_symbols(selected_mode)
 
     async with get_read_session_ctx() as session:
-        repo = DecisionRepository(session)
         # Analysis lists only need the collaboration payload and scalar display
         # fields. Avoid hydrating feature snapshots, model-health blobs, and
         # learning snapshots for every filtered row.
@@ -11488,13 +11537,17 @@ async def _get_analysis_records_uncached(
             AIDecision.raw_llm_response,
             AIDecision.analysis_type,
         )
+        analysis_record_filters = [
+            AIDecision.model_name == ENSEMBLE_TRADER_NAME,
+            AIDecision.analysis_type.is_distinct_from("execution_sync"),
+        ]
         needs_server_filter = bool(normalized_analysis_type or expert_name)
         db_type_filter = bool(normalized_analysis_type and not expert_name and decision_id is None)
         total_without_server_filter = 0
         if decision_id is not None:
             decision_stmt = select(*analysis_columns).where(
+                *analysis_record_filters,
                 AIDecision.id == decision_id,
-                AIDecision.model_name == ENSEMBLE_TRADER_NAME,
             )
             if is_paper is not None:
                 decision_stmt = decision_stmt.where(AIDecision.is_paper == is_paper)
@@ -11502,7 +11555,7 @@ async def _get_analysis_records_uncached(
             all_rows = [SimpleNamespace(**dict(row)) for row in decision_result.mappings().all()]
         elif db_type_filter:
             filters = [
-                AIDecision.model_name == ENSEMBLE_TRADER_NAME,
+                *analysis_record_filters,
                 AIDecision.analysis_type == normalized_analysis_type,
             ]
             if symbol:
@@ -11531,7 +11584,7 @@ async def _get_analysis_records_uncached(
             scan_offset = 0 if needs_server_filter else offset
             projection_stmt = (
                 select(*analysis_columns)
-                .where(AIDecision.model_name == ENSEMBLE_TRADER_NAME)
+                .where(*analysis_record_filters)
                 .order_by(AIDecision.created_at.desc())
                 .offset(scan_offset)
                 .limit(scan_limit)
@@ -11547,10 +11600,15 @@ async def _get_analysis_records_uncached(
         elif db_type_filter:
             pass
         elif not needs_server_filter:
-            total_without_server_filter = await repo.count_decisions(
-                model_name=ENSEMBLE_TRADER_NAME,
-                is_paper=is_paper,
+            count_filters = list(analysis_record_filters)
+            if symbol:
+                count_filters.append(AIDecision.symbol == symbol)
+            if is_paper is not None:
+                count_filters.append(AIDecision.is_paper == is_paper)
+            count_result = await session.execute(
+                select(func.count(AIDecision.id)).where(*count_filters)
             )
+            total_without_server_filter = int(count_result.scalar() or 0)
         position_stmt = select(
             Position.execution_mode,
             Position.symbol,
@@ -11598,7 +11656,7 @@ async def _get_analysis_records_uncached(
     filtered_count = 0
     for d in all_rows:
         raw = _safe_dict(d.raw_llm_response)
-        if not raw:
+        if not raw or _analysis_payload_is_execution_sync(raw):
             continue
         analysis_type, analysis_type_label = infer_analysis_type(d, raw)
         analysis_quality = _safe_dict(raw.get("analysis_quality_contract"))
@@ -11730,12 +11788,62 @@ async def _get_analysis_records_uncached(
             for item in _safe_list(analysis_quality.get("experts"))
             if isinstance(item, dict) and str(item.get("name") or "") in expected_expert_name_set
         }
+        attempted_names.update(returned_names)
+        attempted_names.update(failures_by_name)
+        attempted_names.update(
+            str(item.get("name"))
+            for item in model_timings
+            if str(item.get("name") or "") in expected_expert_name_set
+            and str(item.get("status") or "").lower() not in {"skipped", "not_attempted"}
+        )
+        attempted_names.update(
+            name
+            for name, slot in quality_slots.items()
+            if slot.get("attempted") is True
+        )
+        attempted_experts = [
+            name for name in expected_expert_names if name in attempted_names
+        ]
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
         pre_expert_skip = _analysis_pre_expert_skip(raw)
         ensemble_timed_out = pre_expert_skip.get("kind") == "ensemble_timeout"
-        attempted_expert_count = (
-            0 if pre_expert_skip.get("skipped") else (len(attempted_names) or len(expected_experts))
+        quality_attempted_count_present = "attempted_expert_count" in analysis_quality
+        contract_attempted_count = _safe_int_value(
+            analysis_quality.get("attempted_expert_count"),
+            0,
         )
+        attempted_expert_count = (
+            0
+            if pre_expert_skip.get("skipped")
+            else max(contract_attempted_count, len(attempted_names))
+        )
+        has_explicit_attempt_flags = any(
+            "attempted" in slot for slot in quality_slots.values()
+        )
+        attempt_evidence_status = (
+            "complete"
+            if pre_expert_skip.get("skipped")
+            or quality_attempted_count_present
+            or bool(raw.get("attempted_experts"))
+            or has_explicit_attempt_flags
+            else "partial"
+            if attempted_names
+            else "missing"
+        )
+
+        missing_status_by_name = {
+            expert_name: _analysis_missing_expert_status(
+                expert_name,
+                quality_slots=quality_slots,
+                timings_by_name=timings_by_name,
+                failures_by_name=failures_by_name,
+                attempted_names=attempted_names,
+                pre_expert_skip=pre_expert_skip,
+                ensemble_timed_out=ensemble_timed_out,
+                attempt_evidence_status=attempt_evidence_status,
+            )
+            for expert_name in expected_expert_names
+        }
         missing_experts = [
             {
                 **e,
@@ -11748,21 +11856,12 @@ async def _get_analysis_records_uncached(
                     if ensemble_timed_out
                     else failures_by_name.get(e["expert_name"])
                     or (
-                        "未发起调用，可能是该专家未启用或未配置 API Key。"
-                        if attempted_names and e["expert_name"] not in attempted_names
-                        else "本轮未返回结果，可能是模型调用失败、超时或返回格式不符合 JSON 要求。"
+                        "本轮调度证据显示未发起该专家，没有证据表明是模型配置故障。"
+                        if missing_status_by_name[e["expert_name"]] == "not_attempted"
+                        else "本条记录缺少专家调用证据，无法判断是否发起；这不代表模型不可用。"
                     )
                 ),
-                "status": (
-                    str(_safe_dict(quality_slots.get(e["expert_name"])).get("status") or "")
-                    or "pre_expert_skipped"
-                    if pre_expert_skip.get("skipped")
-                    else "ensemble_timeout"
-                    if ensemble_timed_out
-                    else "called_timeout"
-                    if e["expert_name"] in attempted_names
-                    else "missing"
-                ),
+                "status": missing_status_by_name[e["expert_name"]],
                 "skip_kind": pre_expert_skip.get("kind") or "",
                 "returned": bool(_safe_dict(quality_slots.get(e["expert_name"])).get("returned")),
                 "usable": bool(_safe_dict(quality_slots.get(e["expert_name"])).get("usable")),
@@ -11902,10 +12001,9 @@ async def _get_analysis_records_uncached(
             "expected_expert_count": int(
                 analysis_quality.get("expected_expert_count", len(expected_experts)) or 0
             ),
-            "attempted_expert_count": int(
-                analysis_quality.get("attempted_expert_count", attempted_expert_count) or 0
-            ),
+            "attempted_expert_count": int(attempted_expert_count),
             "attempted_experts": attempted_experts,
+            "attempt_evidence_status": attempt_evidence_status,
             "expert_status_counts": _safe_dict(analysis_quality.get("status_counts")),
             "analysis_complete": (
                 bool(analysis_quality.get("analysis_complete")) if analysis_quality else None

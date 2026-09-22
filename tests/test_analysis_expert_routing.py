@@ -286,3 +286,124 @@ async def test_dashboard_analysis_detail_degrades_when_vector_memory_fails(
         assert response["records"][0]["expert_count"] == 4
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_excludes_exchange_sync_rows_from_expert_analysis(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'analysis-sync-filter.db').as_posix()}",
+    )
+    monkeypatch.setattr(settings, "vector_memory_enabled", False)
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            analysis = AIDecision(
+                model_name=ENSEMBLE_TRADER_NAME,
+                symbol="PEPE/USDT",
+                action="close_short",
+                confidence=0.6,
+                reasoning="expert analysis",
+                raw_llm_response=_legacy_raw_payload("position"),
+                analysis_type="position",
+                is_paper=True,
+                created_at=datetime(2026, 9, 22, 4, 50, 17, tzinfo=UTC),
+            )
+            execution_sync = AIDecision(
+                model_name=ENSEMBLE_TRADER_NAME,
+                symbol="PEPE/USDT",
+                action="close_short",
+                confidence=1.0,
+                reasoning="exchange close fill synchronized",
+                raw_llm_response={
+                    "system_sync": True,
+                    "source": "okx_position_reconcile",
+                    "close_fill": {"order_id": "sync-order"},
+                },
+                analysis_type="execution_sync",
+                is_paper=True,
+                was_executed=True,
+                created_at=datetime(2026, 9, 22, 4, 50, 34, tzinfo=UTC),
+            )
+            session.add_all([analysis, execution_sync])
+            await session.flush()
+            analysis_id = analysis.id
+            execution_sync_id = execution_sync.id
+
+        response = await dashboard.get_analysis_records(
+            analysis_type="position",
+            include_detail=True,
+            symbol="PEPE/USDT",
+            is_paper=True,
+        )
+
+        assert response["count"] == 1
+        assert response["total"] == 1
+        assert response["records"][0]["decision_id"] == analysis_id
+        assert response["records"][0]["expert_count"] == 5
+
+        sync_detail = await dashboard.get_analysis_records(
+            decision_id=execution_sync_id,
+            include_detail=True,
+            is_paper=True,
+        )
+        assert sync_detail["count"] == 0
+        assert sync_detail["records"] == []
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_does_not_infer_attempts_without_call_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'analysis-attempt-evidence.db').as_posix()}",
+    )
+    monkeypatch.setattr(settings, "vector_memory_enabled", False)
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name=ENSEMBLE_TRADER_NAME,
+                symbol="PEPE/USDT",
+                action="hold",
+                confidence=0.0,
+                reasoning="legacy incomplete record",
+                raw_llm_response={"analysis_type": "position", "opinions": []},
+                analysis_type="position",
+                is_paper=True,
+                created_at=datetime.now(UTC),
+            )
+            session.add(decision)
+            await session.flush()
+            decision_id = decision.id
+
+        response = await dashboard.get_analysis_records(
+            decision_id=decision_id,
+            include_detail=True,
+            is_paper=True,
+        )
+        record = response["records"][0]
+
+        assert record["expected_expert_count"] == 5
+        assert record["attempted_expert_count"] == 0
+        assert record["attempted_experts"] == []
+        assert record["attempt_evidence_status"] == "missing"
+        assert {item["status"] for item in record["missing_experts"]} == {
+            "evidence_missing"
+        }
+        assert all(
+            "模型不可用" in item["reason"] for item in record["missing_experts"]
+        )
+    finally:
+        await close_db()

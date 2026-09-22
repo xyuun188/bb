@@ -3638,6 +3638,7 @@ function analysisMissingExpertReason(missing, record) {
     const rawReason = String(missing?.reason || '').trim();
     const lowerReason = rawReason.toLowerCase();
     const skipKind = missing?.skip_kind || record?.expert_call_status?.kind || '';
+    const missingStatus = String(missing?.status || '');
     const ensembleTimedOut = missing?.status === 'ensemble_timeout'
         || skipKind === 'ensemble_timeout'
         || record?.expert_call_status?.timed_out === true;
@@ -3658,6 +3659,18 @@ function analysisMissingExpertReason(missing, record) {
         return `${label} 本轮没有发起调用，不是模型故障：${skipLabel}。原因：${rawReason || record?.expert_call_status?.reason || '预检阶段已确定暂不需要大模型专家。'}`;
     }
 
+    if (missingStatus === 'evidence_missing') {
+        return `${label} 这条记录缺少调用证据，无法判断本轮是否发起；这不代表模型不可用，也不能据此判断 API Key、API URL 或模型名称有问题。`;
+    }
+
+    if (missingStatus === 'invalid_response') {
+        return `${label} 已发起调用，但返回内容未通过结构校验，因此没有进入本轮可用专家结果。${rawReason ? `详情：${rawReason}` : ''}`;
+    }
+
+    if (missingStatus === 'empty_response') {
+        return `${label} 已发起调用，但没有返回可用内容。${rawReason ? `详情：${rawReason}` : ''}`;
+    }
+
     if (cfg && cfg.loading === true) {
         return `${label} 的系统配置还在加载中，暂时无法判断具体原因。`;
     }
@@ -3665,14 +3678,17 @@ function analysisMissingExpertReason(missing, record) {
         return `${label} 在系统设置中已关闭，所以本轮没有发起调用。`;
     }
     const keylessLoopback = cfg?.configured === true
-        && cfg?.configuration_type === 'keyless_loopback';
-    if (cfg && cfg.configured === false && !cfg.api_key) {
+        && (
+            cfg?.configuration_type === 'keyless_loopback'
+            || cfg?.configuration_type === 'target_local'
+        );
+    if (missingStatus === 'not_attempted' && cfg && cfg.configured === false && !cfg.api_key) {
         return `${label} 未配置 API Key，所以本轮没有发起调用。`;
     }
-    if (cfg && Object.hasOwn(cfg, 'api_base') && !cfg.api_base) {
+    if (missingStatus === 'not_attempted' && cfg && Object.hasOwn(cfg, 'api_base') && !cfg.api_base) {
         return `${label} 未配置 API URL，所以本轮没有发起调用。`;
     }
-    if (cfg && Object.hasOwn(cfg, 'model') && !cfg.model) {
+    if (missingStatus === 'not_attempted' && cfg && Object.hasOwn(cfg, 'model') && !cfg.model) {
         return `${label} 未配置模型名称，所以本轮没有发起调用。`;
     }
     if (keylessLoopback && !attempted && !timing) {
@@ -3706,7 +3722,11 @@ function analysisMissingExpertReason(missing, record) {
         return `${label} 已发起调用，但本轮没有返回可用结果，可能是 AI 未响应、超时或返回内容无效。`;
     }
 
-    return `${label} 本轮没有发起调用。可能原因：系统设置中未启用、未配置 API Key、未配置 API URL、未配置模型名称，或服务启动时未加载该专家配置。`;
+    if (missingStatus === 'not_attempted') {
+        return `${label} 本轮调度证据显示没有发起调用，但当前记录没有提供配置故障证据。`;
+    }
+
+    return `${label} 本轮没有可用结果，且记录中的调用证据不足，无法判断是未发起、调用失败还是旧记录缺字段。`;
 }
  
 function renderAnalysisPage() {  
@@ -3732,7 +3752,8 @@ function renderAnalysisPage() {
         const preExpertSkip = analysisPreExpertSkip(r);
         const expertCount = Number(r.expert_count || (r.experts || []).length || 0); 
         const expectedCount = Number(r.expected_expert_count ?? 0);
-        const attemptedCount = preExpertSkip.skipped ? 0 : Number(r.attempted_expert_count || expectedCount);  
+        const attemptedCount = preExpertSkip.skipped ? 0 : Number(r.attempted_expert_count ?? 0);
+        const attemptEvidenceMissing = r.attempt_evidence_status === 'missing';
         const missingCount = preExpertSkip.skipped ? 0 : Math.max(expectedCount - expertCount, 0);  
         const hasMajorConflict = Number(cross.major_conflicts || 0) > 0;  
         const completedCross = Number(cross.completed ?? cross.total ?? 0);
@@ -3747,7 +3768,9 @@ function renderAnalysisPage() {
         const expertStatusColor = missingCount ? 'var(--yellow)' : 'var(--text-muted)';
         const expertSummary = preExpertSkip.skipped
             ? preExpertSkip.label
-            : `发起 ${attemptedCount}/${expectedCount}，返回 ${expertCount}`;
+            : attemptEvidenceMissing
+                ? `调用证据缺失，返回 ${expertCount}/${expectedCount}`
+                : `发起 ${attemptedCount}/${expectedCount}，返回 ${expertCount}`;
         return ` 
         <tr> 
             <td style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${toBeijingTime(r.created_at)}</td> 
@@ -3928,7 +3951,8 @@ function renderAnalysisReasonModal(record) {
     const preExpertSkip = analysisPreExpertSkip(record);
     const expertCount = Number(record.expert_count || experts.length || 0);  
     const expectedCount = Number(record.expected_expert_count ?? 0);
-    const attemptedCount = preExpertSkip.skipped ? 0 : Number(record.attempted_expert_count || expectedCount);  
+    const attemptedCount = preExpertSkip.skipped ? 0 : Number(record.attempted_expert_count ?? 0);
+    const attemptEvidenceMissing = record.attempt_evidence_status === 'missing';
     const completedCross = Number(crossSummary.completed ?? crossSummary.total ?? 0);
     const expectedCross = Number(
         crossSummary.expected ?? record.cross_requested ?? crossSummary.total ?? 0
@@ -3949,7 +3973,9 @@ function renderAnalysisReasonModal(record) {
     );
     const expertSectionSubtitle = preExpertSkip.skipped
         ? preExpertSkip.label
-        : `发起 ${attemptedCount} 个，返回 ${expertCount} 个`;
+        : attemptEvidenceMissing
+            ? `调用证据缺失，返回 ${expertCount} 个`
+            : `发起 ${attemptedCount} 个，返回 ${expertCount} 个`;
     const mlSignal = record.ml_signal || null;
     const mlSignalPrediction = mlPrimaryPrediction(mlSignal);
     const mlSignalDistribution = standardizedReturnDistribution(
@@ -4012,15 +4038,24 @@ function renderAnalysisReasonModal(record) {
  
     const missingHtml = preExpertSkip.skipped ? '' : (record.missing_experts || []).map(e => {
         const reason = analysisMissingExpertReason(e, record);
+        const missingStatus = String(e?.status || '');
         const ensembleTimedOut = e?.status === 'ensemble_timeout'
             || record?.expert_call_status?.kind === 'ensemble_timeout';
         const calledTimeout = e?.status === 'called_timeout';
-        const notCalled = !ensembleTimedOut && !calledTimeout && (
-            !Array.isArray(record.attempted_experts)
-            || !record.attempted_experts.map(String).includes(String(e.expert_name || ''))
-        );
-        const pillText = calledTimeout ? '已调用未返回' : notCalled ? '未调用' : '未返回';
-        const pillTone = calledTimeout ? 'warn' : 'bad';
+        const pillText = ensembleTimedOut
+            ? '整体超时'
+            : calledTimeout
+                ? '已调用未返回'
+                : missingStatus === 'evidence_missing'
+                    ? '调用证据缺失'
+                    : missingStatus === 'not_attempted'
+                        ? '未发起'
+                        : missingStatus === 'invalid_response'
+                            ? '返回无效'
+                            : missingStatus === 'empty_response'
+                                ? '返回为空'
+                                : '调用失败';
+        const pillTone = missingStatus === 'evidence_missing' ? 'muted' : 'bad';
         return `  
         <div class="analysis-card analysis-card-warning">  
             <div class="analysis-card-head">

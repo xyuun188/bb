@@ -12442,7 +12442,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         "close_fill": close_fill_safe,
                         "reconcile_origin": reconcile_origin or "external_okx_sync",
                     },
-                    "analysis_type": "position",
+                    "analysis_type": "execution_sync",
                     "is_paper": pos.execution_mode != "live",
                     "was_executed": True,
                     "executed_at": closed_at,
