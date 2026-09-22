@@ -6,10 +6,12 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from services.current_position_management import build_current_position_management_contract
 from services.dynamic_exit_policy import (
+    MIN_TARGET_CLOSE_FRACTION_STEP,
+    STANDARD_EXIT_REASSESSMENT_SECONDS,
     apply_dynamic_exit,
     evaluate_dynamic_exit_execution_contract,
 )
-from services.exit_execution_singleflight import PROFIT_LOCK_LEDGER_KEY
+from services.exit_execution_singleflight import EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import PAPER_TRAINING_POSITION_LIFECYCLE_VERSION
 
@@ -162,6 +164,65 @@ def test_profit_retrace_generates_continuous_fraction_and_overrides_legacy_size(
     assert result.policy_provenance["fallback_reason"] == ""
     assert result.execution_cost_complete is True
     assert result.current_management_contract_complete is True
+
+
+def test_recent_confirmed_partial_exit_waits_for_a_new_observation_window() -> None:
+    position = _position()
+    contract = dict(position["current_management_contract"])
+    contract[EXIT_INTENT_KEY] = {
+        "state": "exchange_progress_confirmed",
+        "updated_at": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+        "target_close_fraction": 0.45,
+    }
+    position["current_management_contract"] = contract
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is False
+    assert result.reason == "dynamic_exit_observation_interval_active"
+    assert result.exit_reassessment_ready is False
+    assert result.seconds_since_last_confirmed_exit < STANDARD_EXIT_REASSESSMENT_SECONDS
+    assert result.target_close_fraction_step < MIN_TARGET_CLOSE_FRACTION_STEP
+
+
+def test_materially_higher_exit_target_can_reduce_again_before_interval_elapsed() -> None:
+    position = _position()
+    contract = dict(position["current_management_contract"])
+    contract[EXIT_INTENT_KEY] = {
+        "state": "exchange_progress_confirmed",
+        "updated_at": (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+        "target_close_fraction": 0.30,
+    }
+    position["current_management_contract"] = contract
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.eligible is True
+    assert result.exit_reassessment_ready is True
+    assert result.target_close_fraction_step >= MIN_TARGET_CLOSE_FRACTION_STEP
+
+
+def test_hard_risk_exit_bypasses_recent_partial_exit_observation_window() -> None:
+    position = _position(
+        current_price=97.0,
+        notional_usdt=970.0,
+        unrealized_pnl=-30.0,
+        peak_unrealized_pnl=0.0,
+    )
+    contract = dict(position["current_management_contract"])
+    contract[EXIT_INTENT_KEY] = {
+        "state": "exchange_progress_confirmed",
+        "updated_at": (datetime.now(UTC) - timedelta(seconds=30)).isoformat(),
+        "target_close_fraction": 0.9,
+    }
+    position["current_management_contract"] = contract
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is True
+    assert result.eligible is True
+    assert result.close_fraction == 1.0
+    assert result.exit_reassessment_ready is True
 
 
 def test_complete_paper_replacement_adds_exit_pressure_without_creating_order() -> None:
@@ -667,7 +728,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-09-19.dynamic-exit-profit-lock-ledger.v18"
+        "2026-09-22.dynamic-exit-observation-window.v19"
     )
 
 

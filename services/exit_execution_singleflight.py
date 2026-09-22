@@ -131,6 +131,9 @@ class ExitExecutionSingleFlightService:
             token = secrets.token_hex(12)
             attempt_count = self._safe_int(current.get("attempt_count"), 0) + 1
             profit_lock_exit = self._is_profit_lock_exit(decision)
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            dynamic_exit = raw.get("dynamic_exit_policy")
+            dynamic_exit = dynamic_exit if isinstance(dynamic_exit, dict) else {}
             intent = {
                 "version": EXIT_INTENT_VERSION,
                 "key": key,
@@ -142,6 +145,15 @@ class ExitExecutionSingleFlightService:
                     "profit_lock" if profit_lock_exit else "risk_or_other"
                 ),
                 "requested_close_fraction": self._decision_close_fraction(decision),
+                "target_close_fraction": self._safe_fraction(
+                    dynamic_exit.get("target_close_fraction")
+                ),
+                "lifecycle_closed_fraction": self._safe_fraction(
+                    dynamic_exit.get("lifecycle_closed_fraction")
+                ),
+                "incremental_close_fraction": self._safe_fraction(
+                    dynamic_exit.get("incremental_close_fraction")
+                ),
                 "profit_lock_exit": profit_lock_exit,
                 "position_ids": list(position_ids),
                 "acquired_at": now.isoformat(),
@@ -472,6 +484,10 @@ class ExitExecutionSingleFlightService:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @classmethod
+    def _safe_fraction(cls, value: Any) -> float:
+        return round(min(max(cls._safe_float(value, 0.0), 0.0), 1.0), 8)
 
 
 def preserve_exit_execution_intent(

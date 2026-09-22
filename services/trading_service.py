@@ -216,6 +216,7 @@ from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.production_trade_gate import evaluate_production_trade_gate
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
+from services.same_symbol_reentry import SameSymbolReentryGuard
 from services.shadow_backtest_service import ShadowBacktestService
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_context_performance import StrategyContextPerformanceService
@@ -824,6 +825,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             normalize_symbol=self._normalize_position_symbol,
             annotate_decision_source=self._annotate_decision_source,
         )
+        self.same_symbol_reentry_guard = SameSymbolReentryGuard()
         self.entry_capacity = EntryCapacityPolicy(self._normalize_position_symbol)
         self.entry_position_exposure = EntryPositionExposurePolicy()
         self.entry_market_regime = EntryMarketRegimePolicy()
@@ -899,6 +901,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             entry_profit_risk_sizing=self.entry_profit_risk_sizing,
             entry_price_guard=self.entry_price_guard,
             entry_opportunity_gate=self.entry_opportunity_gate,
+            same_symbol_reentry_guard=self.same_symbol_reentry_guard,
             high_risk_review_gate=EntryHighRiskReviewGatePolicy(
                 reviewer=self.high_risk_review_service,
                 allocation_state_provider=self.execution_allocation_state,

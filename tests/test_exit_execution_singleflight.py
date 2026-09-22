@@ -78,6 +78,9 @@ def _profit_lock_decision() -> DecisionOutput:
             "eligible": True,
             "hard_risk": False,
             "close_fraction": 0.4,
+            "target_close_fraction": 0.5,
+            "lifecycle_closed_fraction": 0.1,
+            "incremental_close_fraction": 0.4,
             "lifecycle_net_pnl_usdt": 12.0,
             "profit_lock_pressure": 0.4,
         }
@@ -289,6 +292,9 @@ async def test_confirmed_profit_lock_fill_updates_separate_idempotent_ledger() -
     assert intent["profit_lock_exit"] is True
     assert intent["exit_reason_class"] == "profit_lock"
     assert intent["requested_close_fraction"] == pytest.approx(0.4)
+    assert intent["target_close_fraction"] == pytest.approx(0.5)
+    assert intent["lifecycle_closed_fraction"] == pytest.approx(0.1)
+    assert intent["incremental_close_fraction"] == pytest.approx(0.4)
     assert ledger["realized_quantity"] == pytest.approx(4.0)
     assert ledger["realized_fraction"] == pytest.approx(0.4)
     assert ledger["last_decision_id"] == 509586

@@ -17,6 +17,7 @@ from services.current_position_management import (
 )
 from services.dynamic_policy_values import continuous_budget_fraction
 from services.execution_cost_model import funding_cost_estimate
+from services.exit_execution_singleflight import EXIT_INTENT_KEY
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
 
@@ -25,6 +26,8 @@ MIN_AUTOMATED_EXIT_FRACTION = 0.05
 MIN_EARLY_MODEL_EXIT_PRESSURE = MIN_AUTOMATED_EXIT_FRACTION * 2.0
 MIN_LOSS_REDUCTION_STOP_USAGE = 0.50
 MIN_LOSS_CONTINUATION_EVIDENCE = 0.25
+STANDARD_EXIT_REASSESSMENT_SECONDS = 10 * 60
+MIN_TARGET_CLOSE_FRACTION_STEP = 0.10
 DYNAMIC_EXIT_EXECUTION_CONTRACT_VERSION = "2026-08-24.dynamic-exit-execution-contract.v1"
 
 
@@ -126,6 +129,11 @@ class DynamicExitAssessment:
     required_incremental_lifecycle_fraction: float
     target_close_fraction: float
     incremental_close_fraction: float
+    last_confirmed_exit_at: str | None
+    seconds_since_last_confirmed_exit: float | None
+    previous_target_close_fraction: float | None
+    target_close_fraction_step: float
+    exit_reassessment_ready: bool
     hard_risk: bool
     gross_unrealized_pnl_usdt: float
     fee_after_unrealized_pnl_usdt: float
@@ -239,6 +247,8 @@ def evaluate_dynamic_exit_execution_contract(assessment: Any) -> dict[str, Any]:
             reasons.append("early_exit_observation_active")
         if getattr(assessment, "economic_exit_evidence_complete", None) is not True:
             reasons.append("economic_exit_evidence_incomplete")
+        if getattr(assessment, "exit_reassessment_ready", True) is not True:
+            reasons.append("dynamic_exit_observation_interval_active")
         if close_fraction + 1e-9 < MIN_AUTOMATED_EXIT_FRACTION:
             reasons.append("dynamic_exit_fraction_below_execution_minimum")
 
@@ -310,6 +320,8 @@ def assess_dynamic_exit(
     current_quantity = 0.0
     lifecycle_entry_quantity = 0.0
     profit_lock_realized_quantity = 0.0
+    latest_confirmed_exit_intent: dict[str, Any] = {}
+    latest_confirmed_exit_at: datetime | None = None
     funding_fee_observed = 0.0
     funding_fee_eligible = 0.0
     funding_bill_count = 0
@@ -415,6 +427,18 @@ def assess_dynamic_exit(
             profit_lock_realized_quantity,
             max(_safe_float(profit_lock_ledger.get("realized_quantity"), 0.0), 0.0),
         )
+        exit_intent = _safe_dict(management.get(EXIT_INTENT_KEY))
+        exit_updated_at = _parse_utc_datetime(exit_intent.get("updated_at"))
+        if (
+            exit_intent.get("state") == "exchange_progress_confirmed"
+            and exit_updated_at is not None
+            and (
+                latest_confirmed_exit_at is None
+                or exit_updated_at > latest_confirmed_exit_at
+            )
+        ):
+            latest_confirmed_exit_intent = dict(exit_intent)
+            latest_confirmed_exit_at = exit_updated_at
         current_quantity += qty
         contract_lifecycle_quantity = max(
             _safe_float(management.get("lifecycle_entry_quantity"), 0.0),
@@ -781,6 +805,31 @@ def assess_dynamic_exit(
         if remaining_lifecycle_fraction > 0.0
         else 0.0
     )
+    seconds_since_last_confirmed_exit = (
+        max((observed_at - latest_confirmed_exit_at).total_seconds(), 0.0)
+        if latest_confirmed_exit_at is not None
+        else None
+    )
+    previous_target_close_fraction = (
+        _safe_float(latest_confirmed_exit_intent.get("target_close_fraction"), 0.0)
+        if "target_close_fraction" in latest_confirmed_exit_intent
+        else None
+    )
+    target_close_fraction_step = (
+        max(target_close_fraction - previous_target_close_fraction, 0.0)
+        if previous_target_close_fraction is not None
+        else 0.0
+    )
+    exit_reassessment_ready = bool(
+        hard_risk
+        or latest_confirmed_exit_at is None
+        or (
+            seconds_since_last_confirmed_exit is not None
+            and seconds_since_last_confirmed_exit + 1e-9
+            >= STANDARD_EXIT_REASSESSMENT_SECONDS
+        )
+        or target_close_fraction_step + 1e-9 >= MIN_TARGET_CLOSE_FRACTION_STEP
+    )
     position_age_evidence_complete = bool(
         matches and len(position_ages_minutes) == len(matches)
     )
@@ -828,6 +877,12 @@ def assess_dynamic_exit(
         reasons.append("fee_after_profit_not_positive")
     if not hard_risk and not execution_cost_complete:
         reasons.append("exit_execution_cost_missing")
+    if (
+        not hard_risk
+        and close_fraction > 0.0
+        and not exit_reassessment_ready
+    ):
+        reasons.append("dynamic_exit_observation_interval_active")
     if not hard_risk and matches and not position_age_evidence_complete:
         reasons.append("position_age_evidence_missing")
     elif not hard_risk and early_exit_observation_active:
@@ -840,13 +895,15 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-09-19.dynamic-exit-profit-lock-ledger.v18",
+        "strategy_version": "2026-09-22.dynamic-exit-observation-window.v19",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
         "minimum_loss_reduction_stop_usage": MIN_LOSS_REDUCTION_STOP_USAGE,
         "minimum_loss_continuation_evidence": MIN_LOSS_CONTINUATION_EVIDENCE,
+        "standard_exit_reassessment_seconds": STANDARD_EXIT_REASSESSMENT_SECONDS,
+        "minimum_target_close_fraction_step": MIN_TARGET_CLOSE_FRACTION_STEP,
         "close_fraction_basis": (
             "max_of_total_lifecycle_target_gap_and_confirmed_profit_lock_target_gap"
         ),
@@ -870,6 +927,23 @@ def assess_dynamic_exit(
         ),
         target_close_fraction=round(target_close_fraction, 8),
         incremental_close_fraction=round(close_fraction, 8),
+        last_confirmed_exit_at=(
+            latest_confirmed_exit_at.isoformat()
+            if latest_confirmed_exit_at is not None
+            else None
+        ),
+        seconds_since_last_confirmed_exit=(
+            round(seconds_since_last_confirmed_exit, 3)
+            if seconds_since_last_confirmed_exit is not None
+            else None
+        ),
+        previous_target_close_fraction=(
+            round(previous_target_close_fraction, 8)
+            if previous_target_close_fraction is not None
+            else None
+        ),
+        target_close_fraction_step=round(target_close_fraction_step, 8),
+        exit_reassessment_ready=exit_reassessment_ready,
         hard_risk=hard_risk,
         gross_unrealized_pnl_usdt=round(gross_pnl, 8),
         fee_after_unrealized_pnl_usdt=round(price_fee_after_pnl, 8),

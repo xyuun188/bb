@@ -70,6 +70,7 @@ class EntryPolicy:
         entry_profit_risk_sizing: Any | None = None,
         entry_price_guard: Any | None = None,
         entry_opportunity_gate: Any | None = None,
+        same_symbol_reentry_guard: Any | None = None,
         high_risk_review_gate: Any | None = None,
     ) -> None:
         self.decision_freshness = decision_freshness
@@ -78,6 +79,7 @@ class EntryPolicy:
         self.entry_profit_risk_sizing = entry_profit_risk_sizing
         self.entry_price_guard = entry_price_guard
         self.entry_opportunity_gate = entry_opportunity_gate
+        self.same_symbol_reentry_guard = same_symbol_reentry_guard
         self.high_risk_review_gate_policy = high_risk_review_gate
 
     def score_candidate(
@@ -383,6 +385,23 @@ class EntryPolicy:
                 stale_reason,
                 {"pipeline_context": context.public_data()},
             )
+
+        if self.same_symbol_reentry_guard is not None:
+            reentry = await self.same_symbol_reentry_guard.evaluate(
+                decision,
+                model_mode,
+            )
+            if not reentry.allowed:
+                return PolicyGateResult.block(
+                    "same_symbol_reentry_guard",
+                    reentry.reason,
+                    {
+                        "pipeline_context": context.public_data(),
+                        "stage_status": "blocked",
+                        "skip_kind": "same_symbol_reentry_guard",
+                        "same_symbol_reentry_guard": reentry.to_dict(),
+                    },
+                )
 
         price_guard_reason = await self.prepare_dynamic_risk_contract(
             decision,
