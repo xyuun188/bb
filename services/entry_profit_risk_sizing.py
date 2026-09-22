@@ -87,6 +87,7 @@ def solve_size_aware_positive_expected_net(
     expected_net_return_pct: float,
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
+    allow_non_positive_return_lcb: bool = False,
 ) -> dict[str, Any]:
     """Validate the full risk-sized order without shrinking a losing trade.
 
@@ -94,8 +95,9 @@ def solve_size_aware_positive_expected_net(
     the full risk-sized order had a negative expected return.  That produced
     tiny probe fills which looked like normal paper trading while hiding a
     negative edge.  The current contract either keeps the complete risk-sized
-    order or rejects the entry; quality observation remains an audit signal,
-    never a reason to execute a known losing minimum-size order.
+    order or rejects the entry.  A paper-only quality observation may retain a
+    non-positive lower confidence bound, but only when the complete full-size
+    cost still leaves its expected net return positive.
     """
 
     maximum = max(_safe_float(maximum_notional_usdt, 0.0), 0.0)
@@ -192,14 +194,18 @@ def solve_size_aware_positive_expected_net(
     if upper["expected"] <= 0.0:
         result["reason"] = "full_risk_size_expected_net_not_positive"
         return result
-    if upper["lcb"] <= 0.0:
+    if upper["lcb"] <= 0.0 and not allow_non_positive_return_lcb:
         result["reason"] = "full_risk_size_return_lcb_not_positive"
         return result
 
     result.update(
         {
             "production_eligible": True,
-            "reason": "positive_fee_after_full_risk_size",
+            "reason": (
+                "positive_fee_after_full_risk_size_quality_observation"
+                if upper["lcb"] <= 0.0
+                else "positive_fee_after_full_risk_size"
+            ),
         }
     )
     return result
@@ -1647,12 +1653,12 @@ class EntryProfitRiskSizingPolicy:
             normal_trade.get("objective_net_return_pct"),
             0.0,
         )
-        shadow_only_observation = bool(
+        non_positive_lcb_observation = bool(
             quality_observation_mode and contract_return_lcb_pct <= 0.0
         )
         negative_lcb_stress_fraction = (
             max(-contract_return_lcb_pct / 100.0, 0.0)
-            if shadow_only_observation
+            if non_positive_lcb_observation
             else 0.0
         )
         stress_fraction = max(
@@ -1669,10 +1675,10 @@ class EntryProfitRiskSizingPolicy:
             NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        # A positive-LCB paper observation is the training trade that breaks the
-        # cold-start loop and therefore uses the normal dynamic risk budget.
-        # Negative-LCB observations remain audit-only and can never submit.
-        risk_budget = 0.0 if shadow_only_observation else single_trade_risk_budget
+        # Quality observations use the same bounded paper budget as validated
+        # paper trades.  A negative LCB increases stress instead of disabling
+        # the only execution path that can generate promotion evidence.
+        risk_budget = single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
@@ -1777,6 +1783,7 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
+            allow_non_positive_return_lcb=non_positive_lcb_observation,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -1971,7 +1978,8 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": shadow_only_observation,
+            "paper_quality_shadow_only": False,
+            "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "target_notional_usdt": target_notional,
             "minimum_order_notional_usdt": minimum_order_notional,
@@ -2074,7 +2082,8 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": shadow_only_observation,
+            "paper_quality_shadow_only": False,
+            "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "dynamic_leverage_decision": leverage_decision.to_dict(),
             "existing_position_leverage": (

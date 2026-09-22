@@ -144,6 +144,16 @@ def _decision() -> DecisionOutput:
 
 def _quality_observation_decision(*, return_lcb_pct: float = -0.3) -> DecisionOutput:
     decision = _decision()
+    decision.feature_snapshot.update(
+        {
+            "bid": 99.99,
+            "ask": 100.01,
+            "contract_value_base": 1.0,
+            "orderbook_bids": [[99.99, 100.0]],
+            "orderbook_asks": [[100.01, 5.0], [100.40, 100.0]],
+            "taker_fee_rate": 0.0004,
+        }
+    )
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
         {
@@ -307,6 +317,31 @@ def test_size_aware_profit_solver_rejects_when_minimum_order_still_loses() -> No
     assert solved["reason"] == "full_risk_size_expected_net_not_positive"
     assert solved["selected_notional_usdt"] == pytest.approx(5_000.0)
     assert solved["expected_net_return_pct"] <= 0.0
+
+
+def test_size_aware_profit_solver_allows_negative_lcb_for_quality_observation() -> None:
+    snapshot = _size_aware_book_snapshot(400.0)
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=400.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.5,
+        return_lcb_pct=-0.2,
+        execution_cost=original_cost,
+        allow_non_positive_return_lcb=True,
+    )
+
+    assert solved["production_eligible"] is True
+    assert solved["reason"] == "positive_fee_after_full_risk_size_quality_observation"
+    assert solved["selected_notional_usdt"] == pytest.approx(400.0)
+    assert solved["expected_net_return_pct"] > 0.0
+    assert solved["return_lcb_pct"] <= 0.0
+    assert solved["execution_cost"]["order_size_complete"] is True
+    assert solved["reduced"] is False
 
 
 @pytest.mark.asyncio
@@ -570,27 +605,26 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_negative_lcb_quality_observation_is_shadow_only() -> None:
+async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is False
+    assert sizing["production_eligible"] is True
     assert sizing["paper_quality_observation_mode"] is True
-    assert sizing["paper_quality_shadow_only"] is True
+    assert sizing["paper_quality_shadow_only"] is False
+    assert sizing["paper_quality_non_positive_return_lcb"] is True
     assert sizing["model_requested_leverage"] == 20.0
     assert sizing["model_leverage_is_explicit"] is False
-    assert sizing["final_leverage"] == 1.0
+    assert sizing["final_leverage"] > 1.0
     assert sizing["paper_quality_observation_leverage_cap"] is None
-    # Keep the negative LCB visible for shadow quality/training analysis while
-    # the production risk budget and order authorization remain disabled.
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
-    assert sizing["risk_budget_usdt"] == pytest.approx(0.0)
-    assert sizing["planned_stressed_loss_usdt"] == 0.0
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assessment = RiskEngine().assess(decision, [], _balance)
-    assert assessment.approved is False
+    assert assessment.approved is True, assessment.rejection_reason
 
 
 @pytest.mark.asyncio
@@ -604,6 +638,7 @@ async def test_positive_lcb_unpromoted_observation_uses_normal_dynamic_risk() ->
     assert sizing["production_eligible"] is True
     assert sizing["paper_quality_observation_mode"] is True
     assert sizing["paper_quality_shadow_only"] is False
+    assert sizing["paper_quality_non_positive_return_lcb"] is False
     assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
     assert sizing["final_notional_usdt"] > sizing["minimum_order_notional_usdt"]
     assert sizing["final_leverage"] > 1.0

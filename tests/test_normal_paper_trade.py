@@ -194,7 +194,7 @@ def test_unpromoted_quality_model_builds_normal_risk_paper_contract() -> None:
     )
 
 
-def test_negative_lcb_quality_observation_cannot_authorize_paper_entry() -> None:
+def test_negative_lcb_quality_observation_authorizes_bounded_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.35,
@@ -209,9 +209,16 @@ def test_negative_lcb_quality_observation_cannot_authorize_paper_entry() -> None
         direction_support=selection["selected_support"],
     )
 
-    assert selection["selected"] is False
-    assert selection["selected_side"] == "neutral"
-    assert contract == {}
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert contract["objective_net_return_pct"] == -3.2
+    assert contract["production_permission"] is False
+    assert contract["execution_scope"] == "paper_only"
+    assert normal_paper_trade_contract_reasons(contract) == []
+    assert (
+        contract["single_trade_risk_fraction_cap"]
+        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
 
 
 def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None:

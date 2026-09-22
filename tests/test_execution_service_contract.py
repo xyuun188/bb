@@ -934,9 +934,8 @@ def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
     )
 
     contract, reasons = validate_entry_execution_contract(raw)
-    assert "normal_paper_trade_objective_net_not_positive" in reasons
-    assert "normal_paper_size_aware_expected_net_not_positive" not in reasons
-    assert _return_entry_contract_result(decision, "paper").passed is False
+    assert reasons == []
+    assert _return_entry_contract_result(decision, "paper").passed is True
 
     raw["profit_risk_sizing"].update(
         {
@@ -945,8 +944,11 @@ def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
             "model_requested_leverage": 2.0,
         }
     )
+    raw["profit_risk_sizing"]["dynamic_leverage_decision"][
+        "final_integer_leverage"
+    ] = 2
     _contract, reasons = validate_entry_execution_contract(raw)
-    assert "normal_paper_trade_objective_net_not_positive" in reasons
+    assert reasons == []
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:

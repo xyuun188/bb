@@ -378,7 +378,7 @@ def test_v7_single_aligned_family_still_requires_positive_objective_net() -> Non
     ]
 
 
-def test_quality_observation_blocks_positive_mean_with_negative_lcb() -> None:
+def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
     long_row = _row("local_ml", raw=0.45, objective=-0.20)
     long_row["paper_return_quality_governance"] = {
         "paper_execution_permission": False,
@@ -402,14 +402,12 @@ def test_quality_observation_blocks_positive_mean_with_negative_lcb() -> None:
         execution_cost_pct=0.1,
     )
 
-    assert support["eligible"] is False
+    assert support["eligible"] is True
     assert support["expected_net_return_pct"] == pytest.approx(0.35)
     assert support["objective_net_return_pct"] == pytest.approx(-0.30)
     assert support["paper_quality_observation_only"] is True
-    assert "direction_support_objective_net_not_positive" in support["blocking_reasons"]
-    assert "direction_support_objective_net_not_positive" in (
-        directional_entry_support_reasons(support, "long")
-    )
+    assert support["blocking_reasons"] == []
+    assert directional_entry_support_reasons(support, "long") == []
 
 
 def test_negative_lcb_quality_observation_does_not_leak_into_production_support() -> None:
