@@ -29,7 +29,7 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["paper_normal_entry_requires_positive_return_lcb"] is True
     assert "paper_entry_requires_positive_return_lcb" not in policy
     assert policy["paper_quality_observation_requires_positive_expected_net_return"] is True
-    assert policy["paper_quality_observation_allows_non_positive_return_lcb"] is True
+    assert policy["paper_quality_observation_allows_non_positive_return_lcb"] is False
     assert policy["paper_entry_requires_profit_factor"] is False
     assert policy["paper_entry_requires_positive_expected_net_return"] is True
     assert policy["paper_entry_requires_independent_quant_family_count"] == 1

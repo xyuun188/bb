@@ -25,6 +25,7 @@ from services.normal_paper_trade import (
     normal_paper_order_identity_reasons,
     normal_paper_settlement_contract_reasons,
     normal_paper_trade_contract_reasons,
+    normal_paper_trade_observation_contract_reasons,
     quality_observation_risk_fraction,
     select_normal_paper_trade_side,
 )
@@ -185,7 +186,7 @@ def test_learning_snapshot_preserves_exact_fingerprinted_normal_paper_contract()
     )
 
     assert compact["normal_paper_trade"] == contract
-    assert normal_paper_trade_contract_reasons(
+    assert normal_paper_trade_observation_contract_reasons(
         compact["normal_paper_trade"]
     ) == []
 
@@ -240,7 +241,7 @@ def test_unpromoted_quality_model_builds_normal_risk_paper_contract() -> None:
     )
 
 
-def test_negative_lcb_quality_observation_authorizes_bounded_paper_entry() -> None:
+def test_negative_lcb_quality_observation_is_unauthorized_but_auditable() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.35,
@@ -258,9 +259,13 @@ def test_negative_lcb_quality_observation_authorizes_bounded_paper_entry() -> No
     assert selection["selected"] is True
     assert selection["selection_reason"] == "paper_quality_observation"
     assert contract["objective_net_return_pct"] == -3.2
+    assert contract["authorized"] is False
     assert contract["production_permission"] is False
     assert contract["execution_scope"] == "paper_only"
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(
+        contract
+    )
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
     assert (
         contract["single_trade_risk_fraction_cap"]
         == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION

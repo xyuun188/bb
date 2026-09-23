@@ -245,6 +245,7 @@ async def _collect(order_ids: list[str]) -> dict[str, Any]:
             target_orders_first=True,
             target_orders_only=True,
             target_order_query_limit=len(requested),
+            max_pages=20,
             include_historical=True,
             strict=False,
         )
@@ -302,15 +303,16 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _online(order_ids: list[str]) -> str:
+def _online(order_ids: list[str], *, summary: bool = False) -> str:
     remote_script = "\n".join(
         (
             "import asyncio, json, sys",
             f"sys.path.insert(0, {REMOTE_APP_DIR!r})",
             "from scripts.runtime_env_bootstrap import load_runtime_env_files, drop_privileges_to_runtime_user_if_needed",
             f"from pathlib import Path; root=Path({REMOTE_APP_DIR!r}); load_runtime_env_files(project_root=root); drop_privileges_to_runtime_user_if_needed(project_root=root)",
-            "from scripts.inspect_okx_order_evidence import _collect",
-            f"print(json.dumps(asyncio.run(_collect({order_ids!r})), ensure_ascii=False, default=str))",
+            "from scripts.inspect_okx_order_evidence import _collect, _summarize",
+            f"payload = asyncio.run(_collect({order_ids!r}))",
+            f"print(json.dumps(_summarize(payload) if {summary!r} else payload, ensure_ascii=False, default=str))",
         )
     )
     command = (
@@ -390,7 +392,8 @@ def _summarize(payload: dict[str, Any]) -> dict[str, Any]:
                     "avg_price",
                     "fee_abs",
                     "fill_pnl",
-                    "trade_ids",
+                    "raw_count",
+                    "pagination_complete",
                 )
             }
             for row in fills
@@ -453,14 +456,14 @@ def _summarize(payload: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     args = _parser().parse_args()
     if args.online:
-        raw = _online(args.exchange_order_id)
+        raw = _online(args.exchange_order_id, summary=args.summary)
         try:
             payload = json.loads(raw.splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
             output = raw
         else:
             output = json.dumps(
-                _summarize(payload) if args.summary else payload,
+                payload,
                 ensure_ascii=False,
                 default=str,
             )

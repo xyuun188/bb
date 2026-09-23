@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import isfinite, sqrt
+from math import isclose, isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -625,6 +626,46 @@ def _reconciliation_history(sizing: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def confirmed_fill_has_valid_submission(
+    sizing: dict[str, Any], facts: dict[str, Any], notional: float
+) -> bool:
+    """Keep the submission minimum gate separate from a proven fill settlement."""
+
+    pre_submit = next(
+        (
+            row
+            for row in reversed(_reconciliation_history(sizing))
+            if row.get("source") == "okx_pre_submit_order_shape"
+        ),
+        {},
+    )
+    pre_facts = _safe_dict(pre_submit.get("facts"))
+    submitted = _safe_float(pre_facts.get("order_contracts"), 0.0)
+    filled = _safe_float(facts.get("filled_contracts"), 0.0)
+    contract_size = _safe_float(facts.get("contract_size"), 0.0)
+    price = _safe_float(facts.get("execution_price"), 0.0)
+    minimum = _safe_float(pre_submit.get("minimum_order_notional_usdt"), 0.0)
+    return bool(
+        pre_submit.get("eligible") is True
+        and not pre_submit.get("reasons")
+        and pre_submit.get("facts_fingerprint") == _fingerprint(pre_facts)
+        and minimum > 0
+        and _safe_float(pre_submit.get("final_notional_usdt"), 0.0) + 1e-8 >= minimum
+        and str(facts.get("order_id") or "").strip()
+        and str(facts.get("okx_symbol") or "").strip()
+        and facts.get("okx_symbol") == pre_facts.get("okx_symbol")
+        and submitted > 0
+        and 0 < filled <= submitted + 1e-8
+        and price > 0
+        and contract_size > 0
+        and isclose(
+            contract_size, _safe_float(pre_facts.get("contract_size"), 0.0), rel_tol=1e-9
+        )
+        and notional > 0
+        and isclose(notional, filled * contract_size * price, rel_tol=1e-7, abs_tol=1e-8)
+    )
+
+
 def reconcile_profit_risk_sizing(
     decision: DecisionOutput,
     *,
@@ -637,7 +678,9 @@ def reconcile_profit_risk_sizing(
 
     raw = _safe_dict(decision.raw_response)
     sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))
-    facts = dict(execution_facts or {})
+    # Execution facts are signed into reconciliation history. Snapshot nested
+    # exchange evidence so later balance checks cannot mutate that fingerprint.
+    facts = deepcopy(execution_facts or {})
     original_target = max(_safe_float(sizing.get("target_notional_usdt"), 0.0), 0.0)
     fill_notional_ceiling = max(
         _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
@@ -702,13 +745,14 @@ def reconcile_profit_risk_sizing(
         )
     if model_notional_cap > 0.0 and notional > model_notional_cap + 1e-8:
         reasons.append("execution_position_exceeds_model_request")
-    # Amount precision is applied in the executor after sizing.  A one-contract
-    # order can therefore round down below the exchange's notional minimum even
-    # when the pre-submit target was large enough.  Keep the final executable
-    # shape fail-closed so no invalid order can reach OKX.
+    settled_fill = bool(
+        source == "okx_confirmed_entry_fill"
+        and confirmed_fill_has_valid_submission(sizing, facts, notional)
+    )
     if (
         minimum_order_notional > 0.0
         and notional + 1e-8 < minimum_order_notional
+        and not settled_fill
     ):
         reasons.append("execution_notional_below_exchange_minimum")
     planned_loss = notional * stress
@@ -1675,10 +1719,12 @@ class EntryProfitRiskSizingPolicy:
             NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        # Quality observations use the same bounded paper budget as validated
-        # paper trades.  A negative LCB increases stress instead of disabling
-        # the only execution path that can generate promotion evidence.
-        risk_budget = single_trade_risk_budget
+        # A non-positive lower confidence bound is an observation signal, not an
+        # executable strategy edge.  Keep it in the decision/audit trail, but do
+        # not spend a normal paper risk budget on a known-uncertain direction.
+        # Positive-LCB observations still use the bounded paper budget and can
+        # produce the trusted settlements needed for promotion.
+        risk_budget = 0.0 if non_positive_lcb_observation else single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
@@ -1783,7 +1829,7 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            allow_non_positive_return_lcb=non_positive_lcb_observation,
+            allow_non_positive_return_lcb=False,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -1978,7 +2024,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": False,
+            "paper_quality_shadow_only": non_positive_lcb_observation,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "target_notional_usdt": target_notional,
@@ -2082,7 +2128,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": False,
+            "paper_quality_shadow_only": non_positive_lcb_observation,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "dynamic_leverage_decision": leverage_decision.to_dict(),

@@ -440,6 +440,11 @@ async def main():
             "trade_execution_contract": {
                 "summary": contract.get("summary", {}),
                 "violation_reason_counts": contract.get("violation_reason_counts", {}),
+                # Keep the bounded violation rows in entry-only output. A
+                # count without decision/symbol/reason makes an execution
+                # incident impossible to investigate from the dashboard or
+                # a copied audit report.
+                "violations": contract.get("violations", []),
                 "policy": contract.get("policy", {}),
             },
         }

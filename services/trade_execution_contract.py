@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from core.contract_math import persisted_product_isclose
+from services.entry_profit_risk_sizing import confirmed_fill_has_valid_submission
 from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
     LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
@@ -38,6 +39,7 @@ from services.normal_paper_trade import (
     legacy_normal_paper_v10_trade_contract_reasons,
     legacy_normal_paper_v11_trade_contract_reasons,
     normal_paper_trade_contract_reasons,
+    normal_paper_trade_observation_contract_reasons,
 )
 from services.okx_native_facts import (
     OKX_PROTECTION_EXECUTION_VERSION,
@@ -454,7 +456,7 @@ def summarize_trade_execution_contract(
             "paper_entry_requires_model_promotion": False,
             "paper_normal_entry_requires_positive_return_lcb": True,
             "paper_quality_observation_requires_positive_expected_net_return": True,
-            "paper_quality_observation_allows_non_positive_return_lcb": True,
+            "paper_quality_observation_allows_non_positive_return_lcb": False,
             "paper_entry_requires_profit_factor": False,
             "paper_entry_requires_positive_expected_net_return": True,
             "paper_entry_requires_current_execution_cost": True,
@@ -1273,6 +1275,39 @@ def _authoritative_minimum_fill_settlement(
     }
 
 
+def _confirmed_partial_fill_settlement(
+    sizing: dict[str, Any],
+    *,
+    filled_notional: float,
+    executed: bool,
+    filled_order_present: bool | None,
+    authoritative_fill_complete: bool,
+) -> bool:
+    history = [row for row in _safe_list(sizing.get("execution_reconciliations")) if isinstance(row, dict)]
+    confirmed = history[-1] if history else {}
+    only_minimum_failure = {"execution_notional_below_exchange_minimum"}
+    recorded_reasons = set(_safe_list(confirmed.get("reasons")))
+    sizing_reasons = set(filter(None, str(sizing.get("reason") or "").split(",")))
+    provenance_reasons = set(
+        filter(None, str(_safe_dict(sizing.get("policy_provenance")).get("fallback_reason") or "").split(","))
+    )
+    return bool(
+        executed
+        and filled_order_present is True
+        and authoritative_fill_complete
+        and confirmed.get("source") == "okx_confirmed_entry_fill"
+        and recorded_reasons <= only_minimum_failure
+        and (
+            sizing.get("production_eligible") is True
+            or (sizing_reasons == only_minimum_failure and provenance_reasons == only_minimum_failure)
+        )
+        and isclose(
+            filled_notional, _safe_float(sizing.get("final_notional_usdt")), rel_tol=1e-7, abs_tol=1e-8
+        )
+        and confirmed_fill_has_valid_submission(sizing, _safe_dict(confirmed.get("facts")), filled_notional)
+    )
+
+
 def validate_normal_paper_entry_contract(
     raw: dict[str, Any],
     *,
@@ -1320,6 +1355,18 @@ def validate_normal_paper_entry_contract(
     legacy_quality_v11 = (
         normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V11_VERSION
     )
+    filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
+    confirmed_partial_fill = _confirmed_partial_fill_settlement(
+        sizing,
+        filled_notional=filled_notional,
+        executed=executed,
+        filled_order_present=filled_order_present,
+        authoritative_fill_complete=authoritative_fill_complete,
+    )
+    confirmed_observation_settlement = bool(
+        confirmed_partial_fill
+        and normal_trade.get("selection_reason") == "paper_quality_observation"
+    )
     reasons = (
         legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_fixed_leverage
@@ -1341,6 +1388,8 @@ def validate_normal_paper_entry_contract(
         if allow_legacy_settlement and legacy_quality_v10
         else legacy_normal_paper_v11_trade_contract_reasons(normal_trade)
         if allow_legacy_settlement and legacy_quality_v11
+        else normal_paper_trade_observation_contract_reasons(normal_trade)
+        if confirmed_observation_settlement
         else normal_paper_trade_contract_reasons(normal_trade)
     )
 
@@ -1356,8 +1405,6 @@ def validate_normal_paper_entry_contract(
     single_cap = _safe_float(
         normal_trade.get("single_trade_risk_fraction_cap"), 0.0
     )
-    filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
-
     bounded_fill_drift = _bounded_confirmed_fill_drift(
         observation={
             "current_execution_cost_pct": execution_cost.get("total_pct"),
@@ -1381,7 +1428,6 @@ def validate_normal_paper_entry_contract(
     minimum_fill_settlement_accepted = bool(
         minimum_fill_settlement.get("accepted") is True
     )
-
     expected_sizing_version = (
         LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION
         if legacy_fixed_leverage
@@ -1418,7 +1464,7 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_scope_invalid")
     if sizing.get("production_permission") is not False:
         reasons.append("normal_paper_sizing_production_permission_invalid")
-    if sizing.get("production_eligible") is not True:
+    if sizing.get("production_eligible") is not True and not confirmed_partial_fill:
         reasons.append("normal_paper_sizing_ineligible")
     legacy_settlement = bool(
         allow_legacy_settlement
@@ -1440,7 +1486,10 @@ def validate_normal_paper_entry_contract(
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")
-    if not _provenance_complete(sizing.get("policy_provenance")):
+    if not (
+        _provenance_complete(sizing.get("policy_provenance"))
+        or (confirmed_partial_fill and _provenance_core_complete(sizing.get("policy_provenance")))
+    ):
         reasons.append("normal_paper_sizing_provenance_incomplete")
     if not str(
         _safe_dict(sizing.get("policy_provenance")).get("contract_fingerprint")
@@ -1473,6 +1522,7 @@ def validate_normal_paper_entry_contract(
     if minimum_notional <= 0.0 or (
         final_notional + 1e-8 < minimum_notional
         and not minimum_fill_settlement_accepted
+        and not confirmed_partial_fill
     ):
         reasons.append("normal_paper_minimum_order_invalid")
     tier_max_leverage = _safe_float(
@@ -1564,6 +1614,7 @@ def validate_normal_paper_entry_contract(
             "historical_minimum_fill_settlement_evidence": (
                 minimum_fill_settlement
             ),
+            "confirmed_partial_fill_settlement_accepted": confirmed_partial_fill,
         },
         reasons,
     )

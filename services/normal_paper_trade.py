@@ -454,6 +454,7 @@ def build_normal_paper_trade_contract(
         }
     )
     loss_probability = _float(support.get("loss_probability"), None)
+    authorized = bool(objective_net is not None and objective_net > 0.0)
     if (
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
@@ -490,10 +491,9 @@ def build_normal_paper_trade_contract(
 
     contract = {
         "version": NORMAL_PAPER_TRADE_VERSION,
-        # Quality observations may carry a non-positive lower confidence bound,
-        # but only paper execution can consume this envelope and the fee-after
-        # expected return must remain positive through final sizing.
-        "authorized": True,
+        # Keep uncertain quality observations available to audit and training,
+        # but never sign a non-positive lower bound as entry permission.
+        "authorized": authorized,
         "trade_mode": "paper",
         "execution_scope": "paper_only",
         "entry_type": "normal_strategy_trade",
@@ -599,12 +599,22 @@ def _normal_strategy_trade_contract_reasons(
     require_positive_objective: bool,
     require_quality_permission: bool = True,
     allow_non_positive_objective_observation: bool = False,
+    allow_unauthorized_observation: bool = False,
 ) -> list[str]:
     contract = _dict(value)
     reasons: list[str] = []
     if contract.get("version") != expected_version:
         reasons.append("normal_paper_trade_version_invalid")
-    if contract.get("authorized") is not True:
+    selection_reason = str(contract.get("selection_reason") or "")
+    observation_mode = selection_reason == "paper_quality_observation"
+    objective_net = _float(contract.get("objective_net_return_pct"), None)
+    observation_only = bool(
+        allow_unauthorized_observation
+        and observation_mode
+        and objective_net is not None
+        and objective_net <= 0.0
+    )
+    if contract.get("authorized") is not True and not observation_only:
         reasons.append("normal_paper_trade_not_authorized")
     if contract.get("trade_mode") != "paper":
         reasons.append("normal_paper_trade_mode_invalid")
@@ -618,7 +628,6 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_production_permission_invalid")
     if contract.get("decision_authority") not in {"model", "ensemble"}:
         reasons.append("normal_paper_trade_decision_authority_invalid")
-    selection_reason = str(contract.get("selection_reason") or "")
     if selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS:
         reasons.append("normal_paper_trade_selection_reason_invalid")
     if str(contract.get("side") or "").lower() not in {"long", "short"}:
@@ -630,8 +639,6 @@ def _normal_strategy_trade_contract_reasons(
     expected_net = _float(contract.get("expected_net_return_pct"), None)
     if expected_net is None or expected_net <= 0.0:
         reasons.append("normal_paper_trade_expected_net_not_positive")
-    observation_mode = selection_reason == "paper_quality_observation"
-    objective_net = _float(contract.get("objective_net_return_pct"), None)
     if objective_net is None:
         reasons.append("normal_paper_trade_objective_net_missing")
     elif (
@@ -763,7 +770,6 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
         expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
-        allow_non_positive_objective_observation=True,
     )
 
 
@@ -776,6 +782,7 @@ def normal_paper_trade_observation_contract_reasons(value: Any) -> list[str]:
         require_positive_objective=False,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
+        allow_unauthorized_observation=True,
     )
 
 

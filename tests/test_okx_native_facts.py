@@ -739,6 +739,33 @@ async def test_native_facts_client_paginates_fills_history_with_after_cursor() -
 
 
 @pytest.mark.asyncio
+async def test_native_facts_marks_page_capped_fill_group_incomplete() -> None:
+    now = int(datetime.now(UTC).timestamp() * 1000)
+    rows = [
+        {
+            "billId": f"bill-{index}",
+            "instId": "LAB-USDT-SWAP",
+            "ordId": "large-order",
+            "tradeId": f"trade-{index}",
+            "side": "buy",
+            "fillSz": "1",
+            "fillPx": "10",
+            "ts": str(now - index),
+        }
+        for index in range(2)
+    ]
+    ccxt = _PagedFillCcxt({"": rows})
+
+    groups = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_fill_groups(
+        account_wide_only=True,
+        limit=2,
+        max_pages=1,
+    )
+
+    assert groups[0].pagination_complete is False
+
+
+@pytest.mark.asyncio
 async def test_native_facts_client_targets_missing_order_ids_after_bounded_pull() -> None:
     timestamp = int(datetime.now(UTC).timestamp() * 1000)
     ccxt = _PagedFillCcxt(

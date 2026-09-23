@@ -11,6 +11,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.decision_state import DecisionStage, DecisionStageStatus
+from services.entry_profit_risk_sizing import _fingerprint
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
 from services.exit_execution_singleflight import ExitExecutionLease
@@ -866,6 +867,86 @@ def test_historical_below_minimum_plan_rejects_fill_beyond_reserved_ceiling() ->
     assert "normal_paper_filled_notional_exceeds_risk_budget" in reasons
 
 
+@pytest.mark.parametrize(
+    ("valid_submission", "authoritative_fill_complete", "extra_failure", "accepted"),
+    [(True, True, False, True), (False, True, False, False),
+     (True, False, False, False), (True, True, True, False)],
+)
+def test_confirmed_partial_fill_settlement_is_evidence_bound(
+    valid_submission: bool, authoritative_fill_complete: bool,
+    extra_failure: bool, accepted: bool,
+) -> None:
+    decision = _profit_first_ready_position_review_decision()
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "fee_after_return_lcb_not_positive",
+            "paper_execution_blockers": ["fee_after_return_lcb_not_positive"],
+            "paper_execution_evidence": {"sample_count": 102, "return_lcb": -0.3},
+        }
+    )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="short",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 5.0,
+            "expected_net_return_pct": 0.35,
+            "objective_net_return_pct": -0.2,
+            "loss_probability": 0.3,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": ["fee_after_return_lcb_not_positive"],
+            "strong_expert_opposition": False,
+        },
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    reason = "execution_notional_below_exchange_minimum"
+    if extra_failure:
+        reason += ",execution_stressed_loss_exceeds_risk_budget"
+    pre_facts = {
+        "okx_symbol": "MINA/USDT:USDT", "order_contracts": 40.0, "contract_size": 1.0,
+    }
+    sizing.update({
+        "production_eligible": False,
+        "reason": reason,
+        "final_notional_usdt": 0.15,
+        "planned_stressed_loss_usdt": 0.0015,
+        "execution_reconciliations": [
+            {
+                "source": "okx_pre_submit_order_shape", "eligible": valid_submission,
+                "final_notional_usdt": 40.0, "minimum_order_notional_usdt": 1.0,
+                "facts": pre_facts, "facts_fingerprint": _fingerprint(pre_facts),
+            },
+            {
+                "source": "okx_confirmed_entry_fill", "eligible": False,
+                "reasons": reason.split(","),
+                "facts": {
+                    "okx_symbol": "MINA/USDT:USDT", "order_id": "partial-1",
+                    "filled_contracts": 1.0, "contract_size": 1.0, "execution_price": 0.15,
+                },
+            },
+        ],
+    })
+    sizing["policy_provenance"]["fallback_reason"] = reason
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=0.15,
+        executed=True,
+        filled_order_present=True,
+        authoritative_fill_complete=authoritative_fill_complete,
+    )
+
+    assert contract["confirmed_partial_fill_settlement_accepted"] is accepted
+    assert ("normal_paper_minimum_order_invalid" not in reasons) is accepted
+    assert ("normal_paper_sizing_ineligible" not in reasons) is accepted
+    assert ("normal_paper_sizing_provenance_incomplete" not in reasons) is accepted
+
+
 def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> None:
     decision = _profit_first_ready_position_review_decision()
     decision.raw_response["profit_risk_sizing"]["expected_net_return_pct"] = 0.0
@@ -878,7 +959,7 @@ def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> Non
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
 
 
-def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
+def test_positive_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -898,7 +979,7 @@ def test_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
             "selected_side": "short",
             "prediction_horizon_minutes": 30.0,
             "expected_net_return_pct": 0.35,
-            "objective_net_return_pct": -0.2,
+            "objective_net_return_pct": 0.2,
             "loss_probability": 0.3,
             "quant_evidence_families": ["local_ml"],
             "quant_quality_permissions": {"local_ml": permission},

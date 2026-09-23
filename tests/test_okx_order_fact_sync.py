@@ -1210,6 +1210,78 @@ async def test_order_fact_sync_repairs_account_fill_group_truncated_by_paginatio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stuck_cursor", [False, True])
+async def test_recent_order_sync_requires_all_fill_pages(tmp_path, monkeypatch, stuck_cursor) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "recent-many-fills.db")
+    now = datetime.now(UTC)
+    rows = [
+        {
+            **_fill_row(now - timedelta(milliseconds=index), order_id="many-fills"),
+            "billId": str(1000 - index),
+            "tradeId": f"trade-{index}",
+            "fillSz": "1",
+            "fillPx": str(60000 + index),
+        }
+        for index in range(205)
+    ]
+
+    class PagedCcxt(_FakeCcxt):
+        async def privateGetTradeFills(self, params):
+            self.calls.append(str(params.get("after") or "first"))
+            start = 0
+            if params.get("after") and not stuck_cursor:
+                start = next(
+                    index + 1 for index, row in enumerate(rows)
+                    if row["billId"] == params["after"]
+                )
+            return {"data": rows[start:start + 100]}
+
+    ccxt = PagedCcxt()
+    try:
+        async with get_session_ctx() as session:
+            session.add(Order(
+                model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+                side="buy", order_type="market", quantity=2.05, price=60102.0,
+                status="filled", fee=0.0, exchange_order_id="many-fills",
+                created_at=now, filled_at=now,
+            ))
+        report = await OkxOrderFactSyncService(
+            mode="paper", timeout_seconds=5.0, priority_only=True,
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+        assert order.quantity == pytest.approx(2.05)
+        assert order.price == pytest.approx(60102.0)
+        if stuck_cursor:
+            assert report["confirmed_count"] == 0
+            assert order.okx_sync_status != OKX_SYNC_CONFIRMED
+        else:
+            assert report["confirmed_count"] == 1
+            assert order.okx_fill_contracts == 205.0
+            assert len(order.okx_raw_fills["rows"]) == 205
+            assert order.okx_raw_fills["fills_pagination_complete"] is True
+    finally:
+        await close_db()
+
+
+def test_stored_first_page_is_not_permanently_authoritative() -> None:
+    order = SimpleNamespace(
+        status="filled", exchange_order_id="many-fills", okx_inst_id="BTC-USDT-SWAP",
+        okx_raw_fills={
+            "fills_history_confirmed": True, "order_id": "many-fills",
+            "inst_id": "BTC-USDT-SWAP", "contracts": 100.0, "avg_price": 60000.0,
+            "trade_ids": [str(index) for index in range(100)],
+            "rows": [{"tradeId": str(index)} for index in range(100)],
+        },
+    )
+    assert order_fact_sync_module._order_needs_okx_pull(order) is True
+    assert order_fact_sync_module._order_has_authoritative_stored_okx_fill_fact(order) is False
+    order.okx_raw_fills["fills_pagination_complete"] = True
+    assert order_fact_sync_module._order_has_authoritative_stored_okx_fill_fact(order) is True
+
+
+@pytest.mark.asyncio
 async def test_recovery_order_continues_through_protection_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

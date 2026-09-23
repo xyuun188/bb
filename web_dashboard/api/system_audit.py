@@ -947,7 +947,7 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
     policy.pop("paper_entry_requires_positive_return_lcb", None)
     policy["paper_normal_entry_requires_positive_return_lcb"] = True
     policy["paper_quality_observation_requires_positive_expected_net_return"] = True
-    policy["paper_quality_observation_allows_non_positive_return_lcb"] = True
+    policy["paper_quality_observation_allows_non_positive_return_lcb"] = False
     policy["paper_entry_requires_profit_factor"] = False
     policy["paper_entry_requires_positive_expected_net_return"] = True
     policy["paper_entry_requires_current_execution_cost"] = True

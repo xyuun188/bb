@@ -6,6 +6,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import (
     EntryProfitRiskSizingPolicy,
+    _fingerprint,
     build_portfolio_correlation_context,
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
@@ -605,26 +606,26 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls() -> None:
+async def test_negative_lcb_quality_observation_is_audit_only() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is True
+    assert sizing["production_eligible"] is False
     assert sizing["paper_quality_observation_mode"] is True
-    assert sizing["paper_quality_shadow_only"] is False
+    assert sizing["paper_quality_shadow_only"] is True
     assert sizing["paper_quality_non_positive_return_lcb"] is True
     assert sizing["model_requested_leverage"] == 20.0
     assert sizing["model_leverage_is_explicit"] is False
-    assert sizing["final_leverage"] > 1.0
+    assert sizing["final_leverage"] == pytest.approx(1.0)
     assert sizing["paper_quality_observation_leverage_cap"] is None
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
-    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
-    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assert sizing["risk_budget_usdt"] == pytest.approx(0.0)
+    assert sizing["planned_stressed_loss_usdt"] == pytest.approx(0.0)
     assessment = RiskEngine().assess(decision, [], _balance)
-    assert assessment.approved is True, assessment.rejection_reason
+    assert assessment.approved is False
 
 
 @pytest.mark.asyncio
@@ -1055,6 +1056,47 @@ async def test_execution_reconciliation_rejects_rounding_below_exchange_minimum(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("valid_submission", [True, False])
+async def test_confirmed_partial_fill_requires_valid_submission(valid_submission: bool) -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing["minimum_order_notional_usdt"] = 1.0
+    decision.raw_response["profit_risk_sizing"] = sizing
+    if valid_submission:
+        submitted = reconcile_profit_risk_sizing(
+            decision,
+            final_notional_usdt=10.0,
+            final_leverage=decision.suggested_leverage,
+            source="okx_pre_submit_order_shape",
+            execution_facts={
+                "okx_symbol": "MINA/USDT:USDT",
+                "order_contracts": 10.0,
+                "contract_size": 1.0,
+            },
+        )
+        assert submitted["eligible"] is True
+
+    result = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=0.15,
+        final_leverage=decision.suggested_leverage,
+        source="okx_confirmed_entry_fill",
+        execution_facts={
+            "okx_symbol": "MINA/USDT:USDT",
+            "order_id": "partial-1",
+            "filled_contracts": 1.0,
+            "contract_size": 1.0,
+            "execution_price": 0.15,
+        },
+    )
+
+    assert result["eligible"] is valid_submission
+    assert ("execution_notional_below_exchange_minimum" in result["reasons"]) is not valid_submission
+
+
+@pytest.mark.asyncio
 async def test_pre_submit_latest_okx_minimum_replaces_stale_analysis_minimum() -> None:
     decision = _decision()
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
@@ -1078,6 +1120,33 @@ async def test_pre_submit_latest_okx_minimum_replaces_stale_analysis_minimum() -
     assert result["sizing"]["execution_reconciliations"][-1][
         "minimum_order_notional_usdt"
     ] == pytest.approx(0.3523)
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_reconciliation_freezes_nested_okx_order_rules() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    rules = {"min_notional_usdt": 1.0}
+
+    result = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=10.0,
+        final_leverage=decision.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+        execution_facts={
+            "okx_symbol": "MINA/USDT:USDT",
+            "order_contracts": 10.0,
+            "contract_size": 1.0,
+            "okx_order_rules": rules,
+        },
+    )
+    reconciliation = result["sizing"]["execution_reconciliations"][-1]
+    rules["final_balance_recheck"] = {"available_margin_usdt": 0.0}
+
+    assert reconciliation["facts"]["okx_order_rules"] == {"min_notional_usdt": 1.0}
+    assert reconciliation["facts_fingerprint"] == _fingerprint(reconciliation["facts"])
+    assert reconciliation["eligible"] is True
 
 
 @pytest.mark.asyncio

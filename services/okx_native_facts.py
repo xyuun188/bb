@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -81,6 +81,7 @@ class OkxNativeFillGroup:
     timestamp: datetime | None
     raw_count: int
     rows: tuple[dict[str, Any], ...] = ()
+    pagination_complete: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +98,7 @@ class OkxNativeFillGroup:
             "timestamp_ms": _round(self.timestamp_ms),
             "timestamp": _iso(self.timestamp),
             "raw_count": self.raw_count,
+            "pagination_complete": self.pagination_complete,
         }
 
     @property
@@ -208,6 +210,8 @@ class OkxNativeFactsClient:
         failed_inst_ids: set[str] = set()
         last_error: Exception | None = None
         successful_read = False
+        incomplete_order_ids: set[str] = set()
+        complete_target_order_ids: set[str] = set()
 
         async def fetch_complete_fill_rows(
             params: dict[str, Any],
@@ -216,19 +220,37 @@ class OkxNativeFactsClient:
         ) -> list[dict[str, Any]]:
             complete_rows: list[dict[str, Any]] = []
             effective_inst_ids = target_inst_ids if filter_inst_ids is None else filter_inst_ids
+            target_complete = True
             for fetch_fills in fill_endpoints:
-                complete_rows.extend(
-                    await self._fetch_fill_pages(
-                        fetch_fills,
-                        params,
-                        since_ms=since_ms,
-                        side=side,
-                        target_inst_ids=effective_inst_ids,
-                        page_limit=page_limit,
-                        max_pages=page_count,
-                    )
+                page_rows, incomplete_ids = await self._fetch_fill_pages(
+                    fetch_fills,
+                    params,
+                    since_ms=since_ms,
+                    side=side,
+                    target_inst_ids=effective_inst_ids,
+                    page_limit=page_limit,
+                    max_pages=page_count,
                 )
+                complete_rows.extend(page_rows)
+                incomplete_order_ids.update(incomplete_ids)
+                target_complete = target_complete and not incomplete_ids
+            if params.get("ordId") and target_complete:
+                complete_target_order_ids.add(str(params["ordId"]))
             return complete_rows
+
+        def grouped_rows() -> list[OkxNativeFillGroup]:
+            return [
+                replace(
+                    group,
+                    pagination_complete=(
+                        group.order_id not in incomplete_order_ids
+                        or group.order_id in complete_target_order_ids
+                    ),
+                )
+                for group in group_okx_native_fill_rows(
+                    rows, symbol_normalizer=self.symbol_normalizer
+                )
+            ]
 
         def append_rows(page_rows: Iterable[dict[str, Any]]) -> None:
             for row in page_rows:
@@ -248,7 +270,9 @@ class OkxNativeFactsClient:
                 if str(row.get("ordId") or row.get("order") or "").strip()
             }
             query_limit = _target_order_query_limit(target_order_query_limit)
-            for order_id in sorted(target_order_ids - known_order_ids)[:query_limit]:
+            for order_id in sorted(
+                target_order_ids - (known_order_ids - incomplete_order_ids)
+            )[:query_limit]:
                 try:
                     page_rows = await fetch_complete_fill_rows(
                         {"instType": "SWAP", "ordId": order_id, "limit": str(page_limit)},
@@ -265,10 +289,7 @@ class OkxNativeFactsClient:
         if target_orders_only:
             if strict and last_error is not None and not successful_read:
                 raise last_error
-            return group_okx_native_fill_rows(
-                rows,
-                symbol_normalizer=self.symbol_normalizer,
-            )
+            return grouped_rows()
 
         for params in params_list:
             inst_id = str(params.get("instId") or "").strip().upper()
@@ -309,10 +330,7 @@ class OkxNativeFactsClient:
         if strict and last_error is not None and not successful_read:
             raise last_error
 
-        return group_okx_native_fill_rows(
-            rows,
-            symbol_normalizer=self.symbol_normalizer,
-        )
+        return grouped_rows()
 
     async def _fetch_fill_pages(
         self,
@@ -324,8 +342,10 @@ class OkxNativeFactsClient:
         target_inst_ids: set[str],
         page_limit: int,
         max_pages: int,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], set[str]]:
         rows: list[dict[str, Any]] = []
+        incomplete_order_ids: set[str] = set()
+        candidate_order_ids: set[str] = set()
         after_cursor = ""
         seen_cursors: set[str] = set()
         for _page in range(max(1, int(max_pages or 1))):
@@ -346,7 +366,18 @@ class OkxNativeFactsClient:
                 ):
                     rows.append(row)
             if len(page_rows) < page_limit:
+                incomplete_order_ids.clear()
                 break
+            # The oldest page can split any order it contains. Reaching a page
+            # cap or a stuck cursor is not proof that its fills are complete.
+            candidate_order_ids.update(
+                {
+                    str(row.get("ordId") or row.get("order") or "").strip()
+                    for row in page_rows
+                    if str(row.get("ordId") or row.get("order") or "").strip()
+                }
+            )
+            incomplete_order_ids = set(candidate_order_ids)
             oldest_ts = _oldest_timestamp_ms(page_rows)
             if since_ms > 0 and oldest_ts > 0 and oldest_ts < since_ms:
                 break
@@ -355,7 +386,7 @@ class OkxNativeFactsClient:
                 break
             seen_cursors.add(cursor)
             after_cursor = cursor
-        return rows
+        return rows, incomplete_order_ids
 
     async def fetch_positions(
         self,
