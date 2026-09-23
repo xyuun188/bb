@@ -209,6 +209,10 @@ class ExitExecutionSingleFlightService:
                 and result is not None
                 and result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}
                 and result.quantity > 0
+                and not (
+                    isinstance(result.raw_response, dict)
+                    and result.raw_response.get("requires_okx_fill_backfill") is True
+                )
             ):
                 self._apply_profit_lock_fill(
                     matching,

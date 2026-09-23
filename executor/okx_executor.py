@@ -3453,15 +3453,94 @@ class OKXExecutor(AbstractExecutor):
             if pre_exit_contracts - after_contracts > tolerance:
                 break
 
-        closed_contracts = max(pre_exit_contracts - after_contracts, 0.0)
+        position_delta_contracts = max(pre_exit_contracts - after_contracts, 0.0)
         data = response.get("data") if isinstance(response, dict) else None
         first_item = data[0] if isinstance(data, list) and data else {}
         if not isinstance(first_item, dict):
             first_item = {}
         order_id = str(first_item.get("ordId") or first_item.get("clOrdId") or "").strip()
+        submitted_order_id = order_id
         response_code = str(response.get("code") if isinstance(response, dict) else "")
         s_code = str(first_item.get("sCode") or "")
-        success_code = response_code == "0" or s_code in {"", "0"}
+        success_code = response_code in {"", "0"} and s_code in {"", "0"}
+        native_order_detail: dict[str, Any] | None = None
+        order_detail_error: str | None = None
+        order_detail_identity_error: str | None = None
+        if order_id:
+            native_fetch = getattr(ccxt, "privateGetTradeOrder", None)
+            if callable(native_fetch):
+                order_id_field = "ordId" if first_item.get("ordId") else "clOrdId"
+                try:
+                    detail_response = await self._with_retry(
+                        native_fetch,
+                        {"instId": inst_id, order_id_field: order_id},
+                    )
+                    detail_rows = (
+                        detail_response.get("data")
+                        if isinstance(detail_response, dict)
+                        else None
+                    )
+                    detail_row = (
+                        detail_rows[0]
+                        if isinstance(detail_rows, list) and detail_rows
+                        else None
+                    )
+                    if isinstance(detail_row, dict):
+                        detail_order_id = str(detail_row.get("ordId") or "").strip()
+                        detail_client_order_id = str(detail_row.get("clOrdId") or "").strip()
+                        detail_inst_id = str(detail_row.get("instId") or "").strip().upper()
+                        detail_side = str(detail_row.get("side") or "").strip().lower()
+                        if (
+                            str(detail_row.get(order_id_field) or "").strip() == order_id
+                            and detail_order_id
+                            and detail_inst_id == inst_id
+                            and detail_side == side
+                            and str(detail_response.get("code", "0")) == "0"
+                        ):
+                            native_order_detail = self._native_order_detail_to_execution_order(
+                                detail_row,
+                                symbol=okx_symbol,
+                            )
+                            # Prefer the real OKX order id when the submit
+                            # acknowledgement only returned a client id.
+                            order_id = detail_order_id or order_id
+                        else:
+                            order_detail_identity_error = (
+                                "OKX order detail identity did not match the submitted "
+                                f"order: submitted={order_id!r}, detail_ord_id={detail_order_id!r}, "
+                                f"detail_cl_ord_id={detail_client_order_id!r}, "
+                                f"detail_inst_id={detail_inst_id!r}, detail_side={detail_side!r}."
+                            )
+                except Exception as exc:
+                    order_detail_error = safe_error_text(exc)
+
+        submit_ack_filled_contracts = self._safe_float(
+            first_item.get("accFillSz") or first_item.get("fillSz"),
+            0.0,
+        )
+        if native_order_detail is not None:
+            reported_filled_contracts = self._safe_float(
+                native_order_detail.get("filled"),
+                0.0,
+            )
+            order_status = self._order_status_from_ccxt(
+                str(native_order_detail.get("status") or "")
+            )
+        else:
+            # A submit acknowledgement is not a final fill fact.  Even when
+            # OKX includes an accumulated size in that acknowledgement, only
+            # an identity-checked order detail may authorize the quantity
+            # returned from this execution path.
+            reported_filled_contracts = 0.0
+            order_status = OrderStatus.OPEN
+        order_scoped_fill = min(
+            max(reported_filled_contracts, 0.0),
+            contracts,
+            pre_exit_contracts,
+        )
+        position_delta_unattributed = (
+            position_delta_contracts > tolerance and order_scoped_fill <= tolerance
+        )
         raw_response = {
             **(response if isinstance(response, dict) else {"response": response}),
             "exit_tracking": True,
@@ -3479,10 +3558,19 @@ class OKXExecutor(AbstractExecutor):
             "requested_exit_contracts": requested_exit_contracts,
             "remaining_contracts": max(after_contracts, 0.0),
             "snapshot_error": snapshot_error,
-            "filled_contracts": closed_contracts,
-            "base_quantity": closed_contracts * contract_size,
+            "submitted_order_id": submitted_order_id,
+            "order_detail_error": order_detail_error,
+            "order_detail_identity_error": order_detail_identity_error,
+            "order_detail": native_order_detail,
+            "order_detail_confirmed": native_order_detail is not None,
+            "submit_ack_filled_contracts": submit_ack_filled_contracts,
+            "position_delta_contracts": position_delta_contracts,
+            "position_delta_unattributed": position_delta_unattributed,
+            "exchange_reported_filled_contracts": reported_filled_contracts,
+            "filled_contracts": order_scoped_fill,
+            "base_quantity": order_scoped_fill * contract_size,
         }
-        if not success_code and closed_contracts <= tolerance:
+        if not success_code:
             return ExecutionResult(
                 order_id=order_id or "native_reduce_rejected",
                 symbol=decision.symbol,
@@ -3495,36 +3583,105 @@ class OKXExecutor(AbstractExecutor):
                 timestamp=datetime.now(UTC),
                 raw_response={**raw_response, "do_not_persist_order": True},
             )
-        if closed_contracts <= tolerance:
+        if order_scoped_fill <= tolerance:
+            if not order_id:
+                return ExecutionResult(
+                    order_id="native_reduce_unconfirmed",
+                    symbol=decision.symbol,
+                    side=side,
+                    order_type="market",
+                    quantity=0.0,
+                    price=price,
+                    status=OrderStatus.PENDING,
+                    timestamp=datetime.now(UTC),
+                    raw_response={
+                        **raw_response,
+                        "message": (
+                            "OKX 接受了 reduce-only 平仓请求，但没有返回可关联的订单号；"
+                            "账户持仓净变化不能归属到本单，等待交易所事实同步。"
+                        ),
+                    },
+                )
+            if position_delta_unattributed:
+                raw_response.update(
+                    {
+                        "requires_okx_fill_backfill": True,
+                        "fill_confirmation_basis": "okx_position_delta_pending_order_fill",
+                        "filled_contracts": position_delta_contracts,
+                        "base_quantity": position_delta_contracts * contract_size,
+                    }
+                )
             return ExecutionResult(
-                order_id=order_id or "native_reduce_not_confirmed",
+                order_id=order_id,
                 symbol=decision.symbol,
                 side=side,
                 order_type="market",
-                quantity=0.0,
+                quantity=(
+                    position_delta_contracts * contract_size
+                    if position_delta_unattributed
+                    else 0.0
+                ),
                 price=price,
-                status=OrderStatus.OPEN,
-                exchange_order_id=order_id or None,
+                status=(OrderStatus.PARTIAL if position_delta_unattributed else OrderStatus.OPEN),
+                exchange_order_id=order_id,
                 timestamp=datetime.now(UTC),
                 raw_response={
                     **raw_response,
-                    "error": snapshot_error
-                    or "OKX native reduce-only order was submitted but position is unchanged.",
+                    "message": (
+                        "OKX 仓位已减少，但本单成交数量尚未得到订单级确认；"
+                        "该进度仅用于避免重复平仓，盈亏与止盈锁账本等待成交回填。"
+                        if position_delta_unattributed
+                        else (
+                            "OKX 原生 reduce-only 订单尚无成交记录；"
+                            "继续等待订单同步，不重复提交平仓。"
+                        )
+                    ),
                 },
             )
 
         requested_filled = (
             requested_exit_contracts <= 0
-            or closed_contracts + tolerance >= requested_exit_contracts
+            or order_scoped_fill + tolerance >= requested_exit_contracts
         )
+        native_info = (
+            native_order_detail.get("info")
+            if isinstance(native_order_detail, dict)
+            else None
+        )
+        native_info = native_info if isinstance(native_info, dict) else {}
+        if native_order_detail is not None:
+            raw_response["info"] = dict(native_info)
+            raw_response["id"] = order_id
+            raw_response["source"] = "okx_order_detail"
+            raw_response["fill_confirmation_basis"] = "okx_order_detail"
+            raw_response["order_detail_confirmed"] = True
+            raw_response["execution_result_confirmed"] = False
+            raw_response["fills_history_confirmed"] = False
+        final_price = (
+            self._safe_float(native_order_detail.get("average"), 0.0)
+            if native_order_detail is not None
+            else 0.0
+        ) or self._safe_float(first_item.get("avgPx"), 0.0) or price
+        final_fee = (
+            self._order_fee_cost(native_order_detail)
+            if native_order_detail is not None
+            else abs(self._safe_float(native_info.get("fee"), 0.0))
+        )
+        if order_status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+            order_status = OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL
         return ExecutionResult(
             order_id=order_id or "native_reduce_market",
             symbol=decision.symbol,
             side=side,
             order_type="market",
-            quantity=closed_contracts * contract_size,
-            price=price,
-            status=OrderStatus.FILLED if requested_filled else OrderStatus.PARTIAL,
+            quantity=order_scoped_fill * contract_size,
+            price=final_price,
+            status=(
+                OrderStatus.FILLED
+                if requested_filled and order_status == OrderStatus.FILLED
+                else OrderStatus.PARTIAL
+            ),
+            fee=final_fee,
             exchange_order_id=order_id or None,
             timestamp=datetime.now(UTC),
             raw_response=raw_response,

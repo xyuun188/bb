@@ -6,6 +6,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.exceptions import ExchangeAPIError
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
+from services.trade_order_log_service import TradeOrderLogService
 
 
 class _FeeSnapshotExchange:
@@ -33,6 +34,9 @@ class _MissingLabMarketExchange:
         self.contracts = 9.0
         self.native_order_requests: list[dict] = []
         self.create_order_calls: list[tuple] = []
+        self.detail_overrides: dict = {}
+        self.client_id_only = False
+        self.native_detail_requests: list[dict] = []
 
     def market(self, symbol: str) -> dict:
         raise Exception(f"okx does not have market symbol {symbol}")
@@ -54,7 +58,12 @@ class _MissingLabMarketExchange:
         self.native_order_requests.append(dict(params))
         size = float(params["sz"])
         self.contracts = max(self.contracts - size, 0.0)
-        return {"code": "0", "data": [{"ordId": "LAB_NATIVE_REDUCE_1", "sCode": "0"}]}
+        identity = (
+            {"clOrdId": "LAB_CLIENT_1"}
+            if self.client_id_only
+            else {"ordId": "LAB_NATIVE_REDUCE_1"}
+        )
+        return {"code": "0", "data": [{**identity, "sCode": "0"}]}
 
     async def fetch_positions(self, symbols=None):
         self.fetch_position_calls.append(symbols)
@@ -83,6 +92,30 @@ class _MissingLabMarketExchange:
     async def privateGetTradeOrdersPending(self, params):
         self.native_pending_order_requests.append(dict(params))
         return {"data": []}
+
+    async def privateGetTradeOrder(self, params):
+        self.native_detail_requests.append(dict(params))
+        order_id = str(params.get("ordId") or params.get("clOrdId") or "")
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "instId": "LAB-USDT-SWAP",
+                    "ordId": "LAB_NATIVE_REDUCE_1",
+                    "clOrdId": order_id,
+                    "side": "sell",
+                    "ordType": "market",
+                    "state": "filled",
+                    "sz": "4.5",
+                    "accFillSz": "4.5",
+                    "avgPx": "17.787",
+                    "fee": "-0.01",
+                    "pnl": "0.20",
+                    "fillPnl": "0.05",
+                    **self.detail_overrides,
+                }
+            ],
+        }
 
     async def publicGetPublicInstruments(self, params):
         return {
@@ -251,6 +284,119 @@ async def test_place_order_uses_native_reduce_order_for_position_only_market() -
     ]
     assert result.raw_response["okx_native_reduce_market_order"] is True
     assert result.raw_response["canonical_exchange_symbol"] == "LAB/USDT"
+    assert result.price == pytest.approx(17.787)
+    assert result.fee == pytest.approx(0.01)
+    fact = TradeOrderLogService._okx_execution_fact_payload(result)
+    assert fact["okx_sync_status"] == "okx_order_detail_confirmed"
+    assert fact["okx_fill_pnl"] == pytest.approx(0.20)
+    assert fact["okx_raw_fills"]["order_detail_confirmed"] is True
+    assert fact["okx_raw_fills"]["execution_result_confirmed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "client_id_only", "expected_quantity", "confirmed"),
+    [
+        ({}, True, 0.45, True),
+        ({"accFillSz": "2", "state": "partially_filled"}, False, 0.2, True),
+        ({"ordId": "OTHER_ORDER"}, False, 0.45, False),
+        ({"instId": "BTC-USDT-SWAP"}, False, 0.45, False),
+        ({"side": "buy"}, False, 0.45, False),
+        ({"clOrdId": "OTHER_CLIENT"}, True, 0.45, False),
+    ],
+)
+async def test_native_reduce_requires_matching_order_details(
+    overrides: dict, client_id_only: bool, expected_quantity: float, confirmed: bool
+) -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingLabMarketExchange()
+    exchange.detail_overrides = overrides
+    exchange.client_id_only = client_id_only
+    executor._exchange = exchange
+    executor._connected = True
+    executor._markets_loaded = True
+    decision = DecisionOutput(
+        model_name="position_review",
+        symbol="LAB/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.95,
+        reasoning="reduce LAB with identity-checked evidence",
+        position_size_pct=0.5,
+    )
+
+    result = await executor.place_order(decision)
+
+    assert result.quantity == pytest.approx(expected_quantity)
+    assert result.raw_response["order_detail_confirmed"] is confirmed
+    if confirmed:
+        assert result.exchange_order_id == "LAB_NATIVE_REDUCE_1"
+        assert not result.raw_response.get("requires_okx_fill_backfill")
+        assert result.status == (
+            OrderStatus.FILLED if expected_quantity == 0.45 else OrderStatus.PARTIAL
+        )
+    else:
+        assert result.raw_response["order_detail_identity_error"]
+        assert result.raw_response["requires_okx_fill_backfill"] is True
+        assert result.raw_response["exchange_reported_filled_contracts"] == 0.0
+        assert result.status == OrderStatus.PARTIAL
+    assert exchange.native_detail_requests == [
+        {
+            "instId": "LAB-USDT-SWAP",
+            **(
+                {"clOrdId": "LAB_CLIENT_1"}
+                if client_id_only
+                else {"ordId": "LAB_NATIVE_REDUCE_1"}
+            ),
+        }
+    ]
+
+
+class _MissingNativeOrderDetailExchange(_MissingLabMarketExchange):
+    async def privatePostTradeOrder(self, params):
+        self.native_order_requests.append(dict(params))
+        size = float(params["sz"])
+        self.contracts = max(self.contracts - size, 0.0)
+        return {
+            "code": "0",
+            "data": [
+                {
+                    "ordId": "LAB_NATIVE_REDUCE_1",
+                    "sCode": "0",
+                    "accFillSz": str(size),
+                }
+            ],
+        }
+
+    async def privateGetTradeOrder(self, _params):
+        return {"code": "0", "data": []}
+
+
+@pytest.mark.asyncio
+async def test_native_reduce_without_order_detail_does_not_confirm_fill() -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingNativeOrderDetailExchange()
+    executor._exchange = exchange
+    executor._connected = True
+    executor._markets_loaded = True
+
+    decision = DecisionOutput(
+        model_name="position_review",
+        symbol="LAB/USDT",
+        action=Action.CLOSE_LONG,
+        confidence=0.95,
+        reasoning="close LAB without an order-level fill fact",
+        position_size_pct=0.5,
+    )
+
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.PARTIAL
+    assert result.quantity == pytest.approx(0.45)
+    assert result.raw_response["order_detail_confirmed"] is False
+    assert result.raw_response["submit_ack_filled_contracts"] == pytest.approx(4.5)
+    assert result.raw_response["exchange_reported_filled_contracts"] == pytest.approx(0.0)
+    assert result.raw_response["filled_contracts"] == pytest.approx(4.5)
+    assert result.raw_response["requires_okx_fill_backfill"] is True
 
 
 @pytest.mark.asyncio

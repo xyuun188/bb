@@ -255,14 +255,22 @@ class TradeOrderLogService:
             return {}
         trade_id = str(info.get("tradeId") or "").strip()
         fee = abs(TradeOrderLogService._safe_float(info.get("fee"), 0.0))
+        order_detail_confirmed = raw.get("order_detail_confirmed") is True
+        # Order details contain cumulative pnl; fillPnl describes only the last fill.
+        pnl_value = (
+            info.get("pnl")
+            if order_detail_confirmed and info.get("pnl") not in (None, "")
+            else info.get("fillPnl") or info.get("pnl") or raw.get("pnl")
+        )
         pnl = TradeOrderLogService._safe_float(
-            info.get("fillPnl") or info.get("pnl") or raw.get("pnl"),
+            pnl_value,
             0.0,
         )
         raw_fact = {
-            "source": "okx_execution_result",
+            "source": "okx_order_detail" if order_detail_confirmed else "okx_execution_result",
             "fills_history_confirmed": False,
-            "execution_result_confirmed": True,
+            "execution_result_confirmed": not order_detail_confirmed,
+            "order_detail_confirmed": order_detail_confirmed,
             "order_id": order_id,
             "trade_ids": [trade_id] if trade_id else [],
             "inst_id": inst_id,
@@ -285,7 +293,11 @@ class TradeOrderLogService:
             "okx_fill_contracts": filled_contracts,
             "okx_fill_pnl": pnl,
             "okx_state": state or "filled",
-            "okx_sync_status": "okx_execution_result_confirmed",
+            "okx_sync_status": (
+                "okx_order_detail_confirmed"
+                if order_detail_confirmed
+                else "okx_execution_result_confirmed"
+            ),
             "okx_raw_fills": raw_fact,
         }
         return payload

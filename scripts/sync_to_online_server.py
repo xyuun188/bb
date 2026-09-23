@@ -1104,6 +1104,19 @@ def main() -> None:
                 "model_tunnel_probe_rc=$?; "
                 'if [ "$model_tunnel_restart_rc" -eq 0 ] && '
                 '[ "$model_tunnel_probe_rc" -eq 0 ]; then '
+                # The paper service has its own ExecStartPre probes.  Keep
+                # one short stability window here so a just-restarted tunnel
+                # cannot pass the first probe and disappear during service
+                # startup, which otherwise causes avoidable restart storms.
+                "sleep 3; "
+                f"{model_tunnel_probe}; "
+                "model_tunnel_stable_rc=$?; "
+                'if [ "$model_tunnel_stable_rc" -ne 0 ]; then '
+                "model_tunnel_probe_rc=$model_tunnel_stable_rc; "
+                "fi; "
+                "fi; "
+                'if [ "$model_tunnel_restart_rc" -eq 0 ] && '
+                '[ "$model_tunnel_probe_rc" -eq 0 ]; then '
                 "echo model-tunnels-ok; "
                 "else "
                 "echo model-tunnels-degraded; "

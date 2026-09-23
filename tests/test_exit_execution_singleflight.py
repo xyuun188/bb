@@ -332,3 +332,39 @@ async def test_risk_reduction_fill_does_not_update_profit_lock_ledger() -> None:
 
     assert position.current_management_contract[EXIT_INTENT_KEY]["profit_lock_exit"] is False
     assert PROFIT_LOCK_LEDGER_KEY not in position.current_management_contract
+
+
+@pytest.mark.asyncio
+async def test_pending_backfill_does_not_consume_profit_lock_target() -> None:
+    position = _position()
+    position.current_management_contract["lifecycle_entry_quantity"] = 10.0
+    service = _service(
+        _Repo([position]), _Session(), [datetime(2026, 9, 20, 2, 0, tzinfo=UTC)]
+    )
+    lease = await service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=_profit_lock_decision(),
+        decision_id=509601,
+    )
+    result = ExecutionResult(
+        order_id="pending-fill",
+        exchange_order_id="3938000000000000003",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="market",
+        quantity=4.0,
+        price=0.04,
+        status=OrderStatus.PARTIAL,
+        raw_response={"requires_okx_fill_backfill": True},
+    )
+
+    await service.finish(lease, result)
+
+    assert PROFIT_LOCK_LEDGER_KEY not in position.current_management_contract
+    result.raw_response = {"order_detail_confirmed": True}
+    await service.finish(lease, result)
+    await service.finish(lease, result)
+    assert position.current_management_contract[PROFIT_LOCK_LEDGER_KEY][
+        "realized_quantity"
+    ] == pytest.approx(4.0)
