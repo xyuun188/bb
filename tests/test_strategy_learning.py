@@ -125,6 +125,7 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
             return None
 
     async def empty_outcomes(**_kwargs: Any) -> list[dict[str, Any]]:
+        assert _kwargs["include_decision_evidence"] is True
         return []
 
     replay_row_ids: list[int] = []

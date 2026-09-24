@@ -1427,6 +1427,7 @@ class StrategyLearningService:
                 since=since,
                 limit=effective_limit,
                 compact=True,
+                include_decision_evidence=True,
             )
         )
         try:
