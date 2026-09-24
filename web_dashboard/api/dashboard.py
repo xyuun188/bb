@@ -239,6 +239,7 @@ _dashboard_public_rest_client_lock: asyncio.Lock | None = None
 _dashboard_heavy_cache: dict[tuple[Any, ...], tuple[datetime, Any]] = {}
 _dashboard_heavy_cache_locks: dict[tuple[Any, ...], asyncio.Lock] = {}
 _STRATEGY_LEARNING_SNAPSHOT_VERSION = 1
+_STRATEGY_LEARNING_REQUEST_CACHE_TTL_SECONDS = 15.0
 _STRATEGY_LEARNING_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 _STRATEGY_LEARNING_SNAPSHOT_DIR = settings.data_dir / "dashboard_strategy_learning"
 _dashboard_closed_ledger_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
@@ -12366,7 +12367,10 @@ async def get_strategy_learning(
         capped_limit,
         selected_detail,
     )
-    cached = _dashboard_heavy_cache_get(request_cache_key, ttl_seconds=300.0)
+    cached = _dashboard_heavy_cache_get(
+        request_cache_key,
+        ttl_seconds=_STRATEGY_LEARNING_REQUEST_CACHE_TTL_SECONDS,
+    )
     if cached is not None:
         return sanitize_payload(cached)
 
@@ -12489,8 +12493,9 @@ async def _strategy_learning_watermark_for_request(
 
     from db.session import get_read_session_ctx
     from models.decision import AIDecision
-    from models.learning import ShadowBacktest, StrategyLearningEvent
-    from models.trade import Position
+    from models.learning import ShadowBacktest, StrategyLearningEvent, TradeReflection
+    from models.trade import OkxPositionHistory, Position
+    from services.okx_position_history_store import load_okx_position_history_watermark
 
     closed_filters = (
         Position.execution_mode == selected_mode,
@@ -12515,6 +12520,11 @@ async def _strategy_learning_watermark_for_request(
         AIDecision.is_paper.is_(selected_mode == "paper"),
         AIDecision.analysis_type == "market",
         AIDecision.created_at >= since.replace(tzinfo=None),
+    )
+    history_filters = (OkxPositionHistory.mode == selected_mode,)
+    reflection_filters = (
+        TradeReflection.execution_mode == selected_mode,
+        TradeReflection.closed_at >= since.replace(tzinfo=None),
     )
     async with get_read_session_ctx() as session:
         row = (
@@ -12544,10 +12554,39 @@ async def _strategy_learning_watermark_for_request(
                     select(func.max(AIDecision.updated_at))
                     .where(*decision_filters)
                     .scalar_subquery(),
+                    select(func.count(OkxPositionHistory.id))
+                    .where(*history_filters)
+                    .scalar_subquery(),
+                    select(func.max(OkxPositionHistory.id))
+                    .where(*history_filters)
+                    .scalar_subquery(),
+                    select(func.max(OkxPositionHistory.updated_at_okx))
+                    .where(*history_filters)
+                    .scalar_subquery(),
+                    select(func.max(OkxPositionHistory.synced_at))
+                    .where(*history_filters)
+                    .scalar_subquery(),
+                    select(func.count(TradeReflection.id))
+                    .where(*reflection_filters)
+                    .scalar_subquery(),
+                    select(func.max(TradeReflection.id))
+                    .where(*reflection_filters)
+                    .scalar_subquery(),
+                    select(func.max(TradeReflection.updated_at))
+                    .where(*reflection_filters)
+                    .scalar_subquery(),
                 )
             )
         ).one()
-    return tuple(value.isoformat() if isinstance(value, datetime) else value for value in row)
+    # Strategy learning consumes authoritative OKX settlement outcomes. Use
+    # the cheap history/reflection watermarks instead of loading every outcome
+    # detail inside the two-second request watermark budget.
+    history_watermark = load_okx_position_history_watermark(selected_mode)
+    outcome_watermark = (history_watermark.isoformat() if history_watermark else "",)
+    return (
+        *tuple(value.isoformat() if isinstance(value, datetime) else value for value in row),
+        *outcome_watermark,
+    )
 
 
 async def _profit_attribution_watermark(
@@ -13201,6 +13240,7 @@ def _start_model_contribution_stats_refresh(
     task = _dashboard_model_contribution_stats_refresh_tasks.get(cache_key)
     if task is not None and not task.done():
         return task
+
     task = asyncio.create_task(
         _refresh_model_contribution_stats_cache(
             cache_key,

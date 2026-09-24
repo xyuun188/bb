@@ -364,6 +364,64 @@ async def test_strategy_learning_request_snapshot_skips_repeated_watermark_query
 
 
 @pytest.mark.asyncio
+async def test_strategy_learning_watermark_includes_authoritative_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def one(self) -> tuple[Any, ...]:
+            return (
+                0,
+                None,
+                None,
+                0,
+                None,
+                0,
+                None,
+                None,
+                0,
+                None,
+                None,
+                0,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+
+    class FakeSession:
+        async def execute(self, _statement: Any) -> FakeResult:
+            return FakeResult()
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "db.session.get_read_session_ctx",
+        lambda: FakeSessionContext(),
+    )
+    monkeypatch.setattr(
+        "services.okx_position_history_store.load_okx_position_history_watermark",
+        lambda _mode: datetime(2026, 9, 24, 10, 0, tzinfo=UTC),
+    )
+
+    watermark = await dashboard._strategy_learning_watermark_for_request(
+        selected_mode="paper",
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+
+    assert watermark[-1] == "2026-09-24T10:00:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_strategy_learning_timeout_returns_persisted_stale_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

@@ -269,6 +269,8 @@ MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
 AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
+AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS = 3
+AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
 # A definitive OKX capability rejection (51001 / unsupported execution
 # instrument) must not be rediscovered on every market round.  Keep this
 # separate from the executor's per-request cache so the ranked candidate pool
@@ -2473,38 +2475,63 @@ class TradingService(ModelTrainingCoordinatorMixin):
         ) + 1
 
         async def run() -> None:
+            last_result: dict[str, Any] | None = None
             try:
-                result = await asyncio.wait_for(
-                    self.expert_memory_service.backfill_trade_reflections(mode),
-                    timeout=AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS,
-                )
-                self._authoritative_outcome_feedback_last_result = (
-                    dict(result) if isinstance(result, dict) else {"status": "completed"}
-                )
+                for attempt in range(1, AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS + 1):
+                    try:
+                        result = await asyncio.wait_for(
+                            self.expert_memory_service.backfill_trade_reflections(mode),
+                            timeout=AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS,
+                        )
+                        last_result = (
+                            dict(result)
+                            if isinstance(result, dict)
+                            else {"status": "completed"}
+                        )
+                        if last_result.get("status") == "completed":
+                            self._authoritative_outcome_feedback_last_result = last_result
+                            self._authoritative_outcome_feedback_last_error = None
+                            return
+                    except TimeoutError:
+                        last_result = {
+                            "status": "deferred",
+                            "reason": "feedback_timeout",
+                            "attempt": attempt,
+                            "max_attempts": AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS,
+                        }
+                        self._authoritative_outcome_feedback_last_error = "feedback_timeout"
+                        logger.warning(
+                            "authoritative outcome feedback timed out in background",
+                            mode=mode,
+                            attempt=attempt,
+                            max_attempts=AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS,
+                        )
+                    except Exception as exc:
+                        error = safe_error_text(exc, limit=180)
+                        last_result = {
+                            "status": "degraded",
+                            "error": error,
+                            "attempt": attempt,
+                            "max_attempts": AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS,
+                        }
+                        self._authoritative_outcome_feedback_last_error = error
+                        logger.warning(
+                            "authoritative outcome feedback failed in background",
+                            mode=mode,
+                            attempt=attempt,
+                            max_attempts=AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS,
+                            error=error,
+                        )
+
+                    if attempt < AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS:
+                        await asyncio.sleep(AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS)
+
+                self._authoritative_outcome_feedback_last_result = last_result or {
+                    "status": "degraded",
+                    "reason": "feedback_no_result",
+                }
             except asyncio.CancelledError:
                 raise
-            except TimeoutError:
-                self._authoritative_outcome_feedback_last_result = {
-                    "status": "deferred",
-                    "reason": "feedback_timeout",
-                }
-                self._authoritative_outcome_feedback_last_error = "feedback_timeout"
-                logger.warning(
-                    "authoritative outcome feedback timed out in background",
-                    mode=mode,
-                )
-            except Exception as exc:
-                error = safe_error_text(exc, limit=180)
-                self._authoritative_outcome_feedback_last_result = {
-                    "status": "degraded",
-                    "error": error,
-                }
-                self._authoritative_outcome_feedback_last_error = error
-                logger.warning(
-                    "authoritative outcome feedback failed in background",
-                    mode=mode,
-                    error=error,
-                )
             finally:
                 self._authoritative_outcome_feedback_last_finished_at = datetime.now(UTC)
 
@@ -2879,6 +2906,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         self._shadow_backtest_update_task = task
         task.add_done_callback(self._consume_shadow_backtest_update_result)
+        # Hand control to the newly-created worker once so callers can
+        # observe the task as running before the next scheduler round.
+        await asyncio.sleep(0)
         results["shadow_backtest_maintenance"] = {
             **self._shadow_backtest_maintenance_status(),
             "started_in_background": True,
@@ -7318,7 +7348,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
         except (AttributeError, KeyError, TypeError, ValueError):
             mode = "paper"
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
-        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        # Keep this round's selection based on the cache snapshot that existed
+        # when the round began. The capability refresh runs concurrently and
+        # may finish during the hand-off below, but its result must only affect
+        # the next round; otherwise a background task changes the current
+        # shortlist halfway through its diagnostics.
+        unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
         return bool(
             symbol not in unavailable_by_mode
@@ -8137,7 +8172,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
         verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
-        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         unavailable_symbols = set(unavailable_by_mode)
         verified_symbols.difference_update(unavailable_symbols)
         # Private OKX capability checks are execution permissions, not market
@@ -8190,6 +8225,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 target_count=target,
                 mode=selected_mode,
             )
+            # The refresh is deliberately out of the market-analysis critical
+            # path, but it must start before this round returns; otherwise the
+            # next round observes an empty capability cache and repeats the
+            # same unverified shortlist.
+            await asyncio.sleep(0)
 
         selected = [symbol for symbol in feature_vectors if symbol in verified_symbols]
         selected.extend(
@@ -8290,10 +8330,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     availability_facts,
                     ttl_seconds=cache_ttl,
                 )
-        verified_by_mode = dict(verified_by_mode)
-        verified_by_mode[selected_mode] = verified_symbols
-        self._verified_entry_symbols_by_mode = verified_by_mode
-        unavailable_by_mode = self._entry_unavailable_cache_for_mode(selected_mode)
+        # The background refresh may have completed while this round was
+        # building its immutable shortlist snapshot. Merge that newer result
+        # instead of overwriting it with the stale local copy.
+        current_verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        current_verified_by_mode = (
+            dict(current_verified_by_mode)
+            if isinstance(current_verified_by_mode, dict)
+            else {}
+        )
+        persisted_verified_symbols = set(
+            current_verified_by_mode.get(selected_mode, set()) or set()
+        )
+        persisted_unavailable_symbols = set(
+            self._entry_unavailable_cache_for_mode(selected_mode)
+        )
+        persisted_verified_symbols.update(verified_symbols)
+        persisted_verified_symbols.difference_update(persisted_unavailable_symbols)
+        current_verified_by_mode[selected_mode] = persisted_verified_symbols
+        self._verified_entry_symbols_by_mode = current_verified_by_mode
         selected_unavailable_symbols = {
             symbol
             for symbol in selected_order
@@ -8430,8 +8485,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             statuses[key] = status
             self._market_instrument_refresh_status_by_mode = statuses
             try:
-                result = await asyncio.wait_for(
-                    executor.entry_instrument_availability_shortlist(
+                async with asyncio.timeout(
+                    max(float(MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS), 0.05)
+                ):
+                    result = await executor.entry_instrument_availability_shortlist(
                         list(dict.fromkeys(symbols))[:MARKET_INSTRUMENT_REFRESH_BATCH_SIZE],
                         target_count=max(
                             1,
@@ -8441,9 +8498,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             ),
                         ),
                         concurrency=4,
-                    ),
-                    timeout=max(float(MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS), 0.05),
-                )
+                    )
                 availability = result.get("availability") if isinstance(result, dict) else {}
                 verified = {
                     str(symbol)
@@ -9544,10 +9599,15 @@ class TradingService(ModelTrainingCoordinatorMixin):
         except TimeoutError:
             # Reflection backfill is maintenance only. A slow or oversized
             # historical read must never prevent trading loops and heartbeat
-            # tasks from starting.
+            # tasks from starting. Queue the same idempotent worker so a
+            # restart cannot leave the dashboard at zero indefinitely.
             logger.warning(
                 "trade reflection backfill deferred after startup timeout",
                 timeout_seconds=TRADING_STARTUP_BACKFILL_TIMEOUT_SECONDS,
+            )
+            self._schedule_authoritative_outcome_feedback(
+                mode_manager.mode.value,
+                changed_count=0,
             )
         await self._prime_strategy_context_performance_snapshot(mode_manager.mode.value)
 

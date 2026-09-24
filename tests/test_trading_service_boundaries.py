@@ -698,6 +698,54 @@ async def test_okx_settlement_fact_sync_schedules_feedback_without_blocking_loop
 
 
 @pytest.mark.asyncio
+async def test_authoritative_feedback_retries_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._authoritative_outcome_feedback_task = None
+    service._authoritative_outcome_feedback_last_started_at = None
+    service._authoritative_outcome_feedback_last_finished_at = None
+    service._authoritative_outcome_feedback_last_result = None
+    service._authoritative_outcome_feedback_last_error = None
+    service._authoritative_outcome_feedback_scheduled_count = 0
+    service._authoritative_outcome_feedback_coalesced_count = 0
+    calls = 0
+
+    class FakeExpertMemoryService:
+        async def backfill_trade_reflections(self, _mode: str) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.02)
+            return {"status": "completed", "processed": 2}
+
+    service.expert_memory_service = FakeExpertMemoryService()
+    monkeypatch.setattr(
+        trading_service,
+        "AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        trading_service,
+        "AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS",
+        0,
+    )
+
+    row = service._schedule_authoritative_outcome_feedback("paper", changed_count=0)
+    assert row["status"] == "scheduled"
+    task = service._authoritative_outcome_feedback_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=0.5)
+
+    assert calls == 2
+    assert service._authoritative_outcome_feedback_last_result == {
+        "status": "completed",
+        "processed": 2,
+    }
+    assert service._authoritative_outcome_feedback_last_error is None
+
+
+@pytest.mark.asyncio
 async def test_okx_authoritative_sync_loop_does_not_wait_for_order_fact_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
