@@ -1556,6 +1556,32 @@ class OKXExecutor(AbstractExecutor):
                     reference_price=price,
                     price_limit=submit_price_limit,
                 )
+                stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
+                    decision, price, ticker=ticker
+                )
+                protection = self._format_attached_sl_tp_prices(
+                    ccxt, okx_symbol, decision, stop_loss_px, take_profit_px, price
+                )
+                if not protection.get("ok"):
+                    return ExecutionResult(
+                        order_id="rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response=protection,
+                    )
+                protection_risk = self._entry_protection_risk(
+                    decision=decision,
+                    side=side,
+                    reference_price=price,
+                    price_limit=submit_price_limit,
+                    stop_loss_price=self._safe_float(protection["stop_loss_price"]),
+                    planned_notional_usdt=position_value,
+                )
+                position_value = protection_risk["maximum_notional_usdt"]
                 order_quantity, base_quantity = self._entry_order_amount(
                     ccxt,
                     market,
@@ -1660,6 +1686,7 @@ class OKXExecutor(AbstractExecutor):
                         "base_quantity": base_quantity,
                         "okx_order_rules": okx_order_rules,
                         "leverage_check": leverage_check,
+                        "protection_risk": protection_risk,
                     },
                 )
                 if reconciled_contract.get("eligible") is not True:
@@ -1730,30 +1757,6 @@ class OKXExecutor(AbstractExecutor):
                             "balance_error": final_balance_error or None,
                             "okx_order_rules": okx_order_rules,
                         },
-                    )
-                stop_loss_px, take_profit_px = self._attached_sl_tp_prices(
-                    decision,
-                    price,
-                    ticker=ticker,
-                )
-                protection = self._format_attached_sl_tp_prices(
-                    ccxt,
-                    okx_symbol,
-                    decision,
-                    stop_loss_px,
-                    take_profit_px,
-                    price,
-                )
-                if not protection.get("ok"):
-                    return ExecutionResult(
-                        order_id="rejected",
-                        symbol=decision.symbol,
-                        side=side,
-                        order_type="market",
-                        quantity=0,
-                        price=price,
-                        status=OrderStatus.REJECTED,
-                        raw_response=protection,
                     )
                 params["attachAlgoOrds"] = [
                     {
@@ -4694,16 +4697,71 @@ class OKXExecutor(AbstractExecutor):
         reference_price: float,
         price_limit: dict[str, Any],
     ) -> float:
-        """Use the exchange's worst executable buy price for entry sizing."""
+        """Bound notional at the upper price band for both entry directions."""
 
         price = max(self._safe_float(reference_price, 0.0), 0.0)
-        if str(side or "").lower() != "buy":
+        if str(side or "").lower() not in {"buy", "sell"}:
             return price
         buy_limit = max(
             self._safe_float(price_limit.get("buy_price_limit"), 0.0),
             0.0,
         )
         return max(price, buy_limit)
+
+    def _entry_protection_risk(
+        self,
+        *,
+        decision: DecisionOutput,
+        side: str,
+        reference_price: float,
+        price_limit: dict[str, Any],
+        stop_loss_price: float,
+        planned_notional_usdt: float,
+    ) -> dict[str, Any]:
+        """Keep widened native stops inside the already approved loss budget."""
+
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing") or {}
+        price = max(self._safe_float(reference_price), 0.0)
+        upper = max(price, self._safe_float(price_limit.get("buy_price_limit")))
+        lower_limit = self._safe_float(price_limit.get("sell_price_limit"))
+        lower = min(price, lower_limit) if lower_limit > 0 else price
+        worst_entry = upper if side == "buy" else lower
+        stop = max(self._safe_float(stop_loss_price), 0.0)
+        declared_stress = self._safe_float(sizing.get("stressed_loss_fraction"))
+        stop_ratio = stop / worst_entry if worst_entry > 0 else 0.0
+        stop_is_same_scale = 0.5 <= stop_ratio <= 1.5
+        stop_direction_valid = (
+            stop < worst_entry if side == "buy" else stop > worst_entry
+        )
+        stop_distance = (
+            abs(stop - worst_entry)
+            if stop_is_same_scale and stop_direction_valid
+            else 0.0
+        )
+        stop_stress = stop_distance / worst_entry if worst_entry > 0 else 0.0
+        stress = max(declared_stress, stop_stress)
+        risk_budget = max(self._safe_float(sizing.get("risk_budget_usdt")), 0.0)
+        reserve = max(
+            self._safe_float(sizing.get("estimated_fill_drift_reserve_fraction")), 0.0
+        )
+        maximum = (
+            min(planned_notional_usdt, risk_budget / (stress * (1.0 + reserve)))
+            if risk_budget > 0 and stress > 0 and stop > 0 and worst_entry > 0
+            else 0.0
+        )
+        return {
+            "source": "formatted_native_stop_and_pre_submit_price_band",
+            "side": side,
+            "stop_loss_price": stop,
+            "worst_entry_price": worst_entry,
+            "stop_price_same_scale": stop_is_same_scale,
+            "stop_direction_valid": stop_direction_valid,
+            "stressed_loss_fraction": stress,
+            "risk_budget_usdt": risk_budget,
+            "maximum_notional_usdt": max(maximum, 0.0),
+            "original_notional_usdt": planned_notional_usdt,
+        }
 
     def _entry_fill_integrity(
         self,

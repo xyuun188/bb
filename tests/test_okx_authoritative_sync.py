@@ -436,6 +436,7 @@ class _SlowOptionalStageService(OkxAuthoritativeSyncService):
         exchange_fills: list[OkxFillGroup],
         local_exchange_order_ids: set[str],
         priority_order_ids: set[str] | None = None,
+        local_order_inst_ids: dict[str, str] | None = None,
     ) -> dict[str, tuple[dict[str, Any], ...]]:
         import asyncio
 
@@ -445,6 +446,7 @@ class _SlowOptionalStageService(OkxAuthoritativeSyncService):
             exchange_fills=exchange_fills,
             local_exchange_order_ids=local_exchange_order_ids,
             priority_order_ids=priority_order_ids,
+            local_order_inst_ids=local_order_inst_ids,
         )
 
     async def _fetch_contract_sizes(
@@ -2758,6 +2760,110 @@ async def test_okx_authoritative_sync_accepts_identity_complete_persisted_order_
         )
     finally:
         await close_db()
+
+
+def test_okx_authoritative_diff_uses_complete_order_history_when_fills_are_empty() -> None:
+    now = datetime.now(UTC)
+    order = Order(
+        id=91,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LQTY/USDT",
+        side="buy",
+        order_type="market",
+        quantity=919.0,
+        price=0.19709989,
+        status="filled",
+        exchange_order_id="orders-history-only",
+        okx_inst_id="LQTY-USDT-SWAP",
+        created_at=now - timedelta(minutes=5),
+        filled_at=now - timedelta(minutes=5),
+    )
+    detail = {
+        "ordId": "orders-history-only",
+        "instId": "LQTY-USDT-SWAP",
+        "side": "buy",
+        "posSide": "net",
+        "state": "filled",
+        "accFillSz": "919",
+        "avgPx": "0.19709989",
+        "fee": "-0.0905674",
+        "pnl": "0",
+        "tradeId": "last-fill-only",
+        "fillTime": str(int((now - timedelta(minutes=5)).timestamp() * 1000)),
+    }
+
+    findings = OkxAuthoritativeSyncService(mode="paper")._diff_facts(
+        local_orders=[order],
+        local_positions=[],
+        local_decisions={},
+        exchange_positions=[],
+        exchange_fills=[],
+        exchange_order_contexts={"orders-history-only": (detail,)},
+        instrument_contract_sizes={"LQTY-USDT-SWAP": 1.0},
+        observed_at=now,
+    )
+
+    assert [item.kind for item in findings] == ["local_order_verified_from_okx_order_detail"]
+    assert findings[0].classification == "observation"
+    assert findings[0].okx_contracts == pytest.approx(919.0)
+    assert findings[0].expected_base_quantity is None
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"ordId": "wrong-order"},
+        {"instId": "ETH-USDT-SWAP"},
+        {"side": "sell"},
+        {"state": "live"},
+        {"accFillSz": ""},
+        {"avgPx": ""},
+        {"fee": ""},
+        {"pnl": ""},
+        {"tradeId": ""},
+        {"fillTime": ""},
+    ],
+)
+def test_okx_order_history_detail_rejects_incomplete_or_wrong_identity(updates: dict[str, str]) -> None:
+    from services.okx_authoritative_sync import _order_history_detail_fill_for_order
+
+    now = datetime.now(UTC)
+    order = Order(
+        id=92,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="LQTY/USDT",
+        side="buy",
+        order_type="market",
+        quantity=919.0,
+        price=0.19709989,
+        status="filled",
+        exchange_order_id="orders-history-only",
+        okx_inst_id="LQTY-USDT-SWAP",
+        created_at=now,
+        filled_at=now,
+    )
+    detail = {
+        "ordId": "orders-history-only",
+        "instId": "LQTY-USDT-SWAP",
+        "side": "buy",
+        "posSide": "net",
+        "state": "filled",
+        "accFillSz": "919",
+        "avgPx": "0.19709989",
+        "fee": "-0.0905674",
+        "pnl": "0",
+        "tradeId": "last-fill-only",
+        "fillTime": str(int(now.timestamp() * 1000)),
+    }
+    detail.update(updates)
+
+    assert _order_history_detail_fill_for_order(
+        order,
+        detail,
+        contract_sizes={"LQTY-USDT-SWAP": 1.0},
+    ) is None
 
 
 @pytest.mark.asyncio

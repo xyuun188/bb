@@ -12,7 +12,7 @@ import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from math import isclose
+from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
@@ -49,6 +49,7 @@ from services.okx_native_facts import (
     OkxNativeFactsClient,
     OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
+    validated_okx_order_detail,
 )
 from services.okx_protection_position_recovery import (
     confirmed_protection_lifecycle,
@@ -363,7 +364,10 @@ class OkxOrderFactSyncService:
         submit_recovery_orders = [
             order for order in local_orders if _order_is_rejected_without_exchange_fill(order)
         ]
-        submit_recovery_decisions = await self._load_decisions_for_orders(submit_recovery_orders)
+        external_refresh_orders = [order for order in local_orders if _order_needs_okx_pull(order)]
+        submit_recovery_decisions = await self._load_decisions_for_orders(
+            [*submit_recovery_orders, *external_refresh_orders]
+        )
         submit_recovery_target_order_ids = list(
             dict.fromkeys(
                 exchange_order_id
@@ -373,7 +377,6 @@ class OkxOrderFactSyncService:
                 )
             )
         )
-        external_refresh_orders = [order for order in local_orders if _order_needs_okx_pull(order)]
         target_order_ids = (
             {
                 token
@@ -382,6 +385,10 @@ class OkxOrderFactSyncService:
             }
             | set(submit_recovery_target_order_ids)
             | set(self.recovery_order_ids)
+        )
+        order_inst_ids_by_id = _order_inst_ids_by_id(
+            [*local_orders, *submit_recovery_orders],
+            submit_recovery_decisions,
         )
         priority_target_order_ids = tuple(
             dict.fromkeys(
@@ -767,25 +774,32 @@ class OkxOrderFactSyncService:
             )
             account_order_rows = list(account_order_rows or [])
             account_order_ids = set(_order_rows_by_id(account_order_rows))
-            missing_order_ids = sorted(target_order_ids - account_order_ids)
+            missing_order_ids = sorted(
+                target_order_ids - account_order_ids,
+                key=lambda order_id: -int(order_id) if order_id.isdigit() else 0,
+            )
             if fills:
                 missing_order_ids = sorted(
-                    set(missing_order_ids) - {fill.order_id for fill in fills if fill.order_id}
+                    set(missing_order_ids) - {fill.order_id for fill in fills if fill.order_id},
+                    key=lambda order_id: -int(order_id) if order_id.isdigit() else 0,
                 )
             target_order_rows: list[dict[str, Any]] = []
-            if missing_order_ids:
-                target_order_rows, _ = await run_stage(
-                    "orders_history_targeted",
-                    lambda: native_facts.fetch_order_history_rows(
-                        order_ids=missing_order_ids[:DEFAULT_MAX_ORDER_GAP_QUERIES],
+            for missing_order_id in missing_order_ids[:DEFAULT_MAX_ORDER_GAP_QUERIES]:
+                recovered_rows, _ = await run_stage(
+                    f"orders_history_targeted:{missing_order_id}",
+                    lambda missing_order_id=missing_order_id: native_facts.fetch_order_history_rows(
+                        order_ids=[missing_order_id],
+                        inst_ids_by_order_id=order_inst_ids_by_id,
                         since=since,
                         limit=100,
                         max_pages=1,
                         strict=True,
                     ),
-                    cap_seconds=1.0,
+                    cap_seconds=2.0,
                 )
-                target_order_rows = list(target_order_rows or [])
+                # Commit each successful pull to the batch before another id
+                # can exhaust the budget. A slow order must not lose its peers.
+                target_order_rows.extend(recovered_rows or [])
             order_rows = _dedupe_order_rows([*account_order_rows, *target_order_rows])
             order_rows_by_id = _order_rows_by_id(order_rows)
             fills = [
@@ -1738,12 +1752,6 @@ class OkxOrderFactSyncService:
                 unverified_count += 1
                 samples.append(_sample(order, kind="local_order_incomplete_fill_pull_deferred"))
                 continue
-            if fill is None and _stored_fill_pagination_needs_refresh(order):
-                order.okx_sync_status = OKX_SYNC_UNVERIFIED
-                order.okx_last_error = "OKX cumulative fill pagination is awaiting verification"
-                unverified_count += 1
-                samples.append(_sample(order, kind="local_order_fill_pagination_unverified"))
-                continue
             if fill is not None and canonical_orders_by_exchange_id:
                 canonical = canonical_orders_by_exchange_id.get(str(fill.order_id or "").strip())
                 if canonical is not None and canonical is not order:
@@ -1751,6 +1759,52 @@ class OkxOrderFactSyncService:
                         _sample(order, kind="local_fill_reused_canonical_exchange_fact")
                     )
                     order = canonical
+            if (
+                fill is None
+                and not _order_has_authoritative_stored_okx_fill_fact(order)
+                and not _order_has_okx_order_detail_fact(order)
+            ):
+                order_detail_fill = _order_detail_fill_from_order_row(
+                    order,
+                    order_row,
+                    contract_size=_safe_float(
+                        contract_sizes.get(
+                            str((order_row or {}).get("instId") or "")
+                            .strip()
+                            .upper()
+                        ),
+                        0.0,
+                    ),
+                )
+                if order_detail_fill is not None:
+                    self._apply_order_detail_to_order(
+                        order,
+                        order_detail_fill,
+                        order_row=order_row,
+                        contract_size=_safe_float(
+                            contract_sizes.get(
+                                str((order_row or {}).get("instId") or "")
+                                .strip()
+                                .upper()
+                            ),
+                            0.0,
+                        ),
+                        now=now,
+                    )
+                    confirmed_count += 1
+                    samples.append(
+                        _sample(
+                            order,
+                            kind="local_order_confirmed_from_order_history_detail",
+                        )
+                    )
+                    continue
+            if fill is None and _stored_fill_pagination_needs_refresh(order):
+                order.okx_sync_status = OKX_SYNC_UNVERIFIED
+                order.okx_last_error = "OKX cumulative fill pagination is awaiting verification"
+                unverified_count += 1
+                samples.append(_sample(order, kind="local_order_fill_pagination_unverified"))
+                continue
             if fill is None:
                 pending_fill = _matching_native_full_close_pending_fill(
                     order,
@@ -2260,6 +2314,69 @@ class OkxOrderFactSyncService:
             raw_fact["protection_execution"] = dict(protection_execution)
         order.okx_raw_fills = raw_fact
 
+    @staticmethod
+    def _apply_order_detail_to_order(
+        order: Order,
+        detail: OkxNativeFillGroup,
+        *,
+        order_row: dict[str, Any],
+        contract_size: float,
+        now: datetime,
+    ) -> None:
+        """Persist a complete OKX orders-history execution without claiming fills-history."""
+
+        order.exchange_order_id = detail.order_id
+        order.okx_inst_id = detail.inst_id
+        order.symbol = symbol_from_okx_inst_id(detail.inst_id) or detail.symbol
+        order.side = detail.side
+        order.quantity = detail.contracts * contract_size
+        order.price = detail.avg_price
+        order.fee = detail.fee_abs
+        order.status = (
+            "partial"
+            if _order_row_state(order_row) == "canceled" and detail.contracts > 0
+            else _order_row_status(order_row) or "filled"
+        )
+        order.filled_at = detail.timestamp or getattr(order, "filled_at", None) or now
+        order.okx_trade_ids = ",".join(detail.trade_ids)
+        order.okx_fill_contracts = detail.contracts
+        order.okx_fill_pnl = detail.fill_pnl
+        order.okx_state = _order_row_state(order_row) or "filled"
+        order.okx_sync_status = OKX_SYNC_ORDER_DETAIL_CONFIRMED
+        order.okx_synced_at = now
+        order.okx_last_error = None
+        existing_raw = getattr(order, "okx_raw_fills", None)
+        existing_raw = existing_raw if isinstance(existing_raw, dict) else {}
+        raw_fact = {
+            "source": "okx_order_detail",
+            "order_detail_confirmed": True,
+            "fills_history_confirmed": False,
+            "execution_result_confirmed": False,
+            "exchange_state": _order_row_state(order_row),
+            "order_id": detail.order_id,
+            "trade_ids": list(detail.trade_ids),
+            "inst_id": detail.inst_id,
+            "pos_side": detail.pos_side,
+            "contracts": detail.contracts,
+            "contract_size": contract_size or None,
+            "contract_size_verified": contract_size > 0,
+            "contract_size_source": (
+                "okx_public_instruments" if contract_size > 0 else "okx_public_instruments_missing"
+            ),
+            "base_quantity": detail.contracts * contract_size if contract_size > 0 else None,
+            "avg_price": detail.avg_price,
+            "fee_abs": detail.fee_abs,
+            "fill_pnl": detail.fill_pnl,
+            "pnl_source": "pnl" if "pnl" in order_row else "fillPnl",
+            "timestamp": detail.timestamp.isoformat() if detail.timestamp else None,
+            "rows": [dict(order_row)],
+            "order_rows": [dict(order_row)],
+        }
+        protection_submission = existing_raw.get("protection_submission")
+        if isinstance(protection_submission, dict) and protection_submission:
+            raw_fact["protection_submission"] = dict(protection_submission)
+        order.okx_raw_fills = raw_fact
+
 
 def _order_has_okx_execution_result_fact(order: Order) -> bool:
     raw = getattr(order, "okx_raw_fills", None)
@@ -2305,6 +2422,12 @@ def _recover_okx_execution_result_fact_from_decision(
     decision: AIDecision | None,
 ) -> bool:
     if decision is None:
+        return False
+    # A decision payload is a recovery hint only. Never replace a stronger
+    # exchange-backed fact that was already persisted on this order.
+    if _order_has_authoritative_stored_okx_fill_fact(order) or _order_has_okx_order_detail_fact(
+        order
+    ):
         return False
     raw = getattr(decision, "raw_llm_response", None)
     raw = raw if isinstance(raw, dict) else {}
@@ -2356,14 +2479,18 @@ def _recover_okx_execution_result_fact_from_decision(
     if not inst_id or not inst_id.endswith("-SWAP") or contracts <= 0 or avg_price <= 0:
         return False
     trade_id = str(info.get("tradeId") or raw_response.get("tradeId") or "").strip()
-    fee_abs = abs(_safe_float(info.get("fee") or execution_result.get("fee"), 0.0))
-    fill_pnl = _safe_float(
+    fee_value = info.get("fee") if info.get("fee") is not None else execution_result.get("fee")
+    fee_abs = abs(_safe_float(fee_value, 0.0))
+    fill_pnl_value = (
         info.get("fillPnl")
-        or info.get("pnl")
-        or raw_response.get("pnl")
-        or execution_result.get("pnl"),
-        0.0,
+        if info.get("fillPnl") is not None
+        else info.get("pnl")
+        if info.get("pnl") is not None
+        else raw_response.get("pnl")
+        if raw_response.get("pnl") is not None
+        else execution_result.get("pnl")
     )
+    fill_pnl = _safe_float(fill_pnl_value, 0.0)
     base_quantity = _safe_float(
         execution_result.get("quantity") or getattr(order, "quantity", None),
         0.0,
@@ -2418,12 +2545,22 @@ def _recover_okx_close_fill_fact_from_decision(
     trade_id = str(
         close_fill.get("trade_id") or close_fill.get("tradeId") or info.get("tradeId") or ""
     ).strip()
-    fee_abs = abs(
-        _safe_float(close_fill.get("fee") or info.get("fee") or getattr(order, "fee", None), 0.0)
+    fee_value = (
+        close_fill.get("fee")
+        if close_fill.get("fee") is not None
+        else info.get("fee")
+        if info.get("fee") is not None
+        else getattr(order, "fee", None)
     )
-    fill_pnl = _safe_float(
-        close_fill.get("pnl") or close_fill.get("fillPnl") or info.get("fillPnl"), 0.0
+    fee_abs = abs(_safe_float(fee_value, 0.0))
+    fill_pnl_value = (
+        close_fill.get("pnl")
+        if close_fill.get("pnl") is not None
+        else close_fill.get("fillPnl")
+        if close_fill.get("fillPnl") is not None
+        else info.get("fillPnl")
     )
+    fill_pnl = _safe_float(fill_pnl_value, 0.0)
     base_quantity = _safe_float(
         close_fill.get("quantity")
         or close_fill.get("base_quantity")
@@ -2471,9 +2608,18 @@ def _embedded_okx_order_detail_complete(order: Order, raw: dict[str, Any]) -> bo
     )
     if not isinstance(detail, dict):
         return False
-    detail_contracts = _safe_float(detail.get("accFillSz") or detail.get("fillSz"), 0.0)
-    detail_price = _safe_float(detail.get("avgPx") or detail.get("fillPx"), 0.0)
-    detail_trade_id = str(detail.get("tradeId") or "").strip()
+    validated = validated_okx_order_detail(
+        detail,
+        order_id=exchange_order_id,
+        inst_id=_order_inst_id(order),
+        side=str(getattr(order, "side", "") or ""),
+        contract_size=_safe_float(raw.get("contract_size"), 1.0),
+    )
+    if validated is None:
+        return False
+    detail_contracts = validated.contracts
+    detail_price = validated.avg_price
+    detail_trade_id = validated.trade_ids[0]
     detail_state = str(detail.get("state") or "").strip().lower()
     local_status = str(getattr(order, "status", "") or "").strip().lower()
     terminal_partial_fill = bool(
@@ -2488,6 +2634,10 @@ def _embedded_okx_order_detail_complete(order: Order, raw: dict[str, Any]) -> bo
         and str(detail.get("instId") or "").strip().upper() == fact_inst_id
         and detail_trade_id
         and detail_trade_id in fact_trade_ids
+        and _relative_close_enough(validated.fee_abs, _safe_float(raw.get("fee_abs"), -1), 0.000001)
+        and _relative_close_enough(
+            validated.fill_pnl, _safe_float(raw.get("fill_pnl"), float("nan")), 0.000001
+        )
         and fact_contracts > 0
         and _relative_close_enough(detail_contracts, fact_contracts, 0.000001)
         and fact_price > 0
@@ -2509,8 +2659,9 @@ def _promote_execution_result_to_order_detail(order: Order, *, now: datetime) ->
     raw["order_detail_confirmed"] = True
     raw["execution_result_confirmed"] = False
     raw["fills_history_confirmed"] = False
+    raw["exchange_state"] = str(raw["rows"][0].get("state") or "").strip().lower()
     order.okx_raw_fills = raw
-    order.okx_state = "order_detail_confirmed"
+    order.okx_state = raw["exchange_state"]
     order.okx_sync_status = OKX_SYNC_ORDER_DETAIL_CONFIRMED
     order.okx_synced_at = now
     order.okx_last_error = None
@@ -2553,8 +2704,16 @@ def _apply_execution_result_confirmation_to_order(order: Order, *, now: datetime
     contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
     base_quantity = _stored_fill_base_quantity(raw)
     avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
-    fee_abs = _safe_float(raw.get("fee_abs") or getattr(order, "fee", None), 0.0)
-    fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
+    fee_abs = _safe_float(
+        raw.get("fee_abs") if raw.get("fee_abs") is not None else getattr(order, "fee", None),
+        0.0,
+    )
+    fill_pnl = _safe_float(
+        raw.get("fill_pnl")
+        if raw.get("fill_pnl") is not None
+        else getattr(order, "okx_fill_pnl", None),
+        0.0,
+    )
     if inst_id:
         order.okx_inst_id = inst_id
         order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
@@ -2571,7 +2730,9 @@ def _apply_execution_result_confirmation_to_order(order: Order, *, now: datetime
     order.okx_fill_pnl = fill_pnl
     order_detail_confirmed = raw.get("order_detail_confirmed") is True
     order.okx_state = (
-        "order_detail_confirmed" if order_detail_confirmed else "execution_result_confirmed"
+        str(raw.get("exchange_state") or "order_detail_confirmed")
+        if order_detail_confirmed
+        else "execution_result_confirmed"
     )
     order.okx_sync_status = (
         OKX_SYNC_ORDER_DETAIL_CONFIRMED
@@ -2594,8 +2755,16 @@ def _apply_close_fill_confirmation_to_order(order: Order, *, now: datetime) -> N
     contracts = _safe_float(raw.get("contracts") or getattr(order, "okx_fill_contracts", None), 0.0)
     base_quantity = _stored_fill_base_quantity(raw)
     avg_price = _safe_float(raw.get("avg_price") or getattr(order, "price", None), 0.0)
-    fee_abs = _safe_float(raw.get("fee_abs") or getattr(order, "fee", None), 0.0)
-    fill_pnl = _safe_float(raw.get("fill_pnl") or getattr(order, "okx_fill_pnl", None), 0.0)
+    fee_abs = _safe_float(
+        raw.get("fee_abs") if raw.get("fee_abs") is not None else getattr(order, "fee", None),
+        0.0,
+    )
+    fill_pnl = _safe_float(
+        raw.get("fill_pnl")
+        if raw.get("fill_pnl") is not None
+        else getattr(order, "okx_fill_pnl", None),
+        0.0,
+    )
     filled_at = _parse_datetime(raw.get("timestamp"))
     if inst_id:
         order.okx_inst_id = inst_id
@@ -2773,7 +2942,9 @@ def _repair_execution_contract_size_from_instruments(
     order.okx_fill_contracts = contracts
     order_detail_confirmed = raw.get("order_detail_confirmed") is True
     order.okx_state = (
-        "order_detail_confirmed" if order_detail_confirmed else "execution_result_confirmed"
+        str(raw.get("exchange_state") or "order_detail_confirmed")
+        if order_detail_confirmed
+        else "execution_result_confirmed"
     )
     order.okx_sync_status = (
         OKX_SYNC_ORDER_DETAIL_CONFIRMED
@@ -2799,6 +2970,27 @@ def _order_inst_id(order: Order) -> str:
     if inst_id:
         return inst_id
     return okx_inst_id_from_symbol(getattr(order, "symbol", None)) or ""
+
+
+def _order_inst_ids_by_id(
+    orders: list[Order],
+    decisions_by_id: dict[int, Any],
+) -> dict[str, str]:
+    inst_ids_by_order_id: dict[str, str] = {}
+    for order in orders:
+        inst_id = str(getattr(order, "okx_inst_id", "") or "").strip().upper()
+        if not inst_id:
+            decision = decisions_by_id.get(int(getattr(order, "decision_id", 0) or 0))
+            inst_id = okx_inst_id_from_payload(
+                getattr(decision, "raw_llm_response", None),
+                include_fallback=False,
+            )
+        if not inst_id:
+            inst_id = _order_inst_id(order)
+        for order_id in _split_exchange_order_ids(getattr(order, "exchange_order_id", None)):
+            if inst_id:
+                inst_ids_by_order_id[order_id] = inst_id
+    return inst_ids_by_order_id
 
 
 def _order_requires_native_full_close_backfill(order: Order) -> bool:
@@ -3734,6 +3926,23 @@ def _order_row_filled_at(row: dict[str, Any] | None) -> datetime | None:
     return _datetime_from_ms(row.get("uTime") or row.get("fillTime"))
 
 
+def _order_detail_fill_from_order_row(
+    order: Order,
+    row: dict[str, Any] | None,
+    *,
+    contract_size: float,
+) -> OkxNativeFillGroup | None:
+    """Build a complete, identity-checked execution from OKX orders-history."""
+
+    return validated_okx_order_detail(
+        row,
+        order_id=str(getattr(order, "exchange_order_id", "") or "").strip(),
+        inst_id=_order_inst_id(order),
+        side=str(getattr(order, "side", "") or "").strip().lower(),
+        contract_size=contract_size,
+    )
+
+
 def _order_row_status(row: dict[str, Any] | None) -> str:
     state = _order_row_state(row)
     if state == "filled":
@@ -3791,12 +4000,18 @@ def _base_quantity_from_order_row(row: dict[str, Any], contract_size: float) -> 
 def _apply_order_row_metadata(order: Order, row: dict[str, Any], *, now: datetime) -> None:
     order_id = _order_row_id(row)
     inst_id = str(row.get("instId") or "").strip().upper()
+    side = str(row.get("side") or "").lower().strip()
+    if (
+        order_id not in _split_exchange_order_ids(order.exchange_order_id)
+        or (inst_id and _order_inst_id(order) and inst_id != _order_inst_id(order))
+        or (side and order.side and side != str(order.side).strip().lower())
+    ):
+        return
     if order_id:
         order.exchange_order_id = order_id
     if inst_id:
         order.okx_inst_id = inst_id
         order.symbol = symbol_from_okx_inst_id(inst_id) or order.symbol
-    side = str(row.get("side") or "").lower().strip()
     if side:
         order.side = side
     price = _order_row_price(row)
@@ -4193,7 +4408,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
-        return float(value)
+        result = float(value)
+        return result if isfinite(result) else default
     except (TypeError, ValueError):
         return default
 

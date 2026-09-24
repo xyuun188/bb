@@ -70,8 +70,21 @@ def test_entry_only_decision_command_has_early_targeted_return() -> None:
 
     assert "ENTRY_ONLY = True" in command
     assert "DECISION_ID = 133061" in command
-    assert "if ENTRY_ONLY and DECISION_ID > 0:" in command
+    assert "if ENTRY_ONLY:" in command
+    assert '"recent_entry_flow": await _read_recent_entry_flow(since)' in command
     assert '"selected_decision": await _read_selected_decision()' in command
+
+
+def test_entry_summary_keeps_recent_fills_and_reconciliation_gate() -> None:
+    flow = {
+        "recent_orders": [{"id": 42, "status": "filled", "okx_sync_status": "okx_confirmed"}],
+        "recent_decisions": [{"id": 73, "execution_reason": "risk_budget_ineligible"}],
+        "reconciliation": {"can_open_new_entries": False},
+    }
+    summary = inspect_online_strategy_health._summarize_entry_report(
+        {"recent_entry_flow": flow}
+    )
+    assert summary["recent_entry_flow"] == flow
 
 
 def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:

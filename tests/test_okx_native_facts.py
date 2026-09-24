@@ -11,7 +11,34 @@ from services.okx_native_facts import (
     OkxNativeFactsClient,
     build_okx_protection_execution_lifecycle,
     group_okx_native_fill_rows,
+    validated_okx_order_detail,
 )
+
+
+@pytest.mark.parametrize("key, value", [
+    ("accFillSz", "NaN"), ("avgPx", "inf"), ("fee", None), ("pnl", None),
+    ("pnl", "NaN"), ("uTime", "inf"), ("side", "sell"), ("instId", "ETH-USDT-SWAP"),
+    ("ordId", "wrong"), ("state", "live"), ("tradeId", ""),
+])
+def test_order_detail_rejects_incomplete_or_nonfinite_evidence(key, value) -> None:
+    row = {
+        "ordId": "detail", "instId": "BTC-USDT-SWAP", "side": "buy",
+        "state": "filled", "tradeId": "t", "accFillSz": "2", "avgPx": "100",
+        "fee": 0, "pnl": 0, "uTime": "1780000000000", "fillPnl": "99",
+    }
+    row[key] = value
+    assert validated_okx_order_detail(
+        row, order_id="detail", inst_id="BTC-USDT-SWAP", side="buy", contract_size=0.01,
+    ) is None
+
+
+def test_fill_aggregation_preserves_numeric_zero_over_fallback_pnl() -> None:
+    groups = group_okx_native_fill_rows([{
+        "instId": "BTC-USDT-SWAP", "ordId": "zero", "tradeId": "zero-trade",
+        "side": "buy", "fillSz": "1", "fillPx": "100", "fillPnl": 0,
+        "pnl": "999", "fee": 0, "ts": "1780000000000",
+    }])
+    assert groups[0].fill_pnl == 0
 
 
 class _FakeCcxt:
@@ -313,6 +340,12 @@ class _OrderHistoryDetailFallbackCcxt(_FakeCcxt):
                 }
             ]
         }
+
+
+class _WrongOrderHistoryTargetDetailCcxt(_OrderHistoryDetailFallbackCcxt):
+    async def privateGetTradeOrdersHistory(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.order_history_params.append(dict(params))
+        return {"data": [{"instId": params["instId"], "ordId": "unrelated-order"}]}
 
 
 class _PagedOrderHistoryCcxt:
@@ -1016,6 +1049,45 @@ async def test_native_facts_client_fetches_order_history_rows_with_phase3_begin(
             "begin": str(int(since.timestamp() * 1000)),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_order_history_rows_uses_local_inst_id_and_exact_detail_fallback() -> None:
+    ccxt = _WrongOrderHistoryTargetDetailCcxt()
+    rows = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_order_history_rows(
+        order_ids=["target-order"],
+        inst_ids_by_order_id={"target-order": "XLM-USDT-SWAP"},
+        limit=5,
+    )
+
+    assert [row["ordId"] for row in rows] == ["target-order"]
+    assert all(params["instId"] == "XLM-USDT-SWAP" for params in ccxt.order_history_params)
+    assert ccxt.order_detail_params == [
+        {"instId": "XLM-USDT-SWAP", "ordId": "target-order"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_order_history_context_queries_local_orders_without_any_fills() -> None:
+    ccxt = _OrderHistoryDetailFallbackCcxt()
+    contexts = await OkxNativeFactsClient(_FakeExecutor(ccxt)).fetch_order_history_contexts(
+        order_ids=["target-order"],
+        inst_ids_by_order_id={"target-order": "XLM-USDT-SWAP"},
+        limit=5,
+    )
+
+    assert ccxt.order_history_params == [
+        {
+            "instType": "SWAP",
+            "ordId": "target-order",
+            "limit": "5",
+            "instId": "XLM-USDT-SWAP",
+        }
+    ]
+    assert ccxt.order_detail_params == [
+        {"instId": "XLM-USDT-SWAP", "ordId": "target-order"}
+    ]
+    assert contexts["target-order"]
 
 
 @pytest.mark.asyncio

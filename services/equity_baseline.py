@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from math import isfinite
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -10,8 +11,6 @@ from models.account import ExecutionEquitySnapshot
 from services.phase3_boundary import PHASE3_FIRST_CLEAN_DAY
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-OKX_BASELINE_MAX_DRIFT_RATIO = 0.10
-OKX_BASELINE_MAX_DRIFT_USDT = 250.0
 
 
 def beijing_day_bounds(now: datetime | None = None) -> tuple[str, datetime, datetime]:
@@ -40,7 +39,8 @@ async def apply_daily_equity_baseline(
     return an unavailable baseline instead of estimating from local positions,
     fixed allocations, or historical virtual balances.
     """
-    snapshot_date, start_local, _start_utc = beijing_day_bounds(now)
+    observed_at = now.astimezone(BEIJING_TZ) if now else datetime.now(BEIJING_TZ)
+    snapshot_date, _start_local, _start_utc = beijing_day_bounds(observed_at)
     selected_mode = "live" if mode == "live" else "paper"
 
     baseline = await _get_or_create_baseline(
@@ -48,7 +48,7 @@ async def apply_daily_equity_baseline(
         mode=selected_mode,
         model_name=model_name,
         snapshot_date=snapshot_date,
-        snapshot_at=start_local,
+        snapshot_at=observed_at,
         current_equity=current_equity,
     )
     baseline_equity = _safe_float(baseline.get("equity"), None)
@@ -122,8 +122,11 @@ async def _get_or_create_baseline(
 ) -> dict:
     row = await _select_baseline(session, mode, model_name, snapshot_date)
     if row:
-        okx_equity = _safe_float(current_equity, None)
-        if _baseline_must_be_rebuilt(row, okx_equity, snapshot_date):
+        # A valid opening snapshot is immutable for the Beijing trading day.
+        # Current equity is the observation used to calculate movement; it is
+        # never evidence that the opening balance was wrong.
+        if _baseline_must_be_rebuilt(row, snapshot_date):
+            okx_equity = _safe_float(current_equity, None)
             if okx_equity is None or okx_equity <= 0:
                 return _unavailable_baseline(snapshot_date)
             row.snapshot_at = snapshot_at
@@ -176,7 +179,6 @@ async def _get_or_create_baseline(
 
 def _baseline_must_be_rebuilt(
     row: ExecutionEquitySnapshot,
-    okx_equity: float | None,
     snapshot_date: str,
 ) -> bool:
     source = str(row.source or "")
@@ -187,8 +189,6 @@ def _baseline_must_be_rebuilt(
     row_equity = _safe_float(row.equity, None)
     if row_equity is None or row_equity <= 0:
         return True
-    if okx_equity is None or okx_equity <= 0:
-        return False
     snapshot_at = row.snapshot_at
     if isinstance(snapshot_at, datetime):
         if snapshot_at.tzinfo is None:
@@ -196,10 +196,6 @@ def _baseline_must_be_rebuilt(
         snapshot_local = snapshot_at.astimezone(BEIJING_TZ)
         if snapshot_local.date().isoformat() != snapshot_date:
             return True
-    drift = abs(okx_equity - row_equity)
-    drift_ratio = drift / max(abs(okx_equity), abs(row_equity), 1e-12)
-    if drift > OKX_BASELINE_MAX_DRIFT_USDT and drift_ratio > OKX_BASELINE_MAX_DRIFT_RATIO:
-        return True
     return False
 
 
@@ -280,6 +276,7 @@ def _safe_float(value, default: float | None = 0.0) -> float | None:
     try:
         if value is None:
             return default
-        return float(value)
+        result = float(value)
+        return result if isfinite(result) else default
     except (TypeError, ValueError):
         return default

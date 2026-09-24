@@ -260,7 +260,13 @@ class TradeOrderLogService:
         pnl_value = (
             info.get("pnl")
             if order_detail_confirmed and info.get("pnl") not in (None, "")
-            else info.get("fillPnl") or info.get("pnl") or raw.get("pnl")
+            else (
+                info.get("fillPnl")
+                if info.get("fillPnl") is not None
+                else info.get("pnl")
+                if info.get("pnl") is not None
+                else raw.get("pnl")
+            )
         )
         pnl = TradeOrderLogService._safe_float(
             pnl_value,

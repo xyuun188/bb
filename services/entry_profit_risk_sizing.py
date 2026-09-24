@@ -688,6 +688,12 @@ def reconcile_profit_risk_sizing(
     )
     risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
     stress = max(_safe_float(sizing.get("stressed_loss_fraction"), 0.0), 0.0)
+    protection_risk = _safe_dict(facts.get("protection_risk"))
+    if source == "okx_pre_submit_order_shape" and protection_risk:
+        stress = max(
+            stress,
+            _safe_float(protection_risk.get("stressed_loss_fraction"), 0.0),
+        )
     minimum_order_notional = max(
         _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0),
         0.0,
@@ -785,6 +791,7 @@ def reconcile_profit_risk_sizing(
             "final_leverage": round(leverage, 8),
             "minimum_order_notional_usdt": round(minimum_order_notional, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
+            "stressed_loss_fraction": stress,
             "expected_profit_usdt": round(notional * expected_net / 100.0, 8),
             "execution_reconciliations": history,
         }
@@ -1719,12 +1726,9 @@ class EntryProfitRiskSizingPolicy:
             NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        # A non-positive lower confidence bound is an observation signal, not an
-        # executable strategy edge.  Keep it in the decision/audit trail, but do
-        # not spend a normal paper risk budget on a known-uncertain direction.
-        # Positive-LCB observations still use the bounded paper budget and can
-        # produce the trusted settlements needed for promotion.
-        risk_budget = 0.0 if non_positive_lcb_observation else single_trade_risk_budget
+        # Paper observations retain the paper risk cap. An uncertain lower bound
+        # increases stress (and reduces notional); it is not a live permission.
+        risk_budget = single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
@@ -1829,7 +1833,7 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            allow_non_positive_return_lcb=False,
+            allow_non_positive_return_lcb=non_positive_lcb_observation,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2024,7 +2028,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": non_positive_lcb_observation,
+            "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "target_notional_usdt": target_notional,
@@ -2128,7 +2132,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
-            "paper_quality_shadow_only": non_positive_lcb_observation,
+            "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
             "dynamic_leverage_decision": leverage_decision.to_dict(),

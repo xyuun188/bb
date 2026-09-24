@@ -69,7 +69,6 @@ from services.phase3_server_migration_audit import Phase3ServerMigrationAuditSer
 from services.phase3_stage_handoff import Phase3StageHandoffService
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 from services.production_source_health import ProductionSourceHealthService
-from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.server_monitor_status import (
     collect_platform_runtime_status,
     get_cached_platform_runtime_status,
@@ -79,7 +78,10 @@ from services.shadow_missed_opportunity_closed_loop import (
 )
 from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
 from services.strong_opportunity import StrongOpportunityService
-from services.trade_execution_contract import TradeExecutionContractService
+from services.trade_execution_contract import (
+    TradeExecutionContractService,
+    trade_execution_policy,
+)
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import (
     CURRENT_TRAINING_EPOCH_POLICY,
@@ -942,27 +944,8 @@ def _safe_trade_execution_contract_report(report: dict[str, Any]) -> dict[str, A
         "entry_requires_live_execution_cost",
     ):
         policy.pop(retired_key, None)
-    policy["optimization_target"] = PROFIT_TRAINING_TARGET
-    policy["paper_entry_requires_model_promotion"] = False
     policy.pop("paper_entry_requires_positive_return_lcb", None)
-    policy["paper_normal_entry_requires_positive_return_lcb"] = True
-    policy["paper_quality_observation_requires_positive_expected_net_return"] = True
-    policy["paper_quality_observation_allows_non_positive_return_lcb"] = False
-    policy["paper_entry_requires_profit_factor"] = False
-    policy["paper_entry_requires_positive_expected_net_return"] = True
-    policy["paper_entry_requires_current_execution_cost"] = True
-    policy["paper_entry_requires_independent_quant_family_count"] = 1
-    policy["paper_direction_concentration_alert_threshold"] = 0.80
-    policy["paper_direction_concentration_is_execution_quota"] = False
-    policy["live_entry_requires_production_trade_gate"] = True
-    policy["live_entry_requires_positive_fee_after_return"] = True
-    policy["live_entry_requires_positive_return_lcb"] = True
-    policy["live_entry_requires_current_execution_cost"] = True
-    policy["entry_requires_dynamic_risk_budget"] = True
-    policy["entry_requires_complete_provenance"] = True
-    policy["exit_requires_position_economics"] = True
-    policy["exit_requires_dynamic_close_fraction"] = True
-    policy["filled_order_link_required"] = True
+    policy.update(trade_execution_policy())
     safe["policy"] = policy
     return safe
 

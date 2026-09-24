@@ -1977,6 +1977,109 @@ def test_contract_catalog_keeps_only_public_specification() -> None:
     assert catalog["BTC-USDT-SWAP"] == pytest.approx(0.01)
 
 
+def test_orders_history_complete_execution_is_confirmed_without_fills_history() -> None:
+    now = datetime.now(UTC)
+    order_id = "orders-history-only"
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.02,
+        price=60000.0,
+        status="filled",
+        exchange_order_id=order_id,
+        okx_inst_id="BTC-USDT-SWAP",
+        created_at=now,
+        filled_at=now,
+    )
+    row = {
+        "ordId": order_id,
+        "instId": "BTC-USDT-SWAP",
+        "side": "buy",
+        "posSide": "net",
+        "state": "filled",
+        "accFillSz": "2",
+        "avgPx": "60001.25",
+        "fee": "-0.012",
+        "pnl": "0",
+        "tradeId": "orders-history-trade",
+        "fillTime": str(int(now.timestamp() * 1000)),
+    }
+
+    confirmed, unverified, _skipped, deferred, samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        [order],
+        fills=[],
+        fills_by_order_id={},
+        order_rows_by_id={order_id: row},
+        protection_execution_by_order_id={},
+        contract_sizes={"BTC-USDT-SWAP": 0.01},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids={order_id},
+    )
+
+    assert (confirmed, unverified, deferred) == (1, 0, 0)
+    assert samples[0]["kind"] == "local_order_confirmed_from_order_history_detail"
+    assert order.quantity == pytest.approx(0.02)
+    assert order.price == pytest.approx(60001.25)
+    assert order.fee == pytest.approx(0.012)
+    assert order.okx_fill_pnl == pytest.approx(0.0)
+    assert order.okx_sync_status == OKX_SYNC_ORDER_DETAIL_CONFIRMED
+    assert order.okx_raw_fills["source"] == "okx_order_detail"
+    assert order.okx_raw_fills["order_detail_confirmed"] is True
+    assert order.okx_raw_fills["fills_history_confirmed"] is False
+    assert order.okx_raw_fills["execution_result_confirmed"] is False
+    assert order.okx_raw_fills["pnl_source"] == "pnl"
+    assert "execution_slippage" not in order.okx_raw_fills
+
+
+def test_orders_history_missing_execution_fields_stays_unverified() -> None:
+    now = datetime.now(UTC)
+    order_id = "orders-history-incomplete"
+    order = Order(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        quantity=0.02,
+        price=60000.0,
+        status="filled",
+        exchange_order_id=order_id,
+        okx_inst_id="BTC-USDT-SWAP",
+        created_at=now,
+        filled_at=now,
+    )
+    row = {
+        "ordId": order_id,
+        "instId": "BTC-USDT-SWAP",
+        "side": "buy",
+        "state": "filled",
+    }
+
+    confirmed, unverified, _skipped, deferred, samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        [order],
+        fills=[],
+        fills_by_order_id={},
+        order_rows_by_id={order_id: row},
+        protection_execution_by_order_id={},
+        contract_sizes={"BTC-USDT-SWAP": 0.01},
+        now=now,
+        since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids={order_id},
+    )
+
+    assert (confirmed, unverified, deferred) == (0, 1, 0)
+    assert samples[0]["kind"] == "local_filled_unverified"
+    assert order.okx_sync_status == OKX_SYNC_UNVERIFIED
+
+
 def test_stored_fill_cannot_recover_missing_raw_contracts_from_local_columns() -> None:
     now = datetime.now(UTC)
     order = Order(
@@ -3112,6 +3215,7 @@ async def test_complete_embedded_okx_order_detail_is_promoted_from_execution_res
         "avgPx": "0.00895",
         "fillPx": "0.00895",
         "fee": "-0.001",
+        "pnl": "0",
         "fillTime": _ms(now),
         "uTime": _ms(now),
     }
@@ -3179,6 +3283,66 @@ async def test_complete_embedded_okx_order_detail_is_promoted_from_execution_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state, local_status", [("filled", "filled"), ("canceled", "partial")])
+async def test_sync_recovers_detail_without_fills_and_upgrades_idempotently(
+    tmp_path, monkeypatch, state, local_status,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "detail-upgrade.db")
+    now = datetime.now(UTC)
+    order_id = "detail-upgrade-1"
+    detail = {
+        **_act_order_row(now, order_id=order_id),
+        "state": state, "accFillSz": "4", "tradeId": "last-detail-trade",
+        "fee": 0, "pnl": 0, "fillPnl": "999", "uTime": _ms(now),
+    }
+
+    class DetailCcxt(_FakeCcxt):
+        async def privateGetTradeOrder(self, params):
+            assert params == {"instId": "ACT-USDT-SWAP", "ordId": order_id}
+            return {"data": [detail]}
+
+    ccxt = DetailCcxt(instruments=[_act_instrument_row()])
+    service = OkxOrderFactSyncService(
+        mode="paper", timeout_seconds=5, executor_factory=_executor_factory(ccxt),
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(Order(
+                model_name="ensemble_trader", execution_mode="paper", symbol="ACT/USDT",
+                side="buy", order_type="market", quantity=9, price=0.00895,
+                status="filled", fee=8, okx_fill_pnl=999, exchange_order_id=order_id,
+                created_at=now, filled_at=now,
+            ))
+        report = await service.sync()
+        assert report["confirmed_count"] == 1
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+            assert order.quantity == 4
+            assert order.status == local_status
+            assert order.okx_state == state
+            assert order.okx_fill_pnl == 0
+            assert order.fee == 0
+            assert order.okx_raw_fills["fills_history_confirmed"] is False
+            assert "execution_slippage" not in order.okx_raw_fills
+        await service.sync()
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+            assert order.okx_sync_status == OKX_SYNC_ORDER_DETAIL_CONFIRMED
+            assert order.okx_state == state
+            assert order.okx_fill_pnl == 0
+        ccxt.fills = [_act_fill_row(now, order_id=order_id)]
+        await service.sync()
+        await service.sync()
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+            assert order.okx_sync_status == OKX_SYNC_CONFIRMED
+            assert order.okx_raw_fills["fills_history_confirmed"] is True
+            assert order.quantity == 4
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_terminal_partial_fill_order_detail_is_authoritative(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3199,6 +3363,7 @@ async def test_terminal_partial_fill_order_detail_is_authoritative(
         "avgPx": "0.0194709270639946",
         "fillPx": "0.0194",
         "fee": "-0.21972065",
+        "pnl": "0",
         "fillTime": _ms(now),
         "uTime": _ms(now),
     }

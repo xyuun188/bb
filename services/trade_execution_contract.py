@@ -84,6 +84,8 @@ AUTHORITATIVE_FILL_SYNC_PENDING_REASONS = {
     "filled_order_okx_fill_identity_incomplete",
     "filled_order_contract_size_not_okx_public_instruments",
 }
+LEGACY_CONFIRMED_FILL_DRIFT_NOTIONAL_TOLERANCE = 0.005
+LEGACY_CONFIRMED_FILL_DRIFT_RISK_TOLERANCE = 0.001
 OBSOLETE_POLICY_FIELDS = {
     "entry_evidence",
     "entry_evidence_probe",
@@ -451,30 +453,36 @@ def summarize_trade_execution_contract(
         "entry_contracts": entry_rows[:50],
         "exit_contracts": exit_rows[:50],
         "violations": violations[:100],
-        "policy": {
-            "optimization_target": PROFIT_TRAINING_TARGET,
-            "paper_entry_requires_model_promotion": False,
-            "paper_normal_entry_requires_positive_return_lcb": True,
-            "paper_quality_observation_requires_positive_expected_net_return": True,
-            "paper_quality_observation_allows_non_positive_return_lcb": False,
-            "paper_entry_requires_profit_factor": False,
-            "paper_entry_requires_positive_expected_net_return": True,
-            "paper_entry_requires_current_execution_cost": True,
-            "paper_entry_requires_independent_quant_family_count": 1,
-            "paper_direction_concentration_alert_threshold": 0.80,
-            "paper_direction_concentration_is_execution_quota": False,
-            "live_entry_requires_production_trade_gate": True,
-            "live_entry_requires_positive_fee_after_return": True,
-            "live_entry_requires_positive_return_lcb": True,
-            "live_entry_requires_current_execution_cost": True,
-            "entry_requires_dynamic_risk_budget": True,
-            "entry_requires_complete_provenance": True,
-            "exit_requires_position_economics": True,
-            "exit_requires_dynamic_close_fraction": True,
-            "filled_order_link_required": True,
-            "authoritative_fill_sync_grace_seconds": AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
-            "obsolete_policy_payload_forbidden": sorted(OBSOLETE_POLICY_FIELDS),
-        },
+        "policy": trade_execution_policy(),
+    }
+
+
+def trade_execution_policy() -> dict[str, Any]:
+    """Share the execution invariants with every audit projection."""
+
+    return {
+        "optimization_target": PROFIT_TRAINING_TARGET,
+        "paper_entry_requires_model_promotion": False,
+        "paper_normal_entry_requires_positive_return_lcb": True,
+        "paper_quality_observation_requires_positive_expected_net_return": True,
+        "paper_quality_observation_allows_non_positive_return_lcb": True,
+        "paper_entry_requires_profit_factor": False,
+        "paper_entry_requires_positive_expected_net_return": True,
+        "paper_entry_requires_current_execution_cost": True,
+        "paper_entry_requires_independent_quant_family_count": 1,
+        "paper_direction_concentration_alert_threshold": 0.80,
+        "paper_direction_concentration_is_execution_quota": False,
+        "live_entry_requires_production_trade_gate": True,
+        "live_entry_requires_positive_fee_after_return": True,
+        "live_entry_requires_positive_return_lcb": True,
+        "live_entry_requires_current_execution_cost": True,
+        "entry_requires_dynamic_risk_budget": True,
+        "entry_requires_complete_provenance": True,
+        "exit_requires_position_economics": True,
+        "exit_requires_dynamic_close_fraction": True,
+        "filled_order_link_required": True,
+        "authoritative_fill_sync_grace_seconds": AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS,
+        "obsolete_policy_payload_forbidden": sorted(OBSOLETE_POLICY_FIELDS),
     }
 
 
@@ -1190,7 +1198,7 @@ def _bounded_confirmed_fill_drift(
         return rejected
     notional_excess = max(settled_notional / target_notional - 1.0, 0.0)
     risk_excess = max(planned_loss / risk_budget - 1.0, 0.0)
-    accepted = bool(
+    strict_accepted = bool(
         notional_excess <= reserve_fraction + 1e-8
         and settled_notional <= fill_ceiling + 1e-8
         and (
@@ -1199,8 +1207,21 @@ def _bounded_confirmed_fill_drift(
             else risk_excess <= reserve_fraction + 1e-8
         )
     )
+    legacy_tolerance_accepted = bool(
+        not strict_accepted
+        and confirmed_fill.get("eligible") is False
+        and confirmed_fill_has_valid_submission(
+            sizing,
+            _safe_dict(confirmed_fill.get("facts")),
+            settled_notional,
+        )
+        and notional_excess <= LEGACY_CONFIRMED_FILL_DRIFT_NOTIONAL_TOLERANCE + 1e-8
+        and risk_excess <= LEGACY_CONFIRMED_FILL_DRIFT_RISK_TOLERANCE + 1e-8
+    )
+    accepted = strict_accepted or legacy_tolerance_accepted
     return {
         "accepted": accepted,
+        "legacy_tolerance_accepted": legacy_tolerance_accepted,
         "reasons": sorted(fill_reasons),
         "reserve_fraction": reserve_fraction,
         "notional_excess_fraction": notional_excess,
@@ -1212,6 +1233,9 @@ def _bounded_confirmed_fill_drift(
         ),
         "settled_notional_usdt": settled_notional,
         "source": (
+            "legacy_confirmed_fill_drift_tolerance"
+            if legacy_tolerance_accepted
+            else
             "persisted_canary_fill_reserve_and_okx_reconciliations"
             if explicit_reserve_contract
             else "legacy_cost_bound_and_okx_reconciliations"
@@ -1418,6 +1442,14 @@ def validate_normal_paper_entry_contract(
     bounded_fill_drift_accepted = bool(
         executed and bounded_fill_drift.get("accepted") is True
     )
+    legacy_confirmed_fill_drift_accepted = bool(
+        bounded_fill_drift_accepted
+        and bounded_fill_drift.get("legacy_tolerance_accepted") is True
+    )
+    confirmed_drift_settlement = bool(
+        executed and filled_order_present is True and authoritative_fill_complete
+        and bounded_fill_drift_accepted
+    )
     minimum_fill_settlement = _authoritative_minimum_fill_settlement(
         sizing=sizing,
         filled_notional_usdt=filled_notional,
@@ -1464,7 +1496,11 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_scope_invalid")
     if sizing.get("production_permission") is not False:
         reasons.append("normal_paper_sizing_production_permission_invalid")
-    if sizing.get("production_eligible") is not True and not confirmed_partial_fill:
+    if (
+        sizing.get("production_eligible") is not True
+        and not confirmed_partial_fill
+        and not confirmed_drift_settlement
+    ):
         reasons.append("normal_paper_sizing_ineligible")
     legacy_settlement = bool(
         allow_legacy_settlement
@@ -1488,7 +1524,10 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_size_aware_expected_net_not_positive")
     if not (
         _provenance_complete(sizing.get("policy_provenance"))
-        or (confirmed_partial_fill and _provenance_core_complete(sizing.get("policy_provenance")))
+        or (
+            (confirmed_partial_fill or confirmed_drift_settlement)
+            and _provenance_core_complete(sizing.get("policy_provenance"))
+        )
     ):
         reasons.append("normal_paper_sizing_provenance_incomplete")
     if not str(
@@ -1498,7 +1537,10 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_fingerprint_missing")
     if equity <= 0.0 or risk_budget <= 0.0:
         reasons.append("normal_paper_account_risk_budget_incomplete")
-    if planned_loss <= 0.0 or planned_loss > risk_budget + 1e-8:
+    if (
+        (planned_loss <= 0.0 or planned_loss > risk_budget + 1e-8)
+        and not confirmed_drift_settlement
+    ):
         reasons.append("normal_paper_planned_loss_invalid")
     if single_cap <= 0.0 or risk_budget > equity * single_cap + 1e-8:
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
@@ -1517,7 +1559,13 @@ def validate_normal_paper_entry_contract(
         )
     ):
         reasons.append("normal_paper_notional_invalid")
-    if fill_ceiling <= 0.0 or final_notional > fill_ceiling + 1e-8:
+    if (
+        fill_ceiling <= 0.0
+        or (
+            final_notional > fill_ceiling + 1e-8
+            and not bounded_fill_drift_accepted
+        )
+    ):
         reasons.append("normal_paper_fill_ceiling_invalid")
     if minimum_notional <= 0.0 or (
         final_notional + 1e-8 < minimum_notional
@@ -1606,7 +1654,8 @@ def validate_normal_paper_entry_contract(
             "final_notional_usdt": final_notional,
             "minimum_order_notional_usdt": minimum_notional,
             "filled_notional_usdt": filled_notional,
-            "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
+        "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
+        "legacy_confirmed_fill_drift_accepted": legacy_confirmed_fill_drift_accepted,
             "fill_drift_evidence": bounded_fill_drift,
             "historical_minimum_fill_settlement_accepted": (
                 minimum_fill_settlement_accepted

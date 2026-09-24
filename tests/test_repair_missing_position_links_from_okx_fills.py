@@ -1886,7 +1886,9 @@ async def test_apply_open_position_close_plan_closes_position_and_quarantines_tr
     assert position.is_open is False
     assert position.close_exchange_order_id == "met-close"
     assert position.current_price == pytest.approx(0.1749)
-    assert position.realized_pnl == pytest.approx(-0.049)
+    assert position.realized_pnl == pytest.approx(-0.05)
+    assert position.close_fill_pnl == pytest.approx(-0.049)
+    assert position.settlement_status == "settling"
     assert position.close_fill_pnl == pytest.approx(-0.049)
     assert position.close_fee == pytest.approx(0.001)
     assert position.closed_at == closed_at.replace(tzinfo=None)
@@ -2012,7 +2014,7 @@ async def test_apply_open_position_close_plan_reuses_existing_okx_confirmed_orde
     assert result["applied"] == 1
     assert position.is_open is False
     assert position.close_exchange_order_id == "act-close"
-    assert position.realized_pnl == pytest.approx(1.7907)
+    assert position.realized_pnl == pytest.approx(1.7907 - 0.0057658)
     assert position.unrealized_pnl == pytest.approx(0.0)
     assert position.close_fill_pnl == pytest.approx(1.7907)
     assert position.close_fee == pytest.approx(0.0057658)
@@ -2148,7 +2150,7 @@ async def test_apply_close_link_reassignment_updates_order_and_reflection(
 
     assert result["applied"] == 1
     assert position.close_exchange_order_id == "3693817049043931137"
-    assert position.realized_pnl == pytest.approx(-1.37142857)
+    assert position.realized_pnl == pytest.approx(-1.37142857 - 0.009645)
     assert order["quantity"] == pytest.approx(10.0)
     assert order["fee"] == pytest.approx(0.009645)
     assert {row["source"] for row in reflections} == {
@@ -2281,7 +2283,7 @@ async def test_apply_native_full_close_shared_updates_split_positions_and_one_or
     assert result["applied"] == 1
     assert all(position.close_exchange_order_id == "3693841704639238144" for position in positions)
     assert all(position.current_price == pytest.approx(0.15541926) for position in positions)
-    assert all(position.realized_pnl == pytest.approx(-0.2282) for position in positions)
+    assert all(position.realized_pnl == pytest.approx((-0.4564 - 0.0104908) / 2) for position in positions)
     assert order.exchange_order_id == "3693841704639238144"
     assert order.quantity == pytest.approx(135.0)
     assert order.fee == pytest.approx(0.0104908)
@@ -2391,7 +2393,7 @@ async def test_apply_shared_open_position_close_closes_all_fragments(
         for position in positions
     )
     assert all(
-        position is not None and position.realized_pnl == pytest.approx(0.39)
+        position is not None and position.realized_pnl == pytest.approx((0.78 - 0.01059) / 2)
         for position in positions
     )
     assert all(
@@ -2648,3 +2650,15 @@ async def _async_path(tmp_path):
 
 async def _async_value(value):
     return value
+@pytest.mark.parametrize("pnl, expected", [(0.0, -0.75), (2.0, 1.25), (None, 98.75)])
+def test_repair_settlement_preserves_zero_and_net_costs(pnl, expected) -> None:
+    position = Position(entry_fee=0.5, funding_fee=0.25)
+    repair_script._apply_repair_settlement(
+        position,
+        close_fill_pnl=pnl,
+        close_fee=0.5,
+        fallback_realized_pnl=99.0,
+    )
+    assert position.realized_pnl == pytest.approx(expected)
+    assert position.settlement_status == "settling"
+    assert position.settlement_raw["close_fill_pnl_confirmed"] is (pnl is not None)

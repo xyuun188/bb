@@ -12,9 +12,10 @@ import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
-from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
+from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symbol_from_okx_inst_id
 
 DEFAULT_FILL_LIMIT = 100
 DEFAULT_MAX_FILL_PAGES = 1
@@ -109,6 +110,67 @@ class OkxNativeFillGroup:
             self.rows,
             key=lambda row: _safe_float(row.get("ts") or row.get("fillTime"), 0.0),
         )
+
+
+def validated_okx_order_detail(
+    row: dict[str, Any] | None,
+    *,
+    order_id: str,
+    inst_id: str,
+    side: str,
+    contract_size: float,
+) -> OkxNativeFillGroup | None:
+    """Validate aggregate execution evidence without claiming fill history."""
+
+    if not isinstance(row, dict):
+        return None
+    normalized_inst_id = str(inst_id or "").strip().upper()
+    normalized_side = str(side or "").strip().lower()
+    state = str(row.get("state") or "").strip().lower()
+    trade_id = str(row.get("tradeId") or "").strip()
+    if not (
+        str(order_id or "").strip()
+        and str(row.get("ordId") or "").strip() == str(order_id).strip()
+        and normalized_inst_id.endswith("-SWAP")
+        and str(row.get("instId") or "").strip().upper() == normalized_inst_id
+        and normalized_side in {"buy", "sell"}
+        and str(row.get("side") or "").strip().lower() == normalized_side
+        and state in {"filled", "canceled", "cancelled"}
+        and trade_id
+    ):
+        return None
+    try:
+        contracts = float(row["accFillSz"])
+        avg_price = float(row["avgPx"])
+        fee = float(row["fee"])
+        pnl = float(row["pnl"])
+        timestamp_ms = float(row.get("fillTime") or row["uTime"])
+        size = float(contract_size)
+        if not all(isfinite(value) for value in (contracts, avg_price, fee, pnl, timestamp_ms, size)):
+            return None
+        if min(contracts, avg_price, timestamp_ms, size) <= 0:
+            return None
+        timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0, UTC)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    return OkxNativeFillGroup(
+        order_id=str(order_id).strip(),
+        trade_ids=(trade_id,),
+        inst_id=normalized_inst_id,
+        symbol=symbol_from_okx_inst_id(normalized_inst_id)
+        or normalize_trading_symbol(normalized_inst_id),
+        side=normalized_side,
+        pos_side=str(row.get("posSide") or "").strip().lower(),
+        contracts=contracts,
+        avg_price=avg_price,
+        fee_abs=abs(fee),
+        fill_pnl=pnl,
+        timestamp_ms=timestamp_ms,
+        timestamp=timestamp,
+        raw_count=1,
+        rows=(dict(row),),
+        pagination_complete=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,9 +697,11 @@ class OkxNativeFactsClient:
                 {
                     "side": side,
                     "posSide": raw.get("posSide") or bill.pos_side or "net",
-                    "fillSz": raw.get("fillSz") or raw.get("sz"),
-                    "fillPx": raw.get("fillPx") or raw.get("px"),
-                    "fillPnl": raw.get("fillPnl") or raw.get("pnl"),
+                    "fillSz": raw.get("fillSz") if raw.get("fillSz") is not None else raw.get("sz"),
+                    "fillPx": raw.get("fillPx") if raw.get("fillPx") is not None else raw.get("px"),
+                    "fillPnl": (
+                        raw.get("fillPnl") if raw.get("fillPnl") is not None else raw.get("pnl")
+                    ),
                     "_bb_fill_fact_source": OKX_ACCOUNT_BILLS_TRADE_SOURCE,
                 }
             )
@@ -831,6 +895,8 @@ class OkxNativeFactsClient:
 
         contexts: dict[str, tuple[dict[str, Any], ...]] = {}
         query_limit = max(1, min(int(max_queries or 1), DEFAULT_MAX_ORDER_HISTORY_CONTEXT_QUERIES))
+        # Preserve the caller's priority ordering. Re-sorting here can starve
+        # the same unresolved local ids on every bounded reconciliation cycle.
         for order_id, inst_id in list(targets.items())[:query_limit]:
             params = {"instType": "SWAP", "ordId": order_id, "limit": str(_limit(limit))}
             if inst_id:
@@ -842,13 +908,14 @@ class OkxNativeFactsClient:
             except Exception as exc:
                 history_error = exc
                 rows = []
-            if not rows and callable(fetch_order_detail) and inst_id:
+            has_target = any(str(row.get("ordId") or "").strip() == order_id for row in rows)
+            if not has_target and callable(fetch_order_detail) and inst_id:
                 try:
                     detail_response = await self.executor._with_retry(
                         fetch_order_detail,
                         {"instId": inst_id, "ordId": order_id},
                     )
-                    rows = _response_rows(detail_response)
+                    rows = [*rows, *_response_rows(detail_response)]
                 except Exception:
                     if strict:
                         raise
@@ -863,6 +930,7 @@ class OkxNativeFactsClient:
         *,
         inst_ids: Iterable[Any] | None = None,
         order_ids: Iterable[Any] | None = None,
+        inst_ids_by_order_id: dict[str, str] | None = None,
         since: datetime | int | float | None = None,
         limit: int = DEFAULT_FILL_LIMIT,
         max_pages: int = DEFAULT_MAX_FILL_PAGES,
@@ -887,9 +955,18 @@ class OkxNativeFactsClient:
             if strict:
                 raise RuntimeError("OKX native orders-history API is unavailable")
             return []
+        fetch_order_detail = getattr(ccxt, "privateGetTradeOrder", None)
 
         target_inst_ids = _target_inst_ids(symbols=None, inst_ids=inst_ids)
-        target_order_ids = _target_order_ids(order_ids)
+        ordered_order_ids = list(dict.fromkeys(
+            str(value).strip() for value in order_ids or () if str(value or "").strip()
+        ))
+        target_order_ids = set(ordered_order_ids)
+        target_inst_ids_by_order_id = {
+            str(order_id).strip(): str(inst_id).strip().upper()
+            for order_id, inst_id in (inst_ids_by_order_id or {}).items()
+            if str(order_id).strip() and str(inst_id).strip()
+        }
         page_limit = _limit(limit)
         page_count = _max_pages(max_pages)
         since_ms = _timestamp_ms(since)
@@ -897,11 +974,16 @@ class OkxNativeFactsClient:
         seen: set[str] = set()
 
         if target_order_ids:
-            for order_id in sorted(target_order_ids)[:DEFAULT_MAX_TARGET_ORDER_QUERIES]:
+            for order_id in ordered_order_ids[:DEFAULT_MAX_TARGET_ORDER_QUERIES]:
                 params = {"instType": "SWAP", "ordId": order_id, "limit": str(page_limit)}
-                inst_id = _single_inst_id_for_order(order_id, target_inst_ids)
+                inst_id = (
+                    target_inst_ids_by_order_id.get(order_id)
+                    or _single_inst_id_for_order(order_id, target_inst_ids)
+                )
                 if inst_id:
                     params["instId"] = inst_id
+                target_rows_found = False
+                history_error: Exception | None = None
                 for fetch_orders in fetch_order_methods:
                     try:
                         page_rows = await self._fetch_order_history_pages(
@@ -913,16 +995,42 @@ class OkxNativeFactsClient:
                             page_limit=page_limit,
                             max_pages=page_count,
                         )
-                    except Exception:
-                        if strict and fetch_orders is fetch_order_methods[-1]:
-                            raise
+                    except Exception as exc:
+                        history_error = exc
                         continue
+                    if any(str(row.get("ordId") or "").strip() == order_id for row in page_rows):
+                        target_rows_found = True
                     for row in page_rows:
                         key = _order_row_identity(row)
                         if not key or key in seen:
                             continue
                         seen.add(key)
                         rows.append(row)
+                    if target_rows_found:
+                        break
+                if not target_rows_found and callable(fetch_order_detail) and inst_id:
+                    try:
+                        detail = await self.executor._with_retry(
+                            fetch_order_detail,
+                            {"instId": inst_id, "ordId": order_id},
+                        )
+                        for row in _response_rows(detail):
+                            if not _order_row_matches(
+                                row,
+                                since_ms=since_ms,
+                                target_inst_ids={inst_id},
+                                target_order_ids={order_id},
+                            ):
+                                continue
+                            key = _order_row_identity(row)
+                            if key and key not in seen:
+                                seen.add(key)
+                                rows.append(row)
+                    except Exception:
+                        if strict:
+                            raise
+                elif not target_rows_found and history_error is not None and strict:
+                    raise history_error
 
         if not target_order_ids:
             params_list = [
@@ -1298,7 +1406,8 @@ def group_okx_native_fill_rows(
         group["contracts"] += contracts
         group["price_value"] += price * contracts
         group["fee_abs"] += abs(_safe_float(row.get("fee"), 0.0))
-        group["fill_pnl"] += _safe_float(row.get("fillPnl") or row.get("pnl"), 0.0)
+        pnl_value = row.get("fillPnl") if row.get("fillPnl") is not None else row.get("pnl")
+        group["fill_pnl"] += _safe_float(pnl_value, 0.0)
         group["timestamp_ms"] = max(_safe_float(group.get("timestamp_ms"), 0.0), timestamp_ms)
         group["rows"].append(dict(row))
         if row.get("tradeId"):

@@ -44,6 +44,7 @@ async def test_daily_equity_baseline_uses_okx_current_equity_when_available(
         assert result["today_equity_baseline_total_pnl"] is None
         assert result["today_equity_baseline_source"] == "okx_snapshot"
         assert result["today_equity_pnl"] == pytest.approx(0.0)
+        assert result["today_equity_baseline_at"] == "2026-06-28T20:00:00+08:00"
     finally:
         await close_db()
 
@@ -133,9 +134,12 @@ async def test_daily_equity_baseline_replaces_legacy_local_baseline_with_okx_sna
 
 
 @pytest.mark.asyncio
-async def test_daily_equity_baseline_rebuilds_stale_phase3_okx_snapshot(
+@pytest.mark.parametrize("current_equity, expected_pnl", [(998.15, -5001.85), (7998.15, 1998.15)])
+async def test_daily_equity_baseline_preserves_opening_okx_snapshot_after_large_movement(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    current_equity: float,
+    expected_pnl: float,
 ) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -152,7 +156,7 @@ async def test_daily_equity_baseline_rebuilds_stale_phase3_okx_snapshot(
                     model_name="ensemble_trader",
                     snapshot_date="2026-06-28",
                     snapshot_at=datetime(2026, 6, 28, 0, 0, tzinfo=UTC),
-                    equity=4000.0,
+                    equity=6000.0,
                     total_pnl=0.0,
                     realized_pnl=0.0,
                     unrealized_pnl=0.0,
@@ -170,12 +174,12 @@ async def test_daily_equity_baseline_rebuilds_stale_phase3_okx_snapshot(
                 realized_pnl=9.22,
                 unrealized_pnl=0.0,
                 total_pnl=9.22,
-                current_equity=4998.15,
+                current_equity=current_equity,
                 now=datetime(2026, 6, 28, 12, 0, tzinfo=UTC),
             )
 
-        assert result["today_equity_baseline"] == pytest.approx(4998.15)
-        assert result["today_equity_pnl"] == pytest.approx(0.0)
+        assert result["today_equity_baseline"] == pytest.approx(6000.0)
+        assert result["today_equity_pnl"] == pytest.approx(expected_pnl)
         assert result["today_equity_baseline_source"] == "okx_snapshot"
     finally:
         await close_db()

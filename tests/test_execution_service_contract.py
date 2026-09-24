@@ -947,6 +947,50 @@ def test_confirmed_partial_fill_settlement_is_evidence_bound(
     assert ("normal_paper_sizing_provenance_incomplete" not in reasons) is accepted
 
 
+def test_quality_observation_submission_and_full_fill_audit_use_same_contract() -> None:
+    decision = _profit_first_ready_position_review_decision()
+    permission = paper_quality_permissions()["local_ml"]
+    permission.update(
+        paper_execution_permission=False,
+        paper_execution_reason="fee_after_return_lcb_not_positive",
+        paper_execution_blockers=["fee_after_return_lcb_not_positive"],
+    )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="short",
+        selection_reason="paper_quality_observation",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 5.0,
+            "expected_net_return_pct": 0.35,
+            "objective_net_return_pct": -0.2,
+            "loss_probability": 0.3,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {"local_ml": permission},
+            "paper_quality_observation_only": True,
+            "paper_quality_observation_reasons": ["fee_after_return_lcb_not_positive"],
+            "strong_expert_opposition": False,
+        },
+    )
+
+    submission = _return_entry_contract_result(decision, "paper")
+    assert submission.passed is True, submission.reason
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        filled_notional_usdt=40.0,
+        executed=True,
+        filled_order_present=True,
+        authoritative_fill_complete=True,
+    )
+    assert reasons == []
+    assert contract["contract_complete"] is True
+    assert contract["objective_net_return_pct"] == -0.2
+    assert contract["production_permission"] is False
+    assert contract["confirmed_partial_fill_settlement_accepted"] is False
+    assert _return_entry_contract_result(decision, "live").passed is False
+
+
 def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> None:
     decision = _profit_first_ready_position_review_decision()
     decision.raw_response["profit_risk_sizing"]["expected_net_return_pct"] = 0.0

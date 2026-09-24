@@ -454,7 +454,6 @@ def build_normal_paper_trade_contract(
         }
     )
     loss_probability = _float(support.get("loss_probability"), None)
-    authorized = bool(objective_net is not None and objective_net > 0.0)
     if (
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
@@ -491,9 +490,9 @@ def build_normal_paper_trade_contract(
 
     contract = {
         "version": NORMAL_PAPER_TRADE_VERSION,
-        # Keep uncertain quality observations available to audit and training,
-        # but never sign a non-positive lower bound as entry permission.
-        "authorized": authorized,
+        # Only the explicit paper observation route may use an uncertain LCB.
+        # Final sizing must still prove positive fee-after expected return.
+        "authorized": True,
         "trade_mode": "paper",
         "execution_scope": "paper_only",
         "entry_type": "normal_strategy_trade",
@@ -770,6 +769,7 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
         expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
+        allow_non_positive_objective_observation=True,
     )
 
 

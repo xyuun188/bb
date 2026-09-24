@@ -49,6 +49,10 @@ from services.okx_order_fact_sync import (  # noqa: E402
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_OKX_ONLY,
 )
+from services.position_settlement import (  # noqa: E402
+    apply_position_settlement_snapshot,
+    build_position_settlement_snapshot,
+)
 
 DEFAULT_DAYS = 30
 DEFAULT_WINDOW_SECONDS = 180
@@ -152,7 +156,7 @@ class OpenPositionClosePlan:
     entry_price: float
     exit_price: float
     close_fee: float
-    fill_pnl: float
+    fill_pnl: float | None
     computed_realized_pnl: float
     old_realized_pnl: float
     old_current_price: float | None
@@ -183,7 +187,7 @@ class CloseLinkReassignmentPlan:
     entry_price: float
     exit_price: float
     close_fee: float
-    fill_pnl: float
+    fill_pnl: float | None
     computed_realized_pnl: float
     old_realized_pnl: float
     fill_timestamp: datetime | None
@@ -211,7 +215,7 @@ class NativeFullCloseSharedPlan:
     entry_price_weighted: float
     exit_price: float
     close_fee: float
-    fill_pnl: float
+    fill_pnl: float | None
     fill_timestamp: datetime | None
     source: str
     okx_inst_id: str
@@ -1094,7 +1098,11 @@ def _match_existing_close_order_open_position_plan(
         entry_price=entry_price,
         exit_price=exit_price,
         close_fee=close_fee,
-        fill_pnl=_safe_float(getattr(order, "okx_fill_pnl", None)),
+        fill_pnl=(
+            float(order.okx_fill_pnl)
+            if getattr(order, "okx_fill_pnl", None) is not None
+            else None
+        ),
         computed_realized_pnl=computed_realized_pnl,
         old_realized_pnl=_safe_float(position.realized_pnl),
         old_current_price=(
@@ -1206,7 +1214,11 @@ def _match_open_position_shared_close_plan(
         entry_price_weighted=weighted_entry_price,
         exit_price=_safe_float(order.price),
         close_fee=_safe_float(order.fee),
-        fill_pnl=_safe_float(getattr(order, "okx_fill_pnl", None)),
+        fill_pnl=(
+            float(order.okx_fill_pnl)
+            if getattr(order, "okx_fill_pnl", None) is not None
+            else None
+        ),
         fill_timestamp=_aware(getattr(order, "filled_at", None)),
         source="okx_confirmed_shared_open_position_close",
         okx_inst_id=inst_id,
@@ -2376,6 +2388,38 @@ def _position_management_original_entry_order_ids(position: Position) -> set[str
     return result
 
 
+def _apply_repair_settlement(
+    position: Position,
+    *,
+    close_fill_pnl: float | None,
+    close_fee: float,
+    fallback_realized_pnl: float,
+) -> None:
+    """Keep repaired links provisional until the official lifecycle settles."""
+
+    entry_fee = abs(_safe_float(getattr(position, "entry_fee", None), 0.0))
+    funding_fee = _safe_float(getattr(position, "funding_fee", None), 0.0)
+    # The price-derived fallback already includes the close fee. Zero from
+    # OKX is a real observation and must never select that fallback.
+    gross_pnl = (
+        fallback_realized_pnl + abs(close_fee)
+        if close_fill_pnl is None
+        else close_fill_pnl
+    )
+    apply_position_settlement_snapshot(
+        position,
+        build_position_settlement_snapshot(
+            close_fill_pnl=gross_pnl,
+            entry_fee=entry_fee,
+            close_fee=close_fee,
+            funding_fee=funding_fee,
+            status="settling",
+            source=REPAIR_REFLECTION_SOURCE,
+            raw={"close_fill_pnl_confirmed": close_fill_pnl is not None},
+        ),
+    )
+
+
 async def apply_plans(plans: list[FillLinkPlan]) -> dict[str, Any]:
     if not plans:
         return {"applied": 0}
@@ -2750,9 +2794,12 @@ async def apply_open_position_close_plans(plans: list[OpenPositionClosePlan]) ->
             position.is_open = False
             position.current_price = plan.exit_price
             position.unrealized_pnl = 0.0
-            position.realized_pnl = plan.fill_pnl or plan.computed_realized_pnl
-            position.close_fill_pnl = plan.fill_pnl
-            position.close_fee = plan.close_fee
+            _apply_repair_settlement(
+                position,
+                close_fill_pnl=plan.fill_pnl,
+                close_fee=plan.close_fee,
+                fallback_realized_pnl=plan.computed_realized_pnl,
+            )
             position.closed_at = plan.fill_timestamp or datetime.now(UTC)
             position.close_exchange_order_id = plan.okx_order_id
             if not str(getattr(position, "okx_inst_id", "") or "").strip():
@@ -2874,7 +2921,12 @@ async def apply_close_link_reassignment_plans(
 
             position.close_exchange_order_id = plan.new_okx_order_id
             position.current_price = plan.exit_price
-            position.realized_pnl = plan.fill_pnl or plan.computed_realized_pnl
+            _apply_repair_settlement(
+                position,
+                close_fill_pnl=plan.fill_pnl,
+                close_fee=plan.close_fee,
+                fallback_realized_pnl=plan.computed_realized_pnl,
+            )
             position.unrealized_pnl = 0.0
             position.closed_at = plan.fill_timestamp or position.closed_at
             if not str(getattr(position, "okx_inst_id", "") or "").strip():
@@ -2979,7 +3031,17 @@ async def apply_native_full_close_shared_plans(
                 position.close_exchange_order_id = plan.okx_order_id
                 position.current_price = plan.exit_price
                 position.unrealized_pnl = 0.0
-                position.realized_pnl = plan.fill_pnl * ratio
+                gross_estimate = (
+                    (_safe_float(position.entry_price) - plan.exit_price)
+                    if plan.side == "short"
+                    else (plan.exit_price - _safe_float(position.entry_price))
+                ) * abs(_safe_float(position.quantity))
+                _apply_repair_settlement(
+                    position,
+                    close_fill_pnl=plan.fill_pnl * ratio if plan.fill_pnl is not None else None,
+                    close_fee=plan.close_fee * ratio,
+                    fallback_realized_pnl=gross_estimate - plan.close_fee * ratio,
+                )
                 position.closed_at = plan.fill_timestamp or position.closed_at
                 if not str(getattr(position, "okx_inst_id", "") or "").strip():
                     position.okx_inst_id = okx_inst_id
@@ -3077,11 +3139,11 @@ async def apply_open_position_shared_close_plans(
             for position in selected:
                 quantity = abs(_safe_float(position.quantity))
                 ratio = quantity / plan.total_quantity
-                allocated_fill_pnl = plan.fill_pnl * ratio
+                allocated_fill_pnl = (
+                    plan.fill_pnl * ratio if plan.fill_pnl is not None else None
+                )
                 allocated_fee = plan.close_fee * ratio
-                if plan.fill_pnl:
-                    realized_pnl = allocated_fill_pnl
-                elif plan.side == "short":
+                if plan.side == "short":
                     realized_pnl = (
                         (_safe_float(position.entry_price) - plan.exit_price) * quantity
                         - allocated_fee
@@ -3094,9 +3156,12 @@ async def apply_open_position_shared_close_plans(
                 position.is_open = False
                 position.current_price = plan.exit_price
                 position.unrealized_pnl = 0.0
-                position.realized_pnl = realized_pnl
-                position.close_fill_pnl = allocated_fill_pnl
-                position.close_fee = allocated_fee
+                _apply_repair_settlement(
+                    position,
+                    close_fill_pnl=allocated_fill_pnl,
+                    close_fee=allocated_fee,
+                    fallback_realized_pnl=realized_pnl,
+                )
                 position.closed_at = plan.fill_timestamp or datetime.now(UTC)
                 position.close_exchange_order_id = plan.okx_order_id
                 _add_repair_reflection_marker(

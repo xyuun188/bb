@@ -309,6 +309,79 @@ async def _read_selected_decision():
     }
 
 
+async def _read_recent_entry_flow(since):
+    async with get_read_session_ctx(statement_timeout_ms=30000) as session:
+        decisions = (
+            await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.created_at,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.analysis_type,
+                    AIDecision.was_executed,
+                    AIDecision.execution_reason,
+                    AIDecision.executed_at,
+                )
+                .where(AIDecision.is_paper.is_(True), AIDecision.created_at >= since)
+                .order_by(AIDecision.id.desc())
+                .limit(30)
+            )
+        ).mappings().all()
+        orders = (
+            await session.execute(
+                select(
+                    Order.id,
+                    Order.created_at,
+                    Order.symbol,
+                    Order.side,
+                    Order.status,
+                    Order.decision_id,
+                    Order.filled_at,
+                    Order.okx_sync_status,
+                    Order.exchange_order_id,
+                )
+                .where(Order.execution_mode == "paper")
+                .order_by(Order.id.desc())
+                .limit(10)
+            )
+        ).mappings().all()
+        positions = (
+            await session.execute(
+                select(
+                    Position.id,
+                    Position.symbol,
+                    Position.side,
+                    Position.created_at,
+                    Position.quantity,
+                    Position.entry_exchange_order_id,
+                ).where(Position.execution_mode == "paper", Position.is_open.is_(True))
+            )
+        ).mappings().all()
+    reconciliation_path = APP_ROOT / "data" / "okx_daily_reconciliation_reports" / "latest.json"
+    try:
+        reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+        reconciliation = {
+            key: reconciliation.get(key)
+            for key in (
+                "generated_at",
+                "status",
+                "can_open_new_entries",
+                "can_refresh_training",
+                "entry_blockers",
+                "training_blockers",
+            )
+        }
+    except Exception as exc:
+        reconciliation = {"available": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
+    return {
+        "recent_decisions": [dict(row) for row in decisions],
+        "recent_orders": [dict(row) for row in orders],
+        "open_positions": [dict(row) for row in positions],
+        "reconciliation": reconciliation,
+    }
+
+
 async def main():
     if REPLAY_ONLY:
         started = time.perf_counter()
@@ -331,7 +404,7 @@ async def main():
         return
     since = datetime.now(UTC) - timedelta(minutes=WINDOW_MINUTES)
     contract = await TradeExecutionContractService().report(since=since, limit=5000)
-    if ENTRY_ONLY and DECISION_ID > 0:
+    if ENTRY_ONLY:
         print(json.dumps({
             "generated_at": datetime.now(UTC).isoformat(),
             "window_minutes": WINDOW_MINUTES,
@@ -343,7 +416,8 @@ async def main():
                 "violations": contract.get("violations", []),
                 "policy": contract.get("policy", {}),
             },
-            "selected_decision": await _read_selected_decision(),
+            "selected_decision": await _read_selected_decision() if DECISION_ID > 0 else None,
+            "recent_entry_flow": await _read_recent_entry_flow(since),
         }, ensure_ascii=False, default=str))
         return
     try:
@@ -548,6 +622,7 @@ def _summarize_report(report: dict) -> dict:
         "contract_summary": contract.get("summary") or {},
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_policy": contract.get("policy") or {},
+        "recent_entry_flow": report.get("recent_entry_flow") or {},
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
         "ml_live_ml_ready": ml_status.get("live_ml_ready") is True,
         "model_strategy_blueprint": {
@@ -952,6 +1027,7 @@ def _summarize_entry_report(report: dict) -> dict:
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_violation_rows": contract.get("violations") or [],
         "contract_policy": contract.get("policy") or {},
+        "recent_entry_flow": report.get("recent_entry_flow") or {},
         "selected_decision": _summarize_selected_decision(
             report.get("selected_decision")
         ),

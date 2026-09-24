@@ -242,7 +242,8 @@ async def _fetch_okx_fill_groups(symbols: set[str]) -> dict[str, list[FillGroup]
         )
         group["contracts"] += contracts
         group["price_value"] += price * contracts
-        group["fill_pnl"] += _safe_float(row.get("fillPnl") or row.get("pnl"), 0.0)
+        pnl_value = row.get("fillPnl") if row.get("fillPnl") is not None else row.get("pnl")
+        group["fill_pnl"] += _safe_float(pnl_value, 0.0)
         group["fee_abs"] += abs(_safe_float(row.get("fee"), 0.0))
         group["timestamp_ms"] = max(
             _safe_float(group.get("timestamp_ms"), 0.0),

@@ -2867,7 +2867,8 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
     assert result.status.value == "filled"
     assert exchange.ticker_calls == 2
-    assert exchange.create_calls[0][3] == pytest.approx(50.0 / 1.3)
+    submitted_quantity = exchange.create_calls[0][3]
+    assert 0.0 < submitted_quantity <= 50.0 / 1.3
     request_params = exchange.create_calls[0][5]
     protection = request_params["attachAlgoOrds"][0]
     assert float(protection["slTriggerPx"]) < 1.1
@@ -2884,8 +2885,47 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     rules = result.raw_response["okx_order_rules"]
     assert rules["fill_risk_price"] == 1.3
     assert rules["fill_risk_price_source"] == "okx_buy_price_limit"
-    assert rules["maximum_fill_notional_usdt"] == pytest.approx(50.0)
+    assert rules["maximum_fill_notional_usdt"] <= 50.0
     assert rules["pre_submit_valid"] is True
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert submitted_quantity * (1.3 - float(protection["slTriggerPx"])) <= (
+        sizing["risk_budget_usdt"]
+    )
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_entry_notional_uses_upper_price_band_for_both_sides(side: str) -> None:
+    executor = OKXExecutor(mode="paper")
+    assert executor._entry_market_fill_risk_price(
+        side=side,
+        reference_price=0.21879,
+        price_limit={"buy_price_limit": 0.22207, "sell_price_limit": 0.21549},
+    ) == 0.22207
+
+
+def test_short_stop_widening_reduces_quantity_without_expanding_risk_budget() -> None:
+    executor = OKXExecutor(mode="paper")
+    decision = _entry_decision()
+    decision.action = Action.SHORT
+    decision.raw_response["profit_risk_sizing"].update(
+        risk_budget_usdt=20.0,
+        stressed_loss_fraction=0.005,
+        estimated_fill_drift_reserve_fraction=0.0025,
+    )
+    result = executor._entry_protection_risk(
+        decision=decision,
+        side="sell",
+        reference_price=0.21879,
+        price_limit={"buy_price_limit": 0.22207, "sell_price_limit": 0.21549},
+        stop_loss_price=0.2242,
+        planned_notional_usdt=2984.13253229,
+    )
+    quantity = result["maximum_notional_usdt"] / 0.21549
+    assert 0 < result["maximum_notional_usdt"] < 2984.13253229
+    assert quantity * (0.2242 - 0.21549) <= 20.0
+    assert result["stressed_loss_fraction"] > 0.01
+    assert decision.raw_response["profit_risk_sizing"]["risk_budget_usdt"] == 20.0
 
 
 def test_okx_entry_fill_integrity_quarantines_cross_scale_price_and_underlying() -> None:

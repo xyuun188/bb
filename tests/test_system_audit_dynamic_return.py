@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from services.trade_execution_contract import summarize_trade_execution_contract
 from web_dashboard.api import system_audit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,16 @@ def test_safe_trade_execution_policy_removes_retired_paper_gate_labels() -> None
     assert "entry_requires_positive_return_lcb" not in policy
     assert policy["paper_entry_requires_model_promotion"] is False
     assert policy["live_entry_requires_positive_return_lcb"] is True
+
+
+def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
+    canonical = summarize_trade_execution_contract([])["policy"]
+    stale = {"policy": {"paper_quality_observation_allows_non_positive_return_lcb": False}}
+
+    projected = system_audit._safe_trade_execution_contract_report(stale)
+
+    assert projected["policy"] == canonical
+    assert stale["policy"]["paper_quality_observation_allows_non_positive_return_lcb"] is False
 
 
 def test_removed_fixed_policy_and_global_fallback_tokens_cannot_return_to_production() -> None:
@@ -201,7 +212,7 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_entry_requires_model_promotion": False,
                     "paper_normal_entry_requires_positive_return_lcb": True,
                     "paper_quality_observation_requires_positive_expected_net_return": True,
-            "paper_quality_observation_allows_non_positive_return_lcb": False,
+                    "paper_quality_observation_allows_non_positive_return_lcb": True,
                     "paper_entry_requires_profit_factor": False,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

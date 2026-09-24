@@ -241,7 +241,7 @@ def test_unpromoted_quality_model_builds_normal_risk_paper_contract() -> None:
     )
 
 
-def test_negative_lcb_quality_observation_is_unauthorized_but_auditable() -> None:
+def test_negative_lcb_quality_observation_authorizes_only_bounded_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.35,
@@ -259,17 +259,39 @@ def test_negative_lcb_quality_observation_is_unauthorized_but_auditable() -> Non
     assert selection["selected"] is True
     assert selection["selection_reason"] == "paper_quality_observation"
     assert contract["objective_net_return_pct"] == -3.2
-    assert contract["authorized"] is False
+    assert contract["authorized"] is True
     assert contract["production_permission"] is False
     assert contract["execution_scope"] == "paper_only"
-    assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(
-        contract
-    )
+    assert normal_paper_trade_contract_reasons(contract) == []
+    assert normal_paper_settlement_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
     assert (
         contract["single_trade_risk_fraction_cap"]
         == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
+
+
+def test_unauthorized_shadow_observation_cannot_be_reused_as_entry_permission() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="paper_quality_observation",
+        direction_support=_quality_observation_support("long", objective_net=-0.3),
+    )
+    contract["authorized"] = False
+    contract["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(contract))
+
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
+    assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(contract)
+
+
+def test_negative_lcb_validated_strategy_still_cannot_authorize_entry() -> None:
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=-0.3),
+    ) == {}
 
 
 def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None:
