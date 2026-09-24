@@ -123,6 +123,7 @@ def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> 
                     "status": "observing",
                     "paper_active": True,
                     "inputs": {"rows": [1] * 10_000},
+                    "effective_blockers": ["x"],
                 },
             },
             {
@@ -145,7 +146,11 @@ def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> 
     observation = compact["cards"][0]["details"]
     training = compact["cards"][1]["details"]
 
-    assert observation == {"status": "observing", "paper_active": True}
+    assert observation == {
+        "status": "observing",
+        "paper_active": True,
+        "effective_blockers": ["x"],
+    }
     assert training["local_ai_tools"] == {"available": True}
     assert len(training["optional_source_warnings"]) == 8
     assert "model_registry" not in training

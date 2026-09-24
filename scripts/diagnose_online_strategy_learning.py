@@ -73,6 +73,7 @@ async def main():
             since=since,
             limit=500,
             compact=True,
+            include_decision_evidence=True,
         )
         outcome_result = {
             "elapsed": round(time.monotonic() - started, 3),

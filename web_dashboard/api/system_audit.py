@@ -7214,11 +7214,23 @@ def _dashboard_system_audit_payload(value: Any) -> dict[str, Any]:
             "phase3_paper_resume_preflight",
             "phase3_paper_resume_observation",
         }:
-            card["details"] = {
+            scalar_details = {
                 name: nested
                 for name, nested in details.items()
                 if nested is None or isinstance(nested, (str, int, float, bool))
             }
+            # Preserve actionable blocker codes so operators can distinguish
+            # a real gate from a stale or already-consumed observation.
+            for name in (
+                "blockers",
+                "effective_blockers",
+                "warnings",
+                "issues",
+                "runtime",
+            ):
+                if name in details:
+                    scalar_details[name] = details[name]
+            card["details"] = scalar_details
     return sanitize_payload(payload)
 
 
