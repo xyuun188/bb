@@ -517,7 +517,9 @@ def select_normal_paper_trade_side(
                 "loss_probability": loss_probability,
                 "quant_evidence_families": families,
                 "selection_reason": (
-                    "paper_quality_observation"
+                    "strategy_edge_selected"
+                    if support.get("current_edge_validated") is True
+                    else "paper_quality_observation"
                     if support.get("paper_quality_observation_only") is True
                     else "strategy_edge_selected"
                 ),
@@ -601,13 +603,26 @@ def build_normal_paper_trade_contract(
         ).items()
         if str(source).strip() and isinstance(permission, dict)
     }
+    current_edge_validated = bool(
+        support.get("current_edge_validated") is True
+        and expected_net is not None
+        and expected_net > 0.0
+        and objective_net is not None
+        and objective_net > 0.0
+        and support.get("strong_expert_opposition") is not True
+    )
     quality_observation_only = bool(
-        support.get("paper_quality_observation_only") is True
-        or any(
-            permission.get("paper_execution_permission") is not True
-            for permission in quality_permissions.values()
+        not current_edge_validated
+        and (
+            support.get("paper_quality_observation_only") is True
+            or any(
+                permission.get("paper_execution_permission") is not True
+                for permission in quality_permissions.values()
+            )
         )
     )
+    if current_edge_validated:
+        quality_observation_only = False
     quality_observation_reasons = sorted(
         {
             str(reason)
@@ -632,6 +647,7 @@ def build_normal_paper_trade_contract(
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
+            and not current_edge_validated
             and any(
                 permission.get("paper_execution_permission") is not True
                 for permission in quality_permissions.values()
@@ -688,6 +704,7 @@ def build_normal_paper_trade_contract(
         "training_eligibility_source": ("trusted_settlement_and_task_specific_training_contract"),
         "risk_override_permission": False,
         "quant_quality_permissions": quality_permissions,
+        "current_edge_validated": current_edge_validated,
         "paper_quality_mode": (
             "quality_observation" if quality_observation_only else "validated"
         ),
@@ -776,13 +793,26 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_version_invalid")
     selection_reason = str(contract.get("selection_reason") or "")
     observation_mode = selection_reason == "paper_quality_observation"
+    expected_net = _float(contract.get("expected_net_return_pct"), None)
     objective_net = _float(contract.get("objective_net_return_pct"), None)
+    current_edge_validated = bool(
+        contract.get("current_edge_validated") is True
+        or (
+            selection_reason == "strategy_edge_selected"
+            and expected_net is not None
+            and expected_net > 0.0
+            and objective_net is not None
+            and objective_net > 0.0
+        )
+    )
     observation_only = bool(
         allow_unauthorized_observation
         and observation_mode
         and objective_net is not None
         and objective_net <= 0.0
     )
+    if current_edge_validated:
+        quality_observation_reasons = []
     if contract.get("authorized") is not True and not observation_only:
         reasons.append("normal_paper_trade_not_authorized")
     if contract.get("trade_mode") != "paper":
@@ -805,7 +835,6 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_symbol_missing")
     if contract.get("strong_expert_opposition") is True:
         reasons.append("normal_paper_trade_strong_expert_opposition")
-    expected_net = _float(contract.get("expected_net_return_pct"), None)
     if expected_net is None or expected_net <= 0.0:
         reasons.append("normal_paper_trade_expected_net_not_positive")
     if objective_net is None:
@@ -871,10 +900,18 @@ def _normal_strategy_trade_contract_reasons(
             if not str(source).strip() or not isinstance(permission, dict):
                 reasons.append("normal_paper_trade_quality_permission_invalid")
                 continue
-            if not observation_mode and permission.get("paper_execution_permission") is not True:
+            if (
+                not observation_mode
+                and not current_edge_validated
+                and permission.get("paper_execution_permission") is not True
+            ):
                 reasons.append("normal_paper_trade_quality_permission_denied")
             evidence = _dict(permission.get("paper_execution_evidence"))
-            if not observation_mode and int(_float(evidence.get("sample_count"), 0.0) or 0) <= 0:
+            if (
+                not observation_mode
+                and not current_edge_validated
+                and int(_float(evidence.get("sample_count"), 0.0) or 0) <= 0
+            ):
                 reasons.append("normal_paper_trade_quality_evidence_missing")
     horizon = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0

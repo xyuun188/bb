@@ -882,6 +882,29 @@ async def test_lower_return_lcb_cannot_increase_risk_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_drawdown_pressure_is_diagnostic_and_does_not_globally_shrink_paper_risk() -> None:
+    baseline = _decision()
+    pressured = _decision()
+    pressured.raw_response["strategy_mode"]["drawdown_pressure"] = 1.0
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(baseline, "paper", [])
+    await policy.apply(pressured, "paper", [])
+
+    baseline_sizing = baseline.raw_response["profit_risk_sizing"]
+    pressured_sizing = pressured.raw_response["profit_risk_sizing"]
+    assert pressured_sizing["production_eligible"] is True
+    assert pressured_sizing["risk_budget_usdt"] == pytest.approx(
+        baseline_sizing["risk_budget_usdt"]
+    )
+    assert pressured_sizing["final_notional_usdt"] == pytest.approx(
+        baseline_sizing["final_notional_usdt"]
+    )
+    assert pressured_sizing["drawdown_pressure"] == 1.0
+    assert pressured_sizing["drawdown_capacity_policy"] == "portfolio_diagnostic_only"
+
+
+@pytest.mark.asyncio
 async def test_lower_available_margin_cannot_increase_final_notional() -> None:
     baseline = _decision()
     constrained = deepcopy(baseline)

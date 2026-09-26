@@ -995,10 +995,15 @@ class EntryProfitRiskSizingPolicy:
             0.0,
         )
         liquidity_budget_share = _clamp(side_depth / max(account_equity, 1e-12))
+        # Drawdown is a portfolio-level diagnostic. It must not become a
+        # global multiplier on every independent opportunity: doing so turns a
+        # losing period into a permanent "all trades are tiny" mode and also
+        # starves the training loop of representative fills. Per-entry safety
+        # remains enforced by current return quality, realized-history quality,
+        # liquidity, stress loss, and the remaining portfolio budget.
         single_trade_budget_fraction = _clamp(
             return_quality
             * survival_quality
-            * drawdown_capacity
             * realized_history_capacity
             * liquidity_budget_share
         )
@@ -1218,6 +1223,7 @@ class EntryProfitRiskSizingPolicy:
                 "return_quality": round(return_quality, 8),
                 "survival_quality": round(survival_quality, 8),
                 "drawdown_capacity": round(drawdown_capacity, 8),
+                "drawdown_capacity_policy": "portfolio_diagnostic_only",
                 "realized_history_capacity": round(realized_history_capacity, 8),
                 "liquidity_budget_share": round(liquidity_budget_share, 8),
                 "portfolio_dependency_capacity": round(dependency_capacity, 8),
@@ -1569,6 +1575,10 @@ class EntryProfitRiskSizingPolicy:
 
         raw = _safe_dict(decision.raw_response)
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+        strategy = _safe_dict(raw.get("strategy_mode"))
+        drawdown_pressure = _clamp(
+            _safe_float(strategy.get("drawdown_pressure"), 0.0)
+        )
         contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
         quality_observation_mode = bool(
             normal_trade.get("selection_reason") == "paper_quality_observation"
@@ -2031,6 +2041,8 @@ class EntryProfitRiskSizingPolicy:
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
+            "drawdown_pressure": round(drawdown_pressure, 8),
+            "drawdown_capacity_policy": "portfolio_diagnostic_only",
             "target_notional_usdt": target_notional,
             "minimum_order_notional_usdt": minimum_order_notional,
             "minimum_order_supported": minimum_order_supported,
@@ -2135,6 +2147,8 @@ class EntryProfitRiskSizingPolicy:
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
+            "drawdown_pressure": round(drawdown_pressure, 8),
+            "drawdown_capacity_policy": "portfolio_diagnostic_only",
             "dynamic_leverage_decision": leverage_decision.to_dict(),
             "existing_position_leverage": (
                 round(existing_position_leverage, 8)

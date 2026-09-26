@@ -317,6 +317,7 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "blocking_reasons",
             "production_permission",
             "quant_quality_permissions",
+            "current_edge_validated",
             "paper_quality_observation_only",
             "paper_quality_observation_reasons",
         )
@@ -385,7 +386,7 @@ def assess_directional_entry_support(
             if str(reason).strip()
         }
     )
-    quality_observation_only = bool(quant_quality_permissions) and any(
+    quality_permission_missing = bool(quant_quality_permissions) and any(
         permission.get("paper_execution_permission") is not True
         for permission in quant_quality_permissions.values()
     )
@@ -433,7 +434,7 @@ def assess_directional_entry_support(
             )
             current_contract_ready = bool(
                 positive_expected_net
-                and (positive_objective_net or quality_observation_only)
+                and (positive_objective_net or quality_permission_missing)
             )
             if aligned and current_contract_ready:
                 directional_families.append(item)
@@ -458,7 +459,6 @@ def assess_directional_entry_support(
     expected_net_return_pct = _float(quantitative.get("expected_net_return_pct"))
     objective_net_return_pct = _float(quantitative.get("objective_net_return_pct"))
     loss_probability = _float(quantitative.get("loss_probability"))
-
     auditable_experts = [
         item
         for item in expert_opinions or []
@@ -489,6 +489,23 @@ def assess_directional_entry_support(
     )
     strong_expert_opposition = bool(
         len(opposition_groups) >= 2 and len(opposition) > len(aligned)
+    )
+    # Historical model quality is a promotion signal, not a veto on a
+    # current paper opportunity. Once the current direction has complete
+    # execution-cost evidence and both the current expected return and its
+    # current lower bound are positive, it is a validated paper edge even if
+    # the trailing quality report is still below break-even.
+    current_edge_validated = bool(
+        execution_cost_complete
+        and expected_net_return_pct is not None
+        and expected_net_return_pct > 0.0
+        and objective_net_return_pct is not None
+        and objective_net_return_pct > 0.0
+        and quant_families
+        and not strong_expert_opposition
+    )
+    quality_observation_only = bool(
+        quality_permission_missing and not current_edge_validated
     )
     blockers: list[str] = []
     if side not in {"long", "short"}:
@@ -573,6 +590,7 @@ def assess_directional_entry_support(
         ),
         "quant_family_summaries": family_summaries,
         "quant_quality_permissions": quant_quality_permissions,
+        "current_edge_validated": current_edge_validated,
         "paper_quality_observation_only": quality_observation_only,
         "paper_quality_observation_reasons": quality_observation_reasons,
         "aligned_expert_count": len(aligned),

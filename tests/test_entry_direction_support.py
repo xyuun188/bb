@@ -410,6 +410,33 @@ def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
     assert directional_entry_support_reasons(support, "long") == []
 
 
+def test_current_positive_lcb_overrides_stale_quality_observation_permission() -> None:
+    long_row = _row("local_ml", raw=0.55, objective=0.35)
+    long_row["paper_return_quality_governance"] = {
+        "paper_execution_permission": False,
+        "paper_execution_reason": "historical_quality_not_promoted",
+        "paper_execution_blockers": ["historical_quality_not_promoted"],
+        "paper_execution_evidence_source": "trusted_settlement",
+        "paper_execution_evidence": {"sample_count": 0},
+    }
+    support = assess_paper_model_trade_support(
+        {
+            "selected_horizon_minutes": 30.0,
+            "horizon_cohort_selection": {"selected_horizon_minutes": 30.0},
+            "long": {"evidence": [long_row]},
+            "short": {"evidence": [_row("local_ml", raw=-0.2, objective=-0.4)]},
+        },
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["current_edge_validated"] is True
+    assert support["paper_quality_observation_only"] is False
+    assert support["paper_quality_observation_reasons"] == ["historical_quality_not_promoted"]
+
+
 def test_negative_lcb_quality_observation_does_not_leak_into_production_support() -> None:
     long_row = _row("local_ml", raw=0.45, objective=-0.20)
     long_row["paper_return_quality_governance"] = {

@@ -302,6 +302,32 @@ def test_negative_lcb_validated_strategy_still_cannot_authorize_entry() -> None:
     ) == {}
 
 
+def test_current_positive_edge_does_not_inherit_historical_quality_observation_cap() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.8,
+        objective_net=0.3,
+    )
+    support["current_edge_validated"] = True
+    support["paper_quality_observation_only"] = False
+
+    selection = select_normal_paper_trade_side({"long": support})
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side=selection["selected_side"],
+        selection_reason=selection["selection_reason"],
+        direction_support=support,
+    )
+
+    assert selection["selection_reason"] == "strategy_edge_selected"
+    assert contract["paper_quality_observation_only"] is False
+    assert (
+        contract["single_trade_risk_fraction_cap"]
+        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
+    assert normal_paper_trade_contract_reasons(contract) == []
+
+
 def test_legacy_v9_positive_lcb_contract_remains_settlement_compatible() -> None:
     legacy = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
