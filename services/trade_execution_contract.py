@@ -16,9 +16,9 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     historical_normalized_contract_reasons,
-    normalize_normal_paper_contract,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
+    normalize_normal_paper_contract,
 )
 from services.okx_native_facts import (
     OKX_PROTECTION_EXECUTION_VERSION,
@@ -527,6 +527,7 @@ def _entry_contract_row(
             and filled_notional_source
             and not fill_fact_reasons
         ),
+        allow_historical_settlement=True,
     )
     reasons = list(dict.fromkeys([*reasons, *fill_fact_reasons]))
     contract["contract_complete"] = not reasons
@@ -814,6 +815,7 @@ def validate_entry_execution_contract(
     executed: bool = False,
     filled_order_present: bool | None = None,
     authoritative_fill_complete: bool = False,
+    allow_historical_settlement: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """Validate the persisted contract for its declared execution lifecycle."""
 
@@ -825,7 +827,7 @@ def validate_entry_execution_contract(
             executed=executed,
             filled_order_present=filled_order_present,
             authoritative_fill_complete=authoritative_fill_complete,
-            allow_historical_settlement=True,
+            allow_historical_settlement=allow_historical_settlement,
         )
     if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
@@ -1376,6 +1378,15 @@ def validate_normal_paper_entry_contract(
     single_cap = _safe_float(
         normal_trade.get("single_trade_risk_fraction_cap"), 0.0
     )
+    # Historical settlement must validate the cap that was actually persisted
+    # with the filled order.  The normalized projection intentionally carries
+    # current semantics for analysis/training, but replacing the source cap
+    # here would turn valid old fills into false execution violations.
+    settlement_single_cap = (
+        _safe_float(source_normal_trade.get("single_trade_risk_fraction_cap"), 0.0)
+        if historical_normal_trade
+        else single_cap
+    )
     bounded_fill_drift = _bounded_confirmed_fill_drift(
         observation={
             "current_execution_cost_pct": execution_cost.get("total_pct"),
@@ -1446,7 +1457,10 @@ def validate_normal_paper_entry_contract(
         and not confirmed_drift_settlement
     ):
         reasons.append("normal_paper_planned_loss_invalid")
-    if single_cap <= 0.0 or risk_budget > equity * single_cap + 1e-8:
+    if (
+        settlement_single_cap <= 0.0
+        or risk_budget > equity * settlement_single_cap + 1e-8
+    ):
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
     if stress <= 0.0 or not persisted_product_isclose(
         planned_loss,

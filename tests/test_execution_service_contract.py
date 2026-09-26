@@ -792,7 +792,13 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
         )
     )
 
-    contract, reasons = validate_entry_execution_contract(decision.raw_response)
+    _, reasons = validate_entry_execution_contract(decision.raw_response)
+    assert "normal_paper_historical_contract_not_authorized_for_new_entry" in reasons
+
+    contract, reasons = validate_entry_execution_contract(
+        decision.raw_response,
+        allow_historical_settlement=True,
+    )
     assert reasons == []
     assert contract["contract_lifecycle"] == "normal_paper_trade"
 

@@ -11,45 +11,25 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-09-19.normal-paper-strategy-trade.v12"
-LEGACY_NORMAL_PAPER_TRADE_V11_VERSION = "2026-09-19.normal-paper-strategy-trade.v11"
-LEGACY_NORMAL_PAPER_TRADE_V10_VERSION = "2026-09-18.normal-paper-strategy-trade.v10"
-LEGACY_NORMAL_PAPER_TRADE_V9_VERSION = "2026-09-17.normal-paper-strategy-trade.v9"
-LEGACY_NORMAL_PAPER_TRADE_V8_VERSION = "2026-08-25.normal-paper-strategy-trade.v8"
-LEGACY_NORMAL_PAPER_TRADE_V7_VERSION = "2026-08-21.normal-paper-strategy-trade.v7"
-LEGACY_NORMAL_PAPER_TRADE_V6_VERSION = "2026-08-19.normal-paper-strategy-trade.v6"
-LEGACY_NORMAL_PAPER_TRADE_V5_VERSION = "2026-07-29.normal-paper-strategy-trade.v5"
+NORMAL_PAPER_TRADE_VERSION = "2026-09-26.normal-paper-strategy-trade.v14"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-08-25.normal-paper-dynamic-risk.v5"
-LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION = (
-    "2026-07-28.normal-paper-dynamic-risk.v4"
-)
 NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
-LEGACY_NORMAL_PAPER_TRADE_V4_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
-LEGACY_NORMAL_PAPER_TRADE_V3_VERSION = "2026-07-28.normal-paper-strategy-trade.v3"
-LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION = "2026-07-28.normal-paper-dynamic-risk.v3"
-LEGACY_NORMAL_PAPER_TRADE_VERSION = "2026-07-27.normal-paper-strategy-trade.v2"
-LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-07-27.normal-paper-risk.v2"
-HISTORICAL_NORMAL_PAPER_TRADE_VERSION = "2026-07-22.normal-paper-trade.v1"
-HISTORICAL_NORMAL_PAPER_TRADE_ROUTES = {
-    "evidence_best",
-    "evidence_best_canary",
-    "bounded_exploration",
-    "cold_start_exploration",
-}
-KNOWN_HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
+HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
-        LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_VERSION,
-        HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
+        "2026-09-26.normal-paper-strategy-trade.v13",
+        "2026-09-19.normal-paper-strategy-trade.v12",
+        "2026-09-19.normal-paper-strategy-trade.v11",
+        "2026-09-18.normal-paper-strategy-trade.v10",
+        "2026-09-17.normal-paper-strategy-trade.v9",
+        "2026-08-25.normal-paper-strategy-trade.v8",
+        "2026-08-21.normal-paper-strategy-trade.v7",
+        "2026-08-19.normal-paper-strategy-trade.v6",
+        "2026-07-29.normal-paper-strategy-trade.v5",
+        "2026-07-28.normal-paper-strategy-trade.v4",
+        "2026-07-28.normal-paper-strategy-trade.v3",
+        "2026-07-27.normal-paper-strategy-trade.v2",
+        "2026-07-22.normal-paper-trade.v1",
     }
 )
 NORMAL_PAPER_TRADE_SELECTION_REASONS = {
@@ -57,12 +37,6 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "paper_quality_observation",
 }
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
-LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.0005
-# Legacy floors retained so historical v8-v11 contracts remain verifiable.
-# Current quality-observation contracts use a graduated micro-risk cap; only
-# validated strategy-edge contracts may use the normal paper risk cap.
-NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION = 0.0001
-NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT = 0.0003
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 # Keep paper training samples flowing while preventing a materially stressed
 # portfolio from continuing to stack one direction.
@@ -84,10 +58,6 @@ def _float(value: Any, default: float | None = 0.0) -> float | None:
     return number if isfinite(number) else default
 
 
-def _clamp(value: float, lower: float, upper: float) -> float:
-    return min(max(float(value), lower), upper)
-
-
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -97,55 +67,6 @@ def _fingerprint(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
-def quality_observation_risk_fraction(
-    *,
-    expected_net_return_pct: Any,
-    objective_net_return_pct: Any,
-    loss_probability: Any,
-) -> float:
-    """Return a bounded observation risk cap from current, non-promoted evidence."""
-
-    expected = max(_float(expected_net_return_pct, 0.0) or 0.0, 0.0)
-    objective = _float(objective_net_return_pct, None)
-    parsed_loss = _float(loss_probability, None)
-    loss = _clamp(
-        (
-            parsed_loss
-            if parsed_loss is not None
-            else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
-        ),
-        0.0,
-        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY,
-    )
-    # Positive expected return earns capacity gradually; high loss probability
-    # and a negative lower bound keep the observation side conservative.
-    edge_score = _clamp(expected / 1.0, 0.0, 1.0)
-    loss_score = _clamp(
-        (NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY - loss) / 0.30,
-        0.0,
-        1.0,
-    )
-    objective_score = (
-        _clamp((objective + 0.50) / 0.50, 0.0, 1.0)
-        if objective is not None
-        else 0.0
-    )
-    confidence = _clamp(
-        0.50 * edge_score + 0.30 * loss_score + 0.20 * objective_score,
-        0.0,
-        1.0,
-    )
-    return round(
-        NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
-        + (
-            NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT
-            - NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
-        )
-        * confidence,
-        8,
-    )
 
 
 def normal_paper_client_order_id(decision_id: Any) -> str:
@@ -197,7 +118,7 @@ def normalize_normal_paper_contract(value: Any) -> dict[str, Any]:
             }
         )
         return normalized
-    if version not in KNOWN_HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS:
+    if version not in HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS:
         return {}
 
     expected = _float(
@@ -230,7 +151,6 @@ def normalize_normal_paper_contract(value: Any) -> dict[str, Any]:
         if observation
         else "strategy_edge_selected"
     )
-    historical_cap = _float(contract.get("single_trade_risk_fraction_cap"), None)
     normalized = {
         "canonical_protocol_version": NORMAL_PAPER_TRADE_VERSION,
         "protocol_state": "historical_normalized",
@@ -273,17 +193,9 @@ def normalize_normal_paper_contract(value: Any) -> dict[str, Any]:
         "strong_expert_opposition": bool(
             contract.get("strong_expert_opposition") is True
         ),
-        "single_trade_risk_fraction_cap": (
-            historical_cap
-            if historical_cap is not None and historical_cap > 0.0
-            else quality_observation_risk_fraction(
-                expected_net_return_pct=expected,
-                objective_net_return_pct=objective,
-                loss_probability=loss_probability,
-            )
-            if observation
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
+        # Historical caps are preserved only inside source_contract. The
+        # canonical projection must not carry old micro-sizing into new logic.
+        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "paper_quality_mode": (
             "quality_observation" if observation else "validated"
         ),
@@ -426,66 +338,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "quality_observation_reasons",
         )
     }
-    # Keep already-settled pre-v7 envelopes verifiable while requiring the new
-    # quality-mode fields on v7 contracts. These fields did not exist when the
-    # v4-v6 fingerprints were created.
-    if contract.get("version") in {
-        LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
-    }:
-        for key in (
-            "paper_quality_mode",
-            "paper_quality_observation_only",
-            "quality_observation_reasons",
-        ):
-            payload.pop(key, None)
     return payload
-
-
-def _legacy_v5_contract_fingerprint_payload(
-    contract: dict[str, Any],
-) -> dict[str, Any]:
-    payload = _contract_fingerprint_payload(contract)
-    payload.pop("quant_quality_permissions", None)
-    return payload
-
-
-def _legacy_v3_contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: contract.get(key)
-        for key in (
-            "version",
-            "authorized",
-            "trade_mode",
-            "execution_scope",
-            "entry_type",
-            "trade_kind",
-            "production_permission",
-            "decision_authority",
-            "selection_reason",
-            "symbol",
-            "side",
-            "prediction_horizon_minutes",
-            "valid_for_seconds",
-            "expected_net_return_pct",
-            "objective_net_return_pct",
-            "loss_probability",
-            "quant_evidence_families",
-            "strong_expert_opposition",
-            "single_trade_risk_fraction_cap",
-            "portfolio_risk_fraction_cap",
-            "leverage_policy",
-            "model_leverage_role",
-            "uses_shared_order_pipeline",
-            "uses_shared_position_ledger",
-            "continuous_training_after_trusted_settlement",
-            "separate_sampling_order",
-            "risk_override_permission",
-            "sample_target",
-            "daily_sample_quota",
-        )
-    }
 
 
 def select_normal_paper_trade_side(
@@ -687,15 +540,7 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        "single_trade_risk_fraction_cap": (
-            quality_observation_risk_fraction(
-                expected_net_return_pct=expected_net,
-                objective_net_return_pct=objective_net,
-                loss_probability=loss_probability,
-            )
-            if selection_reason == "paper_quality_observation"
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
+        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -781,7 +626,6 @@ def build_normal_paper_position_lifecycle(decision: Any) -> dict[str, Any]:
 def _normal_strategy_trade_contract_reasons(
     value: Any,
     *,
-    expected_version: str,
     require_positive_objective: bool,
     require_quality_permission: bool = True,
     allow_non_positive_objective_observation: bool = False,
@@ -789,7 +633,7 @@ def _normal_strategy_trade_contract_reasons(
 ) -> list[str]:
     contract = _dict(value)
     reasons: list[str] = []
-    if contract.get("version") != expected_version:
+    if contract.get("version") != NORMAL_PAPER_TRADE_VERSION:
         reasons.append("normal_paper_trade_version_invalid")
     selection_reason = str(contract.get("selection_reason") or "")
     observation_mode = selection_reason == "paper_quality_observation"
@@ -811,8 +655,6 @@ def _normal_strategy_trade_contract_reasons(
         and objective_net is not None
         and objective_net <= 0.0
     )
-    if current_edge_validated:
-        quality_observation_reasons = []
     if contract.get("authorized") is not True and not observation_only:
         reasons.append("normal_paper_trade_not_authorized")
     if contract.get("trade_mode") != "paper":
@@ -861,37 +703,25 @@ def _normal_strategy_trade_contract_reasons(
         for reason in contract.get("quality_observation_reasons") or []
         if str(reason).strip()
     ]
-    if expected_version in {
-        NORMAL_PAPER_TRADE_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
-    }:
-        if contract.get("paper_quality_observation_only") is not observation_mode:
-            reasons.append("normal_paper_trade_quality_mode_invalid")
-        expected_quality_mode = "quality_observation" if observation_mode else "validated"
-        if contract.get("paper_quality_mode") != expected_quality_mode:
-            reasons.append("normal_paper_trade_quality_mode_invalid")
-        if observation_mode and not observation_reasons:
-            reasons.append("normal_paper_trade_quality_observation_reason_missing")
-        loss_probability = _float(contract.get("loss_probability"), None)
-        if (
-            expected_version in {
-                NORMAL_PAPER_TRADE_VERSION,
-                LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-                LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-            }
-            and observation_mode
-            and (
+    if contract.get("paper_quality_observation_only") is not observation_mode:
+        reasons.append("normal_paper_trade_quality_mode_invalid")
+    expected_quality_mode = "quality_observation" if observation_mode else "validated"
+    if contract.get("paper_quality_mode") != expected_quality_mode:
+        reasons.append("normal_paper_trade_quality_mode_invalid")
+    if observation_mode and not observation_reasons:
+        reasons.append("normal_paper_trade_quality_observation_reason_missing")
+    loss_probability = _float(contract.get("loss_probability"), None)
+    if (
+        observation_mode
+        and (
             loss_probability is None
             or loss_probability
             > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
-            )
-        ):
-            reasons.append(
-                "normal_paper_trade_quality_observation_loss_probability_too_high"
-            )
+        )
+    ):
+        reasons.append(
+            "normal_paper_trade_quality_observation_loss_probability_too_high"
+        )
     if require_quality_permission:
         quality_permissions = _dict(contract.get("quant_quality_permissions"))
         if not quality_permissions:
@@ -918,58 +748,19 @@ def _normal_strategy_trade_contract_reasons(
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
         reasons.append("normal_paper_trade_horizon_invalid")
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
-    graduated_observation_version = expected_version in {
-        LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-        LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
-    }
-    expected_single_cap = (
-        quality_observation_risk_fraction(
-            expected_net_return_pct=contract.get("expected_net_return_pct"),
-            objective_net_return_pct=contract.get("objective_net_return_pct"),
-            loss_probability=contract.get("loss_probability"),
-        )
-        if expected_version == NORMAL_PAPER_TRADE_VERSION and observation_mode
-        else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        if expected_version == NORMAL_PAPER_TRADE_VERSION
-        else quality_observation_risk_fraction(
-            expected_net_return_pct=contract.get("expected_net_return_pct"),
-            objective_net_return_pct=contract.get("objective_net_return_pct"),
-            loss_probability=contract.get("loss_probability"),
-        )
-        if observation_mode and graduated_observation_version
-        else NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
-        if observation_mode
-        else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        if expected_version == NORMAL_PAPER_TRADE_VERSION
-        else LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
-    if observation_mode and graduated_observation_version:
-        legacy_floor = isclose(
-            single_cap,
-            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION,
-            abs_tol=1e-12,
-        )
-        graduated_cap = isclose(single_cap, expected_single_cap, abs_tol=1e-8)
-        if not (
-            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_RISK_FRACTION
-            <= single_cap
-            <= NORMAL_PAPER_TRADE_QUALITY_OBSERVATION_RISK_FRACTION_LIMIT
-        ) or not (legacy_floor or graduated_cap):
-            reasons.append("normal_paper_trade_single_risk_cap_invalid")
-    elif not isclose(single_cap, expected_single_cap, abs_tol=1e-12):
+    if not isclose(
+        single_cap,
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+        abs_tol=1e-12,
+    ):
         reasons.append("normal_paper_trade_single_risk_cap_invalid")
     if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
         reasons.append("normal_paper_trade_leverage_policy_invalid")
     if contract.get("model_leverage_role") != "upper_bound_when_explicit":
         reasons.append("normal_paper_trade_model_leverage_role_invalid")
-    fingerprint_payload = (
-        _legacy_v5_contract_fingerprint_payload(contract)
-        if expected_version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
-        else _contract_fingerprint_payload(contract)
-    )
-    if contract.get("contract_fingerprint") != _fingerprint(fingerprint_payload):
+    if contract.get("contract_fingerprint") != _fingerprint(
+        _contract_fingerprint_payload(contract)
+    ):
         reasons.append("normal_paper_trade_fingerprint_mismatch")
     return list(dict.fromkeys(reasons))
 
@@ -979,7 +770,6 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
 
     return _normal_strategy_trade_contract_reasons(
         value,
-        expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=True,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
@@ -991,264 +781,11 @@ def normal_paper_trade_observation_contract_reasons(value: Any) -> list[str]:
 
     return _normal_strategy_trade_contract_reasons(
         value,
-        expected_version=NORMAL_PAPER_TRADE_VERSION,
         require_positive_objective=False,
         require_quality_permission=True,
         allow_non_positive_objective_observation=True,
         allow_unauthorized_observation=True,
     )
-
-
-def legacy_normal_paper_v11_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v11 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-        allow_non_positive_objective_observation=True,
-    )
-
-
-def legacy_normal_paper_v10_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v10 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-        allow_non_positive_objective_observation=True,
-    )
-
-
-def legacy_normal_paper_v9_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v9 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-    )
-
-
-def legacy_normal_paper_v8_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v8 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-        allow_non_positive_objective_observation=True,
-    )
-
-
-def legacy_normal_paper_v7_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v7 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-    )
-
-
-def legacy_normal_paper_v6_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v6 envelopes for settlement and recovery only."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
-        require_positive_objective=True,
-        require_quality_permission=True,
-    )
-
-
-def legacy_normal_paper_v5_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate v5 only for historical settlement and recovery."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
-        require_positive_objective=False,
-        require_quality_permission=False,
-    )
-
-
-def legacy_normal_paper_v4_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate a v4 envelope for settlement and recovery, never new entry."""
-
-    return _normal_strategy_trade_contract_reasons(
-        value,
-        expected_version=LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
-        require_positive_objective=False,
-        require_quality_permission=False,
-    )
-
-
-def legacy_normal_paper_v3_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate the immutable v3 envelope for historical settlement only."""
-
-    contract = _dict(value)
-    reasons: list[str] = []
-    if contract.get("version") != LEGACY_NORMAL_PAPER_TRADE_V3_VERSION:
-        reasons.append("legacy_normal_paper_v3_version_invalid")
-    if contract.get("authorized") is not True:
-        reasons.append("legacy_normal_paper_v3_not_authorized")
-    if contract.get("trade_mode") != "paper" or contract.get("execution_scope") != "paper_only":
-        reasons.append("legacy_normal_paper_v3_scope_invalid")
-    if contract.get("entry_type") != "normal_strategy_trade" or contract.get(
-        "trade_kind"
-    ) != "normal_strategy_trade":
-        reasons.append("legacy_normal_paper_v3_kind_invalid")
-    if contract.get("production_permission") is not False:
-        reasons.append("legacy_normal_paper_v3_production_permission_invalid")
-    selection_reason = str(contract.get("selection_reason") or "")
-    if selection_reason not in {"policy_exploitation", "coverage_sampling"}:
-        reasons.append("legacy_normal_paper_v3_selection_reason_invalid")
-    expected_single_cap = (
-        0.0001 if selection_reason == "coverage_sampling" else 0.0005
-    )
-    if not isclose(
-        _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0,
-        expected_single_cap,
-        abs_tol=1e-12,
-    ):
-        reasons.append("legacy_normal_paper_v3_single_risk_cap_invalid")
-    portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), None)
-    if portfolio_cap is not None and not isclose(portfolio_cap, 0.0015, abs_tol=1e-12):
-        reasons.append("legacy_normal_paper_v3_portfolio_risk_cap_invalid")
-    if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
-        reasons.append("legacy_normal_paper_v3_leverage_policy_invalid")
-    if contract.get("uses_shared_order_pipeline") is not True:
-        reasons.append("legacy_normal_paper_v3_order_pipeline_split")
-    if contract.get("uses_shared_position_ledger") is not True:
-        reasons.append("legacy_normal_paper_v3_position_ledger_split")
-    if contract.get("continuous_training_after_trusted_settlement") is not True:
-        reasons.append("legacy_normal_paper_v3_training_disabled")
-    if contract.get("contract_fingerprint") != _fingerprint(
-        _legacy_v3_contract_fingerprint_payload(contract)
-    ):
-        reasons.append("legacy_normal_paper_v3_fingerprint_mismatch")
-    return list(dict.fromkeys(reasons))
-
-
-def legacy_normal_paper_v2_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate the immutable fixed-1x v2 envelope for historical outcomes only."""
-
-    contract = _dict(value)
-    reasons: list[str] = []
-    if contract.get("version") != LEGACY_NORMAL_PAPER_TRADE_VERSION:
-        reasons.append("legacy_normal_paper_trade_version_invalid")
-    if contract.get("authorized") is not True:
-        reasons.append("legacy_normal_paper_trade_not_authorized")
-    if contract.get("trade_mode") != "paper" or contract.get("execution_scope") != "paper_only":
-        reasons.append("legacy_normal_paper_trade_scope_invalid")
-    if contract.get("entry_type") != "normal_strategy_trade" or contract.get(
-        "trade_kind"
-    ) != "normal_strategy_trade":
-        reasons.append("legacy_normal_paper_trade_kind_invalid")
-    if contract.get("production_permission") is not False:
-        reasons.append("legacy_normal_paper_trade_production_permission_invalid")
-    if contract.get("selection_reason") != "policy_exploitation":
-        reasons.append("legacy_normal_paper_trade_selection_reason_invalid")
-    if str(contract.get("side") or "").lower() not in {"long", "short"}:
-        reasons.append("legacy_normal_paper_trade_side_missing")
-    if not str(contract.get("symbol") or "").strip():
-        reasons.append("legacy_normal_paper_trade_symbol_missing")
-    if not isclose(_float(contract.get("leverage_cap"), 0.0) or 0.0, 1.0, abs_tol=1e-12):
-        reasons.append("legacy_normal_paper_trade_leverage_cap_invalid")
-    legacy_fingerprint_payload = {
-        key: contract.get(key)
-        for key in (
-            "version",
-            "authorized",
-            "trade_mode",
-            "execution_scope",
-            "entry_type",
-            "trade_kind",
-            "production_permission",
-            "decision_authority",
-            "selection_reason",
-            "symbol",
-            "side",
-            "prediction_horizon_minutes",
-            "valid_for_seconds",
-            "expected_net_return_pct",
-            "objective_net_return_pct",
-            "loss_probability",
-            "quant_evidence_families",
-            "strong_expert_opposition",
-            "single_trade_risk_fraction_cap",
-            "portfolio_risk_fraction_cap",
-            "leverage_cap",
-            "uses_shared_order_pipeline",
-            "uses_shared_position_ledger",
-            "continuous_training_after_trusted_settlement",
-            "separate_sampling_order",
-            "risk_override_permission",
-            "sample_target",
-            "daily_sample_quota",
-        )
-    }
-    if contract.get("contract_fingerprint") != _fingerprint(legacy_fingerprint_payload):
-        reasons.append("legacy_normal_paper_trade_fingerprint_mismatch")
-    return list(dict.fromkeys(reasons))
-
-
-def historical_normal_paper_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate the immutable v1 envelope for settlement and training recovery only."""
-
-    contract = _dict(value)
-    reasons: list[str] = []
-    if contract.get("version") != HISTORICAL_NORMAL_PAPER_TRADE_VERSION:
-        reasons.append("historical_normal_paper_trade_version_invalid")
-    if contract.get("authorized") is not True:
-        reasons.append("historical_normal_paper_trade_not_authorized")
-    if contract.get("execution_scope") != "paper_only":
-        reasons.append("historical_normal_paper_trade_scope_invalid")
-    if contract.get("live_execution_permission") is not False:
-        reasons.append("historical_normal_paper_trade_live_permission_invalid")
-    if contract.get("trade_kind") != "normal_paper_trade":
-        reasons.append("historical_normal_paper_trade_kind_invalid")
-    if contract.get("route_kind") not in HISTORICAL_NORMAL_PAPER_TRADE_ROUTES:
-        reasons.append("historical_normal_paper_trade_route_invalid")
-    if str(contract.get("side") or "").lower() not in {"long", "short"}:
-        reasons.append("historical_normal_paper_trade_side_missing")
-    if not str(contract.get("symbol") or "").strip():
-        reasons.append("historical_normal_paper_trade_symbol_missing")
-    if contract.get("uses_shared_order_pipeline") is not True:
-        reasons.append("historical_normal_paper_trade_order_pipeline_split")
-    if contract.get("uses_shared_position_ledger") is not True:
-        reasons.append("historical_normal_paper_trade_position_ledger_split")
-    if contract.get("separate_sampling_order") is not False:
-        reasons.append("historical_normal_paper_trade_sampling_order_split")
-    if contract.get("continuous_training_after_trusted_settlement") is not True:
-        reasons.append("historical_normal_paper_trade_training_disabled")
-    if contract.get("order_creation_owner") != "ensemble_trader_unified_decision":
-        reasons.append("historical_normal_paper_trade_order_owner_invalid")
-    if contract.get("risk_override_permission") is not False:
-        reasons.append("historical_normal_paper_trade_risk_override_invalid")
-    if contract.get("sample_target") is not None or contract.get("daily_sample_quota") is not None:
-        reasons.append("historical_normal_paper_trade_sample_quota_forbidden")
-    horizon = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
-    valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
-    if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
-        reasons.append("historical_normal_paper_trade_horizon_invalid")
-    expected_fingerprint = _fingerprint(
-        {
-            key: item
-            for key, item in contract.items()
-            if key not in {"generated_at", "contract_fingerprint"}
-        }
-    )
-    if contract.get("contract_fingerprint") != expected_fingerprint:
-        reasons.append("historical_normal_paper_trade_fingerprint_mismatch")
-    return list(dict.fromkeys(reasons))
 
 
 def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:

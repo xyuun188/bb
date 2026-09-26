@@ -226,7 +226,7 @@ def test_root_cause_display_is_bounded_but_raw_counts_are_preserved(
     monkeypatch.setattr(
         root_cause_module,
         "validate_entry_execution_contract",
-        lambda _raw: (None, [f"reason_{index}" for index in range(20)]),
+        lambda _raw, **_kwargs: (None, [f"reason_{index}" for index in range(20)]),
     )
     report = StrategySignalRootCauseAuditService().summarize(
         decisions=[_decision(complete=True)],

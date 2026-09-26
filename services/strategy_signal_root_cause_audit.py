@@ -116,7 +116,10 @@ class StrategySignalRootCauseAuditService:
                     expected_returns.append(expected)
                 if lcb is not None:
                     return_lcbs.append(lcb)
-            _, reasons = validate_entry_execution_contract(raw)
+            _, reasons = validate_entry_execution_contract(
+                raw,
+                allow_historical_settlement=True,
+            )
             blocker_counts.update(reasons)
             for reason in reasons:
                 lifecycle_blocker_counts[(lifecycle, reason)] += 1

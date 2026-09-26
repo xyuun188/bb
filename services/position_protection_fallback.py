@@ -99,7 +99,10 @@ class PositionProtectionFallbackPolicy:
         sizing = sizing if isinstance(sizing, dict) else {}
         provenance = sizing.get("policy_provenance")
         provenance = provenance if isinstance(provenance, dict) else {}
-        _, contract_blockers = validate_entry_execution_contract(raw)
+        _, contract_blockers = validate_entry_execution_contract(
+            raw,
+            allow_historical_settlement=True,
+        )
         stop_loss_pct = self.float_parser(
             getattr(decision, "stop_loss_pct", None)
             or sizing.get("stressed_loss_fraction"),

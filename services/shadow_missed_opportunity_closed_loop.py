@@ -112,7 +112,10 @@ def _executed_return_contract_gaps(decisions: Sequence[Any]) -> list[dict[str, A
         if action not in {"long", "short"} or not bool(_row_get(row, "was_executed")):
             continue
         raw = _safe_dict(_row_get(row, "raw_llm_response"))
-        contract, contract_blockers = validate_entry_execution_contract(raw)
+        contract, contract_blockers = validate_entry_execution_contract(
+            raw,
+            allow_historical_settlement=True,
+        )
         if contract_blockers:
             lifecycle = str(contract.get("contract_lifecycle") or "unknown")
             gaps.append(

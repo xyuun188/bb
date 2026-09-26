@@ -11,9 +11,9 @@ from typing import Any
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_VERSION,
     historical_normalized_contract_reasons,
-    normalize_normal_paper_contract,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
+    normalize_normal_paper_contract,
 )
 from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_SOURCE,
@@ -1596,7 +1596,7 @@ def build_okx_history_training_sample(
         "execution_actual_over_budget_loss_usdt": budget_facts["actual_over_budget_loss_usdt"],
         "strategy_entry_kind": "normal_strategy_trade",
         "historical_entry_contract_kind": (
-            "normal_paper_v12"
+            "normal_paper_v14"
             if valid_normal_paper and current_normal_paper
             else "paper_training"
             if valid_paper_training
@@ -1628,11 +1628,11 @@ def build_okx_history_training_sample(
                 "version": normal_paper_evidence.get("version"),
                 "source_version": normal_paper_evidence.get("source_version"),
                 "contract_generation": (
-                    "current_quality_observation_v12"
+                    "current_quality_observation_v14"
                     if current_normal_paper
                     and normal_paper.get("selection_reason")
                     == "paper_quality_observation"
-                    else "current_validated_v12"
+                    else "current_validated_v14"
                     if current_normal_paper
                     else "historical_normalized_current_protocol"
                     if historical_normal_paper

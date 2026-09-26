@@ -9,8 +9,6 @@ from math import sqrt
 from typing import Any
 
 from services.normal_paper_trade import (
-    LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
 )
 from services.normal_paper_trade import (
@@ -41,6 +39,8 @@ from services.paper_training import (
 )
 
 HISTORICAL_NORMAL_PAPER_TRADE_VERSION = "2026-07-22.normal-paper-trade.v1"
+LEGACY_NORMAL_PAPER_TRADE_V4_VERSION = "2026-07-28.normal-paper-strategy-trade.v4"
+LEGACY_NORMAL_PAPER_TRADE_V4_RISK_CAP = 0.0005
 
 
 def build_legacy_normal_paper_v4_trade_contract(
@@ -71,7 +71,7 @@ def build_legacy_normal_paper_v4_trade_contract(
         "quant_evidence_families": ["local_ml"],
         "strong_expert_opposition": False,
         "single_trade_risk_fraction_cap": (
-            LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            LEGACY_NORMAL_PAPER_TRADE_V4_RISK_CAP
         ),
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",

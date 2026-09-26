@@ -112,7 +112,10 @@ class StrongOpportunityService:
         policy = _safe_dict(raw.get("live_ml_profit_contract"))
         gate = _safe_dict(raw.get("production_trade_gate"))
         rules_contract = _safe_dict(raw.get("live_rules_canary_contract"))
-        contract, reasons = validate_entry_execution_contract(raw)
+        contract, reasons = validate_entry_execution_contract(
+            raw,
+            allow_historical_settlement=True,
+        )
         metrics = {
             "contract_lifecycle": lifecycle,
             "expected_net_return_pct": _safe_float(policy.get("expected_net_return_pct")),
