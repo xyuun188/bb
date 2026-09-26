@@ -13,7 +13,11 @@ from services.entry_profit_risk_sizing import (
     solve_size_aware_positive_expected_net,
 )
 from services.execution_cost_model import execution_cost_estimate
-from services.normal_paper_trade import build_normal_paper_trade_contract
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    build_normal_paper_trade_contract,
+    quality_observation_risk_fraction,
+)
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 
@@ -606,7 +610,7 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls() -> None:
+async def test_negative_lcb_quality_observation_uses_graduated_micro_risk_controls() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
@@ -622,7 +626,17 @@ async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls(
     assert sizing["final_leverage"] > 1.0
     assert sizing["paper_quality_observation_leverage_cap"] is None
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
-    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    contract = decision.raw_response["normal_paper_trade"]
+    expected_cap = quality_observation_risk_fraction(
+        expected_net_return_pct=contract["expected_net_return_pct"],
+        objective_net_return_pct=contract["objective_net_return_pct"],
+        loss_probability=contract["loss_probability"],
+    )
+    assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(expected_cap)
+    assert sizing["risk_budget_usdt"] == pytest.approx(1000.0 * expected_cap)
+    assert sizing["risk_budget_usdt"] < (
+        1000.0 * NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
     assert 0.0 < sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assert sizing["expected_net_return_pct"] > 0.0
     assert sizing["production_permission"] is False
@@ -631,7 +645,7 @@ async def test_negative_lcb_quality_observation_uses_normal_paper_risk_controls(
 
 
 @pytest.mark.asyncio
-async def test_positive_lcb_unpromoted_observation_uses_normal_dynamic_risk() -> None:
+async def test_positive_lcb_unpromoted_observation_uses_graduated_micro_risk_controls() -> None:
     decision = _quality_observation_decision(return_lcb_pct=0.52)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
@@ -642,7 +656,17 @@ async def test_positive_lcb_unpromoted_observation_uses_normal_dynamic_risk() ->
     assert sizing["paper_quality_observation_mode"] is True
     assert sizing["paper_quality_shadow_only"] is False
     assert sizing["paper_quality_non_positive_return_lcb"] is False
-    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    contract = decision.raw_response["normal_paper_trade"]
+    expected_cap = quality_observation_risk_fraction(
+        expected_net_return_pct=contract["expected_net_return_pct"],
+        objective_net_return_pct=contract["objective_net_return_pct"],
+        loss_probability=contract["loss_probability"],
+    )
+    assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(expected_cap)
+    assert sizing["risk_budget_usdt"] == pytest.approx(1000.0 * expected_cap)
+    assert sizing["risk_budget_usdt"] < (
+        1000.0 * NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
     assert sizing["final_notional_usdt"] > sizing["minimum_order_notional_usdt"]
     assert sizing["final_leverage"] > 1.0
     assert RiskEngine().assess(decision, [], _balance).approved is True

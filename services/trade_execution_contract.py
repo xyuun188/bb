@@ -13,31 +13,10 @@ from core.contract_math import persisted_product_isclose
 from services.entry_profit_risk_sizing import confirmed_fill_has_valid_submission
 from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
-    LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
-    legacy_normal_paper_v2_trade_contract_reasons,
-    legacy_normal_paper_v3_trade_contract_reasons,
-    legacy_normal_paper_v4_trade_contract_reasons,
-    legacy_normal_paper_v5_trade_contract_reasons,
-    legacy_normal_paper_v6_trade_contract_reasons,
-    legacy_normal_paper_v7_trade_contract_reasons,
-    legacy_normal_paper_v8_trade_contract_reasons,
-    legacy_normal_paper_v9_trade_contract_reasons,
-    legacy_normal_paper_v10_trade_contract_reasons,
-    legacy_normal_paper_v11_trade_contract_reasons,
+    historical_normalized_contract_reasons,
+    normalize_normal_paper_contract,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
 )
@@ -846,7 +825,7 @@ def validate_entry_execution_contract(
             executed=executed,
             filled_order_present=filled_order_present,
             authoritative_fill_complete=authoritative_fill_complete,
-            allow_legacy_settlement=True,
+            allow_historical_settlement=True,
         )
     if lifecycle == "paper_bootstrap_canary":
         return validate_paper_canary_entry_contract(
@@ -1339,46 +1318,30 @@ def validate_normal_paper_entry_contract(
     executed: bool = False,
     filled_order_present: bool | None = None,
     authoritative_fill_complete: bool = False,
-    allow_legacy_settlement: bool = False,
+    allow_historical_settlement: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Validate a normal paper trade; legacy envelopes are settlement-only."""
+    """Validate one canonical normal-paper contract.
 
-    normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+    Historical envelopes are normalized before validation. The normalized
+    object can support settlement/recovery of an existing fill, but it never
+    becomes an authorization envelope for a new submission.
+    """
+
+    source_normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+    normalized_normal_trade = normalize_normal_paper_contract(source_normal_trade)
+    historical_normal_trade = bool(
+        normalized_normal_trade
+        and normalized_normal_trade.get("protocol_state") == "historical_normalized"
+    )
+    normal_trade = normalized_normal_trade or source_normal_trade
+    if historical_normal_trade:
+        raw = dict(raw)
+        raw["normal_paper_trade"] = normal_trade
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     opportunity = _safe_dict(raw.get("opportunity_score"))
     execution_cost = _safe_dict(opportunity.get("execution_cost"))
     pre_order = _safe_dict(raw.get("pre_order_execution_facts"))
     sizing_pass = _safe_dict(raw.get("execution_cost_sizing_pass"))
-    legacy_fixed_leverage = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_VERSION
-    )
-    legacy_dynamic_v3 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION
-    )
-    legacy_objective_v4 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
-    )
-    legacy_quality_v5 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
-    )
-    legacy_quality_v6 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION
-    )
-    legacy_quality_v7 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
-    )
-    legacy_quality_v8 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V8_VERSION
-    )
-    legacy_quality_v9 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V9_VERSION
-    )
-    legacy_quality_v10 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
-    )
-    legacy_quality_v11 = (
-        normal_trade.get("version") == LEGACY_NORMAL_PAPER_TRADE_V11_VERSION
-    )
     filled_notional = max(_safe_float(filled_notional_usdt, 0.0), 0.0)
     confirmed_partial_fill = _confirmed_partial_fill_settlement(
         sizing,
@@ -1392,30 +1355,14 @@ def validate_normal_paper_entry_contract(
         and normal_trade.get("selection_reason") == "paper_quality_observation"
     )
     reasons = (
-        legacy_normal_paper_v2_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_fixed_leverage
-        else legacy_normal_paper_v3_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_dynamic_v3
-        else legacy_normal_paper_v4_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_objective_v4
-        else legacy_normal_paper_v5_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v5
-        else legacy_normal_paper_v6_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v6
-        else legacy_normal_paper_v7_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v7
-        else legacy_normal_paper_v8_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v8
-        else legacy_normal_paper_v9_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v9
-        else legacy_normal_paper_v10_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v10
-        else legacy_normal_paper_v11_trade_contract_reasons(normal_trade)
-        if allow_legacy_settlement and legacy_quality_v11
+        historical_normalized_contract_reasons(source_normal_trade)
+        if historical_normal_trade
         else normal_paper_trade_observation_contract_reasons(normal_trade)
         if confirmed_observation_settlement
         else normal_paper_trade_contract_reasons(normal_trade)
     )
+    if historical_normal_trade and not allow_historical_settlement:
+        reasons.append("normal_paper_historical_contract_not_authorized_for_new_entry")
 
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
     planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
@@ -1460,35 +1407,7 @@ def validate_normal_paper_entry_contract(
     minimum_fill_settlement_accepted = bool(
         minimum_fill_settlement.get("accepted") is True
     )
-    expected_sizing_version = (
-        LEGACY_NORMAL_PAPER_TRADE_SIZING_VERSION
-        if legacy_fixed_leverage
-        else LEGACY_NORMAL_PAPER_TRADE_V3_SIZING_VERSION
-        if legacy_dynamic_v3
-        else LEGACY_NORMAL_PAPER_TRADE_V4_SIZING_VERSION
-        if (
-            legacy_objective_v4
-            or legacy_quality_v5
-            or legacy_quality_v6
-            or legacy_quality_v7
-        )
-        else NORMAL_PAPER_TRADE_SIZING_VERSION
-    )
-    accepted_sizing_versions = {expected_sizing_version}
-    # Settling a persisted legacy trade may pair its historical decision
-    # envelope with the current sizing envelope.  Keep this compatibility
-    # limited to settlement; the entry gate still rejects legacy trade
-    # versions before any new order can be submitted.
-    if allow_legacy_settlement and (
-        legacy_fixed_leverage
-        or legacy_dynamic_v3
-        or legacy_objective_v4
-        or legacy_quality_v5
-        or legacy_quality_v6
-        or legacy_quality_v7
-    ):
-        accepted_sizing_versions.add(NORMAL_PAPER_TRADE_SIZING_VERSION)
-    if sizing.get("contract_version") not in accepted_sizing_versions:
+    if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
         reasons.append("normal_paper_sizing_version_invalid")
     if sizing.get("contract_lifecycle") != "normal_paper_trade":
         reasons.append("normal_paper_sizing_lifecycle_invalid")
@@ -1502,23 +1421,8 @@ def validate_normal_paper_entry_contract(
         and not confirmed_drift_settlement
     ):
         reasons.append("normal_paper_sizing_ineligible")
-    legacy_settlement = bool(
-        allow_legacy_settlement
-        and (
-            legacy_fixed_leverage
-            or legacy_dynamic_v3
-            or legacy_objective_v4
-            or legacy_quality_v5
-            or legacy_quality_v6
-            or legacy_quality_v7
-            or legacy_quality_v8
-            or legacy_quality_v9
-            or legacy_quality_v10
-            or legacy_quality_v11
-        )
-    )
     if (
-        not legacy_settlement
+        not historical_normal_trade
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")
@@ -1577,10 +1481,7 @@ def validate_normal_paper_entry_contract(
         _safe_dict(sizing.get("leverage_tier_selection")).get("max_leverage"),
         0.0,
     )
-    if legacy_fixed_leverage:
-        if not isclose(leverage, 1.0, abs_tol=1e-8):
-            reasons.append("normal_paper_leverage_invalid")
-    else:
+    if not historical_normal_trade:
         dynamic_leverage = _safe_dict(sizing.get("dynamic_leverage_decision"))
         model_requested_leverage = _safe_float(
             sizing.get("model_requested_leverage"),
@@ -1590,13 +1491,10 @@ def validate_normal_paper_entry_contract(
             reasons.append("normal_paper_leverage_invalid")
         if tier_max_leverage < 1.0 or leverage > tier_max_leverage + 1e-8:
             reasons.append("normal_paper_leverage_exceeds_okx_tier")
-        expected_dynamic_leverage_version = (
-            "dynamic_leverage_allocator_v4"
-            if legacy_dynamic_v3
-            else "dynamic_leverage_allocator_v5"
-        )
-        if dynamic_leverage.get("version") != expected_dynamic_leverage_version:
+        if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v5":
             reasons.append("normal_paper_dynamic_leverage_contract_missing")
+    elif leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
+        reasons.append("normal_paper_leverage_invalid")
         if (
             sizing.get("model_leverage_is_explicit") is True
             and model_requested_leverage >= 1.0

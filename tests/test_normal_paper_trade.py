@@ -237,7 +237,11 @@ def test_unpromoted_quality_model_builds_normal_risk_paper_contract() -> None:
     assert contract["production_permission"] is False
     assert (
         contract["single_trade_risk_fraction_cap"]
-        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        == quality_observation_risk_fraction(
+            expected_net_return_pct=contract["expected_net_return_pct"],
+            objective_net_return_pct=contract["objective_net_return_pct"],
+            loss_probability=contract["loss_probability"],
+        )
     )
 
 
@@ -267,7 +271,11 @@ def test_negative_lcb_quality_observation_authorizes_only_bounded_paper_entry() 
     assert normal_paper_trade_observation_contract_reasons(contract) == []
     assert (
         contract["single_trade_risk_fraction_cap"]
-        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        == quality_observation_risk_fraction(
+            expected_net_return_pct=contract["expected_net_return_pct"],
+            objective_net_return_pct=contract["objective_net_return_pct"],
+            loss_probability=contract["loss_probability"],
+        )
     )
 
 

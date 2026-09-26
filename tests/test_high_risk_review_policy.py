@@ -1003,7 +1003,9 @@ async def test_paper_quality_observation_uses_current_paper_advisory_when_cloud_
     assert contract["eligible"] is True
     assert (
         contract["single_trade_risk_fraction_cap"]
-        == NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        == decision.raw_response["normal_paper_trade"][
+            "single_trade_risk_fraction_cap"
+        ]
     )
     assert contract["final_leverage"] == 1.0
     assert contract["dynamic_leverage_allowed"] is True

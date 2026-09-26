@@ -4,33 +4,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
 from services.normal_paper_trade import (
-    HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V3_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V5_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V6_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V9_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_V11_VERSION,
-    LEGACY_NORMAL_PAPER_TRADE_VERSION,
     NORMAL_PAPER_TRADE_VERSION,
-    historical_normal_paper_trade_contract_reasons,
-    legacy_normal_paper_v2_trade_contract_reasons,
-    legacy_normal_paper_v3_trade_contract_reasons,
-    legacy_normal_paper_v4_trade_contract_reasons,
-    legacy_normal_paper_v5_trade_contract_reasons,
-    legacy_normal_paper_v6_trade_contract_reasons,
-    legacy_normal_paper_v7_trade_contract_reasons,
-    legacy_normal_paper_v8_trade_contract_reasons,
-    legacy_normal_paper_v9_trade_contract_reasons,
-    legacy_normal_paper_v10_trade_contract_reasons,
-    legacy_normal_paper_v11_trade_contract_reasons,
+    historical_normalized_contract_reasons,
+    normalize_normal_paper_contract,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
 )
@@ -677,11 +658,6 @@ def _decision_authority(
         authority = _text(normal_paper.get("decision_authority")).lower()
         if authority:
             return authority
-        if (
-            normal_paper.get("version") == HISTORICAL_NORMAL_PAPER_TRADE_VERSION
-            and normal_paper.get("order_creation_owner") == "ensemble_trader_unified_decision"
-        ):
-            return "ensemble"
     gate_validation = validate_production_trade_gate(raw_llm_response.get("production_trade_gate"))
     if gate_validation.valid:
         return _text(gate_validation.gate.get("decision_authority")).lower()
@@ -1246,7 +1222,7 @@ def build_okx_history_training_sample(
                 continue
             candidate = decision_raw_by_order_id.get(order_id)
             if isinstance(candidate, dict) and candidate:
-                raw_llm_response = candidate
+                raw_llm_response = deepcopy(candidate)
                 decision_lineage_source = "exact_entry_order_decision_payload"
             feature_candidate = decision_feature_by_order_id.get(order_id)
             if isinstance(feature_candidate, dict) and feature_candidate:
@@ -1254,13 +1230,15 @@ def build_okx_history_training_sample(
             if raw_llm_response and entry_feature_snapshot:
                 break
     if not raw_llm_response:
-        raw_llm_response = next(
+        raw_llm_response = deepcopy(
+            next(
             (
                 decision_raw_by_position_id[value]
                 for value in position_ids
                 if value in decision_raw_by_position_id
             ),
             {},
+            )
         )
         if raw_llm_response:
             decision_lineage_source = "position_time_fallback_payload"
@@ -1389,75 +1367,34 @@ def build_okx_history_training_sample(
     )
     if obsolete_sampling_entry:
         lineage_gaps.append("obsolete_sampling_entry_not_strategy_trainable")
-    normal_paper = _dict(raw_llm_response.get("normal_paper_trade"))
-    normal_paper_version = _text(normal_paper.get("version"))
-    current_normal_paper = bool(normal_paper and normal_paper_version == NORMAL_PAPER_TRADE_VERSION)
-    legacy_v11_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V11_VERSION
-    )
-    legacy_v10_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
-    )
-    legacy_v9_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V9_VERSION
-    )
-    legacy_v8_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V8_VERSION
-    )
-    legacy_v7_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
-    )
-    legacy_v6_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V6_VERSION
-    )
-    legacy_v5_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V5_VERSION
-    )
-    legacy_v4_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
-    )
-    legacy_v3_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_V3_VERSION
-    )
-    legacy_v2_normal_paper = bool(
-        normal_paper and normal_paper_version == LEGACY_NORMAL_PAPER_TRADE_VERSION
+    source_normal_paper = _dict(raw_llm_response.get("normal_paper_trade"))
+    normal_paper_version = _text(source_normal_paper.get("version"))
+    current_normal_paper = bool(
+        source_normal_paper and normal_paper_version == NORMAL_PAPER_TRADE_VERSION
     )
     historical_normal_paper = bool(
-        normal_paper and normal_paper_version == HISTORICAL_NORMAL_PAPER_TRADE_VERSION
+        source_normal_paper
+        and normal_paper_version != NORMAL_PAPER_TRADE_VERSION
     )
-    normal_paper_gaps = []
-    if current_normal_paper:
-        normal_paper_gaps = normal_paper_trade_contract_reasons(normal_paper)
-        if (
-            normal_paper_gaps
-            and normal_paper.get("selection_reason") == "paper_quality_observation"
-            and not normal_paper_trade_observation_contract_reasons(normal_paper)
-        ):
-            normal_paper_gaps = []
-    elif legacy_v11_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v11_trade_contract_reasons(normal_paper)
-    elif legacy_v10_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v10_trade_contract_reasons(normal_paper)
-    elif legacy_v9_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v9_trade_contract_reasons(normal_paper)
-    elif legacy_v8_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v8_trade_contract_reasons(normal_paper)
-    elif legacy_v7_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v7_trade_contract_reasons(normal_paper)
-    elif legacy_v6_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v6_trade_contract_reasons(normal_paper)
-    elif legacy_v5_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v5_trade_contract_reasons(normal_paper)
-    elif legacy_v4_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v4_trade_contract_reasons(normal_paper)
-    elif legacy_v3_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v3_trade_contract_reasons(normal_paper)
-    elif legacy_v2_normal_paper:
-        normal_paper_gaps = legacy_normal_paper_v2_trade_contract_reasons(normal_paper)
-    elif historical_normal_paper:
-        normal_paper_gaps = historical_normal_paper_trade_contract_reasons(normal_paper)
-    elif normal_paper:
-        normal_paper_gaps = normal_paper_trade_contract_reasons(normal_paper)
+    normalized_normal_paper = normalize_normal_paper_contract(source_normal_paper)
+    if normalized_normal_paper:
+        raw_llm_response["normal_paper_trade_source"] = deepcopy(source_normal_paper)
+        raw_llm_response["normal_paper_trade"] = normalized_normal_paper
+    normal_paper = normalized_normal_paper
+    normal_paper_gaps = (
+        normal_paper_trade_contract_reasons(normal_paper)
+        if current_normal_paper
+        else historical_normalized_contract_reasons(source_normal_paper)
+        if historical_normal_paper
+        else []
+    )
+    if (
+        current_normal_paper
+        and normal_paper_gaps
+        and source_normal_paper.get("selection_reason") == "paper_quality_observation"
+        and not normal_paper_trade_observation_contract_reasons(source_normal_paper)
+    ):
+        normal_paper_gaps = []
     if normal_paper and execution_mode != "paper":
         normal_paper_gaps.append("normal_paper_trade_non_paper_execution_mode")
     paper_exploration = _dict(raw_llm_response.get("paper_exploration"))
@@ -1470,19 +1407,10 @@ def build_okx_history_training_sample(
         paper_training_gaps.append("paper_training_non_paper_execution_mode")
     if paper_training and (paper_exploration or paper_canary):
         paper_training_gaps.append("paper_training_conflicting_entry_contract")
-    if (
-        current_normal_paper
-        or legacy_v10_normal_paper
-        or legacy_v9_normal_paper
-        or legacy_v8_normal_paper
-        or legacy_v7_normal_paper
-        or legacy_v6_normal_paper
-        or legacy_v5_normal_paper
-        or legacy_v4_normal_paper
-        or legacy_v3_normal_paper
-        or legacy_v2_normal_paper
-    ) and (paper_exploration or paper_training or paper_canary):
-        normal_paper_gaps.append("normal_paper_trade_conflicting_legacy_contract")
+    if current_normal_paper and normalized_normal_paper and (
+        paper_exploration or paper_training or paper_canary
+    ):
+        normal_paper_gaps.append("normal_paper_trade_conflicting_entry_contract")
     normal_paper_gaps = list(dict.fromkeys(normal_paper_gaps))
     paper_training_gaps = list(dict.fromkeys(paper_training_gaps))
     valid_paper_exploration = bool(paper_exploration and not paper_exploration_gaps)
@@ -1511,6 +1439,7 @@ def build_okx_history_training_sample(
         if normal_paper_gaps
         else "entry_strategy"
     )
+    normal_paper_evidence = normal_paper
     sample = {
         "source": sample_source,
         "id": int(_value(history, "id", 0) or 0),
@@ -1669,60 +1598,35 @@ def build_okx_history_training_sample(
         "historical_entry_contract_kind": (
             "normal_paper_v12"
             if valid_normal_paper and current_normal_paper
-            else "normal_paper_v11"
-            if valid_normal_paper and legacy_v11_normal_paper
-            else "normal_paper_v10"
-            if valid_normal_paper and legacy_v10_normal_paper
-            else "normal_paper_v9"
-            if valid_normal_paper and legacy_v9_normal_paper
-            else "normal_paper_v8"
-            if valid_normal_paper and legacy_v8_normal_paper
             else "paper_training"
             if valid_paper_training
             else "paper_exploration"
             if valid_paper_exploration
-            else "normal_paper_v1"
+            else "normal_paper_normalized_historical"
             if valid_normal_paper and historical_normal_paper
-            else "normal_paper_v2"
-            if valid_normal_paper and legacy_v2_normal_paper
-            else "normal_paper_v3"
-            if valid_normal_paper and legacy_v3_normal_paper
-            else "normal_paper_v4"
-            if valid_normal_paper and legacy_v4_normal_paper
-            else "normal_paper_v5"
-            if valid_normal_paper and legacy_v5_normal_paper
-            else "normal_paper_v6"
-            if valid_normal_paper and legacy_v6_normal_paper
-            else "normal_paper_v7"
-            if valid_normal_paper and legacy_v7_normal_paper
             else None
         ),
         "strategy_selection_reason": (
-            _text(normal_paper.get("selection_reason"))
+            _text(normal_paper_evidence.get("selection_reason"))
             if valid_normal_paper
-            and (
-                current_normal_paper
-                or legacy_v10_normal_paper
-                or legacy_v9_normal_paper
-                or legacy_v8_normal_paper
-                or legacy_v7_normal_paper
-                or legacy_v6_normal_paper
-                or legacy_v5_normal_paper
-                or legacy_v4_normal_paper
-                or legacy_v3_normal_paper
-                or legacy_v2_normal_paper
-            )
-            else _text(normal_paper.get("route_kind"))
-            if valid_normal_paper and historical_normal_paper
+            and current_normal_paper
+            and normal_paper_evidence.get("selection_reason")
             else _text(paper_training.get("selection_reason"))
             if valid_paper_training
             else _text(paper_exploration.get("selection_reason"))
             if valid_paper_exploration
+            else _text(
+                normal_paper_evidence.get("selection_reason")
+                or normal_paper_evidence.get("historical_selection_reason")
+                or normal_paper_evidence.get("route_kind")
+            )
+            if valid_normal_paper and historical_normal_paper
             else "governed_fee_after_return_strategy"
         ),
         "normal_paper_trade_evidence": (
             {
-                "version": normal_paper.get("version"),
+                "version": normal_paper_evidence.get("version"),
+                "source_version": normal_paper_evidence.get("source_version"),
                 "contract_generation": (
                     "current_quality_observation_v12"
                     if current_normal_paper
@@ -1730,37 +1634,20 @@ def build_okx_history_training_sample(
                     == "paper_quality_observation"
                     else "current_validated_v12"
                     if current_normal_paper
-                    else "historical_quality_v11"
-                    if legacy_v11_normal_paper
-                    else "historical_quality_v10"
-                    if legacy_v10_normal_paper
-                    else "historical_quality_v9"
-                    if legacy_v9_normal_paper
-                    else "historical_quality_v8"
-                    if legacy_v8_normal_paper
-                    else "historical_quality_v7"
-                    if legacy_v7_normal_paper
-                    else "historical_quality_v6"
-                    if legacy_v6_normal_paper
-                    else "historical_quality_v5"
-                    if legacy_v5_normal_paper
-                    else "historical_expected_net_v4"
-                    if legacy_v4_normal_paper
-                    else "historical_dynamic_v3"
-                    if legacy_v3_normal_paper
-                    else "historical_fixed_v2"
-                    if legacy_v2_normal_paper
-                    else "historical_normal_v1"
+                    else "historical_normalized_current_protocol"
+                    if historical_normal_paper
+                    else None
                 ),
-                "entry_type": normal_paper.get("entry_type"),
-                "route_kind": normal_paper.get("route_kind"),
-                "decision_authority": normal_paper.get("decision_authority"),
-                "selection_reason": normal_paper.get("selection_reason"),
-                "expected_net_return_pct": normal_paper.get("expected_net_return_pct"),
-                "objective_net_return_pct": normal_paper.get("objective_net_return_pct"),
-                "loss_probability": normal_paper.get("loss_probability"),
-                "prediction_horizon_minutes": normal_paper.get("prediction_horizon_minutes"),
-                "production_permission": normal_paper.get("production_permission"),
+                "entry_type": normal_paper_evidence.get("entry_type"),
+                "route_kind": normal_paper_evidence.get("route_kind"),
+                "decision_authority": normal_paper_evidence.get("decision_authority"),
+                "selection_reason": normal_paper_evidence.get("selection_reason"),
+                "expected_net_return_pct": normal_paper_evidence.get("expected_net_return_pct"),
+                "objective_net_return_pct": normal_paper_evidence.get("objective_net_return_pct"),
+                "loss_probability": normal_paper_evidence.get("loss_probability"),
+                "prediction_horizon_minutes": normal_paper_evidence.get("prediction_horizon_minutes"),
+                "production_permission": normal_paper_evidence.get("production_permission"),
+                "migration_status": normal_paper_evidence.get("migration_status"),
             }
             if valid_normal_paper
             else {}

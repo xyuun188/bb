@@ -8,7 +8,9 @@ import pytest
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.entry_direction_support import assess_directional_entry_support
 from services.normal_paper_trade import (
+    HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V7_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V8_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V10_VERSION,
@@ -1184,7 +1186,10 @@ def test_legacy_v10_validated_contract_remains_historical_training_eligible() ->
     sample = build_okx_history_training_sample(_history(), **lineage)
 
     assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v10"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_normalized_historical"
+    assert sample["normal_paper_trade_evidence"]["source_version"] == (
+        LEGACY_NORMAL_PAPER_TRADE_V10_VERSION
+    )
     assert sample["strategy_entry_supervision_eligible"] is True
 
 
@@ -1235,10 +1240,13 @@ def test_legacy_v8_negative_lcb_observation_remains_trainable() -> None:
 
     sample = build_okx_history_training_sample(_history(), **lineage)
 
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v8"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_normalized_historical"
     assert sample["strategy_selection_reason"] == "paper_quality_observation"
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
-        "historical_quality_v8"
+        "historical_normalized_current_protocol"
+    )
+    assert sample["normal_paper_trade_evidence"]["source_version"] == (
+        LEGACY_NORMAL_PAPER_TRADE_V8_VERSION
     )
     assert sample["strategy_entry_supervision_eligible"] is True
 
@@ -1257,10 +1265,15 @@ def test_historical_normal_paper_v1_is_recovered_without_runtime_authority() -> 
     assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
     assert sample["decision_authority"] == "ensemble"
     assert sample["strategy_entry_kind"] == "normal_strategy_trade"
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v1"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_normalized_historical"
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True
-    assert sample["normal_paper_trade_evidence"]["contract_generation"] == "historical_normal_v1"
+    assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
+        "historical_normalized_current_protocol"
+    )
+    assert sample["normal_paper_trade_evidence"]["source_version"] == (
+        HISTORICAL_NORMAL_PAPER_TRADE_VERSION
+    )
 
 
 def test_v4_negative_objective_contract_remains_historical_training_eligible() -> None:
@@ -1276,10 +1289,13 @@ def test_v4_negative_objective_contract_remains_historical_training_eligible() -
 
     assert normal_paper_trade_contract_reasons(contract)
     assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v4"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_normalized_historical"
     assert sample["strategy_selection_reason"] == "strategy_edge_selected"
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
-        "historical_expected_net_v4"
+        "historical_normalized_current_protocol"
+    )
+    assert sample["normal_paper_trade_evidence"]["source_version"] == (
+        LEGACY_NORMAL_PAPER_TRADE_V4_VERSION
     )
     assert sample["profit_training_contract"]["eligible"] is True
 
@@ -1314,9 +1330,12 @@ def test_v7_quality_contract_remains_historical_training_eligible() -> None:
     sample = build_okx_history_training_sample(_history(), **lineage)
 
     assert "invalid_normal_paper_trade_contract" not in sample["training_evidence_gaps"]
-    assert sample["historical_entry_contract_kind"] == "normal_paper_v7"
+    assert sample["historical_entry_contract_kind"] == "normal_paper_normalized_historical"
     assert sample["normal_paper_trade_evidence"]["contract_generation"] == (
-        "historical_quality_v7"
+        "historical_normalized_current_protocol"
+    )
+    assert sample["normal_paper_trade_evidence"]["source_version"] == (
+        LEGACY_NORMAL_PAPER_TRADE_V7_VERSION
     )
     assert sample["strategy_entry_supervision_eligible"] is True
 

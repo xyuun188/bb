@@ -799,7 +799,10 @@ def test_legacy_normal_v4_entry_is_blocked_but_settlement_validation_remains_val
     entry_gate = _return_entry_contract_result(decision, "paper")
     assert entry_gate.passed is False
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
-    assert "normal_paper_trade_version_invalid" in str(entry_gate.reason)
+    assert (
+        "normal_paper_historical_contract_not_authorized_for_new_entry"
+        in str(entry_gate.reason)
+    )
 
 
 def test_historical_below_minimum_plan_uses_complete_authoritative_fill() -> None:
@@ -973,12 +976,34 @@ def test_quality_observation_submission_and_full_fill_audit_use_same_contract() 
             "strong_expert_opposition": False,
         },
     )
+    observation_cap = decision.raw_response["normal_paper_trade"][
+        "single_trade_risk_fraction_cap"
+    ]
+    decision.raw_response["profit_risk_sizing"].update(
+        {
+            "account_equity_usdt": 1000.0,
+            "risk_budget_usdt": 1000.0 * observation_cap,
+            "planned_stressed_loss_usdt": 0.1,
+            "target_notional_usdt": 10.0,
+            "final_notional_usdt": 10.0,
+            "fill_notional_ceiling_usdt": 12.0,
+            "final_margin_usdt": 10.0,
+            "stressed_loss_fraction": 0.01,
+        }
+    )
+    decision.raw_response["execution_cost_sizing_pass"].update(
+        {
+            "impact_basis_notional_usdt": 10.0,
+            "final_notional_usdt": 10.0,
+        }
+    )
+    decision.position_size_pct = 0.01
 
     submission = _return_entry_contract_result(decision, "paper")
     assert submission.passed is True, submission.reason
     contract, reasons = validate_entry_execution_contract(
         decision.raw_response,
-        filled_notional_usdt=40.0,
+        filled_notional_usdt=10.0,
         executed=True,
         filled_order_present=True,
         authoritative_fill_complete=True,

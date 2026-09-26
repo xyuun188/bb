@@ -15,7 +15,6 @@ from risk_manager.circuit_breaker import CircuitBreaker
 from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     normal_paper_trade_contract_reasons,
 )
@@ -194,7 +193,11 @@ class RiskEngine:
             if sizing.get("production_eligible") is not True:
                 reason = str(sizing.get("reason") or "normal_paper_risk_budget_ineligible")
                 return f"Normal paper risk budget is not eligible: {reason}."
-            expected_single_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            expected_single_cap = RiskEngine._safe_positive_float(
+                normal_trade.get("single_trade_risk_fraction_cap")
+            )
+            if expected_single_cap <= 0.0:
+                return "Normal paper trade single-trade risk cap is missing."
             if equity <= 0 or risk_budget > (
                 equity * expected_single_cap + 1e-8
             ):
