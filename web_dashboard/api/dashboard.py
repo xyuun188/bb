@@ -11229,6 +11229,7 @@ async def _build_opening_funnel_payload(
         "unknown": 0,
     }
     entry_funnel_reasons = {reason: 0 for reason in ENTRY_FUNNEL_REASONS}
+    hold_reason_buckets: dict[str, int] = {}
     directional_rows: list[dict[str, Any]] = []
     symbol_counts: dict[str, dict[str, int]] = {}
     recent_blocked: list[dict[str, Any]] = []
@@ -11266,6 +11267,33 @@ async def _build_opening_funnel_payload(
             )
             if funnel_reason:
                 entry_funnel_reasons[funnel_reason] += 1
+                hold_reason_buckets[funnel_reason] = (
+                    hold_reason_buckets.get(funnel_reason, 0) + 1
+                )
+                if len(recent_blocked) < 20:
+                    recent_blocked.append(
+                        sanitize_payload(
+                            {
+                                "id": row.id,
+                                "created_at": row.created_at.isoformat()
+                                if row.created_at
+                                else None,
+                                "symbol": symbol,
+                                "action": action or "hold",
+                                "confidence": row.confidence,
+                                "reason_bucket": (
+                                    "waiting_queue"
+                                    if funnel_reason == "no_candidate"
+                                    else "unknown"
+                                ),
+                                "funnel_reason": funnel_reason,
+                                "reason": _display_execution_reason(row, None)
+                                or funnel_reason,
+                                "has_order": False,
+                                "is_hold": True,
+                            }
+                        )
+                    )
             continue
 
         matched_order = order_map.get(row.id)
@@ -11439,6 +11467,7 @@ async def _build_opening_funnel_payload(
             },
             "action_counts": action_counts,
             "reason_buckets": reason_buckets,
+            "hold_reason_buckets": hold_reason_buckets,
             "entry_funnel_reasons": entry_funnel_reasons,
             "direction_symmetry": build_direction_symmetry_report(directional_rows),
             "hold_count": hold_count,
@@ -13686,10 +13715,12 @@ async def get_expert_memories(
         )
 
     selected_mode = str(mode or "").lower()
+    # This table only consumes the compact authoritative contract. Avoid
+    # rebuilding the full decision-evidence payload on every tab refresh.
     outcomes = await load_authoritative_trade_outcomes(
         mode=selected_mode if selected_mode in {"paper", "live"} else None,
         compact=True,
-        include_decision_evidence=True,
+        include_decision_evidence=False,
     )
     outcome_by_position_id = {
         int(position_id): outcome

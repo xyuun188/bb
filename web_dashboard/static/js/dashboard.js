@@ -4382,15 +4382,28 @@ function changeAnalysisPage(page) {
 // ========== Expert Long-term Memory ==========
 
 async function fetchExpertMemories() {
+    const countEl = document.getElementById('expert-memory-count');
+    const reflectionCountEl = document.getElementById('trade-reflection-count');
+    if (countEl && !state.expertMemoryTotal) countEl.textContent = '读取中...';
+    if (reflectionCountEl && !state.tradeReflectionTotal) reflectionCountEl.textContent = '读取中...';
     const params = new URLSearchParams({
         page_size: EXPERT_MEMORY_PAGE_SIZE,
         memory_page: state.expertMemoryPage,
         reflection_page: state.tradeReflectionPage,
+        mode: state.mode === 'live' ? 'live' : 'paper',
     });
-    const data = await fetchLatestPageJSON(
-        'expert-memories',
-        `/api/expert-memories?${params.toString()}`,
-    );
+    let data;
+    try {
+        data = await fetchLatestPageJSON(
+            'expert-memories',
+            `/api/expert-memories?${params.toString()}`,
+        );
+    } catch (error) {
+        if (!state.expertMemoryTotal && countEl) countEl.textContent = '暂不可用';
+        if (!state.tradeReflectionTotal && reflectionCountEl) reflectionCountEl.textContent = '暂不可用';
+        console.warn('Expert memory refresh failed; keeping the visible state explicit.', error);
+        return;
+    }
     if (!data) return;
     state.expertMemories = data.memories || [];
     state.tradeReflections = data.reflections || [];
@@ -12090,11 +12103,15 @@ function renderOpeningFunnelStages(data) {
 function renderOpeningFunnelReasons(data) {
     const el = document.getElementById('opening-funnel-reasons');
     if (!el) return;
-    const buckets = data.reason_buckets || {};
+    const buckets = { ...(data.reason_buckets || {}) };
+    Object.entries(data.hold_reason_buckets || {}).forEach(([key, count]) => {
+        const bucket = key === 'no_candidate' ? 'waiting_queue' : 'unknown';
+        buckets[bucket] = Number(buckets[bucket] || 0) + Number(count || 0);
+    });
     const items = Object.entries(buckets).filter(([, count]) => Number(count || 0) > 0);
     const total = items.reduce((sum, [, count]) => sum + Number(count || 0), 0);
     if (!items.length) {
-        el.innerHTML = '<div class="opening-funnel-empty">暂无被拦截的可执行开仓信号。</div>';
+        el.innerHTML = '<div class="opening-funnel-empty">当前没有未开仓或被拦截样本。</div>';
         return;
     }
     el.innerHTML = items.sort((a, b) => Number(b[1]) - Number(a[1])).map(([key, count]) => {
@@ -12136,17 +12153,17 @@ function renderOpeningFunnelBlocked(data) {
     if (!tbody) return;
     const rows = Array.isArray(data.recent_blocked) ? data.recent_blocked : [];
     if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">暂无被拦截的可执行开仓信号</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);text-align:center;padding:24px;">当前窗口没有未开仓或被拦截样本</td></tr>';
         return;
     }
     tbody.innerHTML = rows.map(row => `
         <tr>
             <td class="opening-funnel-time">${toBeijingTime(row.created_at)}</td>
             <td class="opening-funnel-symbol">${escHtml(row.symbol || '-')}</td>
-            <td><span class="opening-funnel-side">${openingFunnelActionLabel(row.action)}</span></td>
+            <td><span class="opening-funnel-side">${row.is_hold ? '观望' : openingFunnelActionLabel(row.action)}</span></td>
             <td class="opening-funnel-confidence">${Number(row.confidence || 0).toFixed(2)}</td>
             <td><span class="opening-funnel-bucket">${escHtml(openingFunnelReasonLabel(row.reason_bucket))}</span></td>
-            <td class="opening-funnel-reason-cell">${escHtml(row.reason || '-')}</td>
+            <td class="opening-funnel-reason-cell">${escHtml(row.reason === 'no_candidate' ? '未形成可执行方向信号' : (row.reason || '-'))}</td>
         </tr>
     `).join('');
 }
