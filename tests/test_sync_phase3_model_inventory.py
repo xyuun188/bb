@@ -64,6 +64,79 @@ def test_target_inventory_update_replaces_all_llm_rows() -> None:
     assert any(item.get("slot") == "timeseries" for item in updated["models"])
 
 
+def test_target_inventory_update_preserves_verified_specialization_evidence() -> None:
+    namespace = _rendered_namespace()
+    update = namespace["update"]
+    evidence = {
+        "base_model_carrier": "/home/linux/trade_models/qwen3.8-27b",
+        "specialization_required": True,
+        "specialization_status": "trained_shadow_not_live",
+        "specialization_evidence_verified": True,
+        "specialization_id": "qwen3.8-27b-adapter-v1",
+        "specialization_evidence": {
+            "verification_status": "verified",
+            "adapter_version": "adapter-v1",
+        },
+    }
+
+    updated = update(
+        {
+            "models": [
+                {
+                    "slot": "llm_decision_and_expert_carrier",
+                    "served_model_name": "qwen3.8-27b",
+                    **evidence,
+                }
+            ]
+        },
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": "qwen3.8-27b",
+            "status": "verified",
+        },
+    )
+
+    assert updated["models"] == [
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": "qwen3.8-27b",
+            "status": "verified",
+            **evidence,
+        }
+    ]
+
+
+def test_target_inventory_update_does_not_carry_other_model_evidence() -> None:
+    namespace = _rendered_namespace()
+    update = namespace["update"]
+
+    updated = update(
+        {
+            "models": [
+                {
+                    "slot": "llm_decision_and_expert_carrier",
+                    "served_model_name": "legacy-14b",
+                    "specialization_evidence_verified": True,
+                    "specialization_id": "legacy-adapter",
+                }
+            ]
+        },
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": "qwen3.8-27b",
+            "status": "verified",
+        },
+    )
+
+    assert updated["models"] == [
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": "qwen3.8-27b",
+            "status": "verified",
+        }
+    ]
+
+
 def test_target_inventory_rejects_unverified_candidate(tmp_path) -> None:
     namespace = _rendered_namespace()
     candidate_path = tmp_path / "target_model_candidate.json"

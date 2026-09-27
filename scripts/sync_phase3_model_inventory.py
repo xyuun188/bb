@@ -89,6 +89,50 @@ def render_target_inventory_sync() -> str:
 
         def update(data, row):
             rows = data.get("models") if isinstance(data.get("models"), list) else []
+            existing_target = next(
+                (
+                    item
+                    for item in rows
+                    if isinstance(item, dict)
+                    and str(item.get("slot") or "") == "llm_decision_and_expert_carrier"
+                ),
+                {{}},
+            )
+            # Inventory refresh owns the base-model identity, but it must not
+            # erase separately verified FinQuant specialization evidence. Only
+            # carry it forward when it belongs to the same served model.
+            same_verified_model = (
+                str(existing_target.get("served_model_name") or "").strip()
+                == str(row.get("served_model_name") or "").strip()
+                == "qwen3.8-27b"
+                and existing_target.get("specialization_evidence_verified") is True
+            )
+            specialization_keys = (
+                "base_model_carrier",
+                "specialization_required",
+                "specialization_target",
+                "specialization_status",
+                "specialization_evidence_verified",
+                "adapter_path",
+                "lora_adapter",
+                "specialization_manifest",
+                "specialization_id",
+                "fine_tune_id",
+                "training_artifact",
+                "specialization_evidence",
+            )
+            row = {{
+                **(
+                    {{
+                        key: existing_target[key]
+                        for key in specialization_keys
+                        if key in existing_target and existing_target[key] is not None
+                    }}
+                    if same_verified_model
+                    else {{}}
+                ),
+                **row,
+            }}
             rows = [
                 item for item in rows
                 if isinstance(item, dict) and not str(item.get("slot") or "").startswith("llm_")
