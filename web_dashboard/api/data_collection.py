@@ -1480,16 +1480,31 @@ async def get_data_collection_settings() -> dict[str, Any]:
 async def _build_data_collection_status(
     include_feature_coverage: bool = True,
 ) -> dict[str, Any]:
+    section_barrier = asyncio.Event()
+    section_started = 0
+
+    async def run_independent_section(
+        factory: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any] | Exception:
+        nonlocal section_started
+        section_started += 1
+        if section_started >= 4:
+            section_barrier.set()
+        await section_barrier.wait()
+        return await _run_status_section(factory, timeout=timeout)
+
     source_stats_result, quality_result, local_ai_status_result, feature_coverage_result = (
         await asyncio.gather(
-            _run_status_section(_source_breakdown),
-            _run_status_section(_training_sample_quality),
-            _run_status_section(
+            run_independent_section(_source_breakdown),
+            run_independent_section(_training_sample_quality),
+            run_independent_section(
                 _local_ai_training_status,
                 timeout=STATUS_SECTION_TIMEOUT_SECONDS,
             ),
             (
-                _run_status_section(
+                run_independent_section(
                     lambda: CryptoFeatureCoverageService().report(hours=24, limit=1000),
                     timeout=STATUS_SECTION_TIMEOUT_SECONDS,
                 )

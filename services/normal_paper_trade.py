@@ -36,6 +36,11 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "strategy_edge_selected",
     "paper_quality_observation",
 }
+# Quality observations are retained for delayed shadow settlement and training,
+# but they are never a new-entry authorization route.
+NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
+    {"strategy_edge_selected"}
+)
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 # Keep paper training samples flowing while preventing a materially stressed
@@ -344,12 +349,20 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def select_normal_paper_trade_side(
     support_by_side: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Select one auditable model direction without applying promotion statistics."""
+    """Select one currently profitable model direction for a normal paper entry.
+
+    Unpromoted/negative-LCB candidates remain available to the shadow sample
+    pipeline, but cannot be converted into a normal order. This keeps training
+    continuous without treating known-loss evidence as a trade signal.
+    """
 
     by_side = {side: dict(_dict(_dict(support_by_side).get(side))) for side in ("long", "short")}
     candidates: list[dict[str, Any]] = []
     for side, support in by_side.items():
-        if support.get("eligible") is not True:
+        if (
+            support.get("eligible") is not True
+            or support.get("current_edge_validated") is not True
+        ):
             continue
         expected_net = _float(support.get("expected_net_return_pct"), None)
         objective_net = _float(support.get("objective_net_return_pct"), None)
@@ -369,13 +382,7 @@ def select_normal_paper_trade_side(
                 "objective_net_return_pct": objective_net,
                 "loss_probability": loss_probability,
                 "quant_evidence_families": families,
-                "selection_reason": (
-                    "strategy_edge_selected"
-                    if support.get("current_edge_validated") is True
-                    else "paper_quality_observation"
-                    if support.get("paper_quality_observation_only") is True
-                    else "strategy_edge_selected"
-                ),
+                "selection_reason": "strategy_edge_selected",
             }
         )
 
@@ -399,10 +406,7 @@ def select_normal_paper_trade_side(
         if item["expected_net_return_pct"] is not None
         and float(item["expected_net_return_pct"]) > 0.0
         and item["objective_net_return_pct"] is not None
-        and (
-            float(item["objective_net_return_pct"]) > 0.0
-            or item["selection_reason"] == "paper_quality_observation"
-        )
+        and float(item["objective_net_return_pct"]) > 0.0
     ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
@@ -456,8 +460,11 @@ def build_normal_paper_trade_contract(
         ).items()
         if str(source).strip() and isinstance(permission, dict)
     }
+    current_edge_signal = support.get("current_edge_validated")
+    if current_edge_signal is None:
+        current_edge_signal = not bool(support.get("paper_quality_observation_only"))
     current_edge_validated = bool(
-        support.get("current_edge_validated") is True
+        current_edge_signal is True
         and expected_net is not None
         and expected_net > 0.0
         and objective_net is not None
@@ -519,11 +526,16 @@ def build_normal_paper_trade_contract(
     ):
         return {}
 
+    is_new_entry_authorized = bool(
+        selection_reason in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
+        and current_edge_validated
+    )
     contract = {
         "version": NORMAL_PAPER_TRADE_VERSION,
-        # Only the explicit paper observation route may use an uncertain LCB.
-        # Final sizing must still prove positive fee-after expected return.
-        "authorized": True,
+        # Quality observations are evidence for shadow settlement/training only.
+        # They are deliberately persisted as unauthorized so retries cannot
+        # turn them into a normal paper order.
+        "authorized": is_new_entry_authorized,
         "trade_mode": "paper",
         "execution_scope": "paper_only",
         "entry_type": "normal_strategy_trade",
@@ -580,6 +592,15 @@ def ensure_normal_paper_trade_contract(
     decision.raw_response = raw
 
     selection = _dict(raw.get("paper_trade_selection"))
+    # Quality observations are shadow/training evidence only. They must not
+    # be re-materialized as a normal order by a retry or recovery path.
+    if (
+        str(selection.get("selection_reason") or "").strip()
+        not in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
+    ):
+        raw.pop("normal_paper_trade", None)
+        decision.raw_response = raw
+        return {}
     support = _dict(raw.get("independent_direction_support"))
     contract = build_normal_paper_trade_contract(
         symbol=decision.symbol,
@@ -649,12 +670,7 @@ def _normal_strategy_trade_contract_reasons(
             and objective_net > 0.0
         )
     )
-    observation_only = bool(
-        allow_unauthorized_observation
-        and observation_mode
-        and objective_net is not None
-        and objective_net <= 0.0
-    )
+    observation_only = bool(allow_unauthorized_observation and observation_mode)
     if contract.get("authorized") is not True and not observation_only:
         reasons.append("normal_paper_trade_not_authorized")
     if contract.get("trade_mode") != "paper":
@@ -671,6 +687,11 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_decision_authority_invalid")
     if selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS:
         reasons.append("normal_paper_trade_selection_reason_invalid")
+    if (
+        require_positive_objective
+        and selection_reason not in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
+    ):
+        reasons.append("normal_paper_trade_quality_observation_shadow_only")
     if str(contract.get("side") or "").lower() not in {"long", "short"}:
         reasons.append("normal_paper_trade_side_missing")
     if not str(contract.get("symbol") or "").strip():
@@ -800,5 +821,7 @@ def normal_paper_settlement_contract_reasons(value: Any) -> list[str]:
     contract = _dict(value)
     version = contract.get("version")
     if version == NORMAL_PAPER_TRADE_VERSION:
+        if contract.get("selection_reason") == "paper_quality_observation":
+            return normal_paper_trade_observation_contract_reasons(contract)
         return normal_paper_trade_contract_reasons(contract)
     return historical_normalized_contract_reasons(contract)

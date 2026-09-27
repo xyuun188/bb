@@ -609,20 +609,21 @@ async def test_missing_historical_profit_quality_does_not_force_paper_leverage_t
 
 
 @pytest.mark.asyncio
-async def test_negative_lcb_quality_observation_uses_standard_paper_risk_budget() -> None:
+async def test_negative_lcb_quality_observation_cannot_be_sized_as_new_entry() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is True
+    assert sizing["production_eligible"] is False
+    assert "normal_paper_trade_quality_observation_shadow_only" in sizing["reason"]
     assert sizing["paper_quality_observation_mode"] is True
     assert sizing["paper_quality_shadow_only"] is False
     assert sizing["paper_quality_non_positive_return_lcb"] is True
     assert sizing["model_requested_leverage"] == 20.0
     assert sizing["model_leverage_is_explicit"] is False
-    assert sizing["final_leverage"] > 1.0
+    assert sizing["final_leverage"] == 1.0
     assert sizing["paper_quality_observation_leverage_cap"] is None
     assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
     expected_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
@@ -633,18 +634,19 @@ async def test_negative_lcb_quality_observation_uses_standard_paper_risk_budget(
     assert sizing["expected_net_return_pct"] > 0.0
     assert sizing["production_permission"] is False
     assessment = RiskEngine().assess(decision, [], _balance)
-    assert assessment.approved is True, assessment.rejection_reason
+    assert assessment.approved is False
 
 
 @pytest.mark.asyncio
-async def test_positive_lcb_unpromoted_observation_uses_standard_paper_risk_budget() -> None:
+async def test_positive_lcb_unpromoted_observation_cannot_be_sized_as_new_entry() -> None:
     decision = _quality_observation_decision(return_lcb_pct=0.52)
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is True
+    assert sizing["production_eligible"] is False
+    assert "normal_paper_trade_quality_observation_shadow_only" in sizing["reason"]
     assert sizing["paper_quality_observation_mode"] is True
     assert sizing["paper_quality_shadow_only"] is False
     assert sizing["paper_quality_non_positive_return_lcb"] is False
@@ -652,9 +654,9 @@ async def test_positive_lcb_unpromoted_observation_uses_standard_paper_risk_budg
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(expected_cap)
     assert sizing["risk_budget_usdt"] == pytest.approx(1000.0 * expected_cap)
     assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
-    assert sizing["final_notional_usdt"] > sizing["minimum_order_notional_usdt"]
-    assert sizing["final_leverage"] > 1.0
-    assert RiskEngine().assess(decision, [], _balance).approved is True
+    assert sizing["final_notional_usdt"] == 0.0
+    assert sizing["final_leverage"] == 1.0
+    assert RiskEngine().assess(decision, [], _balance).approved is False
 
 
 @pytest.mark.asyncio

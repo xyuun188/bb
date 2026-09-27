@@ -956,7 +956,7 @@ def test_confirmed_partial_fill_settlement_is_evidence_bound(
     assert ("normal_paper_sizing_provenance_incomplete" not in reasons) is accepted
 
 
-def test_quality_observation_submission_and_full_fill_audit_use_same_contract() -> None:
+def test_quality_observation_submission_is_rejected_before_any_fill() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -1006,19 +1006,10 @@ def test_quality_observation_submission_and_full_fill_audit_use_same_contract() 
     decision.position_size_pct = 0.01
 
     submission = _return_entry_contract_result(decision, "paper")
-    assert submission.passed is True, submission.reason
-    contract, reasons = validate_entry_execution_contract(
-        decision.raw_response,
-        filled_notional_usdt=10.0,
-        executed=True,
-        filled_order_present=True,
-        authoritative_fill_complete=True,
-    )
-    assert reasons == []
-    assert contract["contract_complete"] is True
-    assert contract["objective_net_return_pct"] == -0.2
-    assert contract["production_permission"] is False
-    assert contract["confirmed_partial_fill_settlement_accepted"] is False
+    assert submission.passed is False
+    assert "normal_paper_trade_not_authorized" in submission.reason
+    _contract, reasons = validate_entry_execution_contract(decision.raw_response)
+    assert "normal_paper_trade_quality_observation_shadow_only" in reasons
     assert _return_entry_contract_result(decision, "live").passed is False
 
 
@@ -1034,7 +1025,7 @@ def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> Non
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
 
 
-def test_positive_quality_observation_contract_accepts_dynamic_paper_leverage() -> None:
+def test_positive_quality_observation_contract_is_shadow_only() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -1089,22 +1080,10 @@ def test_positive_quality_observation_contract_accepts_dynamic_paper_leverage() 
         }
     )
 
-    contract, reasons = validate_entry_execution_contract(raw)
-    assert reasons == []
-    assert _return_entry_contract_result(decision, "paper").passed is True
-
-    raw["profit_risk_sizing"].update(
-        {
-            "final_margin_usdt": 4.0,
-            "final_leverage": 2.0,
-            "model_requested_leverage": 2.0,
-        }
-    )
-    raw["profit_risk_sizing"]["dynamic_leverage_decision"][
-        "final_integer_leverage"
-    ] = 2
     _contract, reasons = validate_entry_execution_contract(raw)
-    assert reasons == []
+    assert "normal_paper_trade_not_authorized" in reasons
+    assert "normal_paper_trade_quality_observation_shadow_only" in reasons
+    assert _return_entry_contract_result(decision, "paper").passed is False
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:

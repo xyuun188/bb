@@ -873,6 +873,20 @@ class ModelTrainingCoordinatorMixin:
                 minimum_retraining_interval_seconds=(
                     LOCAL_ML_TRAINING_PARAMS.minimum_retraining_interval_seconds
                 ),
+                completed_sample_count=completed_shadow_total,
+                previous_sample_count=previous_completed_shadow_total,
+                sample_batch_threshold=(
+                    LOCAL_ML_TRAINING_PARAMS.batch_sample_threshold
+                ),
+                sample_batch_growth_fraction=(
+                    LOCAL_ML_TRAINING_PARAMS.batch_sample_growth_fraction
+                ),
+                minimum_sample_increment=(
+                    LOCAL_ML_TRAINING_PARAMS.minimum_sample_increment
+                ),
+                drift_minimum_sample_increment=(
+                    LOCAL_ML_TRAINING_PARAMS.drift_minimum_sample_increment
+                ),
             )
             training_policy = {
                 "learning_only": learning_only,
@@ -880,7 +894,7 @@ class ModelTrainingCoordinatorMixin:
                 "trigger_contract": trigger,
                 "distribution_requirement": "non_empty_train_and_holdout",
                 "training_window_policy": CURRENT_TRAINING_EPOCH_POLICY,
-                "cursor_source": "completed_training_decision_group_count",
+                "cursor_source": "clean_sample_or_training_decision_group_count",
                 "trade_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 "process_boundary": "dedicated_training_subprocess",
                 "cursor_process_isolated": True,

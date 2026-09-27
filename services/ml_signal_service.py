@@ -553,6 +553,8 @@ def _local_ml_training_cadence(
     *,
     previous_decision_group_count: int,
     new_decision_group_count: int,
+    previous_sample_count: int = 0,
+    new_sample_count: int = 0,
     seconds_since_training: float | None,
     distribution_drift_detected: bool,
 ) -> dict[str, Any]:
@@ -565,20 +567,41 @@ def _local_ml_training_cadence(
             )
         ),
     )
+    effective_sample_batch_threshold = max(
+        _LOCAL_ML_PARAMS.batch_sample_threshold,
+        int(
+            math.ceil(
+                max(previous_sample_count, 0)
+                * _LOCAL_ML_PARAMS.batch_sample_growth_fraction
+            )
+        ),
+    )
     cooldown_elapsed = bool(
         seconds_since_training is None
         or seconds_since_training >= _LOCAL_ML_PARAMS.minimum_retraining_interval_seconds
     )
     batch_due = bool(cooldown_elapsed and new_decision_group_count >= effective_batch_threshold)
+    sample_batch_due = bool(
+        cooldown_elapsed and new_sample_count >= effective_sample_batch_threshold
+    )
     interval_due = bool(
         new_decision_group_count >= _LOCAL_ML_PARAMS.minimum_decision_group_increment
+        and seconds_since_training is not None
+        and seconds_since_training >= _LOCAL_ML_PARAMS.maximum_training_interval_seconds
+    )
+    sample_interval_due = bool(
+        new_sample_count >= _LOCAL_ML_PARAMS.minimum_sample_increment
         and seconds_since_training is not None
         and seconds_since_training >= _LOCAL_ML_PARAMS.maximum_training_interval_seconds
     )
     drift_due = bool(
         cooldown_elapsed
         and distribution_drift_detected
-        and new_decision_group_count >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
+        and (
+            new_decision_group_count
+            >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
+            or new_sample_count >= _LOCAL_ML_PARAMS.drift_minimum_sample_increment
+        )
     )
     return {
         "configured_batch_decision_group_threshold": (
@@ -588,13 +611,19 @@ def _local_ml_training_cadence(
             _LOCAL_ML_PARAMS.batch_decision_group_growth_fraction
         ),
         "effective_batch_decision_group_threshold": effective_batch_threshold,
+        "configured_batch_sample_threshold": _LOCAL_ML_PARAMS.batch_sample_threshold,
+        "batch_sample_growth_fraction": _LOCAL_ML_PARAMS.batch_sample_growth_fraction,
+        "effective_batch_sample_threshold": effective_sample_batch_threshold,
         "minimum_retraining_interval_seconds": (
             _LOCAL_ML_PARAMS.minimum_retraining_interval_seconds
         ),
         "minimum_retraining_interval_elapsed": cooldown_elapsed,
         "batch_due": batch_due,
+        "sample_batch_due": sample_batch_due,
         "interval_due": interval_due,
+        "sample_interval_due": sample_interval_due,
         "drift_due": drift_due,
+        "new_sample_count": max(new_sample_count, 0),
     }
 
 
@@ -3282,6 +3311,8 @@ class MLSignalService:
                 raw_cadence = _local_ml_training_cadence(
                     previous_decision_group_count=previous_raw_group_count,
                     new_decision_group_count=new_raw_group_count,
+                    previous_sample_count=last_completed_count,
+                    new_sample_count=new_samples,
                     seconds_since_training=seconds_since_training,
                     distribution_drift_detected=False,
                 )
@@ -3291,7 +3322,9 @@ class MLSignalService:
                     or training_data_contract_stale
                     or training_evaluation_contract_stale
                     or raw_cadence["batch_due"]
+                    or raw_cadence["sample_batch_due"]
                     or raw_cadence["interval_due"]
+                    or raw_cadence["sample_interval_due"]
                     or raw_cursor_missing
                     or raw_cursor_probe_error is not None
                     or (
@@ -3364,6 +3397,8 @@ class MLSignalService:
                 cadence = _local_ml_training_cadence(
                     previous_decision_group_count=previous_group_count,
                     new_decision_group_count=new_decision_group_count,
+                    previous_sample_count=last_completed_count,
+                    new_sample_count=new_samples,
                     seconds_since_training=seconds_since_training,
                     distribution_drift_detected=(distribution_drift.get("detected") is True),
                 )
@@ -3381,8 +3416,12 @@ class MLSignalService:
                     if training_evaluation_contract_stale
                     else "mature_decision_group_batch"
                     if batch_due
+                    else "clean_sample_batch"
+                    if cadence["sample_batch_due"]
                     else "daily_minimum_increment"
                     if interval_due
+                    else "daily_sample_minimum_increment"
+                    if cadence["sample_interval_due"]
                     else "distribution_drift_with_new_labels"
                     if drift_due
                     else "not_due"
@@ -3428,7 +3467,9 @@ class MLSignalService:
                     or training_data_contract_stale
                     or training_evaluation_contract_stale
                     or batch_due
+                    or cadence["sample_batch_due"]
                     or interval_due
+                    or cadence["sample_interval_due"]
                     or drift_due
                 )
                 if not should_train:

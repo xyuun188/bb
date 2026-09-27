@@ -13349,6 +13349,10 @@ async def get_model_contribution_stats(
         selected_days=selected_days,
         max_rows=max_rows,
     )
+    # Let the single-flight worker reach its first await before returning the
+    # warming payload. This keeps the background refresh observable to direct
+    # callers without making HTTP requests wait for the expensive computation.
+    await asyncio.sleep(0)
     stale = _dashboard_heavy_cache_peek(
         cache_key,
         max_age_seconds=_DASHBOARD_MODEL_CONTRIBUTION_STALE_TTL_SECONDS,

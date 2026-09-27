@@ -1483,18 +1483,29 @@ async def test_data_collection_status_runs_independent_sections_concurrently(
 
     assert body["training"]["local_ai_tools"]["status"] == "ready"
     assert max_active_db_sections == 3
-    assert events == [
-        "start:source_breakdown",
-        "start:training_sample_quality",
-        "start:local_ai_training_status",
-        "start:crypto_feature_coverage",
-        "end:source_breakdown",
-        "end:training_sample_quality",
-        "end:local_ai_training_status",
-        "end:crypto_feature_coverage",
-        "start:training_governance",
-        "end:training_governance",
-    ]
+    expected_sections = {
+        "source_breakdown",
+        "training_sample_quality",
+        "local_ai_training_status",
+        "crypto_feature_coverage",
+    }
+    assert {
+        event.removeprefix("start:")
+        for event in events
+        if event.startswith("start:")
+        and event != "start:training_governance"
+    } == expected_sections
+    assert {
+        event.removeprefix("end:")
+        for event in events
+        if event.startswith("end:")
+    } == expected_sections | {"training_governance"}
+    governance_start = events.index("start:training_governance")
+    assert all(
+        events.index(f"end:{section}") < governance_start
+        for section in expected_sections
+    )
+    assert events[-1] == "end:training_governance"
 
 
 @pytest.mark.asyncio

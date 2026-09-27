@@ -26,7 +26,7 @@ TRAINING_COST_POLICY = "shadow_market_opportunity_plus_authoritative_okx_executi
 TRAINING_CURSOR_VERSION = "2026-07-27.independent-decision-groups.v1"
 TRAINING_DISTRIBUTION_PROFILE_VERSION = "2026-07-27.training-distribution-profile.v1"
 TRAINING_DISTRIBUTION_DRIFT_VERSION = "2026-07-27.standardized-mean-shift.v1"
-TRAINING_TRIGGER_POLICY_VERSION = "2026-08-17.scaled-batch-cooldown.v2"
+TRAINING_TRIGGER_POLICY_VERSION = "2026-09-27.sample-or-decision-group-cadence.v1"
 LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX = "BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON="
 
 _PROFILE_FEATURES = (
@@ -224,8 +224,19 @@ def decision_group_training_trigger(
     maximum_interval_seconds: int,
     batch_growth_fraction: float = 0.0,
     minimum_retraining_interval_seconds: int = 0,
+    completed_sample_count: int = 0,
+    previous_sample_count: int = 0,
+    sample_batch_threshold: int = 0,
+    sample_batch_growth_fraction: float = 0.0,
+    minimum_sample_increment: int = 0,
+    drift_minimum_sample_increment: int = 0,
 ) -> dict[str, Any]:
-    """Evaluate cadence without treating elapsed time as new evidence."""
+    """Evaluate cadence from independent groups or clean sample growth.
+
+    Decision groups protect chronological independence, while sample growth
+    captures real new labels that share a correlation group. Both are evidence;
+    elapsed time alone never authorizes a run.
+    """
 
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
@@ -233,6 +244,10 @@ def decision_group_training_trigger(
     completed = max(int(completed_group_count), 0)
     rebased = completed < previous
     new_groups = max(completed - previous, 0)
+    previous_samples = max(int(previous_sample_count), 0)
+    completed_samples = max(int(completed_sample_count), 0)
+    sample_rebased = completed_samples < previous_samples
+    new_samples = max(completed_samples - previous_samples, 0)
     parsed_trained_at: datetime | None = None
     if trained_at:
         try:
@@ -251,20 +266,41 @@ def decision_group_training_trigger(
         int(batch_threshold),
         int(math.ceil(previous * max(float(batch_growth_fraction), 0.0))),
     )
+    effective_sample_batch_threshold = max(
+        int(sample_batch_threshold),
+        int(math.ceil(previous_samples * max(float(sample_batch_growth_fraction), 0.0))),
+    )
     cooldown_elapsed = bool(
         seconds_since_training is None
         or seconds_since_training >= max(int(minimum_retraining_interval_seconds), 0)
     )
     batch_due = bool(cooldown_elapsed and new_groups >= effective_batch_threshold)
+    sample_batch_due = bool(
+        cooldown_elapsed
+        and effective_sample_batch_threshold > 0
+        and new_samples >= effective_sample_batch_threshold
+    )
     interval_due = bool(
         new_groups >= int(minimum_increment)
+        and seconds_since_training is not None
+        and seconds_since_training >= int(maximum_interval_seconds)
+    )
+    sample_interval_due = bool(
+        int(minimum_sample_increment) > 0
+        and new_samples >= int(minimum_sample_increment)
         and seconds_since_training is not None
         and seconds_since_training >= int(maximum_interval_seconds)
     )
     drift_due = bool(
         cooldown_elapsed
         and distribution_drift.get("detected") is True
-        and new_groups >= int(drift_minimum_increment)
+        and (
+            new_groups >= int(drift_minimum_increment)
+            or (
+                int(drift_minimum_sample_increment) > 0
+                and new_samples >= int(drift_minimum_sample_increment)
+            )
+        )
     )
     reason = (
         "forced"
@@ -272,11 +308,15 @@ def decision_group_training_trigger(
         else "initial_artifact"
         if not has_artifact
         else "training_view_rebased"
-        if rebased
+        if rebased or sample_rebased
         else "mature_decision_group_batch"
         if batch_due
+        else "clean_sample_batch"
+        if sample_batch_due
         else "daily_minimum_increment"
         if interval_due
+        else "daily_sample_minimum_increment"
+        if sample_interval_due
         else "distribution_drift_with_new_labels"
         if drift_due
         else "not_due"
@@ -289,16 +329,30 @@ def decision_group_training_trigger(
         "last_trained_mature_decision_group_count": previous,
         "new_mature_decision_group_count": new_groups,
         "training_view_rebased": rebased,
+        "completed_clean_sample_count": completed_samples,
+        "last_trained_clean_sample_count": previous_samples,
+        "new_clean_sample_count": new_samples,
+        "sample_view_rebased": sample_rebased,
         "batch_decision_group_threshold": int(batch_threshold),
         "batch_decision_group_growth_fraction": max(float(batch_growth_fraction), 0.0),
         "effective_batch_decision_group_threshold": effective_batch_threshold,
+        "sample_batch_threshold": int(sample_batch_threshold),
+        "sample_batch_growth_fraction": max(float(sample_batch_growth_fraction), 0.0),
+        "effective_sample_batch_threshold": effective_sample_batch_threshold,
         "minimum_retraining_interval_seconds": max(
             int(minimum_retraining_interval_seconds), 0
         ),
         "minimum_retraining_interval_elapsed": cooldown_elapsed,
         "minimum_decision_group_increment": int(minimum_increment),
+        "minimum_sample_increment": int(minimum_sample_increment),
         "drift_minimum_decision_group_increment": int(drift_minimum_increment),
+        "drift_minimum_sample_increment": int(drift_minimum_sample_increment),
         "maximum_training_interval_seconds": int(maximum_interval_seconds),
         "seconds_since_last_successful_training": seconds_since_training,
         "distribution_drift": dict(distribution_drift),
+        "batch_due": batch_due,
+        "sample_batch_due": sample_batch_due,
+        "interval_due": interval_due,
+        "sample_interval_due": sample_interval_due,
+        "drift_due": drift_due,
     }

@@ -213,6 +213,8 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_normal_entry_requires_positive_return_lcb": True,
                     "paper_quality_observation_requires_positive_expected_net_return": True,
                     "paper_quality_observation_allows_non_positive_return_lcb": True,
+                    "paper_quality_observation_is_shadow_only": True,
+                    "paper_quality_observation_authorizes_normal_entry": False,
                     "paper_entry_requires_profit_factor": False,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

@@ -234,3 +234,32 @@ def test_training_trigger_scales_batches_and_cools_down_drift_retraining() -> No
     assert within_cooldown["effective_batch_decision_group_threshold"] == 1001
     assert after_cooldown["reason"] == "distribution_drift_with_new_labels"
     assert after_cooldown["minimum_retraining_interval_elapsed"] is True
+
+
+def test_training_trigger_runs_for_large_clean_sample_growth_without_new_groups() -> None:
+    now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+    result = decision_group_training_trigger(
+        force=False,
+        has_artifact=True,
+        completed_group_count=106,
+        previous_group_count=100,
+        completed_sample_count=54_426,
+        previous_sample_count=0,
+        sample_batch_threshold=1_000,
+        sample_batch_growth_fraction=0.05,
+        minimum_sample_increment=100,
+        drift_minimum_sample_increment=100,
+        trained_at=(now - timedelta(hours=7)).isoformat(),
+        now=now,
+        distribution_drift={"detected": False},
+        batch_threshold=50,
+        minimum_increment=10,
+        drift_minimum_increment=10,
+        maximum_interval_seconds=86400,
+        minimum_retraining_interval_seconds=6 * 60 * 60,
+    )
+
+    assert result["due"] is True
+    assert result["reason"] == "clean_sample_batch"
+    assert result["new_clean_sample_count"] == 54_426
+    assert result["sample_batch_due"] is True

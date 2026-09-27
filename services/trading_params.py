@@ -57,9 +57,13 @@ class LocalMLTrainingParams:
     auto_quarantine_max_batches: int = 5
     batch_decision_group_threshold: int = 50
     batch_decision_group_growth_fraction: float = 0.05
+    batch_sample_threshold: int = 1000
+    batch_sample_growth_fraction: float = 0.05
     minimum_retraining_interval_seconds: int = 6 * 60 * 60
     minimum_decision_group_increment: int = 10
+    minimum_sample_increment: int = 100
     drift_minimum_decision_group_increment: int = 10
+    drift_minimum_sample_increment: int = 100
     maximum_training_interval_seconds: int = 24 * 60 * 60
     distribution_drift_threshold: float = 0.35
     replay_half_life_days: float = 30.0
