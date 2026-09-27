@@ -49,7 +49,11 @@ DEFAULT_LOOKBACK_HOURS = 168
 # smaller window keeps the compact outcome loader from expanding thousands of
 # order/decision ids while the dashboard and reconciliation readers are active.
 STRATEGY_LEARNING_MAX_QUERY_SAMPLES = 200
-STRATEGY_LEARNING_READ_TIMEOUT_SECONDS = 7.0
+# Authoritative outcome reads include bounded joins for OKX history, bills,
+# fills, decisions, reflections, and shadow evidence.  Keep the read bounded,
+# but allow normal PostgreSQL contention to finish instead of discarding the
+# learning context every round.
+STRATEGY_LEARNING_READ_TIMEOUT_SECONDS = 15.0
 STRATEGY_SCHEDULER_VERSION = "2026-07-15.historical-return-prior-scheduler.v2"
 PRODUCTION_STRATEGY_ID = "dynamic_fee_after_return_execution"
 PRODUCTION_STRATEGY_VERSION = "2026-07-15.dynamic-profit-execution.v1"
