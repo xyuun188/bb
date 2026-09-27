@@ -14,6 +14,7 @@ from services.training_epoch import load_training_epoch_start
 
 DEFAULT_WINDOW_HOURS = 168
 MAX_WORST_SAMPLE_COUNT = 8
+SHADOW_QUERY_BATCH_SIZE = 1000
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -1143,7 +1144,7 @@ class SpecialistShadowEvaluationService:
         authoritative_trade_samples: Sequence[Any] | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import select
+        from sqlalchemy import and_, desc, or_, select
 
         from db.session import get_read_session_ctx
         from models.learning import ShadowBacktest
@@ -1171,31 +1172,57 @@ class SpecialistShadowEvaluationService:
             compact_feature_snapshot = ShadowBacktest.training_feature_snapshot.label(
                 "feature_snapshot"
             )
-            result = await session.execute(
-                select(
-                    ShadowBacktest.id,
-                    ShadowBacktest.decision_id,
-                    ShadowBacktest.status,
-                    ShadowBacktest.symbol,
-                    compact_feature_snapshot,
-                    ShadowBacktest.long_return_pct,
-                    ShadowBacktest.short_return_pct,
-                    ShadowBacktest.best_action,
-                    ShadowBacktest.horizon_minutes,
-                    ShadowBacktest.due_at,
-                    ShadowBacktest.created_at,
-                    ShadowBacktest.updated_at,
-                )
-                .where(*filters)
-                .order_by(
-                    ShadowBacktest.created_at.desc(),
-                    ShadowBacktest.id.desc(),
-                )
+            projection = select(
+                ShadowBacktest.id,
+                ShadowBacktest.decision_id,
+                ShadowBacktest.status,
+                ShadowBacktest.symbol,
+                compact_feature_snapshot,
+                ShadowBacktest.long_return_pct,
+                ShadowBacktest.short_return_pct,
+                ShadowBacktest.best_action,
+                ShadowBacktest.horizon_minutes,
+                ShadowBacktest.due_at,
+                ShadowBacktest.created_at,
+                ShadowBacktest.updated_at,
             )
-            rows = (
-                SimpleNamespace(**dict(row))
-                for row in result.mappings()
-            )
+            # A single wide seven-day query can exceed PostgreSQL's statement
+            # timeout even though each page is small. Keyset pagination keeps
+            # the report complete while bounding every database round trip.
+            rows: list[Any] = []
+            cursor_created_at: Any | None = None
+            cursor_id: int | None = None
+            query_count = 0
+            while True:
+                page_filters = list(filters)
+                if cursor_created_at is not None and cursor_id is not None:
+                    page_filters.append(
+                        or_(
+                            ShadowBacktest.created_at < cursor_created_at,
+                            and_(
+                                ShadowBacktest.created_at == cursor_created_at,
+                                ShadowBacktest.id < cursor_id,
+                            ),
+                        )
+                    )
+                result = await session.execute(
+                    projection.where(*page_filters)
+                    .order_by(
+                        desc(ShadowBacktest.created_at),
+                        desc(ShadowBacktest.id),
+                    )
+                    .limit(SHADOW_QUERY_BATCH_SIZE)
+                )
+                query_count += 1
+                page = [SimpleNamespace(**dict(row)) for row in result.mappings()]
+                if not page:
+                    break
+                rows.extend(page)
+                if len(page) < SHADOW_QUERY_BATCH_SIZE:
+                    break
+                last = page[-1]
+                cursor_created_at = last.created_at
+                cursor_id = int(last.id)
             report = summarize_specialist_shadow_evaluation(
                 rows,
                 authoritative_trade_samples=authoritative_trade_samples,
@@ -1212,6 +1239,9 @@ class SpecialistShadowEvaluationService:
             "event_statistics_use_full_window": True,
             "event_evidence_rows_bounded": True,
             "row_limit": None,
+            "row_batch_size": SHADOW_QUERY_BATCH_SIZE,
+            "keyset_pagination": True,
+            "query_count": query_count,
             "training_feature_snapshot_column": True,
             "streamed_rows": True,
         }

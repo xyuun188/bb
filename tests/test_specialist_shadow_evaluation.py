@@ -566,3 +566,5 @@ async def test_specialist_report_mode_filter_uses_only_selected_execution_mode(
     assert paper["query_policy"]["ordered_by_training_index"] is True
     assert "ordered_by_primary_key" not in paper["query_policy"]
     assert paper["query_policy"]["training_feature_snapshot_column"] is True
+    assert paper["query_policy"]["keyset_pagination"] is True
+    assert paper["query_policy"]["row_batch_size"] == 1000
