@@ -2001,6 +2001,20 @@ def test_analysis_missing_expert_ui_does_not_infer_configuration_failure() -> No
     assert "调用证据缺失" in script
 
 
+def test_analysis_missing_expert_ui_distinguishes_deferred_slots_from_timeouts() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    reason_start = script.index("function analysisMissingExpertReason")
+    reason_end = script.index("function renderAnalysisPage", reason_start)
+    reason_block = script[reason_start:reason_end]
+
+    assert "missingStatus === 'circuit_breaker_deferred'" in reason_block
+    assert "missingStatus === 'analysis_budget_deferred'" in reason_block
+    assert "本轮处于熔断冷却" in reason_block
+    assert "剩余分析预算不足" in reason_block
+    assert "circuit_breaker_deferred" in script
+    assert "analysis_budget_deferred" in script
+
+
 def test_analysis_model_decision_observation_is_not_rendered_as_failure() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     decision_start = script.index("const decisionMaker = record.decision_maker || null;")

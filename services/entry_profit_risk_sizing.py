@@ -90,15 +90,13 @@ def solve_size_aware_positive_expected_net(
     execution_cost: dict[str, Any],
     allow_non_positive_return_lcb: bool = False,
 ) -> dict[str, Any]:
-    """Validate the full risk-sized order without shrinking a losing trade.
+    """Choose the largest executable size whose current net return is positive.
 
-    A previous implementation binary-searched down to the exchange minimum when
-    the full risk-sized order had a negative expected return.  That produced
-    tiny probe fills which looked like normal paper trading while hiding a
-    negative edge.  The current contract either keeps the complete risk-sized
-    order or rejects the entry.  A paper-only quality observation may retain a
-    non-positive lower confidence bound, but only when the complete full-size
-    cost still leaves its expected net return positive.
+    The risk budget is still the upper bound.  When the full risk-sized order
+    consumes too many book levels and turns a positive opportunity negative,
+    search downward using the exchange minimum and contract step.  This keeps
+    paper training flowing through the same order/cost contract without
+    authorizing a known losing order or applying a global "small order" cap.
     """
 
     maximum = max(_safe_float(maximum_notional_usdt, 0.0), 0.0)
@@ -132,8 +130,21 @@ def solve_size_aware_positive_expected_net(
     ):
         return result
 
+    step = max(_safe_float(contract_step_notional_usdt, 0.0), 0.0)
+    executable_minimum = max(minimum, step)
+
+    def _quantize(notional: float) -> float:
+        candidate = min(max(_safe_float(notional, 0.0), executable_minimum), maximum)
+        if step <= 0.0:
+            return candidate
+        units = max(int(candidate / step), 1)
+        quantized = units * step
+        if quantized < executable_minimum:
+            quantized = executable_minimum
+        return min(quantized, maximum)
+
     def evaluate(notional: float) -> dict[str, Any] | None:
-        candidate_notional = min(max(notional, minimum), maximum)
+        candidate_notional = _quantize(notional)
         snapshot = dict(feature_snapshot)
         snapshot["planned_order_notional_usdt"] = candidate_notional
         snapshot["planned_order_side"] = normalized_side
@@ -182,30 +193,101 @@ def solve_size_aware_positive_expected_net(
         result["reason"] = "full_risk_size_cost_incomplete"
         return result
 
+    selected = upper
+    iterations = 1
+    reduced = False
+    if upper["expected"] <= 0.0:
+        minimum_candidate = evaluate(executable_minimum)
+        iterations += 1
+        if minimum_candidate is None or minimum_candidate["expected"] <= 0.0:
+            result.update(
+                {
+                    "selected_notional_usdt": (
+                        minimum_candidate["notional"]
+                        if minimum_candidate is not None
+                        else upper["notional"]
+                    ),
+                    "expected_net_return_pct": (
+                        minimum_candidate["expected"]
+                        if minimum_candidate is not None
+                        else upper["expected"]
+                    ),
+                    "return_lcb_pct": (
+                        minimum_candidate["lcb"]
+                        if minimum_candidate is not None
+                        else upper["lcb"]
+                    ),
+                    "execution_cost": (
+                        minimum_candidate["cost"]
+                        if minimum_candidate is not None
+                        else upper["cost"]
+                    ),
+                    "iterations": iterations,
+                    "reduced": False,
+                }
+            )
+            result["reason"] = "no_positive_expected_net_at_exchange_minimum"
+            return result
+
+        # Cost is monotonic for a bounded order-book snapshot. Find the largest
+        # positive point rather than falling all the way to a probe-sized order.
+        low = minimum_candidate["notional"]
+        high = upper["notional"]
+        selected = minimum_candidate
+        for _ in range(16):
+            iterations += 1
+            if high - low <= max(step, 1e-9):
+                break
+            midpoint = _quantize((low + high) / 2.0)
+            if midpoint <= low or midpoint >= high:
+                break
+            candidate = evaluate(midpoint)
+            if candidate is None:
+                high = midpoint
+                continue
+            if candidate["expected"] > 0.0:
+                selected = candidate
+                low = candidate["notional"]
+            else:
+                high = candidate["notional"]
+        reduced = selected["notional"] + 1e-9 < maximum
+
     result.update(
         {
-            "selected_notional_usdt": upper["notional"],
-            "expected_net_return_pct": upper["expected"],
-            "return_lcb_pct": upper["lcb"],
-            "execution_cost": upper["cost"],
-            "iterations": 1,
-            "reduced": False,
+            "selected_notional_usdt": selected["notional"],
+            "expected_net_return_pct": selected["expected"],
+            "return_lcb_pct": selected["lcb"],
+            "execution_cost": selected["cost"],
+            "iterations": iterations,
+            "reduced": reduced,
         }
     )
-    if upper["expected"] <= 0.0:
-        result["reason"] = "full_risk_size_expected_net_not_positive"
+    if selected["expected"] <= 0.0:
+        result["reason"] = "no_positive_expected_net_at_exchange_minimum"
         return result
-    if upper["lcb"] <= 0.0 and not allow_non_positive_return_lcb:
-        result["reason"] = "full_risk_size_return_lcb_not_positive"
+    if selected["lcb"] <= 0.0 and not allow_non_positive_return_lcb:
+        result["reason"] = (
+            "reduced_size_return_lcb_not_positive"
+            if reduced
+            else "full_risk_size_return_lcb_not_positive"
+        )
         return result
 
     result.update(
         {
             "production_eligible": True,
             "reason": (
-                "positive_fee_after_full_risk_size_quality_observation"
-                if upper["lcb"] <= 0.0
-                else "positive_fee_after_full_risk_size"
+                "positive_fee_after_reduced_risk_size_quality_observation"
+                if reduced and selected["lcb"] <= 0.0
+                else (
+                    "positive_fee_after_reduced_risk_size"
+                    if reduced
+                    else (
+                        "positive_fee_after_full_risk_size_quality_observation"
+                        if selected["lcb"] <= 0.0
+                        else "positive_fee_after_full_risk_size"
+                    )
+                )
             ),
         }
     )

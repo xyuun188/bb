@@ -312,6 +312,9 @@ MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_BASE_SECONDS = 30.0
 MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_MAX_SECONDS = 300.0
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
+# Keep the outer watchdog bounded independently from a long user-facing
+# decision interval so one slow round cannot starve market rotation.
+MARKET_ROUND_WATCHDOG_MAX_SECONDS = 180.0
 # The market loop runs more frequently than the decision interval. Keep one
 # round bounded so feature discovery and model work cannot create multi-minute
 # gaps for the next rotation. Symbols that do not fit are explicitly deferred
@@ -1420,7 +1423,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if target_qwen_configured:
                 batch_window = min(
                     batch_window,
-                    max(float(settings.ai_target_qwen_timeout_seconds or 18.0), 8.0),
+                    max(float(settings.ai_target_qwen_timeout_seconds or 26.0), 8.0),
                 )
         if batch_window > 0.0:
             independent_window = 0.0
@@ -1475,7 +1478,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             + float(settings.local_ai_tools_timeout_seconds or 0.0)
         )
         configured_watchdog = float(settings.market_analysis_watchdog_seconds or 180)
-        return max(configured_watchdog, interval * 4.0, expert_budget * 2.0)
+        return min(
+            max(configured_watchdog, expert_budget * 2.0),
+            MARKET_ROUND_WATCHDOG_MAX_SECONDS,
+        )
 
     def position_round_watchdog_seconds(self) -> float:
         """Return the stuck-round watchdog for one full position-review round.

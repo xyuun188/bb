@@ -36,10 +36,13 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
     "strategy_edge_selected",
     "paper_quality_observation",
 }
-# Quality observations are retained for delayed shadow settlement and training,
-# but they are never a new-entry authorization route.
+# Quality observations are current paper-training entries under the same v14
+# contract and risk/order pipeline. They can collect fresh settlement evidence
+# when current expected net return is positive, but never grant production/live
+# permission and never bypass the current cost, loss-probability, or sizing
+# contracts.
 NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
-    {"strategy_edge_selected"}
+    {"strategy_edge_selected", "paper_quality_observation"}
 )
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
@@ -349,24 +352,44 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def select_normal_paper_trade_side(
     support_by_side: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Select one currently profitable model direction for a normal paper entry.
+    """Select one current paper direction under the canonical v14 contract.
 
-    Unpromoted/negative-LCB candidates remain available to the shadow sample
-    pipeline, but cannot be converted into a normal order. This keeps training
-    continuous without treating known-loss evidence as a trade signal.
+    A validated edge uses a positive current lower-bound objective. A quality
+    observation may use a positive current fee-after expected return while its
+    lower bound is still negative, so the paper trainer can collect fresh
+    outcomes and improve the model. Both routes use the same dynamic sizing and
+    execution contract; only the validated route is eligible for promotion.
     """
 
     by_side = {side: dict(_dict(_dict(support_by_side).get(side))) for side in ("long", "short")}
     candidates: list[dict[str, Any]] = []
     for side, support in by_side.items():
-        if (
-            support.get("eligible") is not True
-            or support.get("current_edge_validated") is not True
-        ):
+        if support.get("eligible") is not True:
             continue
         expected_net = _float(support.get("expected_net_return_pct"), None)
         objective_net = _float(support.get("objective_net_return_pct"), None)
         loss_probability = _float(support.get("loss_probability"), 1.0) or 1.0
+        current_edge = bool(
+            support.get("current_edge_validated") is True
+            and objective_net is not None
+            and objective_net > 0.0
+        )
+        quality_observation = (
+            support.get("paper_quality_observation_only") is True
+            and not current_edge
+        )
+        if not current_edge and not quality_observation:
+            continue
+        if expected_net is None or expected_net <= 0.0:
+            continue
+        if (
+            quality_observation
+            and (
+                loss_probability is None
+                or loss_probability > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+            )
+        ):
+            continue
         families = sorted(
             {
                 str(item).strip()
@@ -382,7 +405,11 @@ def select_normal_paper_trade_side(
                 "objective_net_return_pct": objective_net,
                 "loss_probability": loss_probability,
                 "quant_evidence_families": families,
-                "selection_reason": "strategy_edge_selected",
+                "selection_reason": (
+                    "strategy_edge_selected"
+                    if current_edge
+                    else "paper_quality_observation"
+                ),
             }
         )
 
@@ -400,14 +427,6 @@ def select_normal_paper_trade_side(
         ),
         reverse=True,
     )
-    candidates = [
-        item
-        for item in candidates
-        if item["expected_net_return_pct"] is not None
-        and float(item["expected_net_return_pct"]) > 0.0
-        and item["objective_net_return_pct"] is not None
-        and float(item["objective_net_return_pct"]) > 0.0
-    ]
     selected = candidates[0] if candidates else None
     if len(candidates) > 1:
         first = candidates[0]
@@ -528,7 +547,6 @@ def build_normal_paper_trade_contract(
 
     is_new_entry_authorized = bool(
         selection_reason in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
-        and current_edge_validated
     )
     contract = {
         "version": NORMAL_PAPER_TRADE_VERSION,

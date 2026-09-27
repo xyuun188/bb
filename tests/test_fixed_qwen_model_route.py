@@ -27,9 +27,10 @@ def test_fixed_roles_exist_without_ai_models_env(monkeypatch: pytest.MonkeyPatch
     ]
     assert settings.ai_llm_concurrency == 1
     assert settings.ai_expert_timeout_seconds <= 15
-    assert settings.ai_batch_expert_timeout_seconds <= 15
+    assert settings.ai_batch_expert_timeout_seconds >= 24
     assert settings.ai_target_qwen_timeout_seconds >= settings.ai_batch_expert_timeout_seconds
-    assert settings.ai_target_qwen_timeout_seconds <= 18
+    assert settings.ai_target_qwen_timeout_seconds >= 24
+    assert settings.ai_target_qwen_timeout_seconds <= 30
 
 
 @pytest.mark.asyncio

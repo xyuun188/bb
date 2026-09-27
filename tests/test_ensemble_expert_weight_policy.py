@@ -373,17 +373,19 @@ def test_live_entry_keeps_legacy_execution_values() -> None:
     assert "multidimensional_recommendation" not in decision.raw_response
 
 
-def test_positive_mean_uncertain_candidate_stays_shadow_only_until_lcb_is_positive() -> None:
+def test_positive_mean_uncertain_candidate_uses_bounded_quality_observation() -> None:
     decision = _coordinator().combine(
         _features(),
         _paper_exploration_context("paper"),
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.HOLD
-    assert "normal_paper_trade" not in decision.raw_response
-    assert decision.raw_response["paper_trade_selection"]["selected"] is False
-    assert decision.raw_response["entry_permission"]["granted"] is False
+    assert decision.action == Action.LONG
+    assert decision.raw_response["normal_paper_trade"]["selection_reason"] == (
+        "paper_quality_observation"
+    )
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is True
+    assert decision.raw_response["entry_permission"]["granted"] is True
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:

@@ -51,6 +51,7 @@ def _normalized_status(
     if raw_status in {
         "analysis_budget_deferred",
         "pre_expert_skipped",
+        "circuit_breaker_deferred",
     }:
         return "skipped"
     if raw_status in {

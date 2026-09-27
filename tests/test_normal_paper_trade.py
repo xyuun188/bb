@@ -214,7 +214,7 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
     ) == {}
 
 
-def test_unpromoted_quality_model_is_shadow_only() -> None:
+def test_unpromoted_quality_model_can_collect_bounded_paper_training_evidence() -> None:
     support = _quality_observation_support("short")
 
     selection = select_normal_paper_trade_side({"short": support})
@@ -225,12 +225,13 @@ def test_unpromoted_quality_model_is_shadow_only() -> None:
         direction_support=selection["selected_support"],
     )
 
-    assert selection["selected"] is False
-    assert selection["selection_reason"] == "no_direction"
-    assert contract == {}
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert contract["authorized"] is True
+    assert normal_paper_trade_contract_reasons(contract) == []
 
 
-def test_negative_lcb_quality_observation_is_not_a_new_entry() -> None:
+def test_negative_lcb_quality_observation_is_a_bounded_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.35,
@@ -245,20 +246,11 @@ def test_negative_lcb_quality_observation_is_not_a_new_entry() -> None:
         direction_support=selection["selected_support"],
     )
 
-    assert selection["selected"] is False
-    assert selection["selection_reason"] == "no_direction"
-    assert contract == {}
-
-    shadow_contract = build_normal_paper_trade_contract(
-        symbol="BTC/USDT",
-        side="long",
-        selection_reason="paper_quality_observation",
-        direction_support=support,
-    )
-    assert shadow_contract["authorized"] is False
-    assert normal_paper_trade_contract_reasons(shadow_contract)
-    assert normal_paper_settlement_contract_reasons(shadow_contract) == []
-    assert normal_paper_trade_observation_contract_reasons(shadow_contract) == []
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert contract["authorized"] is True
+    assert normal_paper_trade_contract_reasons(contract) == []
+    assert normal_paper_settlement_contract_reasons(contract) == []
 
 
 def test_unauthorized_shadow_observation_cannot_be_reused_as_entry_permission() -> None:
@@ -390,21 +382,25 @@ def test_quality_observation_rejects_excessive_loss_probability() -> None:
     ) == {}
 
 
-def test_positive_expected_net_with_non_positive_objective_cannot_authorize_order() -> None:
-    support = _support("long", expected_net=0.2, objective_net=-0.01)
+def test_positive_expected_net_with_non_positive_objective_uses_quality_observation_route() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.2,
+        objective_net=-0.01,
+    )
     selection = select_normal_paper_trade_side({"long": support})
 
-    assert selection["selected"] is False
-    assert selection["selected_side"] == "neutral"
-    assert (
+    assert selection["selected"] is True
+    assert selection["selected_side"] == "long"
+    assert selection["selection_reason"] == "paper_quality_observation"
+    assert normal_paper_trade_contract_reasons(
         build_normal_paper_trade_contract(
             symbol="BTC/USDT",
             side="long",
-            selection_reason="strategy_edge_selected",
-            direction_support=support,
+            selection_reason=selection["selection_reason"],
+            direction_support=selection["selected_support"],
         )
-        == {}
-    )
+    ) == []
 
 
 def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:

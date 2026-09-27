@@ -497,10 +497,12 @@ values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
 # carrier. These overwrite stale historical values during every deployment.
 values['AI_LLM_CONCURRENCY'] = '1'
 values['AI_LLM_MAX_CALLS_PER_ANALYSIS'] = '1'
-values['AI_EXPERT_TIMEOUT_SECONDS'] = '18'
-values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '18'
+values['AI_EXPERT_TIMEOUT_SECONDS'] = '26'
+values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '26'
 values['AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS'] = '96'
-values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '18'
+values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '26'
+values['AI_TARGET_QWEN_TIMEOUT_SECONDS'] = '26'
+values['AI_TARGET_QWEN_QUEUE_WAIT_SECONDS'] = '6'
 values['AI_DECISION_MAKER_MAX_COMPLETION_TOKENS'] = '96'
 # HIGH_RISK_REVIEW_* is edited atomically by the Dashboard and its secret is
 # stored in the encrypted settings service.  Keeping a second deployment-owned
@@ -509,8 +511,8 @@ try:
     current_tools_timeout = float(values.get('LOCAL_AI_TOOLS_TIMEOUT_SECONDS') or 0)
 except ValueError:
     current_tools_timeout = 0.0
-if current_tools_timeout < 8.0:
-    values['LOCAL_AI_TOOLS_TIMEOUT_SECONDS'] = '8.0'
+if current_tools_timeout < 15.0:
+    values['LOCAL_AI_TOOLS_TIMEOUT_SECONDS'] = '15.0'
 try:
     current_tools_breaker = int(values.get('LOCAL_AI_TOOLS_CIRCUIT_BREAKER_FAILURES') or 0)
 except ValueError:

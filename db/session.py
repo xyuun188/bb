@@ -321,6 +321,30 @@ async def init_db(*, migrate_schema: bool = True) -> None:
                     WHERE closed_at IS NULL
                       AND position_id IS NOT NULL
                     """))
+        elif "postgresql" in settings.database_url:
+            # PostgreSQL deployments must receive the same historical
+            # analysis-type normalization as SQLite.  Without this backfill,
+            # the opening funnel's canonical query silently drops all rows
+            # written before analysis_type became mandatory.
+            await conn.execute(text("""
+                    UPDATE ai_decisions
+                    SET analysis_type = CASE
+                        WHEN lower(coalesce(raw_llm_response->>'analysis_type', '')) IN
+                             ('position', 'position_review', 'holding', 'holdings')
+                             THEN 'position'
+                        WHEN lower(coalesce(raw_llm_response->>'analysis_type', '')) IN
+                             ('market', 'market_scan', 'symbol_scan', 'entry_candidate')
+                             THEN 'market'
+                        WHEN raw_llm_response->'position_review_policy' IS NOT NULL
+                             OR raw_llm_response->'position_review' IS NOT NULL
+                             OR action IN ('close_long', 'close_short', 'reduce',
+                                           'partial_close', 'full_close')
+                             THEN 'position'
+                        ELSE 'market'
+                    END
+                    WHERE model_name = 'ensemble_trader'
+                      AND (analysis_type IS NULL OR analysis_type = '')
+                    """))
         await _ensure_trade_fact_columns(conn)
         await _drop_removed_expert_memory_policy_columns(conn)
         await _delete_non_authoritative_expert_memories(conn)

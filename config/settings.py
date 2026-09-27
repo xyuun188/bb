@@ -238,7 +238,7 @@ class Settings(BaseSettings):
     local_ai_tools_enabled: bool = False
     local_ai_tools_api_base: str = ""
     local_ai_tools_api_key: str = ""
-    local_ai_tools_timeout_seconds: float = 12.0
+    local_ai_tools_timeout_seconds: float = 15.0
     local_ai_tools_circuit_breaker_failures: int = 3
     local_ai_tools_circuit_breaker_cooldown_seconds: float = 45.0
     # Deployment profile is explicit so monitors and sync scripts cannot drift
@@ -310,14 +310,19 @@ class Settings(BaseSettings):
     ai_decision_maker_max_completion_tokens: int = 320
     ai_batch_experts_enabled: bool = True
     ai_batch_expert_max_completion_tokens: int = 560
-    ai_batch_expert_timeout_seconds: float = 15.0
+    # The fixed Qwen carrier has a bounded queue wait plus generation window.
+    # Keep the batch caller budget large enough to cover both phases.
+    ai_batch_expert_timeout_seconds: float = 26.0
     # The local Qwen3.8-27B carrier is deliberately stricter than generic
     # batch providers.  Keep this contract separate: cloud reviewers can use
     # their own longer low-frequency budget without allowing the single A100
     # hot path to regress to a 35-second request.
     ai_target_qwen_max_completion_tokens: int = 96
-    ai_target_qwen_timeout_seconds: float = 18.0
-    ai_target_qwen_queue_wait_seconds: float = 2.0
+    # The target carrier exposes a bounded queue (6s) in front of an
+    # 18s generation deadline.  Callers must budget both phases or a normal
+    # queued request is incorrectly recorded as a model outage.
+    ai_target_qwen_timeout_seconds: float = 26.0
+    ai_target_qwen_queue_wait_seconds: float = 6.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_transient_circuit_breaker_seconds: float = 3.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0

@@ -782,7 +782,7 @@ async def test_batch_format_failure_disables_batch_but_not_real_experts(
     assert _BatchFormatFailingExpert.calls == 1
     assert _BatchFormatFailingExpert.individual_calls == 0
     assert first == {}
-    assert {row["status"] for row in first_context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in first_context["_model_timings"]} == {"batch_failure"}
 
     second_context: dict[str, Any] = {}
     second = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
@@ -790,7 +790,7 @@ async def test_batch_format_failure_disables_batch_but_not_real_experts(
     assert _BatchFormatFailingExpert.calls == 1
     assert _BatchFormatFailingExpert.individual_calls == 0
     assert second == {}
-    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in second_context["_model_timings"]} == {"circuit_breaker_deferred"}
 
 
 @pytest.mark.asyncio
@@ -822,14 +822,14 @@ async def test_batch_failure_retries_real_individual_experts(
     assert decisions == {}
     assert _BatchFailingIndividualSuccessExpert.batch_calls == 1
     assert _BatchFailingIndividualSuccessExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in context["_model_timings"]} == {"batch_failure"}
 
     second_context: dict[str, Any] = {}
     await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
 
     assert _BatchFailingIndividualSuccessExpert.batch_calls == 1
     assert _BatchFailingIndividualSuccessExpert.individual_calls == 0
-    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in second_context["_model_timings"]} == {"circuit_breaker_deferred"}
 
 
 @pytest.mark.asyncio
@@ -856,7 +856,7 @@ async def test_batch_timeout_uses_bounded_independent_retry(
     assert decisions == {}
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in context["_model_timings"]} == {"timeout"}
 
 
 @pytest.mark.asyncio
@@ -889,7 +889,7 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
     assert decisions == {}
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in context["_model_timings"]} == {"timeout"}
 
 
 @pytest.mark.asyncio
@@ -916,7 +916,7 @@ async def test_batch_timeout_activates_minimum_circuit_breaker_when_config_is_ze
 
     assert _BatchTimeoutExpert.batch_calls == 1
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in second_context["_model_timings"]} == {"failed_no_retry"}
+    assert {row["status"] for row in second_context["_model_timings"]} == {"circuit_breaker_deferred"}
 
 
 @pytest.mark.asyncio

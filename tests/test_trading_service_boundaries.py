@@ -8051,6 +8051,21 @@ def test_market_round_budget_is_not_used_as_outer_watchdog(
     assert service.market_round_watchdog_seconds() == 180.0
 
 
+def test_market_round_watchdog_does_not_scale_with_long_decision_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 1800)
+    monkeypatch.setattr(trading_service.settings, "market_analysis_watchdog_seconds", 180)
+
+    assert service.market_round_watchdog_seconds() == 180.0
+
+
 def test_position_round_watchdog_follows_position_review_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -158,6 +158,10 @@ async def build_expert_memory_observability(
             mode=mode if mode in {"paper", "live"} else None,
             limit=500,
             compact=True,
+            # Completeness depends on the exact decision lineage and profit
+            # contract.  The compact projection without evidence payload marks
+            # valid historical outcomes as incomplete.
+            include_decision_evidence=True,
         )
         outcome_positions = {
             int(position_id)

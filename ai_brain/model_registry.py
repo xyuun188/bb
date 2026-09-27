@@ -369,7 +369,9 @@ class ModelRegistry:
             if model.name not in excluded and (not included or model.name in included)
         ]
 
-        context["_attempted_models"] = [model.name for model in active_models]
+        # A slot is attempted only after a provider request is admitted.
+        # Configured-but-deferred experts must not be reported as timed out.
+        context["_attempted_models"] = []
         context["_model_failures"] = []
         context["_model_timings"] = []
         ensure_llm_call_budget(context)
@@ -561,6 +563,7 @@ class ModelRegistry:
                         timing["provider_model"] = provider_model
             return model, result, timing
 
+        context["_attempted_models"] = [model.name for model in active_models]
         tasks = [_timed_decide(model) for model in active_models]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -652,7 +655,7 @@ class ModelRegistry:
                         "expert_name": model.name,
                         "provider_model": _provider_model_name(batch_model),
                         "reason": reason,
-                        "status": "batch_failure_no_retry",
+                        "status": "circuit_breaker_deferred",
                     }
                     for model in provider_group
                 )
@@ -660,14 +663,15 @@ class ModelRegistry:
                     {
                         "stage": "expert_initial",
                         "name": model.name,
-                        "status": "failed_no_retry",
+                        "status": "circuit_breaker_deferred",
                         "started_at": datetime.now(UTC).isoformat(),
                         "duration_sec": 0.0,
                         "batch_expert": True,
                         "shared_batch_call": True,
                         "batch_model_count": len(provider_group),
                         "provider_model": _provider_model_name(batch_model),
-                        "reason": "Qwen3.8-27B batch failure is fail-closed; no independent retry",
+                        "attempted": False,
+                        "reason": reason,
                     }
                     for model in provider_group
                 ]
@@ -684,15 +688,17 @@ class ModelRegistry:
         transport_retry_error = ""
         try:
             requested_batch_timeout = float(
-                settings.ai_batch_expert_timeout_seconds or 18.0
+                settings.ai_batch_expert_timeout_seconds
+                or settings.ai_target_qwen_timeout_seconds
+                or 26.0
             )
             if _is_target_qwen_provider(batch_model):
-                # Do not inherit a generic/cloud batch timeout.  The target
-                # service fails a slow local generation at 18 seconds and a
-                # longer caller timeout merely turns it into queue drain.
+                # Include the target carrier's bounded queue wait and
+                # generation deadline in the caller budget.  Otherwise a
+                # queued but healthy request is recorded as a timeout.
                 requested_batch_timeout = min(
                     requested_batch_timeout,
-                    float(settings.ai_target_qwen_timeout_seconds or 18.0),
+                    float(settings.ai_target_qwen_timeout_seconds or 26.0),
                 )
             requested_batch_timeout = max(requested_batch_timeout, 8.0)
             batch_timeout, budget_snapshot = _bounded_analysis_timeout(
@@ -730,6 +736,16 @@ class ModelRegistry:
                 )
                 return {}, timings
 
+            # The shared request is admitted at this point.  Preserve that
+            # distinction for the persisted quality contract.
+            context["_attempted_models"] = list(
+                dict.fromkeys(
+                    [
+                        *context.get("_attempted_models", []),
+                        *expert_names,
+                    ]
+                )
+            )
             try:
                 result = await asyncio.wait_for(
                     batch_decider(features, context, expert_names),
@@ -851,12 +867,12 @@ class ModelRegistry:
                 failure_status = (
                     "batch_connection_retry_failed"
                     if transport_retry_attempted
-                    else "batch_failure_no_retry"
+                    else "batch_failure"
                 )
                 failure_reason = (
                     f"共享模型连接重试后仍失败：{error_text}"
                     if transport_retry_attempted
-                    else "Qwen3.8-27B batch failure is fail-closed; no independent retry"
+                    else error_text
                 )
                 context.setdefault("_model_failures", []).extend(
                     {
@@ -872,9 +888,13 @@ class ModelRegistry:
                         "stage": "expert_initial",
                         "name": model.name,
                         "status": (
-                            "failed_after_transport_retry"
-                            if transport_retry_attempted
-                            else "failed_no_retry"
+                            "timeout"
+                            if _is_timeout_error(exc)
+                            else (
+                                "failed_after_transport_retry"
+                                if transport_retry_attempted
+                                else "batch_failure"
+                            )
                         ),
                         "started_at": started_at.isoformat(),
                         "duration_sec": duration,
@@ -882,6 +902,7 @@ class ModelRegistry:
                         "shared_batch_call": True,
                         "batch_model_count": len(provider_group),
                         "provider_model": _provider_model_name(batch_model),
+                        "attempted": True,
                         "reason": failure_reason,
                         "transport_retry_attempted": transport_retry_attempted,
                         "transport_retry_reason": transport_retry_error or None,

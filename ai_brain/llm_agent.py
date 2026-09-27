@@ -1089,13 +1089,13 @@ class LLMAgent(AbstractAIModel):
             configured_timeout_value = 0.0
         target_qwen = str(model or "").strip().lower() == "qwen3.8-27b"
         if target_qwen:
-            # The production carrier is one A100 worker.  Keep the HTTP
-            # deadline aligned with the registry budget so a stale generic
-            # 26-30s timeout cannot turn one slow generation into a long
-            # queue stall.
+            # The production carrier is one A100 worker with a bounded queue
+            # in front of its generation deadline.  The caller timeout must
+            # cover both phases; otherwise a normal queued request is recorded
+            # as a model outage before the carrier can answer.
             request_timeout = min(
-                max(float(getattr(settings, "ai_target_qwen_timeout_seconds", 18.0) or 18.0), 8.0),
-                18.0,
+                max(float(getattr(settings, "ai_target_qwen_timeout_seconds", 26.0) or 26.0), 8.0),
+                30.0,
             )
         elif fast_expert:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 18.0)

@@ -368,7 +368,7 @@ async def test_fast_independent_expert_uses_short_json_runtime(
     assert decision.action.value == "hold"
     assert captured_calls
     kwargs = captured_calls[-1]["kwargs"]
-    assert kwargs["timeout"] <= 18.0
+    assert kwargs["timeout"] <= 30.0
     # Independent fallback is fail-closed for the target carrier and must
     # still honor its 96-token generation boundary.
     assert kwargs["max_tokens"] == 96

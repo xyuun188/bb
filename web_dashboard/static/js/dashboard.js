@@ -2841,6 +2841,23 @@ function analysisExpertStatusLine(record, missingCount) {
     if (preExpertSkip.skipped) {
         return `${preExpertSkip.label}；没有消耗大模型专家`;
     }
+    const statusCounts = record?.expert_status_counts || {};
+    const deferredCircuit = Number(statusCounts.circuit_breaker_deferred || 0);
+    const deferredBudget = Number(statusCounts.analysis_budget_deferred || 0);
+    const timedOut = Number(statusCounts.timeout || 0);
+    if (deferredCircuit > 0 || deferredBudget > 0) {
+        const parts = [];
+        if (deferredCircuit > 0) {
+            parts.push(`${deferredCircuit} 个熔断顺延，本轮未发起`);
+        }
+        if (deferredBudget > 0) {
+            parts.push(`${deferredBudget} 个预算顺延，本轮未发起`);
+        }
+        if (timedOut > 0) {
+            parts.push(`${timedOut} 个已发起但超时`);
+        }
+        return parts.join('；');
+    }
     const expectedCount = Number(record?.expected_expert_count ?? 0);
     const successfulCount = Number(record?.expert_count ?? 0);
     const returnedCount = Number(record?.returned_expert_count ?? successfulCount);
@@ -3219,6 +3236,23 @@ function analysisToolAvailable(payload) {
     return true;
 }
 
+function analysisToolHasEvidence(payload) {
+    if (!payload || typeof payload !== 'object' || !Object.keys(payload).length) return false;
+    if (analysisToolAvailable(payload)) return true;
+    const status = String(payload.status || '').toLowerCase();
+    return [
+        'returned',
+        'completed',
+        'ok',
+        'supported',
+        'specialist_shadow_inference',
+        'shadow_observation',
+        'trained_calibrator',
+        'artifact_unavailable',
+    ].includes(status)
+        || Boolean(payload.predictions || payload.return_distribution_contract || payload.model);
+}
+
 function analysisToolPlainStatus(payload) {
     if (!payload || typeof payload !== 'object' || !Object.keys(payload).length) return '未返回';
     if (String(payload.governance_status || '').toLowerCase() === 'returned_but_governance_blocked') {
@@ -3261,15 +3295,25 @@ function analysisToolMetaText(payload) {
     return parts.join('；');
 }
 
+// Keep transport health separate from per-round evidence. A live service can
+// legitimately return no prediction for one bounded batch.
 function analysisToolStatus(payload) {
     if (!payload || typeof payload !== 'object' || !Object.keys(payload).length) {
-        return analysisPill('未返回', 'warn');
+        return analysisPill('\u672c\u8f6e\u672a\u8fd4\u56de', 'muted');
     }
     if (String(payload.governance_status || '').toLowerCase() === 'returned_but_governance_blocked') {
-        return analysisPill('已返回（治理不可交易）', 'muted');
+        return analysisPill('\u5df2\u8fd4\u56de\uff08\u6cbb\u7406\u4e0d\u53ef\u4ea4\u6613\uff09', 'muted');
     }
     if (!analysisToolAvailable(payload)) {
-        return analysisPill(analysisToolPlainStatus(payload), 'warn');
+        const status = String(payload.status || '').toLowerCase();
+        const transient = ['timeout', 'deferred', 'no_result', 'not_returned'].includes(status);
+        const evidence = analysisToolHasEvidence(payload);
+        return analysisPill(
+            evidence
+                ? '\u6709\u670d\u52a1\u8bb0\u5f55\uff0c\u672c\u8f6e\u672a\u8fd4\u56de'
+                : analysisToolPlainStatus(payload),
+            transient || evidence ? 'muted' : 'warn',
+        );
     }
     const observationOnly = payload.production_permission === false
         || ['specialist_shadow_inference', 'shadow_observation', 'trained_calibrator']
@@ -3642,6 +3686,14 @@ function analysisMissingExpertReason(missing, record) {
     const ensembleTimedOut = missing?.status === 'ensemble_timeout'
         || skipKind === 'ensemble_timeout'
         || record?.expert_call_status?.timed_out === true;
+
+    if (missingStatus === 'circuit_breaker_deferred') {
+        return `${label} 本轮处于熔断冷却，未发起调用；这不是模型超时，下一轮会按冷却状态重新评估。`;
+    }
+
+    if (missingStatus === 'analysis_budget_deferred') {
+        return `${label} 本轮剩余分析预算不足，未发起调用；这不是模型故障，下一轮会重新分配预算。`;
+    }
 
     if (missing?.status === 'called_timeout') {
         return `${label} 已发起调用，但在本轮截止时间内未返回；这不是“未调用”，系统已保留本轮超时记录。`;
@@ -4042,10 +4094,16 @@ function renderAnalysisReasonModal(record) {
         const ensembleTimedOut = e?.status === 'ensemble_timeout'
             || record?.expert_call_status?.kind === 'ensemble_timeout';
         const calledTimeout = e?.status === 'called_timeout';
+        const deferredCircuit = e?.status === 'circuit_breaker_deferred';
+        const deferredBudget = e?.status === 'analysis_budget_deferred';
         const pillText = ensembleTimedOut
             ? '整体超时'
             : calledTimeout
                 ? '已调用未返回'
+                : deferredCircuit
+                    ? '熔断顺延'
+                    : deferredBudget
+                        ? '预算顺延'
                 : missingStatus === 'evidence_missing'
                     ? '调用证据缺失'
                     : missingStatus === 'not_attempted'
@@ -4055,7 +4113,8 @@ function renderAnalysisReasonModal(record) {
                             : missingStatus === 'empty_response'
                                 ? '返回为空'
                                 : '调用失败';
-        const pillTone = missingStatus === 'evidence_missing' ? 'muted' : 'bad';
+        const pillTone = ['evidence_missing', 'circuit_breaker_deferred', 'analysis_budget_deferred']
+            .includes(missingStatus) ? 'muted' : 'bad';
         return `  
         <div class="analysis-card analysis-card-warning">  
             <div class="analysis-card-head">
@@ -4405,6 +4464,15 @@ async function fetchExpertMemories() {
         return;
     }
     if (!data) return;
+    // A bounded backend timeout is diagnostic state, not an empty dataset.
+    // Keep the last verified page visible instead of replacing it with zeros.
+    if (
+        ['timeout', 'error'].includes(String(data.status || '').toLowerCase())
+        && (state.expertMemoryTotal > 0 || state.tradeReflectionTotal > 0)
+    ) {
+        console.warn('Expert memory refresh returned a non-data status; keeping the visible state.');
+        return;
+    }
     state.expertMemories = data.memories || [];
     state.tradeReflections = data.reflections || [];
     state.expertMemoryTotal = Number(data.count || 0);

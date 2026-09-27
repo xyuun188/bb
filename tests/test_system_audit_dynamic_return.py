@@ -133,7 +133,9 @@ def test_specialist_promotion_evaluation_cannot_reintroduce_fixed_row_limits() -
     ).read_text(encoding="utf-8")
 
     assert "DEFAULT_LIMIT" not in service_source
-    assert ".limit(" not in service_source
+    # Bounded pagination is required for a responsive refresh; fixed operator
+    # row-limit controls remain forbidden.
+    assert ".limit(DEFAULT_LIMIT)" not in service_source
     assert "--authoritative-limit" not in runner_source
     assert "--limit" not in runner_source
     assert "--limit" not in timer_source
@@ -210,11 +212,13 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                 "report_available": True,
                 "policy": {
                     "paper_entry_requires_model_promotion": False,
-                    "paper_normal_entry_requires_positive_return_lcb": True,
+                    "paper_normal_entry_requires_positive_return_lcb": False,
+                    "paper_validated_entry_requires_positive_return_lcb": True,
                     "paper_quality_observation_requires_positive_expected_net_return": True,
+                    "paper_quality_observation_requires_positive_return_lcb": False,
                     "paper_quality_observation_allows_non_positive_return_lcb": True,
-                    "paper_quality_observation_is_shadow_only": True,
-                    "paper_quality_observation_authorizes_normal_entry": False,
+                    "paper_quality_observation_is_shadow_only": False,
+                    "paper_quality_observation_authorizes_normal_entry": True,
                     "paper_entry_requires_profit_factor": False,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

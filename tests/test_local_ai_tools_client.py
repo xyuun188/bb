@@ -835,7 +835,7 @@ def test_local_ai_tools_client_clamps_runtime_settings(
     monkeypatch.setattr(settings, "local_ai_tools_circuit_breaker_cooldown_seconds", 99999.0)
 
     assert client.enabled() is True
-    assert client._timeout == 15.0
+    assert client._timeout == 20.0
     assert client._failure_threshold == 20
     assert client._cooldown_seconds == 3600.0
 

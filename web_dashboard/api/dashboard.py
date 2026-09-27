@@ -1407,6 +1407,13 @@ def _analysis_missing_expert_status(
     attempted = expert_name in attempted_names or slot.get("attempted") is True
     if pre_expert_skip.get("skipped"):
         return "pre_expert_skipped"
+    if slot_status in {"circuit_breaker_deferred", "analysis_budget_deferred"} or (
+        timing_status in {"circuit_breaker_deferred", "analysis_budget_deferred"}
+    ):
+        return timing_status if timing_status in {
+            "circuit_breaker_deferred",
+            "analysis_budget_deferred",
+        } else slot_status
     if ensemble_timed_out:
         return "ensemble_timeout"
     if slot_status == "timeout" or timing_status in {"timeout", "timeout_fallback"}:
@@ -11043,6 +11050,26 @@ def _opening_funnel_is_analysis_only(
     return False
 
 
+def _opening_funnel_analysis_type(row: Any, raw: dict[str, Any]) -> str:
+    """Normalize new and legacy decision rows to the single funnel protocol."""
+
+    explicit = str(
+        getattr(row, "analysis_type", None) or raw.get("analysis_type") or ""
+    ).strip().lower()
+    if explicit in {"position", "position_review", "holding", "holdings"}:
+        return "position"
+    if explicit in {"market", "market_scan", "symbol_scan", "entry_candidate"}:
+        return "market"
+    action = str(getattr(row, "action", None) or raw.get("action") or "").strip().lower()
+    if action in {"close_long", "close_short", "reduce", "partial_close", "full_close"}:
+        return "position"
+    if isinstance(raw.get("position_review_policy"), dict) or isinstance(
+        raw.get("position_review"), dict
+    ):
+        return "position"
+    return "market"
+
+
 @router.get("/opening-funnel")
 async def get_opening_funnel(
     mode: str | None = None,
@@ -11138,7 +11165,7 @@ async def _build_opening_funnel_payload(
     limit: int = 500,
 ):
     """Diagnose where new entries are filtered out before becoming positions."""
-    from sqlalchemy import select, text
+    from sqlalchemy import or_, select, text
 
     from db.session import get_read_session_ctx
     from models.decision import AIDecision
@@ -11181,7 +11208,13 @@ async def _build_opening_funnel_payload(
                 AIDecision.model_name == ENSEMBLE_TRADER_NAME,
                 AIDecision.is_paper == is_paper,
                 AIDecision.created_at >= since,
-                AIDecision.analysis_type.in_(("market", "entry_candidate")),
+                or_(
+                    AIDecision.analysis_type.in_(("market", "entry_candidate")),
+                    # Historical rows created before the canonical analysis_type
+                    # field are normalized from their raw contract below.
+                    AIDecision.analysis_type.is_(None),
+                    AIDecision.analysis_type == "",
+                ),
             )
             .order_by(AIDecision.created_at.desc())
             .limit(capped_limit)
@@ -11205,11 +11238,8 @@ async def _build_opening_funnel_payload(
     repair_cleanup_rows = 0
     for row in rows:
         raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
-        analysis_type = str(row.analysis_type or raw.get("analysis_type") or "").lower()
-        if analysis_type == "position" or str(row.action or "").lower() in {
-            "close_long",
-            "close_short",
-        }:
+        analysis_type = _opening_funnel_analysis_type(row, raw)
+        if analysis_type == "position":
             continue
         if _opening_funnel_is_repair_cleanup(row):
             repair_cleanup_rows += 1
@@ -11830,7 +11860,13 @@ async def _get_analysis_records_uncached(
             str(item.get("name"))
             for item in model_timings
             if str(item.get("name") or "") in expected_expert_name_set
-            and str(item.get("status") or "").lower() not in {"skipped", "not_attempted"}
+            and str(item.get("status") or "").lower()
+            not in {
+                "skipped",
+                "not_attempted",
+                "circuit_breaker_deferred",
+                "analysis_budget_deferred",
+            }
         )
         attempted_names.update(
             name
@@ -13651,8 +13687,7 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
         )
 
 
-@router.get("/expert-memories")
-async def get_expert_memories(
+async def _get_expert_memories_uncached(
     limit: int = 10,
     page_size: int = 10,
     memory_page: int = 1,
@@ -13720,7 +13755,14 @@ async def get_expert_memories(
     outcomes = await load_authoritative_trade_outcomes(
         mode=selected_mode if selected_mode in {"paper", "live"} else None,
         compact=True,
-        include_decision_evidence=False,
+        # The dashboard's settlement counters are evidence-facing, not a
+        # lightweight ticker summary.  Omitting the exact entry-decision
+        # payload makes every historical outcome look incomplete
+        # (``missing_exact_entry_order_decision_payload``), which collapses
+        # complete samples to zero even though the authoritative records are
+        # present.  Use the canonical evidence projection here so memory,
+        # reflection, and training counts share one contract.
+        include_decision_evidence=True,
     )
     outcome_by_position_id = {
         int(position_id): outcome
@@ -13822,7 +13864,7 @@ async def get_expert_memories(
         )
     complete_outcome_count = sum(
         item.get("outcome_complete") is True
-        and item.get("settlement_fact_trusted") is True
+        and item.get("trade_fact_trusted") is True
         for item in outcomes
     )
     shadow_sample_count = sum(len(item.get("counterfactual_evidence") or []) for item in outcomes)
@@ -13858,6 +13900,119 @@ async def get_expert_memories(
         },
         "daily_target": _daily_target_payload(),
     }
+
+
+@router.get("/expert-memories")
+async def get_expert_memories(
+    limit: int = 10,
+    page_size: int = 10,
+    memory_page: int = 1,
+    reflection_page: int = 1,
+    expert_name: str | None = None,
+    symbol: str | None = None,
+    mode: str | None = None,
+):
+    """Return the memory projection without letting evidence rebuilds blank the UI.
+
+    The authoritative outcome projection is intentionally evidence-complete, so
+    a cold rebuild can be slower than a normal dashboard poll. Keep one bounded
+    read model per page/mode and serve the last verified projection while a
+    refresh is in progress or a single rebuild times out.
+    """
+
+    selected_mode = str(mode or "").lower()
+    selected_mode = selected_mode if selected_mode in {"paper", "live"} else ""
+    size = max(min(int(page_size or limit or 10), 100), 1)
+    memory_page = max(int(memory_page or 1), 1)
+    reflection_page = max(int(reflection_page or 1), 1)
+    cache_key = (
+        "expert-memories",
+        selected_mode,
+        size,
+        memory_page,
+        reflection_page,
+        str(expert_name or ""),
+        str(symbol or ""),
+    )
+    stale = _dashboard_heavy_cache_peek(
+        cache_key,
+        max_age_seconds=_DASHBOARD_EXPERT_MEMORY_STALE_TTL_SECONDS,
+    )
+    cached = _dashboard_heavy_cache_get(
+        cache_key,
+        ttl_seconds=_DASHBOARD_EXPERT_MEMORY_CACHE_TTL_SECONDS,
+    )
+    if isinstance(cached, dict):
+        cached["cache"] = {"hit": True, "stale": False}
+        return sanitize_payload(cached)
+
+    async def build() -> dict[str, Any]:
+        return await _get_expert_memories_uncached(
+            limit=limit,
+            page_size=size,
+            memory_page=memory_page,
+            reflection_page=reflection_page,
+            expert_name=expert_name,
+            symbol=symbol,
+            mode=selected_mode or None,
+        )
+
+    try:
+        payload = await asyncio.wait_for(build(), timeout=18.0)
+    except TimeoutError:
+        payload = None
+        if isinstance(stale, dict):
+            stale["status"] = "stale"
+            stale["stale"] = True
+            stale["stale_reason"] = "expert_memories_refresh_timeout"
+            stale["degraded_reason"] = "expert_memories_refresh_timeout"
+            stale["refresh_in_background"] = True
+            stale["cache"] = {"hit": True, "stale": True}
+            return sanitize_payload(stale)
+        return {
+            "memories": [],
+            "reflections": [],
+            "count": 0,
+            "reflection_count": 0,
+            "status": "timeout",
+            "stale": False,
+            "degraded_reason": "expert_memories_refresh_timeout",
+            "message": "专家记忆正在刷新，暂时没有可用的新投影。",
+        }
+    except Exception as exc:
+        _log_dashboard_fallback("dashboard expert memories fallback", exc)
+        if isinstance(stale, dict):
+            stale["status"] = "stale"
+            stale["stale"] = True
+            stale["stale_reason"] = "expert_memories_refresh_error"
+            stale["degraded_reason"] = "expert_memories_refresh_error"
+            stale["refresh_in_background"] = True
+            stale["cache"] = {"hit": True, "stale": True}
+            return sanitize_payload(stale)
+        return {
+            "memories": [],
+            "reflections": [],
+            "count": 0,
+            "reflection_count": 0,
+            "status": "error",
+            "stale": False,
+            "degraded_reason": "expert_memories_refresh_error",
+            "error": safe_error_text(exc, limit=180),
+        }
+
+    if not isinstance(payload, dict):
+        return {
+            "memories": [],
+            "reflections": [],
+            "count": 0,
+            "reflection_count": 0,
+            "status": "error",
+            "degraded_reason": "expert_memories_invalid_payload",
+        }
+    payload = dict(payload)
+    payload["cache"] = {"hit": False, "stale": False}
+    _dashboard_heavy_cache_set(cache_key, payload)
+    return sanitize_payload(payload)
 
 
 @router.get("/shadow-backtests")

@@ -956,7 +956,7 @@ def test_confirmed_partial_fill_settlement_is_evidence_bound(
     assert ("normal_paper_sizing_provenance_incomplete" not in reasons) is accepted
 
 
-def test_quality_observation_submission_is_rejected_before_any_fill() -> None:
+def test_quality_observation_submission_uses_the_canonical_paper_entry_contract() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -1006,10 +1006,9 @@ def test_quality_observation_submission_is_rejected_before_any_fill() -> None:
     decision.position_size_pct = 0.01
 
     submission = _return_entry_contract_result(decision, "paper")
-    assert submission.passed is False
-    assert "normal_paper_trade_not_authorized" in submission.reason
+    assert submission.passed is True
     _contract, reasons = validate_entry_execution_contract(decision.raw_response)
-    assert "normal_paper_trade_quality_observation_shadow_only" in reasons
+    assert reasons == []
     assert _return_entry_contract_result(decision, "live").passed is False
 
 
@@ -1025,7 +1024,7 @@ def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> Non
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
 
 
-def test_positive_quality_observation_contract_is_shadow_only() -> None:
+def test_positive_quality_observation_contract_is_submit_ready_for_paper_only() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -1081,9 +1080,8 @@ def test_positive_quality_observation_contract_is_shadow_only() -> None:
     )
 
     _contract, reasons = validate_entry_execution_contract(raw)
-    assert "normal_paper_trade_not_authorized" in reasons
-    assert "normal_paper_trade_quality_observation_shadow_only" in reasons
-    assert _return_entry_contract_result(decision, "paper").passed is False
+    assert reasons == []
+    assert _return_entry_contract_result(decision, "paper").passed is True
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:
