@@ -73,6 +73,8 @@ class FeatureVector:
     indicator_price_gap_pct: float = 0.0
     price_reconciliation_warning: str = ""
     market_fact: dict[str, Any] = field(default_factory=dict)
+    feature_refresh_fallback_used: bool = False
+    feature_refresh_fallback_reason: str = ""
     mark_price: float = 0.0
     index_price: float = 0.0
     mark_price_fact: dict[str, Any] = field(default_factory=dict)

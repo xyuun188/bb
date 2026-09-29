@@ -1728,6 +1728,57 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_reuses_complete_fallback_after_timeout() -> None:
+    service = TradingService.__new__(TradingService)
+    fallback = SimpleNamespace(
+        current_price=99.0,
+        close=99.0,
+        bid=98.9,
+        ask=99.1,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+    )
+    calls = 0
+
+    async def feature_snapshot(_symbol: str, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("bounded refresh timeout")
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("ATOM/USDT", fallback)
+
+    assert result is fallback
+    assert calls == 2
+    assert result.feature_refresh_fallback_used is True
+    assert result.feature_refresh_fallback_reason == "authoritative_refresh_timeout"
+
+
+@pytest.mark.asyncio
+async def test_final_market_candidate_refresh_does_not_reuse_incomplete_fallback() -> None:
+    service = TradingService.__new__(TradingService)
+    fallback = SimpleNamespace(
+        current_price=99.0,
+        close=99.0,
+        bid=98.9,
+        ask=99.1,
+    )
+
+    async def feature_snapshot(_symbol: str, **_kwargs: Any) -> Any:
+        raise TimeoutError("bounded refresh timeout")
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("ATOM/USDT", fallback)
+
+    assert result is None
+
+
 def test_auto_scan_feature_fetch_early_quorum_is_market_only() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
@@ -2711,6 +2762,34 @@ async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None
 
     assert "OKX 自动对账异常" in reason
     assert "OKX timeout" in reason
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_timeout_is_advisory_for_market_scan_after_success() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "degraded",
+        "last_error": "OKX timeout",
+        "last_requires_attention_count": 0,
+        "last_success_at": "2026-09-29T06:00:00+00:00",
+        "fresh_success_available": True,
+    }
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._okx_credential_presence = lambda _mode: {
+        "configured": True,
+        "missing_fields": [],
+    }
+
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[],
+        allow_background_refresh=True,
+    )
+
+    assert reason is None
 
 
 @pytest.mark.asyncio

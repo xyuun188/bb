@@ -5744,9 +5744,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
         The initial batch fetch is useful for ranking, but queued symbols can
         become stale while earlier symbols are analyzed. This keeps executable
-        signals tied to a recent market snapshot.
+        signals tied to a recent market snapshot. If the authoritative refresh
+        misses its bounded deadline, a complete prewarmed snapshot remains a
+        valid read-only analysis input; the execution boundary performs its own
+        immediate OKX refresh before any order is submitted.
         """
-        _ = fallback
 
         def funding_ready(candidate: Any) -> bool:
             """Final market analysis may not proceed on an optional funding stub."""
@@ -5792,6 +5794,43 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 diagnostic_details=quality_details,
             )
             return None, quality_issue
+
+        try:
+            fallback_candidate, fallback_quality_issue = validated(
+                fallback,
+                source="prewarmed_fallback",
+            )
+        except Exception as exc:
+            # A legacy/test double may expose a narrower quality-policy
+            # contract. Treat that fallback as unusable rather than allowing
+            # the diagnostic path to change the entry decision.
+            logger.debug(
+                "prewarmed fallback validation failed",
+                symbol=symbol,
+                error=safe_error_text(exc),
+            )
+            fallback_candidate, fallback_quality_issue = None, None
+        fallback_usable = bool(
+            fallback_candidate is not None
+            and fallback_quality_issue is None
+            and funding_ready(fallback_candidate)
+        )
+
+        def use_fallback(reason: str) -> Any | None:
+            if not fallback_usable:
+                return None
+            try:
+                setattr(fallback_candidate, "feature_refresh_fallback_used", True)
+                setattr(fallback_candidate, "feature_refresh_fallback_reason", reason)
+            except Exception:
+                pass
+            logger.warning(
+                "using complete prewarmed feature snapshot after bounded refresh failure",
+                symbol=symbol,
+                feature_refresh_fallback_used=True,
+                feature_refresh_fallback_reason=reason,
+            )
+            return fallback_candidate
 
         local_quality_issue: Any | None = None
         local_candidate: Any | None = None
@@ -5873,14 +5912,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
             logger.warning(
-                "fresh feature vector refresh timed out; deferring symbol", symbol=symbol
+                "fresh feature vector refresh timed out; using fallback when complete",
+                symbol=symbol,
             )
+            fallback_result = use_fallback("authoritative_refresh_timeout")
+            if fallback_result is not None:
+                return fallback_result
         except Exception as e:
             logger.warning(
-                "fresh feature vector refresh failed; deferring symbol",
+                "fresh feature vector refresh failed; using fallback when complete",
                 symbol=symbol,
                 error=safe_error_text(e),
             )
+            fallback_result = use_fallback("authoritative_refresh_error")
+            if fallback_result is not None:
+                return fallback_result
+        fallback_result = use_fallback("authoritative_refresh_invalid")
+        if fallback_result is not None:
+            return fallback_result
         return None
 
     async def _prewarm_market_candidate_indicators(
@@ -13644,7 +13693,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
         okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
         if okx_sync_reason:
-            return okx_sync_reason
+            if allow_background_refresh:
+                # Market rounds are read-only observation/training work. Keep
+                # them running after a transient current-position sync failure;
+                # the execution policy below still performs the hard
+                # authoritative check immediately before any order.
+                payload = self._okx_authoritative_sync_status_payload()
+                if (
+                    payload.get("fresh_success_available") is True
+                    and int(payload.get("last_requires_attention_count") or 0) == 0
+                ):
+                    logger.warning(
+                        "OKX current-position sync issue is advisory for read-only market scan",
+                        reason=okx_sync_reason,
+                        last_success_at=payload.get("last_success_at"),
+                    )
+                    okx_sync_reason = None
+            if okx_sync_reason:
+                return okx_sync_reason
 
         model_mode = self._get_model_execution_mode(model_name)
         credential_presence = self._okx_credential_presence(model_mode)
