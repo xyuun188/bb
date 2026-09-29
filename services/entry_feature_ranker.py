@@ -37,6 +37,13 @@ class EntryFeatureRankResult:
 class EntryFeatureRankerPolicy:
     """Rank symbols after K-line indicators are available, before spending AI tokens."""
 
+    # A single major-market observation is not a usable distribution.  Using it
+    # as the major-only median makes the threshold equal to that one symbol's
+    # turnover and can exclude every other market candidate.  Pooling the
+    # complete current cross-section keeps the value empirical while avoiding
+    # a small-sample hard gate.
+    MIN_NOTIONAL_GROUP_SAMPLE_COUNT = 3
+
     suspicious_symbol_reason: SuspiciousSymbolReason
     major_symbols: frozenset[str]
 
@@ -114,6 +121,21 @@ class EntryFeatureRankerPolicy:
             )
 
         window = "current_market_feature_cross_section"
+        notional_policy_values: dict[str, list[float]] = {}
+        pooled_notional = [
+            *metrics["major_notional"],
+            *metrics["alt_notional"],
+        ]
+        for group in ("major", "alt"):
+            group_values = metrics[f"{group}_notional"]
+            if (
+                len(group_values) < self.MIN_NOTIONAL_GROUP_SAMPLE_COUNT
+                and len(pooled_notional) > len(group_values)
+            ):
+                notional_policy_values[group] = pooled_notional
+            else:
+                notional_policy_values[group] = group_values
+
         return {
             "analysis_volume_floor": empirical_policy_value(
                 "analysis_volume_floor",
@@ -166,7 +188,7 @@ class EntryFeatureRankerPolicy:
             **{
                 f"{tier}_{group}_notional_floor": empirical_policy_value(
                     f"{tier}_{group}_notional_floor",
-                    metrics[f"{group}_notional"],
+                    notional_policy_values[group],
                     selector="median",
                     observation_window=window,
                 )
@@ -174,6 +196,32 @@ class EntryFeatureRankerPolicy:
                 for group in ("major", "alt")
             },
         }
+
+    def _notional_policy_scope(
+        self,
+        feature_vectors: dict[str, Any],
+        group: str,
+    ) -> str:
+        """Describe whether a notional floor uses a pooled small-sample view."""
+
+        group_count = 0
+        total_count = 0
+        for feature in feature_vectors.values():
+            parsed = self._parse_filter_inputs(feature, allow_incomplete_indicator=True)
+            if parsed is None or self._uses_fallback_indicator_snapshot(feature):
+                continue
+            total_count += 1
+            if (
+                ("major" if parsed[0] in self.major_symbols else "alt")
+                == group
+            ):
+                group_count += 1
+        if (
+            group_count < self.MIN_NOTIONAL_GROUP_SAMPLE_COUNT
+            and total_count > group_count
+        ):
+            return "pooled_current_market_cross_section"
+        return f"{group}_current_market_cross_section"
 
     @staticmethod
     def _policy_number(
@@ -436,6 +484,10 @@ class EntryFeatureRankerPolicy:
             "dynamic_policy": {
                 "version": "2026-07-12.dynamic-market-cross-section.v1",
                 "values": {name: item.to_dict() for name, item in dynamic_policy.items()},
+                "notional_policy_scopes": {
+                    group: self._notional_policy_scope(feature_vectors, group)
+                    for group in ("major", "alt")
+                },
             },
             "market_symbol_limit": max(0, int(limit or 0)),
             "rank_underfilled": rank_underfilled,

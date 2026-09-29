@@ -12,7 +12,7 @@ import re
 from typing import Any
 
 OKX_TEMPORARY_SERVICE_CODE = "50001"
-OKX_TEMPORARY_SERVICE_CODES = frozenset({"50001", "50013", "50026"})
+OKX_TEMPORARY_SERVICE_CODES = frozenset({"50001", "50004", "50013", "50026"})
 OKX_TEMPORARY_SERVICE_MARKERS = (
     "service temporarily unavailable",
     "temporarily unavailable",

@@ -2376,6 +2376,49 @@ async def test_analysis_loop_cancels_a_stuck_round_and_releases_scheduler(monkey
 
 
 @pytest.mark.asyncio
+async def test_analysis_loop_detaches_stubborn_cancel_cleanup_and_releases_scheduler(
+    monkeypatch,
+):
+    running = True
+    sleeps: list[float] = []
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal running
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            running = False
+
+    async def stubborn_round(_scope: str) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise
+
+    service = MarketAnalysisService(
+        run_once_provider=stubborn_round,
+        is_running_provider=lambda: running,
+        time_budget_provider=lambda: 0.01,
+    )
+    service.initial_delay_seconds = 0.0
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await service.loop(lambda: 30.0)
+
+    assert cleanup_started.is_set()
+    assert sleeps[0] == 0.0
+    assert sleeps[1] == pytest.approx(30.0, abs=0.1)
+
+    # Let the detached round finish so the test leaves no pending task behind.
+    release_cleanup.set()
+    await original_sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_analysis_loop_marks_watchdog_cancellation_before_canceling_round(monkeypatch):
     running = True
     reasons: list[str | None] = []
@@ -2790,6 +2833,48 @@ async def test_okx_authoritative_sync_timeout_is_advisory_for_market_scan_after_
     )
 
     assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_okx_authoritative_sync_failure_keeps_market_observation_running() -> None:
+    service = TradingService.__new__(TradingService)
+    service.risk_engine = SimpleNamespace(
+        circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
+    )
+    service._okx_authoritative_sync_status_payload = lambda _now=None: {
+        "status": "warning",
+        "last_error": "private service circuit open",
+        "last_requires_attention_count": 0,
+        "fresh_success_available": False,
+    }
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._okx_credential_presence = lambda _mode: {
+        "configured": True,
+        "missing_fields": [],
+    }
+
+    reason = await service._new_pair_analysis_pause_reason(
+        "ensemble_trader",
+        open_positions=[],
+        allow_background_refresh=True,
+    )
+
+    assert "OKX 自动对账异常" in str(reason)
+    assert service._is_authoritative_sync_entry_pause(reason) is True
+    assert (
+        service._market_analysis_pause_reason(
+            reason,
+            run_market_analysis=True,
+        )
+        is None
+    )
+    assert (
+        service._market_analysis_pause_reason(
+            reason,
+            run_market_analysis=False,
+        )
+        == reason
+    )
 
 
 @pytest.mark.asyncio
@@ -12607,6 +12692,57 @@ async def test_market_strategy_context_account_equity_uses_cached_balance() -> N
     assert result == 234.5
     assert allocated_calls == 0
     assert refresh_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pre_order_facts_reuse_recent_balance_after_temporary_okx_error() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {
+                "free": 234.5,
+                "equity": 250.0,
+                "allocatable": 234.5,
+            },
+            "fetched_at": datetime.now(UTC) - timedelta(seconds=30),
+        }
+    }
+    service._okx_authoritative_sync_status_payload = lambda: {
+        "status": "ok",
+        "fresh_success_available": True,
+    }
+
+    class TemporaryBalanceExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": (
+                    "okx_pre_order_account_equity_missing,"
+                    "okx_pre_order_available_margin_missing"
+                ),
+                "balance_snapshot": {
+                    "error": "OKX API error [50004]: private request timeout"
+                },
+                "inst_id": "BTC-USDT-SWAP",
+                "feature_snapshot": {"current_price": 100.0},
+                "policy_provenance": {"source": "okx_native"},
+            }
+
+    async def get_executor(_mode: str) -> TemporaryBalanceExecutor:
+        return TemporaryBalanceExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.symbol = "BTC/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is True
+    assert result["account_equity_usdt"] == pytest.approx(250.0)
+    assert result["available_margin_usdt"] == pytest.approx(234.5)
+    assert result["balance_source"] == "cached_okx_balance_snapshot"
+    assert result["requires_final_balance_recheck"] is True
+    assert result["policy_provenance"]["balance_source"] == "cached_okx_balance_snapshot"
 
 
 @pytest.mark.asyncio

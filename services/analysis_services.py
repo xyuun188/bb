@@ -30,6 +30,31 @@ TimeBudgetProvider = Callable[[], float]
 DecisionStageRecorder = Callable[..., Awaitable[dict[str, Any]]]
 DecisionReasonMarker = Callable[[int, str], Awaitable[None]]
 
+# A cancelled round is allowed a short cooperative cleanup window.  A provider
+# that ignores cancellation must not hold the scheduler hostage indefinitely;
+# the next round still needs to start so market observation and training do not
+# go silent for hours.
+ROUND_CANCEL_DRAIN_SECONDS = 0.25
+
+
+def _consume_detached_round(
+    task: asyncio.Task[Any],
+    *,
+    scope: str | None = None,
+) -> None:
+    """Consume a late round result so detached cleanup cannot leak warnings."""
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning(
+            "detached analysis round finished with an error",
+            scope=scope,
+            error=safe_error_text(exc),
+        )
+
 
 @dataclass
 class _RoundCancellationState:
@@ -141,16 +166,64 @@ class _ScopedAnalysisService:
             await asyncio.wait_for(asyncio.shield(round_task), timeout=time_budget)
         except TimeoutError:
             cancellation_state.reason = "watchdog"
-            round_task.cancel()
-            await asyncio.gather(round_task, return_exceptions=True)
+            await self._cancel_round_without_blocking(round_task)
             raise
         except asyncio.CancelledError:
             cancellation_state.reason = "shutdown" if not self.is_running() else "external"
-            round_task.cancel()
-            await asyncio.gather(round_task, return_exceptions=True)
+            await self._cancel_round_without_blocking(round_task)
             raise
         finally:
             round_cancellation_state.reset(state_token)
+
+    async def _cancel_round_without_blocking(self, round_task: asyncio.Task[Any]) -> None:
+        """Cancel a round without allowing provider cleanup to stop scheduling."""
+
+        if round_task.done():
+            try:
+                round_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    "analysis round finished with an error while being cancelled",
+                    scope=self.scope,
+                    error=safe_error_text(exc),
+                )
+            return
+
+        round_task.cancel()
+        done, pending = await asyncio.wait(
+            {round_task},
+            timeout=ROUND_CANCEL_DRAIN_SECONDS,
+        )
+        if done:
+            try:
+                round_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    "analysis round cancellation cleanup failed",
+                    scope=self.scope,
+                    error=safe_error_text(exc),
+                )
+            return
+
+        # Some HTTP/model clients ignore cancellation while closing a socket.
+        # Keep consuming that late task in the background so the next round can
+        # start on schedule without exposing an unhandled exception.
+        for task in pending:
+            task.add_done_callback(
+                lambda completed, scope=self.scope: _consume_detached_round(
+                    completed,
+                    scope=scope,
+                )
+            )
+        logger.warning(
+            "analysis round cancellation cleanup exceeded bounded drain; detached",
+            scope=self.scope,
+            drain_timeout_seconds=ROUND_CANCEL_DRAIN_SECONDS,
+        )
 
 
 class MarketAnalysisService(_ScopedAnalysisService):

@@ -172,6 +172,37 @@ def test_fallback_indicator_does_not_pollute_cross_sectional_thresholds() -> Non
     assert fallback_metrics["indicator_snapshot_quality"] == "fallback_market_anchor"
 
 
+def test_low_sample_major_notional_uses_pooled_cross_section() -> None:
+    result = _rank(
+        {
+            "ETH/USDT": _feature(
+                "ETH/USDT",
+                notional_24h_usdt=1_000_000_000.0,
+                indicator_snapshot_available=True,
+            ),
+            "ALT/USDT": _feature(
+                "ALT/USDT",
+                notional_24h_usdt=20_000_000.0,
+                indicator_snapshot_available=True,
+            ),
+            "ALT2/USDT": _feature(
+                "ALT2/USDT",
+                notional_24h_usdt=40_000_000.0,
+                indicator_snapshot_available=True,
+            ),
+        },
+        3,
+    )
+
+    values = result.diagnostics["dynamic_policy"]["values"]
+    assert values["analysis_major_notional_floor"]["sample_count"] == 3
+    assert values["analysis_major_notional_floor"]["value"] == pytest.approx(40_000_000.0)
+    assert (
+        result.diagnostics["dynamic_policy"]["notional_policy_scopes"]["major"]
+        == "pooled_current_market_cross_section"
+    )
+
+
 def test_analysis_fallback_fills_observation_slots_without_entry_permission() -> None:
     features = {
         "A/USDT": _feature("A/USDT", volume_ratio=0.01),

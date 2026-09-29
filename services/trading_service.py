@@ -1471,7 +1471,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Return the hard watchdog for a genuinely stuck market-analysis round."""
 
         settings.refresh_runtime_env()
-        interval = max(10.0, float(settings.decision_interval_seconds or 60))
         expert_budget = (
             float(settings.ai_batch_expert_timeout_seconds or 0.0)
             + float(settings.ai_decision_maker_timeout_seconds or 0.0)
@@ -1957,6 +1956,27 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 f"{detail_text}暂停新开仓，等待状态对齐后再恢复。"
             )
         return None
+
+    @staticmethod
+    def _is_authoritative_sync_entry_pause(reason: str | None) -> bool:
+        """Return whether a pause is caused by the exchange truth sync only."""
+
+        return str(reason or "").strip().startswith("OKX 自动对账")
+
+    @classmethod
+    def _market_analysis_pause_reason(
+        cls,
+        entry_pause_reason: str | None,
+        *,
+        run_market_analysis: bool,
+    ) -> str | None:
+        """Keep market observations running while preserving the entry pause."""
+
+        if run_market_analysis and cls._is_authoritative_sync_entry_pause(
+            entry_pause_reason
+        ):
+            return None
+        return entry_pause_reason
 
     @staticmethod
     def _okx_authoritative_sync_attention_detail(samples: Any) -> str | None:
@@ -4359,7 +4379,100 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
         executor = await self._get_okx_executor_for_mode(model_mode)
         side = "long" if decision.action == Action.LONG else "short"
-        return await executor.pre_order_execution_facts(decision.symbol, side)
+        facts = await executor.pre_order_execution_facts(decision.symbol, side)
+        if not isinstance(facts, dict):
+            return {}
+
+        # A transient OKX private-balance outage must not erase otherwise
+        # usable market facts. The executor still performs an authoritative
+        # balance recheck immediately before submitting an order.
+        balance_snapshot = facts.get("balance_snapshot")
+        balance_error = (
+            balance_snapshot.get("error")
+            if isinstance(balance_snapshot, dict)
+            else None
+        )
+        missing_balance = (
+            "okx_pre_order_account_equity_missing" in str(facts.get("reason") or "")
+            or "okx_pre_order_available_margin_missing" in str(facts.get("reason") or "")
+        )
+        if not missing_balance or not is_okx_temporary_service_error(balance_error):
+            return facts
+
+        selected_mode = "live" if model_mode == "live" else "paper"
+        sync_status = self._okx_authoritative_sync_status_payload()
+        if str(sync_status.get("status") or "").lower() not in {"ok", "degraded"} and (
+            sync_status.get("fresh_success_available") is not True
+        ):
+            return facts
+        cached = self.peek_okx_balance_snapshot_for_mode(
+            selected_mode,
+            allow_stale=True,
+        )
+        if not isinstance(cached, dict):
+            return facts
+        cached_equity = max(self._safe_float(cached.get("equity"), 0.0), 0.0)
+        cached_free = max(self._safe_float(cached.get("free"), 0.0), 0.0)
+        if cached_equity <= 0 or cached_free <= 0:
+            return facts
+
+        cache_entry = getattr(self, "_okx_balance_snapshot_cache", {}).get(selected_mode)
+        fetched_at = cache_entry.get("fetched_at") if isinstance(cache_entry, dict) else None
+        cache_age = (
+            max((datetime.now(UTC) - fetched_at).total_seconds(), 0.0)
+            if isinstance(fetched_at, datetime)
+            else self._safe_float(cached.get("stale_age_seconds"), 0.0)
+        )
+        if cache_age > OKX_BALANCE_SNAPSHOT_STALE_SECONDS:
+            return facts
+
+        repaired = dict(facts)
+        repaired["balance_snapshot"] = {
+            **cached,
+            "source": "cached_okx_balance_snapshot",
+            "stale": bool(cache_age > OKX_BALANCE_SNAPSHOT_FRESH_SECONDS),
+            "stale_age_seconds": round(cache_age, 3),
+            "stale_reason": "okx_private_balance_temporary_service_error",
+        }
+        repaired["account_equity_usdt"] = cached_equity
+        repaired["available_margin_usdt"] = cached_free
+        repaired["balance_source"] = "cached_okx_balance_snapshot"
+        repaired["balance_snapshot_age_seconds"] = round(cache_age, 3)
+        repaired["requires_final_balance_recheck"] = True
+        reasons = [
+            item
+            for item in str(facts.get("reason") or "").split(",")
+            if item
+            not in {
+                "okx_pre_order_account_equity_missing",
+                "okx_pre_order_available_margin_missing",
+            }
+        ]
+        repaired["production_eligible"] = not reasons
+        repaired["reason"] = (
+            "okx_native_pre_order_execution_facts_ready_cached_balance"
+            if not reasons
+            else ",".join(reasons)
+        )
+        provenance = dict(facts.get("policy_provenance") or {})
+        provenance.update(
+            {
+                "source": "okx_native_market_facts_and_cached_verified_balance",
+                "fallback_reason": "okx_private_balance_temporary_service_error",
+                "balance_source": "cached_okx_balance_snapshot",
+                "balance_snapshot_age_seconds": round(cache_age, 3),
+                "requires_final_balance_recheck": True,
+            }
+        )
+        repaired["policy_provenance"] = provenance
+        logger.warning(
+            "reused recently verified OKX balance for pre-order facts",
+            mode=selected_mode,
+            symbol=decision.symbol,
+            age_seconds=round(cache_age, 3),
+            final_recheck_required=True,
+        )
+        return repaired
 
     def rejected_execution_result(self, decision: DecisionOutput, reason: str) -> ExecutionResult:
         """Build rejected execution results through an explicit boundary."""
@@ -5820,10 +5933,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if not fallback_usable:
                 return None
             try:
-                setattr(fallback_candidate, "feature_refresh_fallback_used", True)
-                setattr(fallback_candidate, "feature_refresh_fallback_reason", reason)
-            except Exception:
-                pass
+                fallback_candidate.feature_refresh_fallback_used = True
+                fallback_candidate.feature_refresh_fallback_reason = reason
+            except (AttributeError, TypeError) as exc:
+                logger.debug(
+                    "could not annotate prewarmed feature fallback",
+                    symbol=symbol,
+                    error=safe_error_text(exc),
+                )
             logger.warning(
                 "using complete prewarmed feature snapshot after bounded refresh failure",
                 symbol=symbol,
@@ -9772,19 +9889,43 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 open_positions=open_positions,
                 allow_background_refresh=analysis_scope == "market",
             )
+            # A stale/failed private-position refresh must remain a hard
+            # execution gate, but it must not erase market observations,
+            # shadow labels, or training data.  The final execution boundary
+            # rechecks the authoritative state immediately before submit.
+            market_analysis_pause_reason = self._market_analysis_pause_reason(
+                new_pair_pause_reason,
+                run_market_analysis=run_market_analysis,
+            )
+            sync_pause_is_advisory = bool(
+                new_pair_pause_reason and market_analysis_pause_reason is None
+            )
+            if sync_pause_is_advisory:
+                market_analysis_pause_reason = None
+                logger.warning(
+                    "OKX sync issue is execution-only for market observation",
+                    reason=new_pair_pause_reason,
+                    scope=analysis_scope,
+                )
             self._set_loop_stage("record_new_pair_pause_state")
             entry_pause_reason = account_pause_reason or new_pair_pause_reason
-            await self._record_new_pair_pause_state(ENSEMBLE_TRADER_NAME, new_pair_pause_reason)
+            await self._record_new_pair_pause_state(
+                ENSEMBLE_TRADER_NAME,
+                market_analysis_pause_reason,
+            )
             await self._record_entry_pause_state(ENSEMBLE_TRADER_NAME, entry_pause_reason)
             results["entry_paused"] = bool(entry_pause_reason)
             results["entry_pause_reason"] = entry_pause_reason or None
-            results["market_analysis_paused"] = bool(new_pair_pause_reason)
-            results["market_analysis_pause_reason"] = new_pair_pause_reason or None
-            if new_pair_pause_reason and run_market_analysis:
+            results["market_analysis_paused"] = bool(market_analysis_pause_reason)
+            results["market_analysis_pause_reason"] = market_analysis_pause_reason or None
+            results["market_analysis_entry_advisory_pause"] = (
+                new_pair_pause_reason if sync_pause_is_advisory else None
+            )
+            if market_analysis_pause_reason and run_market_analysis:
                 new_pair_market_pause_applied = True
                 logger.warning(
                     "new-pair market analysis paused; existing-position review remains active",
-                    reason=new_pair_pause_reason,
+                    reason=market_analysis_pause_reason,
                     scope=analysis_scope,
                     open_positions=len(open_positions or []),
                 )
@@ -9792,7 +9933,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     {
                         "model": ENSEMBLE_TRADER_NAME,
                         "symbol": "ALL",
-                        "warning": new_pair_pause_reason,
+                        "warning": market_analysis_pause_reason,
                     }
                 )
                 # The account guard is only meant to stop opening new symbols.
@@ -9809,7 +9950,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
             # 1. Discover the bounded automatic market universe.
             self._set_loop_stage("select_symbols")
-            if new_pair_pause_reason:
+            if market_analysis_pause_reason:
                 scan_symbols = []
             else:
                 try:
@@ -9976,6 +10117,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         sorted(active_analysis_symbols)[:10] if run_market_analysis else []
                     ),
                     "new_pair_pause_reason": new_pair_pause_reason,
+                    "market_analysis_pause_reason": market_analysis_pause_reason,
+                    "market_analysis_entry_advisory_pause": (
+                        new_pair_pause_reason if sync_pause_is_advisory else None
+                    ),
                     "entry_pause_reason": entry_pause_reason,
                     "account_paused": bool(account_pause_reason),
                 }
@@ -10219,7 +10364,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 base_market_limit=base_market_limit,
                 run_position_analysis=run_position_analysis,
                 run_market_analysis=run_market_analysis,
-                new_pair_pause_reason=new_pair_pause_reason,
+                new_pair_pause_reason=market_analysis_pause_reason,
                 strategy_context=strategy_mode_context,
             )
             analysis_budget_context["analysis_scope"] = analysis_scope
@@ -10749,7 +10894,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     memory_context.get("memory_feedback"),
                 )
                 market_agent_skills = self.agent_skills.market_skills(
-                    new_pair_pause_reason=new_pair_pause_reason,
+                    new_pair_pause_reason=market_analysis_pause_reason,
                     ml_signal=ml_signal_context,
                     local_ai_tools=local_ai_tools_context,
                     market_regime=market_regime_context,

@@ -251,6 +251,7 @@ _model_observability_refresh_task: asyncio.Task[Any] | None = None
 _dashboard_model_observability_section_refresh_tasks: dict[
     tuple[Any, ...], asyncio.Task[Any]
 ] = {}
+_dashboard_expert_memory_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _dashboard_summary_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 _dashboard_model_contribution_stats_refresh_tasks: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 
@@ -13755,14 +13756,7 @@ async def _get_expert_memories_uncached(
     outcomes = await load_authoritative_trade_outcomes(
         mode=selected_mode if selected_mode in {"paper", "live"} else None,
         compact=True,
-        # The dashboard's settlement counters are evidence-facing, not a
-        # lightweight ticker summary.  Omitting the exact entry-decision
-        # payload makes every historical outcome look incomplete
-        # (``missing_exact_entry_order_decision_payload``), which collapses
-        # complete samples to zero even though the authoritative records are
-        # present.  Use the canonical evidence projection here so memory,
-        # reflection, and training counts share one contract.
-        include_decision_evidence=True,
+        include_decision_evidence=False,
     )
     outcome_by_position_id = {
         int(position_id): outcome
@@ -13957,8 +13951,41 @@ async def get_expert_memories(
             mode=selected_mode or None,
         )
 
+    async def refresh() -> dict[str, Any]:
+        try:
+            value = await build()
+            if not isinstance(value, dict):
+                return {
+                    "status": "error",
+                    "degraded_reason": "expert_memories_invalid_payload",
+                }
+            _dashboard_heavy_cache_set(cache_key, value)
+            return value
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log_dashboard_fallback("dashboard expert memories background refresh", exc)
+            return {
+                "status": "error",
+                "degraded_reason": "expert_memories_refresh_error",
+                "error": safe_error_text(exc, limit=180),
+            }
+        finally:
+            task = _dashboard_expert_memory_refresh_tasks.get(cache_key)
+            if task is asyncio.current_task():
+                _dashboard_expert_memory_refresh_tasks.pop(cache_key, None)
+
+    def ensure_refresh_task() -> asyncio.Task[Any]:
+        existing = _dashboard_expert_memory_refresh_tasks.get(cache_key)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(refresh())
+        _dashboard_expert_memory_refresh_tasks[cache_key] = task
+        return task
+
     try:
-        payload = await asyncio.wait_for(build(), timeout=18.0)
+        task = ensure_refresh_task()
+        payload = await asyncio.wait_for(asyncio.shield(task), timeout=18.0)
     except TimeoutError:
         payload = None
         if isinstance(stale, dict):
