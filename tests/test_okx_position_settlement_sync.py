@@ -31,10 +31,20 @@ from services.okx_position_settlement_sync import (
     _final_fragment_requires_quantity_repair,
     _group_candidates_by_lifecycle,
     _match_position_history_row,
+    _position_history_side,
     _prepare_lifecycle_allocations,
     _reactivate_distinct_superseded_fragment,
 )
 from services.position_settlement import SETTLEMENT_STATUS_UNRESOLVED
+
+
+def test_net_position_history_uses_authoritative_direction_for_side_matching() -> None:
+    assert _position_history_side(
+        {"posSide": "net", "direction": "short"}
+    ) == "short"
+    assert _position_history_side(
+        {"posSide": "net", "direction": "long"}
+    ) == "long"
 
 
 @pytest.mark.asyncio

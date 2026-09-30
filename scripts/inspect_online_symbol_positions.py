@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Inspect online position/order lineage for one normalized trading symbol."""
 
+# ruff: noqa: S608
+
 from __future__ import annotations
 
 import argparse
-import json
 import shlex
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ def main() -> int:
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--exchange-order-id", action="append", default=[])
     args = parser.parse_args()
-    remote_code = f"""
+    remote_code = f"""  # noqa: S608
 import asyncio
 import json
 from pathlib import Path
@@ -35,7 +36,7 @@ from scripts.runtime_env_bootstrap import load_runtime_env_files
 load_runtime_env_files(project_root=Path("/data/bb/app"))
 from sqlalchemy import select
 from db.session import get_read_session_ctx
-from models.trade import Order, Position
+from models.trade import OkxPositionHistory, Order, Position
 
 async def main():
     symbol = {str(args.symbol).strip()!r}
@@ -46,6 +47,11 @@ async def main():
         )).scalars().all())
         orders = list((await session.execute(
             select(Order).where(Order.symbol == symbol).order_by(Order.filled_at.desc(), Order.id.desc())
+        )).scalars().all())
+        history = list((await session.execute(
+            select(OkxPositionHistory)
+            .where(OkxPositionHistory.inst_id == symbol.replace("/", "-") + "-SWAP")
+            .order_by(OkxPositionHistory.updated_at_okx.desc())
         )).scalars().all())
     def position_row(row):
         return {{
@@ -65,9 +71,27 @@ async def main():
             "okx_sync_status": row.okx_sync_status, "filled_at": str(row.filled_at),
             "created_at": str(row.created_at),
         }}
+    def history_row(row):
+        return {{
+            "id": row.id,
+            "inst_id": row.inst_id,
+            "pos_id": row.pos_id,
+            "pos_side": row.pos_side,
+            "opened_at": str(row.opened_at),
+            "updated_at_okx": str(row.updated_at_okx),
+            "open_avg_px": row.open_avg_px,
+            "close_avg_px": row.close_avg_px,
+            "open_max_pos": row.open_max_pos,
+            "close_total_pos": row.close_total_pos,
+            "realized_pnl": row.realized_pnl,
+            "fee": row.fee,
+            "position_ids": row.position_ids,
+            "match_status": row.match_status,
+            "raw_row": row.raw_row,
+        }}
     if order_ids:
         orders = [row for row in orders if any(item in str(row.exchange_order_id or "") for item in order_ids)]
-    print(json.dumps({{"symbol": symbol, "positions": [position_row(row) for row in positions], "orders": [order_row(row) for row in orders]}}, ensure_ascii=False, default=str))
+    print(json.dumps({{"symbol": symbol, "positions": [position_row(row) for row in positions], "orders": [order_row(row) for row in orders], "history": [history_row(row) for row in history]}}, ensure_ascii=False, default=str))
 
 asyncio.run(main())
 """

@@ -2168,13 +2168,13 @@ def _position_history_pos_id(row: dict[str, Any]) -> str:
 
 
 def _position_history_side(row: dict[str, Any]) -> str:
-    for key in ("posSide", "positionSide", "side"):
+    # In net mode OKX reports ``posSide=net`` while ``direction`` preserves
+    # the authoritative long/short lifecycle side. Prefer that explicit
+    # direction before the non-directional position mode.
+    for key in ("direction", "positionSide", "side", "posSide"):
         value = str(row.get(key) or "").lower().strip()
         if value in {"long", "short"}:
             return value
-    direction = str(row.get("direction") or "").lower().strip()
-    if direction in {"long", "short"}:
-        return direction
     return ""
 
 
