@@ -354,11 +354,12 @@ def select_normal_paper_trade_side(
 ) -> dict[str, Any]:
     """Select one current paper direction under the canonical v14 contract.
 
-    A validated edge uses a positive current lower-bound objective. A quality
-    observation may use a positive current fee-after expected return while its
-    lower bound is still negative, so the paper trainer can collect fresh
-    outcomes and improve the model. Both routes use the same dynamic sizing and
-    execution contract; only the validated route is eligible for promotion.
+    Only a validated current edge can authorize a new paper position. A
+    quality observation with a non-positive lower-bound objective remains
+    available in ``by_side`` for shadow analysis and training, but it is not
+    promoted into the order pipeline. This prevents a model whose historical
+    fee-after evidence is below break-even from manufacturing normal entries
+    merely because one current prediction is positive.
     """
 
     by_side = {side: dict(_dict(_dict(support_by_side).get(side))) for side in ("long", "short")}
@@ -374,21 +375,9 @@ def select_normal_paper_trade_side(
             and objective_net is not None
             and objective_net > 0.0
         )
-        quality_observation = (
-            support.get("paper_quality_observation_only") is True
-            and not current_edge
-        )
-        if not current_edge and not quality_observation:
+        if not current_edge:
             continue
         if expected_net is None or expected_net <= 0.0:
-            continue
-        if (
-            quality_observation
-            and (
-                loss_probability is None
-                or loss_probability > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
-            )
-        ):
             continue
         families = sorted(
             {
@@ -405,11 +394,7 @@ def select_normal_paper_trade_side(
                 "objective_net_return_pct": objective_net,
                 "loss_probability": loss_probability,
                 "quant_evidence_families": families,
-                "selection_reason": (
-                    "strategy_edge_selected"
-                    if current_edge
-                    else "paper_quality_observation"
-                ),
+                "selection_reason": "strategy_edge_selected",
             }
         )
 

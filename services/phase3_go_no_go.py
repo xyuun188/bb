@@ -156,7 +156,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_validated_entry_requires_positive_return_lcb",
         "paper_quality_observation_requires_positive_expected_net_return",
         "paper_quality_observation_allows_non_positive_return_lcb",
-        "paper_quality_observation_authorizes_normal_entry",
+        "paper_quality_observation_is_shadow_only",
         "paper_entry_requires_current_execution_cost",
         "live_entry_requires_production_trade_gate",
         "live_entry_requires_positive_fee_after_return",
@@ -171,8 +171,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     required_false_trade_policy = (
         "paper_entry_requires_model_promotion",
         "paper_entry_requires_profit_factor",
-        "paper_quality_observation_requires_positive_return_lcb",
-        "paper_quality_observation_is_shadow_only",
+        "paper_quality_observation_authorizes_normal_entry",
     )
     missing_policy = [
         key for key in required_true_trade_policy if trade_policy.get(key) is not True

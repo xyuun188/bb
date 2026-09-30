@@ -8,6 +8,7 @@ execute trades by itself.
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import math
@@ -146,6 +147,7 @@ def _training_source_code_version() -> str:
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 FULL_TRAINING_PROBE_INTERVAL_SECONDS = 6 * 60 * 60
+LOCAL_ML_RESOURCE_RECOVERY_FRACTIONS = (0.75, 0.50, 0.35)
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -2711,6 +2713,49 @@ def train_from_frame(
     return metadata
 
 
+def _reduced_training_frame(frame: pd.DataFrame, fraction: float) -> pd.DataFrame:
+    """Keep the newest chronological window for bounded resource recovery."""
+
+    if frame.empty:
+        return frame.copy()
+    ordered = _chronological_frame(frame).reset_index(drop=True)
+    minimum = max(MIN_TRAINING_SAMPLE_COUNT, 1)
+    target = max(minimum, int(len(ordered) * max(min(float(fraction), 1.0), 0.1)))
+    target = min(target, len(ordered))
+    return ordered.tail(target).reset_index(drop=True)
+
+
+def train_from_frame_with_resource_recovery(
+    frame: pd.DataFrame,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Retry a full local-ML fit on bounded recent windows after MemoryError."""
+
+    try:
+        return train_from_frame(frame, **kwargs)
+    except MemoryError:
+        original_count = int(len(frame))
+        attempted: list[dict[str, int | float]] = []
+        for fraction in LOCAL_ML_RESOURCE_RECOVERY_FRACTIONS:
+            reduced = _reduced_training_frame(frame, fraction)
+            attempted.append(
+                {"fraction": float(fraction), "sample_count": int(len(reduced))}
+            )
+            gc.collect()
+            try:
+                recovered = train_from_frame(reduced, **kwargs)
+            except MemoryError:
+                continue
+            recovered["resource_recovery"] = {
+                "attempted": True,
+                "policy": "latest_chronological_window_after_memory_error",
+                "original_sample_count": original_count,
+                "attempts": attempted,
+            }
+            return recovered
+        raise
+
+
 class MLSignalService:
     """Lazy loader and inference wrapper for the local profit-quality model."""
 
@@ -3576,7 +3621,7 @@ class MLSignalService:
                     self._last_train_result = result
                     return result
                 candidate_metadata = await asyncio.to_thread(
-                    train_from_frame,
+                    train_from_frame_with_resource_recovery,
                     frame,
                     completed_sample_count=completed_count,
                     completed_raw_decision_group_count=completed_raw_group_count,
@@ -3610,7 +3655,7 @@ class MLSignalService:
                 )
                 if trained_metadata is None:
                     trained_metadata = await asyncio.to_thread(
-                        train_from_frame,
+                        train_from_frame_with_resource_recovery,
                         frame,
                         completed_sample_count=completed_count,
                         completed_raw_decision_group_count=completed_raw_group_count,

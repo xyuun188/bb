@@ -134,6 +134,48 @@ def test_merge_compact_outcomes_keeps_history_and_prefers_refreshed_rows() -> No
     assert merged[1]["value"] == 2
 
 
+def test_compact_decision_projection_keeps_contract_without_full_snapshot() -> None:
+    normal_contract = {
+        "version": "2026-09-26.normal-paper-strategy-trade.v14",
+        "decision_authority": "ensemble",
+        "selection_reason": "strategy_edge_selected",
+    }
+    learning = {
+        "normal_paper_trade": normal_contract,
+        "profit_risk_sizing": {"risk_budget_usdt": 2.5},
+        "ignored_large_branch": {"transcript": "x" * 100_000},
+    }
+    compact_row = SimpleNamespace(
+        _mapping={
+            **{f"learning_{key}": learning.get(key) for key in (
+                "normal_paper_trade",
+                "paper_exploration",
+                "paper_training",
+                "paper_bootstrap_canary",
+                "production_trade_gate",
+                "live_rules_canary_signal",
+                "model_shadow_decision",
+                "profit_risk_sizing",
+            )},
+        }
+    )
+    full_row = SimpleNamespace(_mapping={"decision_learning_snapshot": learning})
+
+    compact = authoritative_trade_outcome._decision_learning_projection(
+        compact_row,
+        include_full_snapshot=False,
+    )
+    full = authoritative_trade_outcome._decision_learning_projection(
+        full_row,
+        include_full_snapshot=True,
+    )
+
+    assert compact["normal_paper_trade"] == full["normal_paper_trade"]
+    assert compact["profit_risk_sizing"] == full["profit_risk_sizing"]
+    assert "ignored_large_branch" not in compact
+    assert len(authoritative_trade_outcome._canonical_json(compact)) < 2_000
+
+
 def _sample(**overrides):
     sample = {
         "source": "okx_position_history",

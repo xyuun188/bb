@@ -42,6 +42,7 @@ from services.ml_signal_service import (
     persist_cached_training_candidate,
     shadow_training_quality_report,
     train_from_frame,
+    train_from_frame_with_resource_recovery,
 )
 from services.ml_training_dataset import (
     count_shadow_training_rows,
@@ -77,6 +78,42 @@ from services.training_data_quality import (
     quality_report,
 )
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
+
+
+def test_local_ml_training_retries_on_latest_window_after_memory_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "label_timestamp": pd.date_range(
+                "2026-09-01",
+                periods=20,
+                freq="min",
+                tz="UTC",
+            ),
+            "decision_group": [f"group-{index}" for index in range(20)],
+            "id": list(range(20)),
+        }
+    )
+    calls: list[pd.DataFrame] = []
+
+    def fake_train(value: pd.DataFrame, **_kwargs: object) -> dict[str, object]:
+        calls.append(value.copy())
+        if len(calls) == 1:
+            raise MemoryError()
+        return {"trained": True}
+
+    monkeypatch.setattr(ml_signal_module, "train_from_frame", fake_train)
+
+    result = train_from_frame_with_resource_recovery(frame)
+
+    assert result["trained"] is True
+    assert len(calls) == 2
+    assert len(calls[1]) < len(frame)
+    assert calls[1]["label_timestamp"].min() > calls[0]["label_timestamp"].min()
+    assert result["resource_recovery"]["policy"] == (
+        "latest_chronological_window_after_memory_error"
+    )
 
 
 @pytest.fixture(autouse=True)

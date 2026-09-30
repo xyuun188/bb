@@ -76,6 +76,19 @@ _COMPACT_OUTCOME_REFRESH_BATCH_ROWS = 120
 _COMPACT_OUTCOME_MAX_SHADOW_ROWS = 2000
 _COMPACT_OUTCOME_REFRESH_FAILURE_BACKOFF_SECONDS = 120.0
 _DECISION_PROJECTION_QUERY_BATCH_SIZE = 50
+# These are the only decision-learning branches consumed while rebuilding the
+# authoritative outcome contract.  Projecting them at the JSON path level keeps
+# compact reads bounded without dropping the lineage and execution contract.
+_COMPACT_DECISION_LEARNING_KEYS = (
+    "normal_paper_trade",
+    "paper_exploration",
+    "paper_training",
+    "paper_bootstrap_canary",
+    "production_trade_gate",
+    "live_rules_canary_signal",
+    "model_shadow_decision",
+    "profit_risk_sizing",
+)
 _compact_outcome_cache: tuple[float, list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_failed_until = 0.0
@@ -129,6 +142,23 @@ def _merge_compact_outcomes(
 
 def _safe_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _decision_learning_projection(
+    row: Any,
+    *,
+    include_full_snapshot: bool,
+) -> dict[str, Any]:
+    """Build the bounded decision payload used by outcome reconstruction."""
+
+    mapping = row._mapping if hasattr(row, "_mapping") else {}
+    if include_full_snapshot:
+        return _safe_dict(mapping.get("decision_learning_snapshot"))
+    return {
+        key: value
+        for key in _COMPACT_DECISION_LEARNING_KEYS
+        if isinstance((value := mapping.get(f"learning_{key}")), dict)
+    }
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -707,11 +737,18 @@ async def load_authoritative_trade_outcomes(
                 AIDecision.stop_loss_pct,
                 AIDecision.take_profit_pct,
             ]
-            # The compact dashboard projection does not consume the large
-            # learning snapshot. Only training/evidence callers need it.
             include_decision_payload = include_training_features or include_decision_evidence
             if include_decision_payload:
                 decision_columns.append(AIDecision.decision_learning_snapshot)
+            else:
+                # Do not drop the decision contract from compact outcome reads.
+                # The authoritative sample still needs the exact entry
+                # authority/strategy lineage, but loading the full JSON snapshot
+                # caused busy PostgreSQL instances to detoast oversized rows.
+                decision_columns.extend(
+                    AIDecision.decision_learning_snapshot[key].label(f"learning_{key}")
+                    for key in _COMPACT_DECISION_LEARNING_KEYS
+                )
             if include_training_features:
                 decision_columns.append(AIDecision.feature_snapshot)
             # PostgreSQL can spend minutes detoasting a single large IN query
@@ -738,15 +775,13 @@ async def load_authoritative_trade_outcomes(
                     stop_loss_pct=row.stop_loss_pct,
                     take_profit_pct=row.take_profit_pct,
                     feature_snapshot=dict(row._mapping.get("feature_snapshot") or {}),
-                    decision_learning_snapshot=(
-                        row._mapping.get("decision_learning_snapshot")
-                        if include_decision_payload
-                        else None
+                    decision_learning_snapshot=_decision_learning_projection(
+                        row,
+                        include_full_snapshot=include_decision_payload,
                     ),
-                    raw_llm_response=(
-                        dict(row._mapping.get("decision_learning_snapshot") or {})
-                        if include_decision_payload
-                        else {}
+                    raw_llm_response=_decision_learning_projection(
+                        row,
+                        include_full_snapshot=include_decision_payload,
                     ),
                 )
                 for row in decision_rows
