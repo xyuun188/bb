@@ -7346,6 +7346,12 @@ class OKXExecutor(AbstractExecutor):
             inst_ids=inst_ids,
         )
 
+    async def get_position_protection_reference_price(self, symbol: str) -> float:
+        """Return the current OKX last price used to validate TP/SL direction."""
+
+        ticker = await self._fetch_native_ticker(symbol)
+        return self._safe_float(ticker.get("last"), 0.0)
+
     async def get_contract_specs_strict(
         self,
         symbols: list[str],

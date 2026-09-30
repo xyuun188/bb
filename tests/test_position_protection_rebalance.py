@@ -8,6 +8,8 @@ from ai_brain.base_model import Action, DecisionOutput
 from services import position_protection_rebalance
 from services.position_protection_rebalance import (
     PositionProtectionRebalanceError,
+    _protection_prices_valid,
+    _reanchor_protection_actions,
     rebalance_position_protection_after_exit,
 )
 
@@ -23,9 +25,13 @@ class _Executor:
         ignored_amend_algo_id: str = "",
         created_visibility_delay_reads: int = 0,
         lot_size: str = "1",
+        reference_price: float = 0.0,
     ) -> None:
         self.position_contracts = position_contracts
         self.protection_contracts = list(protection_contracts)
+        self.protection_stop_prices = [0.16 for _ in self.protection_contracts]
+        self.protection_take_prices = [0.14 for _ in self.protection_contracts]
+        self.reference_price = reference_price
         self.protection_algo_ids = [
             f"algo-{index}" for index in range(1, len(self.protection_contracts) + 1)
         ]
@@ -76,8 +82,8 @@ class _Executor:
                 "reduce_only": True,
                 "state": "live",
                 "order_type": "oco",
-                "stop_loss_price": 0.16,
-                "take_profit_price": 0.14,
+                "stop_loss_price": self.protection_stop_prices[index - 1],
+                "take_profit_price": self.protection_take_prices[index - 1],
                 "created_at_ms": index,
                 "raw": {"info": {"instId": "IRYS-USDT-SWAP"}},
             }
@@ -125,6 +131,8 @@ class _Executor:
         index = self.protection_algo_ids.index(algo_id)
         self.protection_algo_ids.pop(index)
         self.protection_contracts.pop(index)
+        self.protection_stop_prices.pop(index)
+        self.protection_take_prices.pop(index)
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
 
     async def create_position_protection_order(
@@ -148,11 +156,16 @@ class _Executor:
             }
         )
         self.protection_contracts.append(str(contracts).removesuffix(".0"))
+        self.protection_stop_prices.append(stop_loss_price)
+        self.protection_take_prices.append(take_profit_price)
         algo_id = f"algo-{self.next_algo_index}"
         self.next_algo_index += 1
         self.protection_algo_ids.append(algo_id)
         self.hidden_created_reads[algo_id] = self.created_visibility_delay_reads
         return {"code": "0", "data": [{"algoId": algo_id, "sCode": "0"}]}
+
+    async def get_position_protection_reference_price(self, _symbol: str) -> float:
+        return self.reference_price
 
 
 def _decision() -> DecisionOutput:
@@ -164,6 +177,49 @@ def _decision() -> DecisionOutput:
         reasoning="test",
         position_size_pct=0.5,
     )
+
+
+def test_stale_short_protection_prices_are_reanchored_around_live_price() -> None:
+    actions, changed = _reanchor_protection_actions(
+        [
+            {
+                "action": "amend_size",
+                "position_side": "short",
+                "stop_loss_price": 0.16,
+                "take_profit_price": 0.14,
+            }
+        ],
+        side="short",
+        reference_price=0.2,
+    )
+
+    assert changed is True
+    assert _protection_prices_valid(
+        "short",
+        0.2,
+        actions[0]["stop_loss_price"],
+        actions[0]["take_profit_price"],
+    )
+    assert actions[0]["price_reanchored"] is True
+
+
+@pytest.mark.asyncio
+async def test_stale_short_protection_is_rebuilt_before_okx_amend() -> None:
+    executor = _Executor(
+        position_contracts="5",
+        protection_contracts=("13",),
+        reference_price=0.2,
+    )
+
+    result = await rebalance_position_protection_after_exit(executor, _decision())
+
+    assert result["verified"] is True
+    assert result["fallback_reason"] == "stale_trigger_prices_reanchored"
+    assert executor.amend_calls == []
+    assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
+    assert len(executor.create_calls) == 1
+    created = executor.create_calls[0]
+    assert created["take_profit_price"] < 0.2 < created["stop_loss_price"]
 
 
 @pytest.mark.asyncio

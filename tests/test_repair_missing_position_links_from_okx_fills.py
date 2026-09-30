@@ -102,6 +102,156 @@ def test_additional_entry_link_rejects_ambiguous_lifecycles() -> None:
     )
 
 
+def test_additional_entry_link_fans_out_across_one_okx_position_lifecycle() -> None:
+    filled_at = datetime(2026, 9, 29, 20, 15, 2, 914000, tzinfo=UTC)
+    order = SimpleNamespace(
+        exchange_order_id="entry-add-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="CRV-USDT-SWAP",
+        symbol="CRV/USDT",
+        side="sell",
+        execution_mode="paper",
+        quantity=1666.0,
+        okx_fill_contracts=1666.0,
+        price=0.3859,
+        fee=-0.3214547,
+        pnl=0.0,
+        okx_raw_fills={"contract_size": 1.0},
+    )
+    decision = SimpleNamespace(action="short")
+    positions = [
+        SimpleNamespace(
+            id=10564,
+            symbol="CRV/USDT",
+            okx_inst_id="CRV-USDT-SWAP",
+            okx_pos_id="3966486281739546627",
+            side="short",
+            execution_mode="paper",
+            quantity=3029.0,
+            entry_exchange_order_id="3966488257122512897",
+            close_exchange_order_id="3967004830522388481",
+            created_at=datetime(2026, 9, 29, 20, 13, 50, 893736, tzinfo=UTC),
+            closed_at=datetime(2026, 9, 29, 20, 32, 38, 400483, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id=10556,
+            symbol="CRV/USDT",
+            okx_inst_id="CRV-USDT-SWAP",
+            okx_pos_id="3966486281739546627",
+            side="short",
+            execution_mode="paper",
+            quantity=303.0,
+            entry_exchange_order_id="3966488257122512897",
+            close_exchange_order_id=None,
+            created_at=datetime(2026, 9, 29, 20, 13, 50, 893736, tzinfo=UTC),
+            closed_at=None,
+        ),
+    ]
+
+    plans = repair_script._additional_entry_link_plans(order, decision, positions)
+
+    assert [plan.position_id for plan in plans] == [10564, 10556]
+    assert {plan.okx_order_id for plan in plans} == {"entry-add-1"}
+    assert all(plan.link_kind == "entry_add" for plan in plans)
+
+
+def test_additional_entry_link_allows_verified_timezone_skew_for_same_lifecycle() -> None:
+    filled_at = datetime(2026, 9, 29, 20, 15, 2, 914000, tzinfo=UTC)
+    order = SimpleNamespace(
+        exchange_order_id="entry-add-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="CRV-USDT-SWAP",
+        symbol="CRV/USDT",
+        side="sell",
+        execution_mode="paper",
+        quantity=1666.0,
+        okx_fill_contracts=1666.0,
+        price=0.3859,
+        fee=-0.3214547,
+        pnl=0.0,
+        okx_raw_fills={"contract_size": 1.0},
+    )
+    decision = SimpleNamespace(
+        action="short",
+        executed_at=filled_at,
+        created_at=filled_at,
+    )
+    positions = [
+        SimpleNamespace(
+            id=10564,
+            symbol="CRV/USDT",
+            okx_inst_id="CRV-USDT-SWAP",
+            okx_pos_id="3966486281739546627",
+            side="short",
+            execution_mode="paper",
+            quantity=3029.0,
+            entry_exchange_order_id="3966488257122512897",
+            close_exchange_order_id="3967004830522388481",
+            created_at=datetime(2026, 9, 30, 0, 13, 50, 893736, tzinfo=UTC),
+            closed_at=datetime(2026, 9, 30, 0, 32, 38, 400483, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id=10556,
+            symbol="CRV/USDT",
+            okx_inst_id="CRV-USDT-SWAP",
+            okx_pos_id="3966486281739546627",
+            side="short",
+            execution_mode="paper",
+            quantity=303.0,
+            entry_exchange_order_id="3966488257122512897",
+            close_exchange_order_id=None,
+            created_at=datetime(2026, 9, 30, 0, 13, 50, 893736, tzinfo=UTC),
+            closed_at=None,
+        ),
+    ]
+
+    plans = repair_script._additional_entry_link_plans(order, decision, positions)
+
+    assert [plan.position_id for plan in plans] == [10564, 10556]
+
+
+def test_additional_entry_link_rejects_fragments_from_different_okx_lifecycles() -> None:
+    filled_at = datetime(2026, 9, 29, 20, 15, tzinfo=UTC)
+    order = SimpleNamespace(
+        exchange_order_id="entry-add-1",
+        filled_at=filled_at,
+        created_at=filled_at,
+        okx_inst_id="CRV-USDT-SWAP",
+        symbol="CRV/USDT",
+        side="sell",
+        execution_mode="paper",
+        quantity=1666.0,
+    )
+    position = SimpleNamespace(
+        id=1,
+        symbol="CRV/USDT",
+        okx_inst_id="CRV-USDT-SWAP",
+        okx_pos_id="pos-1",
+        side="short",
+        execution_mode="paper",
+        quantity=1.0,
+        entry_exchange_order_id="entry-1",
+        close_exchange_order_id=None,
+        created_at=datetime(2026, 9, 29, 20, 13, tzinfo=UTC),
+        closed_at=None,
+    )
+    other = SimpleNamespace(
+        **{
+            **position.__dict__,
+            "id": 2,
+            "okx_pos_id": "pos-2",
+        }
+    )
+
+    assert repair_script._additional_entry_link_plans(
+        order,
+        SimpleNamespace(action="short"),
+        [position, other],
+    ) == []
+
+
 def test_missing_position_link_repair_imports_online_runtime_bootstrap() -> None:
     source = repair_script.ROOT.joinpath(
         "scripts",

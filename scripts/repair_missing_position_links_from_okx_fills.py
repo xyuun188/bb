@@ -70,6 +70,8 @@ TRUSTED_CLOSE_ORDER_SYNC_STATUSES = {
     OKX_SYNC_OKX_ONLY,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
 }
+ADDITIONAL_ENTRY_FUTURE_POSITION_SKEW_SECONDS = 24 * 60 * 60
+ADDITIONAL_ENTRY_DECISION_MATCH_SECONDS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,11 +445,11 @@ async def collect_plans(
     return plans
 
 
-def _additional_entry_link_plan(
+def _additional_entry_link_candidates(
     order: Order,
     decision: AIDecision | None,
     positions: list[Position],
-) -> FillLinkPlan | None:
+) -> tuple[str, datetime, str, str, list[Position]] | None:
     exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
     filled_at = _aware(getattr(order, "filled_at", None) or getattr(order, "created_at", None))
     action = str(getattr(decision, "action", "") or "").strip().lower()
@@ -470,8 +472,21 @@ def _additional_entry_link_plan(
             continue
         created_at = _aware(getattr(position, "created_at", None))
         closed_at = _aware(getattr(position, "closed_at", None))
-        if created_at is None or created_at > filled_at:
+        if created_at is None:
             continue
+        if created_at > filled_at:
+            future_skew = (created_at - filled_at).total_seconds()
+            decision_time = _aware(
+                getattr(decision, "executed_at", None)
+                or getattr(decision, "created_at", None)
+            )
+            if (
+                future_skew > ADDITIONAL_ENTRY_FUTURE_POSITION_SKEW_SECONDS
+                or decision_time is None
+                or abs((decision_time - filled_at).total_seconds())
+                > ADDITIONAL_ENTRY_DECISION_MATCH_SECONDS
+            ):
+                continue
         if closed_at is not None and closed_at < filled_at:
             continue
         linked_ids = {
@@ -481,9 +496,58 @@ def _additional_entry_link_plan(
         if exchange_order_id in linked_ids:
             return None
         candidates.append(position)
-    if len(candidates) != 1:
+    if not candidates:
         return None
-    position = candidates[0]
+    pos_ids = {
+        str(getattr(position, "okx_pos_id", "") or "").strip()
+        for position in candidates
+    }
+    pos_ids.discard("")
+    if len(candidates) > 1:
+        # A single OKX position lifecycle may be projected into several local
+        # fragments after partial exits.  Only fan out when every fragment
+        # carries the same authoritative posId and the same entry-link set.
+        if len(pos_ids) != 1:
+            return None
+        entry_link_sets = {
+            tuple(sorted(_split_exchange_order_ids(
+                getattr(position, "entry_exchange_order_id", None)
+            )))
+            for position in candidates
+        }
+        if len(entry_link_sets) != 1:
+            return None
+        created_at_values = [
+            _aware(getattr(position, "created_at", None))
+            for position in candidates
+        ]
+        created_at_values = [value for value in created_at_values if value is not None]
+        if not created_at_values:
+            return None
+        if (
+            max(created_at_values) - min(created_at_values)
+        ).total_seconds() > 5:
+            return None
+    return (
+        str(next(iter(pos_ids))) if len(pos_ids) == 1 else "",
+        filled_at,
+        action,
+        order_symbol,
+        candidates,
+    )
+
+
+def _build_additional_entry_link_plan(
+    order: Order,
+    *,
+    position: Position,
+    filled_at: datetime,
+    order_symbol: str,
+) -> FillLinkPlan:
+    exchange_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
+    created_at = _aware(getattr(position, "created_at", None))
+    if created_at is None:
+        created_at = filled_at
     raw_fills = getattr(order, "okx_raw_fills", None)
     raw_fills = raw_fills if isinstance(raw_fills, dict) else {}
     contract_size = _safe_float(raw_fills.get("contract_size"))
@@ -510,6 +574,45 @@ def _additional_entry_link_plan(
         contract_size=contract_size,
         contract_size_source=("order.okx_raw_fills.contract_size" if contract_size > 0 else ""),
     )
+
+
+def _additional_entry_link_plan(
+    order: Order,
+    decision: AIDecision | None,
+    positions: list[Position],
+) -> FillLinkPlan | None:
+    candidate_data = _additional_entry_link_candidates(order, decision, positions)
+    if candidate_data is None:
+        return None
+    _pos_id, filled_at, _action, order_symbol, candidates = candidate_data
+    if len(candidates) != 1:
+        return None
+    return _build_additional_entry_link_plan(
+        order,
+        position=candidates[0],
+        filled_at=filled_at,
+        order_symbol=order_symbol,
+    )
+
+
+def _additional_entry_link_plans(
+    order: Order,
+    decision: AIDecision | None,
+    positions: list[Position],
+) -> list[FillLinkPlan]:
+    candidate_data = _additional_entry_link_candidates(order, decision, positions)
+    if candidate_data is None:
+        return []
+    _pos_id, filled_at, _action, order_symbol, candidates = candidate_data
+    return [
+        _build_additional_entry_link_plan(
+            order,
+            position=position,
+            filled_at=filled_at,
+            order_symbol=order_symbol,
+        )
+        for position in candidates
+    ]
 
 
 async def collect_additional_entry_link_plans(
@@ -580,13 +683,13 @@ async def collect_additional_entry_link_plans(
         positions = list((await session.execute(position_stmt)).scalars().all())
     plans = []
     for order in orders:
-        plan = _additional_entry_link_plan(
+        plans.extend(
+            _additional_entry_link_plans(
             order,
             decisions.get(int(getattr(order, "decision_id", 0) or 0)),
             positions,
+            )
         )
-        if plan is not None:
-            plans.append(plan)
     return plans
 
 

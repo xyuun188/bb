@@ -14,6 +14,8 @@ POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-28.current-position-exact-cover
 PROTECTION_VERIFY_ATTEMPTS = 4
 PROTECTION_TRANSITION_VERIFY_ATTEMPTS = 12
 PROTECTION_VERIFY_DELAY_SECONDS = 0.5
+PROTECTION_MIN_STOP_DISTANCE_RATIO = 0.003
+PROTECTION_MIN_TAKE_DISTANCE_RATIO = 0.002
 
 
 class PositionProtectionRebalanceError(RuntimeError):
@@ -144,6 +146,106 @@ def _safe_positive(value: Any) -> bool:
         return float(value) > 0.0
     except (TypeError, ValueError):
         return False
+
+
+async def _protection_reference_price(executor: Any, symbol: str) -> float:
+    """Read one authoritative last price when the executor exposes it."""
+
+    provider = getattr(executor, "get_position_protection_reference_price", None)
+    if not callable(provider):
+        return 0.0
+    try:
+        value = await provider(symbol)
+    except Exception:
+        return 0.0
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return price if price > 0 else 0.0
+
+
+def _protection_prices_valid(
+    side: str,
+    reference_price: float,
+    stop_loss_price: Any,
+    take_profit_price: Any,
+) -> bool:
+    """Validate trigger direction against the exchange's current last price."""
+
+    try:
+        reference = float(reference_price)
+        stop = float(stop_loss_price)
+        take = float(take_profit_price)
+    except (TypeError, ValueError):
+        return False
+    if reference <= 0 or stop <= 0 or take <= 0:
+        return False
+    if str(side or "").lower() == "short":
+        return take < reference < stop
+    if str(side or "").lower() == "long":
+        return stop < reference < take
+    return False
+
+
+def _reanchor_protection_actions(
+    actions: list[dict[str, Any]],
+    *,
+    side: str,
+    reference_price: float,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Move stale trigger prices around the live price before creating an OCO.
+
+    OKX rejects a short SL below the current last price (and the symmetric long
+    case).  The old OCO's distance is retained where possible, while minimum
+    gaps keep both triggers strictly on the correct side of the market.
+    """
+
+    if reference_price <= 0:
+        return actions, False
+    changed = False
+    normalized_side = str(side or "").lower()
+    updated: list[dict[str, Any]] = []
+    for action in actions:
+        item = dict(action)
+        if str(item.get("action") or "") not in {"amend_size", "create_delta"}:
+            updated.append(item)
+            continue
+        try:
+            stop = float(item.get("stop_loss_price") or 0.0)
+            take = float(item.get("take_profit_price") or 0.0)
+        except (TypeError, ValueError):
+            stop = take = 0.0
+        if _protection_prices_valid(normalized_side, reference_price, stop, take):
+            updated.append(item)
+            continue
+
+        spread = abs(stop - take) if stop > 0 and take > 0 else 0.0
+        stop_gap = max(
+            spread * 0.6,
+            reference_price * PROTECTION_MIN_STOP_DISTANCE_RATIO,
+        )
+        take_gap = max(
+            spread * 0.4,
+            reference_price * PROTECTION_MIN_TAKE_DISTANCE_RATIO,
+        )
+        if normalized_side == "short":
+            new_stop = reference_price + stop_gap
+            new_take = max(reference_price - take_gap, reference_price * 0.001)
+        elif normalized_side == "long":
+            new_stop = max(reference_price - stop_gap, reference_price * 0.001)
+            new_take = reference_price + take_gap
+        else:
+            updated.append(item)
+            continue
+        item["stop_loss_price"] = new_stop
+        item["take_profit_price"] = new_take
+        item["price_reanchored"] = True
+        item["price_reanchor_reference"] = reference_price
+        item["price_reanchor_reason"] = "stale_trigger_direction_against_current_last"
+        changed = True
+        updated.append(item)
+    return updated, changed
 
 
 async def _wait_for_protection_verification(
@@ -430,6 +532,12 @@ async def replace_stuck_protection_amendments(
             or str(preflight_report.get("position_inventory_fingerprint") or "")
         ),
     )
+    reference_price = await _protection_reference_price(executor, symbol)
+    fresh_actions, _ = _reanchor_protection_actions(
+        fresh_actions,
+        side=side,
+        reference_price=reference_price,
+    )
     if fresh_actions != actions:
         raise RuntimeError("Protection replacement refused a changed amend plan")
 
@@ -466,6 +574,11 @@ async def replace_stuck_protection_amendments(
                 "rollback": {"action": "cancel_created", "inst_id": order.get("inst_id")},
             }
         )
+    replacement_plan, _ = _reanchor_protection_actions(
+        replacement_plan,
+        side=side,
+        reference_price=reference_price,
+    )
 
     # A previous attempt may have received an OKX create acknowledgement but
     # timed out before the new algo became visible. Reuse an exact existing
@@ -813,6 +926,12 @@ async def rebalance_current_position_protection(
             "after": before_report,
         }
 
+    reference_price = await _protection_reference_price(executor, normalized_symbol)
+    actions, prices_reanchored = _reanchor_protection_actions(
+        actions,
+        side=normalized_side,
+        reference_price=reference_price,
+    )
     amend_error = ""
     fallback_reason = ""
     replacement_actions: list[dict[str, Any]] = []
@@ -822,11 +941,16 @@ async def rebalance_current_position_protection(
     )
     replacement_input_fingerprint = ""
     action_names = {str(action.get("action") or "") for action in actions}
-    initial_group_replacement = {"amend_size", "create_delta"}.issubset(action_names)
+    initial_group_replacement = (
+        {"amend_size", "create_delta"}.issubset(action_names) or prices_reanchored
+    )
+    if prices_reanchored:
+        fallback_reason = "stale_trigger_prices_reanchored"
     try:
         if initial_group_replacement:
             replacement_input_fingerprint = str(before_report.get("input_fingerprint") or "")
-            fallback_reason = "mixed_protection_plan_create_before_cancel"
+            if not fallback_reason:
+                fallback_reason = "mixed_protection_plan_create_before_cancel"
             replacement_actions = await replace_stuck_protection_amendments(
                 executor,
                 actions,

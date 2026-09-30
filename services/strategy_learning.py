@@ -1263,6 +1263,14 @@ class StrategyLearningService:
         self.champion_service = champion_service or PaperStrategyChampionService()
         self._replay_model_service = replay_model_service
         self.routing_store = routing_store or ContinuousStrategyRoutingStore()
+        # Reuse one bounded outcome read after a caller timeout. This prevents
+        # each market/position round from leaving another database query active.
+        self._outcome_read_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        # The time window is part of the contract, rather than the computed
+        # wall-clock cutoff.  Using ``since`` here made every polling round
+        # cancel the previous query and start another one a few milliseconds
+        # later.
+        self._outcome_read_task_key: tuple[str, int, int] | None = None
 
     def _default_model_replay_context(
         self,
@@ -1425,15 +1433,34 @@ class StrategyLearningService:
         since = max(datetime.now(UTC) - timedelta(hours=effective_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
         epoch_start_naive = epoch_start.replace(tzinfo=None)
-        outcome_task = asyncio.create_task(
-            load_authoritative_trade_outcomes(
-                mode=selected_mode,
-                since=since,
-                limit=effective_limit,
-                compact=True,
-                include_decision_evidence=True,
+        task_key = (selected_mode, effective_hours, effective_limit)
+        outcome_task = self._outcome_read_task
+        if (
+            outcome_task is None
+            or outcome_task.done()
+            or self._outcome_read_task_key != task_key
+        ):
+            if outcome_task is not None and not outcome_task.done():
+                outcome_task.cancel()
+            outcome_task = asyncio.create_task(
+                load_authoritative_trade_outcomes(
+                    mode=selected_mode,
+                    since=since,
+                    limit=effective_limit,
+                    compact=True,
+                    include_decision_evidence=True,
+                )
             )
-        )
+            self._outcome_read_task = outcome_task
+            self._outcome_read_task_key = task_key
+
+            def _clear_finished_outcome_task(task: asyncio.Task[Any]) -> None:
+                if self._outcome_read_task is task:
+                    self._outcome_read_task = None
+                    self._outcome_read_task_key = None
+                _consume_background_outcome_task(task)
+
+            outcome_task.add_done_callback(_clear_finished_outcome_task)
         try:
             # Shield the database task so a caller timeout does not cancel an
             # asyncpg operation midway through a statement. The completed
@@ -1443,11 +1470,11 @@ class StrategyLearningService:
                 timeout=STRATEGY_LEARNING_READ_TIMEOUT_SECONDS,
             )
         except TimeoutError:
-            outcome_task.add_done_callback(_consume_background_outcome_task)
             logger.warning(
                 "strategy_learning_outcome_query_timeout",
                 timeout_seconds=STRATEGY_LEARNING_READ_TIMEOUT_SECONDS,
                 mode=selected_mode,
+                reused_inflight_task=True,
             )
             outcomes = []
         except Exception as exc:

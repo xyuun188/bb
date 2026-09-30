@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 from dataclasses import fields
@@ -171,6 +172,59 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
     replay_statement = session.statements[2]
     assert replay_statement._limit_clause.value == 7
     assert replay_row_ids == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_feedback_reuses_inflight_outcome_read_for_same_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        def all(self) -> list[Any]:
+            return []
+
+    class FakeSession:
+        async def execute(self, _statement: Any) -> FakeResult:
+            return FakeResult()
+
+    class FakeContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    calls: list[dict[str, Any]] = []
+
+    async def slow_outcomes(**kwargs: Any) -> list[dict[str, Any]]:
+        calls.append(kwargs)
+        await asyncio.sleep(0.05)
+        return []
+
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "STRATEGY_LEARNING_READ_TIMEOUT_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_authoritative_trade_outcomes",
+        slow_outcomes,
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "get_read_session_ctx",
+        lambda: FakeContext(),
+    )
+    service = StrategyLearningService()
+    try:
+        await service._feedback(mode="paper", hours=24, limit=7)
+        await service._feedback(mode="paper", hours=24, limit=7)
+        assert len(calls) == 1
+        assert service._outcome_read_task_key == ("paper", 24, 7)
+    finally:
+        if service._outcome_read_task is not None:
+            service._outcome_read_task.cancel()
+            await asyncio.gather(service._outcome_read_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
