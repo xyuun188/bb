@@ -89,6 +89,7 @@ def solve_size_aware_positive_expected_net(
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
     allow_non_positive_return_lcb: bool = False,
+    allow_non_positive_expected_return: bool = False,
 ) -> dict[str, Any]:
     """Choose the largest executable size whose current net return is positive.
 
@@ -199,7 +200,10 @@ def solve_size_aware_positive_expected_net(
     if upper["expected"] <= 0.0:
         minimum_candidate = evaluate(executable_minimum)
         iterations += 1
-        if minimum_candidate is None or minimum_candidate["expected"] <= 0.0:
+        if minimum_candidate is None or (
+            minimum_candidate["expected"] <= 0.0
+            and not allow_non_positive_expected_return
+        ):
             result.update(
                 {
                     "selected_notional_usdt": (
@@ -262,7 +266,7 @@ def solve_size_aware_positive_expected_net(
             "reduced": reduced,
         }
     )
-    if selected["expected"] <= 0.0:
+    if selected["expected"] <= 0.0 and not allow_non_positive_expected_return:
         result["reason"] = "no_positive_expected_net_at_exchange_minimum"
         return result
     if selected["lcb"] <= 0.0 and not allow_non_positive_return_lcb:
@@ -277,6 +281,9 @@ def solve_size_aware_positive_expected_net(
         {
             "production_eligible": True,
             "reason": (
+                "paper_training_entry_current_cost_observation"
+                if allow_non_positive_expected_return and selected["expected"] <= 0.0
+                else
                 "positive_fee_after_reduced_risk_size_quality_observation"
                 if reduced and selected["lcb"] <= 0.0
                 else (
@@ -1666,6 +1673,10 @@ class EntryProfitRiskSizingPolicy:
             normal_trade.get("selection_reason") == "paper_quality_observation"
             and normal_trade.get("paper_quality_observation_only") is True
         )
+        paper_training_entry_mode = bool(
+            normal_trade.get("selection_reason") == "paper_training_entry"
+            and normal_trade.get("paper_training_only") is True
+        )
         opportunity = _safe_dict(raw.get("opportunity_score"))
         distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         execution_cost = _safe_dict(opportunity.get("execution_cost"))
@@ -1797,7 +1808,8 @@ class EntryProfitRiskSizingPolicy:
             0.0,
         )
         non_positive_lcb_observation = bool(
-            quality_observation_mode and contract_return_lcb_pct <= 0.0
+            (quality_observation_mode or paper_training_entry_mode)
+            and contract_return_lcb_pct <= 0.0
         )
         negative_lcb_stress_fraction = (
             max(-contract_return_lcb_pct / 100.0, 0.0)
@@ -1925,7 +1937,8 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            allow_non_positive_return_lcb=non_positive_lcb_observation,
+        allow_non_positive_return_lcb=non_positive_lcb_observation,
+        allow_non_positive_expected_return=paper_training_entry_mode,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2056,6 +2069,16 @@ class EntryProfitRiskSizingPolicy:
             side_depth,
             model_final_notional_cap,
         )
+        # The exchange minimum is authoritative once the risk/liquidity
+        # ceiling proved it can support one complete contract.  A fractional
+        # solver step can otherwise leave the final notional a few decimals
+        # below the minimum and reject an otherwise valid paper entry.
+        if (
+            minimum_order_supported
+            and final_notional + 1e-8 < minimum_order_notional
+        ):
+            final_notional = minimum_order_notional
+            target_notional = max(target_notional, minimum_order_notional)
         planned_loss = final_notional * stress_fraction
         dynamic_take_profit = max(
             declared_take_profit,
@@ -2084,8 +2107,13 @@ class EntryProfitRiskSizingPolicy:
                 or "full_risk_size_profitability_not_proven"
             )
             reasons.append(f"normal_paper_size_aware_{size_reason}")
-        if not isfinite(expected_net) or expected_net <= 0.0:
+        if (
+            not isfinite(expected_net)
+            or (expected_net <= 0.0 and not paper_training_entry_mode)
+        ):
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
+        if paper_training_entry_mode and not isfinite(expected_net):
+            reasons.append("normal_paper_training_expected_net_missing")
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:
@@ -2120,6 +2148,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": quality_observation_mode,
+            "paper_training_entry_mode": paper_training_entry_mode,
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,
@@ -2226,6 +2255,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": quality_observation_mode,
+            "paper_training_entry_mode": paper_training_entry_mode,
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": non_positive_lcb_observation,
             "paper_quality_observation_leverage_cap": None,

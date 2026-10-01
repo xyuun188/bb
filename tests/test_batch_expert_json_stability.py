@@ -345,6 +345,30 @@ def test_compact_batch_prompt_contains_role_specific_tail_evidence() -> None:
     assert "abnormal_wick_count72h=2" in prompt
 
 
+def test_compact_batch_prompt_includes_direction_rules() -> None:
+    prompt = build_batch_experts_user_prompt(
+        {
+            "trend_expert": (
+                "symbol=BTC/USDT; rsi14=72; macd_diff=0.2; ema12=105; "
+                "ema26=100; adx14=32"
+            ),
+            "momentum_expert": (
+                "symbol=BTC/USDT; returns1=0.01; returns5=0.04; "
+                "returns20=0.08; volume_ratio=2"
+            ),
+            "sentiment_expert": "symbol=BTC/USDT; returns5=0.04; news_sent=0.4",
+            "position_expert": "symbol=BTC/USDT; returns5=0.04",
+            "risk_expert": "symbol=BTC/USDT; funding=-0.0001; ob_imbalance=0.4",
+        },
+        {"review_positions": False, "_compact_qwen_batch": True},
+    )
+
+    assert "do not default every role to hold" in prompt
+    assert "RSI/MACD/EMA/ADX" in prompt
+    assert "returns、成交量和短期波动同向时报 l 或 s" in prompt
+    assert "无对应持仓必须报 h" in prompt
+
+
 def test_batch_expert_prompt_can_scope_to_provider_group() -> None:
     prompt = build_batch_experts_user_prompt(
         "symbol=BTC/USDT price=100",

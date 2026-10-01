@@ -130,7 +130,8 @@ def selected_entry_metrics(
     if (
         contract_reasons
         and str(model_mode or "").lower() == "paper"
-        and normal_paper.get("selection_reason") == "paper_quality_observation"
+        and normal_paper.get("selection_reason")
+        in {"paper_quality_observation", "paper_training_entry"}
     ):
         observation_contract = not normal_paper_trade_observation_contract_reasons(
             normal_paper

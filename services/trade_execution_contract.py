@@ -450,6 +450,10 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_is_shadow_only": True,
         "paper_quality_observation_authorizes_normal_entry": False,
         "paper_quality_observation_max_loss_probability": 0.60,
+        "paper_training_entry_requires_current_raw_return": True,
+        "paper_training_entry_allows_non_positive_fee_after_return": True,
+        "paper_training_entry_is_paper_only": True,
+        "paper_training_entry_production_permission": False,
         "paper_entry_requires_profit_factor": False,
         "paper_entry_requires_positive_expected_net_return": True,
         "paper_entry_requires_current_execution_cost": True,
@@ -1359,7 +1363,8 @@ def validate_normal_paper_entry_contract(
     )
     confirmed_observation_settlement = bool(
         confirmed_partial_fill
-        and normal_trade.get("selection_reason") == "paper_quality_observation"
+        and normal_trade.get("selection_reason")
+        in {"paper_quality_observation", "paper_training_entry"}
     )
     reasons = (
         historical_normalized_contract_reasons(source_normal_trade)
@@ -1439,6 +1444,7 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_ineligible")
     if (
         not historical_normal_trade
+        and normal_trade.get("selection_reason") != "paper_training_entry"
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")

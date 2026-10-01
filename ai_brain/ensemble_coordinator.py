@@ -34,6 +34,7 @@ from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_direction_support import (
     assess_directional_entry_support,
     assess_paper_model_trade_support,
+    assess_paper_training_entry_support,
 )
 from services.entry_signal_extraction import (
     enrich_signal_payload,
@@ -953,6 +954,29 @@ class EnsembleCoordinator:
                     execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
                 )
             paper_selection = select_normal_paper_trade_side(support_by_side)
+            # A failed historical quality gate must not deadlock paper
+            # training. Re-evaluate the same current evidence under the
+            # explicit training-entry scope; this never grants live or
+            # production permission and still requires current cost/risk data.
+            if paper_selection.get("selected") is not True:
+                training_support_by_side: dict[str, dict[str, Any]] = {}
+                for side in ("long", "short"):
+                    cost = self._safe_dict(
+                        self._safe_dict(candidate_evidence.get(side)).get(
+                            "execution_cost"
+                        )
+                    )
+                    training_support_by_side[side] = assess_paper_training_entry_support(
+                        direction_competition,
+                        raw_opinions,
+                        side,
+                        execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
+                    )
+                training_selection = select_normal_paper_trade_side(
+                    training_support_by_side
+                )
+                if training_selection.get("selected") is True:
+                    paper_selection = training_selection
             selected_side = str(paper_selection.get("selected_side") or "neutral")
             selected_support = self._safe_dict(paper_selection.get("selected_support"))
             normal_contract = (
@@ -1015,6 +1039,8 @@ class EnsembleCoordinator:
                     "granted": True,
                     "scope": "paper_only",
                     "reason": normal_contract["selection_reason"],
+                    "training_only": normal_contract["selection_reason"]
+                    == "paper_training_entry",
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(
@@ -1051,6 +1077,13 @@ class EnsembleCoordinator:
             hold_raw["entry_permission"] = {
                 "granted": False,
                 "reason": str(paper_selection.get("selection_reason") or "no_direction"),
+                "diagnostic_status": str(
+                    paper_selection.get("diagnostic_status") or "no_candidate"
+                ),
+                "blocking_category": str(
+                    paper_selection.get("blocking_category") or "unknown"
+                ),
+                "blocking_reasons": list(paper_selection.get("blocking_reasons") or []),
                 "production_permission": False,
             }
             hold_raw["base_weighted_score_observation"] = round(
@@ -1058,8 +1091,16 @@ class EnsembleCoordinator:
                 4,
             )
             hold_raw["memory_feedback_observation"] = self._memory_feedback(context)
+            selection_status = str(paper_selection.get("diagnostic_status") or "")
+            reason_text = (
+                "模型已完成分析，但当前费后收益/质量门禁未通过，本轮保持观望"
+                if selection_status == "profit_gate_blocked"
+                else "模型分析证据尚不完整，本轮保持观望"
+                if selection_status == "evidence_blocked"
+                else "当前没有可审计的模型方向，或存在明确强反向风险证据，本轮保持观望"
+            )
             reason = self._reason(
-                "当前没有可审计的模型方向，或存在明确强反向风险证据，本轮保持观望",
+                reason_text,
                 decision_score,
                 disagreement,
                 raw_opinions,

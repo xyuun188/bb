@@ -193,12 +193,51 @@ def test_split_service_deploy_stops_model_consumers_before_tunnel_restart() -> N
     restart_index = command.index("restart-model-tunnels")
     readiness_index = command.index("refresh-model-readiness")
     network_index = command.index("okx_code=$(curl")
-    start_index = command.index(
-        "systemctl start 'bb-paper-trading.service' 'bb-dashboard.service' &&"
+    restore_index = command.index(
+        "if [ \"$trading_was_active\" = 'active' ]; then "
+        "systemctl start 'bb-paper-trading.service';"
     )
-    assert stop_index < restart_index < readiness_index < network_index < start_index
+    dashboard_index = command.index(
+        "systemctl start 'bb-dashboard.service' &&",
+        network_index,
+    )
+    assert stop_index < restart_index < readiness_index < network_index < restore_index
+    assert network_index < dashboard_index
     assert command.index("trap resume_platform_services EXIT") < stop_index
-    assert command.index("trap - EXIT") > start_index
+    assert command.index("trap - EXIT") > dashboard_index
+
+
+def test_split_service_deploy_can_explicitly_resume_trading() -> None:
+    from scripts.sync_to_online_server import _split_services_restart_command
+
+    command = _split_services_restart_command(
+        trading_service="bb-paper-trading.service",
+        dashboard_service="bb-dashboard.service",
+        model_tunnel_restart="restart-model-tunnels; ",
+        model_tunnel_active_check="check-model-tunnels; ",
+        model_readiness_refresh="refresh-model-readiness; ",
+        resume_trading=True,
+    )
+
+    assert "systemctl start 'bb-paper-trading.service' 'bb-dashboard.service' &&" in command
+    assert "trading_was_active=" not in command
+
+
+def test_split_service_deploy_can_explicitly_keep_trading_stopped() -> None:
+    from scripts.sync_to_online_server import _split_services_restart_command
+
+    command = _split_services_restart_command(
+        trading_service="bb-paper-trading.service",
+        dashboard_service="bb-dashboard.service",
+        model_tunnel_restart="restart-model-tunnels; ",
+        model_tunnel_active_check="check-model-tunnels; ",
+        model_readiness_refresh="refresh-model-readiness; ",
+        keep_trading_stopped=True,
+    )
+
+    assert "systemctl stop 'bb-paper-trading.service'" in command
+    assert "trading_was_active=" not in command
+    assert "systemctl is-active 'bb-paper-trading.service'" not in command
 
 
 def test_sync_to_online_server_requires_okx_network_route() -> None:

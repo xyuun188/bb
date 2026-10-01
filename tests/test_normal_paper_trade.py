@@ -199,6 +199,9 @@ def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
 
     assert selection["selected"] is False
     assert selection["selected_side"] == "neutral"
+    assert selection["diagnostic_status"] == "evidence_blocked"
+    assert "direction_support_expected_net_not_positive" in selection["blocking_reasons"]
+    assert selection["blocking_reasons_by_side"]["short"]
     assert contract == {}
 
 

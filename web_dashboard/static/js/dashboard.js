@@ -2302,6 +2302,38 @@ function opportunityScoreBlock(score, decision = null) {
     `;
 }
 
+function paperTradeDiagnosticHtml(attribution) {
+    const selection = attribution?.paper_trade_selection || {};
+    const permission = attribution?.entry_permission || {};
+    if (!Object.keys(selection).length && !Object.keys(permission).length) return '';
+    const reasons = Array.from(new Set([
+        ...(Array.isArray(selection.blocking_reasons) ? selection.blocking_reasons : []),
+        ...(Array.isArray(permission.blocking_reasons) ? permission.blocking_reasons : []),
+    ].filter(Boolean)));
+    const status = String(selection.diagnostic_status || permission.diagnostic_status || '').toLowerCase();
+    const category = String(selection.blocking_category || permission.blocking_category || '').toLowerCase();
+    const blockedByProfit = status === 'profit_gate_blocked' || category === 'profit_gate';
+    const title = blockedByProfit ? '收益门禁状态' : permission.granted === true ? '开仓授权状态' : '开仓阻断状态';
+    const summary = permission.granted === true
+        ? '模型分析和当前收益证据已通过模拟盘开仓授权。'
+        : blockedByProfit
+            ? '模型服务正常完成分析；当前费后收益或质量证据不足，因此暂不开仓。该状态不是模型故障，分析结果仍会进入训练和复盘。'
+            : status === 'evidence_blocked'
+                ? '模型已返回，但本轮证据链不完整，系统保留分析并等待完整数据。'
+                : '本轮没有获得模拟盘开仓授权，具体原因如下。';
+    return `
+        <div class="analysis-card analysis-final-card">
+            <div class="analysis-card-head">
+                <div class="analysis-card-title">${escHtml(title)}</div>
+                ${analysisPill(permission.granted === true ? '已授权' : blockedByProfit ? '收益门禁拦截' : '未授权', permission.granted === true ? 'good' : 'warn')}
+            </div>
+            <div class="analysis-card-text">
+                <div class="analysis-note"><span>状态说明</span>${analysisText(summary)}</div>
+                ${reasons.length ? `<div class="analysis-note analysis-note-muted"><span>结构化阻断原因</span><div class="analysis-resolution-list">${reasons.map(reason => `<div class="analysis-resolution-item"><strong>${escHtml(dashboardReasonText(reason))}</strong><span>${escHtml(reason)}</span></div>`).join('')}</div></div>` : ''}
+            </div>
+        </div>`;
+}
+
 function showDecisionReason(decisionId) { 
     const decision = state.allDecisions.find(d => Number(d.id) === Number(decisionId)); 
     if (!decision) return; 
@@ -4391,7 +4423,7 @@ function renderAnalysisReasonModal(record) {
                 ${analysisMetric('分析信心 / 仓位', `${finalConfidence} / ${positionSize}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
             </div>
 
-            ${attributionHtml ? analysisSection('决策归因面板', attributionHtml) : ''}
+            ${attributionHtml ? analysisSection('决策归因面板', `${paperTradeDiagnosticHtml(attribution)}${attributionHtml}`) : paperTradeDiagnosticHtml(attribution)}
             ${analysisSection(isPositionFundingAnalysis ? '持仓资金费' : '市场资金费', fundingAnalysisHtml)}
             ${analysisSection('Agent/Skills 守门', renderAnalysisAgentSkills(agentSkills))}
             ${analysisSection('本地ML盈亏质量', renderAnalysisMlSignal(mlSignal))}
@@ -5437,6 +5469,15 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     authoritative_slippage_distribution_missing: '缺少权威真实滑点分布',
     average_fee_after_return_not_positive: '平均费后收益不为正',
     empirical_return_lower_hinge_not_positive: '费后收益经验下界不为正',
+    direction_support_expected_net_not_positive: '当前方向扣费后预期净收益不为正，收益门禁拦截开仓',
+    direction_support_objective_net_not_positive: '当前方向稳健费后目标收益不为正，收益门禁拦截开仓',
+    direction_support_objective_net_missing: '当前方向缺少稳健费后目标收益，收益证据不足',
+    direction_support_quality_observation_loss_probability_too_high: '质量观察的亏损概率超过安全上限',
+    direction_support_quant_family_conflict: '量化收益家族方向冲突，暂不授权开仓',
+    direction_support_strong_expert_opposition: '独立专家存在强反向意见，暂不授权开仓',
+    direction_support_execution_cost_incomplete: '手续费/滑点执行成本证据不完整',
+    direction_support_quant_evidence_missing: '缺少可审计的量化收益证据',
+    direction_support_prediction_horizon_missing: '缺少有效预测周期，无法完成收益比较',
     profit_factor_undefined: '缺少亏损分母，盈亏比暂时无法计算',
     profit_factor_not_above_break_even: '盈亏比没有高于自然盈亏平衡线 1',
     profit_factor_below_unity: '盈亏比低于自然盈亏平衡线 1',

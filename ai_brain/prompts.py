@@ -660,11 +660,23 @@ def build_batch_experts_user_prompt(
     }
     if compact_qwen_batch:
         compact_role_contracts = {
-            "trend_expert": "只报趋势方向，诊断用。",
-            "momentum_expert": "只报扣费后收益质量。",
-            "sentiment_expert": "只报下一窗口时序方向。",
-            "position_expert": "无持仓必须 hold。",
-            "risk_expert": "只报风险方向，风险不明则 hold。",
+            "trend_expert": (
+                "只报趋势方向；RSI/MACD/EMA/ADX/价格相对均线同向时必须报 l 或 s，"
+                "仅中性或冲突才报 h。"
+            ),
+            "momentum_expert": (
+                "只报动量方向；returns、成交量和短期波动同向时报 l 或 s，"
+                "仅无方向或冲突才报 h。"
+            ),
+            "sentiment_expert": (
+                "只报下一窗口时序方向；returns 或新闻情绪有净方向时报 l 或 s，"
+                "仅中性或缺失才报 h。"
+            ),
+            "position_expert": "只做持仓退出诊断；无对应持仓必须报 h。",
+            "risk_expert": (
+                "只报较安全方向；无硬风险时按资金费率、盘口和波动选择 l 或 s，"
+                "风险不明或双方相当才报 h。"
+            ),
         }
         role_contracts = "\n".join(
             f"- {name}: {compact_role_contracts[name]}" for name in requested_experts
@@ -694,11 +706,16 @@ def build_batch_experts_user_prompt(
             for name in requested_experts
         }
         compact_order = ",".join(requested_experts)
+        compact_role_rules = "\n".join(
+            f"- {name}: {compact_role_contracts[name]}" for name in requested_experts
+        )
         return (
             "QWEN_TARGET_BATCH_V2\n"
             "Production Qwen ultra-compact mode. JSON only; no markdown/thinking/reasoning. "
             f"Return exactly {{\"a\":[\"l|s|h|cl|cs\",...]}} in this order: {compact_order}. "
             "Use one action code per item only; never include expert names, confidence, or explanations.\n"
+            "Role rules (follow these; do not default every role to hold):\n"
+            f"{compact_role_rules}\n"
             f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
             "Codes: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
             "No invented data; position_expert=hold without a position."

@@ -861,17 +861,33 @@ def _split_services_restart_command(
     model_tunnel_active_check: str,
     model_readiness_refresh: str,
     keep_trading_stopped: bool = False,
+    resume_trading: bool = False,
 ) -> str:
     quoted_trading = _remote_quote(trading_service)
     quoted_dashboard = _remote_quote(dashboard_service)
-    resume_command = (
-        f"systemctl start {quoted_dashboard} >/dev/null 2>&1 || true; "
-        f"systemctl stop {quoted_trading} >/dev/null 2>&1 || true; "
-        if keep_trading_stopped
-        else f"systemctl start {quoted_trading} {quoted_dashboard} >/dev/null 2>&1 || true; "
+    if keep_trading_stopped:
+        resume_command = (
+            f"systemctl start {quoted_dashboard} >/dev/null 2>&1 || true; "
+            f"systemctl stop {quoted_trading} >/dev/null 2>&1 || true; "
+        )
+    elif resume_trading:
+        resume_command = (
+            f"systemctl start {quoted_trading} {quoted_dashboard} "
+            ">/dev/null 2>&1 || true; "
+        )
+    else:
+        resume_command = (
+            f"systemctl start {quoted_dashboard} >/dev/null 2>&1 || true; "
+            f"if [ \"$trading_was_active\" = 'active' ]; then "
+            f"systemctl start {quoted_trading} >/dev/null 2>&1 || true; "
+            f"else systemctl stop {quoted_trading} >/dev/null 2>&1 || true; fi; "
+        )
+    state_probe = (
+        f"trading_was_active=$(systemctl is-active {quoted_trading} 2>/dev/null || true); "
+        if not keep_trading_stopped and not resume_trading
+        else ""
     )
-    maintenance_window = (
-        "set -e; "
+    maintenance_window = "set -e; " + state_probe + (
         "resume_platform_services() { "
         + resume_command
         + "}; "
@@ -883,8 +899,15 @@ def _split_services_restart_command(
             f"systemctl start {quoted_dashboard} && "
             f"systemctl stop {quoted_trading} >/dev/null 2>&1 || true; "
         )
-    else:
+    elif resume_trading:
         service_start = f"systemctl start {quoted_trading} {quoted_dashboard} && "
+    else:
+        service_start = (
+            f"if [ \"$trading_was_active\" = 'active' ]; then "
+            f"systemctl start {quoted_trading}; "
+            f"else systemctl stop {quoted_trading} >/dev/null 2>&1 || true; fi; "
+            f"systemctl start {quoted_dashboard} && "
+        )
     return maintenance_window + model_tunnel_restart + (
         f"{model_readiness_refresh}"
         f"{model_tunnel_active_check}"
@@ -932,8 +955,9 @@ def parse_args() -> argparse.Namespace:
         "--resume-trading",
         action="store_true",
         help=(
-            "Explicitly resume the paper-trading service after deployment. "
-            "Omitting this flag always leaves paper trading stopped."
+            "Explicitly resume paper trading after deployment even if it was "
+            "stopped before synchronization. Without this flag, the previous "
+            "service state is preserved."
         ),
     )
     parser.add_argument(
@@ -1145,9 +1169,8 @@ def main() -> None:
                 model_tunnel_restart=model_tunnel_restart,
                 model_tunnel_active_check=model_tunnel_active_check,
                 model_readiness_refresh=model_readiness_refresh,
-                # Deployment is fail-closed: paper trading remains stopped
-                # unless the operator explicitly opts into a resume.
-                keep_trading_stopped=not bool(args.resume_trading),
+                keep_trading_stopped=bool(args.keep_trading_stopped),
+                resume_trading=bool(args.resume_trading),
             )
             safe_print(run_remote_text(ssh, command, timeout=120, check=True))
             return
@@ -1156,13 +1179,20 @@ def main() -> None:
                 f"systemctl restart {_remote_quote(args.service)} && "
                 f"systemctl is-active {_remote_quote(args.service)} && "
             )
-        else:
-            # Deployment is fail-closed even when the legacy single-service
-            # path is used.  Never restart paper trading implicitly; only an
-            # explicit --resume-trading may start it.
+        elif args.keep_trading_stopped:
             trading_action = (
                 f"systemctl stop {_remote_quote(args.service)} >/dev/null 2>&1 || true; "
-                f"systemctl disable {_remote_quote(args.service)} >/dev/null 2>&1 || true; "
+            )
+        else:
+            # Preserve the prior state for the legacy single-service path too.
+            # A running service must keep running after source synchronization;
+            # an intentionally stopped service remains stopped.
+            trading_action = (
+                f"trading_was_active=$(systemctl is-active {_remote_quote(args.service)} "
+                "2>/dev/null || true); "
+                f"systemctl stop {_remote_quote(args.service)} >/dev/null 2>&1 || true; "
+                f"if [ \"$trading_was_active\" = 'active' ]; then "
+                f"systemctl start {_remote_quote(args.service)}; fi; "
             )
         command = (
             trading_action

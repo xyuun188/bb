@@ -10,6 +10,7 @@ from typing import Any
 
 INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-09-18.paper-model-direction.v13"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
+PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
@@ -148,6 +149,7 @@ def summarize_paper_quantitative_evidence(
     selected_side: str,
     *,
     execution_cost_pct: float | None,
+    support_scope: str = PAPER_MODEL_TRADE_SCOPE,
 ) -> dict[str, Any]:
     """Build the cost-complete model summary that experts may inspect pre-decision."""
 
@@ -222,7 +224,11 @@ def summarize_paper_quantitative_evidence(
     positive_families = [
         item
         for item in family_summaries
-        if (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
+        if (
+            (_float(item.get("raw_expected_return_pct")) or 0.0) > 0.0
+            if support_scope == PAPER_TRAINING_ENTRY_SCOPE
+            else (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
+        )
     ]
     loss_probabilities = [
         float(value)
@@ -242,6 +248,12 @@ def summarize_paper_quantitative_evidence(
         if family_summaries
         else None
     )
+    raw_expected_return_pct = (
+        sum(float(item["raw_expected_return_pct"]) for item in family_summaries)
+        / len(family_summaries)
+        if family_summaries
+        else None
+    )
     return {
         "version": INDEPENDENT_DIRECTION_SUPPORT_VERSION,
         "scope": PAPER_MODEL_TRADE_SCOPE,
@@ -249,6 +261,7 @@ def summarize_paper_quantitative_evidence(
         "execution_cost_pct": parsed_cost,
         "execution_cost_complete": execution_cost_complete,
         "expected_net_return_pct": expected_net_return_pct,
+        "raw_expected_return_pct": raw_expected_return_pct,
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": (
             sum(loss_probabilities) / len(loss_probabilities)
@@ -320,6 +333,8 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "current_edge_validated",
             "paper_quality_observation_only",
             "paper_quality_observation_reasons",
+            "paper_training_only",
+            "paper_training_reasons",
         )
     }
 
@@ -336,12 +351,17 @@ def assess_directional_entry_support(
 
     side = str(selected_side or "").lower()
     opposite_side = "short" if side == "long" else "long"
-    paper_scope = support_scope == PAPER_MODEL_TRADE_SCOPE
+    paper_scope = support_scope in {
+        PAPER_MODEL_TRADE_SCOPE,
+        PAPER_TRAINING_ENTRY_SCOPE,
+    }
+    training_scope = support_scope == PAPER_TRAINING_ENTRY_SCOPE
     competition = _dict(direction_competition)
     quantitative = summarize_paper_quantitative_evidence(
         direction_competition,
         side,
         execution_cost_pct=execution_cost_pct,
+        support_scope=support_scope,
     )
     parsed_cost = _float(quantitative.get("execution_cost_pct"))
     execution_cost_complete = quantitative.get("execution_cost_complete") is True
@@ -433,8 +453,16 @@ def assess_directional_entry_support(
                 (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
             )
             current_contract_ready = bool(
-                positive_expected_net
-                and (positive_objective_net or quality_permission_missing)
+                (
+                    positive_expected_net
+                    and (positive_objective_net or quality_permission_missing)
+                )
+                if not training_scope
+                else (
+                    selected_raw is not None
+                    and opposite_raw is not None
+                    and selected_raw > opposite_raw
+                )
             )
             if aligned and current_contract_ready:
                 directional_families.append(item)
@@ -505,21 +533,22 @@ def assess_directional_entry_support(
         and not strong_expert_opposition
     )
     quality_observation_only = bool(
-        quality_permission_missing and not current_edge_validated
+        quality_permission_missing and not current_edge_validated and not training_scope
     )
     blockers: list[str] = []
     if side not in {"long", "short"}:
         blockers.append("direction_support_side_missing")
     if paper_scope and not execution_cost_complete:
         blockers.append("direction_support_execution_cost_incomplete")
-    if paper_scope and (
+    if paper_scope and not training_scope and (
         expected_net_return_pct is None or expected_net_return_pct <= 0.0
     ):
         blockers.append("direction_support_expected_net_not_positive")
-    if paper_scope and objective_net_return_pct is None:
+    if paper_scope and not training_scope and objective_net_return_pct is None:
         blockers.append("direction_support_objective_net_missing")
     elif (
         paper_scope
+        and not training_scope
         and objective_net_return_pct <= 0.0
         and not quality_observation_only
     ):
@@ -544,6 +573,11 @@ def assess_directional_entry_support(
     if paper_scope:
         if strong_expert_opposition:
             blockers.append("direction_support_strong_expert_opposition")
+        if training_scope:
+            if len(aligned) < MIN_GOVERNED_ALIGNED_EXPERT_COUNT:
+                blockers.append("paper_training_aligned_experts_insufficient")
+            if len(aligned) <= len(opposition):
+                blockers.append("paper_training_expert_direction_not_resolved")
     else:
         if len(auditable_experts) < 3:
             blockers.append("direction_support_expert_analysis_incomplete")
@@ -569,6 +603,7 @@ def assess_directional_entry_support(
         "execution_cost_pct": parsed_cost,
         "execution_cost_complete": execution_cost_complete,
         "expected_net_return_pct": expected_net_return_pct,
+        "raw_expected_return_pct": _float(quantitative.get("raw_expected_return_pct")),
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": loss_probability,
         "prediction_horizon_minutes": prediction_horizon_minutes,
@@ -593,6 +628,15 @@ def assess_directional_entry_support(
         "current_edge_validated": current_edge_validated,
         "paper_quality_observation_only": quality_observation_only,
         "paper_quality_observation_reasons": quality_observation_reasons,
+        "paper_training_only": training_scope,
+        "paper_training_reasons": (
+            [
+                "historical_quality_gate_is_observation_only",
+                "current_directional_evidence_is_training_eligible",
+            ]
+            if training_scope
+            else []
+        ),
         "aligned_expert_count": len(aligned),
         "opposition_expert_count": len(opposition),
         "hold_expert_count": len(holds),
@@ -633,6 +677,24 @@ def assess_paper_model_trade_support(
     )
 
 
+def assess_paper_training_entry_support(
+    direction_competition: dict[str, Any] | None,
+    expert_opinions: list[dict[str, Any]] | None,
+    selected_side: str,
+    *,
+    execution_cost_pct: float | None,
+) -> dict[str, Any]:
+    """Assess a paper-only training entry without promoting it to production."""
+
+    return assess_directional_entry_support(
+        direction_competition,
+        expert_opinions,
+        selected_side,
+        support_scope=PAPER_TRAINING_ENTRY_SCOPE,
+        execution_cost_pct=execution_cost_pct,
+    )
+
+
 def directional_entry_support_reasons(value: Any, selected_side: str) -> list[str]:
     support = _dict(value)
     reasons: list[str] = []
@@ -642,24 +704,33 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         reasons.append("direction_support_not_eligible")
     if support.get("selected_side") != str(selected_side or "").lower():
         reasons.append("direction_support_side_mismatch")
-    if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
+    if support.get("support_scope") in {
+        PAPER_MODEL_TRADE_SCOPE,
+        PAPER_TRAINING_ENTRY_SCOPE,
+    }:
         if support.get("execution_cost_complete") is not True:
             reasons.append("direction_support_execution_cost_incomplete")
-        expected_net = _float(support.get("expected_net_return_pct"))
-        if expected_net is None or expected_net <= 0.0:
-            reasons.append("direction_support_expected_net_not_positive")
-        objective_net = _float(support.get("objective_net_return_pct"))
-        observation_only = support.get("paper_quality_observation_only") is True
-        if objective_net is None:
-            reasons.append("direction_support_objective_net_missing")
-        elif objective_net <= 0.0 and not observation_only:
-            reasons.append("direction_support_objective_net_not_positive")
+        if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
+            expected_net = _float(support.get("expected_net_return_pct"))
+            if expected_net is None or expected_net <= 0.0:
+                reasons.append("direction_support_expected_net_not_positive")
+            objective_net = _float(support.get("objective_net_return_pct"))
+            observation_only = support.get("paper_quality_observation_only") is True
+            if objective_net is None:
+                reasons.append("direction_support_objective_net_missing")
+            elif objective_net <= 0.0 and not observation_only:
+                reasons.append("direction_support_objective_net_not_positive")
+        elif support.get("paper_training_only") is not True:
+            reasons.append("paper_training_scope_marker_missing")
     if not support.get("quant_evidence_families"):
         reasons.append("direction_support_quant_evidence_missing")
     horizon = _float(support.get("prediction_horizon_minutes"))
     if horizon is None or horizon <= 0.0:
         reasons.append("direction_support_prediction_horizon_missing")
-    if support.get("support_scope") == PAPER_MODEL_TRADE_SCOPE:
+    if support.get("support_scope") in {
+        PAPER_MODEL_TRADE_SCOPE,
+        PAPER_TRAINING_ENTRY_SCOPE,
+    }:
         if support.get("conflicting_quant_families"):
             reasons.append("direction_support_quant_family_conflict")
         if support.get("strong_expert_opposition") is True:
@@ -669,16 +740,37 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             for reason in support.get("paper_quality_observation_reasons") or []
             if str(reason).strip()
         ]
+        observation_only = support.get("paper_quality_observation_only") is True
         if observation_only and not observation_reasons:
             reasons.append("direction_support_quality_observation_reason_missing")
         loss_probability = _float(support.get("loss_probability"))
-        if observation_only and (
+        if (
+            support.get("support_scope") == PAPER_TRAINING_ENTRY_SCOPE
+            and support.get("paper_training_only") is not True
+        ):
+            reasons.append("paper_training_scope_marker_missing")
+        if (
+            (
+                observation_only
+                or support.get("support_scope") == PAPER_TRAINING_ENTRY_SCOPE
+            )
+            and (
             loss_probability is None
             or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
+            )
         ):
             reasons.append(
                 "direction_support_quality_observation_loss_probability_too_high"
             )
+        if support.get("support_scope") == PAPER_TRAINING_ENTRY_SCOPE:
+            if int(support.get("aligned_expert_count") or 0) < (
+                MIN_GOVERNED_ALIGNED_EXPERT_COUNT
+            ):
+                reasons.append("paper_training_aligned_experts_insufficient")
+            if int(support.get("aligned_expert_count") or 0) <= int(
+                support.get("opposition_expert_count") or 0
+            ):
+                reasons.append("paper_training_expert_direction_not_resolved")
     else:
         if int(support.get("aligned_expert_count") or 0) < (
             MIN_GOVERNED_ALIGNED_EXPERT_COUNT

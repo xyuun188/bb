@@ -1503,6 +1503,48 @@ def _display_opportunity_score(
     return payload
 
 
+def _display_paper_trade_selection(raw: dict[str, Any]) -> dict[str, Any]:
+    """Expose entry-gate diagnostics without duplicating the full evidence payload."""
+
+    selection = _safe_dict(raw.get("paper_trade_selection"))
+    if not selection:
+        return {}
+    by_side: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        support = _safe_dict(_safe_dict(selection.get("by_side")).get(side))
+        if not support:
+            continue
+        by_side[side] = {
+            key: support.get(key)
+            for key in (
+                "eligible",
+                "reason",
+                "expected_net_return_pct",
+                "objective_net_return_pct",
+                "loss_probability",
+                "blocking_reasons",
+            )
+            if key in support
+        }
+    return {
+        key: selection.get(key)
+        for key in (
+            "version",
+            "selected",
+            "selected_side",
+            "selection_reason",
+            "eligible_side_count",
+            "diagnostic_status",
+            "blocking_category",
+            "blocking_reasons",
+            "blocking_reasons_by_side",
+            "decision_authority",
+            "production_permission",
+        )
+        if key in selection
+    } | {"by_side": by_side}
+
+
 def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
     """Expose the persisted distribution and cost contract without recalculating it."""
 
@@ -1924,6 +1966,8 @@ def _build_decision_attribution(
     decision_maker = _safe_dict(raw.get("decision_maker"))
     close_evidence = _safe_dict(raw.get("close_evidence"))
     high_risk_review = _safe_dict(raw.get("high_risk_review"))
+    paper_selection = _safe_dict(raw.get("paper_trade_selection"))
+    entry_permission = _safe_dict(raw.get("entry_permission"))
     ml = _extract_primary_ml(raw)
     local = _extract_local_tools(raw)
 
@@ -1985,6 +2029,22 @@ def _build_decision_attribution(
         "timeseries": local.get("timeseries", {}),
         "sentiment": local.get("sentiment", {}),
         "opportunity_score": opportunity,
+        "paper_trade_selection": {
+            "selected": paper_selection.get("selected"),
+            "selected_side": paper_selection.get("selected_side"),
+            "selection_reason": paper_selection.get("selection_reason"),
+            "diagnostic_status": paper_selection.get("diagnostic_status"),
+            "blocking_category": paper_selection.get("blocking_category"),
+            "blocking_reasons": list(paper_selection.get("blocking_reasons") or []),
+            "eligible_side_count": paper_selection.get("eligible_side_count"),
+        },
+        "entry_permission": {
+            "granted": entry_permission.get("granted"),
+            "reason": entry_permission.get("reason"),
+            "diagnostic_status": entry_permission.get("diagnostic_status"),
+            "blocking_category": entry_permission.get("blocking_category"),
+            "blocking_reasons": list(entry_permission.get("blocking_reasons") or []),
+        },
         "high_risk_review": high_risk_review,
         "decision_maker": {
             "status": decision_maker.get("status"),
@@ -10797,6 +10857,8 @@ async def get_decisions(
                     "execution_reason": display_reason,
                     "reason_code": decision_summary.get("final_reason_code"),
                     "reason_evidence": decision_summary.get("final_reason_evidence"),
+                    "paper_trade_selection": _display_paper_trade_selection(raw),
+                    "entry_permission": _safe_dict(raw.get("entry_permission")),
                     "decision_state": decision_state,
                     "executed_at": d.executed_at.isoformat() if d.executed_at else None,
                     "execution_price": d.execution_price,
@@ -12010,6 +12072,8 @@ async def _get_analysis_records_uncached(
                 ),
                 "prediction_economics": _display_prediction_economics(raw),
                 "direction_competition": _safe_dict(raw.get("direction_competition")),
+                "paper_trade_selection": _display_paper_trade_selection(raw),
+                "entry_permission": _safe_dict(raw.get("entry_permission")),
                 "dynamic_exit_policy": _safe_dict(raw.get("dynamic_exit_policy")),
                 "position_review_policy": (
                     raw.get("position_review_policy")

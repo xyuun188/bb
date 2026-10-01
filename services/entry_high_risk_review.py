@@ -160,6 +160,10 @@ class EntryHighRiskReviewGatePolicy:
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
         sizing = _safe_dict(raw.get("profit_risk_sizing"))
         selected_metrics = selected_entry_metrics(decision, model_mode)
+        paper_training_entry = bool(
+            normal_trade.get("selection_reason") == "paper_training_entry"
+            and normal_trade.get("paper_training_only") is True
+        )
         normal_risk_cap = _safe_float(
             normal_trade.get("single_trade_risk_fraction_cap"), -1.0
         )
@@ -172,14 +176,17 @@ class EntryHighRiskReviewGatePolicy:
             violations.append("execution_mode_not_paper")
         if not (
             selected_metrics.source == "normal_paper_trade_contract"
-            and selected_metrics.quality_observation
+            and (selected_metrics.quality_observation or paper_training_entry)
         ):
             violations.append("paper_quality_observation_contract_invalid")
         if normal_trade.get("execution_scope") != "paper_only":
             violations.append("normal_trade_scope_invalid")
         if normal_trade.get("production_permission") is not False:
             violations.append("normal_trade_production_permission_invalid")
-        if normal_trade.get("paper_quality_observation_only") is not True:
+        if (
+            normal_trade.get("paper_quality_observation_only") is not True
+            and not paper_training_entry
+        ):
             violations.append("paper_quality_observation_contract_missing")
         if sizing.get("execution_scope") != "paper_only":
             violations.append("sizing_scope_invalid")
@@ -187,7 +194,10 @@ class EntryHighRiskReviewGatePolicy:
             violations.append("sizing_production_permission_invalid")
         if sizing.get("production_eligible") is not True:
             violations.append("sizing_not_eligible")
-        if sizing.get("paper_quality_observation_mode") is not True:
+        if (
+            sizing.get("paper_quality_observation_mode") is not True
+            and sizing.get("paper_training_entry_mode") is not True
+        ):
             violations.append("paper_quality_observation_sizing_missing")
         current_normal_paper = normal_trade.get("version") == NORMAL_PAPER_TRADE_VERSION
         advisory_risk_cap = (
@@ -218,6 +228,7 @@ class EntryHighRiskReviewGatePolicy:
                 "paper_quality_observation_mode"
             )
             is True,
+            "paper_training_entry_mode": paper_training_entry,
             "single_trade_risk_fraction_cap": sizing_risk_cap,
             "final_leverage": final_leverage,
             "risk_fraction_limit": advisory_risk_cap,

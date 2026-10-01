@@ -6504,14 +6504,30 @@ class OKXExecutor(AbstractExecutor):
                 except Exception:
                     return fallback
 
+            # CCXT can return a partially normalized balance shape when the
+            # private endpoint responds without the usual ``total``/``eq``
+            # fields.  ``free`` is still an authoritative account fact in
+            # that response; treating the missing equity as zero collapses
+            # the risk budget and blocks every paper entry.  Prefer explicit
+            # equity fields, then derive the minimum truthful equity from
+            # free + used (never from a model or a stale strategy value).
             total = float(asset_data.get("total") or 0.0)
+            used = float(asset_data.get("used") or 0.0)
             cash = raw_float("cashBal", total)
-            equity = raw_float("eq", total)
+            explicit_equity = raw_float("eq", 0.0)
             available = float(asset_data.get("free") or 0.0) or raw_float("availEq", 0.0)
+            equity = max(
+                explicit_equity,
+                total,
+                cash,
+                available + max(used, 0.0),
+                available,
+                0.0,
+            )
             allocatable = equity if equity > 0 else (cash if cash > 0 else total)
             return {
                 "free": available,
-                "used": float(asset_data.get("used") or 0.0),
+                "used": used,
                 "total": total,
                 "cash": cash,
                 "equity": equity,

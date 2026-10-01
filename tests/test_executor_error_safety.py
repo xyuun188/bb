@@ -154,6 +154,21 @@ class _NativeBalanceOnlyCcxt:
         }
 
 
+class _PartialNormalizedBalanceCcxt:
+    urls = {"api": {"rest": "https://www.okx.com"}}
+    hostname = "www.okx.com"
+    markets = {}
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        # Some OKX/CCXT responses expose free/used while omitting total and
+        # the account-detail equity field.  The executor must preserve a
+        # truthful equity fallback instead of returning zero.
+        return {
+            "USDT": {"free": 12.0, "used": 3.0, "total": 0.0},
+            "info": {"data": []},
+        }
+
+
 class _InitTimeSyncCcxt:
     urls = {"api": {"rest": "https://www.okx.com"}}
     hostname = "www.okx.com"
@@ -2044,6 +2059,16 @@ async def test_okx_native_balance_snapshot_avoids_ccxt_market_loading() -> None:
     assert result["allocatable"] == 16.0
     assert exchange.balance_calls == 1
     assert exchange.instrument_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_okx_partial_normalized_balance_derives_equity_from_free_and_used() -> None:
+    result = await _executor(_PartialNormalizedBalanceCcxt()).get_balance_snapshot()
+
+    assert result["free"] == 12.0
+    assert result["used"] == 3.0
+    assert result["equity"] == 15.0
+    assert result["allocatable"] == 15.0
 
 
 @pytest.mark.asyncio

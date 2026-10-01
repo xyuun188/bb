@@ -1391,7 +1391,8 @@ def build_okx_history_training_sample(
     if (
         current_normal_paper
         and normal_paper_gaps
-        and source_normal_paper.get("selection_reason") == "paper_quality_observation"
+        and source_normal_paper.get("selection_reason")
+        in {"paper_quality_observation", "paper_training_entry"}
         and not normal_paper_trade_observation_contract_reasons(source_normal_paper)
     ):
         normal_paper_gaps = []
@@ -1631,7 +1632,7 @@ def build_okx_history_training_sample(
                     "current_quality_observation_v14"
                     if current_normal_paper
                     and normal_paper.get("selection_reason")
-                    == "paper_quality_observation"
+                    in {"paper_quality_observation", "paper_training_entry"}
                     else "current_validated_v14"
                     if current_normal_paper
                     else "historical_normalized_current_protocol"
