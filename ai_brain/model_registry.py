@@ -253,6 +253,11 @@ class ModelRegistry:
         self._initialized = False
         self._batch_expert_disabled_until_by_provider: dict[tuple[str, str], float] = {}
         self._batch_expert_last_error_by_provider: dict[tuple[str, str], str] = {}
+        # A target Qwen carrier is single-worker.  One registry can serve
+        # market and position rounds concurrently, so the shared batch call
+        # needs a provider-level single-flight gate in addition to the generic
+        # LLM capacity pool.
+        self._batch_provider_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     def register(self, model: AbstractAIModel) -> None:
         """Register a model instance. Must have a unique name."""
@@ -313,6 +318,7 @@ class ModelRegistry:
         old_names = set(self._models.keys())
         self._models.clear()
         self._initialized = False
+        self._batch_provider_locks.clear()
 
         for m in create_models_from_config():
             self.register(m)
@@ -351,6 +357,7 @@ class ModelRegistry:
         """Shutdown all models gracefully."""
         tasks = [model.shutdown() for model in self._models.values()]
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._batch_provider_locks.clear()
         self._initialized = False
         logger.info("all models shut down")
 
@@ -686,6 +693,8 @@ class ModelRegistry:
 
         transport_retry_attempted = False
         transport_retry_error = ""
+        provider_queue_deferred = False
+        provider_queue_wait_seconds = 0.0
         try:
             requested_batch_timeout = float(
                 settings.ai_batch_expert_timeout_seconds
@@ -736,20 +745,69 @@ class ModelRegistry:
                 )
                 return {}, timings
 
-            # The shared request is admitted at this point.  Preserve that
-            # distinction for the persisted quality contract.
-            context["_attempted_models"] = list(
-                dict.fromkeys(
-                    [
-                        *context.get("_attempted_models", []),
-                        *expert_names,
-                    ]
-                )
+            provider_lock = self._batch_provider_locks.setdefault(
+                provider_key,
+                asyncio.Lock(),
             )
+            lock_wait_started = time.perf_counter()
+            provider_lock_acquired = False
             try:
+                # Keep the lock across the bounded request and its one
+                # transport retry.  Releasing it between attempts would let a
+                # second symbol enter the single-worker carrier while the
+                # first request is still recovering.
+                lock_remaining = batch_timeout
+                deadline = context.get("_analysis_deadline_monotonic")
+                try:
+                    if deadline:
+                        lock_remaining = min(
+                            lock_remaining,
+                            max(
+                                float(deadline) - asyncio.get_running_loop().time() - 0.1,
+                                0.05,
+                            ),
+                        )
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        provider_lock.acquire(),
+                        timeout=max(lock_remaining, 0.05),
+                    )
+                except TimeoutError:
+                    provider_queue_deferred = True
+                    raise
+                provider_lock_acquired = True
+                # The shared request is admitted at this point.  Preserve that
+                # distinction for the persisted quality contract.
+                context["_attempted_models"] = list(
+                    dict.fromkeys(
+                        [
+                            *context.get("_attempted_models", []),
+                            *expert_names,
+                        ]
+                    )
+                )
+                provider_queue_wait_seconds = round(
+                    time.perf_counter() - lock_wait_started,
+                    3,
+                )
+                context["_batch_provider_queue_wait_seconds"] = provider_queue_wait_seconds
+                request_timeout = batch_timeout
+                try:
+                    if deadline:
+                        request_timeout = min(
+                            request_timeout,
+                            max(
+                                float(deadline) - asyncio.get_running_loop().time() - 0.1,
+                                0.05,
+                            ),
+                        )
+                except (TypeError, ValueError):
+                    pass
                 result = await asyncio.wait_for(
                     batch_decider(features, context, expert_names),
-                    timeout=batch_timeout,
+                    timeout=max(request_timeout, 0.05),
                 )
             except Exception as first_exc:
                 first_error_text = safe_error_text(first_exc, limit=240)
@@ -788,6 +846,9 @@ class ModelRegistry:
                 finally:
                     context.pop("_batch_transport_retry_active", None)
                     context.pop("_batch_transport_retry_limit", None)
+            finally:
+                if provider_lock_acquired:
+                    provider_lock.release()
             self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
             self._batch_expert_last_error_by_provider.pop(provider_key, None)
             duration = round(time.perf_counter() - perf_started, 3)
@@ -826,6 +887,7 @@ class ModelRegistry:
                         "transport_retry_attempted": transport_retry_attempted,
                         "transport_retry_recovered": transport_retry_attempted,
                         "transport_retry_reason": transport_retry_error or None,
+                        "provider_queue_wait_seconds": provider_queue_wait_seconds,
                     }
                 )
             decisions = {
@@ -837,6 +899,36 @@ class ModelRegistry:
         except Exception as exc:
             duration = round(time.perf_counter() - perf_started, 3)
             error_text = safe_error_text(exc, limit=240)
+            if provider_queue_deferred:
+                reason = (
+                    "single-worker model provider queue wait exceeded this symbol's "
+                    "analysis budget; deferred without opening"
+                )
+                context.setdefault("_model_failures", []).extend(
+                    {
+                        "expert_name": model.name,
+                        "provider_model": _provider_model_name(batch_model),
+                        "reason": reason,
+                        "status": "provider_queue_deferred",
+                    }
+                    for model in provider_group
+                )
+                return {}, [
+                    {
+                        "stage": "expert_initial",
+                        "name": model.name,
+                        "status": "provider_queue_deferred",
+                        "started_at": started_at.isoformat(),
+                        "duration_sec": duration,
+                        "batch_expert": True,
+                        "shared_batch_call": True,
+                        "batch_model_count": len(provider_group),
+                        "provider_model": _provider_model_name(batch_model),
+                        "attempted": False,
+                        "reason": reason,
+                    }
+                    for model in provider_group
+                ]
             breaker_seconds = _batch_failure_breaker_seconds(
                 exc,
                 error_text,

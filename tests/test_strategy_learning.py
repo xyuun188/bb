@@ -220,11 +220,48 @@ async def test_feedback_reuses_inflight_outcome_read_for_same_window(
         await service._feedback(mode="paper", hours=24, limit=7)
         await service._feedback(mode="paper", hours=24, limit=7)
         assert len(calls) == 1
-        assert service._outcome_read_task_key == ("paper", 24, 7)
+        assert service._outcome_read_task_key == ("paper", 24, 7, True)
     finally:
         if service._outcome_read_task is not None:
             service._outcome_read_task.cancel()
             await asyncio.gather(service._outcome_read_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_realtime_strategy_context_uses_compact_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[bool] = []
+
+    async def empty_outcomes(**kwargs: Any) -> list[dict[str, Any]]:
+        observed.append(bool(kwargs["include_decision_evidence"]))
+        return []
+
+    class FakeResult:
+        def all(self) -> list[Any]:
+            return []
+
+    class FakeSession:
+        async def execute(self, _statement: Any) -> FakeResult:
+            return FakeResult()
+
+    class FakeContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(strategy_learning_module, "load_authoritative_trade_outcomes", empty_outcomes)
+    monkeypatch.setattr(strategy_learning_module, "get_read_session_ctx", lambda: FakeContext())
+    service = StrategyLearningService()
+    await service.apply_to_strategy_context(
+        mode="paper",
+        strategy_context={},
+        open_positions=[],
+    )
+
+    assert observed == [False]
 
 
 @pytest.mark.asyncio

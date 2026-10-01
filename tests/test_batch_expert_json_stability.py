@@ -1008,6 +1008,54 @@ async def test_independent_provider_groups_run_concurrently(
 
 
 @pytest.mark.asyncio
+async def test_same_single_worker_provider_is_single_flight_across_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _ProviderBatchExpert.batch_calls = []
+    _ProviderBatchExpert.running_batch_calls = 0
+    _ProviderBatchExpert.peak_batch_calls = 0
+    registry = ModelRegistry()
+    for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    ):
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3.8-27b",
+                batch_delay_seconds=0.03,
+            )
+        )
+    await registry.initialize_all()
+
+    first_context: dict[str, Any] = {}
+    second_context: dict[str, Any] = {}
+    first, second = await asyncio.gather(
+        registry.decide_all(FeatureVector(symbol="BTC/USDT"), first_context),
+        registry.decide_all(FeatureVector(symbol="ETH/USDT"), second_context),
+    )
+
+    assert set(first) == set(second) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "position_expert",
+        "risk_expert",
+    }
+    assert _ProviderBatchExpert.peak_batch_calls == 1
+    assert len(_ProviderBatchExpert.batch_calls) == 2
+    assert all(
+        float(context.get("_batch_provider_queue_wait_seconds") or 0.0) >= 0.0
+        for context in (first_context, second_context)
+    )
+
+
+@pytest.mark.asyncio
 async def test_paper_complete_plans_use_one_shared_batch_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

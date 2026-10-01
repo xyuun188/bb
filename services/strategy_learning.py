@@ -1270,7 +1270,7 @@ class StrategyLearningService:
         # wall-clock cutoff.  Using ``since`` here made every polling round
         # cancel the previous query and start another one a few milliseconds
         # later.
-        self._outcome_read_task_key: tuple[str, int, int] | None = None
+        self._outcome_read_task_key: tuple[str, int, int, bool] | None = None
 
     def _default_model_replay_context(
         self,
@@ -1367,6 +1367,7 @@ class StrategyLearningService:
             mode=mode,
             hours=hours,
             limit=limit,
+            include_decision_evidence=False,
             include_historical_replay=replay_enabled,
             replay_holdout_source_ids=_replay_holdout_source_ids(
                 model_strategy_blueprint if replay_enabled else None
@@ -1420,6 +1421,7 @@ class StrategyLearningService:
         mode: str,
         hours: int,
         limit: int,
+        include_decision_evidence: bool = True,
         include_historical_replay: bool = False,
         replay_holdout_source_ids: set[int] | None = None,
     ) -> StrategyFeedback:
@@ -1433,7 +1435,16 @@ class StrategyLearningService:
         since = max(datetime.now(UTC) - timedelta(hours=effective_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
         epoch_start_naive = epoch_start.replace(tzinfo=None)
-        task_key = (selected_mode, effective_hours, effective_limit)
+        # Real-time strategy context only needs the compact outcome projection.
+        # Dashboard/replay callers can opt into decision evidence explicitly;
+        # keep the two query shapes separate so a heavy report read cannot be
+        # reused by the trading loop (or vice versa).
+        task_key = (
+            selected_mode,
+            effective_hours,
+            effective_limit,
+            bool(include_decision_evidence),
+        )
         outcome_task = self._outcome_read_task
         if (
             outcome_task is None
@@ -1448,7 +1459,7 @@ class StrategyLearningService:
                     since=since,
                     limit=effective_limit,
                     compact=True,
-                    include_decision_evidence=True,
+                    include_decision_evidence=bool(include_decision_evidence),
                 )
             )
             self._outcome_read_task = outcome_task

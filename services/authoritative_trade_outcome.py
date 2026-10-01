@@ -597,6 +597,44 @@ async def load_authoritative_trade_outcomes(
         and session_factory is get_read_session_ctx
         and str(settings.database_url or "").startswith("postgresql")
     )
+    if cache_enabled and not _force_compact_refresh:
+        # Cold starts used to let every concurrent trading-loop caller run the
+        # same heavyweight PostgreSQL reconstruction.  Share one refresh task
+        # from the first request, just as we already do for stale-cache
+        # refreshes.  The caller's mode/window/limit are applied after the
+        # shared full cache has been populated.
+        if _compact_outcome_cache is None:
+            if (
+                (_compact_outcome_refresh_task is None or _compact_outcome_refresh_task.done())
+                and time.monotonic() >= _compact_outcome_refresh_failed_until
+            ):
+                _compact_outcome_refresh_task = asyncio.create_task(
+                    load_authoritative_trade_outcomes(
+                        compact=True,
+                        _force_compact_refresh=True,
+                    )
+                )
+                _compact_outcome_refresh_task.add_done_callback(_compact_outcome_refresh_done)
+            refresh_task = _compact_outcome_refresh_task
+            if refresh_task is not None:
+                try:
+                    await asyncio.shield(refresh_task)
+                except Exception:
+                    # The shared refresh callback records backoff.  Do not let
+                    # every trading-loop caller immediately issue its own
+                    # heavyweight reconstruction after the same failure; an
+                    # empty compact projection is safer and the next refresh
+                    # window will retry once.
+                    return []
+            if _compact_outcome_cache is not None:
+                cached_at, cached_outcomes = _compact_outcome_cache
+                del cached_at
+                return _filter_compact_outcomes(
+                    cached_outcomes,
+                    mode=mode,
+                    since=since,
+                    limit=limit,
+                )
     if cache_enabled and _compact_outcome_cache is not None:
         cached_at, cached_outcomes = _compact_outcome_cache
         cache_age = time.monotonic() - cached_at
