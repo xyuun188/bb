@@ -13,7 +13,7 @@ from ai_brain.llm_agent import (
     _claim_llm_call,
 )
 from ai_brain.model_registry import ModelRegistry, _batch_failure_breaker_seconds
-from ai_brain.prompts import build_batch_experts_user_prompt
+from ai_brain.prompts import _compact_role_signal, build_batch_experts_user_prompt
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
@@ -287,6 +287,62 @@ def test_batch_expert_prompt_preserves_role_signal_tail_beyond_legacy_limit() ->
     )
 
     assert "role-signal-tail" in prompt
+
+
+def test_compact_role_signal_keeps_role_specific_evidence() -> None:
+    context = (
+        "symbol=BTC/USDT; price=100; change24h=1.2%; bid=99.9; ask=100.1; "
+        "rsi14=63.4; macd_diff=0.0042; ema12=101; ema26=99; adx14=27.5; "
+        "bb_pct=0.82; bb_width=0.11; price_vs_sma20=0.02; price_vs_sma50=0.04; "
+        "returns1=0.003; returns5=0.012; returns20=0.031; volume_ratio=2.1; "
+        "vol20=0.018; atr14=0.009; news_sent=-0.12; social_sent=0.08; "
+        "abnormal_wick_count72h=2; abnormal_wick_max=4.5%; funding=0.0001; "
+        "ob_imbalance=0.22; role-signal-tail"
+    )
+
+    trend = _compact_role_signal(context, "trend_expert")
+    momentum = _compact_role_signal(context, "momentum_expert")
+    risk = _compact_role_signal(context, "risk_expert")
+
+    assert "rsi14=63.4" in trend
+    assert "adx14=27.5" in trend
+    assert "returns5=0.012" in momentum
+    assert "volume_ratio=2.1" in momentum
+    assert "abnormal_wick_count72h=2" in risk
+    assert "funding=0.0001" in risk
+    assert len(trend) <= 220
+    assert len(momentum) <= 220
+    assert len(risk) <= 220
+
+
+def test_compact_batch_prompt_contains_role_specific_tail_evidence() -> None:
+    prompt = build_batch_experts_user_prompt(
+        {
+            "trend_expert": (
+                "symbol=BTC/USDT; price=100; rsi14=63.4; macd_diff=0.0042; "
+                "adx14=27.5; bb_pct=0.82; price_vs_sma20=0.02"
+            ),
+            "momentum_expert": (
+                "symbol=BTC/USDT; price=100; returns1=0.003; returns5=0.012; "
+                "returns20=0.031; volume_ratio=2.1; vol20=0.018; atr14=0.009"
+            ),
+            "sentiment_expert": (
+                "symbol=BTC/USDT; price=100; returns1=0.003; news_sent=-0.12; "
+                "social_sent=0.08; direct_news=1; headlines=ETF approval"
+            ),
+            "position_expert": "symbol=BTC/USDT; price=100; returns5=0.012; rsi14=63.4",
+            "risk_expert": (
+                "symbol=BTC/USDT; price=100; abnormal_wick_count72h=2; "
+                "abnormal_wick_max=4.5%; vol20=0.018; funding=0.0001"
+            ),
+        },
+        {"review_positions": False, "_compact_qwen_batch": True},
+    )
+
+    assert "rsi14=63.4" in prompt
+    assert "returns5=0.012" in prompt
+    assert "news_sent=-0.12" in prompt
+    assert "abnormal_wick_count72h=2" in prompt
 
 
 def test_batch_expert_prompt_can_scope_to_provider_group() -> None:

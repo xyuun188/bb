@@ -382,6 +382,30 @@ def test_missing_index_reference_is_visible_without_corrupting_swap_path() -> No
     ]
 
 
+def test_lagging_reference_prices_do_not_expand_executable_candle_window() -> None:
+    timestamp = 1_783_990_859_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(0.01290, timestamp),
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 0.01290)
+    auxiliary["mark_price_fact"]["source_timestamp_ms"] = timestamp - 5 * 60_000
+    auxiliary["index_price_fact"]["source_timestamp_ms"] = timestamp - 7 * 60_000
+
+    contract = build_market_source_consistency(
+        rest,
+        [],
+        **auxiliary,
+        bars=[[timestamp, 0.01285, 0.01295, 0.01280, 0.01290, 10_000]],
+    )
+
+    assert contract["status"] == "clean"
+    assert contract["reasons"] == []
+    assert contract["path"]["missing_open_times_ms"] == []
+    assert contract["assertions"]["one_minute_path_verified"] is True
+
+
 def test_index_basis_is_not_compared_with_executable_swap_candle_path() -> None:
     timestamp = 1_783_990_800_000
     rest = build_market_fact(

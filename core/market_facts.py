@@ -525,11 +525,16 @@ def build_market_source_consistency(
         for value in [*facts, orderbook, mark, index]
         if (timestamp := _timestamp_ms(value.get("source_timestamp_ms"))) is not None
     ]
+    executable_timestamps = [
+        timestamp
+        for value in [*facts, orderbook]
+        if (timestamp := _timestamp_ms(value.get("source_timestamp_ms"))) is not None
+    ]
     missing_minutes: list[int] = []
-    if timestamps and normalized_bars:
+    if executable_timestamps and normalized_bars:
         minute_ms = 60_000
-        first_open = min(timestamps) - min(timestamps) % minute_ms
-        last_open = max(timestamps) - max(timestamps) % minute_ms
+        first_open = min(executable_timestamps) - min(executable_timestamps) % minute_ms
+        last_open = max(executable_timestamps) - max(executable_timestamps) % minute_ms
         available_minutes = {
             item["open_time_ms"] - item["open_time_ms"] % minute_ms
             for item in normalized_bars

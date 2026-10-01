@@ -256,6 +256,31 @@ async def test_vector_memory_search_defers_while_auto_reindex_is_warming(
     assert result["hits"] == []
 
 
+@pytest.mark.asyncio
+async def test_vector_memory_search_defers_when_store_gate_is_owned_by_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    service = VectorMemoryService(data_dir=tmp_path)
+    await service._store_call_lock.acquire()
+    try:
+        started = time.perf_counter()
+        result = await service.search("BTC long")
+        elapsed = time.perf_counter() - started
+    finally:
+        service._store_call_lock.release()
+
+    assert elapsed < 0.05
+    assert result["status"] == "warming"
+    assert result["deferred"] is True
+    assert result["reason"] == "vector_memory_store_busy"
+    assert result["hits"] == []
+
+
 def test_vector_memory_settings_defaults_are_safe() -> None:
     assert settings.vector_memory_enabled is False
     assert settings.vector_memory_backend == "jsonl"

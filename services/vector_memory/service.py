@@ -29,6 +29,10 @@ _VECTOR_MEMORY_MAX_NEWS_INDEX_ROWS = 500
 _VECTOR_MEMORY_REINDEX_FAILURE_BACKOFF_SECONDS = 300
 
 
+class _VectorMemoryStoreBusy(RuntimeError):
+    """Raised when advisory memory maintenance owns the serialized store gate."""
+
+
 def _vector_memory_decision_from_mapping(mapping: Any) -> SimpleNamespace:
     raw = {
         key: mapping.get(f"{_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX}{key}")
@@ -132,12 +136,23 @@ class VectorMemoryService:
             self._next_reindex_retry_at = None
             self._cached_document_count = None
 
-    async def _store_call(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
+    async def _store_call(
+        self,
+        operation: Any,
+        *args: Any,
+        defer_if_locked: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         """Run blocking vector-store work away from the trading event loop."""
 
         # Serialize store calls so a timed-out filesystem operation cannot race
         # a later writer. The worker is shielded and releases the gate only
         # after it actually finishes.
+        # This check is intentionally immediately adjacent to acquire: there is
+        # no await between them, so a search cannot slip into an already-held
+        # maintenance gate and turn advisory work into an analysis timeout.
+        if defer_if_locked and self._store_call_lock.locked():
+            raise _VectorMemoryStoreBusy
         await self._store_call_lock.acquire()
         worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
         timeout = max(float(settings.vector_memory_operation_timeout_seconds or 2.0), 0.1)
@@ -417,7 +432,18 @@ class VectorMemoryService:
                     text,
                     top_k=top_k,
                     filters=filters,
+                    defer_if_locked=True,
                 )
+        except _VectorMemoryStoreBusy:
+            return {
+                "enabled": True,
+                "status": "warming",
+                "hits": [],
+                "warming": True,
+                "deferred": True,
+                "reason": "vector_memory_store_busy",
+                "selection_policy": "observation_only",
+            }
         except Exception as exc:
             if self._discard_store_after_recoverable_error(exc):
                 try:

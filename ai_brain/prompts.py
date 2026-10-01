@@ -5,6 +5,7 @@ Designed for OpenAI-compatible chat completion API.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from services.entry_direction_support import summarize_paper_quantitative_evidence
@@ -58,6 +59,119 @@ def compact_value(
             for item in list(value)[:list_limit]
         ]
     return _short_text(value, 80)
+
+
+_ROLE_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "trend_expert": (
+        "symbol",
+        "price",
+        "change24h",
+        "rsi14",
+        "macd_diff",
+        "ema12",
+        "ema26",
+        "adx14",
+        "bb_pct",
+        "bb_width",
+        "price_vs_sma20",
+        "price_vs_sma50",
+    ),
+    "momentum_expert": (
+        "symbol",
+        "price",
+        "change24h",
+        "returns1",
+        "returns5",
+        "returns20",
+        "volume_ratio",
+        "vol20",
+        "atr14",
+        "bb_pct",
+        "rsi14",
+        "adx14",
+        "funding",
+        "ob_imbalance",
+    ),
+    "sentiment_expert": (
+        "symbol",
+        "price",
+        "change24h",
+        "returns1",
+        "returns5",
+        "returns20",
+        "news_sent",
+        "social_sent",
+        "mentions",
+        "articles",
+        "direct_news",
+        "market_background_news",
+        "sentiment_available",
+        "headlines",
+        "news_items",
+    ),
+    "position_expert": (
+        "symbol",
+        "price",
+        "change24h",
+        "returns5",
+        "returns20",
+        "rsi14",
+        "volume_ratio",
+        "vol20",
+        "news_sent",
+        "funding",
+        "ob_imbalance",
+    ),
+    "risk_expert": (
+        "symbol",
+        "price",
+        "change24h",
+        "abnormal_wick_count72h",
+        "abnormal_wick_max",
+        "abnormal_wick_recent_h",
+        "volume24h",
+        "volume_ratio",
+        "vol20",
+        "atr14",
+        "funding",
+        "ob_imbalance",
+        "bid_depth",
+        "ask_depth",
+        "news_sent",
+        "social_sent",
+    ),
+}
+
+
+def _compact_role_signal(value: Any, expert_name: str, limit: int = 220) -> str:
+    """Keep role-relevant key/value evidence inside the compact batch contract."""
+
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    fields: dict[str, str] = {}
+    for match in re.finditer(r"([A-Za-z][A-Za-z0-9_]*)=([^;]*)(?:;|$)", text):
+        key = match.group(1)
+        item = " ".join(match.group(2).split())
+        if item:
+            fields.setdefault(key, item)
+    if not fields:
+        return text[:limit]
+
+    selected = _ROLE_SIGNAL_FIELDS.get(expert_name, ())
+    parts: list[str] = []
+    for key in selected:
+        item = fields.get(key)
+        if item:
+            parts.append(f"{key}={item}")
+    # Preserve a small amount of context for newly added fields without
+    # letting an unknown field crowd out the role's core evidence.
+    if not parts:
+        parts = [f"{key}={item}" for key, item in list(fields.items())[:8]]
+    compact = ";".join(parts)
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip(" ;")
 
 
 SYSTEM_PROMPT = """You are a professional cryptocurrency quantitative trading AI. Your task is to analyze real-time market data, technical indicators, and news sentiment to make precise trading decisions.
@@ -573,9 +687,10 @@ def build_batch_experts_user_prompt(
     if compact_qwen_batch:
         compact_data = {
             # The target carrier only emits one action code per role. Keep a
-            # short high-signal prefix so long feature tails cannot push the
-            # single-worker prefill back into the multi-second knee.
-            name: _short_text(market_by_expert.get(name, ""), 48)
+            # bounded role-scoped context.  A prefix-only truncation used to
+            # discard the role's RSI/ADX/return/news evidence, making every
+            # expert see the same symbol/price header and default to hold.
+            name: _compact_role_signal(market_by_expert.get(name, ""), name)
             for name in requested_experts
         }
         compact_order = ",".join(requested_experts)

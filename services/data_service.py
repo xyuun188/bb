@@ -1366,7 +1366,11 @@ class DataService:
         timestamp_sources: list[dict[str, Any]] = []
         for snapshot in source_snapshots:
             timestamp_sources.append(snapshot)
-            for key in ("orderbook_fact", "mark_price_fact", "index_price_fact"):
+            # The executable 1m path proves ticker/orderbook continuity. Mark
+            # and index observations are reference data and may legitimately
+            # lag or arrive from a different clock; including them here can
+            # expand the required candle window into an unavailable history.
+            for key in ("orderbook_fact",):
                 nested = snapshot.get(key)
                 if isinstance(nested, dict):
                     timestamp_sources.append(nested)
