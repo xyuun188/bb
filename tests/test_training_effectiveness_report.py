@@ -11,6 +11,8 @@ from services.training_effectiveness_report import (
     calculate_fee_after_return,
     calculate_metric_delta,
     classify_sample_authority,
+    report_valid_sample_count,
+    should_preserve_cached_report,
     validate_report,
 )
 
@@ -117,6 +119,28 @@ def test_service_distinguishes_real_empty_result_from_provider_failure():
     )
     assert report["status"] == "partial"
     assert "no_okx_realized_samples" in report["conclusion"]["blocking_reasons"]
+
+
+def test_empty_candidate_does_not_replace_cached_authoritative_report():
+    cached = {
+        "status": "complete",
+        "sample_quality": {"valid_sample_count": 3},
+        "metrics": {"observed": {"sample_count": 3}},
+    }
+    candidate = {
+        "status": "partial",
+        "sample_quality": {"valid_sample_count": 0},
+        "metrics": {"observed": {"sample_count": 0}},
+    }
+    assert report_valid_sample_count(cached) == 3
+    assert report_valid_sample_count(candidate) == 0
+    assert should_preserve_cached_report(candidate, cached) is True
+
+
+def test_complete_empty_candidate_is_not_silently_preserved():
+    cached = {"status": "complete", "sample_quality": {"valid_sample_count": 2}}
+    candidate = {"status": "complete", "sample_quality": {"valid_sample_count": 0}}
+    assert should_preserve_cached_report(candidate, cached) is False
 
 
 def test_service_infers_active_model_from_authoritative_samples_when_registry_has_no_active():

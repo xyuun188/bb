@@ -18,7 +18,6 @@ from services.paper_live_consistency import (
     assert_strategy_context_decision_parity,
 )
 from services.strategy_contract_adapter import (
-    ai_output_from_decision,
     context_from_feature_vector,
     decision_from_ai_output,
 )
@@ -117,7 +116,7 @@ def test_invalid_decision_contract_fails_closed() -> None:
         _decision(context, confidence=1.1)
 
 
-def test_decision_output_round_trip_preserves_execution_semantics() -> None:
+def test_decision_output_maps_to_standard_contract() -> None:
     context = _context(ExecutionMode.PAPER)
     legacy = DecisionOutput(
         model_name="ensemble_trader",
@@ -133,10 +132,6 @@ def test_decision_output_round_trip_preserves_execution_semantics() -> None:
     standard = decision_from_ai_output(legacy, context)
     assert standard.action == StrategyAction.ENTER
     assert standard.side == PositionSide.LONG
-    restored = ai_output_from_decision(standard, context)
-    assert restored.action == Action.LONG
-    assert restored.position_size_pct == pytest.approx(0.2)
-    assert restored.raw_response["strategy_contract"]["decision_sha256"] == standard.decision_sha256
 
 
 def test_realtime_adapter_rejects_naive_feature_time() -> None:

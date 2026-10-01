@@ -80,6 +80,8 @@ tmp_*_check.py
 /online_health_*.json
 /test_full_latest.out
 /inspect.out
+/current_strategy_health.json
+/tracked_files.txt
 /_tmp_*.py
 *.bak-codex-*
 *.bak_codex_*

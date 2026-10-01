@@ -69,7 +69,6 @@ ALLOWLIST = (
     "web_dashboard/static/css/dashboard.css",
     "web_dashboard/static/index.html",
     "web_dashboard/static/js/dashboard.js",
-    "docs/superpowers/plans/2026-06-26-phase-3-quant-master-control-plan.md",
 )
 
 

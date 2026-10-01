@@ -43,13 +43,14 @@ async def run_once(
     *,
     record_history: bool,
     source: str,
+    fresh_required_audits: bool = True,
     collector: Callable[..., Awaitable[dict[str, Any]]] = collect_system_audit_status,
 ) -> dict[str, Any]:
     try:
         payload = await collector(
             record_history=record_history,
             source=source,
-            fresh_required_audits=True,
+            fresh_required_audits=fresh_required_audits,
         )
         return {
             "ok": True,
@@ -64,11 +65,17 @@ async def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="subprocess")
     parser.add_argument("--no-record-history", action="store_true")
+    parser.add_argument(
+        "--fresh-required-audits",
+        action="store_true",
+        help="Bypass recent required-card snapshots for an operator-requested full scan.",
+    )
     args = parser.parse_args()
     try:
         result = await run_once(
             record_history=not bool(args.no_record_history),
             source=str(args.source or "subprocess")[:80],
+            fresh_required_audits=bool(args.fresh_required_audits),
         )
     except asyncio.CancelledError:
         raise

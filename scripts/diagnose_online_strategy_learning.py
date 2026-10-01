@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import shlex
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.remote_ssh import connect_remote_ssh, run_remote_text
-
+from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 
 REMOTE_CODE = r'''
 import asyncio

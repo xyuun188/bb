@@ -163,57 +163,6 @@ def decision_from_ai_output(
     return standard
 
 
-def ai_output_from_decision(
-    decision: StrategyDecision,
-    context: StrategyContext,
-    *,
-    model_name: str | None = None,
-    reasoning: str | None = None,
-) -> DecisionOutput:
-    """Build a legacy executor view for compatibility with existing BB policies."""
-
-    assert_decision_matches_context(context, decision)
-    action = _legacy_action(decision)
-    hints = dict(decision.protection_hints)
-    current_exposure = _current_exposure(context.position_snapshot)
-    close_fraction = 0.0
-    if decision.action == StrategyAction.EXIT:
-        close_fraction = 1.0
-    elif decision.action == StrategyAction.REDUCE and current_exposure > 0:
-        close_fraction = min(
-            max((current_exposure - decision.target_exposure) / current_exposure, 0.0),
-            1.0,
-        )
-    raw_response = {
-        "strategy_contract": {
-            "adapter_version": STRATEGY_ADAPTER_VERSION,
-            "context_sha256": context.context_sha256,
-            "strategy_input_sha256": context.strategy_input_sha256,
-            "decision_sha256": decision.decision_sha256,
-            "reason_codes": list(decision.reason_codes),
-        }
-    }
-    return DecisionOutput(
-        model_name=str(model_name or decision.source),
-        symbol=decision.symbol,
-        action=action,
-        confidence=decision.confidence,
-        reasoning=reasoning or ",".join(decision.reason_codes),
-        position_size_pct=(
-            decision.target_exposure if decision.action == StrategyAction.ENTER else 0.0
-        ),
-        suggested_leverage=_finite(hints.get("suggested_leverage"), default=1.0),
-        stop_loss_pct=_finite(hints.get("stop_loss_pct")),
-        take_profit_pct=_finite(hints.get("take_profit_pct")),
-        suggested_holding_minutes=_finite(hints.get("suggested_holding_minutes")),
-        maximum_holding_minutes=_finite(hints.get("maximum_holding_minutes")),
-        suggested_close_fraction=close_fraction,
-        timestamp=context.decision_time,
-        raw_response=raw_response,
-        feature_snapshot=dict(context.feature_snapshot),
-    )
-
-
 def _build_context(
     *,
     symbol: str,
@@ -266,14 +215,6 @@ def _standard_action(
             return StrategyAction.REDUCE, side, current_exposure * (1 - fraction)
         return StrategyAction.EXIT, side, 0.0
     return StrategyAction.HOLD, current_side, current_exposure
-
-
-def _legacy_action(decision: StrategyDecision) -> Action:
-    if decision.action == StrategyAction.ENTER:
-        return Action.LONG if decision.side == PositionSide.LONG else Action.SHORT
-    if decision.action in {StrategyAction.EXIT, StrategyAction.REDUCE}:
-        return Action.CLOSE_LONG if decision.side == PositionSide.LONG else Action.CLOSE_SHORT
-    return Action.HOLD
 
 
 def _reason_codes(

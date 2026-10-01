@@ -395,6 +395,45 @@ def load_cached_training_effectiveness_report(
     return payload
 
 
+def report_valid_sample_count(report: dict[str, Any] | None) -> int:
+    """Return the authoritative sample count represented by a report."""
+
+    if not isinstance(report, dict):
+        return 0
+    quality = report.get("sample_quality")
+    if isinstance(quality, dict):
+        try:
+            count = int(quality.get("valid_sample_count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            return count
+    metrics = report.get("metrics")
+    if isinstance(metrics, dict):
+        observed = metrics.get("observed")
+        if isinstance(observed, dict):
+            try:
+                return max(int(observed.get("sample_count") or 0), 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def should_preserve_cached_report(
+    candidate: dict[str, Any] | None,
+    cached: dict[str, Any] | None,
+) -> bool:
+    """Prevent a transient empty read from erasing useful training evidence."""
+
+    return (
+        report_valid_sample_count(candidate) == 0
+        and report_valid_sample_count(cached) > 0
+        and isinstance(candidate, dict)
+        and str(candidate.get("status") or "").lower()
+        in {"partial", "generation_failed", "invalid"}
+    )
+
+
 def apply_report_filters(report: dict[str, Any], **filters: Any) -> dict[str, Any]:
     """Apply filters and recompute metrics from the cached sample projection."""
 

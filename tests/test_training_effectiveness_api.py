@@ -129,3 +129,57 @@ async def test_dashboard_route_exposes_failure_sidecar_without_overwriting_valid
     assert result["status"] == "complete"
     assert result["metrics"]["observed"]["sample_count"] == 2
     assert result["generation_failure"]["error_code"] == "generation_timeout"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_generation_preserves_cached_report_on_empty_snapshot(
+    monkeypatch, tmp_path
+):
+    from web_dashboard.api import dashboard
+
+    candidate = {
+        "report_id": "te-empty",
+        "input_fingerprint": "sha256:" + "2" * 64,
+        "status": "partial",
+        "sample_quality": {"valid_sample_count": 0},
+        "metrics": {"observed": {"sample_count": 0}},
+    }
+    cached = {
+        "report_id": "te-good",
+        "status": "complete",
+        "sample_quality": {"valid_sample_count": 4},
+        "metrics": {"observed": {"sample_count": 4}},
+    }
+    async def build_candidate(*_args, **_kwargs):
+        return candidate
+
+    monkeypatch.setattr(
+        dashboard.TrainingEffectivenessReportService,
+        "build",
+        build_candidate,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "load_cached_training_effectiveness_report",
+        lambda **_kwargs: cached,
+    )
+    report_root = tmp_path / "training_effectiveness_reports"
+    monkeypatch.setattr(dashboard, "report_directory", lambda _data_dir=None: report_root)
+    monkeypatch.setattr(
+        dashboard,
+        "generation_failure_report_path",
+        lambda *, data_dir=None, mode="all": report_root
+        / f"latest{'-' + mode if mode != 'all' else ''}-generation-failed.json",
+    )
+
+    await dashboard._generate_training_effectiveness_report(mode="all")
+
+    latest = tmp_path / "training_effectiveness_reports" / "latest.json"
+    assert latest.exists() is False
+    sidecar = (
+        tmp_path
+        / "training_effectiveness_reports"
+        / "latest-generation-failed.json"
+    )
+    assert sidecar.exists()
+    assert "empty_authoritative_snapshot" in sidecar.read_text(encoding="utf-8")

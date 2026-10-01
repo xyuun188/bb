@@ -1595,6 +1595,25 @@ async def test_data_collection_status_audit_read_does_not_start_refresh(
     assert body["cache"]["cold_start"] is True
 
 
+@pytest.mark.asyncio
+async def test_data_collection_status_audit_read_does_not_build_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_build(_include_feature_coverage: bool) -> dict[str, Any]:
+        raise AssertionError("audit read must not run the DB-heavy SQLite builder")
+
+    monkeypatch.setattr(settings, "database_url", "sqlite+aiosqlite:///runtime.db")
+    monkeypatch.setattr(data_collection_module, "_build_data_collection_status", unexpected_build)
+
+    body = await data_collection_module.get_data_collection_status(
+        include_feature_coverage=False,
+        start_background_refresh=False,
+    )
+
+    assert body["status"] == "warming"
+    assert body["cache"]["cold_start"] is True
+
+
 def test_persisted_data_collection_status_round_trips(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

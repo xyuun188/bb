@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 
-
 REMOTE_CODE = r"""
 import asyncio
 import json

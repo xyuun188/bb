@@ -10,13 +10,13 @@ This document is the single execution entrypoint for the next phase.
 
 It consolidates and supersedes the execution guidance in:
 
-- `docs/superpowers/plans/2026-06-29-system-profitability-optimization-plan.md`
-- `docs/superpowers/plans/2026-06-29-profit-first-master-control-v3-plan.md`
+- `docs/archive/2026-06-29-system-profitability-optimization-plan.md`
+- `docs/archive/2026-06-29-profit-first-master-control-v3-plan.md`
 
 It inherits historical facts, safety boundaries, and Phase 3 infrastructure constraints from:
 
-- `docs/superpowers/plans/2026-06-26-phase-3-quant-master-control-plan.md`
-- `docs/superpowers/plans/2026-06-22-quant-closed-loop-eradication.md`
+- `docs/archive/2026-06-26-phase-3-quant-master-control-plan.md`
+- `docs/archive/2026-06-22-quant-closed-loop-eradication.md`
 
 Use the older documents as evidence logs and background references only. Do not execute a new change from an older plan if it conflicts with this document.
 

@@ -33,6 +33,7 @@ from services.training_effectiveness_report import (  # noqa: E402
     generation_failure_report_path,
     load_cached_training_effectiveness_report,
     report_directory,
+    should_preserve_cached_report,
 )  # noqa: E402
 
 LOCK_NAME = "training_effectiveness_report.lock"
@@ -102,7 +103,13 @@ def main(argv: list[str] | None = None) -> int:
     root = report_directory(settings.data_dir)
     lock_path = Path(settings.data_dir) / LOCK_NAME
     fingerprint = build_input_fingerprint(_freshness_inputs(args))
-    latest = load_cached_training_effectiveness_report(data_dir=settings.data_dir)
+    latest_report_id = (
+        None if args.mode == "all" else f"latest-{args.mode}"
+    )
+    latest = load_cached_training_effectiveness_report(
+        report_id=latest_report_id,
+        data_dir=settings.data_dir,
+    )
     if latest.get("status") == "complete" and latest.get("input_fingerprint") == fingerprint:
         print(json.dumps({"status": "cached", "report_id": latest.get("report_id"), "input_fingerprint": fingerprint}))
         return 0
@@ -147,12 +154,50 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         else:
-            _atomic_write(root / "latest.json", report)
-            generation_failure_report_path(
-                data_dir=settings.data_dir,
-                mode=args.mode,
-            ).unlink(missing_ok=True)
-            print(json.dumps({"status": "written", "report_id": report.get("report_id"), "path": str(report_path), "input_fingerprint": fingerprint}))
+            cached = load_cached_training_effectiveness_report(data_dir=settings.data_dir)
+            if should_preserve_cached_report(report, cached):
+                preserved = build_generation_failed_report(
+                    filters=_freshness_inputs(args),
+                    run_id=args.run_id,
+                    input_fingerprint=fingerprint,
+                    error_code="empty_authoritative_snapshot",
+                    stage=args.stage,
+                )
+                preserved["latest_preserved"] = True
+                preserved["latest_preserved_reason"] = (
+                    "candidate_report_has_no_authoritative_samples"
+                )
+                preserved["candidate_report_id"] = report.get("report_id")
+                _atomic_write(
+                    generation_failure_report_path(
+                        data_dir=settings.data_dir,
+                        mode=args.mode,
+                    ),
+                    preserved,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "status": "latest_preserved",
+                            "report_id": report.get("report_id"),
+                            "path": str(report_path),
+                            "preserved_report_id": cached.get("report_id"),
+                            "input_fingerprint": fingerprint,
+                        }
+                    )
+                )
+            else:
+                latest_path = (
+                    root / "latest.json"
+                    if args.mode == "all"
+                    else root / f"latest-{args.mode}.json"
+                )
+                _atomic_write(latest_path, report)
+                generation_failure_report_path(
+                    data_dir=settings.data_dir,
+                    mode=args.mode,
+                ).unlink(missing_ok=True)
+                print(json.dumps({"status": "written", "report_id": report.get("report_id"), "path": str(report_path), "input_fingerprint": fingerprint}))
         return 0
     finally:
         _release_lock(lock_path, descriptor)

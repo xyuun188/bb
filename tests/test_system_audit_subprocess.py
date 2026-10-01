@@ -26,6 +26,25 @@ def test_system_audit_runner_bootstraps_online_runtime_before_settings_imports()
     settings_heavy_import_index = source.index("from web_dashboard.api.system_audit import")
     assert bootstrap_index < settings_heavy_import_index
     assert "drop_privileges_to_runtime_user_if_needed(project_root=ROOT)" in source
+    assert "--fresh-required-audits" in source
+
+
+@pytest.mark.asyncio
+async def test_system_audit_runner_reuses_recent_required_cards_by_default() -> None:
+    calls: list[bool] = []
+
+    async def collector(**kwargs: Any) -> dict[str, Any]:
+        calls.append(bool(kwargs["fresh_required_audits"]))
+        return {"checked_at": datetime.now(UTC).isoformat(), "status": "ok"}
+
+    await run_system_audit_snapshot.run_once(
+        record_history=False,
+        source="test",
+        fresh_required_audits=False,
+        collector=collector,
+    )
+
+    assert calls == [False]
 
 
 @pytest.mark.asyncio
@@ -119,7 +138,7 @@ async def test_audit_reads_persisted_data_collection_snapshot_before_warming(
 
 
 @pytest.mark.asyncio
-async def test_audit_cold_start_waits_for_one_bounded_data_collection_refresh(
+async def test_audit_cold_start_does_not_start_data_collection_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -156,8 +175,8 @@ async def test_audit_cold_start_waits_for_one_bounded_data_collection_refresh(
     assert calls == [
         {
             "include_feature_coverage": False,
-            "start_background_refresh": True,
-            "wait_for_initial_refresh": True,
+            "start_background_refresh": False,
+            "wait_for_initial_refresh": False,
         }
     ]
 

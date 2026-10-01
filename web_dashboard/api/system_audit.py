@@ -126,7 +126,7 @@ SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 1
 # integrity scans to finish without starving the required contract card.
 # This work runs in the background; the API serves the last completed snapshot
 # while a new one is being assembled.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 45.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
 # These two cards directly feed the phase-3 go/no-go decision. They must be
 # collected before the diagnostic backlog so queue contention cannot turn a
 # healthy required check into ``required_audits_deferred``.
@@ -134,7 +134,7 @@ REQUIRED_AUDIT_MAX_CONCURRENCY = 2
 REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS = 10 * 60
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 60.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
 SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS = 900.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -4319,8 +4319,11 @@ async def _data_collection_status_for_audit() -> dict[str, Any]:
     getter = data_collection_api.get_data_collection_status
     kwargs: dict[str, Any] = {
         "include_feature_coverage": False,
-        "start_background_refresh": True,
-        "wait_for_initial_refresh": True,
+        # System audit is read-only diagnostics. Starting the first DB-heavy
+        # refresh here can consume the entire audit budget and turn an
+        # unavailable snapshot into a false required-audit blocker.
+        "start_background_refresh": False,
+        "wait_for_initial_refresh": False,
     }
     try:
         parameters = inspect.signature(getter).parameters

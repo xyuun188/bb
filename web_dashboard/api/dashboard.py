@@ -98,6 +98,7 @@ from services.training_effectiveness_report import (
     load_cached_training_effectiveness_report,
     load_generation_failure_report,
     report_directory,
+    should_preserve_cached_report,
 )
 from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
@@ -13640,6 +13641,37 @@ async def _generate_training_effectiveness_report(*, mode: str) -> None:
             if selected_mode == "all"
             else root / f"latest-{selected_mode}.json"
         )
+        cached = load_cached_training_effectiveness_report(
+            report_id=None if selected_mode == "all" else f"latest-{selected_mode}",
+            data_dir=settings.data_dir,
+        )
+        if should_preserve_cached_report(report, cached):
+            preserved = build_generation_failed_report(
+                filters=filters,
+                input_fingerprint=report.get("input_fingerprint"),
+                error_code="empty_authoritative_snapshot",
+                stage="dashboard",
+            )
+            preserved["latest_preserved"] = True
+            preserved["latest_preserved_reason"] = (
+                "candidate_report_has_no_authoritative_samples"
+            )
+            preserved["candidate_report_id"] = report.get("report_id")
+            failure_path = generation_failure_report_path(
+                data_dir=settings.data_dir, mode=selected_mode
+            )
+            with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
+                json.dump(preserved, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                temporary = Path(handle.name)
+            await asyncio.to_thread(temporary.replace, failure_path)
+            await asyncio.to_thread(
+                lambda: report_path.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            )
+            return
         for path in (report_path, latest_path):
             with NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as handle:
                 json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)

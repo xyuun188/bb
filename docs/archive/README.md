@@ -16,6 +16,13 @@
 | [repair_retrospective_and_monitoring_2026-06-21](./repair_retrospective_and_monitoring_2026-06-21.md) | 历史修复复盘与监控记录。 |
 | [strategy_closure_plan_2026-06-20](./strategy_closure_plan_2026-06-20.md) | 早期策略闭环治理计划。 |
 | [system_business_logic_tech_stack_models_2026-07-26](./system_business_logic_tech_stack_models_2026-07-26.md) | 历史系统全景快照，含旧线上状态和旧提交基线。 |
+| [2026-06-22 quant closed-loop eradication](./2026-06-22-quant-closed-loop-eradication.md) | 早期全量闭环治理记录，已由当前权威执行文档替代。 |
+| [2026-06-26 Phase 3 quant master control](./2026-06-26-phase-3-quant-master-control-plan.md) | Phase 3 历史基础设施与验收记录，仅供追溯。 |
+| [2026-06-29 Profit-First master control v3](./2026-06-29-profit-first-master-control-v3-plan.md) | 已被同日 authoritative master plan 替代。 |
+| [2026-06-29 system profitability optimization](./2026-06-29-system-profitability-optimization-plan.md) | 已被同日 authoritative master plan 替代。 |
+| [2026-07-22 continuous model training and trading remediation](./2026-07-22-continuous-model-training-and-trading-remediation-plan.md) | 历史训练/交易整改计划，已归档。 |
+| [2026-07-27 paper/live permission and training loop remediation](./2026-07-27-paper-live-permission-and-training-loop-remediation-plan.md) | 历史权限与训练闭环计划，已归档。 |
+| [2026-08-17 quant platform full remediation](./2026-08-17-quant-platform-full-remediation-plan.md) | 历史平台整改计划，已归档。 |
 
 ## 使用限制
 

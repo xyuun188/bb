@@ -15,9 +15,9 @@ from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_VERSION,
-    normalize_normal_paper_contract,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
+    normalize_normal_paper_contract,
 )
 
 

@@ -1679,6 +1679,12 @@ async def get_data_collection_status(
 ) -> dict[str, Any]:
     cache_enabled = str(settings.database_url or "").startswith("postgresql")
     if not cache_enabled:
+        # Read-only callers (notably the isolated system audit) must never
+        # fall through to the full DB-heavy builder on SQLite.  The previous
+        # branch ignored ``start_background_refresh=False`` and could block
+        # the whole audit until its global deadline.
+        if not start_background_refresh:
+            return _warming_data_collection_status(include_feature_coverage)
         return await _build_data_collection_status(include_feature_coverage)
     cached = _status_cache.get(include_feature_coverage)
     if cached is not None:
