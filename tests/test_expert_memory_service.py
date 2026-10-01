@@ -339,3 +339,5 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
     assert loader_calls[0]["limit"] == 200
     assert loader_calls[0]["compact"] is True
     assert loader_calls[0]["include_decision_evidence"] is True
+    assert report["batches"] == 1
+    assert report["batch_size"] == 25

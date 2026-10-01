@@ -388,6 +388,21 @@ class VectorMemoryService:
         if not text:
             return {"enabled": True, "status": "empty_query", "hits": []}
         self.ensure_fresh_index(reason="search")
+        # Reindex is advisory maintenance.  It owns the serialized store gate
+        # for the duration of the rebuild, so waiting here only converts a
+        # healthy cold-start into a model-analysis timeout.  Return an explicit
+        # deferred state; callers can continue without historical context and
+        # the next request will use the rebuilt index.
+        if self._auto_reindex_running():
+            return {
+                "enabled": True,
+                "status": "warming",
+                "hits": [],
+                "warming": True,
+                "deferred": True,
+                "reason": "vector_memory_reindex_in_progress",
+                "selection_policy": "observation_only",
+            }
         filters = {
             key: value
             for key, value in {
@@ -427,6 +442,16 @@ class VectorMemoryService:
                         "selection_policy": "similarity_ranked_top_k_without_fixed_score_gate",
                         "store_recovered": True,
                     }
+            if self._auto_reindex_running():
+                return {
+                    "enabled": True,
+                    "status": "warming",
+                    "hits": [],
+                    "warming": True,
+                    "deferred": True,
+                    "reason": "vector_memory_reindex_in_progress",
+                    "selection_policy": "observation_only",
+                }
             self._last_error = safe_error_text(exc, limit=180)
             logger.warning("vector memory search failed", error=self._last_error)
             return {"enabled": True, "status": "error", "error": self._last_error, "hits": []}

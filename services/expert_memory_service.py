@@ -34,6 +34,11 @@ MEMORY_HIT_MARK_TIMEOUT_SECONDS = 0.75
 # decision/market JSON for every lifecycle at once previously grew the trading
 # process to several gigabytes and stalled its heartbeat.
 AUTHORITATIVE_BACKFILL_LIMIT = 200
+# Keep each reflection/memory write transaction short.  A single transaction
+# over the whole outcome window used to hold a pooled connection while every
+# expert memory was upserted, starving the trading loop and producing dropped
+# model-analysis requests.
+AUTHORITATIVE_BACKFILL_BATCH_SIZE = 25
 
 
 def _exchange_order_ids(value: Any) -> tuple[str, ...]:
@@ -288,27 +293,38 @@ class ExpertMemoryService:
                 if outcome.get("settlement_fact_trusted") is True
                 and outcome.get("outcome_complete") is True
             ]
-            async with self.session_factory() as session:
-                processed = 0
-                for outcome in complete_outcomes:
-                    processed += int(
-                        await self._record_authoritative_outcome_in_session(session, outcome)
-                    )
-                report = {
-                    "status": "completed",
-                    "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
-                    "scanned": len(outcomes),
-                    "eligible": len(complete_outcomes),
-                    "unique_lifecycles": len(
-                        {str(item.get("lifecycle_key") or "") for item in complete_outcomes}
-                    ),
-                    "complete_before_reflection_sync": len(complete_outcomes),
-                    "processed": processed,
-                    "truncated": len(outcomes) >= AUTHORITATIVE_BACKFILL_LIMIT,
-                    "batch_limit": AUTHORITATIVE_BACKFILL_LIMIT,
-                }
-                logger.info("trade reflection backfill completed", **report)
-                return report
+            processed = 0
+            batch_size = max(int(AUTHORITATIVE_BACKFILL_BATCH_SIZE), 1)
+            batches = 0
+            for start in range(0, len(complete_outcomes), batch_size):
+                batch = complete_outcomes[start : start + batch_size]
+                # A fresh context commits this small batch and promptly returns
+                # its connection before the next batch is loaded.
+                async with self.session_factory() as session:
+                    for outcome in batch:
+                        processed += int(
+                            await self._record_authoritative_outcome_in_session(
+                                session, outcome
+                            )
+                        )
+                batches += 1
+            report = {
+                "status": "completed",
+                "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+                "scanned": len(outcomes),
+                "eligible": len(complete_outcomes),
+                "unique_lifecycles": len(
+                    {str(item.get("lifecycle_key") or "") for item in complete_outcomes}
+                ),
+                "complete_before_reflection_sync": len(complete_outcomes),
+                "processed": processed,
+                "batches": batches,
+                "batch_size": batch_size,
+                "truncated": len(outcomes) >= AUTHORITATIVE_BACKFILL_LIMIT,
+                "batch_limit": AUTHORITATIVE_BACKFILL_LIMIT,
+            }
+            logger.info("trade reflection backfill completed", **report)
+            return report
         except Exception as exc:
             logger.warning("failed to backfill trade reflections", error=safe_error_text(exc))
             return {"status": "error", "processed": 0, "error": safe_error_text(exc)}

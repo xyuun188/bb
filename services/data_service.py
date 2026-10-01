@@ -1292,8 +1292,15 @@ class DataService:
             selected["market_source_snapshots"] = [
                 self._market_source_snapshot_payload(item) for item in source_snapshots
             ]
+            # The market scan can reuse the isolated native 1m refresh that was
+            # started by the ticker snapshot.  Final entry validation still
+            # calls the same helper synchronously and remains fail-closed.
             selected["native_consistency_bars_1m"] = (
-                await self._fetch_native_consistency_bars(normalized, source_snapshots)
+                await self._fetch_native_consistency_bars(
+                    normalized,
+                    source_snapshots,
+                    wait_for_completion=block_on_remote,
+                )
             )
             if selected.get("source") == "rest":
                 self.ws_client.latest_tickers[normalized] = dict(selected)
@@ -1343,6 +1350,8 @@ class DataService:
         self,
         symbol: str,
         source_snapshots: list[dict[str, Any]],
+        *,
+        wait_for_completion: bool = True,
     ) -> list[Any]:
         normalized = self._normalize_symbols([symbol])[0]
         now = asyncio.get_running_loop().time()
@@ -1416,6 +1425,8 @@ class DataService:
         task_key = (normalized, required_first_open, required_last_open)
         existing = tasks.get(task_key)
         if existing is not None and not existing.done():
+            if not wait_for_completion:
+                return []
             try:
                 rows = list(
                     await asyncio.wait_for(
@@ -1509,6 +1520,8 @@ class DataService:
             _consume_task_result(finished)
 
         task.add_done_callback(cleanup)
+        if not wait_for_completion:
+            return []
         try:
             rows = list(
                 await asyncio.wait_for(

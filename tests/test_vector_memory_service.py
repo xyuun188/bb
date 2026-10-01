@@ -235,6 +235,27 @@ async def test_vector_memory_store_timeout_does_not_block_following_calls(
     assert service._store_call_lock.locked() is False
 
 
+@pytest.mark.asyncio
+async def test_vector_memory_search_defers_while_auto_reindex_is_warming(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", True)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._auto_reindex_task = asyncio.create_task(asyncio.sleep(60))
+    try:
+        result = await service.search("BTC long")
+    finally:
+        await service._cancel_auto_reindex()
+
+    assert result["status"] == "warming"
+    assert result["deferred"] is True
+    assert result["hits"] == []
+
+
 def test_vector_memory_settings_defaults_are_safe() -> None:
     assert settings.vector_memory_enabled is False
     assert settings.vector_memory_backend == "jsonl"
