@@ -300,6 +300,13 @@ def parse_exchange_position_snapshot(
         or _first_positive_float(info.get("imr"), default=0.0)
         or _first_positive_float(info.get("margin"), default=0.0)
     )
+    leverage = _first_positive_float(
+        info.get("lever"),
+        info.get("leverage"),
+        position.get("leverage"),
+        position.get("lever"),
+        default=0.0,
+    )
 
     return {
         "symbol": symbol,
@@ -315,6 +322,7 @@ def parse_exchange_position_snapshot(
         "raw_quantity": raw_quantity,
         "notional": notional,
         "margin_used": margin_used,
+        "leverage": leverage,
         "raw_symbol": info.get("instId") or position.get("symbol"),
         "ccxt_symbol": position.get("symbol"),
         "raw_pos_side": okx_pos_side or ccxt_side,

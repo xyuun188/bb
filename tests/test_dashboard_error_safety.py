@@ -23,6 +23,35 @@ from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api import dashboard, symbols
 
 
+def test_open_position_display_prefers_native_exchange_leverage() -> None:
+    positions = dashboard._group_open_dashboard_positions(
+        [
+            {
+                "id": 1,
+                "model_name": ENSEMBLE_TRADER_NAME,
+                "mode": "paper",
+                "symbol": "XRP/USDT",
+                "side": "long",
+                "quantity": 581.0,
+                "entry_price": 1.5248,
+                "leverage": 1.0,
+            }
+        ],
+        {
+            ("XRP/USDT", "long"): {
+                "quantity": 581.0,
+                "entry_price": 1.5248,
+                "mark_price": 1.5232,
+                "upl": -0.92,
+                "leverage": 23.0,
+            }
+        },
+        mode="paper",
+    )
+
+    assert positions[0]["leverage"] == pytest.approx(23.0)
+
+
 class _FixedDashboardDatetime(datetime):
     @classmethod
     def now(cls, tz=None):

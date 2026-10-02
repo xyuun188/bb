@@ -35,6 +35,29 @@ def test_parse_position_treats_non_mapping_info_as_empty() -> None:
     assert snapshot["contracts"] == pytest.approx(2.0)
 
 
+def test_parse_okx_position_snapshot_preserves_native_leverage() -> None:
+    snapshot = parse_exchange_position_snapshot(
+        {
+            "symbol": "XRP/USDT:USDT",
+            "side": "long",
+            "contracts": 581.0,
+            "markPrice": 1.5232,
+            "entryPrice": 1.5248,
+            "info": {
+                "instId": "XRP-USDT-SWAP",
+                "pos": "581",
+                "posSide": "net",
+                "lever": "23",
+                "upl": "-0.92",
+            },
+        },
+        symbol_normalizer=normalize_trading_symbol,
+    )
+
+    assert snapshot is not None
+    assert snapshot["leverage"] == pytest.approx(23.0)
+
+
 def test_parse_position_does_not_infer_contract_size_from_notional() -> None:
     snapshot = parse_exchange_position_snapshot(
         {

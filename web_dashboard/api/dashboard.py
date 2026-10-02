@@ -1254,7 +1254,7 @@ def _group_open_dashboard_positions(
             "local_entry_price": 0.0,
             "local_unrealized_pnl": 0.0,
             "realized_pnl": 0.0,
-            "leverage": 1.0,
+            "leverage": _safe_float(snapshot.get("leverage"), 1.0) or 1.0,
             "stop_loss": None,
             "take_profit": None,
             "is_open": True,
@@ -1295,6 +1295,10 @@ def _group_open_dashboard_positions(
             group["exchange_mark_price"] = exchange_mark
             group["exchange_unrealized_pnl"] = exchange_upl
             group["exchange_margin_used"] = _exchange_snapshot_margin(snapshot)
+            exchange_leverage = _safe_float(snapshot.get("leverage"), 0.0) or 0.0
+            if exchange_leverage > 0:
+                # OKX is authoritative; local rows can lag after a restart.
+                group["leverage"] = exchange_leverage
         else:
             group["quantity"] = local_qty
             group["entry_price"] = local_entry
@@ -7888,7 +7892,11 @@ async def _build_display_open_positions_snapshot(
                             _safe_float(getattr(row, "realized_pnl", None), 0.0) or 0.0
                             for row in group_rows
                         ),
-                        "leverage": p.leverage,
+                        "leverage": (
+                            _safe_float(snapshot.get("leverage"), 0.0) or 0.0
+                            if snapshot and _safe_float(snapshot.get("leverage"), 0.0) > 0
+                            else _safe_float(p.leverage, 1.0) or 1.0
+                        ),
                         "stop_loss": p.stop_loss_price,
                         "take_profit": p.take_profit_price,
                         "current_management_contract": _safe_dict(
@@ -8003,8 +8011,11 @@ async def _build_display_open_positions_snapshot(
                         if local_position is not None
                         else 0.0
                     ),
-                    "leverage": getattr(local_position, "leverage", None)
-                    or snapshot.get("leverage"),
+                    "leverage": (
+                        _safe_float(snapshot.get("leverage"), 0.0) or 0.0
+                        if _safe_float(snapshot.get("leverage"), 0.0) > 0
+                        else getattr(local_position, "leverage", None) or 1.0
+                    ),
                     "stop_loss": getattr(local_position, "stop_loss_price", None),
                     "take_profit": getattr(local_position, "take_profit_price", None),
                     "is_open": True,
