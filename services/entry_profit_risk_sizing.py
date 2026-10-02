@@ -2137,6 +2137,15 @@ class EntryProfitRiskSizingPolicy:
             )
         )
         profit_quality = max(_safe_float(opportunity.get("profit_quality_ratio"), 0.0), 0.0)
+        training_edge_return = _safe_float(
+            normal_trade.get("current_raw_expected_return_pct"),
+            float("nan"),
+        )
+        if not isfinite(training_edge_return):
+            training_edge_return = _safe_float(
+                distribution.get("raw_expected_return_pct"),
+                float("nan"),
+            )
         aligned_source_count = len(
             {
                 str(item).strip()
@@ -2163,7 +2172,16 @@ class EntryProfitRiskSizingPolicy:
                 atr_pct=_atr_ratio(decision),
                 execution_cost=execution_cost,
                 portfolio_capacity_fraction=1.0,
-                policy_scope="paper",
+                policy_scope=(
+                    "paper_training"
+                    if paper_training_entry_mode
+                    else "paper"
+                ),
+                training_edge_return_pct=(
+                    training_edge_return
+                    if paper_training_entry_mode and isfinite(training_edge_return)
+                    else None
+                ),
             )
         )
         dynamic_leverage_limit = float(leverage_decision.final_integer_leverage)
@@ -2282,6 +2300,11 @@ class EntryProfitRiskSizingPolicy:
             "stressed_loss_fraction": stress_fraction,
             "negative_lcb_stress_fraction": negative_lcb_stress_fraction,
             "expected_net_return_pct": expected_net,
+            "training_edge_return_pct": (
+                training_edge_return
+                if isfinite(training_edge_return)
+                else None
+            ),
             "return_lcb_pct": return_lcb,
             "size_aware_profitability": size_aware_solution,
             "dynamic_take_profit_fraction": dynamic_take_profit,

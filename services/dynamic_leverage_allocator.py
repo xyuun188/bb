@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from math import floor
+from math import floor, isfinite
 from typing import Any
 
 
@@ -47,6 +47,7 @@ class DynamicLeverageInput:
     execution_cost: dict[str, Any] = field(default_factory=dict)
     portfolio_capacity_fraction: float = 1.0
     policy_scope: str = "live"
+    training_edge_return_pct: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,18 +94,41 @@ class DynamicLeverageAllocator:
 
     def allocate(self, data: DynamicLeverageInput) -> DynamicLeverageDecision:
         policy_scope = str(data.policy_scope or "live").lower()
-        paper_scope = policy_scope == "paper"
+        paper_scope = policy_scope in {"paper", "paper_training"}
+        training_scope = policy_scope == "paper_training"
         raw_system_max = _safe_float(data.system_max_leverage, 0.0)
         system_max = max(floor(raw_system_max), 1)
         requested = _clamp(_safe_float(data.requested_leverage, 1.0), 1.0, float(system_max))
         reasons: list[str] = []
         adjustments: list[dict[str, Any]] = []
         cost = data.execution_cost if isinstance(data.execution_cost, dict) else {}
+        effective_return = _safe_float(data.expected_net_return_pct, 0.0)
+        if not isfinite(effective_return):
+            effective_return = 0.0
+        training_edge = _safe_float(data.training_edge_return_pct, float("nan"))
+        if training_scope and isfinite(training_edge) and training_edge > 0.0:
+            effective_return = training_edge
+            adjustments.append(
+                {
+                    "factor": "paper_training_current_edge_basis",
+                    "net_return_pct": round(
+                        _safe_float(data.expected_net_return_pct, 0.0),
+                        8,
+                    ),
+                    "training_edge_return_pct": round(training_edge, 8),
+                    "effective_return_pct": round(effective_return, 8),
+                    "historical_profitability_is_not_a_leverage_gate": True,
+                }
+            )
         missing_inputs: list[str] = []
         if not paper_scope and int(data.aligned_source_count) <= 0:
             missing_inputs.append("authoritative_return_samples_missing")
         if not paper_scope and _safe_float(data.expected_net_return_pct, 0.0) <= 0:
             missing_inputs.append("positive_fee_after_return_missing")
+        if training_scope and (
+            not isfinite(training_edge) or training_edge <= 0.0
+        ):
+            missing_inputs.append("paper_training_current_edge_missing")
         if cost.get("production_eligible") is not True:
             missing_inputs.append("live_execution_cost_incomplete")
         if raw_system_max < 1.0:
@@ -142,9 +166,19 @@ class DynamicLeverageAllocator:
                 },
             )
 
-        signal_quality = self._signal_quality_leverage(data, float(system_max), adjustments)
+        signal_quality = self._signal_quality_leverage(
+            data,
+            float(system_max),
+            adjustments,
+            effective_return=effective_return,
+        )
         volatility = self._volatility_leverage(data, float(system_max), adjustments)
-        liquidity = self._liquidity_leverage(data, float(system_max), adjustments)
+        liquidity = self._liquidity_leverage(
+            data,
+            float(system_max),
+            adjustments,
+            effective_return=effective_return,
+        )
         if paper_scope:
             history = float(system_max)
             adjustments.append(
@@ -218,6 +252,7 @@ class DynamicLeverageAllocator:
                 "generated_at": datetime.now(UTC).isoformat(),
                 "strategy_version": "2026-07-28.scope-aware-dynamic-leverage.v5",
                 "policy_scope": policy_scope,
+                "effective_return_pct": round(effective_return, 8),
                 "fallback_reason": "",
                 "production_eligible": True,
             },
@@ -228,8 +263,18 @@ class DynamicLeverageAllocator:
         data: DynamicLeverageInput,
         system_max: float,
         adjustments: list[dict[str, Any]],
+        *,
+        effective_return: float | None = None,
     ) -> float:
-        positive_edge = max(data.expected_net_return_pct, 0.0)
+        positive_edge = max(
+            _safe_float(
+                data.expected_net_return_pct
+                if effective_return is None
+                else effective_return,
+                0.0,
+            ),
+            0.0,
+        )
         downside = max(data.expected_loss_pct, 0.0)
         cost = data.execution_cost if isinstance(data.execution_cost, dict) else {}
         execution_cost = max(_safe_float(cost.get("total_pct"), 0.0), 0.0)
@@ -240,7 +285,7 @@ class DynamicLeverageAllocator:
         survival_component = (1.0 - _clamp(data.loss_probability, 0.0, 1.0)) * (
             1.0 - _clamp(data.tail_risk_score, 0.0, 1.0)
         )
-        if str(data.policy_scope or "live").lower() == "paper":
+        if str(data.policy_scope or "live").lower() in {"paper", "paper_training"}:
             # Paper leverage is determined by the current trade's edge and risk.
             # Historical profitability is evidence for promotion, not permission
             # or a leverage multiplier for an unpromoted model.
@@ -275,9 +320,10 @@ class DynamicLeverageAllocator:
                     history_quality_observation,
                     6,
                 ),
-                "historical_profit_quality_is_gate": not (
-                    str(data.policy_scope or "live").lower() == "paper"
-                ),
+                "historical_profit_quality_is_gate": str(
+                    data.policy_scope or "live"
+                ).lower()
+                not in {"paper", "paper_training"},
             }
         )
         return _clamp(leverage, 1.0, system_max)
@@ -312,6 +358,8 @@ class DynamicLeverageAllocator:
         data: DynamicLeverageInput,
         system_max: float,
         adjustments: list[dict[str, Any]],
+        *,
+        effective_return: float | None = None,
     ) -> float:
         cost = data.execution_cost if isinstance(data.execution_cost, dict) else {}
         slippage = max(
@@ -330,7 +378,15 @@ class DynamicLeverageAllocator:
         if cost_pressure <= 0:
             adjustments.append({"factor": "liquidity_cost_missing", "leverage": 1.0})
             return 1.0
-        positive_edge = max(data.expected_net_return_pct, 0.0)
+        positive_edge = max(
+            _safe_float(
+                data.expected_net_return_pct
+                if effective_return is None
+                else effective_return,
+                0.0,
+            ),
+            0.0,
+        )
         cost_share = positive_edge / max(positive_edge + cost_pressure, 1e-9)
         leverage = 1.0 + (system_max - 1.0) * cost_share
         adjustments.append(
