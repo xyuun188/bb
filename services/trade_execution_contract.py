@@ -63,8 +63,6 @@ AUTHORITATIVE_FILL_SYNC_PENDING_REASONS = {
     "filled_order_okx_fill_identity_incomplete",
     "filled_order_contract_size_not_okx_public_instruments",
 }
-LEGACY_CONFIRMED_FILL_DRIFT_NOTIONAL_TOLERANCE = 0.005
-LEGACY_CONFIRMED_FILL_DRIFT_RISK_TOLERANCE = 0.001
 OBSOLETE_POLICY_FIELDS = {
     "entry_evidence",
     "entry_evidence_probe",
@@ -1197,21 +1195,12 @@ def _bounded_confirmed_fill_drift(
             else risk_excess <= reserve_fraction + 1e-8
         )
     )
-    legacy_tolerance_accepted = bool(
-        not strict_accepted
-        and confirmed_fill.get("eligible") is False
-        and confirmed_fill_has_valid_submission(
-            sizing,
-            _safe_dict(confirmed_fill.get("facts")),
-            settled_notional,
-        )
-        and notional_excess <= LEGACY_CONFIRMED_FILL_DRIFT_NOTIONAL_TOLERANCE + 1e-8
-        and risk_excess <= LEGACY_CONFIRMED_FILL_DRIFT_RISK_TOLERANCE + 1e-8
-    )
-    accepted = strict_accepted or legacy_tolerance_accepted
+    # A fill is accepted only when the current persisted reserve contract
+    # covers both notional and stressed-loss drift. Historical tolerance
+    # thresholds are intentionally not part of the execution protocol.
+    accepted = strict_accepted
     return {
         "accepted": accepted,
-        "legacy_tolerance_accepted": legacy_tolerance_accepted,
         "reasons": sorted(fill_reasons),
         "reserve_fraction": reserve_fraction,
         "notional_excess_fraction": notional_excess,
@@ -1223,12 +1212,9 @@ def _bounded_confirmed_fill_drift(
         ),
         "settled_notional_usdt": settled_notional,
         "source": (
-            "legacy_confirmed_fill_drift_tolerance"
-            if legacy_tolerance_accepted
-            else
             "persisted_canary_fill_reserve_and_okx_reconciliations"
             if explicit_reserve_contract
-            else "legacy_cost_bound_and_okx_reconciliations"
+            else "cost_bound_and_okx_reconciliations"
         ),
     }
 
@@ -1410,10 +1396,6 @@ def validate_normal_paper_entry_contract(
     bounded_fill_drift_accepted = bool(
         executed and bounded_fill_drift.get("accepted") is True
     )
-    legacy_confirmed_fill_drift_accepted = bool(
-        bounded_fill_drift_accepted
-        and bounded_fill_drift.get("legacy_tolerance_accepted") is True
-    )
     confirmed_drift_settlement = bool(
         executed and filled_order_present is True and authoritative_fill_complete
         and bounded_fill_drift_accepted
@@ -1578,7 +1560,6 @@ def validate_normal_paper_entry_contract(
             "minimum_order_notional_usdt": minimum_notional,
             "filled_notional_usdt": filled_notional,
         "bounded_fill_drift_accepted": bounded_fill_drift_accepted,
-        "legacy_confirmed_fill_drift_accepted": legacy_confirmed_fill_drift_accepted,
             "fill_drift_evidence": bounded_fill_drift,
             "historical_minimum_fill_settlement_accepted": (
                 minimum_fill_settlement_accepted

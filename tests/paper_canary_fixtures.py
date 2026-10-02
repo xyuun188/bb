@@ -117,7 +117,7 @@ def complete_paper_canary_raw() -> dict[str, Any]:
     }
 
 
-def bounded_legacy_fill_drift_raw(
+def historical_fill_drift_raw(
     *,
     excess_fraction: float = 0.001,
 ) -> dict[str, Any]:

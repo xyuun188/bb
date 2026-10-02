@@ -17,8 +17,8 @@ from services.trade_execution_contract import (
     validate_production_entry_contract,
 )
 from tests.paper_canary_fixtures import (
-    bounded_legacy_fill_drift_raw,
     complete_paper_canary_raw,
+    historical_fill_drift_raw,
 )
 
 
@@ -812,16 +812,16 @@ def test_malformed_executed_paper_canary_still_fails_closed() -> None:
     assert report["violation_reason_counts"]["paper_canary_risk_budget_invalid"] == 1
 
 
-def test_bounded_legacy_canary_fill_drift_uses_persisted_cost_evidence() -> None:
-    raw = bounded_legacy_fill_drift_raw(excess_fraction=0.001)
+def test_historical_fill_drift_beyond_current_reserve_fails_closed() -> None:
+    raw = historical_fill_drift_raw(excess_fraction=0.004)
     final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
     report = summarize_trade_execution_contract(
         [_decision(13, "long", raw)],
         orders=[_filled_order(13, quantity=final_notional / 100.0)],
     )
 
-    assert report["summary"]["contract_violation_count"] == 0
-    assert report["entry_contracts"][0]["bounded_fill_drift_accepted"] is True
+    assert report["summary"]["entry_contract_ready_count"] == 0
+    assert report["violation_reason_counts"]["paper_canary_risk_contract_ineligible"] == 1
 
 
 def test_confirmed_canary_fill_within_reserved_ceiling_keeps_contract_complete() -> None:
@@ -920,7 +920,7 @@ def test_confirmed_canary_fill_beyond_reserved_ceiling_fails_closed() -> None:
 
 
 def test_canary_fill_drift_beyond_persisted_cost_evidence_fails_closed() -> None:
-    raw = bounded_legacy_fill_drift_raw(excess_fraction=0.003)
+    raw = historical_fill_drift_raw(excess_fraction=0.003)
     final_notional = raw["profit_risk_sizing"]["final_notional_usdt"]
     report = summarize_trade_execution_contract(
         [_decision(14, "long", raw)],
