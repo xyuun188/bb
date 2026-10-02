@@ -563,7 +563,7 @@ async def test_sub_minimum_bounded_target_is_not_promoted_to_exchange_minimum() 
 
 
 @pytest.mark.asyncio
-async def test_explicit_one_x_model_recommendation_remains_an_upper_bound() -> None:
+async def test_baseline_one_x_model_recommendation_does_not_cap_dynamic_allocator() -> None:
     decision = _decision()
     decision.suggested_leverage = 1.0
     decision.raw_response["multidimensional_recommendation"] = {
@@ -575,8 +575,8 @@ async def test_explicit_one_x_model_recommendation_remains_an_upper_bound() -> N
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["model_leverage_is_explicit"] is True
-    assert decision.suggested_leverage == 1.0
+    assert sizing["model_leverage_is_explicit"] is False
+    assert decision.suggested_leverage > 1.0
 
 
 @pytest.mark.asyncio

@@ -2796,6 +2796,29 @@ def test_okx_entry_amount_below_raw_min_size_is_rejected_without_enlargement() -
     assert base_quantity == 0.0
 
 
+def test_okx_entry_amount_uses_reference_quote_for_minimum_after_price_band_refresh() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "BOME/USDT:USDT",
+        "contractSize": 1000.0,
+        "limits": {"amount": {"min": 1.0}},
+        "info": {"minSz": "1", "lotSz": "1"},
+    }
+
+    contracts, base_quantity = executor._entry_order_amount(
+        _FloorAmountPrecisionCcxt(),
+        market,
+        position_value=0.9584,
+        price=0.0009729,
+        balance=100.0,
+        leverage=1.0,
+        reference_price=0.0009583,
+    )
+
+    assert contracts == 1.0
+    assert base_quantity == 1000.0
+
+
 def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None:
     executor = OKXExecutor(mode="paper")
     market = {

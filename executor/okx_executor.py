@@ -1061,6 +1061,7 @@ class OKXExecutor(AbstractExecutor):
                     price,
                     balance,
                     decision.suggested_leverage,
+                    reference_price=price,
                 )
                 okx_order_rules = self._entry_order_rule_snapshot(
                     market,
@@ -1069,6 +1070,7 @@ class OKXExecutor(AbstractExecutor):
                     leverage=decision.suggested_leverage,
                     planned_notional_usdt=position_value,
                     final_contracts=order_quantity,
+                    authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                 )
             else:
                 okx_order_rules = {}
@@ -1481,6 +1483,7 @@ class OKXExecutor(AbstractExecutor):
                         price,
                         balance,
                         decision.suggested_leverage,
+                        reference_price=price,
                     )
                     okx_order_rules = self._entry_order_rule_snapshot(
                         market,
@@ -1489,6 +1492,7 @@ class OKXExecutor(AbstractExecutor):
                         leverage=decision.suggested_leverage,
                         planned_notional_usdt=position_value,
                         final_contracts=order_quantity,
+                        authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                     )
                     if order_quantity <= 0:
                         return ExecutionResult(
@@ -1589,6 +1593,7 @@ class OKXExecutor(AbstractExecutor):
                     fill_risk_price,
                     balance,
                     decision.suggested_leverage,
+                    reference_price=price,
                 )
                 okx_order_rules = self._entry_order_rule_snapshot(
                     market,
@@ -1598,6 +1603,7 @@ class OKXExecutor(AbstractExecutor):
                     planned_notional_usdt=position_value,
                     final_contracts=order_quantity,
                     fill_risk_price=fill_risk_price,
+                    authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                 )
                 okx_order_rules["pre_submit_price_refresh"] = {
                     "source": "okx_native_ticker_immediately_before_submit",
@@ -4657,6 +4663,8 @@ class OKXExecutor(AbstractExecutor):
         price: float,
         balance: float,
         leverage: float,
+        *,
+        reference_price: float | None = None,
     ) -> tuple[float, float]:
         """Return (contracts, base_quantity) for OKX swap orders.
 
@@ -4673,8 +4681,16 @@ class OKXExecutor(AbstractExecutor):
         min_contracts = amount_min if amount_min > 0 else 0.0
         contracts = planned_contracts
 
-        # Exchange minimums may reject a risk-sized order, but must never enlarge it.
-        if min_contracts > 0 and planned_contracts < min_contracts:
+        # Validate the minimum against the refreshed reference quote, while
+        # sizing the quantity against the conservative fill-risk price. A
+        # small price-band move must not turn one valid minimum contract into
+        # zero contracts before submission.
+        minimum_price = max(
+            self._safe_float(reference_price, 0.0),
+            0.0,
+        ) or price
+        minimum_notional = min_contracts * contract_size * minimum_price
+        if min_contracts > 0 and position_value + 1e-8 < minimum_notional:
             return 0.0, 0.0
 
         try:
@@ -4821,6 +4837,7 @@ class OKXExecutor(AbstractExecutor):
         planned_notional_usdt: float,
         final_contracts: float,
         fill_risk_price: float | None = None,
+        authorized_fill_ceiling_usdt: float | None = None,
     ) -> dict[str, Any]:
         contract_size = self._contract_size(market)
         amount_min = self._amount_min(market)
@@ -4835,6 +4852,10 @@ class OKXExecutor(AbstractExecutor):
         min_notional = amount_min * contract_size * price if price > 0 else 0.0
         final_notional = max(final_contracts, 0.0) * contract_size * max(price, 0.0)
         maximum_fill_notional = max(final_contracts, 0.0) * contract_size * sizing_price
+        fill_ceiling = max(
+            self._safe_float(authorized_fill_ceiling_usdt, 0.0),
+            max(planned_notional_usdt, 0.0),
+        )
         effective_leverage = max(float(leverage or 1.0), 1.0)
         return {
             "okx_symbol": market.get("symbol"),
@@ -4859,6 +4880,7 @@ class OKXExecutor(AbstractExecutor):
             "final_base_quantity": round(max(final_contracts, 0.0) * contract_size, 12),
             "final_notional_usdt": round(final_notional, 8),
             "maximum_fill_notional_usdt": round(maximum_fill_notional, 8),
+            "authorized_fill_ceiling_usdt": round(fill_ceiling, 8),
             "required_margin_usdt": round(final_notional / effective_leverage, 8),
             "planned_below_minimum_contracts": bool(
                 amount_min > 0 and 0 < planned_contracts < amount_min
@@ -4870,9 +4892,19 @@ class OKXExecutor(AbstractExecutor):
                 final_contracts > 0
                 and (amount_min <= 0 or final_contracts >= amount_min)
                 and (amount_market_max <= 0 or final_contracts <= amount_market_max)
-                and maximum_fill_notional <= max(planned_notional_usdt, 0.0) + 1e-8
+                and maximum_fill_notional <= fill_ceiling + 1e-8
             ),
         }
+
+    def _sizing_fill_ceiling(self, decision: DecisionOutput) -> float:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        sizing = raw.get("profit_risk_sizing")
+        if not isinstance(sizing, dict):
+            return 0.0
+        return max(
+            self._safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
+            0.0,
+        )
 
     def _minimum_order_notional(self, market: dict[str, Any], price: float) -> float:
         min_contracts = self._amount_min(market)

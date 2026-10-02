@@ -1277,7 +1277,14 @@ class EnsembleCoordinator:
         fallback_stop = min(max(volatility, 0.005), 0.10)
 
         position, position_models = weighted("position_size_pct", maximum=1.0)
-        leverage, leverage_models = weighted("suggested_leverage", minimum=0.999)
+        # ``1.0`` is the schema/default baseline emitted by experts when they
+        # do not provide a differentiated leverage view. Treating that value
+        # as an explicit upper bound made every paper-training entry run at
+        # one-times leverage even when the dynamic risk allocator had a valid
+        # higher executable range. Only a value strictly above the baseline is
+        # a model leverage request; the allocator remains the sole authority
+        # for the final leverage.
+        leverage, leverage_models = weighted("suggested_leverage", minimum=1.0)
         stop, stop_models = weighted("stop_loss_pct", maximum=1.0)
         take_profit, take_models = weighted("take_profit_pct", maximum=1.0)
         holding, holding_models = weighted("suggested_holding_minutes")

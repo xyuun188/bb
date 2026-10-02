@@ -1719,16 +1719,6 @@ class EntryProfitRiskSizingPolicy:
         position_contributors = _safe_list(
             _safe_dict(recommendation.get("contributors")).get("position_size_pct")
         )
-        model_leverage_is_explicit = (
-            bool(prior_sizing.get("model_leverage_is_explicit"))
-            if reuse_model_request
-            else (
-                bool(leverage_contributors)
-                and "suggested_leverage" not in recommendation_fallback_fields
-                if recommendation
-                else False
-            )
-        )
         model_requested_leverage = max(
             _safe_float(
                 prior_sizing.get("model_requested_leverage")
@@ -1737,6 +1727,25 @@ class EntryProfitRiskSizingPolicy:
                 1.0,
             ),
             1.0,
+        )
+        # A one-times value is the baseline/default in the paper decision
+        # schema. It is not a differentiated model cap; otherwise an
+        # observation-only expert returning the default would permanently
+        # force every training entry to one-times leverage. Values above the
+        # baseline remain explicit upper bounds and are still reduced by the
+        # dynamic allocator and exchange tier.
+        model_leverage_is_explicit = (
+            model_requested_leverage > 1.0
+            and (
+                bool(prior_sizing.get("model_leverage_is_explicit"))
+                if reuse_model_request
+                else (
+                    bool(leverage_contributors)
+                    and "suggested_leverage" not in recommendation_fallback_fields
+                    if recommendation
+                    else False
+                )
+            )
         )
         model_position_fraction = _clamp(
             _safe_float(
