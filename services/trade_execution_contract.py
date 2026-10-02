@@ -1518,14 +1518,14 @@ def validate_normal_paper_entry_contract(
             reasons.append("normal_paper_leverage_exceeds_okx_tier")
         if dynamic_leverage.get("version") != "dynamic_leverage_allocator_v5":
             reasons.append("normal_paper_dynamic_leverage_contract_missing")
-    elif leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
-        reasons.append("normal_paper_leverage_invalid")
         if (
-            sizing.get("model_leverage_is_explicit") is True
-            and model_requested_leverage >= 1.0
+            model_requested_leverage > 1.0
+            and sizing.get("model_leverage_is_explicit") is True
             and leverage > model_requested_leverage + 1e-8
         ):
             reasons.append("normal_paper_leverage_exceeds_model_request")
+    elif leverage < 1.0 or not isclose(leverage, float(int(leverage)), abs_tol=1e-8):
+        reasons.append("normal_paper_leverage_invalid")
     if execution_cost.get("production_eligible") is not True or (
         _safe_float(execution_cost.get("total_pct"), 0.0) <= 0.0
     ):

@@ -39,6 +39,7 @@ from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatu
 from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
+    uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.normal_paper_trade import normal_paper_order_identity_reasons
@@ -1075,7 +1076,7 @@ class OKXExecutor(AbstractExecutor):
             else:
                 okx_order_rules = {}
 
-            if order_quantity <= 0 and decision.is_entry:
+            if order_quantity <= 0 and decision.is_entry and position_value <= 0:
                 min_notional = self._minimum_order_notional(market, price)
                 affordable_notional = balance * max(float(decision.suggested_leverage or 1.0), 1.0)
                 return ExecutionResult(
@@ -1586,6 +1587,60 @@ class OKXExecutor(AbstractExecutor):
                     planned_notional_usdt=position_value,
                 )
                 position_value = protection_risk["maximum_notional_usdt"]
+                minimum_contracts = self._amount_min(market)
+                minimum_price = max(price, fill_risk_price, 0.0)
+                minimum_notional = (
+                    minimum_contracts * contract_size * minimum_price
+                    if minimum_contracts > 0 and contract_size > 0 and minimum_price > 0
+                    else 0.0
+                )
+                minimum_refresh = uplift_profit_risk_sizing_to_exchange_minimum(
+                    decision,
+                    minimum_notional_usdt=minimum_notional,
+                    available_margin_usdt=balance,
+                    leverage=decision.suggested_leverage,
+                    source="okx_pre_submit_current_minimum",
+                    execution_facts={
+                        "okx_symbol": okx_symbol,
+                        "price": price,
+                        "fill_risk_price": fill_risk_price,
+                        "contract_size": contract_size,
+                        "minimum_contracts": minimum_contracts,
+                        "protection_risk": protection_risk,
+                    },
+                )
+                if minimum_refresh.get("eligible") is not True:
+                    return ExecutionResult(
+                        order_id="risk_contract_rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0.0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "当前 OKX 最小下单名义金额已高于旧排队计划，"
+                                "且不能在现有风险预算内合法补齐；系统未提交订单。"
+                            ),
+                            "execution_blocker": "execution_minimum_contract_refresh",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "minimum_refresh": minimum_refresh,
+                            "okx_symbol": okx_symbol,
+                            "okx_order_rules": okx_order_rules,
+                        },
+                    )
+                refreshed_sizing = minimum_refresh.get("sizing")
+                refreshed_notional = (
+                    self._safe_float(
+                        refreshed_sizing.get("final_notional_usdt"),
+                        0.0,
+                    )
+                    if isinstance(refreshed_sizing, dict)
+                    else 0.0
+                )
+                position_value = max(position_value, refreshed_notional)
                 order_quantity, base_quantity = self._entry_order_amount(
                     ccxt,
                     market,

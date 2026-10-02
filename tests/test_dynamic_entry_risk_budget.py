@@ -11,6 +11,7 @@ from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
     solve_size_aware_positive_expected_net,
+    uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
@@ -580,6 +581,32 @@ async def test_baseline_one_x_model_recommendation_does_not_cap_dynamic_allocato
 
 
 @pytest.mark.asyncio
+async def test_stale_sizing_envelope_cannot_restore_one_x_model_cap() -> None:
+    decision = _decision()
+    decision.suggested_leverage = 1.0
+    decision.raw_response["multidimensional_recommendation"] = {
+        "fallback_fields": ["suggested_leverage"],
+        "contributors": {"suggested_leverage": []},
+    }
+    decision.raw_response["profit_risk_sizing"] = {
+        "contract_version": "2026-08-25.normal-paper-dynamic-risk.v5",
+        "contract_lifecycle": "normal_paper_trade",
+        "model_requested_leverage": 1.0,
+        "model_leverage_is_explicit": True,
+        "model_requested_position_fraction": 0.01,
+        "model_position_is_explicit": True,
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["model_leverage_is_explicit"] is False
+    assert sizing["model_requested_leverage"] == 1.0
+    assert decision.suggested_leverage > 1.0
+
+
+@pytest.mark.asyncio
 async def test_missing_historical_profit_quality_does_not_force_paper_leverage_to_one_x() -> None:
     decision = _decision()
     opportunity = decision.raw_response["opportunity_score"]
@@ -1089,6 +1116,68 @@ async def test_execution_reconciliation_rejects_rounding_below_exchange_minimum(
     assert result["eligible"] is False
     assert "execution_notional_below_exchange_minimum" in result["reasons"]
     assert decision.position_size_pct == 0.0
+
+
+@pytest.mark.asyncio
+async def test_execution_minimum_refresh_uplifts_stale_queued_size_within_budget() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing["final_notional_usdt"] = 0.9324
+    sizing["target_notional_usdt"] = 0.9324
+    sizing["minimum_order_notional_usdt"] = 0.9324
+    sizing["fill_notional_ceiling_usdt"] = 10.0
+    sizing["risk_budget_usdt"] = 10.0
+    sizing["stressed_loss_fraction"] = 0.01
+    decision.raw_response["profit_risk_sizing"] = sizing
+
+    result = uplift_profit_risk_sizing_to_exchange_minimum(
+        decision,
+        minimum_notional_usdt=0.9345,
+        available_margin_usdt=100.0,
+        leverage=2.0,
+        source="test_current_okx_minimum",
+        execution_facts={"symbol": "DOGE/USDT"},
+    )
+
+    assert result["eligible"] is True
+    assert result["changed"] is True
+    assert result["sizing"]["final_notional_usdt"] == pytest.approx(0.9345)
+    assert result["sizing"]["execution_minimum_uplifts"][-1]["facts"] == {
+        "symbol": "DOGE/USDT"
+    }
+    assert decision.suggested_leverage == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_execution_minimum_refresh_rejects_when_budget_cannot_cover_minimum() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    sizing["final_notional_usdt"] = 0.9324
+    sizing["target_notional_usdt"] = 0.9324
+    sizing["minimum_order_notional_usdt"] = 0.9324
+    sizing["fill_notional_ceiling_usdt"] = 0.933
+    sizing["risk_budget_usdt"] = 0.001
+    sizing["stressed_loss_fraction"] = 0.02
+    decision.raw_response["profit_risk_sizing"] = sizing
+
+    result = uplift_profit_risk_sizing_to_exchange_minimum(
+        decision,
+        minimum_notional_usdt=0.9345,
+        available_margin_usdt=100.0,
+        leverage=2.0,
+        source="test_current_okx_minimum",
+    )
+
+    assert result["eligible"] is False
+    assert result["changed"] is False
+    assert "exchange_minimum_exceeds_authorized_fill_ceiling" in result["reasons"]
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] == pytest.approx(
+        0.9324
+    )
 
 
 @pytest.mark.asyncio

@@ -776,8 +776,12 @@ def reconcile_profit_risk_sizing(
         0.0,
     )
     risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
-    stress = max(_safe_float(sizing.get("stressed_loss_fraction"), 0.0), 0.0)
     protection_risk = _safe_dict(facts.get("protection_risk"))
+    stress = max(
+        _safe_float(sizing.get("stressed_loss_fraction"), 0.0),
+        _safe_float(protection_risk.get("stressed_loss_fraction"), 0.0),
+        0.0,
+    )
     if source == "okx_pre_submit_order_shape" and protection_risk:
         stress = max(
             stress,
@@ -804,7 +808,12 @@ def reconcile_profit_risk_sizing(
         _safe_float(sizing.get("model_requested_leverage"), 0.0),
         0.0,
     )
-    model_leverage_is_explicit = sizing.get("model_leverage_is_explicit") is not False
+    # Missing legacy flags must not default to "explicit". A historical 1x
+    # value is only a schema baseline, never a fresh model hard cap.
+    model_leverage_is_explicit = (
+        model_requested_leverage > 1.0
+        and sizing.get("model_leverage_is_explicit") is True
+    )
     model_position_fraction = _clamp(
         _safe_float(sizing.get("model_requested_position_fraction"), 0.0)
     )
@@ -919,6 +928,115 @@ def reconcile_profit_risk_sizing(
     decision.position_size_pct = position_size if eligible else 0.0
     decision.suggested_leverage = leverage if eligible else 1.0
     return {"eligible": eligible, "reasons": reasons, "sizing": sizing}
+
+
+def uplift_profit_risk_sizing_to_exchange_minimum(
+    decision: DecisionOutput,
+    *,
+    minimum_notional_usdt: float,
+    available_margin_usdt: float,
+    leverage: float,
+    source: str,
+    execution_facts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Raise a stale executable size to the current exchange minimum.
+
+    A queued decision can cross an instrument's minimum notional by a few
+    decimals while waiting for the execution slot. The current minimum may be
+    used only when the already-authorized fill ceiling, model cap, margin, and
+    stressed-loss budget all cover it. This is a contract refresh, not a new
+    size decision and it never lowers a position or relaxes a veto.
+    """
+
+    raw = _safe_dict(decision.raw_response)
+    sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))
+    current = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
+    minimum = max(_safe_float(minimum_notional_usdt, 0.0), 0.0)
+    margin = max(_safe_float(available_margin_usdt, 0.0), 0.0)
+    final_leverage = max(_safe_float(leverage, 1.0), 1.0)
+    facts = deepcopy(execution_facts or {})
+    if minimum <= 0.0 or current + 1e-8 >= minimum:
+        return {"eligible": True, "changed": False, "sizing": sizing}
+
+    reasons: list[str] = []
+    if sizing.get("production_eligible") is not True:
+        reasons.append("upstream_sizing_ineligible")
+    fill_ceiling = max(_safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0), 0.0)
+    if fill_ceiling <= 0.0 or minimum > fill_ceiling + 1e-8:
+        reasons.append("exchange_minimum_exceeds_authorized_fill_ceiling")
+    model_cap = max(
+        _safe_float(sizing.get("model_requested_notional_cap_usdt"), 0.0),
+        _safe_float(sizing.get("model_final_notional_cap_usdt"), 0.0),
+        0.0,
+    )
+    if model_cap > 0.0 and minimum > model_cap + 1e-8:
+        reasons.append("exchange_minimum_exceeds_model_notional_cap")
+    if margin <= 0.0 or minimum > margin * final_leverage + 1e-8:
+        reasons.append("exchange_minimum_exceeds_available_margin")
+    protection_risk = _safe_dict(facts.get("protection_risk"))
+    stress = max(
+        _safe_float(sizing.get("stressed_loss_fraction"), 0.0),
+        _safe_float(protection_risk.get("stressed_loss_fraction"), 0.0),
+        0.0,
+    )
+    risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
+    if stress <= 0.0 or risk_budget <= 0.0:
+        reasons.append("exchange_minimum_risk_inputs_incomplete")
+    elif minimum * stress > risk_budget + 1e-8:
+        reasons.append("exchange_minimum_exceeds_stressed_loss_budget")
+    if reasons:
+        return {"eligible": False, "changed": False, "reasons": reasons, "sizing": sizing}
+
+    generated_at = datetime.now(UTC).isoformat()
+    history = list(_safe_list(sizing.get("execution_minimum_uplifts")))
+    history.append(
+        {
+            "source": str(source or "execution_minimum_uplift"),
+            "generated_at": generated_at,
+            "previous_final_notional_usdt": round(current, 8),
+            "minimum_notional_usdt": round(minimum, 8),
+            "final_leverage": round(final_leverage, 8),
+            "facts": facts,
+            "facts_fingerprint": _fingerprint(facts),
+        }
+    )
+    sizing.update(
+        {
+            "target_notional_usdt": round(
+                max(_safe_float(sizing.get("target_notional_usdt"), 0.0), minimum),
+                8,
+            ),
+            "final_notional_usdt": round(minimum, 8),
+            "final_margin_usdt": round(minimum / final_leverage, 8),
+            "final_leverage": round(final_leverage, 8),
+            "minimum_order_notional_usdt": round(minimum, 8),
+            "minimum_order_supported": True,
+            "planned_stressed_loss_usdt": round(minimum * stress, 8),
+            "expected_profit_usdt": round(
+                minimum * _safe_float(sizing.get("expected_net_return_pct"), 0.0) / 100.0,
+                8,
+            ),
+            "position_size_pct": round(
+                minimum / max(margin * final_leverage, 1e-12),
+                8,
+            ),
+            "execution_minimum_uplifts": history,
+        }
+    )
+    provenance = dict(_safe_dict(sizing.get("policy_provenance")))
+    provenance.update(
+        {
+            "generated_at": generated_at,
+            "fallback_reason": "",
+            "contract_fingerprint": _fingerprint(sizing),
+        }
+    )
+    sizing["policy_provenance"] = provenance
+    raw["profit_risk_sizing"] = sizing
+    decision.raw_response = raw
+    decision.position_size_pct = sizing["position_size_pct"]
+    decision.suggested_leverage = final_leverage
+    return {"eligible": True, "changed": True, "sizing": sizing}
 
 
 @dataclass(slots=True)
@@ -1704,11 +1822,6 @@ class EntryProfitRiskSizingPolicy:
         side = _side(decision)
         depth_key = "orderbook_ask_depth" if side == "long" else "orderbook_bid_depth"
         side_depth = max(_safe_float(snapshot.get(depth_key), 0.0), 0.0)
-        prior_sizing = _safe_dict(raw.get("profit_risk_sizing"))
-        reuse_model_request = (
-            prior_sizing.get("contract_version") == NORMAL_PAPER_TRADE_SIZING_VERSION
-            and prior_sizing.get("contract_lifecycle") == "normal_paper_trade"
-        )
         recommendation = _safe_dict(raw.get("multidimensional_recommendation"))
         recommendation_fallback_fields = {
             str(item) for item in _safe_list(recommendation.get("fallback_fields"))
@@ -1719,13 +1832,16 @@ class EntryProfitRiskSizingPolicy:
         position_contributors = _safe_list(
             _safe_dict(recommendation.get("contributors")).get("position_size_pct")
         )
+        # A new sizing pass may only consume the current recommendation. An
+        # older profit_risk_sizing envelope is an execution result, not model
+        # input; inheriting it can turn a stale 1x flag into a hard cap.
+        recommendation_leverage = (
+            recommendation.get("suggested_leverage")
+            if "suggested_leverage" in recommendation
+            else decision.suggested_leverage
+        )
         model_requested_leverage = max(
-            _safe_float(
-                prior_sizing.get("model_requested_leverage")
-                if reuse_model_request
-                else decision.suggested_leverage,
-                1.0,
-            ),
+            _safe_float(recommendation_leverage, 1.0),
             1.0,
         )
         # A one-times value is the baseline/default in the paper decision
@@ -1737,33 +1853,25 @@ class EntryProfitRiskSizingPolicy:
         model_leverage_is_explicit = (
             model_requested_leverage > 1.0
             and (
-                bool(prior_sizing.get("model_leverage_is_explicit"))
-                if reuse_model_request
-                else (
-                    bool(leverage_contributors)
-                    and "suggested_leverage" not in recommendation_fallback_fields
-                    if recommendation
-                    else False
-                )
-            )
-        )
-        model_position_fraction = _clamp(
-            _safe_float(
-                prior_sizing.get("model_requested_position_fraction")
-                if reuse_model_request
-                else decision.position_size_pct,
-                0.0,
-            )
-        )
-        model_position_is_explicit = (
-            bool(prior_sizing.get("model_position_is_explicit"))
-            if reuse_model_request
-            else (
-                bool(position_contributors)
-                and "position_size_pct" not in recommendation_fallback_fields
+                bool(leverage_contributors)
+                and "suggested_leverage" not in recommendation_fallback_fields
                 if recommendation
                 else False
             )
+        )
+        recommendation_position = (
+            recommendation.get("position_size_pct")
+            if "position_size_pct" in recommendation
+            else decision.position_size_pct
+        )
+        model_position_fraction = _clamp(
+            _safe_float(recommendation_position, 0.0)
+        )
+        model_position_is_explicit = (
+            bool(position_contributors)
+            and "position_size_pct" not in recommendation_fallback_fields
+            if recommendation
+            else False
         )
         model_position_cap_applied = bool(
             model_position_fraction > 0.0 and model_position_is_explicit
