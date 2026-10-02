@@ -13573,11 +13573,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Store AI/OKX/actual leverage in the decision and execution payloads."""
         raw_result = self._safe_dict(result.raw_response)
         leverage_check = self._safe_dict(raw_result.get("leverage_check"))
-        actual = self._safe_float(
-            leverage_check.get("actual_leverage")
-            or leverage_check.get("target_leverage")
-            or decision.suggested_leverage,
-            ai_requested_leverage,
+        status = getattr(getattr(result, "status", None), "value", None)
+        actual_raw = leverage_check.get("actual_leverage")
+        if actual_raw is None and status in {"filled", "partially_filled", "pending"}:
+            actual_raw = leverage_check.get("target_leverage")
+        actual = (
+            self._safe_float(actual_raw, float("nan"))
+            if actual_raw is not None
+            else float("nan")
         )
         okx_max = self._safe_float(
             leverage_check.get("okx_max_leverage") or leverage_check.get("max_leverage"),
@@ -13585,19 +13588,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         target = self._safe_float(
             leverage_check.get("target_leverage") or decision.suggested_leverage,
-            actual,
+            ai_requested_leverage,
         )
         summary: dict[str, Any] = {
             "ai_suggested_leverage": round(float(ai_requested_leverage or 1.0), 4),
             "okx_max_leverage": round(float(okx_max), 4) if okx_max > 0 else None,
-            "actual_leverage": round(float(actual or target or 1.0), 4),
+            "target_leverage": round(float(target), 4) if target > 0 else None,
+            "actual_leverage": round(float(actual), 4) if actual > 0 else None,
+            "execution_status": status,
         }
         raw = self._safe_dict(decision.raw_response)
         raw["execution_leverage"] = summary
         decision.raw_response = raw
         raw_result["execution_leverage"] = summary
         result.raw_response = raw_result
-        decision.suggested_leverage = self._safe_float(summary.get("actual_leverage"), 1.0)
+        if actual > 0:
+            decision.suggested_leverage = actual
 
     async def _get_open_positions_context(self) -> list[dict]:
         return await self.okx_sync_service.get_open_positions_context()

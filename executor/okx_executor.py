@@ -1640,7 +1640,12 @@ class OKXExecutor(AbstractExecutor):
                     if isinstance(refreshed_sizing, dict)
                     else 0.0
                 )
-                position_value = max(position_value, refreshed_notional)
+                # The protection-derived maximum is an authoritative risk
+                # ceiling. Refreshing the exchange minimum may raise a stale
+                # undersized order, but it must never restore the old larger
+                # target and bypass the current stop/slippage stress budget.
+                if refreshed_notional > 0.0:
+                    position_value = min(position_value, refreshed_notional)
                 order_quantity, base_quantity = self._entry_order_amount(
                     ccxt,
                     market,
