@@ -321,7 +321,9 @@ MARKET_ROUND_WATCHDOG_MAX_SECONDS = 180.0
 # and remain eligible through the defer tracker.
 MARKET_ROUND_SCHEDULER_MAX_SECONDS = 120.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
-MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 30.0
+# Keep the single-flight queue above the 75-second entry handoff deadline.
+# The final execution boundary refreshes market/account facts before submit.
+MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 120.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
@@ -7583,6 +7585,17 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # shortlist halfway through its diagnostics.
         unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
+        contract_authorized = bool(
+            contract.get("authorized") is True
+            and permission.get("granted") is True
+            and not normal_paper_trade_contract_reasons(contract)
+        )
+        if contract_authorized:
+            # The ranker's analysis-only label is a coverage/provenance marker.
+            # It must not veto a decision that already carries the complete
+            # normal-paper authorization contract; otherwise one decision is
+            # simultaneously authorized and permanently non-executable.
+            return bool(symbol not in unavailable_by_mode)
         return bool(
             symbol not in unavailable_by_mode
             and selection.get("selected") is True
@@ -9340,6 +9353,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
             ),
         }
 
+    def _finalize_unsubmitted_entry_contract(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Close a paper entry contract whenever no order was submitted."""
+
+        if decision.is_entry and str(model_mode or "").lower() == "paper":
+            attach_risk_adjusted_trade_recommendation(
+                decision,
+                status="rejected",
+                reason=str(reason or "entry_not_submitted"),
+            )
+        return self._safe_dict(decision.raw_response)
+
     async def _run_market_entry_pipeline(
         self,
         *,
@@ -9372,12 +9401,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "动态费后收益风险预算生成失败，本次 entry 失败关闭："
                 f"{safe_error_text(exc, limit=160)}"
             )
+            finalized_raw = self._finalize_unsubmitted_entry_contract(
+                decision,
+                model_mode,
+                reason,
+            )
             raw_response = self._annotate_candidate_selection(
                 decision,
                 selected=False,
                 reason=reason,
             )
             if decision_db_id is not None:
+                await self._mark_decision_raw_response(decision_db_id, finalized_raw)
                 await self._mark_decision_raw_response(decision_db_id, raw_response)
                 await self._record_and_persist_decision_stage(
                     decision_db_id,
@@ -9612,10 +9647,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 gate_acquired = True
             except TimeoutError:
                 reason = (
-                    "开仓裁决等待执行链路超过 30 秒，行情与账户快照可能已经过期；"
+                    "开仓裁决等待执行链路超过 "
+                    f"{MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS:g} 秒，"
+                    "行情与账户快照可能已经过期；"
                     "本次不提交订单，下一轮使用最新数据重新评估。"
                 )
+                finalized_raw = self._finalize_unsubmitted_entry_contract(
+                    decision,
+                    model_mode,
+                    reason,
+                )
                 if decision_db_id is not None:
+                    await self._mark_decision_raw_response(decision_db_id, finalized_raw)
                     await self._mark_decision_reason(decision_db_id, reason)
                 self.market_decision_result_recorder.append_result(
                     results=results,
@@ -9654,6 +9697,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
         except asyncio.CancelledError:
             reason = "开仓执行队列在服务停止时被取消，系统未把该裁决视为已成交。"
             if decision_db_id is not None:
+                finalized_raw = self._finalize_unsubmitted_entry_contract(
+                    decision,
+                    model_mode,
+                    reason,
+                )
+                await self._mark_decision_raw_response(decision_db_id, finalized_raw)
                 await self._mark_decision_reason(decision_db_id, reason)
                 await self.decision_final_state_ensurer.ensure(
                     decision_db_id,
@@ -9671,9 +9720,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 error=safe_error_text(exc),
             )
             if decision_db_id is not None:
+                reason = "开仓执行队列异常中断，系统未提交或确认新的成交。"
+                finalized_raw = self._finalize_unsubmitted_entry_contract(
+                    decision,
+                    model_mode,
+                    reason,
+                )
+                await self._mark_decision_raw_response(decision_db_id, finalized_raw)
                 await self._mark_decision_reason(
                     decision_db_id,
-                    "开仓执行队列异常中断，系统未提交或确认新的成交。",
+                    reason,
                 )
                 await self.decision_final_state_ensurer.ensure(
                     decision_db_id,

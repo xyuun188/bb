@@ -5611,6 +5611,68 @@ async def test_entry_policy_reprices_execution_cost_with_planned_order_notional(
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_preserves_supported_exchange_minimum_after_vwap_rounding() -> None:
+    planned_values: list[float] = []
+
+    class FakePriceGuard:
+        async def guard_reason(
+            self,
+            decision: DecisionOutput,
+            _model_mode: str,
+        ) -> None:
+            decision.feature_snapshot = {
+                **(decision.feature_snapshot or {}),
+                "bid": 0.02111,
+                "ask": 0.02112,
+                "contract_value_base": 10.0,
+                "orderbook_bids": [[0.02111, 10.0]],
+                "orderbook_asks": [[0.02112, 10.0]],
+            }
+
+    def fake_score(decision: DecisionOutput, _strategy: dict[str, Any] | None) -> float:
+        planned_values.append(
+            float((decision.feature_snapshot or {}).get("planned_order_notional_usdt") or 0.0)
+        )
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["opportunity_score"] = {
+            "score": 1.0,
+            "execution_cost": {"order_size_complete": True},
+        }
+        decision.raw_response = raw
+        return 1.0
+
+    async def fake_sizing(
+        decision: DecisionOutput,
+        _model_mode: str,
+        _open_positions: list[dict[str, Any]],
+    ) -> None:
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["profit_risk_sizing"] = {
+            "production_eligible": True,
+            "final_notional_usdt": 0.2111,
+            "minimum_order_notional_usdt": 0.2112,
+            "minimum_order_supported": True,
+            "fill_notional_ceiling_usdt": 10.0,
+        }
+        decision.raw_response = raw
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_price_guard=FakePriceGuard(),
+    )
+    decision = _decision(Action.LONG)
+    decision.feature_snapshot = {"current_price": 0.021115}
+
+    await policy.prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert planned_values[-1] == pytest.approx(0.2112)
+    assert decision.raw_response["execution_cost_sizing_pass"]["impact_basis_notional_usdt"] == pytest.approx(
+        0.2112
+    )
+
+
+@pytest.mark.asyncio
 async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None:
     service = TradingService.__new__(TradingService)
     events: list[str] = []
@@ -7078,12 +7140,38 @@ async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking
     assert service._market_entry_pipeline_snapshot() == {
         "active_count": 0,
         "active_symbols": [],
-        "queue_timeout_seconds": 30.0,
+        "queue_timeout_seconds": 120.0,
         "single_flight": True,
         "stage": "idle",
         "stage_updated_at": service._market_entry_pipeline_stage_updated_at.isoformat(),
     }
     assert len(published) == 1
+
+
+def test_unsubmitted_entry_contract_is_terminal_rejected() -> None:
+    service = TradingService.__new__(TradingService)
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "trade_recommendation_contract": {
+            "version": "2026-07-22.multidimensional-paper-plan.v2",
+            "risk_adjustment": {
+                "status": "pending",
+                "complete": False,
+                "reasons": ["risk_adjustment_pending"],
+            },
+        }
+    }
+
+    raw = service._finalize_unsubmitted_entry_contract(
+        decision,
+        "paper",
+        "queue_timeout",
+    )
+
+    risk = raw["trade_recommendation_contract"]["risk_adjustment"]
+    assert risk["status"] == "rejected"
+    assert risk["reason"] == "queue_timeout"
+    assert "risk_adjustment_pending" not in risk["reasons"]
 
 
 def test_market_budget_clock_includes_pre_ai_round_work(

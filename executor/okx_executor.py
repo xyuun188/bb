@@ -7406,12 +7406,12 @@ class OKXExecutor(AbstractExecutor):
             for level in (book.get("asks") or [])
             if isinstance(level, (list, tuple)) and len(level) >= 2
         ]
-        bid = max(self._safe_float(ticker.get("bid"), 0.0), 0.0)
-        ask = max(self._safe_float(ticker.get("ask"), 0.0), 0.0)
-        if bid <= 0 and bids:
-            bid = bids[0][0]
-        if ask <= 0 and asks:
-            ask = asks[0][0]
+        # The top of the immediately sampled order book is the sole
+        # executable quote authority.  Ticker bid/ask is independently
+        # sampled and may legitimately lag during normal sub-second movement;
+        # using it as a second execution source quarantines valid entries.
+        bid = bids[0][0] if bids else max(self._safe_float(ticker.get("bid"), 0.0), 0.0)
+        ask = asks[0][0] if asks else max(self._safe_float(ticker.get("ask"), 0.0), 0.0)
         bid_depth = sum(price * contracts * contract_value_base for price, contracts in bids)
         ask_depth = sum(price * contracts * contract_value_base for price, contracts in asks)
         total_depth = bid_depth + ask_depth
@@ -7477,15 +7477,40 @@ class OKXExecutor(AbstractExecutor):
             "source_timestamp_ms": mark_source_timestamp_ms,
             "price": mark_price,
         }
+        # The order book is the executable quote authority for the immediate
+        # paper entry.  The ticker is still retained for last-price telemetry,
+        # but using its independently sampled bid/ask as a second executable
+        # source made normal sub-second quote movement look like a source
+        # contradiction and quarantined otherwise valid entries.
+        executable_quote_snapshot = {
+            "bid": bid,
+            "ask": ask,
+            "source": "rest",
+            "source_endpoint": "okx_rest_market_books",
+            "source_channel": "books",
+            "timestamp": orderbook_source_timestamp_ms,
+            "last_price": ticker_last or ((bid + ask) / 2.0),
+            "notional_24h_usdt": notional_24h_usdt,
+            "volume_24h_contracts": volume_24h_contracts,
+            "volume_24h_base": volume_24h_base,
+            "orderbook_bid_depth": bid_depth,
+            "orderbook_ask_depth": ask_depth,
+            "contract_spec": spec,
+        }
         native_snapshot = {
             "symbol": normalize_trading_symbol(symbol),
             "inst_id": inst_id,
             "inst_type": "SWAP",
             "source": "rest",
-            "source_endpoint": "okx_rest_market_ticker",
-            "source_channel": "tickers",
-            "timestamp": ticker_source_timestamp_ms,
-            "last_price": ticker_last,
+            # The market fact below is the executable pre-order contract.
+            # Its quote and provenance must come from the same order-book
+            # sample; retaining ticker provenance here creates a mixed fact
+            # (book bid/ask with ticker source/time) that the consistency
+            # validator correctly rejects.
+            "source_endpoint": "okx_rest_market_books",
+            "source_channel": "books",
+            "timestamp": orderbook_source_timestamp_ms,
+            "last_price": ticker_last or ((bid + ask) / 2.0),
             "bid": bid,
             "ask": ask,
             "mark_price": mark_price,
@@ -7501,7 +7526,7 @@ class OKXExecutor(AbstractExecutor):
         }
         base_market_fact = build_market_fact(
             symbol,
-            native_snapshot,
+            executable_quote_snapshot,
             contract_spec=spec,
             received_at=datetime.now(UTC),
         )
@@ -7512,6 +7537,7 @@ class OKXExecutor(AbstractExecutor):
             mark_price_fact=mark_price_fact,
             index_price_fact=None,
             bars=(),
+            allow_authoritative_quote_without_path=True,
             generated_at=datetime.now(UTC),
         )
         primary_market_fact = build_market_fact(

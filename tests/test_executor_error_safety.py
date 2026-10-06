@@ -2720,6 +2720,8 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert snapshot["market_fact"]["quality"]["status"] == "clean"
     assert snapshot["market_fact"]["source_consistency"]["status"] == "clean"
     assert snapshot["market_fact"]["fact_id"].startswith("sha256:")
+    assert snapshot["market_fact"]["source_endpoint"] == "okx_rest_market_books"
+    assert snapshot["market_fact"]["source_timestamp_ms"] == 1780000000001
     assert snapshot["contract_value_base"] == pytest.approx(0.01)
     assert snapshot["orderbook_bid_depth"] == pytest.approx(99.9 * 2.0 * 0.01)
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
@@ -2731,6 +2733,91 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
         "orderbook",
         "mark_price",
     ]
+
+
+@pytest.mark.asyncio
+async def test_okx_pre_order_execution_uses_orderbook_quotes_when_ticker_lags() -> None:
+    class _LaggingTickerCcxt:
+        urls = {"api": {"rest": "https://www.okx.com"}}
+        hostname = "www.okx.com"
+
+        def market(self, symbol: str) -> dict[str, Any]:
+            return {
+                "symbol": symbol,
+                "id": "BTC-USDT-SWAP",
+                "info": {"instId": "BTC-USDT-SWAP"},
+            }
+
+        async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "last": "100",
+                        "bidPx": "98",
+                        "askPx": "102",
+                        "vol24h": "1000",
+                        "volCcy24h": "100000",
+                        "ts": "1780000000000",
+                    }
+                ]
+            }
+
+        async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {"data": [{"instId": "BTC-USDT-SWAP", "last": "100"}]}
+
+        async def fetch_order_book(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "bids": [[99.9, 2.0]],
+                "asks": [[100.1, 3.0]],
+                "timestamp": 1780000000001,
+            }
+
+        async def publicGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "markPx": "100.05",
+                        "ts": "1780000000002",
+                    }
+                ]
+            }
+
+        async def publicGetPublicInstruments(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "data": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "instType": "SWAP",
+                        "settleCcy": "USDT",
+                        "uly": "BTC-USDT",
+                        "ctType": "linear",
+                        "ctVal": "0.01",
+                        "ctMult": "1",
+                        "ctValCcy": "BTC",
+                        "minSz": "1",
+                        "lotSz": "1",
+                        "tickSz": "0.1",
+                    }
+                ]
+            }
+
+        async def privateGetAccountFeeRates(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {"data": [{"taker": "-0.0005", "ts": "1780000000002"}]}
+
+    executor = _executor(_LaggingTickerCcxt())
+    facts = await executor.pre_order_execution_facts("BTC/USDT", "long")
+
+    assert facts["production_eligible"] is True
+    snapshot = facts["feature_snapshot"]
+    assert snapshot["bid"] == pytest.approx(99.9)
+    assert snapshot["ask"] == pytest.approx(100.1)
+    assert snapshot["market_fact"]["prices"]["bid"] == pytest.approx(99.9)
+    assert snapshot["market_fact"]["prices"]["ask"] == pytest.approx(100.1)
+    assert snapshot["market_fact"]["source_endpoint"] == "okx_rest_market_books"
+    assert snapshot["market_fact"]["source_timestamp_ms"] == 1780000000001
+    assert snapshot["market_fact"]["source_consistency"]["status"] == "clean"
 
 
 @pytest.mark.asyncio

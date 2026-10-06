@@ -343,6 +343,7 @@ def build_market_source_consistency(
     mark_price_fact: Mapping[str, Any] | None,
     index_price_fact: Mapping[str, Any] | None,
     bars: Iterable[Any],
+    allow_authoritative_quote_without_path: bool = False,
     generated_at: Any = None,
 ) -> dict[str, Any]:
     primary = _dict(primary_fact)
@@ -589,8 +590,40 @@ def build_market_source_consistency(
         reasons.append("executable_quote_sources_not_reconciled")
 
     native_quote_continuity = bool(quotes_reconciled and tick_alignment_verified)
+    # The immediate pre-order refresh is itself an authoritative native
+    # snapshot: the executable top-of-book, mark price and instrument
+    # specification are fetched together from OKX and bound to one instId.
+    # A delayed candle request must not quarantine that snapshot when the
+    # executable sources agree but the optional one-minute path is temporarily
+    # unavailable. Callers outside the pre-order boundary retain the stricter
+    # path requirement by leaving this flag disabled.
+    authoritative_quote_continuity = bool(
+        allow_authoritative_quote_without_path
+        and not normalized_bars
+        and valid_intervals
+        and quotes_reconciled
+        and tick_alignment_verified
+        and orderbook
+        and _text(orderbook.get("source_endpoint"))
+        and all(
+            _text(fact.get("source_endpoint")) == _text(orderbook.get("source_endpoint"))
+            for fact in facts
+        )
+        and quote_time_span_ms is not None
+        and quote_time_span_ms <= 2_000
+    )
+    if authoritative_quote_continuity:
+        path_reasons = [
+            reason
+            for reason in path_reasons
+            if reason != "observed_price_outside_recent_native_path"
+        ]
     market_continuity_verified = bool(native_quote_continuity or prices_within_path)
+    if authoritative_quote_continuity:
+        market_continuity_verified = True
     if native_quote_continuity:
+        reference_warnings.extend(path_reasons)
+    elif authoritative_quote_continuity:
         reference_warnings.extend(path_reasons)
     else:
         reasons.extend(path_reasons)

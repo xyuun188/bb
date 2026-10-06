@@ -16,7 +16,10 @@ from services.dynamic_exit_policy import (
     apply_dynamic_exit,
     evaluate_dynamic_exit_execution_contract,
 )
-from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
+from services.entry_profit_risk_sizing import (
+    reconcile_profit_risk_sizing,
+    uplift_profit_risk_sizing_to_exchange_minimum,
+)
 from services.live_ml_profit_contract import apply_live_ml_profit_contract
 from services.normal_paper_trade import (
     ensure_normal_paper_trade_contract,
@@ -261,6 +264,29 @@ class EntryPolicy:
         if impact_basis_notional <= 0:
             return None
 
+        # One complete exchange contract is indivisible.  The execution-cost
+        # estimator may use a slightly lower bid/ask VWAP than the mark-price
+        # minimum and produce (for example) 0.2111 vs 0.2112.  Do not feed
+        # that fractional underflow back into the authoritative sizing
+        # contract when the risk budget already proved the minimum contract is
+        # supported; doing so turns a valid one-contract paper entry into a
+        # false minimum-notional rejection.
+        minimum_order_notional = max(
+            _safe_float(sizing.get("minimum_order_notional_usdt"), 0.0),
+            0.0,
+        )
+        fill_notional_ceiling = max(
+            _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
+            0.0,
+        )
+        if (
+            minimum_order_notional > 0.0
+            and impact_basis_notional < minimum_order_notional
+            and sizing.get("minimum_order_supported") is True
+            and fill_notional_ceiling + 1e-8 >= minimum_order_notional
+        ):
+            impact_basis_notional = minimum_order_notional
+
         snapshot = (
             dict(decision.feature_snapshot)
             if isinstance(decision.feature_snapshot, dict)
@@ -284,6 +310,33 @@ class EntryPolicy:
         sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
         sizing = sizing if isinstance(sizing, dict) else {}
         final_notional = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
+        # The sizing pass above may refresh execution cost and reintroduce a
+        # fractional underflow after the initial planning clamp. Re-apply the
+        # same exchange-minimum contract at the final sizing boundary so a
+        # supported indivisible contract is not rejected by a stale decimal
+        # price/VWAP difference.
+        minimum_refresh = uplift_profit_risk_sizing_to_exchange_minimum(
+            decision,
+            minimum_notional_usdt=_safe_float(
+                sizing.get("minimum_order_notional_usdt"), 0.0
+            ),
+            available_margin_usdt=_safe_float(
+                sizing.get("available_margin_usdt"), 0.0
+            ),
+            leverage=_safe_float(
+                sizing.get("final_leverage") or decision.suggested_leverage,
+                1.0,
+            ),
+            source="entry_policy_final_sizing_minimum",
+            execution_facts={"stage": "final_dynamic_entry_sizing"},
+        )
+        if minimum_refresh.get("eligible") is True and minimum_refresh.get("changed"):
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
+            sizing = sizing if isinstance(sizing, dict) else {}
+            final_notional = max(
+                _safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0
+            )
         if final_notional > impact_basis_notional:
             reconcile_profit_risk_sizing(
                 decision,

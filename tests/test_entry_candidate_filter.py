@@ -235,6 +235,59 @@ def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -
     }
 
 
+def test_market_analysis_only_training_contract_is_promoted() -> None:
+    service = object.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    decision = _decision("BTC/USDT")
+    support = {
+        "eligible": True,
+        "selected_side": "short",
+        "support_scope": "paper_training_entry",
+        "paper_training_only": True,
+        "prediction_horizon_minutes": 5.0,
+        "expected_net_return_pct": -0.1,
+        "objective_net_return_pct": -0.2,
+        "raw_expected_return_pct": 0.3,
+        "loss_probability": 0.35,
+        "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": {
+            "local_ml": {
+                "paper_execution_permission": False,
+                "paper_execution_reason": "training_only",
+            }
+        },
+        "aligned_expert_count": 2,
+        "opposition_expert_count": 0,
+        "strong_expert_opposition": False,
+    }
+    decision.raw_response = {
+        "paper_trade_selection": {
+            "selected": True,
+            "selection_reason": "paper_training_entry",
+        },
+        "entry_permission": {
+            "granted": True,
+            "training_only": True,
+        },
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="short",
+            selection_reason="paper_training_entry",
+            direction_support=support,
+        ),
+    }
+
+    assert service._entry_gate_reason_with_market_boundary(decision) is None
+    assert decision.raw_response["market_analysis_only_contract"]["promoted_for_execution"] is True
+
+
 def test_known_unavailable_market_candidate_cannot_be_promoted() -> None:
     service = object.__new__(TradingService)
     service._market_analysis_only_symbols = {"BTC/USDT"}

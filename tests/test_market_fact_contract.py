@@ -293,6 +293,31 @@ def test_current_candle_lag_is_warning_when_native_executable_quotes_overlap() -
     ) == []
 
 
+def test_authoritative_pre_order_quote_can_pass_without_delayed_candle_path() -> None:
+    timestamp = 1_783_990_859_000
+    rest = build_market_fact(
+        "ROBO/USDT",
+        _snapshot(0.01305, timestamp),
+        contract_spec=_spec(),
+    )
+    auxiliary = _source_consistency_auxiliary(timestamp, 0.01305)
+    auxiliary["orderbook_fact"]["source_endpoint"] = rest["source_endpoint"]
+    auxiliary["orderbook_fact"]["source_timestamp_ms"] = timestamp
+
+    contract = build_market_source_consistency(
+        rest,
+        [],
+        **auxiliary,
+        bars=[],
+        allow_authoritative_quote_without_path=True,
+    )
+
+    assert contract["status"] == "clean"
+    assert contract["reasons"] == []
+    assert "recent_one_minute_price_path_missing" in contract["reference_warnings"]
+    assert contract["assertions"]["market_continuity_verified"] is True
+
+
 def test_subsecond_native_quote_movement_uses_spread_bounded_reconciliation() -> None:
     timestamp = 1_783_990_859_000
     rest = build_market_fact(
