@@ -56,39 +56,11 @@ class EntryPriceGuardPolicy:
 
         snapshot = _safe_dict(decision.feature_snapshot)
         raw = _safe_dict(decision.raw_response)
-        stored_basis = _safe_dict(raw.get("pre_execution_analysis_basis"))
-        stored_price = _safe_float(stored_basis.get("snapshot_price"))
-        stored_basis_valid = bool(
-            stored_basis.get("version") == "2026-08-19.entry-analysis-basis.v1"
-            and stored_basis.get("validated") is True
-            and str(stored_basis.get("symbol") or "") == str(decision.symbol or "")
-            and str(stored_basis.get("action") or "") == decision.action.value
-            and stored_price > 0
-        )
-        if stored_basis_valid:
-            snapshot_price = stored_price
-            analysis_fact = _safe_dict(stored_basis.get("market_fact"))
-        else:
-            quality_reason = self.market_data_quality_reason_provider(
-                snapshot,
-                stage_label="pre-order analysis snapshot",
-            )
-            if quality_reason:
-                return (
-                    "Pre-order analysis market fact is invalid; entry fails closed: "
-                    f"{quality_reason}"
-                )
-            snapshot_price = _safe_float(snapshot.get("current_price") or snapshot.get("close"))
-            analysis_fact = _safe_dict(snapshot.get("market_fact"))
-            stored_basis = {
-                "version": "2026-08-19.entry-analysis-basis.v1",
-                "validated": True,
-                "symbol": decision.symbol,
-                "action": decision.action.value,
-                "snapshot_price": snapshot_price,
-                "market_fact": analysis_fact,
-            }
 
+        # The execution snapshot is the only market-data contract that can
+        # authorize an order.  The analysis snapshot is historical context:
+        # it remains an immutable price basis for drift measurement, but its
+        # native fact must never veto a newer authoritative execution fact.
         execution_facts: dict[str, Any] = {}
         if self.pre_order_execution_facts_provider is not None:
             try:
@@ -114,11 +86,44 @@ class EntryPriceGuardPolicy:
                 or execution_inst_id != expected_inst_id
             ):
                 return "Pre-order market fact and execution fact instrument mismatch; entry fails closed."
+            execution_quality_reason = self.market_data_quality_reason_provider(
+                execution_snapshot,
+                stage_label="pre-order execution snapshot",
+            )
+            if execution_quality_reason:
+                return (
+                    "Authoritative pre-order execution market fact is invalid; "
+                    f"entry fails closed: {execution_quality_reason}"
+                )
             fresh = execution_snapshot
         else:
             fresh = await self._fresh_valid_snapshot(decision.symbol)
             if not fresh:
                 return "Fresh pre-order native market fact is incomplete; entry fails closed."
+
+        stored_basis = _safe_dict(raw.get("pre_execution_analysis_basis"))
+        stored_price = _safe_float(stored_basis.get("snapshot_price"))
+        stored_basis_valid = bool(
+            stored_basis.get("version") == "2026-08-19.entry-analysis-basis.v1"
+            and stored_basis.get("validated") is True
+            and str(stored_basis.get("symbol") or "") == str(decision.symbol or "")
+            and str(stored_basis.get("action") or "") == decision.action.value
+            and stored_price > 0
+        )
+        if stored_basis_valid:
+            snapshot_price = stored_price
+            analysis_fact = _safe_dict(stored_basis.get("market_fact"))
+        else:
+            snapshot_price = _safe_float(snapshot.get("current_price") or snapshot.get("close"))
+            analysis_fact = _safe_dict(snapshot.get("market_fact"))
+            stored_basis = {
+                "version": "2026-08-19.entry-analysis-basis.v1",
+                "validated": True,
+                "symbol": decision.symbol,
+                "action": decision.action.value,
+                "snapshot_price": snapshot_price,
+                "market_fact": analysis_fact,
+            }
 
         if snapshot_price <= 0:
             return "Pre-order analysis price is missing; entry fails closed."

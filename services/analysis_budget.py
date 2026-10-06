@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,8 +15,12 @@ POSITION_REVIEW_MEDIUM_LOAD_MAX_GROUPS_PER_ROUND = 10
 POSITION_REVIEW_HIGH_LOAD_MAX_GROUPS_PER_ROUND = 14
 MARKET_ANALYSIS_MIN_EXPLORATION_SYMBOLS = 2
 MARKET_ANALYSIS_HIGH_RISK_MIN_EXPLORATION_SYMBOLS = 1
-MARKET_ANALYSIS_NO_POSITION_CAP = 6
-MARKET_ANALYSIS_LOW_RISK_OPEN_POSITION_CAP = 3
+# Market analysis is an observation/training throughput budget.  It is not an
+# entry permission or sizing control.  Keep the configured scan roster
+# observable even when the position loop is empty or lightly populated; the
+# execution pipeline still owns every exchange/risk gate.
+MARKET_ANALYSIS_NO_POSITION_CAP = 8
+MARKET_ANALYSIS_LOW_RISK_OPEN_POSITION_CAP = 8
 MARKET_ANALYSIS_MEDIUM_RISK_CAP = 2
 MARKET_ANALYSIS_HIGH_RISK_CAP = 1
 
@@ -339,10 +342,7 @@ class AnalysisBudgetPolicy:
             return 0, "no_market_budget"
         dynamic_cap = max(
             runtime.market_min_exploration_symbols,
-            min(
-                runtime.market_no_position_cap,
-                max(1, math.ceil(math.sqrt(base_market_limit))),
-            ),
+            runtime.market_no_position_cap,
         )
         if roster_underfilled:
             dynamic_cap = max(
@@ -377,18 +377,9 @@ class AnalysisBudgetPolicy:
             cap = max(runtime.market_min_exploration_symbols, runtime.market_medium_risk_cap)
             return min(base_market_limit, cap), "position_first_medium_risk"
 
-        discovery_floor = min(
-            base_market_limit,
-            max(
-                runtime.market_min_exploration_symbols,
-                math.ceil(math.sqrt(base_market_limit)),
-            ),
-        )
         base_cap = max(
             runtime.market_min_exploration_symbols,
             runtime.market_low_risk_open_position_cap,
-            discovery_floor,
-            math.ceil(base_market_limit * 0.15),
         )
         policy = (
             "position_first_low_risk_underfilled"

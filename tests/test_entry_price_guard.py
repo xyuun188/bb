@@ -104,19 +104,53 @@ async def test_live_rules_canary_does_not_require_model_return_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_analysis_fact_cannot_be_rescued_by_a_fresh_snapshot() -> None:
+async def test_dirty_analysis_fact_is_replaced_by_authoritative_execution_snapshot() -> None:
     async def fresh_feature(_symbol: str) -> Any:
-        raise AssertionError("dirty analysis must be blocked before refresh")
+        raise AssertionError("authoritative execution facts must avoid a duplicate feature refresh")
+
+    async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
+        return {
+            "production_eligible": True,
+            "inst_id": "BTC-USDT-SWAP",
+            "feature_snapshot": {"current_price": 100.1, "close": 100.1},
+        }
 
     policy = EntryPriceGuardPolicy(
         fresh_feature_provider=fresh_feature,
-        market_data_quality_reason_provider=lambda _snapshot, **_kwargs: "dirty fact",
+        market_data_quality_reason_provider=lambda _snapshot, **kwargs: (
+            "dirty analysis fact"
+            if kwargs.get("stage_label") == "pre-order analysis snapshot"
+            else None
+        ),
         decision_age_seconds_provider=lambda _decision: 12.0,
+        pre_order_execution_facts_provider=execution_facts,
     )
 
-    reason = await policy.guard_reason(_decision())
+    reason = await policy.guard_reason(_decision(), "paper")
 
-    assert "analysis market fact is invalid" in reason
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_dirty_authoritative_execution_fact_still_fails_closed() -> None:
+    async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
+        return {
+            "production_eligible": True,
+            "inst_id": "BTC-USDT-SWAP",
+            "feature_snapshot": {"current_price": 100.1, "close": 100.1},
+        }
+
+    policy = EntryPriceGuardPolicy(
+        fresh_feature_provider=lambda _symbol: {},
+        market_data_quality_reason_provider=lambda _snapshot, **_kwargs: "dirty execution fact",
+        decision_age_seconds_provider=lambda _decision: 12.0,
+        pre_order_execution_facts_provider=execution_facts,
+    )
+
+    reason = await policy.guard_reason(_decision(), "paper")
+
+    assert "execution market fact is invalid" in reason
+    assert "dirty execution fact" in reason
 
 
 @pytest.mark.asyncio
@@ -259,7 +293,7 @@ async def test_repeated_guard_keeps_original_analysis_price_as_immutable_basis()
 
     def quality(snapshot: dict[str, Any], **_kwargs: Any) -> None:
         calls["quality"] += 1
-        assert snapshot.get("current_price") == 100.0
+        assert snapshot.get("current_price") == 101.0
         return None
 
     decision = _decision()
@@ -272,7 +306,7 @@ async def test_repeated_guard_keeps_original_analysis_price_as_immutable_basis()
 
     assert await policy.guard_reason(decision, "paper") is None
     assert await policy.guard_reason(decision, "paper") is None
-    assert calls["quality"] == 1
+    assert calls["quality"] == 2
     assert decision.raw_response["pre_execution_price_check"]["snapshot_price"] == 100.0
 
 

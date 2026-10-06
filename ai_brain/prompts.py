@@ -821,7 +821,9 @@ def build_batch_experts_user_prompt(
         "unpromoted_quantitative_summary": compact_value(
             unpromoted_quantitative_summary,
             depth=3,
-            dict_limit=16,
+            # Keep the explicit authorization flag in the model-visible
+            # contract even when the summary grows with more evidence fields.
+            dict_limit=32,
             list_limit=2,
         ),
         "ml_signal": (

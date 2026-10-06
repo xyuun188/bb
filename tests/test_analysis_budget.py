@@ -57,7 +57,7 @@ def test_market_only_budget_is_independent_from_open_position_snapshot() -> None
 
     assert result["risk_level"] == "market_only"
     assert result["market_limit_policy"] == "market_only_independent_budget"
-    assert result["market_symbol_limit"] == 5
+    assert result["market_symbol_limit"] == 8
     assert result["position_group_count"] == 1
 
 

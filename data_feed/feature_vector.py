@@ -73,6 +73,11 @@ class FeatureVector:
     indicator_price_gap_pct: float = 0.0
     price_reconciliation_warning: str = ""
     market_fact: dict[str, Any] = field(default_factory=dict)
+    # A complete price/indicator snapshot may still be useful for model
+    # observation when auxiliary native execution facts are incomplete.  This
+    # flag is persisted with the sample and is never sufficient for an order.
+    market_data_observation_only: bool = False
+    market_data_observation_reasons: list[str] = field(default_factory=list)
     feature_refresh_fallback_used: bool = False
     feature_refresh_fallback_reason: str = ""
     mark_price: float = 0.0

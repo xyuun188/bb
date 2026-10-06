@@ -679,7 +679,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             market_value_reader=self.market_value_reader.read,
         )
         self.entry_market_llm_prefilter = EntryMarketLLMPrefilterPolicy(
-            self.entry_market_data_quality.reason
+            self.entry_market_data_quality.observation_blocker
         )
         self.memory_position_store = MemoryPositionStore(
             paper_executor_provider=lambda: self.paper_executor,
@@ -4396,7 +4396,15 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "okx_pre_order_account_equity_missing" in str(facts.get("reason") or "")
             or "okx_pre_order_available_margin_missing" in str(facts.get("reason") or "")
         )
-        if not missing_balance or not is_okx_temporary_service_error(balance_error):
+        balance_snapshot_is_empty = (
+            isinstance(balance_snapshot, dict)
+            and self._safe_float(balance_snapshot.get("equity"), 0.0) <= 0
+            and self._safe_float(balance_snapshot.get("free"), 0.0) <= 0
+            and not balance_error
+        )
+        if not missing_balance or not (
+            is_okx_temporary_service_error(balance_error) or balance_snapshot_is_empty
+        ):
             return facts
 
         selected_mode = "live" if model_mode == "live" else "paper"
@@ -4432,7 +4440,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "source": "cached_okx_balance_snapshot",
             "stale": bool(cache_age > OKX_BALANCE_SNAPSHOT_FRESH_SECONDS),
             "stale_age_seconds": round(cache_age, 3),
-            "stale_reason": "okx_private_balance_temporary_service_error",
+            "stale_reason": (
+                "okx_private_balance_temporary_service_error"
+                if balance_error
+                else "okx_private_balance_empty_snapshot"
+            ),
         }
         repaired["account_equity_usdt"] = cached_equity
         repaired["available_margin_usdt"] = cached_free
@@ -4458,7 +4470,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
         provenance.update(
             {
                 "source": "okx_native_market_facts_and_cached_verified_balance",
-                "fallback_reason": "okx_private_balance_temporary_service_error",
+                "fallback_reason": (
+                    "okx_private_balance_temporary_service_error"
+                    if balance_error
+                    else "okx_private_balance_empty_snapshot"
+                ),
                 "balance_source": "cached_okx_balance_snapshot",
                 "balance_snapshot_age_seconds": round(cache_age, 3),
                 "requires_final_balance_recheck": True,
@@ -5885,12 +5901,33 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 return None, None
             quality_policy = getattr(self, "entry_market_data_quality", None)
             quality_issue = (
-                quality_policy.issue(candidate, stage_label="AI分析前")
+                quality_policy.observation_issue(candidate, stage_label="AI observation")
                 if quality_policy is not None
                 else None
             )
             if quality_issue is None:
                 return candidate, None
+            # Analysis and training may retain a priced snapshot as
+            # observation-only.  The strict EntryPriceGuard still calls the
+            # same policy at the execution boundary and will reject it there.
+            try:
+                candidate.market_data_observation_only = True
+                candidate.market_data_observation_reasons = [
+                    str(getattr(quality_issue, "code", "market_data_quality"))
+                ]
+                issue_payload = (
+                    quality_issue.as_dict()
+                    if hasattr(quality_issue, "as_dict")
+                    else {"code": str(getattr(quality_issue, "code", "market_data_quality"))}
+                )
+                candidate.market_data_quality = issue_payload
+                candidate.training_quality_reason = (
+                    f"market_data_quality:{getattr(quality_issue, 'code', 'market_data_quality')}"
+                )
+            except (AttributeError, TypeError):
+                pass
+            if self._is_valid_feature_vector(candidate) and funding_ready(candidate):
+                return candidate, quality_issue
             quality_details = getattr(quality_issue, "details", None)
             quality_details = quality_details if isinstance(quality_details, dict) else {}
             log_method = logger.info if source == "fresh_local_market_cache" else logger.warning
@@ -5914,9 +5951,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 source="prewarmed_fallback",
             )
         except Exception as exc:
-            # A legacy/test double may expose a narrower quality-policy
-            # contract. Treat that fallback as unusable rather than allowing
-            # the diagnostic path to change the entry decision.
             logger.debug(
                 "prewarmed fallback validation failed",
                 symbol=symbol,
@@ -5924,10 +5958,32 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
             fallback_candidate, fallback_quality_issue = None, None
         fallback_usable = bool(
-            fallback_candidate is not None
-            and fallback_quality_issue is None
-            and funding_ready(fallback_candidate)
+            fallback_candidate is not None and funding_ready(fallback_candidate)
         )
+
+        # A priced fallback with an execution-only quality issue is already a
+        # valid observation snapshot. Do not spend the entire market-round
+        # budget waiting for mark/path reconciliation that the final order
+        # boundary will perform again. This is the key separation between
+        # observation throughput and executable-entry validation.
+        quality_policy = getattr(self, "entry_market_data_quality", None)
+        if fallback_usable and fallback_quality_issue is not None and quality_policy is not None:
+            if quality_policy.observation_blocker(
+                fallback_candidate,
+                stage_label="AI observation",
+            ) is None:
+                try:
+                    fallback_candidate.feature_refresh_fallback_used = True
+                    fallback_candidate.feature_refresh_fallback_reason = "observation_only_quality_issue"
+                except (AttributeError, TypeError):
+                    pass
+                logger.info(
+                    "using prewarmed snapshot for observation-only analysis",
+                    symbol=symbol,
+                    diagnostic_code=getattr(fallback_quality_issue, "code", "market_data_quality"),
+                    execution_refresh_required=True,
+                )
+                return fallback_candidate
 
         def use_fallback(reason: str) -> Any | None:
             if not fallback_usable:
@@ -10906,7 +10962,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     open_positions=open_positions,
                 )
                 market_data_quality_issue = (
-                    self.entry_market_data_quality.issue(fv, stage_label="AI分析前")
+                    self.entry_market_data_quality.observation_issue(fv, stage_label="AI observation")
                     if prefilter_reason
                     else None
                 )

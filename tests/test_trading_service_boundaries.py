@@ -1391,8 +1391,8 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
 
     class QualityPolicy:
         @staticmethod
-        def issue(candidate: Any, *, stage_label: str) -> Any | None:
-            assert stage_label == "AI分析前"
+        def observation_issue(candidate: Any, *, stage_label: str) -> Any | None:
+            assert stage_label == "AI observation"
             return stale_issue if candidate is stale else None
 
     service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
@@ -1701,6 +1701,11 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
         bid=99.9,
         ask=100.1,
         indicator_snapshot_available=False,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
     )
     fallback = SimpleNamespace(
         current_price=99.0,
@@ -1711,9 +1716,9 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
     )
 
     class QualityPolicy:
-        def issue(self, vector: Any, *, stage_label: str) -> Any:
+        def observation_issue(self, vector: Any, *, stage_label: str) -> Any:
             assert vector is fresh
-            assert stage_label == "AI分析前"
+            assert stage_label == "AI observation"
             return SimpleNamespace(code="short_cycle_features_missing")
 
     async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
@@ -1725,7 +1730,9 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
 
     result = await service._fresh_feature_vector_for_analysis("ATOM/USDT", fallback)
 
-    assert result is None
+    assert result is fresh
+    assert result.market_data_observation_only is True
+    assert result.market_data_observation_reasons == ["short_cycle_features_missing"]
 
 
 @pytest.mark.asyncio
@@ -12743,6 +12750,48 @@ async def test_pre_order_facts_reuse_recent_balance_after_temporary_okx_error() 
     assert result["balance_source"] == "cached_okx_balance_snapshot"
     assert result["requires_final_balance_recheck"] is True
     assert result["policy_provenance"]["balance_source"] == "cached_okx_balance_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_pre_order_facts_reuse_recent_balance_after_empty_okx_snapshot() -> None:
+    service = TradingService.__new__(TradingService)
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 234.5, "equity": 250.0, "allocatable": 234.5},
+            "fetched_at": datetime.now(UTC) - timedelta(seconds=30),
+        }
+    }
+    service._okx_authoritative_sync_status_payload = lambda: {
+        "status": "ok",
+        "fresh_success_available": True,
+    }
+
+    class EmptyBalanceExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": (
+                    "okx_pre_order_account_equity_missing,"
+                    "okx_pre_order_available_margin_missing"
+                ),
+                "balance_snapshot": {"equity": 0.0, "free": 0.0},
+                "inst_id": "BTC-USDT-SWAP",
+                "feature_snapshot": {"current_price": 100.0},
+                "policy_provenance": {"source": "okx_native"},
+            }
+
+    async def get_executor(_mode: str) -> EmptyBalanceExecutor:
+        return EmptyBalanceExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.symbol = "BTC/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is True
+    assert result["balance_source"] == "cached_okx_balance_snapshot"
+    assert result["policy_provenance"]["fallback_reason"] == "okx_private_balance_empty_snapshot"
 
 
 @pytest.mark.asyncio

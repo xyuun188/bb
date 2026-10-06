@@ -651,7 +651,9 @@ async def test_entry_size_rejects_before_okx_when_min_contracts_unaffordable():
     rules = result.raw_response["okx_order_rules"]
     assert rules["pre_submit_valid"] is False
     assert rules["amount_min_contracts"] == pytest.approx(10.0)
-    assert rules["affordable_notional_usdt"] == pytest.approx(1.0)
+    # The exchange-confirmed leverage is authoritative for the final
+    # pre-submit affordability snapshot.
+    assert rules["affordable_notional_usdt"] == pytest.approx(3.0)
     assert rules["min_notional_usdt"] == pytest.approx(10.0)
 
 

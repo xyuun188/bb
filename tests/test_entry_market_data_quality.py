@@ -170,6 +170,31 @@ def test_entry_market_data_quality_policy_fails_closed_without_native_fact():
     assert issue.code == "native_market_fact_missing"
 
 
+def test_observation_quality_reports_incomplete_native_fact_without_blocking_price_observation():
+    snapshot = _valid_snapshot()
+    snapshot.pop("market_fact")
+    policy = EntryMarketDataQualityPolicy()
+
+    issue = policy.observation_issue(snapshot, stage_label="AI observation")
+
+    assert issue is not None
+    assert issue.code == "native_market_fact_missing"
+    assert policy.observation_blocker(snapshot, stage_label="AI observation") is None
+
+
+def test_execution_and_observation_share_one_evaluation_contract():
+    snapshot = _valid_snapshot()
+    snapshot.pop("market_fact")
+    policy = EntryMarketDataQualityPolicy()
+
+    execution_issue = policy.issue(snapshot, stage_label="entry")
+    observation_issue = policy.observation_issue(snapshot, stage_label="AI observation")
+
+    assert execution_issue is not None
+    assert execution_issue.code == observation_issue.code == "native_market_fact_missing"
+    assert execution_issue.details == observation_issue.details
+
+
 def test_entry_market_data_quality_policy_rejects_stale_consistency_contract():
     snapshot = _valid_snapshot()
     snapshot["market_fact"]["source_consistency"]["version"] = (

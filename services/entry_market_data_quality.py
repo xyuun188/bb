@@ -54,6 +54,16 @@ class EntryMarketDataQualityPolicy:
         return issue.reason if issue else None
 
     def issue(self, source: Any, *, stage_label: str = "下单前") -> MarketDataQualityIssue | None:
+        """Evaluate the canonical strict execution contract."""
+        return self._evaluate(source, stage_label=stage_label, allow_incomplete_native_fact=False)
+
+    def _evaluate(
+        self,
+        source: Any,
+        *,
+        stage_label: str,
+        allow_incomplete_native_fact: bool,
+    ) -> MarketDataQualityIssue | None:
         try:
             market_fact_issue = self._market_fact_issue(source, stage_label)
             snapshot = self._snapshot(source)
@@ -65,7 +75,7 @@ class EntryMarketDataQualityPolicy:
                 {},
             )
 
-        if market_fact_issue:
+        if market_fact_issue and not allow_incomplete_native_fact:
             return market_fact_issue
 
         price = self._reference_price(snapshot)
@@ -87,6 +97,45 @@ class EntryMarketDataQualityPolicy:
             issue = checker(snapshot, price, stage_label)
             if issue:
                 return issue
+        return market_fact_issue if allow_incomplete_native_fact else None
+
+    def observation_issue(
+        self,
+        source: Any,
+        *,
+        stage_label: str = "AI observation",
+    ) -> MarketDataQualityIssue | None:
+        """Return quality diagnostics while keeping observation separate from execution."""
+        return self._evaluate(
+            source,
+            stage_label=stage_label,
+            allow_incomplete_native_fact=True,
+        )
+
+    def observation_blocker(
+        self,
+        source: Any,
+        *,
+        stage_label: str = "AI observation",
+    ) -> str | None:
+        """Only block observation when no usable price payload exists."""
+
+        try:
+            snapshot = self._snapshot(source)
+        except (TypeError, ValueError, AttributeError):
+            return self._issue(
+                "market_payload_invalid",
+                stage_label,
+                "market observation payload is invalid",
+                {},
+            ).reason
+        if self._reference_price(snapshot) <= 0:
+            return self._issue(
+                "missing_valid_price",
+                stage_label,
+                "market observation has no usable price",
+                snapshot,
+            ).reason
         return None
 
     @staticmethod

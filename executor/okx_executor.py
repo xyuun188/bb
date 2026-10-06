@@ -1517,6 +1517,24 @@ class OKXExecutor(AbstractExecutor):
                                 "contract_size": contract_size,
                                 "planned_order_contracts": order_quantity,
                                 "planned_base_quantity": base_quantity,
+                                "okx_min_order_notional_usdt": round(
+                                    self._safe_float(
+                                        okx_order_rules.get("min_notional_usdt"),
+                                        0.0,
+                                    ),
+                                    8,
+                                ),
+                                "affordable_notional_usdt": round(
+                                    self._safe_float(
+                                        okx_order_rules.get("affordable_notional_usdt"),
+                                        0.0,
+                                    ),
+                                    8,
+                                ),
+                                "planned_order_notional_usdt": round(
+                                    max(base_quantity, 0.0) * max(price, 0.0),
+                                    8,
+                                ),
                                 "okx_order_rules": okx_order_rules,
                             },
                         )
@@ -1701,6 +1719,27 @@ class OKXExecutor(AbstractExecutor):
                             "system_pre_submit_rejection": True,
                             "okx_rejection": False,
                             "okx_symbol": okx_symbol,
+                            "contract_size": contract_size,
+                            "planned_order_contracts": order_quantity,
+                            "planned_base_quantity": base_quantity,
+                            "okx_min_order_notional_usdt": round(
+                                self._safe_float(
+                                    okx_order_rules.get("min_notional_usdt"),
+                                    0.0,
+                                ),
+                                8,
+                            ),
+                            "affordable_notional_usdt": round(
+                                self._safe_float(
+                                    okx_order_rules.get("affordable_notional_usdt"),
+                                    0.0,
+                                ),
+                                8,
+                            ),
+                            "planned_order_notional_usdt": round(
+                                max(base_quantity, 0.0) * max(price, 0.0),
+                                8,
+                            ),
                             "okx_order_rules": okx_order_rules,
                         },
                     )
@@ -5137,6 +5176,24 @@ class OKXExecutor(AbstractExecutor):
                 "planned_order_contracts": order_quantity,
                 "planned_base_quantity": base_quantity,
                 "amount_max_market_contracts": max_market_contracts,
+                # Keep the rejection envelope identical to the direct
+                # minimum-order guard so dashboard/audit consumers can
+                # explain every pre-submit block from one contract.
+                "okx_min_order_notional_usdt": round(
+                    self._safe_float(okx_order_rules.get("min_notional_usdt"), 0.0),
+                    8,
+                ),
+                "affordable_notional_usdt": round(
+                    self._safe_float(
+                        okx_order_rules.get("affordable_notional_usdt"),
+                        0.0,
+                    ),
+                    8,
+                ),
+                "planned_order_notional_usdt": round(
+                    max(base_quantity, 0.0) * max(price, 0.0),
+                    8,
+                ),
                 "okx_order_rules": okx_order_rules,
             },
         )
