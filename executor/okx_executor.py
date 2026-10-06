@@ -26,6 +26,7 @@ from core.exceptions import (
     OrderPlacementError,
     RateLimitError,
 )
+from core.market_facts import build_market_fact, build_market_source_consistency
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
 from core.symbols import (
@@ -7415,6 +7416,113 @@ class OKXExecutor(AbstractExecutor):
         ask_depth = sum(price * contracts * contract_value_base for price, contracts in asks)
         total_depth = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0.0
+        ticker_info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        ticker_last = max(self._safe_float(ticker.get("last"), 0.0), 0.0)
+        volume_24h_contracts = max(
+            self._safe_float(
+                ticker.get("volume_24h_contracts")
+                or ticker_info.get("vol24h"),
+                0.0,
+            ),
+            0.0,
+        )
+        volume_24h_base = max(
+            self._safe_float(
+                ticker.get("volume_24h_base")
+                or ticker_info.get("volCcy24h"),
+                0.0,
+            ),
+            0.0,
+        )
+        notional_24h_usdt = max(
+            self._safe_float(
+                ticker.get("notional_24h_usdt")
+                or ticker.get("volume_24h_quote")
+                or ticker_info.get("volCcyQuote24h"),
+                0.0,
+            ),
+            0.0,
+        )
+        if notional_24h_usdt <= 0 and volume_24h_base > 0 and ticker_last > 0:
+            notional_24h_usdt = volume_24h_base * ticker_last
+        orderbook_source_timestamp_ms = int(
+            self._safe_float(book.get("timestamp"), 0.0)
+            or self._safe_float((book.get("info") or {}).get("ts"), 0.0)
+        )
+        ticker_source_timestamp_ms = int(
+            self._safe_float(ticker.get("timestamp"), 0.0)
+            or self._safe_float(ticker_info.get("ts"), 0.0)
+        )
+        mark_source_timestamp_ms = int(self._safe_float(mark_row.get("ts"), 0.0))
+        orderbook_fact = {
+            "inst_id": inst_id,
+            "inst_type": "SWAP",
+            "source_endpoint": "okx_rest_market_books",
+            "source_channel": "books",
+            "source_timestamp_ms": orderbook_source_timestamp_ms,
+            "bid": bid,
+            "ask": ask,
+            "bid_depth_usdt": bid_depth,
+            "ask_depth_usdt": ask_depth,
+            "contract_spec_version": (
+                str(spec.get("spec_version") or "").strip()
+                or str(spec.get("contract_spec_version") or "").strip()
+            ),
+        }
+        mark_price_fact = {
+            "inst_id": inst_id,
+            "inst_type": "SWAP",
+            "source_endpoint": "okx_rest_public_mark_price",
+            "source_channel": "mark-price",
+            "source_timestamp_ms": mark_source_timestamp_ms,
+            "price": mark_price,
+        }
+        native_snapshot = {
+            "symbol": normalize_trading_symbol(symbol),
+            "inst_id": inst_id,
+            "inst_type": "SWAP",
+            "source": "rest",
+            "source_endpoint": "okx_rest_market_ticker",
+            "source_channel": "tickers",
+            "timestamp": ticker_source_timestamp_ms,
+            "last_price": ticker_last,
+            "bid": bid,
+            "ask": ask,
+            "mark_price": mark_price,
+            "notional_24h_usdt": notional_24h_usdt,
+            "volume_24h_contracts": volume_24h_contracts,
+            "volume_24h_base": volume_24h_base,
+            "orderbook_bid_depth": bid_depth,
+            "orderbook_ask_depth": ask_depth,
+            "orderbook_imbalance": imbalance,
+            "contract_spec": spec,
+            "orderbook_fact": orderbook_fact,
+            "mark_price_fact": mark_price_fact,
+        }
+        base_market_fact = build_market_fact(
+            symbol,
+            native_snapshot,
+            contract_spec=spec,
+            received_at=datetime.now(UTC),
+        )
+        market_source_consistency = build_market_source_consistency(
+            base_market_fact,
+            (),
+            orderbook_fact=orderbook_fact,
+            mark_price_fact=mark_price_fact,
+            index_price_fact=None,
+            bars=(),
+            generated_at=datetime.now(UTC),
+        )
+        primary_market_fact = build_market_fact(
+            symbol,
+            {
+                **native_snapshot,
+                "market_source_consistency": market_source_consistency,
+            },
+            contract_spec=spec,
+            received_at=datetime.now(UTC),
+        )
         reasons: list[str] = []
         if not inst_id:
             reasons.append("okx_pre_order_inst_id_missing")
@@ -7452,12 +7560,19 @@ class OKXExecutor(AbstractExecutor):
             "orderbook_imbalance": imbalance,
             "contract_value_base": contract_value_base,
             "contract_spec": spec,
+            "notional_24h_usdt": notional_24h_usdt,
+            "volume_24h_contracts": volume_24h_contracts,
+            "volume_24h_base": volume_24h_base,
             "taker_fee_rate": fee.get("taker_fee_rate"),
             "entry_fee_rate": fee.get("entry_fee_rate"),
             "exit_fee_rate": fee.get("exit_fee_rate"),
             "fee_rate_source": fee.get("fee_rate_source"),
             "fee_rate_observed_at": fee.get("fee_rate_observed_at"),
             "fee_policy_provenance": fee.get("policy_provenance"),
+            "market_fact": primary_market_fact,
+            "market_source_consistency": market_source_consistency,
+            "orderbook_fact": orderbook_fact,
+            "mark_price_fact": mark_price_fact,
         }
         return {
             "production_eligible": not reasons,

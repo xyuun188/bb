@@ -844,7 +844,9 @@ class OkxNativeFactsClient:
                     "instFamily": str(row.get("instFamily") or ""),
                     "lotSz": str(row.get("lotSz") or ""),
                     "minSz": str(row.get("minSz") or ""),
+                    "tickSz": str(row.get("tickSz") or ""),
                     "settleCcy": str(row.get("settleCcy") or ""),
+                    "state": str(row.get("state") or ""),
                     "source": "okx_public_instruments",
                     "source_endpoint": source_endpoint,
                 }

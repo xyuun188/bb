@@ -2609,6 +2609,8 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                         "last": "100",
                         "bidPx": "99.9",
                         "askPx": "100.1",
+                            "vol24h": "1000",
+                            "volCcy24h": "100000",
                         "ts": "1780000000000",
                     }
                 ]
@@ -2715,6 +2717,9 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert facts["production_eligible"] is True
     assert facts["inst_id"] == "BTC-USDT-SWAP"
     snapshot = facts["feature_snapshot"]
+    assert snapshot["market_fact"]["quality"]["status"] == "clean"
+    assert snapshot["market_fact"]["source_consistency"]["status"] == "clean"
+    assert snapshot["market_fact"]["fact_id"].startswith("sha256:")
     assert snapshot["contract_value_base"] == pytest.approx(0.01)
     assert snapshot["orderbook_bid_depth"] == pytest.approx(99.9 * 2.0 * 0.01)
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
