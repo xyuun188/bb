@@ -16,14 +16,12 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# ExecutionService allows an entry exchange request up to 60 seconds. The
-# handoff deadline must cover that complete window plus local persistence;
-# cancelling earlier can leave the exchange task alive while stale-entry repair
-# permits the same signal to be retried.
-DEFAULT_ENTRY_EXECUTION_HANDOFF_TIMEOUT_SECONDS = 75.0
-# Keep stale-entry repair later than every detached handoff. Export the value so
-# maintenance cannot silently drift below the execution deadline again.
-ENTRY_EXECUTION_PENDING_RECOVERY_SECONDS = 120.0
+# Risk preparation performs several authoritative OKX reads before submit. The
+# handoff budget must cover that preparation plus the bounded exchange request;
+# recovery remains later than the handoff so an in-flight result is not rewritten
+# while the submit task is still allowed to finish.
+DEFAULT_ENTRY_EXECUTION_HANDOFF_TIMEOUT_SECONDS = 150.0
+ENTRY_EXECUTION_PENDING_RECOVERY_SECONDS = 240.0
 # Short aliases make the deadline explicit at call sites and keep older
 # imports that used the generic name source-compatible.
 ENTRY_EXECUTION_HANDOFF_TIMEOUT_SECONDS = DEFAULT_ENTRY_EXECUTION_HANDOFF_TIMEOUT_SECONDS

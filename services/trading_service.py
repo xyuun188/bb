@@ -323,7 +323,14 @@ MARKET_ROUND_SCHEDULER_MAX_SECONDS = 120.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
 # Keep the single-flight queue above the 75-second entry handoff deadline.
 # The final execution boundary refreshes market/account facts before submit.
-MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 120.0
+# Entry risk preparation and exchange submission are independent per-symbol
+# after the model decision has completed.  A single-flight gate serialized all
+# candidates behind one slow OKX refresh, so a normal market round could
+# produce hundreds of decisions but submit only one or two orders.  Keep the
+# queue bounded for exchange/API safety while allowing unrelated symbols to
+# progress concurrently.
+MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY = 4
+MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 45.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
@@ -450,6 +457,7 @@ LOCAL_QUANT_PROMPT_ENABLED = True
 LOCAL_QUANT_MARKET_PREFILTER_ENABLED = True
 OKX_BALANCE_SNAPSHOT_FRESH_SECONDS = 15.0
 OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
+OKX_BALANCE_SNAPSHOT_CONTENTION_WAIT_SECONDS = 12.0
 MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 30.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
 # Shadow maintenance is low priority; keep the foreground batch within the
@@ -575,7 +583,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             timeout_provider=self.position_review_stage_timeout_seconds,
             round_watchdog_provider=self.position_round_watchdog_seconds,
         )
-        self._execution_lock = asyncio.Lock()
+        # Entry candidates are already deduplicated per symbol and guarded by
+        # the bounded market-entry pipeline. A process-wide single-flight lock
+        # here serialized every candidate across risk preparation, private
+        # account reads, and exchange submission, so four upstream workers
+        # still produced one real execution at a time. Keep execution writes
+        # bounded, but allow unrelated symbols to progress concurrently.
+        self._execution_lock = asyncio.Semaphore(MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY)
         self.exit_execution_singleflight = ExitExecutionSingleFlightService()
         self.entry_execution_pipeline = EntryExecutionPipeline(lambda: self.entry_policy)
         self.exit_execution_pipeline = ExitExecutionPipeline(lambda: self.exit_policy)
@@ -997,7 +1011,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._recent_decisions: list[dict] = []
         self._recent_executions: list[dict] = []
         self._market_entry_pipeline_tasks: dict[str, asyncio.Task] = {}
-        self._market_entry_pipeline_semaphore = asyncio.Semaphore(1)
+        self._market_entry_pipeline_semaphore = asyncio.Semaphore(
+            MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY
+        )
         self._market_entry_pipeline_stage = "idle"
         self._market_entry_pipeline_stage_updated_at: datetime | None = None
         self._start_time: datetime | None = None
@@ -4370,7 +4386,72 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Load the OKX-native facts consumed by authoritative entry sizing."""
 
         executor = await self._get_okx_executor_for_mode(model_mode)
-        return await executor.entry_risk_facts(decision.symbol, open_positions)
+        facts = await executor.entry_risk_facts(decision.symbol, open_positions)
+        if not isinstance(facts, dict):
+            return {}
+
+        # Sizing and pre-order execution must use one account fact chain.  OKX
+        # can return a transiently empty private balance during a concurrent
+        # refresh even though the verified service cache and the immediate
+        # pre-order path still contain the live paper balance. Reuse that
+        # verified snapshot for sizing only; the executor continues to perform
+        # the final balance recheck before submission.
+        cached = self.peek_okx_balance_snapshot_for_mode(
+            "live" if model_mode == "live" else "paper",
+            allow_stale=True,
+        )
+        cached_equity = max(
+            self._safe_float(cached.get("equity"), 0.0) if isinstance(cached, dict) else 0.0,
+            0.0,
+        )
+        cached_free = max(
+            self._safe_float(cached.get("free"), 0.0) if isinstance(cached, dict) else 0.0,
+            0.0,
+        )
+        current_equity = max(self._safe_float(facts.get("account_equity_usdt"), 0.0), 0.0)
+        current_margin = max(self._safe_float(facts.get("available_margin_usdt"), 0.0), 0.0)
+        if cached_equity <= 0.0 and cached_free <= 0.0:
+            return facts
+        if current_equity > 0.0 and current_margin > 0.0:
+            return facts
+
+        repaired = dict(facts)
+        repaired["account_equity_usdt"] = max(current_equity, cached_equity)
+        repaired["available_margin_usdt"] = max(current_margin, cached_free)
+        repaired["balance_snapshot"] = {
+            **(cached if isinstance(cached, dict) else {}),
+            "source": "cached_okx_balance_snapshot",
+        }
+        repaired["balance_source"] = "cached_okx_balance_snapshot"
+        repaired["requires_final_balance_recheck"] = True
+        provenance = self._safe_dict(facts.get("policy_provenance"))
+        reasons = [
+            item
+            for item in str(provenance.get("fallback_reason") or "").split(",")
+            if item
+            not in {
+                "okx_account_equity_missing",
+                "okx_available_margin_missing",
+            }
+        ]
+        only_balance_gap = bool(
+            str(provenance.get("fallback_reason") or "").strip()
+            and not reasons
+        )
+        repaired["production_eligible"] = bool(
+            facts.get("production_eligible") is True or only_balance_gap
+        )
+        provenance = dict(provenance)
+        provenance.update(
+            {
+                "source": "okx_native_facts_with_verified_cached_balance",
+                "balance_source": "cached_okx_balance_snapshot",
+                "requires_final_balance_recheck": True,
+                "fallback_reason": "okx_entry_risk_facts_balance_repaired_from_cache",
+            }
+        )
+        repaired["policy_provenance"] = provenance
+        return repaired
 
     async def pre_order_execution_facts(
         self,
@@ -9327,7 +9408,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
     def _market_entry_pipeline_gate(self) -> asyncio.Semaphore:
         gate = getattr(self, "_market_entry_pipeline_semaphore", None)
         if not isinstance(gate, asyncio.Semaphore):
-            gate = asyncio.Semaphore(1)
+            gate = asyncio.Semaphore(MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY)
             self._market_entry_pipeline_semaphore = gate
         return gate
 
@@ -9346,7 +9427,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "active_count": len(active_tasks),
             "active_symbols": list(active_tasks)[:20],
             "queue_timeout_seconds": MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS,
-            "single_flight": True,
+            "single_flight": False,
+            "max_concurrency": MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY,
             "stage": str(getattr(self, "_market_entry_pipeline_stage", "idle") or "idle"),
             "stage_updated_at": (
                 updated_at.isoformat() if isinstance(updated_at, datetime) else None
@@ -14421,13 +14503,33 @@ class TradingService(ModelTrainingCoordinatorMixin):
             refresh_cached = cached_snapshot("OKX balance refresh already in progress")
             if refresh_cached:
                 return refresh_cached
-            logger.warning(
-                "OKX balance refresh already in progress without a usable cache; "
-                "suppressing duplicate fallback request",
-                mode=selected_mode,
-                policy="single_flight_fail_closed",
-            )
-            return None
+            # Concurrent entry candidates must share the in-flight refresh
+            # result.  Returning ``None`` here made every candidate after the
+            # first one fail as ``account_incomplete`` even though the account
+            # request itself succeeded a moment later.
+            try:
+                await asyncio.wait_for(
+                    lock.acquire(),
+                    timeout=OKX_BALANCE_SNAPSHOT_CONTENTION_WAIT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "OKX balance refresh contention exceeded wait budget",
+                    mode=selected_mode,
+                    wait_seconds=OKX_BALANCE_SNAPSHOT_CONTENTION_WAIT_SECONDS,
+                )
+                return cached_snapshot("OKX balance refresh contention timeout")
+            else:
+                try:
+                    joined_cached = self._cached_okx_balance_snapshot(
+                        selected_mode,
+                        max_age_seconds=OKX_BALANCE_SNAPSHOT_STALE_SECONDS,
+                    )
+                    if joined_cached:
+                        return joined_cached
+                finally:
+                    lock.release()
+                return cached_snapshot("OKX balance refresh completed without a usable snapshot")
         stale_cached = cached_snapshot("OKX balance snapshot refresh scheduled")
         if stale_cached and allow_stale_while_refresh:
             self._schedule_okx_balance_snapshot_refresh(selected_mode)

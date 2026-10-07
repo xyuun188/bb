@@ -197,7 +197,17 @@ def solve_size_aware_positive_expected_net(
     selected = upper
     iterations = 1
     reduced = False
-    if upper["expected"] <= 0.0:
+    if upper["expected"] <= 0.0 and allow_non_positive_expected_return:
+        # Training entries are deliberately allowed to observe a currently
+        # negative edge, but the observation must still be representative.
+        # Shrinking such entries through the binary-search branch below turns
+        # every losing signal into a one-contract micro-order and starves the
+        # training loop. Keep the independently risk-sized upper bound; the
+        # exchange minimum, margin, depth, and final risk contract still apply.
+        selected = upper
+        iterations = 1
+        reduced = False
+    elif upper["expected"] <= 0.0:
         minimum_candidate = evaluate(executable_minimum)
         iterations += 1
         if minimum_candidate is None or (

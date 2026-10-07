@@ -90,6 +90,71 @@ class _FakeCcxt:
         }
 
 
+class _MarketAndExecutionInstrumentCcxt:
+    def __init__(self) -> None:
+        self.public_params: list[dict[str, Any]] = []
+        self.execution_params: list[dict[str, Any]] = []
+
+    async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.public_params.append(dict(params))
+        return {
+            "data": [{
+                "instType": "SWAP",
+                "instId": "PEPE-USDT-SWAP",
+                "ctVal": "10000000",
+                "ctMult": "1",
+                "tickSz": "0.000000001",
+                "lotSz": "0.1",
+                "minSz": "0.1",
+                "settleCcy": "USDT",
+                "state": "live",
+            }]
+        }
+
+    async def executionGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.execution_params.append(dict(params))
+        return {
+            "data": [{
+                "instType": "SWAP",
+                "instId": "PEPE-USDT-SWAP",
+                "ctVal": "10000000",
+                "ctMult": "1",
+                "tickSz": "0.00000001",
+                "lotSz": "0.1",
+                "minSz": "0.1",
+                "settleCcy": "USDT",
+                "state": "live",
+            }]
+        }
+
+
+class _NativeFactsExecutor:
+    def __init__(self, ccxt: Any) -> None:
+        self.ccxt = ccxt
+
+    async def _get_ccxt(self) -> Any:
+        return self.ccxt
+
+    async def _with_retry(self, method: Any, *args: Any, **kwargs: Any) -> Any:
+        return await method(*args)
+
+
+@pytest.mark.asyncio
+async def test_market_contract_specs_use_public_route_separate_from_execution_specs() -> None:
+    ccxt = _MarketAndExecutionInstrumentCcxt()
+    client = OkxNativeFactsClient(_NativeFactsExecutor(ccxt))
+
+    market = await client.fetch_market_contract_specs(symbols=["PEPE/USDT"])
+    execution = await client.fetch_contract_specs(symbols=["PEPE/USDT"])
+
+    assert market["PEPE-USDT-SWAP"]["tickSz"] == "0.000000001"
+    assert execution["PEPE-USDT-SWAP"]["tickSz"] == "0.00000001"
+    assert ccxt.public_params == [
+        {"instType": "SWAP", "instId": "PEPE-USDT-SWAP"}
+    ]
+    assert ccxt.execution_params == [{"instType": "SWAP"}]
+
+
 class _NativeStateCcxt:
     def __init__(self) -> None:
         self.position_params: list[dict[str, Any]] = []

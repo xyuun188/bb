@@ -292,6 +292,8 @@ class StaleEntryCandidateExpirer:
                 )
                 for row_id, row in candidate_rows.items()
             }
+            for row_id, row in candidate_rows.items():
+                row._stale_entry_original_execution_reason = before[row_id][0]
 
             async def order_count_provider(decision_id: int) -> int:
                 return int(order_counts.get(int(decision_id or 0), 0))
@@ -370,7 +372,12 @@ class StaleEntryCandidateExpirer:
         )
         stmt = (
             update(AIDecision.__table__)
-            .where(AIDecision.id == bindparam("target_decision_id"))
+            .where(
+                AIDecision.id == bindparam("target_decision_id"),
+                AIDecision.was_executed.is_(False),
+                AIDecision.execution_reason
+                == bindparam("expected_execution_reason"),
+            )
             .values(
                 execution_reason=bindparam("execution_reason"),
                 raw_llm_response=merged_raw,
@@ -384,6 +391,10 @@ class StaleEntryCandidateExpirer:
             payloads.append(
                 {
                     "target_decision_id": int(row_id),
+                    "expected_execution_reason": str(
+                        getattr(updated, "_stale_entry_original_execution_reason", "")
+                        or ""
+                    ),
                     "execution_reason": updated.execution_reason,
                     "raw_patch": top,
                     "opportunity_patch": opportunity,
@@ -403,6 +414,13 @@ class StaleEntryCandidateExpirer:
         for row_id, updated in updates.items():
             persisted = persisted_by_id.get(row_id)
             if persisted is None:
+                continue
+            expected_reason = str(
+                getattr(updated, "_stale_entry_original_execution_reason", "") or ""
+            )
+            if str(getattr(persisted, "execution_reason", "") or "") != expected_reason:
+                continue
+            if bool(getattr(persisted, "was_executed", False)):
                 continue
             persisted.execution_reason = updated.execution_reason
             persisted.raw_llm_response = _merge_expired_raw_response(

@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
+from services.stale_entry_candidate_expirer import ENTRY_PENDING_EXECUTION_MAX_SECONDS
 
 
 def _decision(action: Action = Action.LONG) -> DecisionOutput:
@@ -52,7 +53,10 @@ async def test_decision_final_state_ensurer_marks_pending_entry_without_order() 
     )
 
     assert flushed
-    assert "120 秒内没有生成本地订单记录" in row.execution_reason
+    assert (
+        f"{ENTRY_PENDING_EXECUTION_MAX_SECONDS:.0f} 秒内没有生成本地订单记录"
+        in row.execution_reason
+    )
     assert results["decisions"][0]["execution_status"] == "error"
     assert results["decisions"][0]["is_paper"] is True
 

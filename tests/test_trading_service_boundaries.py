@@ -6092,6 +6092,85 @@ async def test_okx_balance_snapshot_reuses_fresh_cache_between_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_okx_balance_snapshot_waits_for_inflight_refresh_without_account_gap() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+    service._okx_live = None
+    service._okx_balance_snapshot_cache = {}
+    service._okx_balance_snapshot_locks = {}
+
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class SlowExecutor:
+        async def get_balance_snapshot(self, _asset: str) -> dict[str, Any]:
+            refresh_started.set()
+            await release_refresh.wait()
+            return {
+                "free": 12.0,
+                "used": 3.0,
+                "total": 15.0,
+                "cash": 15.0,
+                "equity": 16.0,
+                "allocatable": 16.0,
+            }
+
+    service._okx_paper = SlowExecutor()
+    first_task = asyncio.create_task(service._get_okx_balance_snapshot_for_mode("paper"))
+    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+    second_task = asyncio.create_task(service._get_okx_balance_snapshot_for_mode("paper"))
+    await asyncio.sleep(0)
+    assert second_task.done() is False
+
+    release_refresh.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first is not None
+    assert second is not None
+    assert second["equity"] == 16.0
+    assert second.get("error") is None
+
+
+@pytest.mark.asyncio
+async def test_entry_risk_facts_reuses_verified_cached_balance_when_native_refresh_is_empty() -> None:
+    service = TradingService.__new__(TradingService)
+    service._safe_float = TradingService._safe_float.__get__(service, TradingService)
+
+    class EmptyBalanceExecutor:
+        async def entry_risk_facts(self, _symbol: str, _positions: list[dict[str, Any]]) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "account_equity_usdt": 0.0,
+                "available_margin_usdt": 0.0,
+                "policy_provenance": {
+                    "fallback_reason": "okx_account_equity_missing,okx_available_margin_missing"
+                },
+            }
+
+    async def executor_provider(_mode: str) -> EmptyBalanceExecutor:
+        return EmptyBalanceExecutor()
+
+    service._get_okx_executor_for_mode = executor_provider
+    service.peek_okx_balance_snapshot_for_mode = lambda *_args, **_kwargs: {
+        "free": 5345.0,
+        "equity": 5345.0,
+        "source": "verified_cache",
+    }
+
+    facts = await service.entry_exchange_risk_facts(
+        "paper",
+        SimpleNamespace(symbol="LINK/USDT"),
+        [],
+    )
+
+    assert facts["production_eligible"] is True
+    assert facts["account_equity_usdt"] == pytest.approx(5345.0)
+    assert facts["available_margin_usdt"] == pytest.approx(5345.0)
+    assert facts["requires_final_balance_recheck"] is True
+    assert facts["balance_source"] == "cached_okx_balance_snapshot"
+
+
+@pytest.mark.asyncio
 async def test_okx_balance_snapshot_returns_stale_cache_while_refresh_in_progress() -> None:
     service = TradingService.__new__(TradingService)
     service._safe_float = TradingService._safe_float.__get__(service, TradingService)
@@ -7075,7 +7154,9 @@ async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking
     service._analysis_symbol_lock = asyncio.Lock()
     service._active_analysis_symbols = {service._normalize_position_symbol("ZIL/USDT")}
     service._market_entry_pipeline_tasks = {}
-    service._market_entry_pipeline_semaphore = asyncio.Semaphore(1)
+    service._market_entry_pipeline_semaphore = asyncio.Semaphore(
+        trading_service.MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY
+    )
     service._recent_decisions = []
     service._recent_executions = []
     pipeline_started = asyncio.Event()
@@ -7140,8 +7221,9 @@ async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking
     assert service._market_entry_pipeline_snapshot() == {
         "active_count": 0,
         "active_symbols": [],
-        "queue_timeout_seconds": 120.0,
-        "single_flight": True,
+        "queue_timeout_seconds": trading_service.MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS,
+        "single_flight": False,
+        "max_concurrency": trading_service.MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY,
         "stage": "idle",
         "stage_updated_at": service._market_entry_pipeline_stage_updated_at.isoformat(),
     }

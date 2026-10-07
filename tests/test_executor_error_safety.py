@@ -2687,7 +2687,7 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
                             "ctType": "linear",
                         "minSz": "1",
                         "lotSz": "1",
-                        "tickSz": "0.1",
+                        "tickSz": "0.01",
                     }
                 ]
             }
@@ -2722,6 +2722,8 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert snapshot["market_fact"]["fact_id"].startswith("sha256:")
     assert snapshot["market_fact"]["source_endpoint"] == "okx_rest_market_books"
     assert snapshot["market_fact"]["source_timestamp_ms"] == 1780000000001
+    assert snapshot["market_contract_spec"]["tickSz"] == "0.1"
+    assert snapshot["contract_spec"]["tickSz"] == "0.01"
     assert snapshot["contract_value_base"] == pytest.approx(0.01)
     assert snapshot["orderbook_bid_depth"] == pytest.approx(99.9 * 2.0 * 0.01)
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)

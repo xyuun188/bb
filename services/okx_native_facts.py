@@ -852,6 +852,59 @@ class OkxNativeFactsClient:
                 }
         return specs
 
+    async def fetch_market_contract_specs(
+        self,
+        *,
+        symbols: Iterable[Any] | None = None,
+        inst_ids: Iterable[Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return contract metadata for the public market quote source.
+
+        This is intentionally separate from :meth:`fetch_contract_specs`,
+        whose route is the execution account's instrument universe in paper
+        mode.  OKX demo and public instruments can legitimately publish
+        different ``tickSz`` values; using execution metadata to validate a
+        public quote quarantines valid market facts.
+        """
+
+        ccxt = await self.executor._get_ccxt()
+        fetch_instruments, source_endpoint = _market_instruments_fetcher(ccxt)
+        if not callable(fetch_instruments):
+            raise RuntimeError("OKX public market instruments API is unavailable")
+
+        target_inst_ids = _target_inst_ids(symbols=symbols, inst_ids=inst_ids)
+        params: dict[str, Any] = {"instType": "SWAP"}
+        if len(target_inst_ids) == 1:
+            params["instId"] = next(iter(target_inst_ids))
+        response = await self.executor._with_retry(fetch_instruments, params)
+        specs: dict[str, dict[str, Any]] = {}
+        for row in _response_rows(response):
+            inst_id = str(row.get("instId") or "").strip().upper()
+            if not inst_id or not inst_id.endswith("-USDT-SWAP"):
+                continue
+            if target_inst_ids and inst_id not in target_inst_ids:
+                continue
+            if _safe_float(row.get("ctVal"), 0.0) <= 0:
+                continue
+            specs[inst_id] = {
+                "instId": inst_id,
+                "instType": str(row.get("instType") or "SWAP"),
+                "ctType": str(row.get("ctType") or ""),
+                "ctVal": str(row.get("ctVal") or ""),
+                "ctMult": str(row.get("ctMult") or "1"),
+                "ctValCcy": str(row.get("ctValCcy") or ""),
+                "uly": str(row.get("uly") or ""),
+                "instFamily": str(row.get("instFamily") or ""),
+                "lotSz": str(row.get("lotSz") or ""),
+                "minSz": str(row.get("minSz") or ""),
+                "tickSz": str(row.get("tickSz") or ""),
+                "settleCcy": str(row.get("settleCcy") or ""),
+                "state": str(row.get("state") or ""),
+                "source": "okx_public_instruments",
+                "source_endpoint": source_endpoint,
+            }
+        return specs
+
     async def fetch_order_history_contexts(
         self,
         *,
@@ -1617,6 +1670,19 @@ def _contract_instruments_fetcher(exchange: Any) -> tuple[Any, str]:
     if callable(execution_fetch):
         return execution_fetch, "okx_execution_public_instruments"
     return getattr(exchange, "publicGetPublicInstruments", None), "okx_public_instruments"
+
+
+def _market_instruments_fetcher(exchange: Any) -> tuple[Any, str]:
+    """Return the public market instrument route used by market facts.
+
+    Paper execution has its own instrument metadata.  The quote/order-book
+    contract must never inherit those execution-only tick rules.
+    """
+
+    public_fetch = getattr(exchange, "publicGetPublicInstruments", None)
+    if callable(public_fetch):
+        return public_fetch, "okx_public_instruments"
+    return _contract_instruments_fetcher(exchange)
 
 
 def _target_inst_ids(

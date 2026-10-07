@@ -34,6 +34,7 @@ def render_target_inventory_sync() -> str:
         from __future__ import annotations
 
         import json
+        import os
         import re
         import urllib.request
         from datetime import datetime, timezone
@@ -69,6 +70,7 @@ def render_target_inventory_sync() -> str:
                 encoding="utf-8",
             )
             temporary.replace(path)
+            os.chmod(path, 0o644)
 
 
         def candidate():

@@ -7379,11 +7379,20 @@ class OKXExecutor(AbstractExecutor):
         fetch_mark_price = getattr(ccxt, "publicGetPublicMarkPrice", None)
         if not callable(fetch_mark_price):
             fetch_mark_price = ccxt.executionGetPublicMarkPrice
-        ticker, book, mark_response, specs, fee, balance_snapshot = await asyncio.gather(
+        (
+            ticker,
+            book,
+            mark_response,
+            execution_specs,
+            market_specs,
+            fee,
+            balance_snapshot,
+        ) = await asyncio.gather(
             self._fetch_native_ticker(symbol),
             self._with_retry(fetch_order_book, okx_symbol),
             self._with_retry(fetch_mark_price, {"instId": inst_id}),
             self._native_facts_client().fetch_contract_specs(symbols=[symbol]),
+            self._native_facts_client().fetch_market_contract_specs(symbols=[symbol]),
             self.fetch_account_fee_snapshot(),
             self.get_balance_snapshot(),
         )
@@ -7391,10 +7400,29 @@ class OKXExecutor(AbstractExecutor):
         mark_row = mark_rows[0] if isinstance(mark_rows, list) and mark_rows else {}
         mark_row = mark_row if isinstance(mark_row, dict) else {}
         mark_price = max(self._safe_float(mark_row.get("markPx"), 0.0), 0.0)
-        spec = specs.get(inst_id) if isinstance(specs, dict) else None
-        spec = spec if isinstance(spec, dict) else {}
-        ct_val = max(self._safe_float(spec.get("ctVal"), 0.0), 0.0)
-        ct_mult = max(self._safe_float(spec.get("ctMult"), 0.0), 0.0)
+        execution_spec = (
+            execution_specs.get(inst_id)
+            if isinstance(execution_specs, dict)
+            else None
+        )
+        execution_spec = execution_spec if isinstance(execution_spec, dict) else {}
+        market_spec = (
+            market_specs.get(inst_id)
+            if isinstance(market_specs, dict)
+            else None
+        )
+        market_spec = market_spec if isinstance(market_spec, dict) else {}
+        # Public ticker/order-book facts are validated against the public
+        # market contract.  Quantity, minimums and order formatting use the
+        # execution-account contract.  These may differ on OKX paper mode.
+        ct_val = max(
+            self._safe_float(execution_spec.get("ctVal"), 0.0),
+            0.0,
+        )
+        ct_mult = max(
+            self._safe_float(execution_spec.get("ctMult"), 0.0),
+            0.0,
+        )
         contract_value_base = ct_val * ct_mult
         bids = [
             [self._safe_float(level[0], 0.0), self._safe_float(level[1], 0.0)]
@@ -7449,10 +7477,6 @@ class OKXExecutor(AbstractExecutor):
             self._safe_float(book.get("timestamp"), 0.0)
             or self._safe_float((book.get("info") or {}).get("ts"), 0.0)
         )
-        ticker_source_timestamp_ms = int(
-            self._safe_float(ticker.get("timestamp"), 0.0)
-            or self._safe_float(ticker_info.get("ts"), 0.0)
-        )
         mark_source_timestamp_ms = int(self._safe_float(mark_row.get("ts"), 0.0))
         orderbook_fact = {
             "inst_id": inst_id,
@@ -7465,8 +7489,8 @@ class OKXExecutor(AbstractExecutor):
             "bid_depth_usdt": bid_depth,
             "ask_depth_usdt": ask_depth,
             "contract_spec_version": (
-                str(spec.get("spec_version") or "").strip()
-                or str(spec.get("contract_spec_version") or "").strip()
+                str(market_spec.get("spec_version") or "").strip()
+                or str(market_spec.get("contract_spec_version") or "").strip()
             ),
         }
         mark_price_fact = {
@@ -7495,7 +7519,8 @@ class OKXExecutor(AbstractExecutor):
             "volume_24h_base": volume_24h_base,
             "orderbook_bid_depth": bid_depth,
             "orderbook_ask_depth": ask_depth,
-            "contract_spec": spec,
+            "contract_spec": execution_spec,
+            "market_contract_spec": market_spec,
         }
         native_snapshot = {
             "symbol": normalize_trading_symbol(symbol),
@@ -7520,14 +7545,15 @@ class OKXExecutor(AbstractExecutor):
             "orderbook_bid_depth": bid_depth,
             "orderbook_ask_depth": ask_depth,
             "orderbook_imbalance": imbalance,
-            "contract_spec": spec,
+            "contract_spec": execution_spec,
+            "market_contract_spec": market_spec,
             "orderbook_fact": orderbook_fact,
             "mark_price_fact": mark_price_fact,
         }
         base_market_fact = build_market_fact(
             symbol,
             executable_quote_snapshot,
-            contract_spec=spec,
+            contract_spec=market_spec,
             received_at=datetime.now(UTC),
         )
         market_source_consistency = build_market_source_consistency(
@@ -7546,7 +7572,7 @@ class OKXExecutor(AbstractExecutor):
                 **native_snapshot,
                 "market_source_consistency": market_source_consistency,
             },
-            contract_spec=spec,
+            contract_spec=market_spec,
             received_at=datetime.now(UTC),
         )
         reasons: list[str] = []
@@ -7558,8 +7584,10 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("okx_pre_order_bid_ask_invalid")
         if mark_price <= 0:
             reasons.append("okx_pre_order_mark_price_missing")
-        if contract_value_base <= 0:
+        if contract_value_base <= 0 or not execution_spec:
             reasons.append("okx_pre_order_contract_spec_missing")
+        if not market_spec:
+            reasons.append("okx_pre_order_market_contract_spec_missing")
         if not bids or not asks or bid_depth <= 0 or ask_depth <= 0:
             reasons.append("okx_pre_order_orderbook_incomplete")
         if not fee.get("taker_fee_rate"):
@@ -7585,7 +7613,8 @@ class OKXExecutor(AbstractExecutor):
             "orderbook_ask_depth": ask_depth,
             "orderbook_imbalance": imbalance,
             "contract_value_base": contract_value_base,
-            "contract_spec": spec,
+            "contract_spec": execution_spec,
+            "market_contract_spec": market_spec,
             "notional_24h_usdt": notional_24h_usdt,
             "volume_24h_contracts": volume_24h_contracts,
             "volume_24h_base": volume_24h_base,
@@ -7612,7 +7641,8 @@ class OKXExecutor(AbstractExecutor):
             "ticker_source_timestamp_ms": ticker.get("timestamp"),
             "orderbook_source_timestamp_ms": book.get("timestamp"),
             "mark_source_timestamp_ms": self._safe_float(mark_row.get("ts"), 0.0),
-            "contract_spec": spec,
+            "contract_spec": execution_spec,
+            "market_contract_spec": market_spec,
             "fee_snapshot": fee,
             "balance_snapshot": balance_snapshot,
             "account_equity_usdt": account_equity,
@@ -7621,7 +7651,13 @@ class OKXExecutor(AbstractExecutor):
             "policy_provenance": {
                 "source": "okx_native_ticker_orderbook_mark_contract_fee_and_balance",
                 "observation_window": "current_immediate_pre_order_refresh",
-                "sample_count": len(bids) + len(asks) + int(mark_price > 0) + int(bool(spec)),
+                "sample_count": (
+                    len(bids)
+                    + len(asks)
+                    + int(mark_price > 0)
+                    + int(bool(market_spec))
+                    + int(bool(execution_spec))
+                ),
                 "generated_at": generated_at,
                 "strategy_version": "2026-09-19.okx-pre-order-execution-facts.v3",
                 "fallback_reason": "" if not reasons else ",".join(reasons),

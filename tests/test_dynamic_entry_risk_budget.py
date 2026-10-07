@@ -544,6 +544,42 @@ async def test_paper_training_uses_current_raw_edge_for_leverage_when_net_is_neg
 
 
 @pytest.mark.asyncio
+async def test_paper_training_negative_edge_keeps_risk_sized_observation_not_micro_order() -> None:
+    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    normal_trade = decision.raw_response["normal_paper_trade"]
+    normal_trade["selection_reason"] = "paper_training_entry"
+    normal_trade["paper_quality_observation_only"] = False
+    normal_trade["paper_training_only"] = True
+    normal_trade["paper_quality_mode"] = "training"
+    normal_trade["current_raw_expected_return_pct"] = 0.9
+    normal_trade["paper_training_reasons"] = [
+        "historical_quality_gate_is_observation_only",
+        "current_directional_evidence_is_training_eligible",
+    ]
+    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
+
+    normal_trade["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(normal_trade)
+    )
+    decision.raw_response["opportunity_score"]["return_distribution_contract"][
+        "raw_expected_return_pct"
+    ] = -0.05
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["size_aware_profitability"]["reason"] == (
+        "paper_training_entry_current_cost_observation"
+    )
+    assert sizing["final_notional_usdt"] > sizing["minimum_order_notional_usdt"]
+    assert sizing["final_notional_usdt"] >= (
+        sizing["size_aware_profitability"]["original_notional_usdt"] * 0.999
+    )
+
+
+@pytest.mark.asyncio
 async def test_fallback_one_x_is_not_treated_as_model_leverage_cap() -> None:
     decision = _decision()
     decision.suggested_leverage = 1.0

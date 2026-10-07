@@ -82,7 +82,7 @@ def test_stale_entry_candidate_reason_helpers() -> None:
     assert is_pending_execution_reason("")
     assert is_pending_execution_reason("正在提交 OKX：下单中")
     assert not is_pending_execution_reason("风险检查拦截")
-    assert "120 秒内没有生成本地订单记录" in pending_execution_failed_reason(
+    assert f"{ENTRY_PENDING_EXECUTION_MAX_SECONDS:.0f} 秒内没有生成本地订单记录" in pending_execution_failed_reason(
         "BTC/USDT",
         "long",
     )
@@ -557,7 +557,10 @@ async def test_stale_entry_candidate_expirer_marks_pending_rows_by_order_state()
     )
 
     assert expired == 2
-    assert "120 秒内没有生成本地订单记录" in pending_without_order.execution_reason
+    assert (
+        f"{ENTRY_PENDING_EXECUTION_MAX_SECONDS:.0f} 秒内没有生成本地订单记录"
+        in pending_without_order.execution_reason
+    )
     assert "本地订单记录已生成" in pending_with_order.execution_reason
     without_order_state = decision_state_from_raw(pending_without_order.raw_llm_response)[
         "summary"
@@ -627,7 +630,10 @@ async def test_pending_execution_expiry_prefers_exchange_submit_stage_time() -> 
     )
 
     assert expired == 1
-    assert "120 秒内没有生成本地订单记录" in pending_row.execution_reason
+    assert (
+        f"{ENTRY_PENDING_EXECUTION_MAX_SECONDS:.0f} 秒内没有生成本地订单记录"
+        in pending_row.execution_reason
+    )
     assert pending_execution_is_stale(pending_row, now)
     state = decision_state_from_raw(pending_row.raw_llm_response)["summary"]
     assert state["final_stage"] == DecisionStage.LOCAL_SYNC

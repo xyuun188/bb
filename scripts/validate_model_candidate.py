@@ -292,6 +292,12 @@ def write_atomic(path: Path, payload: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        # The model host validator may run as root while the platform
+        # readiness probe runs as the dedicated ``linux`` account.  mkstemp
+        # creates a 0600 file; preserve the non-secret candidate contract as
+        # world-readable so readiness can verify the exact manifest instead
+        # of treating a permission error as an invalid empty payload.
+        os.chmod(path, 0o644)
     finally:
         temporary.unlink(missing_ok=True)
 
