@@ -22,9 +22,8 @@ from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION,
+    NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_MIN_CONCENTRATION_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     is_normal_paper_trade_decision,
@@ -1922,10 +1921,9 @@ class EntryProfitRiskSizingPolicy:
         concentration_risk_fraction = (
             current_portfolio_risk / account_equity if account_equity > 0.0 else 0.0
         )
-        same_side_concentration_limit_applied = bool(
-            direction_concentration >= NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION
-            and concentration_risk_fraction
-            >= NORMAL_PAPER_TRADE_MIN_CONCENTRATION_RISK_FRACTION
+        direction_concentration_alert = bool(
+            direction_concentration
+            >= NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
         )
         declared_stop = _normalized_ratio(decision.stop_loss_pct)
         declared_take_profit = _normalized_ratio(decision.take_profit_pct)
@@ -2234,8 +2232,37 @@ class EntryProfitRiskSizingPolicy:
         reasons.extend(contract_reasons)
         if not is_normal_paper_trade_decision(decision):
             reasons.append("normal_paper_trade_contract_incomplete")
+        exchange_fact_provenance = _safe_dict(facts.get("policy_provenance"))
+        exchange_fact_blockers = list(
+            dict.fromkeys(
+                [
+                    item.strip()
+                    for item in str(
+                        exchange_fact_provenance.get("fallback_reason") or ""
+                    ).split(",")
+                    if item.strip()
+                ]
+                + [
+                    str(
+                        _safe_dict(
+                            facts.get("entry_instrument_availability")
+                        ).get("reason")
+                        or ""
+                    ).strip()
+                ]
+                + [
+                    f"missing_contract_spec:{item}"
+                    for item in _safe_list(facts.get("missing_contract_specs"))
+                    if str(item).strip()
+                ]
+            )
+        )
+        exchange_fact_blockers = [
+            item for item in exchange_fact_blockers if item
+        ]
         if facts.get("production_eligible") is not True:
             reasons.append("normal_paper_exchange_facts_ineligible")
+            reasons.extend(exchange_fact_blockers)
         if account_equity <= 0 or available_margin <= 0:
             reasons.append("normal_paper_account_incomplete")
         if target_price <= 0:
@@ -2273,8 +2300,6 @@ class EntryProfitRiskSizingPolicy:
             _safe_float(execution_cost.get("total_pct"), 0.0) <= 0.0
         ):
             reasons.append("normal_paper_execution_cost_incomplete")
-        if same_side_concentration_limit_applied:
-            reasons.append("normal_paper_same_side_concentration_limit")
         eligible = not reasons
         generated_at = datetime.now(UTC).isoformat()
         audit_inputs = {
@@ -2323,9 +2348,12 @@ class EntryProfitRiskSizingPolicy:
             "portfolio_risk_limit_applied": False,
             "direction_concentration": direction_concentration,
             "concentration_risk_fraction": concentration_risk_fraction,
-            "direction_concentration_limit": NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION,
-            "concentration_risk_fraction_limit": NORMAL_PAPER_TRADE_MIN_CONCENTRATION_RISK_FRACTION,
-            "direction_concentration_limit_applied": same_side_concentration_limit_applied,
+            "direction_concentration_alert": direction_concentration_alert,
+            "direction_concentration_alert_threshold": (
+                NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
+            ),
+            "exchange_risk_facts_blockers": exchange_fact_blockers,
+            "exchange_risk_facts_provenance": exchange_fact_provenance,
             "leverage_tier_input_fingerprint": _safe_dict(
                 leverage_tier_selection.get("policy_provenance")
             ).get("input_fingerprint"),
@@ -2361,15 +2389,11 @@ class EntryProfitRiskSizingPolicy:
             "portfolio_risk_limit_applied": False,
             "direction_concentration": round(direction_concentration, 8),
             "concentration_risk_fraction": round(concentration_risk_fraction, 8),
-            "direction_concentration_limit": round(
-                NORMAL_PAPER_TRADE_MAX_DIRECTION_CONCENTRATION,
+            "direction_concentration_alert": direction_concentration_alert,
+            "direction_concentration_alert_threshold": round(
+                NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
                 8,
             ),
-            "concentration_risk_fraction_limit": round(
-                NORMAL_PAPER_TRADE_MIN_CONCENTRATION_RISK_FRACTION,
-                8,
-            ),
-            "direction_concentration_limit_applied": same_side_concentration_limit_applied,
             "current_portfolio_stressed_loss_usdt": round(current_portfolio_risk, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
             "target_notional_usdt": round(target_notional, 8),
@@ -2439,7 +2463,10 @@ class EntryProfitRiskSizingPolicy:
             "portfolio_risk_snapshot": portfolio_snapshot,
             "leverage_tier_selection": leverage_tier_selection,
             "exchange_contract_specs": contract_specs,
-            "exchange_risk_facts_provenance": facts.get("policy_provenance"),
+            "exchange_risk_facts_blockers": exchange_fact_blockers,
+            "exchange_risk_facts_provenance": exchange_fact_provenance,
+            "entry_instrument_availability": facts.get("entry_instrument_availability"),
+            "missing_contract_specs": facts.get("missing_contract_specs"),
             "audit_inputs": audit_inputs,
             "units": {
                 "money": "USDT",

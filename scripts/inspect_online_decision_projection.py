@@ -51,6 +51,7 @@ async def main():
                 selection = raw.get("paper_trade_selection") if isinstance(raw.get("paper_trade_selection"), dict) else {{}}
                 sizing = raw.get("profit_risk_sizing") if isinstance(raw.get("profit_risk_sizing"), dict) else {{}}
                 facts = raw.get("pre_order_execution_facts") if isinstance(raw.get("pre_order_execution_facts"), dict) else {{}}
+                exchange_facts = raw.get("exchange_risk_facts") if isinstance(raw.get("exchange_risk_facts"), dict) else {{}}
                 stage_machine = raw.get("decision_state_machine") if isinstance(raw.get("decision_state_machine"), dict) else {{}}
                 execution = raw.get("execution_result") if isinstance(raw.get("execution_result"), dict) else {{}}
                 result.append({{
@@ -108,6 +109,19 @@ async def main():
                             "available_margin_usdt",
                             "balance_snapshot",
                             "market_source_consistency",
+                            "policy_provenance",
+                        )
+                    }},
+                    "exchange_risk_facts": {{
+                        key: exchange_facts.get(key)
+                        for key in (
+                            "production_eligible",
+                            "account_equity_usdt",
+                            "available_margin_usdt",
+                            "reported_max_leverage",
+                            "missing_contract_specs",
+                            "entry_instrument_availability",
+                            "balance_snapshot",
                             "policy_provenance",
                         )
                     }},

@@ -142,6 +142,21 @@ def test_missing_required_plan_sections_block_entry(
     assert expected_reason in paper_trade_recommendation_reasons(decision)
 
 
+def test_ineligible_sizing_reports_authoritative_blocker_not_missing_size() -> None:
+    decision = _decision()
+    decision.raw_response["profit_risk_sizing"] = {
+        "contract_lifecycle": "normal_paper_trade",
+        "production_eligible": False,
+        "reason": "normal_paper_exchange_facts_ineligible,okx_leverage_tiers_missing",
+    }
+    _prepare(decision)
+
+    assert paper_trade_recommendation_reasons(decision) == [
+        "normal_paper_exchange_facts_ineligible",
+        "okx_leverage_tiers_missing",
+    ]
+
+
 def test_positive_gross_but_negative_fee_after_return_can_remain_hold() -> None:
     raw = _raw()
     raw["opportunity_score"].update(

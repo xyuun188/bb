@@ -1065,7 +1065,7 @@ async def test_existing_portfolio_stress_does_not_reduce_normal_paper_risk_budge
 
 
 @pytest.mark.asyncio
-async def test_normal_paper_blocks_stressed_same_side_concentration() -> None:
+async def test_normal_paper_same_side_concentration_is_diagnostic_only() -> None:
     decision = _decision()
     open_positions = [
         {
@@ -1085,9 +1085,12 @@ async def test_normal_paper_blocks_stressed_same_side_concentration() -> None:
     await policy.apply(decision, "paper", open_positions)
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is False
-    assert sizing["direction_concentration_limit_applied"] is True
-    assert "normal_paper_same_side_concentration_limit" in sizing["reason"]
+    assert sizing["production_eligible"] is True
+    assert sizing["direction_concentration_alert"] is True
+    assert sizing["direction_concentration_alert_threshold"] == pytest.approx(0.80)
+    assert "same_side_concentration" not in sizing["reason"]
+    assert decision.position_size_pct > 0.0
+    assert RiskEngine().assess(decision, open_positions, 1000.0).approved is True
 
 
 @pytest.mark.asyncio
@@ -1129,7 +1132,7 @@ async def test_normal_paper_allows_opposite_side_when_concentration_is_high() ->
 
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is True
-    assert sizing["direction_concentration_limit_applied"] is False
+    assert sizing["direction_concentration_alert"] is False
 
 
 @pytest.mark.asyncio

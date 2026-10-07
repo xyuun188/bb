@@ -13,6 +13,8 @@ from core.contract_math import persisted_product_isclose
 from services.entry_profit_risk_sizing import confirmed_fill_has_valid_submission
 from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
+    HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS,
+    NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     historical_normalized_contract_reasons,
@@ -417,7 +419,9 @@ def summarize_trade_execution_contract(
         "dominant_entry_direction": dominant_side,
         "dominant_entry_direction_share": round(dominant_share, 8),
         "direction_concentration_alert": bool(entry_rows and dominant_share > 0.80),
-        "direction_concentration_alert_threshold": 0.80,
+        "direction_concentration_alert_threshold": (
+            NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
+        ),
         "single_family_authorized_entry_count": single_family_authorized_entry_count,
     }
     return {
@@ -456,7 +460,9 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_entry_requires_positive_expected_net_return": True,
         "paper_entry_requires_current_execution_cost": True,
         "paper_entry_requires_independent_quant_family_count": 1,
-        "paper_direction_concentration_alert_threshold": 0.80,
+        "paper_direction_concentration_alert_threshold": (
+            NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
+        ),
         "paper_direction_concentration_is_execution_quota": False,
         "live_entry_requires_production_trade_gate": True,
         "live_entry_requires_positive_fee_after_return": True,
@@ -1410,7 +1416,17 @@ def validate_normal_paper_entry_contract(
     minimum_fill_settlement_accepted = bool(
         minimum_fill_settlement.get("accepted") is True
     )
-    if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
+    historical_sizing_settlement = bool(
+        allow_historical_settlement
+        and executed
+        and filled_order_present is True
+        and sizing.get("contract_version")
+        in HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS
+    )
+    if (
+        sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION
+        and not historical_sizing_settlement
+    ):
         reasons.append("normal_paper_sizing_version_invalid")
     if sizing.get("contract_lifecycle") != "normal_paper_trade":
         reasons.append("normal_paper_sizing_lifecycle_invalid")

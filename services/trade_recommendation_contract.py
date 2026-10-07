@@ -528,10 +528,30 @@ def paper_trade_recommendation_reasons(decision: DecisionOutput) -> list[str]:
     risk = _dict(contract.get("risk_adjustment"))
     plan = _dict(risk.get("adjusted_recommendation"))
     reasons = list(dict.fromkeys(str(item) for item in _list(risk.get("reasons"))))
+    sizing = _dict(raw.get("profit_risk_sizing"))
+    sizing_ineligible = bool(
+        sizing.get("contract_lifecycle") == "normal_paper_trade"
+        and sizing.get("production_eligible") is not True
+    )
+    sizing_reasons = (
+        [
+            item.strip()
+            for item in str(sizing.get("reason") or "").split(",")
+            if item.strip()
+        ]
+        if sizing_ineligible
+        else []
+    )
+    reasons.extend(sizing_reasons)
     if str(risk.get("status") or "") not in {"prepared", "approved", "passed"}:
         reasons.append("trade_plan_risk_adjustment_not_approved")
     if risk.get("complete") is not True:
-        reasons.extend(_entry_plan_reasons(plan))
+        plan_reasons = _entry_plan_reasons(plan)
+        if sizing_reasons:
+            plan_reasons = [
+                item for item in plan_reasons if item != "trade_plan_position_size_missing"
+            ]
+        reasons.extend(plan_reasons)
     return list(dict.fromkeys(reasons or _entry_plan_reasons(plan)))
 
 
