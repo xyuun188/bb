@@ -10,7 +10,10 @@ def test_remote_script_compiles_against_current_normal_paper_contract() -> None:
     assert "NORMAL_PAPER_TRADE_VERSION" in script
     assert "normal_paper_trade_contract_reasons" in script
     assert "load_authoritative_trade_training_samples" in script
-    assert 'raw.get("normal_paper_trade")' in script
+    assert 'AIDecision.raw_llm_response["normal_paper_trade"].label("contract")' in script
+    assert "select(AIDecision)" not in script
+    assert "AIDecision.id < last_id" in script
+    assert ".limit(PAGE_SIZE)" in script
     assert "PAPER_BOOTSTRAP_" not in script
     assert '"production_permission": False' in script
     assert ".limit(LIMIT)" not in script

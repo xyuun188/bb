@@ -89,6 +89,54 @@ _COMPACT_DECISION_LEARNING_KEYS = (
     "model_shadow_decision",
     "profit_risk_sizing",
 )
+# Only these top-level feature facts are consumed by the canonical training
+# projection.  Selecting them as JSON paths avoids detoasting the full
+# feature_snapshot column for every authoritative lifecycle.
+_COMPACT_TRAINING_FEATURE_KEYS = (
+    "adx_14",
+    "atr_14",
+    "atr_pct",
+    "bb_pct",
+    "bb_width",
+    "change_24h_pct",
+    "close",
+    "current_price",
+    "decision_confidence",
+    "funding_interval_hours",
+    "funding_interval_minutes",
+    "funding_rate",
+    "horizon_minutes",
+    "macd",
+    "macd_diff",
+    "macd_signal",
+    "news_article_count",
+    "news_sentiment_avg",
+    "open_interest_value",
+    "orderbook_ask_depth",
+    "orderbook_bid_depth",
+    "orderbook_imbalance",
+    "price_vs_sma20",
+    "price_vs_sma50",
+    "returns_1",
+    "returns_5",
+    "returns_20",
+    "rsi_14",
+    "rsi_7",
+    "round_trip_fee_pct",
+    "social_mention_count",
+    "social_sentiment_avg",
+    "spread_pct",
+    "stoch_k",
+    "symbol",
+    "volume_24h",
+    "volume_ratio",
+    "volatility_20",
+    "historical_market_path_only",
+    "historical_shadow_rebuild_version",
+    "training_market_fact_contract",
+    "training_label_contract",
+    "local_ai_tools_shadow",
+)
 _compact_outcome_cache: tuple[float, list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_failed_until = 0.0
@@ -158,6 +206,17 @@ def _decision_learning_projection(
         key: value
         for key in _COMPACT_DECISION_LEARNING_KEYS
         if isinstance((value := mapping.get(f"learning_{key}")), dict)
+    }
+
+
+def _decision_feature_projection(row: Any) -> dict[str, Any]:
+    """Rebuild the bounded training feature map from labeled JSON paths."""
+
+    mapping = row._mapping if hasattr(row, "_mapping") else {}
+    return {
+        key: value
+        for key in _COMPACT_TRAINING_FEATURE_KEYS
+        if (value := mapping.get(f"feature_{key}")) is not None
     }
 
 
@@ -775,7 +834,7 @@ async def load_authoritative_trade_outcomes(
                 AIDecision.stop_loss_pct,
                 AIDecision.take_profit_pct,
             ]
-            include_decision_payload = include_training_features or include_decision_evidence
+            include_decision_payload = bool(include_decision_evidence)
             if include_decision_payload:
                 decision_columns.append(AIDecision.decision_learning_snapshot)
             else:
@@ -788,7 +847,10 @@ async def load_authoritative_trade_outcomes(
                     for key in _COMPACT_DECISION_LEARNING_KEYS
                 )
             if include_training_features:
-                decision_columns.append(AIDecision.feature_snapshot)
+                decision_columns.extend(
+                    AIDecision.feature_snapshot[key].label(f"feature_{key}")
+                    for key in _COMPACT_TRAINING_FEATURE_KEYS
+                )
             # PostgreSQL can spend minutes detoasting a single large IN query
             # against ``ai_decisions``.  Keep each projection bounded so one
             # slow/oversized decision payload cannot time out the whole
@@ -812,7 +874,7 @@ async def load_authoritative_trade_outcomes(
                     model_name=row.model_name,
                     stop_loss_pct=row.stop_loss_pct,
                     take_profit_pct=row.take_profit_pct,
-                    feature_snapshot=dict(row._mapping.get("feature_snapshot") or {}),
+                    feature_snapshot=_decision_feature_projection(row),
                     decision_learning_snapshot=_decision_learning_projection(
                         row,
                         include_full_snapshot=include_decision_payload,

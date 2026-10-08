@@ -51,7 +51,12 @@ class DynamicPositionCapacityPolicy:
             "sample_count": open_groups,
             "generated_at": generated_at,
             "strategy_version": "2026-07-12.position-count-observation.v1",
-            "fallback_reason": "" if account_equity is not None and account_equity > 0 else "account_equity_missing",
+            # This policy is deliberately observation-only.  Account equity is
+            # owned by the canonical fee-after-return sizing contract and is
+            # not required to report open-group counts.
+            "fallback_reason": "",
+            "account_equity_required": False,
+            "account_equity_observed": account_equity is not None and account_equity > 0,
             "production_eligible": False,
             "production_permission": False,
         }

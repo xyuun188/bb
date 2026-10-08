@@ -158,6 +158,10 @@ from services.model_training_state import (
     ModelTrainingStateStore,
 )
 from services.normal_paper_trade import normal_paper_trade_contract_reasons
+from services.okx_balance_snapshot import (
+    balance_snapshot_recovery_reason,
+    balance_snapshot_verified,
+)
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
@@ -315,6 +319,11 @@ MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
 # Keep the outer watchdog bounded independently from a long user-facing
 # decision interval so one slow round cannot starve market rotation.
 MARKET_ROUND_WATCHDOG_MAX_SECONDS = 180.0
+# Keep enough hard-watchdog headroom for one complete market scheduler round
+# plus final persistence/dashboard cleanup. The soft scheduler budget below is
+# independent from the configured watchdog knob; a low legacy watchdog must
+# not shrink the candidate rotation budget to a fraction of one symbol.
+MARKET_ROUND_FINALIZATION_RESERVE_SECONDS = 15.0
 # The market loop runs more frequently than the decision interval. Keep one
 # round bounded so feature discovery and model work cannot create multi-minute
 # gaps for the next rotation. Symbols that do not fit are explicitly deferred
@@ -1218,7 +1227,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         base_budget = max(8.0, interval * 0.90)
         del strategy_context
         requested_symbols = max(self._safe_int(market_symbol_count, 0), 0)
-        target_symbols = min(max(requested_symbols, 1), 8)
+        # A single shortlisted symbol still needs enough room for the
+        # pre-analysis context work already spent in this round.  Reserving
+        # only one symbol made the first candidate reach the model boundary
+        # with less than its start reserve and produced a zero-analysis round.
+        # Keep a two-symbol minimum so a sparse shortlist cannot starve the
+        # market loop; this changes scheduling capacity only, never entry
+        # permission or sizing.
+        target_symbols = min(max(requested_symbols, 2), 8)
         per_symbol_floor = max(
             24.0,
             interval,
@@ -1230,8 +1246,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if requested_symbols > 0
             else base_budget
         )
-        watchdog_ceiling = max(base_budget, self.market_round_watchdog_seconds() * 0.75)
-        return min(market_budget, watchdog_ceiling, MARKET_ROUND_SCHEDULER_MAX_SECONDS)
+        # The watchdog is a hard stuck-round kill switch, not a second market
+        # scheduler budget. Coupling the two made a low legacy watchdog (for
+        # example 55s) reduce a normal round to ~41s and defer every candidate
+        # before model inference. Keep the soft market budget bounded only by
+        # the scheduler contract; the watchdog itself is sized below to cover
+        # this contract plus finalization.
+        return min(market_budget, MARKET_ROUND_SCHEDULER_MAX_SECONDS)
 
     def market_symbol_minimum_start_budget_seconds(self) -> float:
         """Reserve context, viable inference, and persistence for one symbol."""
@@ -1496,7 +1517,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         configured_watchdog = float(settings.market_analysis_watchdog_seconds or 180)
         return min(
-            max(configured_watchdog, expert_budget * 2.0),
+            max(
+                configured_watchdog,
+                expert_budget * 2.0,
+                MARKET_ROUND_SCHEDULER_MAX_SECONDS
+                + MARKET_ROUND_FINALIZATION_RESERVE_SECONDS,
+            ),
             MARKET_ROUND_WATCHDOG_MAX_SECONDS,
         )
 
@@ -4390,68 +4416,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
-        # Sizing and pre-order execution must use one account fact chain.  OKX
-        # can return a transiently empty private balance during a concurrent
-        # refresh even though the verified service cache and the immediate
-        # pre-order path still contain the live paper balance. Reuse that
-        # verified snapshot for sizing only; the executor continues to perform
-        # the final balance recheck before submission.
-        cached = self.peek_okx_balance_snapshot_for_mode(
-            "live" if model_mode == "live" else "paper",
-            allow_stale=True,
-        )
-        cached_equity = max(
-            self._safe_float(cached.get("equity"), 0.0) if isinstance(cached, dict) else 0.0,
-            0.0,
-        )
-        cached_free = max(
-            self._safe_float(cached.get("free"), 0.0) if isinstance(cached, dict) else 0.0,
-            0.0,
-        )
-        current_equity = max(self._safe_float(facts.get("account_equity_usdt"), 0.0), 0.0)
-        current_margin = max(self._safe_float(facts.get("available_margin_usdt"), 0.0), 0.0)
-        if cached_equity <= 0.0 and cached_free <= 0.0:
-            return facts
-        if current_equity > 0.0 and current_margin > 0.0:
-            return facts
-
-        repaired = dict(facts)
-        repaired["account_equity_usdt"] = max(current_equity, cached_equity)
-        repaired["available_margin_usdt"] = max(current_margin, cached_free)
-        repaired["balance_snapshot"] = {
-            **(cached if isinstance(cached, dict) else {}),
-            "source": "cached_okx_balance_snapshot",
-        }
-        repaired["balance_source"] = "cached_okx_balance_snapshot"
-        repaired["requires_final_balance_recheck"] = True
-        provenance = self._safe_dict(facts.get("policy_provenance"))
-        reasons = [
-            item
-            for item in str(provenance.get("fallback_reason") or "").split(",")
-            if item
-            not in {
-                "okx_account_equity_missing",
-                "okx_available_margin_missing",
-            }
-        ]
-        only_balance_gap = bool(
-            str(provenance.get("fallback_reason") or "").strip()
-            and not reasons
-        )
-        repaired["production_eligible"] = bool(
-            facts.get("production_eligible") is True or only_balance_gap
-        )
-        provenance = dict(provenance)
-        provenance.update(
-            {
-                "source": "okx_native_facts_with_verified_cached_balance",
-                "balance_source": "cached_okx_balance_snapshot",
-                "requires_final_balance_recheck": True,
-                "fallback_reason": "okx_entry_risk_facts_balance_repaired_from_cache",
-            }
-        )
-        repaired["policy_provenance"] = provenance
-        return repaired
+        return self._entry_facts_with_verified_balance(model_mode, facts, pre_order=False)
 
     async def pre_order_execution_facts(
         self,
@@ -4466,68 +4431,69 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
-        # A transient OKX private-balance outage must not erase otherwise
-        # usable market facts. The executor still performs an authoritative
-        # balance recheck immediately before submitting an order.
-        balance_snapshot = facts.get("balance_snapshot")
-        balance_error = (
-            balance_snapshot.get("error")
-            if isinstance(balance_snapshot, dict)
-            else None
-        )
-        missing_balance = (
-            "okx_pre_order_account_equity_missing" in str(facts.get("reason") or "")
-            or "okx_pre_order_available_margin_missing" in str(facts.get("reason") or "")
-        )
-        balance_snapshot_is_empty = (
-            isinstance(balance_snapshot, dict)
-            and self._safe_float(balance_snapshot.get("equity"), 0.0) <= 0
-            and self._safe_float(balance_snapshot.get("free"), 0.0) <= 0
-            and not balance_error
-        )
-        if not missing_balance or not (
-            is_okx_temporary_service_error(balance_error) or balance_snapshot_is_empty
-        ):
-            return facts
+        return self._entry_facts_with_verified_balance(model_mode, facts, pre_order=True)
+
+    def _entry_facts_with_verified_balance(
+        self,
+        model_mode: str,
+        facts: dict[str, Any],
+        *,
+        pre_order: bool,
+    ) -> dict[str, Any]:
+        """Use one bounded account-fact policy for sizing and pre-order checks."""
 
         selected_mode = "live" if model_mode == "live" else "paper"
-        sync_status = self._okx_authoritative_sync_status_payload()
-        if str(sync_status.get("status") or "").lower() not in {"ok", "degraded"} and (
-            sync_status.get("fresh_success_available") is not True
-        ):
+        balance_snapshot = facts.get("balance_snapshot")
+        if balance_snapshot_verified(balance_snapshot):
+            self._remember_okx_balance_snapshot_for_mode(selected_mode, balance_snapshot)
             return facts
-        cached = self.peek_okx_balance_snapshot_for_mode(
-            selected_mode,
-            allow_stale=True,
-        )
+        prefix = "okx_pre_order_" if pre_order else "okx_"
+        balance_reasons = {
+            f"{prefix}account_equity_missing",
+            f"{prefix}available_margin_missing",
+        }
+        provenance = dict(self._safe_dict(facts.get("policy_provenance")))
+        original_reasons = str(
+            (facts.get("reason") if pre_order else provenance.get("fallback_reason")) or ""
+        ).split(",")
+        recovery_reason = balance_snapshot_recovery_reason(balance_snapshot)
+        if not recovery_reason or not balance_reasons.intersection(original_reasons):
+            return facts
+        cached = self.peek_okx_balance_snapshot_for_mode(selected_mode, allow_stale=True)
         if not isinstance(cached, dict):
             return facts
         cached_equity = max(self._safe_float(cached.get("equity"), 0.0), 0.0)
         cached_free = max(self._safe_float(cached.get("free"), 0.0), 0.0)
         if cached_equity <= 0 or cached_free <= 0:
             return facts
-
         cache_entry = getattr(self, "_okx_balance_snapshot_cache", {}).get(selected_mode)
         fetched_at = cache_entry.get("fetched_at") if isinstance(cache_entry, dict) else None
-        cache_age = (
-            max((datetime.now(UTC) - fetched_at).total_seconds(), 0.0)
-            if isinstance(fetched_at, datetime)
-            else self._safe_float(cached.get("stale_age_seconds"), 0.0)
+        if not isinstance(fetched_at, datetime):
+            return facts
+        cache_age = max(
+            (datetime.now(UTC) - fetched_at).total_seconds(),
+            0.0,
         )
         if cache_age > OKX_BALANCE_SNAPSHOT_STALE_SECONDS:
+            return facts
+        sync_status = self._okx_authoritative_sync_status_payload()
+        sync_state = str(sync_status.get("status") or "").lower()
+        if (
+            sync_state in {"paused", "disabled", "error"}
+            and sync_status.get("fresh_success_available") is not True
+            and cache_age > OKX_BALANCE_SNAPSHOT_FRESH_SECONDS
+        ):
             return facts
 
         repaired = dict(facts)
         repaired["balance_snapshot"] = {
             **cached,
             "source": "cached_okx_balance_snapshot",
-            "stale": bool(cache_age > OKX_BALANCE_SNAPSHOT_FRESH_SECONDS),
-            "stale_age_seconds": round(cache_age, 3),
-            "stale_reason": (
-                "okx_private_balance_temporary_service_error"
-                if balance_error
-                else "okx_private_balance_empty_snapshot"
+            "stale": bool(
+                cached.get("stale") or cache_age > OKX_BALANCE_SNAPSHOT_FRESH_SECONDS
             ),
+            "stale_age_seconds": round(cache_age, 3),
+            "stale_reason": recovery_reason,
         }
         repaired["account_equity_usdt"] = cached_equity
         repaired["available_margin_usdt"] = cached_free
@@ -4536,28 +4502,20 @@ class TradingService(ModelTrainingCoordinatorMixin):
         repaired["requires_final_balance_recheck"] = True
         reasons = [
             item
-            for item in str(facts.get("reason") or "").split(",")
-            if item
-            not in {
-                "okx_pre_order_account_equity_missing",
-                "okx_pre_order_available_margin_missing",
-            }
+            for item in original_reasons
+            if item and item not in balance_reasons
         ]
         repaired["production_eligible"] = not reasons
-        repaired["reason"] = (
-            "okx_native_pre_order_execution_facts_ready_cached_balance"
-            if not reasons
-            else ",".join(reasons)
-        )
-        provenance = dict(facts.get("policy_provenance") or {})
+        if pre_order:
+            repaired["reason"] = (
+                "okx_native_pre_order_execution_facts_ready_cached_balance"
+                if not reasons
+                else ",".join(reasons)
+            )
         provenance.update(
             {
                 "source": "okx_native_market_facts_and_cached_verified_balance",
-                "fallback_reason": (
-                    "okx_private_balance_temporary_service_error"
-                    if balance_error
-                    else "okx_private_balance_empty_snapshot"
-                ),
+                "fallback_reason": ",".join(reasons) if reasons else recovery_reason,
                 "balance_source": "cached_okx_balance_snapshot",
                 "balance_snapshot_age_seconds": round(cache_age, 3),
                 "requires_final_balance_recheck": True,
@@ -4565,9 +4523,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         repaired["policy_provenance"] = provenance
         logger.warning(
-            "reused recently verified OKX balance for pre-order facts",
+            "reused recently verified OKX balance for entry facts",
             mode=selected_mode,
-            symbol=decision.symbol,
+            stage="pre_order" if pre_order else "sizing",
             age_seconds=round(cache_age, 3),
             final_recheck_required=True,
         )
@@ -9752,22 +9710,21 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     execution_status="skipped",
                     reason=reason,
                 )
-            else:
-                self._set_market_entry_pipeline_stage(f"risk_and_execution:{symbol}")
-                await self._run_market_entry_pipeline(
-                    symbol=symbol,
-                    model_name=model_name,
-                    decision=decision,
-                    decision_db_id=decision_db_id,
-                    model_mode=model_mode,
-                    feature_vector=feature_vector,
-                    results=results,
-                    open_positions=open_positions,
-                    staged_entry_counts=staged_entry_counts,
-                    strategy_mode_context=strategy_mode_context,
-                    market_regime_context=market_regime_context,
-                    new_pair_pause_reason=new_pair_pause_reason,
-                )
+            self._set_market_entry_pipeline_stage(f"risk_and_execution:{symbol}")
+            await self._run_market_entry_pipeline(
+                symbol=symbol,
+                model_name=model_name,
+                decision=decision,
+                decision_db_id=decision_db_id,
+                model_mode=model_mode,
+                feature_vector=feature_vector,
+                results=results,
+                open_positions=open_positions,
+                staged_entry_counts=staged_entry_counts,
+                strategy_mode_context=strategy_mode_context,
+                market_regime_context=market_regime_context,
+                new_pair_pause_reason=new_pair_pause_reason,
+            )
             if decision_db_id is not None:
                 await self.decision_final_state_ensurer.ensure(
                     decision_db_id,
@@ -14358,6 +14315,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
         cached = cache.get(mode)
         if not isinstance(cached, dict):
             return None
+        if (
+            cached.get("invalidated") is True
+            and max_age_seconds <= OKX_BALANCE_SNAPSHOT_FRESH_SECONDS
+        ):
+            return None
         fetched_at = cached.get("fetched_at")
         if not isinstance(fetched_at, datetime):
             return None
@@ -14367,6 +14329,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         snapshot = dict(cached.get("snapshot") or {})
         if not snapshot:
             return None
+        if cached.get("invalidated") is True:
+            snapshot["stale"] = True
+            snapshot["stale_age_seconds"] = round(max(age, 0.0), 3)
+            snapshot["stale_reason"] = "balance_invalidated_after_execution"
         if stale_reason is not None:
             snapshot["stale"] = True
             snapshot["stale_age_seconds"] = round(age, 3)
@@ -14381,11 +14347,37 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
         return snapshot
 
+    def _remember_okx_balance_snapshot_for_mode(
+        self,
+        mode: str,
+        snapshot: Any,
+    ) -> dict[str, Any] | None:
+        if not balance_snapshot_verified(snapshot):
+            return None
+        selected_mode = "live" if mode == "live" else "paper"
+        cache = getattr(self, "_okx_balance_snapshot_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._okx_balance_snapshot_cache = cache
+        stored = {
+            key: value
+            for key, value in snapshot.items()
+            if key not in {"stale", "stale_age_seconds", "stale_reason", "error"}
+        }
+        cache[selected_mode] = {
+            "snapshot": stored,
+            "fetched_at": datetime.now(UTC),
+        }
+        return dict(stored)
+
     def _invalidate_okx_balance_snapshot_cache_for_mode(self, mode: str) -> None:
         selected_mode = "live" if mode == "live" else "paper"
         cache = getattr(self, "_okx_balance_snapshot_cache", None)
-        if isinstance(cache, dict):
-            cache.pop(selected_mode, None)
+        cached = cache.get(selected_mode) if isinstance(cache, dict) else None
+        if isinstance(cached, dict):
+            # Keep the last verified fact for bounded intermediate recovery.
+            # It is no longer fresh; submission still fetches native balance.
+            cached["invalidated"] = True
 
     def _invalidate_okx_balance_snapshot_cache_for_model(self, model_name: str | None) -> None:
         selected_mode = mode_manager.mode.value
@@ -14404,18 +14396,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
     ) -> dict[str, Any] | None:
         """Return OKX USDT balance fields for allocation and order sizing."""
         selected_mode = "live" if mode == "live" else "paper"
-
-        def remember_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-            stored_snapshot = dict(snapshot)
-            stored_snapshot.pop("stale", None)
-            stored_snapshot.pop("stale_age_seconds", None)
-            stored_snapshot.pop("stale_reason", None)
-            stored_snapshot.pop("error", None)
-            self._okx_balance_snapshot_cache[selected_mode] = {
-                "snapshot": stored_snapshot,
-                "fetched_at": datetime.now(UTC),
-            }
-            return dict(stored_snapshot)
 
         def cached_snapshot(reason: str) -> dict[str, Any] | None:
             return self._cached_okx_balance_snapshot(
@@ -14445,15 +14425,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     fallback.get_balance_snapshot("USDT"),
                     timeout=10.0,
                 )
-                if snapshot.get("error"):
+                remembered = self._remember_okx_balance_snapshot_for_mode(selected_mode, snapshot)
+                if remembered is None:
                     logger.warning(
                         "fresh OKX balance snapshot fallback returned error",
                         mode=selected_mode,
                         original_reason=reason,
-                        error=safe_error_text(snapshot.get("error")),
+                        error=safe_error_text(
+                            snapshot.get("error") if isinstance(snapshot, dict) else "empty snapshot"
+                        ),
                     )
                     return None
-                snapshot = remember_snapshot(snapshot)
+                snapshot = remembered
                 snapshot["fallback_executor"] = True
                 snapshot["fallback_reason"] = reason
                 logger.warning(
@@ -14555,15 +14538,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 snapshot = await asyncio.wait_for(
                     executor.get_balance_snapshot("USDT"), timeout=8.0
                 )
-                if snapshot.get("error"):
-                    reason = safe_error_text(snapshot.get("error"))
+                remembered = self._remember_okx_balance_snapshot_for_mode(selected_mode, snapshot)
+                if remembered is None:
+                    reason = safe_error_text(
+                        snapshot.get("error") if isinstance(snapshot, dict) else "empty snapshot"
+                    ) or "OKX balance snapshot is empty"
                     fallback_snapshot = cached_snapshot(reason) or await fresh_executor_snapshot(
                         reason
                     )
                     if fallback_snapshot:
                         return fallback_snapshot
                     return None
-                return remember_snapshot(snapshot)
+                return remembered
             except TimeoutError:
                 logger.warning("timed out fetching OKX balance snapshot", mode=selected_mode)
                 reason = "OKX balance snapshot request timed out"

@@ -9,6 +9,7 @@ import pytest
 import executor.okx_executor as okx_module
 from ai_brain.base_model import Action, DecisionOutput
 from core.exceptions import ExchangeAPIError, OrderPlacementError
+from core.symbols import okx_inst_id_from_symbol
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
@@ -1044,6 +1045,36 @@ class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
         }
 
 
+class _MarketCacheMissingOnSubmitCcxt(_EntryMaxMarketSizeCcxt):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_attempts = 0
+
+    async def create_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.submit_attempts += 1
+        if self.submit_attempts == 1:
+            raise ExchangeAPIError(
+                f"OKX SDK market is not loaded: {symbol}",
+                code="client_market_cache",
+            )
+        return await super().create_order(
+            symbol,
+            order_type,
+            side,
+            quantity,
+            price,
+            params,
+        )
+
+
 class _AttachedProtectionRejectedOnceCcxt(_EntryMaxMarketSizeCcxt):
     def __init__(
         self,
@@ -2072,6 +2103,50 @@ async def test_okx_partial_normalized_balance_derives_equity_from_free_and_used(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail, equity, free",
+    [
+        ({"cashBal": "100", "eq": "70", "availEq": "0", "availBal": "50"}, 70.0, 0.0),
+        ({"cashBal": "100", "eq": "0", "availEq": "0"}, 0.0, 0.0),
+        ({"cashBal": "100", "eq": "-5", "availEq": "0"}, -5.0, 0.0),
+    ],
+)
+async def test_native_balance_preserves_explicit_equity_and_zero_margin(detail, equity, free):
+    class BalanceClient:
+        async def privateGetAccountBalance(self, _params):
+            return {"code": "0", "data": [{"details": [{"ccy": "USDT", **detail}]}]}
+
+    result = await _executor(BalanceClient()).get_balance_snapshot()
+    assert result["equity"] == equity
+    assert result["free"] == free
+    assert result["verified"] is True
+    assert result["allocatable"] == max(equity, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [None, {}, {"code": "0", "data": []}])
+async def test_native_balance_empty_response_is_not_a_verified_zero(response):
+    class BalanceClient:
+        async def privateGetAccountBalance(self, _params):
+            return response
+
+    result = await _executor(BalanceClient()).get_balance_snapshot()
+    assert result["verified"] is False
+    assert result["error_kind"] == "empty_response"
+
+
+@pytest.mark.asyncio
+async def test_native_balance_error_payload_keeps_exchange_code():
+    class BalanceClient:
+        async def privateGetAccountBalance(self, _params):
+            return {"code": "50113", "msg": "Invalid signature", "data": []}
+
+    result = await _executor(BalanceClient()).get_balance_snapshot()
+    assert result["verified"] is False
+    assert "[50113]" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_okx_cancel_replace_error_is_redacted() -> None:
     token, hidden_value, error_text = _secret_bearing_error()
     result = await _executor(_FailingCancelCcxt(error_text))._cancel_stale_exit_order(
@@ -2144,6 +2219,65 @@ async def test_okx_entry_instrument_prefilter_does_not_retry_transport_failure()
     assert result["execution_verified"] is False
     assert result["reason"] == "okx_private_entry_instrument_probe_failed"
     assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_risk_facts_keeps_transient_instrument_probe_advisory() -> None:
+    class TransientProbeExecutor(OKXExecutor):
+        async def get_balance_snapshot(self, _asset: str = "USDT") -> dict[str, Any]:
+            return {
+                "free": 1000.0,
+                "used": 0.0,
+                "total": 1000.0,
+                "cash": 1000.0,
+                "equity": 1000.0,
+                "allocatable": 1000.0,
+            }
+
+        async def _resolve_swap_symbol(self, symbol: str) -> str:
+            return f"{symbol}:USDT"
+
+        async def _fetch_okx_leverage_tiers(self, _symbol: str) -> list[dict[str, Any]]:
+            return [{"maxLeverage": "10"}]
+
+        async def entry_instrument_availability(
+            self,
+            _symbol: str,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "available": None,
+                "reason": "okx_private_entry_instrument_probe_failed",
+                "error_code": "50004",
+            }
+
+    executor = TransientProbeExecutor(mode="paper", load_markets_on_initialize=False)
+    executor._connected = True
+    class Facts:
+        async def fetch_contract_specs(
+            self,
+            symbols: list[str],
+        ) -> dict[str, dict[str, str]]:
+            return {
+                okx_inst_id_from_symbol(symbol): {
+                    "ctVal": "1",
+                    "ctMult": "1",
+                    "lotSz": "1",
+                    "minSz": "1",
+                }
+                for symbol in symbols
+            }
+
+    executor._native_facts_client = lambda: Facts()
+
+    facts = await executor.entry_risk_facts("BTC/USDT", [])
+
+    assert facts["production_eligible"] is True
+    assert facts["entry_instrument_recheck_required"] is True
+    assert facts["entry_instrument_advisory_reason"] == (
+        "okx_private_entry_instrument_probe_failed"
+    )
+    assert facts["policy_provenance"]["fallback_reason"] == ""
 
 
 @pytest.mark.asyncio
@@ -2999,6 +3133,32 @@ async def test_okx_entry_caps_market_order_above_exchange_max_before_submit() ->
 
 
 @pytest.mark.asyncio
+async def test_okx_submit_refreshes_missing_market_cache_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _MarketCacheMissingOnSubmitCcxt()
+    executor = _executor(exchange)
+    refresh_calls: list[bool] = []
+
+    async def refresh_markets() -> None:
+        refresh_calls.append(True)
+
+    monkeypatch.setattr(executor, "_load_usdt_swap_markets", refresh_markets)
+
+    order = await executor._create_order_with_client_recovery(
+        exchange,
+        "LINEA/USDT:USDT",
+        "sell",
+        10.0,
+        {"tdMode": "cross"},
+    )
+
+    assert order["id"] == "entry-max-market"
+    assert exchange.submit_attempts == 2
+    assert refresh_calls == [True]
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_reprices_attached_protection_immediately_before_submit() -> None:
     exchange = _MovingEntryTickerCcxt()
     executor = _executor(exchange)
@@ -3034,6 +3194,38 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
         sizing["risk_budget_usdt"]
     )
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+
+
+@pytest.mark.asyncio
+async def test_okx_entry_rechecks_advisory_instrument_before_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _EntryMaxMarketSizeCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.raw_response["profit_risk_sizing"][
+        "exchange_risk_facts_provenance"
+    ] = {"entry_instrument_recheck_required": True}
+    probes: list[bool] = []
+
+    async def unavailable_probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        probes.append(True)
+        return {
+            "available": None,
+            "reason": "okx_private_entry_instrument_probe_failed",
+        }
+
+    monkeypatch.setattr(executor, "entry_instrument_availability", unavailable_probe)
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.order_id == "entry_instrument_recheck_failed"
+    assert result.raw_response["execution_blocker"] == (
+        "okx_pre_submit_entry_instrument_recheck"
+    )
+    assert probes == [True]
+    assert exchange.create_calls == []
 
 
 @pytest.mark.parametrize("side", ["buy", "sell"])

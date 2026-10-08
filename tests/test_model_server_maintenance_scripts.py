@@ -646,6 +646,41 @@ def test_sync_to_online_server_only_filter_rejects_unsafe_paths() -> None:
         raise AssertionError(f"unsafe --only value was accepted: {value!r}")
 
 
+def test_sync_to_online_server_rejects_untracked_local_import_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    services_dir = tmp_path / "services"
+    services_dir.mkdir()
+    importer = services_dir / "importer.py"
+    dependency = services_dir / "dependency.py"
+    importer.write_text("from services.dependency import value\n", encoding="utf-8")
+    dependency.write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sync, "ROOT", tmp_path)
+
+    with pytest.raises(RuntimeError, match="services/dependency.py"):
+        sync.validate_deployment_source_dependencies([importer])
+
+
+def test_sync_to_online_server_accepts_closed_local_import_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import sync_to_online_server as sync
+
+    services_dir = tmp_path / "services"
+    services_dir.mkdir()
+    importer = services_dir / "importer.py"
+    dependency = services_dir / "dependency.py"
+    importer.write_text("from services.dependency import value\n", encoding="utf-8")
+    dependency.write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sync, "ROOT", tmp_path)
+
+    sync.validate_deployment_source_dependencies([importer, dependency])
+
+
 def test_start_online_model_tunnels_use_approved_internal_ports() -> None:
     from scripts import start_online_model_tunnels as tunnels
 

@@ -10,7 +10,9 @@ logs, virtualenvs, caches, and Git metadata stay on their current machine.
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -692,6 +694,89 @@ def iter_upload_files(include_tests: bool) -> list[Path]:
     return sorted(files, key=lambda item: item.as_posix().lower())
 
 
+def validate_deployment_source_dependencies(files: list[Path]) -> None:
+    """Reject omitted local imports before touching the running deployment."""
+
+    included = {path.resolve() for path in files}
+    missing: dict[str, set[str]] = {}
+    for path in files:
+        rel = path.relative_to(ROOT)
+        if path.suffix != ".py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=rel.as_posix())
+        package = list(rel.parts[:-1])
+        for node in ast.walk(tree):
+            modules: list[list[str]] = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name.split(".") for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module.split(".") if node.module else []
+                if node.level:
+                    base = package[: len(package) - node.level + 1] + base
+                if base:
+                    modules = [base, *[base + alias.name.split(".") for alias in node.names]]
+            for module in modules:
+                # Only inspect application-owned imports, never installed packages.
+                if not module or module[0] not in REMOTE_MANAGED_SOURCE_ROOTS:
+                    continue
+                candidates = [ROOT.joinpath(*module).with_suffix(".py")]
+                candidates.extend(
+                    ROOT.joinpath(*module[:length], "__init__.py")
+                    for length in range(1, len(module) + 1)
+                )
+                for dependency in candidates:
+                    if dependency.is_file() and dependency.resolve() not in included:
+                        name = dependency.relative_to(ROOT).as_posix()
+                        missing.setdefault(name, set()).add(rel.as_posix())
+    if missing:
+        details = "; ".join(
+            f"{name} (imported by {', '.join(sorted(importers))})"
+            for name, importers in sorted(missing.items())
+        )
+        raise RuntimeError(
+            "Deployment blocked before upload: local source dependencies are absent "
+            f"from the Git-index upload set: {details}. Review and git add the required files."
+        )
+
+
+def _verify_remote_sources_command(files: list[Path], remote_app_dir: str) -> str:
+    expected = {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in files
+        if path.suffix == ".py"
+    }
+    script = f"""import hashlib
+import json
+from pathlib import Path
+
+root = Path({remote_app_dir!r})
+expected = json.loads({json.dumps(expected)!r})
+mismatches = []
+for name, digest in expected.items():
+    path = root / name
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        mismatches.append(name)
+if mismatches:
+    raise SystemExit('source-integrity-failed: ' + ', '.join(mismatches))
+print('source-integrity-ok:' + str(len(expected)))
+"""
+    return f"python3 - <<'PY'\n{script}\nPY"
+
+
+def _runtime_import_probe_command(remote_app_dir: str) -> str:
+    return (
+        f"cd {_remote_quote(remote_app_dir)} && "
+        "PYBIN=python3; "
+        "if [ -x .venv/bin/python ]; then PYBIN=.venv/bin/python; "
+        "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "
+        "$PYBIN -c "
+        + _remote_quote(
+            "import scripts.run_dashboard; import scripts.run_paper_trading; "
+            "print('runtime-imports-ok')"
+        )
+    )
+
+
 def _normalise_only_filter(value: str) -> str:
     normalised = str(value or "").strip().replace("\\", "/")
     if not normalised:
@@ -988,10 +1073,10 @@ def main() -> None:
     args = parse_args()
     if args.keep_trading_stopped and args.resume_trading:
         raise SystemExit("--keep-trading-stopped and --resume-trading are mutually exclusive")
-    files = filter_upload_files(
-        iter_upload_files(include_tests=args.include_tests),
-        list(args.only or []),
-    )
+    deployment_files = iter_upload_files(include_tests=args.include_tests)
+    if not args.runtime_env_only:
+        validate_deployment_source_dependencies(deployment_files)
+    files = filter_upload_files(deployment_files, list(args.only or []))
     safe_print(f"Prepared {len(files)} files for upload to {args.remote_app_dir}.")
     local_ai_tools_api_key = ""
     if args.dry_run:
@@ -1057,6 +1142,14 @@ def main() -> None:
             sftp.close()
         safe_print(f"Uploaded {len(uploaded)} changed files.")
         safe_print(f"Removed {len(removed)} stale source files.")
+        safe_print(
+            run_remote_text(
+                ssh,
+                _verify_remote_sources_command(files, args.remote_app_dir),
+                timeout=60,
+                check=True,
+            )
+        )
         if any(path.endswith("/requirements.txt") for path in uploaded):
             safe_print("Installing updated Python requirements on online server.")
             run_remote_text(
@@ -1075,6 +1168,14 @@ def main() -> None:
         if args.skip_restart:
             safe_print("Skipped service restart.")
             return
+        safe_print(
+            run_remote_text(
+                ssh,
+                _runtime_import_probe_command(args.remote_app_dir),
+                timeout=90,
+                check=True,
+            )
+        )
         safe_print("Ensuring the public Dashboard proxy is installed and healthy.")
         safe_print(
             run_remote_text(

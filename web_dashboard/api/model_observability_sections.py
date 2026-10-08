@@ -158,10 +158,11 @@ async def build_expert_memory_observability(
             mode=mode if mode in {"paper", "live"} else None,
             limit=500,
             compact=True,
-            # Completeness depends on the exact decision lineage and profit
-            # contract.  The compact projection without evidence payload marks
-            # valid historical outcomes as incomplete.
-            include_decision_evidence=True,
+            # Dashboard counts consume settlement, reflection, and compact
+            # lineage fields only. Do not detoast the full decision snapshot
+            # on every polling request; explicit replay/report endpoints own
+            # the heavy evidence projection.
+            include_decision_evidence=False,
         )
         outcome_positions = {
             int(position_id)

@@ -315,7 +315,7 @@ def test_execution_service_persists_okx_51001_entry_negative_cache() -> None:
     ]
 
 
-def test_execution_service_persists_missing_loaded_market_negative_cache() -> None:
+def test_execution_service_does_not_persist_local_market_cache_failure() -> None:
     marked: list[tuple[str, str, dict[str, Any]]] = []
     service = _test_execution_service(
         okx_executor_provider=lambda _mode: _noop_async(),
@@ -330,21 +330,7 @@ def test_execution_service_persists_missing_loaded_market_negative_cache() -> No
         error="OKX SDK market is not loaded: LINEA/USDT:USDT",
     )
 
-    assert marked == [
-        (
-            "paper",
-            "LINEA/USDT",
-            {
-                "available": False,
-                "reason": "okx_private_entry_instrument_unavailable",
-                "error_code": "execution_instrument_missing",
-                "error": "OKX SDK market is not loaded: LINEA/USDT:USDT",
-                "source": "execution_service_order_submit",
-                "analysis_only": True,
-                "execution_verified": False,
-            },
-        )
-    ]
+    assert marked == []
 
 
 def _dynamic_return_ready_decision() -> DecisionOutput:

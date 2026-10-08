@@ -13,12 +13,37 @@ from models.trade import OkxPositionHistory
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+    _decision_feature_projection,
+    _decision_learning_projection,
     build_authoritative_trade_outcome,
     load_authoritative_trade_outcomes,
 )
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.okx_position_history_store import load_okx_position_history_records
 from services.training_data_quality import annotate_training_payload
+
+
+def test_compact_decision_projection_keeps_training_facts_without_large_payloads() -> None:
+    row = SimpleNamespace(
+        _mapping={
+            "feature_current_price": 100.0,
+            "feature_training_label_contract": {"version": "label-v1"},
+            "feature_local_ai_tools_shadow": {"status": "shadow"},
+            "feature_unused_transcript": "x" * 100_000,
+            "learning_normal_paper_trade": {"version": "paper-v1"},
+            "learning_unused_transcript": {"text": "x" * 100_000},
+        }
+    )
+
+    features = _decision_feature_projection(row)
+    learning = _decision_learning_projection(row, include_full_snapshot=False)
+
+    assert features == {
+        "current_price": 100.0,
+        "training_label_contract": {"version": "label-v1"},
+        "local_ai_tools_shadow": {"status": "shadow"},
+    }
+    assert learning == {"normal_paper_trade": {"version": "paper-v1"}}
 
 
 @pytest.mark.asyncio

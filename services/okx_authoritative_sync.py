@@ -11,6 +11,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import or_, select
@@ -52,6 +53,7 @@ DEFAULT_MAX_PULL_ATTEMPTS = 2
 MAX_AUTHORITATIVE_FILL_PAGES = 10
 LOCAL_ORDER_SYNC_GRACE_SECONDS = AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
 QUANTITY_TOLERANCE_RATIO = 0.02
+DECISION_PROJECTION_BATCH_SIZE = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,12 +617,10 @@ class OkxAuthoritativeSyncService:
             }
             local_decisions: dict[int, AIDecision] = {}
             if decision_ids:
-                decision_rows = await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                local_decisions = await self._load_bounded_decisions(
+                    session,
+                    decision_ids,
                 )
-                local_decisions = {
-                    int(decision.id): decision for decision in decision_rows.scalars().all()
-                }
             position_rows = await session.execute(
                 select(Position)
                 .where(
@@ -692,12 +692,10 @@ class OkxAuthoritativeSyncService:
             }
             context_decisions: dict[int, AIDecision] = {}
             if decision_ids:
-                decision_rows = await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                context_decisions = await self._load_bounded_decisions(
+                    session,
+                    decision_ids,
                 )
-                context_decisions = {
-                    int(decision.id): decision for decision in decision_rows.scalars().all()
-                }
         return context_orders, context_decisions
 
     async def _load_filled_local_orders_by_exchange_ids(
@@ -740,13 +738,49 @@ class OkxAuthoritativeSyncService:
             }
             context_decisions: dict[int, AIDecision] = {}
             if decision_ids:
-                decision_rows = await session.execute(
-                    select(AIDecision).where(AIDecision.id.in_(decision_ids))
+                context_decisions = await self._load_bounded_decisions(
+                    session,
+                    decision_ids,
                 )
-                context_decisions = {
-                    int(decision.id): decision for decision in decision_rows.scalars().all()
-                }
         return context_orders, context_decisions
+
+    @staticmethod
+    async def _load_bounded_decisions(
+        session: Any,
+        decision_ids: set[int],
+    ) -> dict[int, AIDecision]:
+        """Load only the bounded lineage snapshot needed by reconciliation.
+
+        A full ``AIDecision`` row detoasts raw model transcripts and can exceed
+        PostgreSQL's read timeout during an otherwise healthy OKX audit.  The
+        reconciliation helpers only need the decision id and the compact
+        learning snapshot (for attached protection ids); order/position facts
+        remain authoritative sources for symbols and execution quantities.
+        """
+
+        ordered_ids = sorted(
+            int(value) for value in decision_ids if int(value or 0) > 0
+        )
+        decisions: dict[int, AIDecision] = {}
+        for offset in range(0, len(ordered_ids), DECISION_PROJECTION_BATCH_SIZE):
+            batch = ordered_ids[offset : offset + DECISION_PROJECTION_BATCH_SIZE]
+            rows = await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.decision_learning_snapshot.label(
+                        "decision_learning_snapshot"
+                    ),
+                ).where(AIDecision.id.in_(batch))
+            )
+            for row in rows:
+                snapshot = row._mapping.get("decision_learning_snapshot")
+                compact = dict(snapshot) if isinstance(snapshot, dict) else {}
+                decisions[int(row.id)] = SimpleNamespace(
+                    id=int(row.id),
+                    raw_llm_response=compact,
+                    decision_learning_snapshot=compact,
+                )
+        return decisions
 
     async def _load_local_positions_by_exchange_ids(
         self,

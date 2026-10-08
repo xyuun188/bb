@@ -285,7 +285,13 @@ class ExpertMemoryService:
                 since=load_training_epoch_start(),
                 limit=AUTHORITATIVE_BACKFILL_LIMIT,
                 compact=True,
-                include_decision_evidence=True,
+                # Reflection backfill only needs the bounded lineage and
+                # authoritative settlement facts. Loading the full decision
+                # learning snapshot detoasts oversized JSON rows and can
+                # exhaust the PostgreSQL statement timeout, leaving memory
+                # and replay counts at zero. Full evidence remains opt-in for
+                # explicit replay/report callers.
+                include_decision_evidence=False,
             )
             complete_outcomes = [
                 outcome

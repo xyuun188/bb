@@ -29,7 +29,65 @@ from models.base import Base
 
 _engine = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_session_gate: asyncio.Semaphore | None = None
+_session_gate_limit: int | None = None
 logger = structlog.get_logger(__name__)
+
+
+def _session_gate_capacity() -> int:
+    """Return the per-process database concurrency budget.
+
+    SQLAlchemy's pool capacity is shared by several independent background
+    workers.  Letting every worker race directly for ``pool_size +
+    max_overflow`` turns a short burst into pool timeouts, which then drops
+    training samples and authoritative sync work.  Keep a smaller cooperative
+    budget in front of the pool so callers wait in asyncio instead of
+    consuming overflow connections.
+    """
+
+    try:
+        raw_pool_capacity = max(
+            int(settings.database_pool_size or 0),
+            1,
+        ) + max(
+            int(settings.database_max_overflow or 0),
+            0,
+        )
+    except (TypeError, ValueError):
+        raw_pool_capacity = 1
+    configured = getattr(settings, "database_session_concurrency", None)
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        try:
+            pool_size = max(int(settings.database_pool_size or 0), 1)
+        except (TypeError, ValueError):
+            pool_size = 1
+        try:
+            max_overflow = max(int(settings.database_max_overflow or 0), 0)
+        except (TypeError, ValueError):
+            max_overflow = 0
+        value = min(pool_size + max_overflow, 24)
+    return max(1, min(value, raw_pool_capacity))
+
+
+def _get_session_gate() -> asyncio.Semaphore:
+    """Return the lazily-created process-wide session concurrency gate."""
+
+    global _session_gate, _session_gate_limit
+    limit = _session_gate_capacity()
+    if _session_gate is None or _session_gate_limit != limit:
+        _session_gate = asyncio.Semaphore(limit)
+        _session_gate_limit = limit
+    return _session_gate
+
+
+async def _acquire_session_slot() -> asyncio.Semaphore:
+    gate = _get_session_gate()
+    await gate.acquire()
+    return gate
 
 
 async def _close_session_uncancelled(session: AsyncSession) -> None:
@@ -85,7 +143,7 @@ async def get_engine():
             engine_kwargs["max_overflow"] = max(int(settings.database_max_overflow or 0), 0)
             engine_kwargs["pool_timeout"] = max(
                 float(settings.database_pool_timeout_seconds or 0.0),
-                0.5,
+                5.0,
             )
             # Production PostgreSQL connections can be closed by the server or
             # network while they are idle. Probe a connection before handing it
@@ -120,34 +178,42 @@ async def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    maker = await get_sessionmaker()
-    async with maker() as session:
-        try:
-            yield session
-            await session.commit()
-        except BaseException:
-            await session.rollback()
-            raise
-        finally:
-            # Cancellation can interrupt AsyncSession.__aexit__ before the
-            # aiosqlite connection has been returned.  Shield the final close
-            # so short-lived workers cannot leak a connection into loop
-            # teardown.
-            await _close_session_uncancelled(session)
+    gate = await _acquire_session_slot()
+    try:
+        maker = await get_sessionmaker()
+        async with maker() as session:
+            try:
+                yield session
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                # Cancellation can interrupt AsyncSession.__aexit__ before the
+                # aiosqlite connection has been returned.  Shield the final
+                # close so short-lived workers cannot leak a connection into
+                # loop teardown.
+                await _close_session_uncancelled(session)
+    finally:
+        gate.release()
 
 
 @asynccontextmanager
 async def get_session_ctx() -> AsyncGenerator[AsyncSession, None]:
-    maker = await get_sessionmaker()
-    async with maker() as session:
-        try:
-            yield session
-            await session.commit()
-        except BaseException:
-            await session.rollback()
-            raise
-        finally:
-            await _close_session_uncancelled(session)
+    gate = await _acquire_session_slot()
+    try:
+        maker = await get_sessionmaker()
+        async with maker() as session:
+            try:
+                yield session
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                await _close_session_uncancelled(session)
+    finally:
+        gate.release()
 
 
 @asynccontextmanager
@@ -177,61 +243,65 @@ async def get_read_session_ctx(
         except (TypeError, ValueError):
             idle_transaction_timeout_ms = 15_000
 
-    maker = await get_sessionmaker()
-    async with maker() as session:
-        try:
-            if "postgresql" in settings.database_url:
-                normalized_isolation = str(transaction_isolation or "").strip().upper()
-                if normalized_isolation:
-                    # This must be the first statement in the transaction.  Keep
-                    # the accepted values explicit so a caller cannot inject SQL.
-                    allowed_isolations = {
-                        "REPEATABLE READ READ ONLY",
-                        "SERIALIZABLE READ ONLY",
-                    }
-                    if normalized_isolation not in allowed_isolations:
-                        raise ValueError(
-                            f"unsupported read transaction isolation: {transaction_isolation!r}"
-                        )
-                    await session.execute(
-                        text(f"SET TRANSACTION ISOLATION LEVEL {normalized_isolation}")
-                    )
-                    session.info["bb_consistent_read_snapshot_started"] = True
-                statement_timeout = max(int(statement_timeout_ms), 100)
-                idle_timeout = max(int(idle_transaction_timeout_ms), 100)
-                # Transaction-local limits protect the shared pool from a
-                # cancelled browser request without constraining writes,
-                # migrations, or model training connections.
-                await session.execute(
-                    text("SELECT set_config('statement_timeout', :value, true)"),
-                    {"value": f"{statement_timeout}ms"},
-                )
-                await session.execute(
-                    text("SELECT set_config('idle_in_transaction_session_timeout', :value, true)"),
-                    {"value": f"{idle_timeout}ms"},
-                )
-            yield session
-        finally:
-            # SELECT starts a transaction in PostgreSQL.  Roll it back even
-            # after a successful response, and especially after cancellation,
-            # so a pooled connection is never left idle in transaction.
-            # Detach already-loaded ORM rows first: rollback expires them, but
-            # callers intentionally build response/strategy state after the
-            # context closes.
-            expunge_all = getattr(session, "expunge_all", None)
-            if callable(expunge_all):
-                expunge_all()
+    gate = await _acquire_session_slot()
+    try:
+        maker = await get_sessionmaker()
+        async with maker() as session:
             try:
-                await session.rollback()
-            except Exception as exc:
-                # A dropped connection is already unusable; do not mask the
-                # original request error while returning it to the pool.
-                logger.debug(
-                    "database session rollback skipped",
-                    error=type(exc).__name__,
-                )
+                if "postgresql" in settings.database_url:
+                    normalized_isolation = str(transaction_isolation or "").strip().upper()
+                    if normalized_isolation:
+                        # This must be the first statement in the transaction.  Keep
+                        # the accepted values explicit so a caller cannot inject SQL.
+                        allowed_isolations = {
+                            "REPEATABLE READ READ ONLY",
+                            "SERIALIZABLE READ ONLY",
+                        }
+                        if normalized_isolation not in allowed_isolations:
+                            raise ValueError(
+                                f"unsupported read transaction isolation: {transaction_isolation!r}"
+                            )
+                        await session.execute(
+                            text(f"SET TRANSACTION ISOLATION LEVEL {normalized_isolation}")
+                        )
+                        session.info["bb_consistent_read_snapshot_started"] = True
+                    statement_timeout = max(int(statement_timeout_ms), 100)
+                    idle_timeout = max(int(idle_transaction_timeout_ms), 100)
+                    # Transaction-local limits protect the shared pool from a
+                    # cancelled browser request without constraining writes,
+                    # migrations, or model training connections.
+                    await session.execute(
+                        text("SELECT set_config('statement_timeout', :value, true)"),
+                        {"value": f"{statement_timeout}ms"},
+                    )
+                    await session.execute(
+                        text("SELECT set_config('idle_in_transaction_session_timeout', :value, true)"),
+                        {"value": f"{idle_timeout}ms"},
+                    )
+                yield session
             finally:
-                await _close_session_uncancelled(session)
+                # SELECT starts a transaction in PostgreSQL.  Roll it back even
+                # after a successful response, and especially after cancellation,
+                # so a pooled connection is never left idle in transaction.
+                # Detach already-loaded ORM rows first: rollback expires them, but
+                # callers intentionally build response/strategy state after the
+                # context closes.
+                expunge_all = getattr(session, "expunge_all", None)
+                if callable(expunge_all):
+                    expunge_all()
+                try:
+                    await session.rollback()
+                except Exception as exc:
+                    # A dropped connection is already unusable; do not mask the
+                    # original request error while returning it to the pool.
+                    logger.debug(
+                        "database session rollback skipped",
+                        error=type(exc).__name__,
+                    )
+                finally:
+                    await _close_session_uncancelled(session)
+    finally:
+        gate.release()
 
 
 async def init_db(*, migrate_schema: bool = True) -> None:

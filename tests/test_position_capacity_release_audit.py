@@ -10,6 +10,7 @@ import services.position_capacity_release_audit as position_capacity_release_aud
 from services.current_position_management import (
     build_current_position_management_contract,
 )
+from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.okx_native_facts import OKX_PROTECTION_EXECUTION_VERSION
 from services.position_capacity_release_audit import PositionCapacityReleaseAuditService
 
@@ -107,6 +108,18 @@ def _dynamic_exit_policy(*, complete: bool = True) -> dict:
             "fallback_reason": "" if complete else "position_economics_missing",
         },
     }
+
+
+def test_dynamic_capacity_observation_does_not_require_account_equity() -> None:
+    decision = DynamicPositionCapacityPolicy().evaluate(
+        open_positions=[{"symbol": "BTC/USDT", "side": "long"}],
+        account_equity=None,
+    )
+
+    assert decision.entry_limit is None
+    assert decision.policy_provenance["fallback_reason"] == ""
+    assert decision.policy_provenance["account_equity_required"] is False
+    assert decision.policy_provenance["account_equity_observed"] is False
 
 
 def test_capacity_audit_reports_hard_capacity_and_position_economics_only() -> None:
@@ -214,6 +227,26 @@ def test_capacity_audit_observes_new_position_before_management_refresh() -> Non
     assert pending["authoritative_entry_fact_sync_pending_reason"] == (
         "initial_position_management_sync"
     )
+
+
+def test_capacity_audit_treats_partial_new_management_contract_as_pending() -> None:
+    position = _position(
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+        current_management_contract={
+            "kind": "current_position_takeover",
+            "entry_fee_evidence_complete": True,
+            "protection_evidence_complete": False,
+            "blockers": ["okx_protection_evidence_incomplete"],
+        },
+    )
+
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [])
+
+    assert report["position_economics_pending_count"] == 1
+    assert report["position_economics_incomplete_count"] == 0
+    assert report["position_economics_pending"][0][
+        "authoritative_entry_fact_sync_pending_reason"
+    ] == "authoritative_entry_fact_sync_grace"
 
 
 def test_capacity_audit_checks_fragmented_positions_as_one_net_position_group() -> None:

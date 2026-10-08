@@ -44,6 +44,7 @@ from services.entry_profit_risk_sizing import (
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.normal_paper_trade import normal_paper_order_identity_reasons
+from services.okx_balance_snapshot import finite_balance_value
 from services.okx_entry_environment_compatibility import (
     assess_okx_entry_environment_compatibility,
 )
@@ -1575,6 +1576,61 @@ class OKXExecutor(AbstractExecutor):
                     )
                 price = self._safe_float(submit_ticker.get("last"), 0.0)
                 ticker = {**submit_ticker, **submit_price_limit}
+                sizing = (
+                    decision.raw_response.get("profit_risk_sizing")
+                    if isinstance(decision.raw_response, dict)
+                    else {}
+                )
+                sizing = sizing if isinstance(sizing, dict) else {}
+                risk_facts_provenance = sizing.get("exchange_risk_facts_provenance")
+                risk_facts_provenance = (
+                    risk_facts_provenance
+                    if isinstance(risk_facts_provenance, dict)
+                    else {}
+                )
+                instrument_recheck_required = bool(
+                    risk_facts_provenance.get("entry_instrument_recheck_required")
+                    or sizing.get("entry_instrument_recheck_required")
+                )
+                if instrument_recheck_required:
+                    try:
+                        final_instrument_probe = await self.entry_instrument_availability(
+                            decision.symbol,
+                            okx_symbol=okx_symbol,
+                            force=True,
+                        )
+                    except Exception as exc:
+                        final_instrument_probe = {
+                            "available": None,
+                            "reason": "okx_pre_submit_entry_instrument_recheck_failed",
+                            "error": safe_error_text(exc, limit=220),
+                        }
+                    okx_order_rules["entry_instrument_recheck"] = final_instrument_probe
+                    if final_instrument_probe.get("available") is not True:
+                        return ExecutionResult(
+                            order_id="entry_instrument_recheck_failed",
+                            symbol=decision.symbol,
+                            side=side,
+                            order_type="market",
+                            quantity=0.0,
+                            price=price,
+                            status=OrderStatus.REJECTED,
+                            raw_response={
+                                "error": (
+                                    "OKX 开仓合约在最终提交前未能完成账户环境复核，"
+                                    "本次不发送订单，下一轮重新获取事实。"
+                                ),
+                                "execution_blocker": (
+                                    "okx_pre_submit_entry_instrument_recheck"
+                                ),
+                                "system_pre_submit_rejection": True,
+                                "okx_rejection": False,
+                                "okx_symbol": okx_symbol,
+                                "entry_instrument_recheck_required": True,
+                                "entry_instrument_recheck": final_instrument_probe,
+                                "okx_order_rules": okx_order_rules,
+                            },
+                        )
                 fill_risk_price = self._entry_market_fill_risk_price(
                     side=side,
                     reference_price=price,
@@ -4108,6 +4164,36 @@ class OKXExecutor(AbstractExecutor):
                 params,
             )
         except ExchangeAPIError as submit_error:
+            # CCXT can lose a newly listed swap from its local market cache
+            # between sizing and submission. This is a local client state
+            # failure, not an OKX order rejection; refresh the swap markets
+            # once and retry the same logical request before classifying it as
+            # an exchange failure. No second retry is attempted after the
+            # refresh, so a remote order cannot be duplicated by this repair.
+            if self._is_missing_market_symbol_error(safe_error_text(submit_error)):
+                logger.warning(
+                    "OKX client market cache missing at submit; refreshing once",
+                    symbol=symbol,
+                    error=safe_error_text(submit_error),
+                )
+                try:
+                    self._markets_loaded = False
+                    await self._load_usdt_swap_markets()
+                    return await self._with_retry(
+                        ccxt.create_order,
+                        symbol,
+                        "market",
+                        side,
+                        quantity,
+                        None,
+                        params,
+                    )
+                except Exception as refresh_error:
+                    logger.warning(
+                        "OKX client market cache refresh did not recover submit",
+                        symbol=symbol,
+                        error=safe_error_text(refresh_error),
+                    )
             client_order_id = str(params.get("clOrdId") or "").strip()
             native_fetch = getattr(ccxt, "privateGetTradeOrder", None)
             inst_id = okx_inst_id_from_symbol(symbol)
@@ -6633,9 +6719,34 @@ class OKXExecutor(AbstractExecutor):
         ccxt = await self._get_ccxt()
         try:
             balance_data = await self._fetch_balance_without_markets(ccxt, asset)
+            if not isinstance(balance_data, dict):
+                return {
+                    "free": 0.0,
+                    "equity": 0.0,
+                    "error": "OKX balance response is empty",
+                    "error_kind": "empty_response",
+                    "verified": False,
+                }
+            code = str(balance_data.get("code") or "0").strip()
+            if code != "0":
+                raise ExchangeAPIError(
+                    f"OKX API error [{code}]: {safe_error_text(balance_data.get('msg'))}",
+                    code=code,
+                )
             if asset not in balance_data and isinstance(balance_data.get("data"), list):
                 balance_data = self._balance_response_to_ccxt_shape(balance_data, asset)
             asset_data = balance_data.get(asset, {}) or {}
+            if not isinstance(asset_data, dict) or not any(
+                finite_balance_value(asset_data.get(key)) is not None
+                for key in ("total", "used", "free")
+            ):
+                return {
+                    "free": 0.0,
+                    "equity": 0.0,
+                    "error": f"OKX balance response has no {asset} account facts",
+                    "error_kind": "empty_response",
+                    "verified": False,
+                }
             raw_detail = {}
             info = balance_data.get("info") or {}
             for item in info.get("data", []) if isinstance(info, dict) else []:
@@ -6648,45 +6759,58 @@ class OKXExecutor(AbstractExecutor):
                 if raw_detail:
                     break
 
-            def raw_float(key: str, fallback: float = 0.0) -> float:
-                try:
-                    return float(raw_detail.get(key) or fallback)
-                except Exception:
-                    return fallback
-
-            # CCXT can return a partially normalized balance shape when the
-            # private endpoint responds without the usual ``total``/``eq``
-            # fields.  ``free`` is still an authoritative account fact in
-            # that response; treating the missing equity as zero collapses
-            # the risk budget and blocks every paper entry.  Prefer explicit
-            # equity fields, then derive the minimum truthful equity from
-            # free + used (never from a model or a stale strategy value).
-            total = float(asset_data.get("total") or 0.0)
-            used = float(asset_data.get("used") or 0.0)
-            cash = raw_float("cashBal", total)
-            explicit_equity = raw_float("eq", 0.0)
-            available = float(asset_data.get("free") or 0.0) or raw_float("availEq", 0.0)
-            equity = max(
-                explicit_equity,
-                total,
-                cash,
-                available + max(used, 0.0),
-                available,
-                0.0,
+            total_value = finite_balance_value(asset_data.get("total"))
+            used = finite_balance_value(asset_data.get("used")) or 0.0
+            free_value = finite_balance_value(asset_data.get("free"))
+            available = (
+                free_value
+                if free_value is not None
+                else finite_balance_value(raw_detail.get("availEq")) or 0.0
             )
-            allocatable = equity if equity > 0 else (cash if cash > 0 else total)
+            cash_value = finite_balance_value(raw_detail.get("cashBal"))
+            equity_value = finite_balance_value(raw_detail.get("eq"))
+            # Equity includes floating PnL. Cash/free balances must never
+            # override an explicit lower (or zero) native equity value.
+            normalized_total_is_placeholder = (
+                total_value == 0.0
+                and (available > 0.0 or used > 0.0)
+                and equity_value is None
+            )
+            equity = (
+                equity_value
+                if equity_value is not None
+                else available + used
+                if normalized_total_is_placeholder or total_value is None
+                else total_value
+            )
+            total = (
+                available + used
+                if normalized_total_is_placeholder
+                else total_value
+                if total_value is not None
+                else equity
+            )
+            cash = cash_value if cash_value is not None else total
             return {
                 "free": available,
                 "used": used,
                 "total": total,
                 "cash": cash,
                 "equity": equity,
-                "allocatable": allocatable,
+                "allocatable": max(equity, 0.0),
+                "verified": True,
+                "source": "okx_account_balance",
             }
         except Exception as e:
             error_text = safe_error_text(e)
             logger.error("fetch balance snapshot failed", error=error_text)
-            return {"free": 0.0, "used": 0.0, "total": 0.0, "error": error_text}
+            return {
+                "free": 0.0,
+                "used": 0.0,
+                "total": 0.0,
+                "error": error_text,
+                "verified": False,
+            }
 
     async def _fetch_balance_without_markets(
         self,
@@ -6745,28 +6869,32 @@ class OKXExecutor(AbstractExecutor):
                     break
             if raw_detail:
                 break
+        if not raw_detail:
+            return {"info": {"data": data or []}}
 
-        def raw_float(key: str, fallback: float = 0.0) -> float:
-            try:
-                return float(raw_detail.get(key) or fallback)
-            except Exception:
-                return fallback
+        def first_value(*keys: str) -> float | None:
+            return next(
+                (
+                    number
+                    for key in keys
+                    if (number := finite_balance_value(raw_detail.get(key))) is not None
+                ),
+                None,
+            )
 
-        cash = raw_float("cashBal")
-        equity = raw_float("eq", cash)
-        used = raw_float("frozenBal")
-        available = (
-            raw_float("availBal")
-            or raw_float("availEq")
-            or raw_float("disEq")
-            or max(equity - used, 0.0)
-        )
-        total = equity if equity > 0 else cash
+        cash = first_value("cashBal")
+        equity = first_value("eq", "cashBal")
+        used = first_value("frozenBal") or 0.0
+        available = first_value("availEq", "availBal", "disEq")
+        if available is None and equity is not None:
+            available = max(equity - used, 0.0)
+        if not any(value is not None for value in (cash, equity, available)):
+            return {"info": {"data": data or []}}
         return {
             asset: {
                 "free": available,
                 "used": used,
-                "total": total,
+                "total": equity,
             },
             "info": {"data": data or []},
         }
@@ -6831,7 +6959,27 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("target_okx_contract_spec_missing")
         if missing_specs:
             reasons.append("open_position_okx_contract_spec_missing")
-        if instrument_availability.get("available") is not True:
+        instrument_available = instrument_availability.get("available")
+        instrument_probe_reason = str(
+            instrument_availability.get("reason") or ""
+        ).strip()
+        # A private leverage probe can fail transiently while the public
+        # execution contract, balance and leverage tiers are still valid. This
+        # is advisory at the sizing stage: the final pre-order facts and the
+        # submit path remain authoritative and must recheck the instrument
+        # before an order can be sent. A confirmed 51001/unavailable result is
+        # still a hard blocker.
+        instrument_recheck_required = bool(
+            instrument_available is not True
+            and instrument_probe_reason
+            in {
+                "okx_private_entry_instrument_temporarily_unverified",
+                "okx_private_entry_instrument_probe_failed",
+            }
+        )
+        if instrument_available is False or (
+            instrument_available is not True and not instrument_recheck_required
+        ):
             reasons.append(
                 str(
                     instrument_availability.get("reason")
@@ -6850,6 +6998,10 @@ class OKXExecutor(AbstractExecutor):
             "contract_specs": contract_specs,
             "missing_contract_specs": missing_specs,
             "entry_instrument_availability": instrument_availability,
+            "entry_instrument_recheck_required": instrument_recheck_required,
+            "entry_instrument_advisory_reason": (
+                instrument_probe_reason if instrument_recheck_required else ""
+            ),
             "balance_snapshot": balance_snapshot,
             "policy_provenance": {
                 "source": "okx_native_balance_contract_specs_and_leverage_tiers",
@@ -6858,6 +7010,10 @@ class OKXExecutor(AbstractExecutor):
                 "generated_at": generated_at,
                 "strategy_version": "2026-07-15.okx-entry-risk-facts.v2",
                 "fallback_reason": ",".join(reasons),
+                "entry_instrument_recheck_required": instrument_recheck_required,
+                "entry_instrument_advisory_reason": (
+                    instrument_probe_reason if instrument_recheck_required else ""
+                ),
             },
         }
 

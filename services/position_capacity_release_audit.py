@@ -406,40 +406,46 @@ class PositionCapacityReleaseAuditService:
             and management_complete
             and stop_distance > 0
         )
-        blockers = {
-            str(reason or "").strip()
-            for reason in management_contract.get("blockers", [])
-            if str(reason or "").strip()
-        }
         created_at = _as_utc(getattr(position, "created_at", None))
         sync_deadline = (
             created_at + timedelta(seconds=AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS)
             if created_at is not None
             else None
         )
-        authoritative_entry_fact_sync_pending = bool(
-            not economics_complete
-            and blockers == {"authoritative_entry_fee_evidence_incomplete"}
-            and management_contract.get("protection_evidence_complete") is True
-            and stop_distance > 0
-            and sync_deadline is not None
-            and datetime.now(UTC) <= sync_deadline
-        )
         # A newly-created local position can briefly be visible before the
-        # first OKX takeover refresh persists its prices and management
-        # contract.  Treat that narrow, evidence-free window as pending sync
-        # rather than a hard economics violation; once the grace period ends,
-        # the same row remains an incomplete position and blocks promotion.
-        initial_management_sync_pending = bool(
-            not economics_complete
-            and not management_contract
+        # first OKX takeover refresh persists all execution, fee, and
+        # protection facts.  Treat the whole bounded window as pending sync;
+        # once it expires, the same row remains an incomplete position and
+        # blocks promotion regardless of which sub-fact is missing.
+        has_partial_management_evidence = bool(
+            management_contract
+            and (
+                "kind" in management_contract
+                or "normal_paper_lifecycle" in management_contract
+                or "position_scope" in management_contract
+                or "blockers" in management_contract
+                or "entry_fee_evidence_complete" in management_contract
+                or "protection_evidence_complete" in management_contract
+            )
+        )
+        missing_initial_position_facts = bool(
+            not management_contract
             and quantity > 0
-            and (entry_price <= 0 or current_price <= 0 or notional <= 0)
+            and (entry_price <= 0 or current_price <= 0 or notional <= 0 or stop_distance <= 0)
+        )
+        within_entry_fact_sync_grace = bool(
+            not economics_complete
+            and (has_partial_management_evidence or missing_initial_position_facts)
             and sync_deadline is not None
             and datetime.now(UTC) <= sync_deadline
         )
-        authoritative_entry_fact_sync_pending = (
-            authoritative_entry_fact_sync_pending or initial_management_sync_pending
+        authoritative_entry_fact_sync_pending = within_entry_fact_sync_grace
+        pending_reason = (
+            "initial_position_management_sync"
+            if within_entry_fact_sync_grace and not management_contract
+            else "authoritative_entry_fact_sync_grace"
+            if within_entry_fact_sync_grace
+            else None
         )
         return {
             "id": int(getattr(position, "id", 0) or 0),
@@ -463,9 +469,7 @@ class PositionCapacityReleaseAuditService:
                 authoritative_entry_fact_sync_pending
             ),
             "authoritative_entry_fact_sync_pending_reason": (
-                "initial_position_management_sync"
-                if initial_management_sync_pending
-                else None
+                pending_reason
             ),
             "authoritative_entry_fact_sync_deadline_at": (
                 sync_deadline.isoformat()

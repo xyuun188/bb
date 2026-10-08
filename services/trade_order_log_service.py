@@ -75,7 +75,7 @@ class TradeOrderLogService:
             async with self._session_context_factory() as session:
                 repo = self._trade_repo_factory(session)
                 symbol = self._result_symbol(result, decision)
-                payload = self._okx_execution_fact_payload(result)
+                payload = self._okx_execution_fact_payload(result, decision=decision)
                 order_payload = {
                     "model_name": model_name,
                     "execution_mode": self._execution_mode_provider(model_name),
@@ -196,7 +196,11 @@ class TradeOrderLogService:
             return default
 
     @staticmethod
-    def _okx_execution_fact_payload(result: Any) -> dict[str, Any]:
+    def _okx_execution_fact_payload(
+        result: Any,
+        *,
+        decision: DecisionOutput | None = None,
+    ) -> dict[str, Any]:
         raw = getattr(result, "raw_response", None)
         raw = raw if isinstance(raw, dict) else {}
         info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
@@ -290,6 +294,14 @@ class TradeOrderLogService:
             else None,
             "rows": [dict(info)],
         }
+        verified_spec = TradeOrderLogService._verified_contract_spec(
+            result,
+            decision,
+            inst_id=inst_id,
+            filled_contracts=filled_contracts,
+        )
+        if verified_spec:
+            raw_fact.update(verified_spec)
         protection_submission = raw.get("protection_submission")
         if isinstance(protection_submission, dict) and protection_submission:
             raw_fact["protection_submission"] = dict(protection_submission)
@@ -307,6 +319,47 @@ class TradeOrderLogService:
             "okx_raw_fills": raw_fact,
         }
         return payload
+
+    @staticmethod
+    def _verified_contract_spec(
+        result: Any,
+        decision: DecisionOutput | None,
+        *,
+        inst_id: str,
+        filled_contracts: float,
+    ) -> dict[str, Any]:
+        """Copy only the decision's official spec when fill algebra agrees."""
+
+        if decision is None or not inst_id or filled_contracts <= 0:
+            return {}
+        raw_decision = getattr(decision, "raw_response", None)
+        raw_decision = raw_decision if isinstance(raw_decision, dict) else {}
+        facts = raw_decision.get("pre_order_execution_facts")
+        facts = facts if isinstance(facts, dict) else {}
+        spec = facts.get("contract_spec")
+        spec = spec if isinstance(spec, dict) else {}
+        spec_inst_id = str(spec.get("instId") or facts.get("inst_id") or "").strip().upper()
+        source = str(spec.get("source") or "").strip()
+        if spec_inst_id != str(inst_id).strip().upper() or source != "okx_public_instruments":
+            return {}
+        try:
+            contract_size = float(spec.get("ctVal")) * float(spec.get("ctMult") or 1.0)
+            filled_quantity = float(getattr(result, "quantity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return {}
+        if contract_size <= 0 or filled_quantity <= 0:
+            return {}
+        if abs(filled_contracts * contract_size - filled_quantity) > max(
+            1e-9,
+            abs(filled_quantity) * 1e-7,
+        ):
+            return {}
+        return {
+            "contract_size": contract_size,
+            "contract_size_verified": True,
+            "contract_size_source": "okx_public_instruments",
+            "contract_spec": dict(spec),
+        }
 
     @staticmethod
     def _okx_native_backfill_payload(result: Any, raw: dict[str, Any]) -> dict[str, Any]:

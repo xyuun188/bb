@@ -267,7 +267,11 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/trading.db"
     database_pool_size: int = 16
     database_max_overflow: int = 24
-    database_pool_timeout_seconds: float = 2.0
+    database_pool_timeout_seconds: float = 5.0
+    # Keep a cooperative ceiling below the raw SQLAlchemy pool capacity so
+    # background sync, training, dashboard reads, and market analysis cannot
+    # all consume overflow connections at once.
+    database_session_concurrency: int = 24
 
     # --- Redis ---
     redis_url: str = "redis://localhost:6379/0"

@@ -544,7 +544,7 @@ async def test_paper_training_uses_current_raw_edge_for_leverage_when_net_is_neg
 
 
 @pytest.mark.asyncio
-async def test_paper_training_negative_edge_keeps_risk_sized_observation_not_micro_order() -> None:
+async def test_paper_training_negative_fee_after_return_remains_a_bounded_entry() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade["selection_reason"] = "paper_training_entry"
@@ -574,9 +574,9 @@ async def test_paper_training_negative_edge_keeps_risk_sized_observation_not_mic
         "paper_training_entry_current_cost_observation"
     )
     assert sizing["final_notional_usdt"] > sizing["minimum_order_notional_usdt"]
-    assert sizing["final_notional_usdt"] >= (
-        sizing["size_aware_profitability"]["original_notional_usdt"] * 0.999
-    )
+    assert "normal_paper_expected_net_not_positive_after_size_cost" not in sizing["reason"]
+    assert sizing["paper_profitability_gate_applied"] is False
+    assert sizing["paper_training_current_edge_gate_applied"] is True
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,17 @@ OKX_TEMPORARY_SERVICE_MARKERS = (
     "system error. try again later",
     "max retries exceeded",
 )
+OKX_ENTRY_UNAVAILABLE_CODES = frozenset({"51001", "51155"})
+OKX_ENTRY_UNAVAILABLE_MARKERS = (
+    "can't trade this pair",
+    "cannot trade this pair",
+    "local compliance restrictions",
+    "not currently tradable",
+    "not available for trading",
+    "instrument suspended",
+    "market suspended",
+    "instrument id doesn't exist",
+)
 OKX_BRACKET_ERROR_PATTERN = re.compile(
     r"okx\s+api\s+error\s*\[([^\]]+)\]\s*:\s*(.+)",
     re.IGNORECASE,
@@ -105,6 +116,30 @@ def is_okx_temporary_service_error(value: Any) -> bool:
             or any(item in combined for item in OKX_TEMPORARY_SERVICE_CODES)
         )
     )
+
+
+def is_okx_entry_instrument_unavailable(value: Any) -> bool:
+    """Return whether an entry failure is a durable instrument capability block."""
+
+    code, message = extract_okx_error(value)
+    if isinstance(value, dict):
+        code = (
+            code
+            or str(value.get("error_code") or "").strip()
+            or str(value.get("okx_error_code") or "").strip()
+            or None
+        )
+        message = (
+            message
+            or str(value.get("raw_error") or "").strip()
+            or str(value.get("error") or "").strip()
+            or None
+        )
+    text = _stringify(value).lower()
+    combined = f"{text} {str(message or '').lower()}"
+    if code in OKX_ENTRY_UNAVAILABLE_CODES:
+        return True
+    return any(marker in combined for marker in OKX_ENTRY_UNAVAILABLE_MARKERS)
 
 
 def okx_temporary_service_error_message(value: Any | None = None) -> str:

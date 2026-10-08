@@ -6151,11 +6151,13 @@ async def test_entry_risk_facts_reuses_verified_cached_balance_when_native_refre
         return EmptyBalanceExecutor()
 
     service._get_okx_executor_for_mode = executor_provider
-    service.peek_okx_balance_snapshot_for_mode = lambda *_args, **_kwargs: {
-        "free": 5345.0,
-        "equity": 5345.0,
-        "source": "verified_cache",
+    service._okx_balance_snapshot_cache = {
+        "paper": {
+            "snapshot": {"free": 5345.0, "equity": 5345.0},
+            "fetched_at": datetime.now(UTC),
+        }
     }
+    service._okx_authoritative_sync_status_payload = lambda: {"status": "ok"}
 
     facts = await service.entry_exchange_risk_facts(
         "paper",
@@ -7318,6 +7320,27 @@ def test_market_round_time_budget_has_a_scheduler_ceiling(
     monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 60)
 
     assert service.market_round_time_budget_seconds(market_symbol_count=8) == 120.0
+
+
+def test_sparse_market_shortlist_reserves_two_analysis_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
+    monkeypatch.setattr(trading_service.settings, "decision_interval_seconds", 30)
+
+    per_symbol_budget = (
+        service.market_symbol_minimum_start_budget_seconds()
+        + trading_service.MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS
+    )
+
+    assert service.market_round_time_budget_seconds(market_symbol_count=1) == pytest.approx(
+        min(per_symbol_budget * 2, trading_service.MARKET_ROUND_SCHEDULER_MAX_SECONDS)
+    )
 
 
 def test_market_ai_budget_reason_distinguishes_reserve_deferral_from_timeout(
@@ -12885,8 +12908,8 @@ async def test_pre_order_facts_reuse_recent_balance_after_temporary_okx_error() 
         }
     }
     service._okx_authoritative_sync_status_payload = lambda: {
-        "status": "ok",
-        "fresh_success_available": True,
+        "status": "warning",
+        "fresh_success_available": False,
     }
 
     class TemporaryBalanceExecutor:

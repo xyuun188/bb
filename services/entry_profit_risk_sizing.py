@@ -2062,8 +2062,13 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-        allow_non_positive_return_lcb=non_positive_lcb_observation,
-        allow_non_positive_expected_return=paper_training_entry_mode,
+            # A training entry is a bounded paper observation. It may carry a
+            # negative fee-after-return estimate while its current raw edge is
+            # positive; the settlement is training evidence, never promotion
+            # or live permission. Keep the full independently sized target so
+            # training does not collapse into exchange-minimum probe orders.
+            allow_non_positive_return_lcb=non_positive_lcb_observation,
+            allow_non_positive_expected_return=paper_training_entry_mode,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2281,7 +2286,10 @@ class EntryProfitRiskSizingPolicy:
             reasons.append(f"normal_paper_size_aware_{size_reason}")
         if (
             not isfinite(expected_net)
-            or (expected_net <= 0.0 and not paper_training_entry_mode)
+            or (
+                expected_net <= 0.0
+                and not paper_training_entry_mode
+            )
         ):
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
         if paper_training_entry_mode and not isfinite(expected_net):
@@ -2454,7 +2462,8 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "dynamic_take_profit_fraction": round(dynamic_take_profit, 8),
-            "paper_profitability_gate_applied": True,
+            "paper_profitability_gate_applied": not paper_training_entry_mode,
+            "paper_training_current_edge_gate_applied": paper_training_entry_mode,
             "size_aware_profitability": size_aware_solution,
             "selection_reason": normal_trade.get("selection_reason"),
             "single_trade_risk_fraction_cap": round(single_trade_risk_fraction, 8),

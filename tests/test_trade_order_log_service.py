@@ -313,6 +313,61 @@ async def test_trade_order_log_service_persists_okx_execution_result_facts() -> 
 
 
 @pytest.mark.asyncio
+async def test_trade_order_log_service_persists_verified_decision_contract_spec() -> None:
+    repo = FakeTradeRepo()
+    result = ExecutionResult(
+        order_id="okx-contract-spec-1",
+        exchange_order_id="okx-contract-spec-1",
+        symbol="ACT/USDT",
+        side="buy",
+        order_type="market",
+        quantity=15.8,
+        price=0.0097,
+        status=OrderStatus.FILLED,
+        raw_response={
+            "id": "okx-contract-spec-1",
+            "filled_contracts": 158.0,
+            "average": 0.0097,
+            "info": {
+                "ordId": "okx-contract-spec-1",
+                "instId": "ACT-USDT-SWAP",
+                "state": "filled",
+                "accFillSz": "158",
+                "avgPx": "0.0097",
+                "fee": "-0.007663",
+                "tradeId": "trade-contract-spec-1",
+            },
+        },
+    )
+    decision = _decision()
+    decision.symbol = "ACT/USDT"
+    decision.raw_response = {
+        "pre_order_execution_facts": {
+            "inst_id": "ACT-USDT-SWAP",
+            "contract_spec": {
+                "instId": "ACT-USDT-SWAP",
+                "ctVal": "0.1",
+                "ctMult": "1",
+                "source": "okx_public_instruments",
+            },
+        }
+    }
+    service = TradeOrderLogService(
+        execution_mode_provider=lambda model_name: f"mode:{model_name}",
+        session_context_factory=lambda: FakeSessionContext(object()),
+        trade_repo_factory=lambda _session: repo,
+    )
+
+    await service.log_trade(result, "ensemble_trader", decision, decision_id=18795)
+
+    fact = repo.orders[0]["okx_raw_fills"]
+    assert fact["contract_size"] == pytest.approx(0.1)
+    assert fact["contract_size_verified"] is True
+    assert fact["contract_size_source"] == "okx_public_instruments"
+    assert fact["contract_spec"]["instId"] == "ACT-USDT-SWAP"
+
+
+@pytest.mark.asyncio
 async def test_trade_order_log_service_skips_zero_quantity_tracking_order() -> None:
     repo = FakeTradeRepo()
     result = ExecutionResult(

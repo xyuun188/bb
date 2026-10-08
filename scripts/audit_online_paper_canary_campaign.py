@@ -50,6 +50,7 @@ from services.normal_paper_trade import (
 
 WINDOW_HOURS = {max(int(hours), 1)!r}
 LIMIT = {max(int(limit), 1)!r}
+PAGE_SIZE = 250
 
 
 def obj(value):
@@ -60,21 +61,42 @@ async def run():
     now = datetime.now(UTC)
     window_start = now - timedelta(hours=WINDOW_HOURS)
     async with get_read_session_ctx() as session:
-        result = await session.execute(
-            select(AIDecision)
-            .where(
+        decisions = []
+        last_id = None
+        while True:
+            conditions = [
                 AIDecision.is_paper.is_(True),
                 AIDecision.created_at >= window_start.replace(tzinfo=None),
-                AIDecision.raw_llm_response.is_not(None),
+            ]
+            if last_id is not None:
+                conditions.append(AIDecision.id < last_id)
+            result = await session.execute(
+                select(
+                    AIDecision.id,
+                    AIDecision.created_at,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.raw_llm_response["normal_paper_trade"].label("contract"),
+                    AIDecision.was_executed,
+                    AIDecision.executed_at,
+                    AIDecision.execution_price,
+                    AIDecision.execution_reason,
+                    AIDecision.outcome,
+                    AIDecision.outcome_pnl_pct,
+                )
+                .where(*conditions)
+                .order_by(AIDecision.id.desc())
+                .limit(PAGE_SIZE)
             )
-            .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
-        )
-        decisions = list(result.scalars().all())
+            page = list(result.all())
+            decisions.extend(page)
+            if len(page) < PAGE_SIZE:
+                break
+            last_id = int(page[-1].id)
 
     rows = []
     for decision in decisions:
-        raw = obj(decision.raw_llm_response)
-        contract = obj(raw.get("normal_paper_trade"))
+        contract = obj(decision.contract)
         if not contract:
             continue
         reasons = normal_paper_trade_contract_reasons(contract)

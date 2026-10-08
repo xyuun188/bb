@@ -24,7 +24,10 @@ from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
 from services.normal_paper_trade import attach_normal_paper_order_identity
-from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_error_classifier import (
+    is_okx_entry_instrument_unavailable,
+    is_okx_temporary_service_error,
+)
 from services.production_trade_gate import validate_production_trade_gate
 from services.strategy_arbitration import arbitrate_decision
 from services.trade_execution_contract import (
@@ -381,19 +384,8 @@ class ExecutionService:
         if self.entry_instrument_unavailable_marker is None:
             return
         error_text = safe_error_text(error, limit=220)
-        lowered = error_text.lower()
         error_code = self._exchange_error_code(error)
-        missing_market = any(
-            marker in lowered
-            for marker in (
-                "instrument id doesn't exist",
-                "market is not loaded",
-                "market not loaded",
-                "does not have market symbol",
-                "bad symbol",
-            )
-        )
-        if error_code != "51001" and not missing_market:
+        if not is_okx_entry_instrument_unavailable(error):
             return
         try:
             self.entry_instrument_unavailable_marker(
