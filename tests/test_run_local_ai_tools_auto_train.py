@@ -81,3 +81,12 @@ def test_main_emits_one_structured_result_frame(
     assert json.loads(
         output.removeprefix(runner.LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
     ) == {"trained": False, "reason": "not_due"}
+
+
+@pytest.mark.parametrize("reason", ["resource_memory", "resource_error", "load_samples_error"])
+def test_main_returns_failure_for_all_training_resource_errors(monkeypatch, reason) -> None:
+    async def fake_run_once():
+        return {"trained": False, "reason": reason}
+
+    monkeypatch.setattr(runner, "run_once", fake_run_once)
+    assert runner.main() == 2

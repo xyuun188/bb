@@ -454,8 +454,9 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
-        "paper_training_entry_allows_non_positive_fee_after_return": True,
-        "paper_training_entry_is_paper_only": True,
+        "paper_training_entry_allows_non_positive_fee_after_return": False,
+        "paper_training_entry_is_shadow_only": True,
+        "paper_training_entry_authorizes_normal_entry": False,
         "paper_training_entry_production_permission": False,
         "paper_entry_requires_profit_factor": False,
         "paper_entry_requires_positive_expected_net_return": True,
@@ -1450,9 +1451,15 @@ def validate_normal_paper_entry_contract(
             and filled_order_present is True
         )
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
-        and normal_trade.get("selection_reason") != "paper_training_entry"
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")
+    if (
+        not historical_normal_trade
+        and not confirmed_observation_settlement
+        and not (allow_historical_settlement and executed and filled_order_present is True)
+        and _safe_float(sizing.get("return_lcb_pct"), 0.0) <= 0.0
+    ):
+        reasons.append("normal_paper_size_aware_return_lcb_not_positive")
     if not (
         _provenance_complete(sizing.get("policy_provenance"))
         or (

@@ -62,6 +62,7 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
     training_input_fingerprint,
+    training_result_failed,
     training_timeline,
 )
 from services.profit_supervision import (
@@ -2278,6 +2279,7 @@ def train_from_frame(
     completed_sample_count: int | None = None,
     completed_raw_decision_group_count: int | None = None,
     full_training_probe_at: str | None = None,
+    authoritative_trade_training_probe: dict[str, Any] | None = None,
     training_quality_report: dict[str, Any] | None = None,
     trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
@@ -2561,6 +2563,10 @@ def train_from_frame(
         "training_trade_sample_count": len(trade_samples or []),
         "completed_trade_sample_count": len(trade_samples or []),
         "last_trained_completed_trade_sample_count": len(trade_samples or []),
+        "authoritative_trade_training_cursor": (
+            ml_training_dataset.authoritative_trade_training_cursor(trade_samples or [])
+        ),
+        "authoritative_trade_training_probe": authoritative_trade_training_probe or {},
         "training_window_composition": _training_window_composition(train),
         "training_task_manifest": task_manifest,
         "training_sample_sources": {
@@ -3211,11 +3217,7 @@ class MLSignalService:
         try:
             result = await self._maybe_auto_train_process(force=force)
             result.setdefault("training_input_fingerprint", training_input_fingerprint(result))
-            failed = str(result.get("reason") or "") in {
-                "error",
-                "load_samples_error",
-                "timeout",
-            }
+            failed = training_result_failed(result)
             delay = (
                 AUTO_TRAIN_RETRY_INTERVAL_SECONDS if failed else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
             )
@@ -3252,7 +3254,7 @@ class MLSignalService:
             lease.release()
 
     async def _maybe_auto_train_process(self, *, force: bool = False) -> dict[str, Any]:
-        """Retrain in the background when enough fresh shadow samples exist."""
+        """Retrain on fresh shadow labels or changed authoritative trade outcomes."""
         if self._train_lock.locked():
             return {
                 "trained": False,
@@ -3344,7 +3346,37 @@ class MLSignalService:
                     else None
                 )
                 new_samples = max(completed_count - last_completed_count, 0)
+                # Probe narrow settlement facts first; rebuild clean outcome
+                # samples only when the probe or the periodic full check is due.
                 checkpoint = self._full_training_probe_checkpoint(cursor_metadata)
+                trade_cursor: dict[str, Any] = {}
+                trade_cursor_probe: dict[str, Any] = {}
+                trade_inputs_changed = False
+                trade_cursor_probe_changed = False
+                trade_training_due = False
+                cooldown_elapsed = bool(
+                    seconds_since_training is None
+                    or seconds_since_training
+                    >= _LOCAL_ML_PARAMS.minimum_retraining_interval_seconds
+                )
+                try:
+                    trade_cursor_probe = (
+                        await ml_training_dataset.probe_authoritative_trade_training_cursor()
+                    )
+                    previous_trade_probe = _safe_dict(
+                        checkpoint.get("authoritative_trade_training_probe")
+                    )
+                    trade_cursor_probe_changed = bool(
+                        trade_cursor_probe.get("available")
+                        and trade_cursor_probe.get("fingerprint")
+                        != previous_trade_probe.get("fingerprint")
+                        and (
+                            previous_trade_probe
+                            or int(trade_cursor_probe.get("history_row_count") or 0) > 0
+                        )
+                    )
+                except Exception as exc:
+                    trade_cursor_probe["error"] = safe_error_text(exc, limit=180)
                 checkpoint_at = self._parse_datetime(checkpoint.get("at"))
                 seconds_since_probe = (
                     max((now - checkpoint_at).total_seconds(), 0.0)
@@ -3388,6 +3420,9 @@ class MLSignalService:
                     or raw_cadence["sample_interval_due"]
                     or raw_cursor_missing
                     or raw_cursor_probe_error is not None
+                    or (trade_cursor_probe_changed and cooldown_elapsed)
+                    or seconds_since_probe is None
+                    or seconds_since_probe >= FULL_TRAINING_PROBE_INTERVAL_SECONDS
                     or (
                         new_raw_group_count
                         >= _LOCAL_ML_PARAMS.drift_minimum_decision_group_increment
@@ -3425,6 +3460,10 @@ class MLSignalService:
                             "seconds_since_full_training_probe": seconds_since_probe,
                             "raw_cursor_missing": raw_cursor_missing,
                             "raw_cursor_probe_error": raw_cursor_probe_error,
+                            "authoritative_trade_training_probe": (
+                                checkpoint.get("authoritative_trade_training_probe") or {}
+                            ),
+                            "authoritative_trade_probe_error": trade_cursor_probe.get("error"),
                             "distribution_drift": {"detected": False, "probe": "deferred"},
                         },
                         "message": "Lightweight training cursor is not due; full feature loading and drift probing are deferred.",
@@ -3433,6 +3472,21 @@ class MLSignalService:
                     return result
 
                 trigger_rows = await ml_training_dataset.load_shadow_training_rows()
+                trade_samples = (
+                    await ml_training_dataset.load_authoritative_trade_training_samples()
+                )
+                trade_cursor = ml_training_dataset.authoritative_trade_training_cursor(
+                    trade_samples
+                )
+                previous_trade_cursor = _safe_dict(
+                    cursor_metadata.get("authoritative_trade_training_cursor")
+                )
+                trade_inputs_changed = bool(
+                    trade_samples
+                    and trade_cursor.get("fingerprint")
+                    != previous_trade_cursor.get("fingerprint")
+                )
+                trade_training_due = bool(trade_inputs_changed and cooldown_elapsed)
                 trigger_frame = build_training_frame(trigger_rows)
                 completed_decision_group_count = (
                     int(trigger_frame["decision_group"].nunique()) if not trigger_frame.empty else 0
@@ -3453,8 +3507,10 @@ class MLSignalService:
                     current_distribution_profile,
                     _safe_dict(cursor_metadata.get("training_distribution_profile")),
                 )
-                completed_trade_count = last_completed_trade_count
-                new_trade_samples = 0
+                completed_trade_count = len(trade_samples)
+                new_trade_samples = max(
+                    completed_trade_count - last_completed_trade_count, 0
+                )
                 cadence = _local_ml_training_cadence(
                     previous_decision_group_count=previous_group_count,
                     new_decision_group_count=new_decision_group_count,
@@ -3475,6 +3531,8 @@ class MLSignalService:
                     if training_data_contract_stale
                     else "training_evaluation_contract_changed"
                     if training_evaluation_contract_stale
+                    else "authoritative_trade_outcomes_changed"
+                    if trade_training_due
                     else "mature_decision_group_batch"
                     if batch_due
                     else "clean_sample_batch"
@@ -3521,12 +3579,17 @@ class MLSignalService:
                     "full_training_probe_performed": True,
                     "full_training_probe_interval_seconds": FULL_TRAINING_PROBE_INTERVAL_SECONDS,
                     "raw_cursor_probe_error": raw_cursor_probe_error,
+                    "authoritative_trade_training_cursor": trade_cursor,
+                    "authoritative_trade_training_probe": trade_cursor_probe,
+                    "authoritative_trade_inputs_changed": trade_inputs_changed,
+                    "authoritative_trade_training_due": trade_training_due,
                 }
                 should_train = (
                     force
                     or not metadata
                     or training_data_contract_stale
                     or training_evaluation_contract_stale
+                    or trade_training_due
                     or batch_due
                     or cadence["sample_batch_due"]
                     or interval_due
@@ -3559,14 +3622,6 @@ class MLSignalService:
                     self._last_train_result = result
                     return result
 
-                trade_samples = (
-                    await ml_training_dataset.load_authoritative_trade_training_samples()
-                )
-                completed_trade_count = len(trade_samples)
-                new_trade_samples = max(
-                    completed_trade_count - last_completed_trade_count,
-                    0,
-                )
                 self._training = True
                 self._last_train_started_at = datetime.now(UTC).isoformat()
                 if self._active_training_run_id:
@@ -3600,6 +3655,8 @@ class MLSignalService:
                         "full_training_probe_at": now.isoformat(),
                         "full_training_probe_performed": True,
                         "cost_complete_sample_count": int(len(frame)),
+                        "completed_decision_group_count": completed_decision_group_count,
+                        "new_decision_group_count": new_decision_group_count,
                         "decision_group_count": partition_report["decision_group_count"],
                         "train_sample_count": partition_report["train_sample_count"],
                         "train_decision_group_count": partition_report[
@@ -3642,6 +3699,7 @@ class MLSignalService:
                     completed_sample_count=completed_count,
                     completed_raw_decision_group_count=completed_raw_group_count,
                     full_training_probe_at=now.isoformat(),
+                    authoritative_trade_training_probe=trade_cursor_probe,
                     training_quality_report=quality_state["quality_report"],
                     trade_samples=trade_samples,
                     persist_artifact=False,
@@ -3676,6 +3734,7 @@ class MLSignalService:
                         completed_sample_count=completed_count,
                         completed_raw_decision_group_count=completed_raw_group_count,
                         full_training_probe_at=now.isoformat(),
+                        authoritative_trade_training_probe=trade_cursor_probe,
                         training_quality_report=quality_state["quality_report"],
                         trade_samples=trade_samples,
                         persist_artifact=True,
@@ -4928,6 +4987,9 @@ class MLSignalService:
         checkpoint = {
             "at": metadata.get("full_training_probe_at"),
             "raw_decision_group_count": metadata.get("completed_shadow_raw_decision_group_count"),
+            "authoritative_trade_training_probe": _safe_dict(
+                metadata.get("authoritative_trade_training_probe")
+            ),
         }
         try:
             payload = self.training_state_store.read()
@@ -4944,6 +5006,11 @@ class MLSignalService:
                 checkpoint["at"] = candidate_at
                 checkpoint["raw_decision_group_count"] = last_result.get(
                     "completed_shadow_raw_decision_group_count"
+                )
+                checkpoint["authoritative_trade_training_probe"] = _safe_dict(
+                    _safe_dict(last_result.get("training_policy")).get(
+                        "authoritative_trade_training_probe"
+                    )
                 )
         return checkpoint
 

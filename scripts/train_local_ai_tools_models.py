@@ -51,8 +51,8 @@ from scripts.run_phase3_paper_resume_observation import (
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.execution_cost_model import round_trip_fee_pct  # noqa: E402
 from services.local_ai_training_contract import (  # noqa: E402
-    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
     LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
+    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
 )
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
@@ -799,6 +799,40 @@ def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_training_shadow_sample(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project one shadow row through the canonical training transport."""
+
+    features = _snapshot(row.get("features"))
+    if not features:
+        return None
+    features.setdefault("symbol", row.get("symbol"))
+    features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
+    features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
+    fee_pct, _fee_source = round_trip_fee_pct(features)
+    if fee_pct > 0:
+        features["round_trip_fee_pct"] = fee_pct
+    compact_features = _compact_local_ai_tools_features(features)
+    if not compact_features:
+        return None
+    return {
+        "id": int(row.get("id") or 0),
+        "decision_id": int(row.get("decision_id") or 0) or None,
+        "label_version": str(row.get("label_version") or ""),
+        "symbol": row.get("symbol"),
+        "analysis_type": row.get("analysis_type"),
+        "decision_action": row.get("decision_action"),
+        "decision_confidence": _as_float(row.get("decision_confidence")),
+        "horizon_minutes": int(row.get("horizon_minutes") or 10),
+        "features": compact_features,
+        "model_shadow_action": str(features.get("model_shadow_action") or "").lower(),
+        "long_return_pct": _as_float(row.get("long_return_pct")),
+        "short_return_pct": _as_float(row.get("short_return_pct")),
+        "label_timestamp": row.get("label_timestamp"),
+        "best_action": row.get("best_action"),
+        "missed_opportunity": bool(row.get("missed_opportunity")),
+    }
+
+
 async def _load_shadow_samples(
     *,
     sample_budget: int | None = None,
@@ -808,42 +842,9 @@ async def _load_shadow_samples(
     epoch_start = load_training_data_start()
 
     def append_sample(row: Mapping[str, Any]) -> None:
-        features = _snapshot(row.get("features"))
-        if not features:
-            return
-        features.setdefault("symbol", row.get("symbol"))
-        features.setdefault(
-            "decision_confidence",
-            _as_float(row.get("decision_confidence")),
-        )
-        features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
-        fee_pct, _fee_source = round_trip_fee_pct(features)
-        if fee_pct > 0:
-            features["round_trip_fee_pct"] = fee_pct
-        compact_features = _compact_local_ai_tools_features(features)
-        if not compact_features:
-            return
-        samples.append(
-            {
-                "id": int(row.get("id") or 0),
-                "decision_id": int(row.get("decision_id") or 0) or None,
-                "label_version": str(row.get("label_version") or ""),
-                "symbol": row.get("symbol"),
-                "analysis_type": row.get("analysis_type"),
-                "decision_action": row.get("decision_action"),
-                "decision_confidence": _as_float(row.get("decision_confidence")),
-                "horizon_minutes": int(row.get("horizon_minutes") or 10),
-                "features": compact_features,
-                "model_shadow_action": str(
-                    features.get("model_shadow_action") or ""
-                ).lower(),
-                "long_return_pct": _as_float(row.get("long_return_pct")),
-                "short_return_pct": _as_float(row.get("short_return_pct")),
-                "label_timestamp": row.get("label_timestamp"),
-                "best_action": row.get("best_action"),
-                "missed_opportunity": bool(row.get("missed_opportunity")),
-            }
-        )
+        sample = _compact_training_shadow_sample(row)
+        if sample is not None:
+            samples.append(sample)
 
     filters = (
         ShadowBacktest.status == "completed",
@@ -1338,7 +1339,7 @@ async def _run_cli() -> None:
             + json.dumps(
                 {
                     "trained": False,
-                    "reason": "resource_error",
+                    "reason": "resource_memory",
                     "error": "MemoryError",
                     "training_process_isolated": True,
                 },

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,7 @@ from sqlalchemy import and_, func, or_, select
 
 from db.session import get_read_session_ctx
 from models.learning import ShadowBacktest
+from models.trade import OkxPositionHistory
 from services.ml_training_contract import MIN_TRAINING_DECISION_GROUP_COUNT
 from services.training_data_quality import annotate_samples, assess_shadow_sample
 from services.training_epoch import load_training_data_start
@@ -256,3 +258,100 @@ async def load_authoritative_trade_training_samples() -> list[dict[str, Any]]:
 
     annotated = annotate_samples(await _load_trade_samples(compact=True), "trade")
     return [sample for sample in annotated if not sample.get("exclude_from_training")]
+
+
+async def probe_authoritative_trade_training_cursor() -> dict[str, Any]:
+    """Detect settlement/link repairs without loading decision or raw payloads."""
+
+    epoch_start = load_training_data_start()
+    filters = (
+        or_(
+            OkxPositionHistory.updated_at_okx >= epoch_start,
+            and_(
+                OkxPositionHistory.updated_at_okx.is_(None),
+                OkxPositionHistory.opened_at >= epoch_start,
+            ),
+        ),
+    )
+    columns = (
+        OkxPositionHistory.id,
+        OkxPositionHistory.row_identity,
+        OkxPositionHistory.mode,
+        OkxPositionHistory.opened_at,
+        OkxPositionHistory.updated_at_okx,
+        OkxPositionHistory.close_status,
+        OkxPositionHistory.realized_pnl,
+        OkxPositionHistory.pnl,
+        OkxPositionHistory.pnl_ratio,
+        OkxPositionHistory.fee,
+        OkxPositionHistory.funding_fee,
+        OkxPositionHistory.open_avg_px,
+        OkxPositionHistory.close_avg_px,
+        OkxPositionHistory.open_max_pos,
+        OkxPositionHistory.close_total_pos,
+        OkxPositionHistory.entry_order_ids,
+        OkxPositionHistory.close_order_ids,
+        OkxPositionHistory.linked_order_ids,
+        OkxPositionHistory.position_ids,
+        OkxPositionHistory.match_status,
+        OkxPositionHistory.evidence_gaps,
+    )
+    digest = hashlib.sha256(epoch_start.isoformat().encode("utf-8"))
+    count = 0
+    async with get_read_session_ctx() as session:
+        # Match the bounded lifecycle window used by the compact outcome loader.
+        result = await session.stream(
+            select(*columns)
+            .where(*filters)
+            .order_by(
+                OkxPositionHistory.updated_at_okx.desc().nullslast(),
+                OkxPositionHistory.opened_at.desc().nullslast(),
+                OkxPositionHistory.id.desc(),
+            )
+            .limit(2000)
+        )
+        async for mapping in result.mappings():
+            digest.update(
+                json.dumps(
+                    dict(mapping), sort_keys=True, default=str, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            count += 1
+    return {
+        "history_row_count": count,
+        "available": True,
+        "source": "bounded_okx_settlement_fact_projection",
+        "fingerprint": digest.hexdigest(),
+    }
+
+
+def authoritative_trade_training_cursor(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fingerprint the canonical clean outcomes, including repaired and losing facts."""
+
+    identities = sorted(
+        (
+            str(sample.get("lifecycle_key") or sample.get("id") or ""),
+            str(sample.get("closed_at") or sample.get("label_timestamp") or ""),
+            json.dumps(
+                {
+                    "labels": sample.get("labels"),
+                    "target": sample.get("profit_training_contract"),
+                    "outcome_fingerprint": sample.get("outcome_fingerprint"),
+                    "profit_supervision": sample.get("profit_supervision"),
+                    "realized_pnl": sample.get("realized_pnl"),
+                    "net_return": sample.get("net_return_after_all_cost_pct"),
+                    "quality": sample.get("data_quality_status"),
+                },
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ),
+        )
+        for sample in samples
+    )
+    return {
+        "sample_count": len(samples),
+        "fingerprint": hashlib.sha256(
+            json.dumps(identities, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }

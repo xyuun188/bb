@@ -10,8 +10,6 @@ import textwrap
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from scripts.phase3_quant_api_source import SERVICE_CODE
-
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -19,6 +17,7 @@ if str(ROOT) not in sys.path:
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from scripts.phase3_quant_api_source import SERVICE_CODE  # noqa: E402
 
 PHASE3_ROOT = "/data/BB"
 PHASE3_API_PORT = 8101
@@ -69,6 +68,10 @@ def render_phase3_quant_api_service() -> str:
             Environment=LOCAL_AI_TOOLS_CORS_ORIGINS=http://127.0.0.1:8002,http://localhost:8002,http://127.0.0.1:18001
             EnvironmentFile=-{PHASE3_ENV_FILE}
             LimitNOFILE=65535
+            MemoryAccounting=true
+            MemoryHigh=4G
+            MemoryMax=6G
+            OOMPolicy=continue
             ExecStart={PHASE3_PYTHON_BIN} -m uvicorn local_ai_tools_api:app --host 127.0.0.1 --port {PHASE3_API_PORT} --timeout-keep-alive 30
             # Training uses isolated multiprocessing workers.  Reap the whole
             # service cgroup on restart so stale workers cannot keep the API
@@ -293,7 +296,10 @@ def _remote_smoke_command() -> str:
         "assert timeseries.get('live_ml_ready') is live, timeseries\n"
         "if has_artifact:\n"
         "    assert timeseries.get('horizon_minutes') in timeseries.get('available_horizon_minutes', []), timeseries\n"
-        "    assert timeseries.get('horizon_selection_policy') == 'best_governed_lower_quantile_native_horizon', timeseries\n"
+        "    policy = timeseries.get('horizon_selection_policy')\n"
+        "    assert policy in {'runtime_primary_horizon_5m_when_available', 'best_governed_lower_quantile_native_horizon'}, timeseries\n"
+        "    if policy == 'runtime_primary_horizon_5m_when_available' and 5 in timeseries.get('available_horizon_minutes', []):\n"
+        "        assert timeseries.get('horizon_minutes') == 5, timeseries\n"
         "else:\n"
         "    assert timeseries.get('horizon_minutes') == 5, timeseries\n"
         "assert timeseries.get('prediction_quality', {}).get('production_eligible') is live, timeseries\n"

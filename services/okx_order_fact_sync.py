@@ -471,6 +471,7 @@ class OkxOrderFactSyncService:
         account_fills_complete = False
         account_orders_complete = False
         target_fill_order_ids: set[str] = set()
+        discovered_local_orders: list[Order] = []
 
         async def run_stage(
             stage: str,
@@ -715,7 +716,6 @@ class OkxOrderFactSyncService:
             account_wide_fills, account_fills_complete = await run_stage(
                 "fills_history_account",
                 lambda: native_facts.fetch_fill_groups(
-                    inst_ids=order_target_inst_ids,
                     since=account_since,
                     limit=100,
                     max_pages=ACCOUNT_HISTORY_MAX_PAGES,
@@ -808,25 +808,30 @@ class OkxOrderFactSyncService:
                 else fill
                 for fill in fills
             ]
-            incomplete_fill_order_ids = _fills_underreport_order_history(
+            discovered_local_orders = await self._load_discovered_orders(
+                set(order_rows_by_id) | {fill.order_id for fill in fills}
+            )
+            account_recovery_order_ids = _account_order_fill_recovery_ids(
                 fills,
                 order_rows_by_id,
+                discovered_local_orders,
             )
-            if incomplete_fill_order_ids:
+            if account_recovery_order_ids:
+                recovery_batch = account_recovery_order_ids[
+                    :DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC
+                ]
                 incomplete_include_historical = _target_fill_query_requires_historical(
-                    incomplete_fill_order_ids,
-                    orders=[*local_orders, *submit_recovery_orders],
+                    recovery_batch,
+                    orders=[*local_orders, *discovered_local_orders, *submit_recovery_orders],
                     now=datetime.now(UTC),
                 )
                 incomplete_include_historical = bool(
-                    set(incomplete_fill_order_ids) & set(self.recovery_order_ids)
+                    set(recovery_batch) & set(self.recovery_order_ids)
                 ) or incomplete_include_historical
                 incomplete_target_fills, incomplete_target_complete = await run_stage(
                     "fills_history_targeted_incomplete",
                     lambda: native_facts.fetch_fill_groups(
-                        order_ids=sorted(incomplete_fill_order_ids)[
-                            :DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC
-                        ],
+                        order_ids=recovery_batch,
                         since=since,
                         limit=100,
                         max_pages=TARGET_ORDER_FILL_MAX_PAGES,
@@ -840,7 +845,14 @@ class OkxOrderFactSyncService:
                 )
                 fills = _dedupe_fills_by_order_id([*fills, *(incomplete_target_fills or [])])
                 if incomplete_target_complete:
-                    target_fill_order_ids.update(incomplete_fill_order_ids)
+                    target_fill_order_ids.update(recovery_batch)
+                remaining_recovery_ids = _account_order_fill_recovery_ids(
+                    fills,
+                    order_rows_by_id,
+                    discovered_local_orders,
+                )
+                if remaining_recovery_ids:
+                    deferred_stages.append("account_order_fill_recovery_pending")
             protection_algo_rows, protection_complete = await run_stage(
                 "protection_algo_history",
                 lambda: native_facts.fetch_protection_algo_history_rows(
@@ -899,10 +911,24 @@ class OkxOrderFactSyncService:
         order_rows_by_id = _order_rows_by_id(order_rows)
         incomplete_fill_ids = _fills_underreport_order_history(fills, order_rows_by_id)
         incomplete_fill_ids.update(fill.order_id for fill in fills if not fill.pagination_complete)
-        if incomplete_fill_ids:
+        stored_orders_by_id = authoritative_orders_by_exchange_id(discovered_local_orders)
+        observed_fills_by_id = {fill.order_id: fill for fill in fills}
+        preserved_fill_ids = {
+            order_id
+            for order_id in incomplete_fill_ids
+            if _stored_fill_matches_order_history(
+                stored_orders_by_id.get(order_id),
+                order_rows_by_id.get(order_id),
+                observed_fills_by_id.get(order_id),
+            )
+        }
+        if preserved_fill_ids:
+            completed_stages.append("stored_complete_order_facts_preserved")
+        unresolved_fill_ids = incomplete_fill_ids - preserved_fill_ids
+        if unresolved_fill_ids:
             deferred_stages.append("order_fill_pagination_incomplete")
             stage_errors.append(
-                "order_fill_pagination_incomplete: " + ",".join(sorted(incomplete_fill_ids)[:8])
+                "order_fill_pagination_incomplete: " + ",".join(sorted(unresolved_fill_ids)[:8])
             )
         target_fill_order_ids.difference_update(incomplete_fill_ids)
         fills = [fill for fill in fills if fill.order_id not in incomplete_fill_ids]
@@ -1465,6 +1491,18 @@ class OkxOrderFactSyncService:
                 )
                 for row in rows.all()
             }
+
+    async def _load_discovered_orders(self, exchange_order_ids: set[str]) -> list[Order]:
+        if not exchange_order_ids:
+            return []
+        async with get_session_ctx() as session:
+            rows = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == self.mode,
+                    Order.exchange_order_id.in_(sorted(exchange_order_ids)),
+                )
+            )
+            return list(rows.scalars().all())
 
     async def _load_stored_slippage_refresh_orders(
         self,
@@ -2262,6 +2300,7 @@ class OkxOrderFactSyncService:
     ) -> None:
         if not _fill_can_replace_order_fact(order, fill, order_row):
             raise ValueError("Incomplete OKX cumulative fills cannot replace an order fact")
+        stored_protection = confirmed_protection_lifecycle(order)
         contract_size_source = str(contract_size_source or "").strip()
         if not _is_verified_public_contract_size(contract_size, contract_size_source):
             raise ValueError("OKX fill facts require a positive public-instruments contract size")
@@ -2312,6 +2351,18 @@ class OkxOrderFactSyncService:
             raw_fact["protection_submission"] = dict(protection_submission)
         if isinstance(protection_execution, dict) and protection_execution:
             raw_fact["protection_execution"] = dict(protection_execution)
+        elif (
+            stored_protection is not None
+            and str(stored_protection.get("generated_order_id") or "") == fill.order_id
+            and str(stored_protection.get("inst_id") or "").upper() == fill.inst_id.upper()
+            and str(stored_protection.get("close_side") or "").lower() == fill.side.lower()
+            and _relative_close_enough(
+                _safe_float(stored_protection.get("contracts"), 0.0),
+                fill.contracts,
+                0.000001,
+            )
+        ):
+            raw_fact["protection_execution"] = stored_protection
         order.okx_raw_fills = raw_fact
 
     @staticmethod
@@ -3746,6 +3797,116 @@ def _fills_underreport_order_history(
         ):
             incomplete.add(order_id)
     return incomplete
+
+
+def _account_order_fill_recovery_ids(
+    fills: Iterable[OkxNativeFillGroup],
+    order_rows_by_id: dict[str, dict[str, Any]],
+    local_orders: Iterable[Order],
+) -> list[str]:
+    fills = list(fills)
+    recovery_ids = _fills_underreport_order_history(fills, order_rows_by_id)
+    fill_ids = {fill.order_id for fill in fills}
+    fills_by_id = {fill.order_id: fill for fill in fills}
+    local_by_id = authoritative_orders_by_exchange_id(local_orders)
+    for order_id, row in order_rows_by_id.items():
+        if (
+            order_id in fill_ids
+            or _order_row_contracts(row) <= 0
+            or (
+                _order_row_state(row) not in {"filled", "partially_filled"}
+                and _safe_float(row.get("accFillSz") or row.get("fillSz"), 0.0) <= 0
+            )
+        ):
+            continue
+        recovery_ids.add(order_id)
+    recovery_ids = {
+        order_id
+        for order_id in recovery_ids
+        if not _stored_fill_matches_order_history(
+            local_by_id.get(order_id), order_rows_by_id.get(order_id), fills_by_id.get(order_id)
+        )
+    }
+    # Missing facts take precedence over refreshing bounded pages of known executions.
+    return sorted(
+        recovery_ids,
+        key=lambda order_id: (
+            bool(
+                (local := local_by_id.get(order_id)) is not None
+                and _order_has_authoritative_stored_okx_fill_fact(local)
+            ),
+            _order_row_time(order_rows_by_id.get(order_id)) or datetime.max.replace(tzinfo=UTC),
+            order_id,
+        ),
+    )
+
+
+def _stored_fill_matches_order_history(
+    order: Order | None, row: dict[str, Any] | None,
+    observed: OkxNativeFillGroup | None = None,
+) -> bool:
+    if (
+        order is None
+        or not _order_has_authoritative_stored_okx_fill_fact(order)
+        or not _order_has_verified_public_contract_size(order)
+    ):
+        return False
+    raw = order.okx_raw_fills
+    if not isinstance(row, dict):
+        if observed is None or str(order.status or "").lower() != "filled":
+            return False
+        # Account fills and order history have independent page caps. A
+        # terminal complete fact may cover a page only through exact trade rows.
+        stored_rows = {
+            str(value.get("tradeId") or ""): _authoritative_fill_row(value)
+            for value in raw.get("rows") or []
+            if isinstance(value, dict) and value.get("tradeId")
+        }
+        if not observed.rows or not all(
+            stored_rows.get(str(value.get("tradeId") or ""))
+            == _authoritative_fill_row(value)
+            for value in observed.rows
+        ):
+            return False
+        row = {
+            "ordId": raw.get("order_id"),
+            "instId": raw.get("inst_id"),
+            "side": order.side,
+            "accFillSz": raw.get("contracts"),
+            "avgPx": raw.get("avg_price"),
+        }
+    expected = _safe_float(row.get("accFillSz"), 0.0)
+    if expected <= 0 and _order_row_state(row) == "filled":
+        expected = _order_row_contracts(row)
+    if observed is not None and (
+        observed.order_id != str(raw.get("order_id") or "").strip()
+        or observed.inst_id.upper() != str(raw.get("inst_id") or "").strip().upper()
+        or observed.side.lower() != str(order.side or "").strip().lower()
+        or observed.contracts > expected
+        and not _relative_close_enough(observed.contracts, expected, 0.000001)
+        or not set(observed.trade_ids).issubset(_trade_id_set(raw.get("trade_ids")))
+    ):
+        return False
+    average_price = _safe_float(row.get("avgPx"), 0.0)
+    return bool(
+        expected > 0
+        and _order_row_id(row) == str(raw.get("order_id") or "").strip()
+        and str(row.get("instId") or "").strip().upper()
+        == str(raw.get("inst_id") or "").strip().upper()
+        and str(row.get("side") or "").strip().lower()
+        == str(order.side or "").strip().lower()
+        and _relative_close_enough(_safe_float(raw.get("contracts"), 0.0), expected, 0.000001)
+        and _relative_close_enough(
+            _safe_float(order.okx_fill_contracts, 0.0), expected, 0.000001,
+        )
+        and (
+            average_price <= 0
+            or _relative_close_enough(
+                _safe_float(raw.get("avg_price"), 0.0), average_price, 0.000001,
+            )
+        )
+        and _order_fill_fact_matches_local(order, raw)
+    )
 
 
 def _fill_matches_order_total(

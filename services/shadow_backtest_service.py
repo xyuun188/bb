@@ -1095,9 +1095,10 @@ class ShadowBacktestService:
                         price_path,
                     )
                 feature_snapshot["market_fact_contract"] = market_contract
-                feature_snapshot["training_market_fact_contract"] = (
-                    compact_market_fact_contract(market_contract)
-                )
+                if not historical_outcome:
+                    feature_snapshot["training_market_fact_contract"] = (
+                        compact_market_fact_contract(market_contract)
+                    )
                 current_cost_facts = execution_cost_facts.get(execution_mode, {})
                 if _safe_shadow_number(current_cost_facts.get("taker_fee_rate")):
                     feature_snapshot.update(current_cost_facts)

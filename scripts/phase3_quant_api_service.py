@@ -21,6 +21,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
 )
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -152,7 +153,7 @@ TRAINING_SENTIMENT_TREE_COUNT = min(
 )
 ISOLATE_TRAINING_PROCESS = os.environ.get(
     "LOCAL_AI_TOOLS_ISOLATE_TRAINING_PROCESS",
-    "false",
+    "true",
 ).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_AI_TOOLS_API_KEY = os.environ.get("LOCAL_AI_TOOLS_API_KEY", "").strip()
 ERROR_TEXT_LIMIT = 180
@@ -6082,33 +6083,38 @@ def _invalidate_parent_bundle_cache() -> None:
     _STATUS_ARTIFACT_CACHE.clear()
 
 
+def _discard_training_executor(executor: ProcessPoolExecutor, request_id: str) -> None:
+    global _TRAIN_EXECUTOR
+
+    _terminate_training_executor(executor)
+    _clear_training_runtime_state(request_id)
+    with _TRAIN_EXECUTOR_LOCK:
+        if _TRAIN_EXECUTOR is executor:
+            _TRAIN_EXECUTOR = None
+
+
 def _run_training_request(req: TrainRequest) -> dict[str, Any]:
     global _TRAIN_EXECUTOR
 
-    if (
-        not ISOLATE_TRAINING_PROCESS
-        or os.environ.get("LOCAL_AI_TOOLS_TRAINING_CHILD") == "1"
-    ):
+    if not ISOLATE_TRAINING_PROCESS or os.environ.get(
+        "LOCAL_AI_TOOLS_TRAINING_CHILD"
+    ) == "1":
         return _train_impl(req)
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     executor = _training_executor()
     request_id = uuid.uuid4().hex
     started_at = datetime.now(timezone.utc).isoformat()
-    future = executor.submit(_isolated_training_worker, payload)
-    _write_training_runtime_state(
-        request_id=request_id,
-        started_at=started_at,
-        executor=executor,
-        phase="running",
-    )
     try:
+        future = executor.submit(_isolated_training_worker, payload)
+        _write_training_runtime_state(
+            request_id=request_id,
+            started_at=started_at,
+            executor=executor,
+            phase="running",
+        )
         result = future.result(timeout=TRAIN_REQUEST_TIMEOUT_SECONDS)
     except FutureTimeoutError:
-        _terminate_training_executor(executor)
-        _clear_training_runtime_state(request_id)
-        with _TRAIN_EXECUTOR_LOCK:
-            if _TRAIN_EXECUTOR is executor:
-                _TRAIN_EXECUTOR = None
+        _discard_training_executor(executor, request_id)
         return {
             "trained": False,
             "reason": "timeout",
@@ -6121,18 +6127,15 @@ def _run_training_request(req: TrainRequest) -> dict[str, Any]:
             "training_timeout_seconds": TRAIN_REQUEST_TIMEOUT_SECONDS,
             "training_worker_terminated": True,
         }
-    except MemoryError:
-        _terminate_training_executor(executor)
-        _clear_training_runtime_state(request_id)
-        with _TRAIN_EXECUTOR_LOCK:
-            if _TRAIN_EXECUTOR is executor:
-                _TRAIN_EXECUTOR = None
+    except (MemoryError, BrokenProcessPool, OSError) as exc:
+        _discard_training_executor(executor, request_id)
+        error_text = safe_error(exc) or type(exc).__name__
         return {
             "trained": False,
-            "reason": "resource_memory",
-            "error": "MemoryError",
+            "reason": "resource_memory" if isinstance(exc, MemoryError) else "resource_error",
+            "error": f"{type(exc).__name__}: {error_text}",
             "message": (
-                "训练刷新因内存不足停止；现有模型产物保持不变，已进入资源退避。"
+                "训练工作进程失败；现有模型产物保持不变，已进入资源退避。"
             ),
             "resource_failure": True,
             "resource_failure_policy": "preserve_current_artifact_and_backoff",
@@ -6142,11 +6145,7 @@ def _run_training_request(req: TrainRequest) -> dict[str, Any]:
             "training_worker_terminated": True,
         }
     except BaseException:
-        _terminate_training_executor(executor)
-        _clear_training_runtime_state(request_id)
-        with _TRAIN_EXECUTOR_LOCK:
-            if _TRAIN_EXECUTOR is executor:
-                _TRAIN_EXECUTOR = None
+        _discard_training_executor(executor, request_id)
         raise
     else:
         _clear_training_runtime_state(request_id)

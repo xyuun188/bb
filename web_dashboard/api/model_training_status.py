@@ -19,7 +19,10 @@ from core.trading_mode import mode_manager
 from services.cloud_reviewer_verification import load_cloud_reviewer_verification
 from services.entry_high_risk_review import validate_cloud_reviewer_route
 from services.model_contribution_performance import ModelContributionPerformanceService
-from services.model_training_registry import build_model_training_registry
+from services.model_training_registry import (
+    attach_scheduler_timestamps,
+    build_model_training_registry,
+)
 from services.model_training_state import ModelTrainingStateStore
 from web_dashboard.api.text_sanitize import sanitize_payload
 
@@ -154,6 +157,14 @@ def _cached_registry(*, include_stale: bool = False) -> dict[str, Any] | None:
     if stale and not include_stale:
         return None
     result = dict(payload)
+    from web_dashboard.api.dashboard import _compact_training_scheduler_state
+
+    scheduler_state = _compact_training_scheduler_state(MODEL_TRAINING_STATE_STORE.read())
+    result["scheduler_state"] = scheduler_state
+    result["models"] = [
+        dict(row) for row in payload.get("models") or [] if isinstance(row, dict)
+    ]
+    attach_scheduler_timestamps(result["models"], scheduler_state)
     result["cache"] = {
         "hit": True,
         "stale": stale,

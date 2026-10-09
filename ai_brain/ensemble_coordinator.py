@@ -34,7 +34,6 @@ from services.dynamic_exit_policy import assess_dynamic_exit
 from services.entry_direction_support import (
     assess_directional_entry_support,
     assess_paper_model_trade_support,
-    assess_paper_training_entry_support,
 )
 from services.entry_signal_extraction import (
     enrich_signal_payload,
@@ -954,29 +953,6 @@ class EnsembleCoordinator:
                     execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
                 )
             paper_selection = select_normal_paper_trade_side(support_by_side)
-            # A failed historical quality gate must not deadlock paper
-            # training. Re-evaluate the same current evidence under the
-            # explicit training-entry scope; this never grants live or
-            # production permission and still requires current cost/risk data.
-            if paper_selection.get("selected") is not True:
-                training_support_by_side: dict[str, dict[str, Any]] = {}
-                for side in ("long", "short"):
-                    cost = self._safe_dict(
-                        self._safe_dict(candidate_evidence.get(side)).get(
-                            "execution_cost"
-                        )
-                    )
-                    training_support_by_side[side] = assess_paper_training_entry_support(
-                        direction_competition,
-                        raw_opinions,
-                        side,
-                        execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
-                    )
-                training_selection = select_normal_paper_trade_side(
-                    training_support_by_side
-                )
-                if training_selection.get("selected") is True:
-                    paper_selection = training_selection
             selected_side = str(paper_selection.get("selected_side") or "neutral")
             selected_support = self._safe_dict(paper_selection.get("selected_support"))
             normal_contract = (
@@ -990,11 +966,8 @@ class EnsembleCoordinator:
                 if paper_selection.get("selected") is True
                 else {}
             )
-            if normal_contract:
+            if normal_contract.get("authorized") is True:
                 action = Action.LONG if selected_side == "long" else Action.SHORT
-                quality_observation = (
-                    normal_contract.get("selection_reason") == "paper_quality_observation"
-                )
                 loss_probability = self._finite_or_none(selected_support.get("loss_probability"))
                 confidence = (
                     min(
@@ -1006,11 +979,7 @@ class EnsembleCoordinator:
                 )
                 reason = self._reason(
                     (
-                        "模型扣费后期望收益为正但稳健下界尚未转正，执行极小风险模拟盘质量观察做多"
-                        if quality_observation and action == Action.LONG
-                        else "模型扣费后期望收益为正但稳健下界尚未转正，执行极小风险模拟盘质量观察做空"
-                        if quality_observation
-                        else "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做多"
+                        "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做多"
                         if action == Action.LONG
                         else "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做空"
                     ),
@@ -1039,8 +1008,7 @@ class EnsembleCoordinator:
                     "granted": True,
                     "scope": "paper_only",
                     "reason": normal_contract["selection_reason"],
-                    "training_only": normal_contract["selection_reason"]
-                    == "paper_training_entry",
+                    "training_only": False,
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(

@@ -40,10 +40,11 @@ from services.model_training_state import (
     ALL_TRAINABLE_MODEL_IDS,
     LOCAL_AI_TOOL_MODEL_IDS,
     LOCAL_ML_MODEL_IDS,
-    ModelTrainingStateStore,
     TRANSIENT_ERROR_RETRY_SECONDS,
+    ModelTrainingStateStore,
     classify_training_failure,
     training_input_fingerprint,
+    training_result_failed,
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
@@ -233,14 +234,7 @@ class ModelTrainingCoordinatorMixin:
             result
             for result in results
             if isinstance(result, dict)
-            and str(result.get("reason") or "")
-            in {
-                "error",
-                "invalid_training_response",
-                "load_samples_error",
-                "timeout",
-                "resource_error",
-            }
+            and training_result_failed(result)
         ]
         failed = bool(failed_results)
         if any(classify_training_failure(result) == "transient" for result in failed_results):
@@ -672,12 +666,7 @@ class ModelTrainingCoordinatorMixin:
         try:
             result = await self._maybe_train_local_ai_tools_process(force=force)
             result.setdefault("training_input_fingerprint", training_input_fingerprint(result))
-            failed = str(result.get("reason") or "") in {
-                "error",
-                "load_samples_error",
-                "timeout",
-                "resource_error",
-            }
+            failed = training_result_failed(result)
             delay = (
                 AUTO_TRAIN_RETRY_INTERVAL_SECONDS if failed else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
             )
@@ -770,6 +759,11 @@ class ModelTrainingCoordinatorMixin:
                 cursor_result.get("completed_training_decision_group_count"),
                 0,
             )
+            market_cursor_only = str(cursor_result.get("cursor_count_scope") or "") == (
+                "clean_market_groups_and_settlement_fact_fingerprint"
+            )
+            trade_probe = cursor_result.get("authoritative_trade_training_probe") or {}
+            previous_trade_probe: dict[str, Any] = {}
             previous_completed_trade_total = int(
                 (status or {}).get("last_trained_completed_trade_sample_count")
                 or (status or {}).get("completed_trade_sample_count")
@@ -798,10 +792,15 @@ class ModelTrainingCoordinatorMixin:
                         "purged_cost_holdout_decision_group_count",
                     )
                 )
+            if market_cursor_only:
+                previous_group_total = self._safe_int(
+                    (status or {}).get("completed_market_decision_group_count"), 0
+                )
             training_state_cursor = 0
             training_state_shadow_cursor = 0
             training_state_trade_cursor = 0
             training_state_trained_at = None
+            canonical_market_cursor = None
             state_store = self._model_training_state()
             read_training_state = getattr(state_store, "read", None)
             if callable(read_training_state):
@@ -809,10 +808,13 @@ class ModelTrainingCoordinatorMixin:
                 model_rows = state_payload.get("models") or {}
                 for model_id in LOCAL_AI_TOOL_MODEL_IDS:
                     model_row = model_rows.get(model_id) or {}
+                    successful_result = model_row.get("last_successful_result") or {}
                     training_state_cursor = max(
                         training_state_cursor,
                         self._safe_int(
-                            (model_row.get("sample_cursor") or {}).get("decision_group"),
+                            successful_result.get("completed_market_decision_group_count")
+                            if market_cursor_only
+                            else (model_row.get("sample_cursor") or {}).get("decision_group"),
                             0,
                         ),
                     )
@@ -848,6 +850,15 @@ class ModelTrainingCoordinatorMixin:
                             or str(succeeded_at) > str(training_state_trained_at)
                         ):
                             training_state_trained_at = succeeded_at
+                            previous_trade_probe = (
+                                successful_result.get("authoritative_trade_training_probe") or {}
+                            )
+                            if successful_result.get("cursor_count_scope") == (
+                                "clean_market_groups_and_settlement_fact_fingerprint"
+                            ):
+                                canonical_market_cursor = self._safe_int(
+                                    successful_result.get("completed_market_decision_group_count"), 0
+                                )
             previous_completed_shadow_total = max(
                 previous_completed_shadow_total,
                 training_state_shadow_cursor,
@@ -856,6 +867,8 @@ class ModelTrainingCoordinatorMixin:
                 previous_completed_trade_total,
                 training_state_trade_cursor,
             )
+            if market_cursor_only:
+                completed_trade_total = previous_completed_trade_total
             new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
             new_trade = max(completed_trade_total - previous_completed_trade_total, 0)
             shadow_training_view_rebased = (
@@ -865,6 +878,8 @@ class ModelTrainingCoordinatorMixin:
                 previous_group_total,
                 training_state_cursor,
             )
+            if market_cursor_only and canonical_market_cursor is not None:
+                previous_group_total = canonical_market_cursor
             distribution_drift = training_distribution_drift(
                 cursor_result.get("training_distribution_profile") or {},
                 (status or {}).get("training_distribution_profile") or {},
@@ -907,6 +922,19 @@ class ModelTrainingCoordinatorMixin:
                     LOCAL_ML_TRAINING_PARAMS.drift_minimum_sample_increment
                 ),
             )
+            settlement_changed = bool(
+                market_cursor_only
+                and trade_probe.get("available")
+                and trade_probe.get("fingerprint")
+                and trade_probe.get("fingerprint") != previous_trade_probe.get("fingerprint")
+                and (
+                    previous_trade_probe.get("fingerprint")
+                    or int(trade_probe.get("history_row_count") or 0) > 0
+                )
+            )
+            if settlement_changed and trigger["minimum_retraining_interval_elapsed"]:
+                trigger.update({"due": True, "reason": "authoritative_settlement_facts_changed"})
+            trigger["authoritative_settlement_changed"] = settlement_changed
             training_policy = {
                 "learning_only": learning_only,
                 "trigger": trigger["reason"],
@@ -918,6 +946,7 @@ class ModelTrainingCoordinatorMixin:
                 "process_boundary": "dedicated_training_subprocess",
                 "cursor_process_isolated": True,
                 "shadow_training_view_rebased": shadow_training_view_rebased,
+                "cursor_count_scope": cursor_result.get("cursor_count_scope"),
             }
             if status_probe_error:
                 training_policy["status_probe_error"] = status_probe_error
@@ -938,6 +967,12 @@ class ModelTrainingCoordinatorMixin:
                     "new_decision_group_count": trigger["new_mature_decision_group_count"],
                     "training_policy": training_policy,
                     "training_process_isolated": True,
+                    "authoritative_trade_training_probe": trade_probe,
+                    "completed_market_decision_group_count": cursor_result.get(
+                        "completed_market_decision_group_count"
+                    ),
+                    "cursor_count_scope": cursor_result.get("cursor_count_scope"),
+                    "training_input_fingerprint": training_input_fingerprint(cursor_result),
                 }
 
             active_run_id = getattr(self, "_local_tools_active_training_run_id", None)
@@ -984,16 +1019,27 @@ class ModelTrainingCoordinatorMixin:
             # the lightweight probe prevents a rejected challenger from retraining the
             # same historical window every check.
             authoritative_shadow_total = completed_shadow_total
-            authoritative_trade_total = completed_trade_total
+            authoritative_trade_total = (
+                self._safe_int(reported_trade_total, previous_completed_trade_total)
+                if market_cursor_only
+                else completed_trade_total
+            )
             authoritative_group_total = completed_group_total
             result["completed_shadow_sample_count"] = completed_shadow_total
-            result["completed_trade_sample_count"] = completed_trade_total
+            result["completed_trade_sample_count"] = authoritative_trade_total
             result["completed_training_decision_group_count"] = completed_group_total
             result["new_shadow_sample_count"] = new_shadow
-            result["new_trade_sample_count"] = new_trade
+            result["new_trade_sample_count"] = max(
+                authoritative_trade_total - previous_completed_trade_total, 0
+            )
             result["new_decision_group_count"] = trigger["new_mature_decision_group_count"]
             result["training_policy"] = training_policy
             result["training_process_isolated"] = True
+            if market_cursor_only:
+                result["completed_market_decision_group_count"] = completed_group_total
+                result["authoritative_trade_training_probe"] = trade_probe
+                result["cursor_count_scope"] = cursor_result.get("cursor_count_scope")
+                result["training_input_fingerprint"] = training_input_fingerprint(cursor_result)
             if result.get("trained"):
                 result["last_trained_completed_shadow_sample_count"] = authoritative_shadow_total
                 result["last_trained_completed_trade_sample_count"] = authoritative_trade_total

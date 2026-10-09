@@ -296,9 +296,9 @@ def test_local_ai_tools_memory_failure_retries_with_bounded_training_window(
     )
 
     assert result["trained"] is True
-    assert calls == [(10, 6), (5, 3)]
-    assert result["resource_recovery"]["fraction"] == 0.5
-    assert result["resource_recovery"]["reduced_counts"]["shadow_samples"] == 5
+    assert calls == [(10, 6), (3, 2)]
+    assert result["resource_recovery"]["fraction"] == 0.25
+    assert result["resource_recovery"]["reduced_counts"]["shadow_samples"] == 3
 
 
 def test_local_ai_tools_training_rejects_overlapping_registry_mutations(
@@ -407,6 +407,47 @@ def test_isolated_training_success_clears_runtime_evidence(
     assert result["training_request_id"]
     assert result["training_timeout_seconds"] == module.TRAIN_REQUEST_TIMEOUT_SECONDS
     assert module.TRAINING_RUNTIME_STATE_PATH.exists() is False
+
+
+@pytest.mark.parametrize("failure_point", ["submit", "result"])
+@pytest.mark.parametrize("failure_type", ["memory", "broken_pool"])
+def test_isolated_worker_failure_is_structured_and_releases_executor(
+    monkeypatch, tmp_path, failure_point, failure_type
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    module.ISOLATE_TRAINING_PROCESS = True
+    module.TRAINING_RUNTIME_STATE_PATH = tmp_path / "training_process.json"
+    error = MemoryError() if failure_type == "memory" else module.BrokenProcessPool(
+        "worker terminated abruptly"
+    )
+    terminated = []
+
+    class FailedFuture:
+        def result(self, *, timeout):
+            raise error
+
+    class FakeExecutor:
+        _processes = {}
+
+        def submit(self, _worker, _payload):
+            if failure_point == "submit":
+                raise error
+            return FailedFuture()
+
+    executor = FakeExecutor()
+    module._TRAIN_EXECUTOR = executor
+    monkeypatch.setattr(module, "_training_executor", lambda: executor)
+    monkeypatch.setattr(module, "_terminate_training_executor", terminated.append)
+    result = module._run_training_request(module.TrainRequest())
+
+    assert result["reason"] == (
+        "resource_memory" if failure_type == "memory" else "resource_error"
+    )
+    assert result["trained"] is False
+    assert result["training_worker_terminated"] is True
+    assert terminated == [executor]
+    assert module._TRAIN_EXECUTOR is None
+    assert not module.TRAINING_RUNTIME_STATE_PATH.exists()
 
 
 def test_startup_cleanup_reaps_only_recorded_stale_training_workers(
@@ -2755,6 +2796,8 @@ def _local_ai_tools_training_module(tmp_path: Path) -> ModuleType:
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
     module.FeatureRequest.model_rebuild()
     module.TrainRequest.model_rebuild()
+    # Model-math unit tests inject in-memory models; isolation is tested separately.
+    module.ISOLATE_TRAINING_PROCESS = False
 
     class DummyModel:
         def fit(self, *_args: object, **_kwargs: object) -> DummyModel:
@@ -3438,6 +3481,10 @@ def test_phase3_quant_api_deploy_contract_uses_data_bb_and_8101() -> None:
     assert "--host 127.0.0.1 --port 8101" in service
     assert "KillMode=control-group" in service
     assert "TimeoutStopSec=20" in service
+    assert "MemoryAccounting=true" in service
+    assert "MemoryHigh=4G" in service
+    assert "MemoryMax=6G" in service
+    assert "OOMPolicy=continue" in service
     assert "bb-phase3-quant-api.service" in source
     assert "/data/trade_ai" not in source
     assert "local-ai-tools.service" not in source

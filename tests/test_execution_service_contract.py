@@ -942,7 +942,7 @@ def test_confirmed_partial_fill_settlement_is_evidence_bound(
     assert ("normal_paper_sizing_provenance_incomplete" not in reasons) is accepted
 
 
-def test_quality_observation_submission_uses_the_canonical_paper_entry_contract() -> None:
+def test_quality_observation_cannot_submit_a_paper_order() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -992,9 +992,9 @@ def test_quality_observation_submission_uses_the_canonical_paper_entry_contract(
     decision.position_size_pct = 0.01
 
     submission = _return_entry_contract_result(decision, "paper")
-    assert submission.passed is True
+    assert submission.passed is False
     _contract, reasons = validate_entry_execution_contract(decision.raw_response)
-    assert reasons == []
+    assert "normal_paper_trade_not_authorized" in reasons
     assert _return_entry_contract_result(decision, "live").passed is False
 
 
@@ -1010,7 +1010,7 @@ def test_normal_paper_entry_rejects_nonpositive_size_aware_expected_net() -> Non
     assert entry_gate.blocker == "normal_paper_trade_contract_incomplete"
 
 
-def test_positive_quality_observation_contract_is_submit_ready_for_paper_only() -> None:
+def test_positive_quality_observation_still_requires_entry_authorization() -> None:
     decision = _profit_first_ready_position_review_decision()
     permission = paper_quality_permissions()["local_ml"]
     permission.update(
@@ -1066,8 +1066,8 @@ def test_positive_quality_observation_contract_is_submit_ready_for_paper_only() 
     )
 
     _contract, reasons = validate_entry_execution_contract(raw)
-    assert reasons == []
-    assert _return_entry_contract_result(decision, "paper").passed is True
+    assert "normal_paper_trade_not_authorized" in reasons
+    assert _return_entry_contract_result(decision, "paper").passed is False
 
 
 def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() -> None:

@@ -38,6 +38,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_ORDER_DETAIL_CONFIRMED,
     OKX_SYNC_UNVERIFIED,
     OkxOrderFactSyncService,
+    _account_order_fill_recovery_ids,
     _build_contract_size_catalog,
     _configure_order_fact_write_transaction,
     _database_timeout_stage,
@@ -1207,6 +1208,294 @@ async def test_order_fact_sync_repairs_account_fill_group_truncated_by_paginatio
         assert order.okx_raw_fills["base_quantity"] == pytest.approx(0.06)
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_account_discovery_backfills_other_instrument_and_history_only_fill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "account-discovery-unseen.db")
+    now = datetime.now(UTC)
+    known_row = _fill_row(now, order_id="known-btc")
+    unseen_row = _act_fill_row(now - timedelta(minutes=2), order_id="unseen-act")
+    targeted_ids: list[str] = []
+
+    class DiscoveryCcxt(_FakeCcxt):
+        async def privateGetTradeFillsHistory(self, params):
+            order_id = str(params.get("ordId") or "")
+            if order_id:
+                targeted_ids.append(order_id)
+                return {"data": [row for row in self.fills if row["ordId"] == order_id]}
+            # The account page cap omits ACT entirely; orders-history still discovers it.
+            return {"data": [known_row]}
+
+    ccxt = DiscoveryCcxt(
+        fills=[known_row, unseen_row],
+        orders=[
+            _order_row(now, order_id="known-btc"),
+            _act_order_row(now - timedelta(minutes=2), order_id="unseen-act"),
+        ],
+        instruments=[_act_instrument_row(), _FakeCcxt().instruments[0]],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(Order(
+                model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+                side="buy", order_type="market", quantity=0.02, price=60000,
+                status="filled", exchange_order_id="known-btc", created_at=now, filled_at=now,
+            ))
+        service = OkxOrderFactSyncService(
+            mode="paper", timeout_seconds=20, executor_factory=_executor_factory(ccxt),
+        )
+        # Keep an unresolved BTC target without triggering the priority-only early return.
+        monkeypatch.setattr(order_fact_sync_module, "_prioritized_exchange_order_ids", lambda *a, **k: [])
+        report = await service.sync()
+
+        assert report["status"] == "ok"
+        assert report["backfilled_count"] == 1
+        assert "unseen-act" in targeted_ids
+        async with get_session_ctx() as session:
+            order = (await session.execute(
+                select(Order).where(Order.exchange_order_id == "unseen-act")
+            )).scalar_one()
+        assert order.quantity == pytest.approx(4)
+        assert order.okx_raw_fills["fills_history_confirmed"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_account_discovery_fill_pull_is_not_filtered_by_local_refresh_symbols(
+    tmp_path, monkeypatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "account-discovery-symbols.db")
+    now = datetime.now(UTC)
+    ccxt = _FakeCcxt(
+        fills=[_fill_row(now, order_id="known-btc"), _act_fill_row(now, order_id="unseen-act")],
+        orders=[_order_row(now, order_id="known-btc"), _act_order_row(now, order_id="unseen-act")],
+        instruments=[_act_instrument_row(), _FakeCcxt().instruments[0]],
+    )
+    try:
+        async with get_session_ctx() as session:
+            session.add(Order(
+                model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+                side="buy", order_type="market", quantity=0.02, price=60000,
+                status="filled", exchange_order_id="known-btc", created_at=now, filled_at=now,
+            ))
+        monkeypatch.setattr(order_fact_sync_module, "_prioritized_exchange_order_ids", lambda *a, **k: [])
+        report = await OkxOrderFactSyncService(
+            mode="paper", timeout_seconds=20, executor_factory=_executor_factory(ccxt),
+        ).sync()
+        assert report["backfilled_count"] == 1
+        async with get_session_ctx() as session:
+            assert (await session.execute(
+                select(Order).where(Order.exchange_order_id == "unseen-act")
+            )).scalar_one().symbol == "ACT/USDT"
+    finally:
+        await close_db()
+
+
+def test_account_fill_recovery_prioritizes_old_gaps_without_requerying_verified_orders() -> None:
+    now = datetime.now(UTC)
+    rows = {
+        "new": _order_row(now, order_id="new"),
+        "old": _order_row(now - timedelta(hours=1), order_id="old"),
+        "zero-cancel": {**_order_row(now), "state": "canceled", "accFillSz": "0"},
+    }
+    rows["zero-cancel"]["ordId"] = "zero-cancel"
+    assert _account_order_fill_recovery_ids([], rows, []) == ["old", "new"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_order_history", [False, True])
+async def test_account_fill_recovery_does_not_starve_missing_orders_with_stored_complete_facts(
+    tmp_path, monkeypatch, known_order_history,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "account-recovery-budget.db")
+    now = datetime.now(UTC)
+    known_ids = [f"known-{index}" for index in range(6)]
+    order_rows = [
+        {**_order_row(now - timedelta(hours=1), order_id=order_id), "accFillSz": "2"}
+        for order_id in known_ids
+    ]
+    missing_id = "missing-act"
+    order_rows.append(_act_order_row(now, order_id=missing_id))
+    complete_fills = [
+        OkxNativeFillGroup(
+            order_id=order_id, trade_ids=(f"trade-{order_id}-a", f"trade-{order_id}-b"),
+            inst_id="BTC-USDT-SWAP",
+            symbol="BTC/USDT", side="buy", pos_side="long", contracts=2, avg_price=60000,
+            fee_abs=0.12, fill_pnl=0, timestamp_ms=now.timestamp() * 1000,
+            timestamp=now, raw_count=2,
+            rows=tuple(
+                {**_fill_row(now, order_id=order_id), "tradeId": f"trade-{order_id}-{part}",
+                 "fillSz": "1", "fee": "-0.06"}
+                for part in ("a", "b")
+            ),
+        )
+        for order_id in known_ids
+    ]
+    missing_fill = OkxNativeFillGroup(
+        order_id=missing_id, trade_ids=("trade-missing-act",), inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT", side="buy", pos_side="long", contracts=4, avg_price=0.00895,
+        fee_abs=0.001, fill_pnl=0, timestamp_ms=now.timestamp() * 1000,
+        timestamp=now, raw_count=1, rows=(_act_fill_row(now, order_id=missing_id),),
+    )
+    targeted_ids: list[str] = []
+
+    async def fetch_fill_groups(_self, **kwargs):
+        ids = list(kwargs.get("order_ids") or [])
+        if ids:
+            targeted_ids.extend(ids)
+            return [fill for fill in [*complete_fills, missing_fill] if fill.order_id in ids]
+        return [
+            replace(fill, contracts=1, fee_abs=0.06, raw_count=1,
+                    trade_ids=(fill.trade_ids[0],), rows=(fill.rows[0],), pagination_complete=False)
+            for fill in complete_fills
+        ]
+
+    monkeypatch.setattr(order_fact_sync_module.OkxNativeFactsClient, "fetch_fill_groups", fetch_fill_groups)
+    monkeypatch.setattr(order_fact_sync_module, "_prioritized_exchange_order_ids", lambda *a, **k: [])
+    ccxt = _FakeCcxt(
+        orders=order_rows if known_order_history else [order_rows[-1]],
+        instruments=[_act_instrument_row(), _FakeCcxt().instruments[0]],
+    )
+    try:
+        async with get_session_ctx() as session:
+            for fill in complete_fills:
+                order = Order(
+                    model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+                    side="buy", order_type="market", quantity=0.02, price=60000,
+                    status="filled", exchange_order_id=fill.order_id, created_at=now, filled_at=now,
+                )
+                OkxOrderFactSyncService._apply_fill_to_order(
+                    order, fill, now=now, sync_status=OKX_SYNC_CONFIRMED,
+                    contract_size=0.01, contract_size_source="okx_public_instruments",
+                )
+                session.add(order)
+        report = await OkxOrderFactSyncService(
+            mode="paper", timeout_seconds=20, executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert targeted_ids == [missing_id]
+        assert report["status"] == "ok"
+        assert report["backfilled_count"] == 1
+        assert "stored_complete_order_facts_preserved" in report["completed_stages"]
+        assert "account_order_fill_recovery_pending" not in report["deferred_stages"]
+        async with get_session_ctx() as session:
+            orders = (await session.execute(select(Order))).scalars().all()
+        by_id = {order.exchange_order_id: order for order in orders}
+        assert by_id[missing_id].okx_fill_contracts == pytest.approx(4)
+        for order_id in known_ids:
+            assert by_id[order_id].okx_fill_contracts == pytest.approx(2)
+            assert by_id[order_id].okx_raw_fills["fills_pagination_complete"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["contracts", "inst_id", "side", "pagination", "price",
+     "observed_contracts", "observed_instrument", "observed_side", "observed_trade_ids"],
+)
+def test_account_fill_recovery_keeps_genuine_stored_fact_discrepancies(change) -> None:
+    now = datetime.now(UTC)
+    fill = OkxNativeFillGroup(
+        order_id="known", trade_ids=("trade-known",), inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT", side="buy", pos_side="long", contracts=2, avg_price=60000,
+        fee_abs=0.12, fill_pnl=0, timestamp_ms=now.timestamp() * 1000,
+        timestamp=now, raw_count=1, rows=(_fill_row(now, order_id="known"),),
+    )
+    order = Order(
+        exchange_order_id="known", side="buy", symbol="BTC/USDT", quantity=0.02,
+        price=60000, status="filled",
+    )
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order, fill, now=now, sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=0.01, contract_size_source="okx_public_instruments",
+    )
+    row = {**_order_row(now, order_id="known"), "accFillSz": "2"}
+    partial = replace(fill, contracts=1, pagination_complete=False)
+    if change == "contracts":
+        row["accFillSz"] = "3"
+    elif change == "inst_id":
+        row["instId"] = "ACT-USDT-SWAP"
+    elif change == "side":
+        row["side"] = "sell"
+    elif change == "pagination":
+        order.okx_raw_fills["fills_pagination_complete"] = False
+    elif change == "price":
+        row["avgPx"] = "60010"
+    elif change == "observed_contracts":
+        partial = replace(partial, contracts=3)
+    elif change == "observed_instrument":
+        partial = replace(partial, inst_id="ACT-USDT-SWAP")
+    elif change == "observed_side":
+        partial = replace(partial, side="sell")
+    elif change == "observed_trade_ids":
+        partial = replace(partial, trade_ids=("trade-unseen",))
+    assert _account_order_fill_recovery_ids([partial], {"known": row}, [order]) == ["known"]
+
+
+@pytest.mark.parametrize("change", [None, "fee", "trade_id", "status", "pagination"])
+def test_complete_stored_fact_covers_only_exact_account_rows_without_order_history(change):
+    now = datetime.now(UTC)
+    fill = OkxNativeFillGroup(
+        order_id="known", trade_ids=("trade-known",), inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT", side="buy", pos_side="long", contracts=2, avg_price=60000,
+        fee_abs=0.12, fill_pnl=0, timestamp_ms=now.timestamp() * 1000,
+        timestamp=now, raw_count=1, rows=(_fill_row(now, order_id="known"),),
+    )
+    order = Order(
+        exchange_order_id="known", side="buy", symbol="BTC/USDT", quantity=0.02,
+        price=60000, status="filled",
+    )
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order, fill, now=now, sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=0.01, contract_size_source="okx_public_instruments",
+    )
+    observed = replace(fill, pagination_complete=False)
+    if change == "fee":
+        observed = replace(observed, rows=({**fill.rows[0], "fee": "-0.13"},))
+    elif change == "trade_id":
+        observed = replace(observed, trade_ids=("new-trade",), rows=({**fill.rows[0], "tradeId": "new-trade"},))
+    elif change == "status":
+        order.status = "partial"
+    elif change == "pagination":
+        order.okx_raw_fills["fills_pagination_complete"] = False
+    assert _account_order_fill_recovery_ids([observed], {}, [order]) == (
+        [] if change is None else ["known"]
+    )
+
+
+@pytest.mark.parametrize("change", [None, "inst_id", "contracts", "generated_order_id"])
+def test_fill_refresh_preserves_only_identity_matching_confirmed_protection(change) -> None:
+    now = datetime.now(UTC)
+    fill = OkxNativeFillGroup(
+        order_id="protection", trade_ids=("trade-1",), inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT", side="buy", pos_side="net", contracts=4, avg_price=0.00895,
+        fee_abs=0.001, fill_pnl=0, timestamp_ms=now.timestamp() * 1000,
+        timestamp=now, raw_count=1, rows=(_act_fill_row(now, order_id="protection"),),
+    )
+    lifecycle = {
+        "lifecycle_complete": True, "source_authority": "okx_algo_history_plus_fills_history",
+        "generated_order_id": "protection", "inst_id": "ACT-USDT-SWAP",
+        "close_side": "buy", "position_side": "short", "contracts": 4,
+        "algo_id": "algo-1", "reduce_only": True,
+    }
+    if change is not None:
+        lifecycle[change] = 5 if change == "contracts" else "wrong-identity"
+    order = Order(
+        status="filled", exchange_order_id="protection", quantity=4,
+        okx_raw_fills={"fills_history_confirmed": True, "base_quantity": 4,
+                       "protection_execution": lifecycle},
+    )
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order, fill, now=now, sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=1, contract_size_source="okx_public_instruments",
+    )
+    assert ("protection_execution" in order.okx_raw_fills) is (change is None)
 
 
 @pytest.mark.asyncio

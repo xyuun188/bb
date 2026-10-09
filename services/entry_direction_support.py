@@ -677,24 +677,6 @@ def assess_paper_model_trade_support(
     )
 
 
-def assess_paper_training_entry_support(
-    direction_competition: dict[str, Any] | None,
-    expert_opinions: list[dict[str, Any]] | None,
-    selected_side: str,
-    *,
-    execution_cost_pct: float | None,
-) -> dict[str, Any]:
-    """Assess a paper-only training entry without promoting it to production."""
-
-    return assess_directional_entry_support(
-        direction_competition,
-        expert_opinions,
-        selected_side,
-        support_scope=PAPER_TRAINING_ENTRY_SCOPE,
-        execution_cost_pct=execution_cost_pct,
-    )
-
-
 def directional_entry_support_reasons(value: Any, selected_side: str) -> list[str]:
     support = _dict(value)
     reasons: list[str] = []

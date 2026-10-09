@@ -311,7 +311,7 @@ def decision_group_training_trigger(
         else "initial_artifact"
         if not has_artifact
         else "training_view_rebased"
-        if rebased or sample_rebased
+        if cooldown_elapsed and (rebased or sample_rebased)
         else "mature_decision_group_batch"
         if batch_due
         else "clean_sample_batch"

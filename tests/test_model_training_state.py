@@ -1,21 +1,145 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
-from services.ml_signal_service import MLSignalService
 from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+from services.ml_signal_service import MLSignalService
 from services.model_artifact_registry import ModelArtifactRegistry
 from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
     LOCAL_ML_MODEL_IDS,
     MODEL_TRAINING_STATE_VERSION,
     ModelTrainingStateStore,
+    classify_training_failure,
     training_input_fingerprint,
+    training_result_failed,
     training_timeline,
 )
+
+
+@pytest.mark.parametrize("reason", ["resource_memory", "resource_error"])
+def test_resource_reason_without_error_text_is_still_failed(tmp_path, reason) -> None:
+    result = {"trained": False, "reason": reason}
+    assert training_result_failed(result)
+    assert classify_training_failure(result) == "resource"
+    now = datetime.now(UTC)
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    store.finish_check(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id="resource-failure",
+        result=result,
+        next_check_at=now,
+    )
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    assert row["state"] == "failed"
+    assert row["resource_failure_count"] == 1
+
+
+def test_state_lock_content_cannot_block_new_writer(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    store.lock_dir.mkdir()
+    store.write_lock_path.write_text("orphaned-file-token", encoding="utf-8")
+
+    store.heartbeat(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        interval_seconds=1800,
+    )
+
+    assert store.read()["state_file_available"]
+
+
+def test_state_lock_is_exclusive_and_released_by_close(tmp_path, monkeypatch) -> None:
+    from services import model_training_state
+
+    monkeypatch.setattr(model_training_state, "WRITE_LOCK_WAIT_SECONDS", 0.03)
+    first = ModelTrainingStateStore(tmp_path / "state.json")
+    second = ModelTrainingStateStore(first.path)
+    handle = first._acquire_write_lock()
+    try:
+        with pytest.raises(TimeoutError, match="write lock timed out"):
+            second._acquire_write_lock()
+    finally:
+        first._release_write_lock(handle)
+    next_handle = second._acquire_write_lock()
+    second._release_write_lock(next_handle)
+    assert classify_training_failure(error="model training state write lock timed out") == "transient"
+
+
+def test_state_lock_is_released_when_writer_process_exits(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    code = (
+        "import os; from pathlib import Path; "
+        "from services.model_training_state import ModelTrainingStateStore; "
+        f"store = ModelTrainingStateStore(Path({str(store.path)!r})); "
+        "handle = store._acquire_write_lock(); os._exit(0)"
+    )
+    subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        timeout=15,
+    )
+    handle = store._acquire_write_lock()
+    store._release_write_lock(handle)
+
+
+def test_scheduler_migrates_full_diagnostics_without_changing_training_cursor(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    result = {
+        "trained": True,
+        "reason": "trained_challenger_rejected",
+        "completed_market_decision_group_count": 193,
+        "completed_trade_sample_count": 420,
+        "cursor_count_scope": "clean_market_groups_and_settlement_fact_fingerprint",
+        "authoritative_trade_training_probe": {"fingerprint": "settlement-facts", "available": True},
+        "quality_report": {
+            "data_quality_version": "current-quality",
+            "totals": {"included": 420},
+            "authoritative_trade_outcomes": {
+                "fingerprint": "all-outcomes",
+                "records": [{"id": index, "details": "x" * 2000} for index in range(2000)],
+            },
+        },
+    }
+    persisted = {
+        "version": MODEL_TRAINING_STATE_VERSION,
+        "status": "ok",
+        "schedulers": {},
+        "models": {
+            model_id: {
+                "sample_cursor": {"shadow": 1000, "trade": 420, "decision_group": 193},
+                "last_successful_training_at": "2026-10-09T13:56:44+00:00",
+                "last_result": result,
+                "last_successful_result": result,
+                "history": [],
+            }
+            for model_id in LOCAL_AI_TOOL_MODEL_IDS
+        },
+    }
+    store.path.write_text(json.dumps(persisted), encoding="utf-8")
+    store.heartbeat(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        interval_seconds=1800,
+    )
+
+    assert store.path.stat().st_size < 250_000
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    assert row["sample_cursor"] == {"shadow": 1000, "trade": 420, "decision_group": 193}
+    success = row["last_successful_result"]
+    assert success["completed_market_decision_group_count"] == 193
+    assert success["authoritative_trade_training_probe"]["fingerprint"] == "settlement-facts"
+    assert success["quality_report"]["totals"]["included"] == 420
+    assert success["quality_report"]["authoritative_trade_outcomes"]["fingerprint"] == "all-outcomes"
+    assert len(result["quality_report"]["authoritative_trade_outcomes"]["records"]) == 2000
 
 
 def test_pytest_scheduler_state_isolated_from_runtime_data() -> None:
@@ -211,6 +335,35 @@ def test_training_timeline_separates_check_attempt_success_and_champion() -> Non
     assert timeline["latest_training_next_check_at"] == "2026-10-09T00:29:37+00:00"
 
 
+@pytest.mark.parametrize("new_attempt", [False, True])
+def test_training_timeline_uses_terminal_evidence_for_stale_running_attempt(tmp_path, new_attempt):
+    interrupted_at = datetime(2026, 10, 9, 14, 28, tzinfo=UTC)
+    started_at = interrupted_at + timedelta(minutes=5) if new_attempt else interrupted_at - timedelta(minutes=2)
+    row = {
+        "state": "running" if new_attempt else "skipped",
+        "last_started_at": started_at.isoformat(),
+        "last_training_attempt_state": "running",
+        "last_training_attempt_error": None,
+        "last_result": {"trained": False, "reason": "not_due"},
+        "history": [
+            {"event": "interrupted", "at": interrupted_at.isoformat(),
+             "error": "training_process_interrupted"},
+        ],
+    }
+    expected = "running" if new_attempt else "interrupted"
+    assert training_timeline(row)["latest_training_attempt_state"] == expected
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    payload = store.read()
+    payload["models"][LOCAL_ML_MODEL_IDS[0]] = row
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+    normalized = store.read()["models"][LOCAL_ML_MODEL_IDS[0]]
+    assert normalized["last_training_attempt_state"] == expected
+    assert normalized["last_training_attempt_error"] == (
+        None if new_attempt else "training_process_interrupted"
+    )
+    assert normalized.get("last_successful_training_at") is None
+
+
 def test_rejected_challenger_is_recorded_as_successful_training(tmp_path) -> None:
     now = [datetime(2026, 10, 8, 23, 59, 37, tzinfo=UTC)]
     store = ModelTrainingStateStore(
@@ -237,6 +390,35 @@ def test_rejected_challenger_is_recorded_as_successful_training(tmp_path) -> Non
 
     assert timeline["latest_training_success_at"] == now[0].isoformat()
     assert row["last_successful_result"]["reason"] == "trained_challenger_rejected"
+
+
+def test_normal_training_skip_does_not_block_next_cursor_probe(tmp_path) -> None:
+    now = [datetime(2026, 10, 8, 23, 59, 37, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+
+    store.record_external_result(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id="waiting-for-mature-partition",
+        result={
+            "trained": False,
+            "reason": "decision_group_training_partition_immature",
+            "decision_group_partition": {"ready": False},
+        },
+        next_check_at=now[0] + timedelta(minutes=30),
+    )
+
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    assert row["state"] == "skipped"
+    gate = store.training_gate(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+    )
+    assert gate["allowed"] is True
+    assert gate["reason"] == "training_gate_open"
 
 
 def test_resource_failures_backoff_and_open_circuit_until_input_changes(tmp_path) -> None:
@@ -483,6 +665,8 @@ def test_recovery_marks_interrupted_training_and_preserves_history(tmp_path) -> 
     assert row["next_check_at"] is not None
     assert row["history"][-1]["event"] == "interrupted"
     assert row.get("last_successful_training_at") is None
+    assert row["last_training_attempt_state"] == "interrupted"
+    assert training_timeline(row)["latest_training_attempt_error"] == "training_process_interrupted"
 
 
 def test_recovery_schedules_existing_interrupted_run_without_duplicate_event(tmp_path) -> None:

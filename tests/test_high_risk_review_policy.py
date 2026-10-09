@@ -985,7 +985,7 @@ async def test_entry_high_risk_review_does_not_annotate_non_entry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_quality_observation_uses_current_paper_advisory_when_cloud_is_disabled(
+async def test_paper_quality_observation_cannot_use_advisory_when_cloud_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "high_risk_review_enabled", False)
@@ -993,22 +993,10 @@ async def test_paper_quality_observation_uses_current_paper_advisory_when_cloud_
 
     result = await EntryHighRiskReviewGatePolicy().evaluate(decision, "paper", [])
 
-    assert result is not None and result.passed is True
-    review = decision.raw_response["high_risk_review"]
-    assert review["status"] == "skipped_advisory_only"
-    assert review["approved"] is None
-    assert review["hard_review_required"] is False
-    assert review["review_required_for_live"] is True
-    contract = review["paper_advisory_contract"]
-    assert contract["eligible"] is True
-    assert (
-        contract["single_trade_risk_fraction_cap"]
-        == decision.raw_response["normal_paper_trade"][
-            "single_trade_risk_fraction_cap"
-        ]
-    )
-    assert contract["final_leverage"] == 1.0
-    assert contract["dynamic_leverage_allowed"] is True
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_config_missing"
+    contract = EntryHighRiskReviewGatePolicy._paper_advisory_contract(decision, "paper")
+    assert "normal_paper_trade_not_authorized" in contract["violations"]
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1005,29 @@ async def test_current_paper_advisory_accepts_dynamic_leverage(
 ) -> None:
     monkeypatch.setattr(settings, "high_risk_review_enabled", False)
     decision = _paper_quality_observation_decision()
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.4,
+            "objective_net_return_pct": 0.2,
+            "loss_probability": 0.25,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "strong_expert_opposition": False,
+        },
+    )
+    decision.raw_response["profit_risk_sizing"].update(
+        {
+            "paper_quality_observation_mode": False,
+            "expected_net_return_pct": 0.4,
+            "return_lcb_pct": 0.2,
+        }
+    )
     decision.suggested_leverage = 2.0
     decision.raw_response["profit_risk_sizing"]["final_leverage"] = 2.0
 
@@ -1058,7 +1069,7 @@ async def test_paper_advisory_fallback_rejects_contract_above_current_risk_cap(
 
 
 @pytest.mark.asyncio
-async def test_paper_quality_observation_records_reviewer_error_as_advisory(
+async def test_paper_quality_observation_reviewer_error_remains_blocking(
     high_risk_settings: None,
 ) -> None:
     class ReviewerTimeout:
@@ -1072,15 +1083,16 @@ async def test_paper_quality_observation_records_reviewer_error_as_advisory(
         [],
     )
 
-    assert result is not None and result.passed is True
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_failed"
     review = decision.raw_response["high_risk_review"]
-    assert review["status"] == "error_advisory_only"
-    assert review["approved"] is None
+    assert review["status"] == "error_blocked"
+    assert review["approved"] is False
     assert review["error_code"] == "reviewer_call_failed"
 
 
 @pytest.mark.asyncio
-async def test_v10_quality_observation_records_reviewer_rejection_as_advisory(
+async def test_quality_observation_reviewer_rejection_remains_blocking(
     high_risk_settings: None,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -1106,14 +1118,13 @@ async def test_v10_quality_observation_records_reviewer_rejection_as_advisory(
         [],
     )
 
-    assert result is not None and result.passed is True
+    assert result is not None and result.passed is False
+    assert result.blocker == "high_risk_review_rejected"
     assert captured["opportunity_score"]["expected_net_return_pct"] == 0.0241367
     review = decision.raw_response["high_risk_review"]
-    assert review["status"] == "rejected_advisory_only"
-    assert review["approved"] is None
-    assert review["hard_review_required"] is False
-    assert review["reviewer_approved"] is False
-    assert review["reviewer_confidence"] == 0.92
+    assert review["status"] == "rejected"
+    assert review["approved"] is False
+    assert review["confidence"] == 0.92
 
 
 @pytest.mark.asyncio

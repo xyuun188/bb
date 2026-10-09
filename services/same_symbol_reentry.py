@@ -152,26 +152,13 @@ class SameSymbolReentryGuard:
                 opportunity.get("expected_net_return_pct"),
             )
         )
-        training_entry = selection_reason == "paper_training_entry"
-        current_raw_expected = _safe_float(
-            normal_trade.get("current_raw_expected_return_pct")
-        )
         opportunity_consistent = bool(
-            training_entry
-            and current_raw_expected is not None
-            and current_raw_expected > 0.0
-            or (
-                not training_entry
-                and (
-                    expected_net is None
-                    or (
-                        expected_net > 0.0
-                        and (
-                            opportunity_score is None
-                            or opportunity_score > 0.0
-                            or selection_reason == "paper_quality_observation"
-                        )
-                    )
+            selection_reason not in {"paper_quality_observation", "paper_training_entry"}
+            and (
+                expected_net is None
+                or (
+                    expected_net > 0.0
+                    and (opportunity_score is None or opportunity_score > 0.0)
                 )
             )
         )

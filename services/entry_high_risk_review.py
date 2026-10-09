@@ -18,7 +18,7 @@ from core.safe_output import safe_error_text
 from services.entry_direction_metrics import selected_entry_metrics
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_VERSION,
+    normal_paper_trade_contract_reasons,
 )
 from services.trading_policies import PolicyGateResult
 
@@ -27,8 +27,6 @@ _DEFAULT_TAIL_RISK_THRESHOLD = 0.65
 _DEFAULT_LEVERAGE_THRESHOLD = 8.0
 _DEFAULT_POSITION_SIZE_THRESHOLD = 0.12
 _DEFAULT_MIN_APPROVAL_CONFIDENCE = 0.5
-_PAPER_ADVISORY_RISK_FRACTION_CAP = 0.0002
-_PAPER_ADVISORY_LEVERAGE_CAP = 1.0
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _RETIRED_REVIEWER_MARKERS = ("deepseek-r1-14b-risk", "14b", "finquant-expert")
 
@@ -160,10 +158,6 @@ class EntryHighRiskReviewGatePolicy:
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
         sizing = _safe_dict(raw.get("profit_risk_sizing"))
         selected_metrics = selected_entry_metrics(decision, model_mode)
-        paper_training_entry = bool(
-            normal_trade.get("selection_reason") == "paper_training_entry"
-            and normal_trade.get("paper_training_only") is True
-        )
         normal_risk_cap = _safe_float(
             normal_trade.get("single_trade_risk_fraction_cap"), -1.0
         )
@@ -171,55 +165,38 @@ class EntryHighRiskReviewGatePolicy:
             sizing.get("single_trade_risk_fraction_cap"), -1.0
         )
         final_leverage = _safe_float(sizing.get("final_leverage"), -1.0)
-        violations: list[str] = []
+        violations: list[str] = normal_paper_trade_contract_reasons(normal_trade)
         if str(model_mode or "").lower() != "paper":
             violations.append("execution_mode_not_paper")
         if not (
             selected_metrics.source == "normal_paper_trade_contract"
-            and (selected_metrics.quality_observation or paper_training_entry)
+            and not selected_metrics.quality_observation
         ):
             violations.append("paper_quality_observation_contract_invalid")
         if normal_trade.get("execution_scope") != "paper_only":
             violations.append("normal_trade_scope_invalid")
         if normal_trade.get("production_permission") is not False:
             violations.append("normal_trade_production_permission_invalid")
-        if (
-            normal_trade.get("paper_quality_observation_only") is not True
-            and not paper_training_entry
-        ):
-            violations.append("paper_quality_observation_contract_missing")
         if sizing.get("execution_scope") != "paper_only":
             violations.append("sizing_scope_invalid")
         if sizing.get("production_permission") is not False:
             violations.append("sizing_production_permission_invalid")
         if sizing.get("production_eligible") is not True:
             violations.append("sizing_not_eligible")
-        if (
-            sizing.get("paper_quality_observation_mode") is not True
-            and sizing.get("paper_training_entry_mode") is not True
-        ):
-            violations.append("paper_quality_observation_sizing_missing")
-        current_normal_paper = normal_trade.get("version") == NORMAL_PAPER_TRADE_VERSION
-        advisory_risk_cap = (
-            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            if current_normal_paper
-            else _PAPER_ADVISORY_RISK_FRACTION_CAP
-        )
+        if _safe_float(sizing.get("expected_net_return_pct")) <= 0.0:
+            violations.append("sizing_expected_net_not_positive")
+        if _safe_float(sizing.get("return_lcb_pct")) <= 0.0:
+            violations.append("sizing_return_lcb_not_positive")
+        advisory_risk_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         if not 0.0 < normal_risk_cap <= advisory_risk_cap:
             violations.append("normal_trade_risk_cap_exceeded")
         if not 0.0 < sizing_risk_cap <= advisory_risk_cap:
             violations.append("sizing_risk_cap_exceeded")
         decision_leverage = _safe_float(decision.suggested_leverage, -1.0)
-        if current_normal_paper:
-            if final_leverage < 1.0 or abs(final_leverage - round(final_leverage)) > 1e-8:
-                violations.append("final_leverage_invalid")
-            if decision_leverage < 1.0 or abs(decision_leverage - final_leverage) > 1e-8:
-                violations.append("decision_leverage_invalid")
-        else:
-            if not 0.0 < final_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
-                violations.append("final_leverage_exceeded")
-            if not 0.0 < decision_leverage <= _PAPER_ADVISORY_LEVERAGE_CAP:
-                violations.append("decision_leverage_exceeded")
+        if final_leverage < 1.0 or abs(final_leverage - round(final_leverage)) > 1e-8:
+            violations.append("final_leverage_invalid")
+        if decision_leverage < 1.0 or abs(decision_leverage - final_leverage) > 1e-8:
+            violations.append("decision_leverage_invalid")
         return {
             "eligible": not violations,
             "execution_scope": "paper_only",
@@ -228,11 +205,11 @@ class EntryHighRiskReviewGatePolicy:
                 "paper_quality_observation_mode"
             )
             is True,
-            "paper_training_entry_mode": paper_training_entry,
+            "paper_training_entry_mode": False,
             "single_trade_risk_fraction_cap": sizing_risk_cap,
             "final_leverage": final_leverage,
             "risk_fraction_limit": advisory_risk_cap,
-            "dynamic_leverage_allowed": current_normal_paper,
+            "dynamic_leverage_allowed": True,
             "violations": violations,
         }
 

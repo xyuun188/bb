@@ -2128,6 +2128,11 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
             "last_trained_completed_shadow_raw_decision_group_count": 80,
             "trained_at": now,
             "full_training_probe_at": now,
+            "authoritative_trade_training_probe": {
+                "available": True,
+                "history_row_count": 1,
+                "fingerprint": "unchanged-settlement-probe",
+            },
         }
     )
 
@@ -2142,6 +2147,9 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
 
     async def forbidden_trade_samples() -> list[dict[str, object]]:
         raise AssertionError("not_due must not load authoritative trade samples")
+
+    async def trade_probe() -> dict[str, object]:
+        return dict(metadata["authoritative_trade_training_probe"])
 
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: metadata  # type: ignore[method-assign]
@@ -2169,6 +2177,9 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
         "services.ml_training_dataset.load_authoritative_trade_training_samples",
         forbidden_trade_samples,
     )
+    monkeypatch.setattr(
+        ml_training_dataset, "probe_authoritative_trade_training_cursor", trade_probe
+    )
 
     result = await service.maybe_auto_train()
 
@@ -2176,6 +2187,119 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
     assert result["reason"] == "not_due"
     assert result["full_training_probe_performed"] is False
     assert result["training_policy"]["full_probe_throttled"] is True
+
+
+def test_authoritative_trade_cursor_detects_loss_repair_and_is_order_independent() -> None:
+    original = [
+        {"lifecycle_key": "paper-1", "realized_pnl": -2.0},
+        {"lifecycle_key": "paper-2", "realized_pnl": 3.0},
+    ]
+    cursor = ml_training_dataset.authoritative_trade_training_cursor(original)
+    reversed_cursor = ml_training_dataset.authoritative_trade_training_cursor(original[::-1])
+    repaired_cursor = ml_training_dataset.authoritative_trade_training_cursor(
+        [{**original[0], "realized_pnl": -4.0}, original[1]]
+    )
+    assert cursor == reversed_cursor
+    assert cursor["fingerprint"] != repaired_cursor["fingerprint"]
+    assert cursor["sample_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_new_authoritative_loss_triggers_training_without_new_shadow_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = ModelTrainingStateStore(tmp_path / "state.json")
+    service = MLSignalService(
+        artifact_registry=ModelArtifactRegistry(
+            root=tmp_path / "artifacts", model_id=LOCAL_ML_MODEL_IDS[0]
+        ),
+        training_state_store=store,
+    )
+    metadata = _ml_training_metadata(
+        artifact_persisted=True, ready=False, completed_sample_count=80
+    )
+    metadata.update(
+        {
+            "trained_at": (datetime.now(UTC) - timedelta(hours=7)).isoformat(),
+            "full_training_probe_at": datetime.now(UTC).isoformat(),
+            "last_trained_completed_shadow_decision_group_count": 80,
+            "last_trained_completed_shadow_raw_decision_group_count": 80,
+            "authoritative_trade_training_probe": {
+                "available": True, "history_row_count": 1, "fingerprint": "old-probe"
+            },
+            "authoritative_trade_training_cursor": (
+                ml_training_dataset.authoritative_trade_training_cursor(
+                    [{"lifecycle_key": "loss-1", "realized_pnl": -2.0}]
+                )
+            ),
+        }
+    )
+    load_calls = 0
+
+    async def count() -> int:
+        return 80
+
+    async def probe() -> dict[str, object]:
+        return {"available": True, "history_row_count": 1, "fingerprint": "new-probe"}
+
+    async def rows() -> list[object]:
+        return []
+
+    async def trade_samples() -> list[dict[str, object]]:
+        nonlocal load_calls
+        load_calls += 1
+        return [{"lifecycle_key": "loss-1", "realized_pnl": -4.0}]
+
+    async def quarantine() -> dict[str, object]:
+        return {"scanned": 0, "quarantined": 0}
+
+    service._current_metadata = lambda: metadata
+    service._training_cursor_metadata = lambda current: current
+    service._completed_shadow_sample_count = count
+    service._quarantine_dirty_training_samples = quarantine
+    monkeypatch.setattr(ml_training_dataset, "count_shadow_training_decision_groups", count)
+    monkeypatch.setattr(ml_training_dataset, "probe_authoritative_trade_training_cursor", probe)
+    monkeypatch.setattr(ml_training_dataset, "load_shadow_training_rows", rows)
+    monkeypatch.setattr(
+        ml_training_dataset, "load_authoritative_trade_training_samples", trade_samples
+    )
+    monkeypatch.setattr(
+        ml_signal_module, "build_training_frame", lambda _rows: _training_frame(80)
+    )
+    monkeypatch.setattr(
+        ml_signal_module, "shadow_training_quality_report",
+        lambda _rows: {"quality_report": {}},
+    )
+    monkeypatch.setattr(
+        ml_signal_module, "decision_group_partition",
+        lambda _frame: SimpleNamespace(
+            report={
+                "ready": False, "reason": "insufficient_mature_partition",
+                **{
+                    key: 0 for key in (
+                        "decision_group_count", "train_sample_count",
+                        "train_decision_group_count", "holdout_sample_count",
+                        "holdout_decision_group_count", "purged_training_decision_group_count",
+                        "purged_training_sample_count", "minimum_train_sample_count",
+                        "minimum_train_decision_group_count",
+                    )
+                },
+            }
+        ),
+    )
+
+    first = await service.maybe_auto_train()
+    assert first["training_policy"]["trigger"] == "authoritative_trade_outcomes_changed"
+    assert first["training_policy"]["authoritative_trade_training_due"] is True
+    assert first["new_decision_group_count"] == 0
+    assert first["reason"] == "insufficient_mature_partition"
+    assert load_calls == 1
+
+    second = await service.maybe_auto_train()
+    assert second["reason"] == "not_due"
+    assert second["full_training_probe_performed"] is False
+    assert load_calls == 1
 
 
 @pytest.mark.asyncio

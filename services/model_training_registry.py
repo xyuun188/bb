@@ -861,7 +861,7 @@ def _llm_rows(
     return [finquant, *normalized_base_rows]
 
 
-def _attach_scheduler_timestamps(
+def attach_scheduler_timestamps(
     rows: list[dict[str, Any]],
     scheduler_state: dict[str, Any],
 ) -> None:
@@ -911,7 +911,7 @@ def build_model_training_registry(
         *_specialist_rows(local_tools, specialist),
         *_llm_rows(server, contributions),
     ]
-    _attach_scheduler_timestamps(models, _safe_dict(scheduler_state))
+    attach_scheduler_timestamps(models, _safe_dict(scheduler_state))
     lifecycle_counts = Counter(str(row.get("lifecycle") or "unknown") for row in models)
     trainable_count = sum(1 for row in models if bool(row.get("trainable")))
     identity_failures = [

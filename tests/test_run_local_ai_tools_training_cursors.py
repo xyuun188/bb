@@ -25,6 +25,21 @@ def test_cursor_process_installs_memory_guard_before_project_imports() -> None:
     assert "resource.RLIMIT_AS" in text
 
 
+def test_compact_shadow_row_does_not_depend_on_trade_probe(monkeypatch) -> None:
+    monkeypatch.setattr(script, "_shadow_sample_from_mapping", lambda row: row)
+    result = script._compact_shadow_sample(
+        {
+            "id": 42,
+            "symbol": "BTC/USDT",
+            "features": {"returns_5": 0.1, "spread_pct": 0.01},
+        }
+    )
+
+    assert result is not None
+    assert result["id"] == 42
+    assert result["features"]["returns_5"] == 0.1
+
+
 def _shadow_sample(sample_id: int, group: str) -> dict:
     return {
         "id": sample_id,
@@ -169,8 +184,15 @@ async def test_streaming_cursor_scans_shadow_history_once(
         scans += 1
         yield {"id": 1, "decision_id": 1}
 
-    async def no_trades() -> list[dict]:
-        return []
+    async def trade_probe() -> dict:
+        return {
+            "available": True,
+            "history_row_count": 5,
+            "fingerprint": "settlement-facts",
+        }
+
+    async def forbidden_full_trade_load() -> list[dict]:
+        pytest.fail("cursor probes must not reconstruct authoritative trade outcomes")
 
     monkeypatch.setattr(script, "_iter_shadow_samples_stream", stream)
     monkeypatch.setattr(script, "annotate_sample", lambda sample, _kind: sample)
@@ -184,7 +206,8 @@ async def test_streaming_cursor_scans_shadow_history_once(
             "short_return_pct": -0.2,
         },
     )
-    monkeypatch.setattr(script, "_load_trade_samples", no_trades)
+    monkeypatch.setattr(script, "_load_trade_samples", forbidden_full_trade_load)
+    monkeypatch.setattr(script, "probe_authoritative_trade_training_cursor", trade_probe)
     monkeypatch.setattr(
         script,
         "annotate_training_payload",
@@ -195,3 +218,7 @@ async def test_streaming_cursor_scans_shadow_history_once(
 
     assert scans == 1
     assert result["completed_market_sample_count"] == 1
+    assert result["completed_training_decision_group_count"] == 1
+    assert result["authoritative_trade_training_probe"]["history_row_count"] == 5
+    assert "completed_trade_sample_count" not in result
+    assert "completed_authoritative_cost_sample_count" not in result

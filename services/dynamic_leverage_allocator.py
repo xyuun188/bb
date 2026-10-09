@@ -47,7 +47,6 @@ class DynamicLeverageInput:
     execution_cost: dict[str, Any] = field(default_factory=dict)
     portfolio_capacity_fraction: float = 1.0
     policy_scope: str = "live"
-    training_edge_return_pct: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +93,7 @@ class DynamicLeverageAllocator:
 
     def allocate(self, data: DynamicLeverageInput) -> DynamicLeverageDecision:
         policy_scope = str(data.policy_scope or "live").lower()
-        paper_scope = policy_scope in {"paper", "paper_training"}
-        training_scope = policy_scope == "paper_training"
+        paper_scope = policy_scope == "paper"
         raw_system_max = _safe_float(data.system_max_leverage, 0.0)
         system_max = max(floor(raw_system_max), 1)
         requested = _clamp(_safe_float(data.requested_leverage, 1.0), 1.0, float(system_max))
@@ -105,30 +103,13 @@ class DynamicLeverageAllocator:
         effective_return = _safe_float(data.expected_net_return_pct, 0.0)
         if not isfinite(effective_return):
             effective_return = 0.0
-        training_edge = _safe_float(data.training_edge_return_pct, float("nan"))
-        if training_scope and isfinite(training_edge) and training_edge > 0.0:
-            effective_return = training_edge
-            adjustments.append(
-                {
-                    "factor": "paper_training_current_edge_basis",
-                    "net_return_pct": round(
-                        _safe_float(data.expected_net_return_pct, 0.0),
-                        8,
-                    ),
-                    "training_edge_return_pct": round(training_edge, 8),
-                    "effective_return_pct": round(effective_return, 8),
-                    "historical_profitability_is_not_a_leverage_gate": True,
-                }
-            )
         missing_inputs: list[str] = []
+        if policy_scope not in {"paper", "live"}:
+            missing_inputs.append("execution_policy_scope_invalid")
         if not paper_scope and int(data.aligned_source_count) <= 0:
             missing_inputs.append("authoritative_return_samples_missing")
-        if not paper_scope and _safe_float(data.expected_net_return_pct, 0.0) <= 0:
+        if effective_return <= 0:
             missing_inputs.append("positive_fee_after_return_missing")
-        if training_scope and (
-            not isfinite(training_edge) or training_edge <= 0.0
-        ):
-            missing_inputs.append("paper_training_current_edge_missing")
         if cost.get("production_eligible") is not True:
             missing_inputs.append("live_execution_cost_incomplete")
         if raw_system_max < 1.0:
@@ -285,7 +266,7 @@ class DynamicLeverageAllocator:
         survival_component = (1.0 - _clamp(data.loss_probability, 0.0, 1.0)) * (
             1.0 - _clamp(data.tail_risk_score, 0.0, 1.0)
         )
-        if str(data.policy_scope or "live").lower() in {"paper", "paper_training"}:
+        if str(data.policy_scope or "live").lower() == "paper":
             # Paper leverage is determined by the current trade's edge and risk.
             # Historical profitability is evidence for promotion, not permission
             # or a leverage multiplier for an unpromoted model.
@@ -323,7 +304,7 @@ class DynamicLeverageAllocator:
                 "historical_profit_quality_is_gate": str(
                     data.policy_scope or "live"
                 ).lower()
-                not in {"paper", "paper_training"},
+                != "paper",
             }
         )
         return _clamp(leverage, 1.0, system_max)

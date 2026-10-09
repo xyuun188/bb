@@ -111,6 +111,7 @@ def build_historical_market_contract(
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+    path["path_fingerprint"] = data_fingerprint
     return {
         "version": MARKET_FACT_CONTRACT_VERSION,
         "status": "historical_ohlcv_only",

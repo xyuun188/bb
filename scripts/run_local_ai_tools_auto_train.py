@@ -18,6 +18,7 @@ from db.session import close_db  # noqa: E402
 from services.local_ai_tools_client import LocalAIToolsClient  # noqa: E402
 from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX  # noqa: E402
 from services.model_training_coordinator import ModelTrainingCoordinatorMixin  # noqa: E402
+from services.model_training_state import training_result_failed  # noqa: E402
 
 
 class IndependentTrainingCoordinator(ModelTrainingCoordinatorMixin):
@@ -63,12 +64,7 @@ def main() -> int:
         LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
         + json.dumps(result, ensure_ascii=False, sort_keys=True)
     )
-    return (
-        2
-        if result.get("reason")
-        in {"error", "invalid_training_response", "timeout", "resource_error"}
-        else 0
-    )
+    return 2 if training_result_failed(result) else 0
 
 
 if __name__ == "__main__":

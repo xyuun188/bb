@@ -235,7 +235,7 @@ def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -
     }
 
 
-def test_market_analysis_only_training_contract_is_promoted() -> None:
+def test_market_analysis_only_training_contract_is_not_promoted() -> None:
     service = object.__new__(TradingService)
     service._market_analysis_only_symbols = {"BTC/USDT"}
 
@@ -284,8 +284,11 @@ def test_market_analysis_only_training_contract_is_promoted() -> None:
         ),
     }
 
-    assert service._entry_gate_reason_with_market_boundary(decision) is None
-    assert decision.raw_response["market_analysis_only_contract"]["promoted_for_execution"] is True
+    assert service._entry_gate_reason_with_market_boundary(decision) is not None
+    assert decision.raw_response["market_analysis_only_contract"]["entry_permission"] is False
+    assert not decision.raw_response["market_analysis_only_contract"].get(
+        "promoted_for_execution", False
+    )
 
 
 def test_known_unavailable_market_candidate_cannot_be_promoted() -> None:

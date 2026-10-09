@@ -95,38 +95,32 @@ def test_dynamic_leverage_missing_cost_distribution_falls_back_to_one_x() -> Non
     assert decision.policy_provenance["fallback_reason"] == "live_execution_cost_incomplete"
 
 
-def test_paper_training_uses_current_raw_edge_when_net_return_is_negative() -> None:
+def test_paper_negative_fee_after_return_cannot_authorize_leverage() -> None:
     decision = DynamicLeverageAllocator().allocate(
         _input(
-            policy_scope="paper_training",
+            policy_scope="paper",
             expected_net_return_pct=-0.35,
             return_lcb_pct=-0.55,
-            training_edge_return_pct=0.85,
             profit_quality_ratio=0.0,
             loss_probability=0.25,
             tail_risk_score=0.20,
         )
     )
 
-    assert decision.final_integer_leverage > 1
-    assert decision.policy_provenance["policy_scope"] == "paper_training"
-    assert decision.policy_provenance["effective_return_pct"] == 0.85
-    assert any(
-        item.get("factor") == "paper_training_current_edge_basis"
-        for item in decision.adjustments
-    )
+    assert decision.final_integer_leverage == 1
+    assert decision.policy_provenance["production_eligible"] is False
+    assert "positive_fee_after_return_missing" in decision.reasons
 
 
-def test_paper_training_without_current_raw_edge_fails_closed() -> None:
+def test_retired_training_execution_scope_fails_closed() -> None:
     decision = DynamicLeverageAllocator().allocate(
         _input(
             policy_scope="paper_training",
             expected_net_return_pct=-0.35,
             return_lcb_pct=-0.55,
-            training_edge_return_pct=None,
         )
     )
 
     assert decision.final_integer_leverage == 1
     assert decision.policy_provenance["production_eligible"] is False
-    assert "paper_training_current_edge_missing" in decision.reasons
+    assert "execution_policy_scope_invalid" in decision.reasons

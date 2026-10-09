@@ -37,95 +37,54 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import and_, or_, select  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from scripts.train_local_ai_tools_models import (  # noqa: E402
     _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE,
-    _compact_local_ai_tools_features,
+    _compact_training_shadow_sample,
     _completed_shadow_sample_count,
     _load_shadow_samples,
     _load_trade_samples,
     _shadow_sample_columns,
     _shadow_sample_from_mapping,
-    _snapshot,
 )
 from services.local_ai_training_contract import (  # noqa: E402
     LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
     TRAINING_CURSOR_VERSION,
     TRAINING_DISTRIBUTION_PROFILE_VERSION,
-    authoritative_cost_training_identity,
     local_ai_training_cursor,
     market_training_identity,
 )
+from services.ml_training_dataset import probe_authoritative_trade_training_cursor  # noqa: E402
 from services.training_data_quality import (  # noqa: E402
     annotate_sample,
     annotate_training_payload,
 )
-from services.training_epoch import load_training_epoch_start  # noqa: E402
+from services.training_epoch import load_training_data_start  # noqa: E402
 
 CursorCounter = Callable[[], Awaitable[int]]
 SampleLoader = Callable[[], Awaitable[list[dict[str, Any]]]]
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if math.isfinite(parsed) else default
-
-
 def _compact_shadow_sample(mapping: Any) -> dict[str, Any] | None:
     """Build the same bounded shadow row used by the full training loader."""
 
-    row = _shadow_sample_from_mapping(mapping)
-    features = _snapshot(row.get("features"))
-    if not features:
-        return None
-    features.setdefault("symbol", row.get("symbol"))
-    features.setdefault("decision_confidence", _safe_float(row.get("decision_confidence")))
-    features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
-    compact_features = _compact_local_ai_tools_features(features)
-    if not compact_features:
-        return None
-    return {
-        "id": int(row.get("id") or 0),
-        "decision_id": int(row.get("decision_id") or 0) or None,
-        "label_version": str(row.get("label_version") or ""),
-        "symbol": row.get("symbol"),
-        "analysis_type": row.get("analysis_type"),
-        "decision_action": row.get("decision_action"),
-        "decision_confidence": _safe_float(row.get("decision_confidence")),
-        "horizon_minutes": int(row.get("horizon_minutes") or 10),
-        "features": compact_features,
-        "long_return_pct": _safe_float(row.get("long_return_pct")),
-        "short_return_pct": _safe_float(row.get("short_return_pct")),
-        "label_timestamp": row.get("label_timestamp"),
-        "best_action": row.get("best_action"),
-        "missed_opportunity": bool(row.get("missed_opportunity")),
-    }
+    return _compact_training_shadow_sample(_shadow_sample_from_mapping(mapping))
 
 
 async def _iter_shadow_samples_stream():
     """Yield bounded shadow rows page-by-page instead of materializing history."""
 
-    epoch_start = load_training_epoch_start()
+    epoch_start = load_training_data_start()
     before_id: int | None = None
     filters = (
         ShadowBacktest.status == "completed",
         ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
-        or_(
-            ShadowBacktest.decision_action.in_(["long", "short"]),
-            and_(
-                ShadowBacktest.missed_opportunity.is_(True),
-                ShadowBacktest.best_action.in_(["long", "short"]),
-            ),
-        ),
     )
     while True:
         async with get_read_session_ctx() as session:
@@ -170,12 +129,6 @@ def _duplicate_metadata(sample: dict[str, Any], seen: dict[tuple[int, int, str],
     return result
 
 
-def _shadow_group_key(sample: dict[str, Any]) -> str:
-    decision_id = int(sample.get("decision_id") or 0)
-    sample_id = int(sample.get("id") or 0)
-    return f"shadow_decision:{decision_id or sample_id}"
-
-
 async def _streaming_cursor_probe() -> dict[str, Any]:
     """Compute the canonical cursor in one bounded-memory database pass."""
 
@@ -209,26 +162,9 @@ async def _streaming_cursor_probe() -> dict[str, Any]:
             stats[1] += numeric
             stats[2] += numeric * numeric
 
-    trade_samples = await _load_trade_samples()
-    trade_payload = annotate_training_payload(
-        shadow_samples=[],
-        trade_samples=trade_samples,
-        sequence_samples=[],
-        text_sentiment_samples=[],
-    )
-    cost_count = 0
-    cost_groups: set[str] = set()
-    for sample in trade_payload["trade_samples"]:
-        identity = authoritative_cost_training_identity(sample)
-        if identity is None:
-            continue
-        cost_count += 1
-        cost_groups.add(str(identity["decision_group"]))
-        numeric = float(identity["execution_cost_pct"])
-        stats = profile_stats["authoritative_execution_cost_pct"]
-        stats[0] += 1.0
-        stats[1] += numeric
-        stats[2] += numeric * numeric
+    # A cursor detects changed settlement facts; only the fitting loader may
+    # reconstruct outcomes and report eligible trade/cost sample counts.
+    trade_probe = await probe_authoritative_trade_training_cursor()
 
     profile: dict[str, dict[str, float | int]] = {}
     for key, (count, total, square_total) in profile_stats.items():
@@ -241,11 +177,10 @@ async def _streaming_cursor_probe() -> dict[str, Any]:
         "version": TRAINING_CURSOR_VERSION,
         "training_transport_version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
         "completed_market_sample_count": market_count,
-        "completed_trade_sample_count": len(trade_payload["trade_samples"]),
-        "completed_authoritative_cost_sample_count": cost_count,
         "completed_market_decision_group_count": len(market_groups),
-        "completed_authoritative_cost_decision_group_count": len(cost_groups),
-        "completed_training_decision_group_count": len(market_groups | cost_groups),
+        "completed_training_decision_group_count": len(market_groups),
+        "authoritative_trade_training_probe": trade_probe,
+        "cursor_count_scope": "clean_market_groups_and_settlement_fact_fingerprint",
         "training_distribution_profile": {
             "version": TRAINING_DISTRIBUTION_PROFILE_VERSION,
             "features": profile,

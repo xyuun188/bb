@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from services.local_ai_training_contract import (
     COST_MODEL_VERSION,
     RETURN_LABEL_VERSION,
@@ -234,6 +236,39 @@ def test_training_trigger_scales_batches_and_cools_down_drift_retraining() -> No
     assert within_cooldown["effective_batch_decision_group_threshold"] == 1001
     assert after_cooldown["reason"] == "distribution_drift_with_new_labels"
     assert after_cooldown["minimum_retraining_interval_elapsed"] is True
+
+
+@pytest.mark.parametrize(
+    ("completed_group_count", "completed_sample_count"),
+    [(90, 1000), (100, 900)],
+)
+def test_rebased_cursor_does_not_repeat_training_during_cooldown(
+    completed_group_count, completed_sample_count
+) -> None:
+    now = datetime(2026, 10, 9, 14, tzinfo=UTC)
+    common = {
+        "force": False,
+        "has_artifact": True,
+        "completed_group_count": completed_group_count,
+        "previous_group_count": 100,
+        "completed_sample_count": completed_sample_count,
+        "previous_sample_count": 1000,
+        "now": now,
+        "distribution_drift": {"detected": False},
+        "batch_threshold": 50,
+        "minimum_increment": 10,
+        "drift_minimum_increment": 10,
+        "maximum_interval_seconds": 86400,
+        "minimum_retraining_interval_seconds": 21600,
+    }
+    recent = decision_group_training_trigger(
+        **common, trained_at=(now - timedelta(minutes=30)).isoformat()
+    )
+    due = decision_group_training_trigger(
+        **common, trained_at=(now - timedelta(hours=7)).isoformat()
+    )
+    assert recent["reason"] == "not_due"
+    assert due["reason"] == "training_view_rebased"
 
 
 def test_training_trigger_runs_for_large_clean_sample_growth_without_new_groups() -> None:

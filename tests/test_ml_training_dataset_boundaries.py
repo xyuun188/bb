@@ -7,6 +7,7 @@ def test_ml_training_dataset_owns_database_access_functions() -> None:
         "count_shadow_training_rows",
         "count_shadow_training_decision_groups",
         "load_authoritative_trade_training_samples",
+        "probe_authoritative_trade_training_cursor",
         "select_shadow_training_rows",
     }
 

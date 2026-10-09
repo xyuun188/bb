@@ -314,6 +314,46 @@ async def test_stale_registry_keeps_last_known_good_during_background_refresh(
     await model_training_status.shutdown_model_training_status_tasks()
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_cached_registry_refreshes_scheduler_without_changing_artifact_cache(monkeypatch, stale):
+    snapshot = {
+        "models": [{
+            "model_id": "local_ml_profit_quality",
+            "trainable": True,
+            "trained_at": "2026-09-15T00:00:00+00:00",
+            "last_training_attempt_error": "MemoryError",
+            "last_successful_training_at": "2026-09-15T00:00:00+00:00",
+        }],
+        "scheduler_state": {"status": "error"},
+    }
+    live = {
+        "status": "ok",
+        "models": {
+            "local_ml_profit_quality": {
+                "state": "succeeded",
+                "last_successful_training_at": "2026-10-09T13:56:44+00:00",
+                "last_training_attempt_state": "succeeded",
+                "last_training_attempt_error": None,
+            },
+        },
+    }
+    age = model_training_status._REGISTRY_CACHE_TTL_SECONDS + 1 if stale else 0
+    monkeypatch.setattr(model_training_status, "_registry_cache", (time.monotonic() - age, snapshot))
+    monkeypatch.setattr(
+        model_training_status, "MODEL_TRAINING_STATE_STORE",
+        type("Store", (), {"read": lambda self: live})(),
+    )
+
+    payload = model_training_status._cached_registry(include_stale=True)
+
+    assert payload["scheduler_state"]["status"] == "ok"
+    assert payload["models"][0]["last_successful_training_at"] == "2026-10-09T13:56:44+00:00"
+    assert payload["models"][0]["last_training_attempt_error"] is None
+    assert payload["models"][0]["artifact_trained_at"] == "2026-09-15T00:00:00+00:00"
+    assert snapshot["scheduler_state"]["status"] == "error"
+    assert snapshot["models"][0]["last_training_attempt_error"] == "MemoryError"
+
+
 @pytest.mark.asyncio
 async def test_model_observability_serves_stale_snapshot_while_refreshing(
     monkeypatch: pytest.MonkeyPatch,

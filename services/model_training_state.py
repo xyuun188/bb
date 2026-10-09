@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from services.local_ai_training_contract import (
     LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
@@ -30,7 +31,6 @@ LOCAL_AI_TOOL_MODEL_IDS = (
 )
 ALL_TRAINABLE_MODEL_IDS = LOCAL_ML_MODEL_IDS + LOCAL_AI_TOOL_MODEL_IDS
 MAX_HISTORY_EVENTS = 30
-WRITE_LOCK_STALE_SECONDS = 30.0
 WRITE_LOCK_WAIT_SECONDS = 3.0
 INTERRUPTED_RETRY_INTERVAL_SECONDS = 5 * 60
 RESOURCE_ERROR_RETRY_DELAYS_SECONDS = (5 * 60, 15 * 60, 30 * 60, 60 * 60, 3 * 60 * 60)
@@ -48,8 +48,12 @@ _TRANSIENT_ERROR_MARKERS = (
     "statement timeout",
     "deadlock detected",
     "could not serialize access",
+    "model training state write lock timed out",
 )
 _RESOURCE_ERROR_MARKERS = (
+    "resource_memory",
+    "resource_error",
+    "brokenprocesspool",
     "memoryerror",
     "out of memory",
     "oom",
@@ -58,6 +62,24 @@ _RESOURCE_ERROR_MARKERS = (
     "training_process_interrupted",
     "training process interrupted",
 )
+TRAINING_FAILURE_REASONS = frozenset(
+    {
+        "error",
+        "invalid_training_response",
+        "load_samples_error",
+        "timeout",
+        "resource_memory",
+        "resource_error",
+    }
+)
+
+
+def training_result_failed(result: dict[str, Any]) -> bool:
+    """Keep timer exits, retry cadence and persisted failure state consistent."""
+
+    return not bool(result.get("trained")) and bool(
+        result.get("error") or str(result.get("reason") or "") in TRAINING_FAILURE_REASONS
+    )
 
 
 def training_input_fingerprint(value: Any) -> str:
@@ -82,6 +104,7 @@ def training_input_fingerprint(value: Any) -> str:
             "training_distribution_profile",
             "training_transport_version",
             "cursor_policy",
+            "authoritative_trade_training_probe",
         )
         if key in payload
     }
@@ -220,6 +243,28 @@ def _fresh_state(now: datetime) -> dict[str, Any]:
     }
 
 
+def _bounded_training_diagnostic(value: Any, *, depth: int = 0) -> Any:
+    """Keep scheduling state separate from full artifact evaluation reports."""
+
+    if isinstance(value, dict):
+        if depth >= 8:
+            return {"summary_only": True, "item_count": len(value)}
+        return {
+            str(key): _bounded_training_diagnostic(item, depth=depth + 1)
+            for key, item in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple)):
+        if depth >= 8:
+            return {"summary_only": True, "item_count": len(value)}
+        return [
+            _bounded_training_diagnostic(item, depth=depth + 1)
+            for item in value[:16]
+        ]
+    if isinstance(value, str):
+        return value[:1000]
+    return value
+
+
 def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
     payload = result if isinstance(result, dict) else {}
     keys = (
@@ -241,6 +286,9 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "new_shadow_sample_count",
         "new_trade_sample_count",
         "completed_training_decision_group_count",
+        "completed_market_decision_group_count",
+        "authoritative_trade_training_probe",
+        "cursor_count_scope",
         "last_trained_completed_training_decision_group_count",
         "completed_shadow_raw_decision_group_count",
         "last_trained_completed_shadow_raw_decision_group_count",
@@ -290,8 +338,9 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(value, dict) and key in {
             "quality_report", "governance_report", "metrics", "sample_cursor",
             "training_policy",
+            "authoritative_trade_training_probe",
         }:
-            summary[key] = value
+            summary[key] = _bounded_training_diagnostic(value)
         elif isinstance(value, str):
             summary[key] = value[:1000]
         elif isinstance(value, (bool, int, float)):
@@ -357,7 +406,16 @@ def training_timeline(row: Any) -> dict[str, Any]:
             attempt_at = event["at"]
     attempt_state = state.get("last_training_attempt_state")
     attempt_error = state.get("last_training_attempt_error")
-    if not attempt_state and outcome_event is not None:
+    event_at = _parse_datetime((outcome_event or {}).get("at"))
+    started_at = _parse_datetime(attempt_at)
+    completed_running_attempt = bool(
+        attempt_state == "running"
+        and outcome_event is not None
+        and outcome_event.get("event") != "started"
+        and event_at is not None
+        and (started_at is None or event_at >= started_at)
+    )
+    if (not attempt_state or completed_running_attempt) and outcome_event is not None:
         attempt_state = attempt_states[outcome_event["event"]]
         attempt_error = outcome_event.get("error")
     success_at = state.get("last_successful_training_at")
@@ -451,54 +509,58 @@ class ModelTrainingStateStore:
             payload["error"] = "state_version_unsupported"
         payload.setdefault("schedulers", {})
         payload.setdefault("models", {})
+        for row in payload["models"].values():
+            if not isinstance(row, dict):
+                continue
+            for field in ("last_result", "last_successful_result"):
+                if isinstance(row.get(field), dict):
+                    row[field] = _result_summary(row[field])
+            if row.get("last_training_attempt_state") == "running":
+                timeline = training_timeline(row)
+                row["last_training_attempt_state"] = timeline["latest_training_attempt_state"]
+                row["last_training_attempt_error"] = timeline["latest_training_attempt_error"]
         return payload
 
-    def _acquire_write_lock(self) -> str:
+    def _acquire_write_lock(self) -> BinaryIO:
         self.lock_dir.mkdir(parents=True, exist_ok=True)
-        token = uuid.uuid4().hex
+        descriptor = os.open(self.write_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+        if os.name == "nt" and self.write_lock_path.stat().st_size == 0:
+            handle.write(b"0")
         deadline = time.monotonic() + WRITE_LOCK_WAIT_SECONDS
-        while True:
-            try:
-                descriptor = os.open(
-                    self.write_lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-            except FileExistsError:
-                try:
-                    age = max(time.time() - self.write_lock_path.stat().st_mtime, 0.0)
-                except FileNotFoundError:
-                    continue
-                if age > WRITE_LOCK_STALE_SECONDS:
-                    try:
-                        self.write_lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("model training state write lock timed out") from None
-                time.sleep(0.02)
-                continue
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(token)
-            return token
-
-    def _release_write_lock(self, token: str) -> None:
         try:
-            current = self.write_lock_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
-            return
-        if current == token:
-            try:
-                self.write_lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return handle
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("model training state write lock timed out") from None
+                    time.sleep(0.02)
+        except BaseException:
+            handle.close()
+            raise
+
+    def _release_write_lock(self, handle: BinaryIO) -> None:
+        # Closing releases the kernel lock, including after process termination.
+        # Never unlink the shared inode while another writer may be waiting.
+        handle.close()
 
     def _write(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
             encoding="utf-8",
         )
         os.replace(temporary, self.path)
@@ -759,16 +821,7 @@ class ModelTrainingStateStore:
         reason = str(summary.get("reason") or "unknown")
         trained = bool(summary.get("trained"))
         error = str(summary.get("error") or "")
-        failed = bool(
-            error
-            or reason
-            in {
-                "error",
-                "load_samples_error",
-                "timeout",
-                "resource_blocked",
-            }
-        )
+        failed = training_result_failed(summary) or reason == "resource_blocked"
         failure_class = classify_training_failure(summary)
         input_fingerprint = next(
             (
@@ -887,7 +940,7 @@ class ModelTrainingStateStore:
         reason = str(summary.get("reason") or "external_training")
         trained = bool(summary.get("trained"))
         error = str(summary.get("error") or "")
-        failed = bool(error or reason in {"error", "load_samples_error", "timeout", "resource_blocked"})
+        failed = training_result_failed(summary) or reason == "resource_blocked"
         failure_class = classify_training_failure(summary)
         state = "succeeded" if trained else "failed" if failed else "skipped"
         input_fingerprint = next(
@@ -1142,9 +1195,22 @@ class ModelTrainingStateStore:
                 "force": bool(force),
             }
 
+        # ``next_check_at`` is a retry backoff only for failed/interrupted
+        # runs.  A normal ``skipped`` result (for example, waiting for a
+        # mature train/holdout partition) must be re-evaluated on the next
+        # scheduler tick so its canonical cursors can decide whether it is
+        # still not due.  Treating every scheduled check as a failure hides
+        # new labels behind ``retry_backoff_active`` and prevents that
+        # decision from being made.
         future_checks = [
             parsed
-            for parsed in (_parse_datetime(row.get("next_check_at")) for row in rows)
+            for row in rows
+            if (
+                str(row.get("state") or "") in {"failed", "interrupted", "resource_blocked"}
+                or str(row.get("failure_class") or "").strip()
+                in {"transient", "resource"}
+            )
+            for parsed in (_parse_datetime(row.get("next_check_at")),)
             if parsed is not None and parsed > now_ts
         ]
         if future_checks and not force:
@@ -1198,6 +1264,8 @@ class ModelTrainingStateStore:
                     row["next_check_at"] = _iso(next_check_at)
                     row["resource_failure_count"] = resource_failure_count
                     row["resource_error_class"] = "resource"
+                    row["last_training_attempt_state"] = row["state"]
+                    row["last_training_attempt_error"] = "training_process_interrupted"
                     row["resource_circuit_open_until"] = (
                         _iso(next_check_at) if row.get("state") == "resource_blocked" else None
                     )
@@ -1229,6 +1297,8 @@ class ModelTrainingStateStore:
                         "state": state,
                         "last_finished_at": _iso(now),
                         "last_error": "training_process_interrupted",
+                        "last_training_attempt_state": state,
+                        "last_training_attempt_error": "training_process_interrupted",
                         "active_run_id": None,
                         "active_sample_cursor": None,
                         "next_check_at": _iso(next_check_at),

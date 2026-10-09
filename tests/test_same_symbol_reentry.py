@@ -133,7 +133,7 @@ def test_reentry_does_not_treat_decision_timestamp_as_market_evidence() -> None:
     assert result.decision_evidence_source == "decision.timestamp"
 
 
-def test_negative_lcb_is_allowed_only_for_explicit_quality_observation() -> None:
+def test_negative_lcb_never_authorizes_reentry_even_for_quality_observation() -> None:
     now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
 
     observation = SameSymbolReentryGuard.assess(
@@ -159,8 +159,9 @@ def test_negative_lcb_is_allowed_only_for_explicit_quality_observation() -> None
         now=now,
     )
 
-    assert observation.allowed is True
-    assert observation.opportunity_contract_consistent is True
+    assert observation.allowed is False
+    assert observation.opportunity_contract_consistent is False
+    assert observation.reason == "entry_opportunity_contract_inconsistent"
     assert invalid.allowed is False
     assert invalid.reason == "entry_opportunity_contract_inconsistent"
 
