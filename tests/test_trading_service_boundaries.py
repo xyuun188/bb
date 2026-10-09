@@ -3447,6 +3447,40 @@ async def test_local_ai_tools_training_uses_framed_result_after_stdout_logs(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_training_preserves_structured_failure_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    class FakeProcess:
+        returncode = 2
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON="
+                b'{"trained":false,"reason":"resource_error","error":"MemoryError"}\n',
+                b"traceback tail",
+            )
+
+    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        trading_service.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await service._run_local_ai_tools_training_subprocess()
+
+    assert result == {
+        "trained": False,
+        "reason": "resource_error",
+        "error": "MemoryError",
+    }
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_training_requires_framed_machine_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

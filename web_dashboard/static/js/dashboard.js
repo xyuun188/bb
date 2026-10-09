@@ -11738,7 +11738,13 @@ function renderMLSignalOverview() {
                 ? '模型服务在线，当前显示最近一次成功状态。'
             : '暂时无法取得模型状态，系统正在自动重试。')
         : (ready ? (status.live_ml_ready === true ? '实盘候选已就绪' : '实盘未晋升') : unavailableReason);
-    const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
+    const latestTraining = status.latest_training || {};
+    const latestAttemptAt = status.latest_training_attempt_at;
+    const successfulTrainingAt = status.latest_training_success_at || status.latest_training_at || latestTraining.trained_at;
+    const trainedAt = latestAttemptAt ? toBeijingTime(latestAttemptAt) : '-';
+    const attemptStates = { running: '训练中', succeeded: '训练完成', failed: '训练失败', resource_blocked: '资源退避', interrupted: '训练中断', skipped: '未触发训练' };
+    const attemptState = attemptStates[status.latest_training_attempt_state] || '状态未提供';
+    const attemptError = status.latest_training_attempt_error;
     const samples = mlSampleCounts();
     const readiness = status.readiness || {};
     const readinessMetrics = readiness.metrics || {};
@@ -11821,7 +11827,10 @@ function renderMLSignalOverview() {
             ${mlMetricCard('当前新增待训练样本', mlSampleCountLabel(samples.newCount), status.sample_count_blocker || (samples.completedMl !== null && samples.trainedCursor !== null ? `当前干净完成 ${samples.completedMl} - 最近已训练游标 ${samples.trainedCursor}` : '等待当前干净样本总数与最近训练游标'), status.sample_count_blocker ? 'bad' : (Number(samples.newCount || 0) > 0 ? 'warn' : 'muted'))}
             ${mlMetricCard('最近预测', latestText, latestPrediction ? `${mlSideLabel(latestPrediction.best_side)} ${distributionSummaryText(latestDistribution)}` : '等待新分析', latestDistribution && Number(latestDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn')}
             ${mlMetricCard('正目标期望数量', `${strongSignals} / ${records.length}`, '最近记录里标准合同目标期望为正且有收益差的数量', strongSignals ? 'warn' : 'muted')}
-            ${mlMetricCard('训练时间', trainedAt, status.version ? `版本 ${String(status.version).slice(0, 10)}` : '', 'muted')}
+            ${mlMetricCard('最近自动检查', status.latest_training_check_at ? toBeijingTime(status.latest_training_check_at) : '-', status.latest_training_check_reason === 'not_due' ? '未达到新增成熟样本或重训间隔条件' : (status.latest_training_check_reason || '等待调度记录'), 'muted')}
+            ${mlMetricCard('最近训练尝试', trainedAt, latestAttemptAt ? `${attemptState}${attemptError ? `：${attemptError}` : ''}` : '暂无实际训练尝试记录', attemptError ? 'warn' : 'muted')}
+            ${mlMetricCard('最近成功训练', successfulTrainingAt ? toBeijingTime(successfulTrainingAt) : '-', latestTraining.champion_retained ? '候选已训练；未通过晋升，当前使用模型保持不变' : '训练完成不等于已获实盘权限', 'muted')}
+            ${mlMetricCard('当前 Champion 时间', status.trained_at ? toBeijingTime(status.trained_at) : '-', status.version ? `版本 ${String(status.version).slice(0, 10)}` : '当前生产/模拟 Champion 制品时间', 'muted')}
             ${mlMetricCard('质量契约版本', readinessMetrics.required_training_data_version || status.quality_report?.required_training_data_version || status.quality_report?.data_quality_version || '证据缺失', '当前训练和晋升必须满足的质量门禁', readinessMetrics.required_training_data_version ? 'good' : 'warn')}
             ${mlMetricCard('当前 Champion 训练数据版本', readinessMetrics.training_data_version || '证据缺失', `目标 ${readinessMetrics.required_training_data_version || status.quality_report?.data_quality_version || '证据缺失'}`, readinessMetrics.training_data_version && readinessMetrics.training_data_version === (readinessMetrics.required_training_data_version || status.quality_report?.data_quality_version) ? 'good' : 'warn')}
             ${mlMetricCard('训练窗口配置', samples.limit === null ? '未公开' : String(samples.limit), '这是训练数据窗口，不是收益、仓位或生产准入阈值', 'muted')}

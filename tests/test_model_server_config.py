@@ -533,4 +533,4 @@ async def test_ml_signal_status_uses_live_completed_total_not_artifact_total(
     assert result["completed_shadow_sample_count"] == 2492
     assert result["last_trained_completed_shadow_sample_count"] == 2359
     assert result["new_shadow_sample_count"] == 133
-    assert result["completed_shadow_sample_count_source"] == "current_training_epoch"
+    assert result["completed_shadow_sample_count_source"] == "canonical_clean_training_scope"

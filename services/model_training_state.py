@@ -14,6 +14,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from services.local_ai_training_contract import (
+    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
+)
+
 MODEL_TRAINING_STATE_VERSION = "2026-07-12.v1"
 LOCAL_ML_MODEL_IDS = ("local_ml_profit_quality",)
 LOCAL_AI_TOOL_MODEL_IDS = (
@@ -29,9 +33,22 @@ MAX_HISTORY_EVENTS = 30
 WRITE_LOCK_STALE_SECONDS = 30.0
 WRITE_LOCK_WAIT_SECONDS = 3.0
 INTERRUPTED_RETRY_INTERVAL_SECONDS = 5 * 60
-RESOURCE_ERROR_RETRY_DELAYS_SECONDS = (5 * 60, 15 * 60, 60 * 60, 3 * 60 * 60, 6 * 60 * 60)
+RESOURCE_ERROR_RETRY_DELAYS_SECONDS = (5 * 60, 15 * 60, 30 * 60, 60 * 60, 3 * 60 * 60)
 RESOURCE_ERROR_CIRCUIT_THRESHOLD = 3
 RESOURCE_ERROR_CIRCUIT_OPEN_SECONDS = 6 * 60 * 60
+TRANSIENT_ERROR_RETRY_SECONDS = 5 * 60
+_TRANSIENT_ERROR_MARKERS = (
+    "connectiondoesnotexist",
+    "connection was closed",
+    "server closed the connection",
+    "connection reset",
+    "connection aborted",
+    "querycancelederror",
+    "canceling statement due to statement timeout",
+    "statement timeout",
+    "deadlock detected",
+    "could not serialize access",
+)
 _RESOURCE_ERROR_MARKERS = (
     "memoryerror",
     "out of memory",
@@ -63,6 +80,7 @@ def training_input_fingerprint(value: Any) -> str:
             "completed_market_decision_group_count",
             "completed_authoritative_cost_decision_group_count",
             "training_distribution_profile",
+            "training_transport_version",
             "cursor_policy",
         )
         if key in payload
@@ -73,6 +91,10 @@ def training_input_fingerprint(value: Any) -> str:
             for key in sorted(payload)
             if key in {"reason", "trained", "error"}
         }
+    normalized["training_transport_version"] = str(
+        payload.get("training_transport_version")
+        or LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+    )
     return hashlib.sha256(
         json.dumps(
             normalized,
@@ -89,7 +111,12 @@ def classify_training_failure(
     *,
     error: str | None = None,
 ) -> str:
-    """Classify failures that should consume the resource circuit budget."""
+    """Classify training failures as resource, transient, or functional.
+
+    Database/network interruptions are retryable service failures. They must
+    not consume the memory/resource circuit budget, otherwise one dropped
+    PostgreSQL connection can suppress training for six hours.
+    """
 
     payload = result if isinstance(result, dict) else {}
     reason = str(payload.get("reason") or "").lower()
@@ -102,6 +129,8 @@ def classify_training_failure(
             error,
         )
     ).lower()
+    if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
+        return "transient"
     if any(marker in text for marker in _RESOURCE_ERROR_MARKERS):
         return "resource"
     return "functional"
@@ -203,6 +232,7 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "shadow_sample_count",
         "trade_sample_count",
         "completed_shadow_sample_count",
+        "completed_sample_count",
         "last_trained_completed_shadow_sample_count",
         "last_trained_completed_sample_count",
         "completed_trade_sample_count",
@@ -234,6 +264,14 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         "model_version",
         "model_stage",
         "promotion_flow",
+        "training_mode",
+        "training_policy",
+        "challenger_version",
+        "champion_version",
+        "challenger_rejected",
+        "champion_retained",
+        "promotion_ready",
+        "data_quality_version",
         "sample_cursor",
         "quality_report",
         "governance_report",
@@ -249,13 +287,97 @@ def _result_summary(result: dict[str, Any] | None) -> dict[str, Any]:
         value = payload.get(key)
         if value is None:
             continue
-        if isinstance(value, dict) and key in {"quality_report", "governance_report", "metrics", "sample_cursor"}:
+        if isinstance(value, dict) and key in {
+            "quality_report", "governance_report", "metrics", "sample_cursor",
+            "training_policy",
+        }:
             summary[key] = value
         elif isinstance(value, str):
             summary[key] = value[:1000]
         elif isinstance(value, (bool, int, float)):
             summary[key] = value
     return summary
+
+
+def _successful_training_cursor(summary: dict[str, Any]) -> dict[str, int]:
+    """Preserve explicit zero cursors instead of substituting fitting counts."""
+
+    fields = {
+        "shadow": (
+            "last_trained_completed_shadow_sample_count",
+            "last_trained_completed_sample_count",
+            "completed_shadow_sample_count",
+            "completed_sample_count",
+        ),
+        "trade": (
+            "last_trained_completed_trade_sample_count",
+            "completed_trade_sample_count",
+        ),
+        "decision_group": (
+            "last_trained_completed_training_decision_group_count",
+            "completed_training_decision_group_count",
+        ),
+    }
+    cursor = {}
+    for axis, keys in fields.items():
+        value = next((summary[key] for key in keys if summary.get(key) is not None), None)
+        if value is not None:
+            cursor[axis] = max(int(value), 0)
+    return cursor
+
+
+def training_timeline(row: Any) -> dict[str, Any]:
+    """Separate scheduler checks from fitting attempts and successful training."""
+
+    state = row if isinstance(row, dict) else {}
+    history = state.get("history")
+    history = history if isinstance(history, list) else []
+    attempt_at = state.get("last_started_at")
+    outcome_event = None
+    attempt_states = {
+        "started": "running",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "resource_blocked": "resource_blocked",
+        "interrupted": "interrupted",
+        "external_succeeded": "succeeded",
+        "external_failed": "failed",
+    }
+    for event in history:
+        if not isinstance(event, dict) or not event.get("at"):
+            continue
+        event_name = event.get("event")
+        if event_name not in attempt_states:
+            continue
+        if outcome_event is None or str(event["at"]) > str(outcome_event["at"]):
+            outcome_event = event
+        if event_name in {"started", "external_succeeded", "external_failed"} and (
+            not attempt_at or str(event["at"]) > str(attempt_at)
+        ):
+            attempt_at = event["at"]
+    attempt_state = state.get("last_training_attempt_state")
+    attempt_error = state.get("last_training_attempt_error")
+    if not attempt_state and outcome_event is not None:
+        attempt_state = attempt_states[outcome_event["event"]]
+        attempt_error = outcome_event.get("error")
+    success_at = state.get("last_successful_training_at")
+    if not attempt_state and success_at and (
+        not attempt_at or str(success_at) >= str(attempt_at)
+    ):
+        attempt_state = "succeeded"
+        attempt_at = attempt_at or success_at
+    last_result = state.get("last_result")
+    last_result = last_result if isinstance(last_result, dict) else {}
+    return {
+        "latest_training_check_at": state.get("last_check_at"),
+        "latest_training_check_state": state.get("state"),
+        "latest_training_check_reason": last_result.get("reason"),
+        "latest_training_attempt_at": attempt_at,
+        "latest_training_attempt_state": attempt_state,
+        "latest_training_attempt_error": attempt_error,
+        "latest_training_success_at": success_at,
+        "latest_training_next_check_at": state.get("next_check_at"),
+    }
 
 
 @dataclass
@@ -477,6 +599,7 @@ class ModelTrainingStateStore:
         timed_out_models: list[str] = []
         models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
         failed_model_ids: list[str] = []
+        transient_failed_model_ids: list[str] = []
         interrupted_model_ids: list[str] = []
         model_state_counts: dict[str, int] = {}
         for model_id, raw in models.items():
@@ -486,6 +609,12 @@ class ModelTrainingStateStore:
             model_state_counts[state] = model_state_counts.get(state, 0) + 1
             if state == "failed":
                 failed_model_ids.append(str(model_id))
+                failure_class = str(raw.get("failure_class") or "").lower()
+                if failure_class == "transient" or classify_training_failure(
+                    raw.get("last_result") if isinstance(raw.get("last_result"), dict) else None,
+                    error=str(raw.get("last_error") or ""),
+                ) == "transient":
+                    transient_failed_model_ids.append(str(model_id))
             elif state == "interrupted":
                 interrupted_model_ids.append(str(model_id))
             if state != "running":
@@ -502,15 +631,20 @@ class ModelTrainingStateStore:
         payload["timed_out_model_ids"] = timed_out_models
         payload["training_timeout_exceeded"] = bool(timed_out_models)
         payload["failed_model_ids"] = sorted(failed_model_ids)
+        payload["transient_failed_model_ids"] = sorted(transient_failed_model_ids)
         payload["interrupted_model_ids"] = sorted(interrupted_model_ids)
         payload["unhealthy_model_ids"] = sorted(
             set(failed_model_ids) | set(interrupted_model_ids) | set(timed_out_models)
         )
         payload["model_state_counts"] = dict(sorted(model_state_counts.items()))
         payload["model_state_healthy"] = not payload["unhealthy_model_ids"]
-        if failed_model_ids:
+        hard_failed_model_ids = sorted(
+            set(failed_model_ids) - set(transient_failed_model_ids)
+        )
+        payload["hard_failed_model_ids"] = hard_failed_model_ids
+        if hard_failed_model_ids:
             payload["status"] = "error"
-        elif interrupted_model_ids or timed_out_models:
+        elif transient_failed_model_ids or interrupted_model_ids or timed_out_models:
             payload["status"] = "warning"
         return payload
 
@@ -598,6 +732,8 @@ class ModelTrainingStateStore:
                         "owner_host": self.hostname,
                     }
                 )
+                row["last_training_attempt_state"] = "running"
+                row["last_training_attempt_error"] = None
                 self._append_history(
                     row,
                     {
@@ -681,7 +817,11 @@ class ModelTrainingStateStore:
                         )
                 else:
                     resource_failure_count = 0
-                    effective_next_check_at = next_check_at
+                    effective_next_check_at = (
+                        now + timedelta(seconds=TRANSIENT_ERROR_RETRY_SECONDS)
+                        if failed and failure_class == "transient"
+                        else next_check_at
+                    )
                 row.update(
                     {
                         "scheduler_id": scheduler_id,
@@ -698,7 +838,10 @@ class ModelTrainingStateStore:
                         "active_run_id": None,
                         "active_sample_cursor": None,
                         "retry_count": retry_count + 1 if failed else 0,
-                        "resource_error_class": failure_class if failed else None,
+                        "failure_class": failure_class if failed else None,
+                        "resource_error_class": (
+                            "resource" if failed and failure_class == "resource" else None
+                        ),
                         "resource_failure_count": resource_failure_count,
                         "resource_failure_fingerprint": input_fingerprint
                         or previous_fingerprint
@@ -711,21 +854,11 @@ class ModelTrainingStateStore:
                 )
                 if trained:
                     row["last_successful_training_at"] = _iso(now)
-                cursor = {
-                    "shadow": summary.get("last_trained_completed_shadow_sample_count")
-                    or summary.get("last_trained_completed_sample_count")
-                    or summary.get("completed_shadow_sample_count"),
-                    "trade": summary.get("last_trained_completed_trade_sample_count")
-                    or summary.get("completed_trade_sample_count"),
-                    "decision_group": summary.get(
-                        "last_trained_completed_training_decision_group_count"
-                    )
-                    or summary.get("completed_training_decision_group_count"),
-                }
-                if trained:
-                    row["sample_cursor"] = {
-                        key: int(value) for key, value in cursor.items() if value is not None
-                    }
+                    row["last_successful_result"] = summary
+                    row["sample_cursor"] = _successful_training_cursor(summary)
+                if started or trained or failed:
+                    row["last_training_attempt_state"] = effective_state
+                    row["last_training_attempt_error"] = error or None
                 self._append_history(
                     row,
                     {
@@ -755,6 +888,7 @@ class ModelTrainingStateStore:
         trained = bool(summary.get("trained"))
         error = str(summary.get("error") or "")
         failed = bool(error or reason in {"error", "load_samples_error", "timeout", "resource_blocked"})
+        failure_class = classify_training_failure(summary)
         state = "succeeded" if trained else "failed" if failed else "skipped"
         input_fingerprint = next(
             (
@@ -778,11 +912,20 @@ class ModelTrainingStateStore:
                         "last_run_id": str(run_id),
                         "last_result": summary,
                         "last_error": error or None,
-                        "next_check_at": _iso(next_check_at),
+                        "next_check_at": _iso(
+                            now + timedelta(seconds=TRANSIENT_ERROR_RETRY_SECONDS)
+                            if failed and failure_class == "transient"
+                            else next_check_at
+                        ),
                         "active_run_id": None,
                         "active_sample_cursor": None,
                         "retry_count": 0 if trained else int(row.get("retry_count") or 0),
-                        "resource_error_class": None if trained else classify_training_failure(summary),
+                        "failure_class": None if trained else failure_class,
+                        "resource_error_class": (
+                            "resource"
+                            if not trained and classify_training_failure(summary) == "resource"
+                            else None
+                        ),
                         "resource_failure_count": 0 if trained else int(row.get("resource_failure_count") or 0),
                         "resource_failure_fingerprint": input_fingerprint if not trained else None,
                         "resource_circuit_open_until": None if trained else row.get("resource_circuit_open_until"),
@@ -790,17 +933,11 @@ class ModelTrainingStateStore:
                 )
                 if trained:
                     row["last_successful_training_at"] = _iso(now)
-                    cursor = {
-                        "shadow": summary.get("last_trained_completed_shadow_sample_count")
-                        or summary.get("completed_shadow_sample_count"),
-                        "trade": summary.get("last_trained_completed_trade_sample_count")
-                        or summary.get("completed_trade_sample_count"),
-                        "decision_group": summary.get("last_trained_completed_training_decision_group_count")
-                        or summary.get("completed_training_decision_group_count"),
-                    }
-                    row["sample_cursor"] = {
-                        key: int(value) for key, value in cursor.items() if value is not None
-                    }
+                    row["last_successful_result"] = summary
+                    row["sample_cursor"] = _successful_training_cursor(summary)
+                if trained or failed:
+                    row["last_training_attempt_state"] = state
+                    row["last_training_attempt_error"] = error or None
                 self._append_history(
                     row,
                     {

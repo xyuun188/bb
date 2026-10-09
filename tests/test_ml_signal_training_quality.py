@@ -2145,7 +2145,9 @@ async def test_ml_signal_not_due_uses_lightweight_cursor_without_loading_full_wi
 
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: metadata  # type: ignore[method-assign]
-    service._training_cursor_metadata = lambda current: current  # type: ignore[method-assign]
+    service._training_cursor_metadata = (  # type: ignore[method-assign]
+        lambda current: current
+    )
     monkeypatch.setattr(
         "services.ml_signal_service.build_ml_readiness_report",
         lambda _metadata, _influence: {
@@ -2212,7 +2214,7 @@ async def test_rejected_challenger_contract_and_cursor_prevent_rapid_retraining(
     service = MLSignalService(
         artifact_registry=SimpleNamespace(
             model_root=tmp_path / "model_artifacts",
-            resolve_challenger=lambda: challenger,
+            resolve_challenger=lambda load_bundle=False: challenger,
         ),
         training_state_store=ModelTrainingStateStore(tmp_path / "training_state.json"),
     )

@@ -62,6 +62,7 @@ from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
     training_input_fingerprint,
+    training_timeline,
 )
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
@@ -2927,6 +2928,17 @@ class MLSignalService:
             }
         metadata = _safe_dict(resolved.manifest)
         activation = _safe_dict(resolved.activation_manifest)
+        latest_metadata = self._training_cursor_metadata(metadata)
+        latest_training = {
+            "trained_at": latest_metadata.get("trained_at"),
+            "artifact_version": latest_metadata.get("artifact_version")
+            or latest_metadata.get("version"),
+            "sample_cursor": {
+                "shadow": latest_metadata.get("last_trained_completed_shadow_sample_count"),
+                "trade": latest_metadata.get("last_trained_completed_trade_sample_count"),
+            },
+            "champion_retained": latest_metadata != metadata,
+        }
         influence = _influence_policy(metadata)
         readiness = build_ml_readiness_report(metadata, influence)
         influence, readiness = _activation_gated_policy(
@@ -2946,6 +2958,10 @@ class MLSignalService:
             "model_path": str(resolved.model_path),
             "artifact_registry": self.artifact_registry.status_metadata(),
             **metadata,
+            "latest_training": latest_training,
+            "latest_training_at": latest_training["trained_at"],
+            "latest_training_artifact_version": latest_training["artifact_version"],
+            "latest_training_shadow_cursor": latest_training["sample_cursor"]["shadow"],
             "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
             "artifact_activation_manifest": activation,
             "readiness_state": readiness.get("state"),
@@ -3670,6 +3686,9 @@ class MLSignalService:
                     trained_influence,
                 )
                 candidate_result_evidence = {
+                    "trained_at": trained_metadata.get("trained_at"),
+                    "last_trained_completed_shadow_sample_count": completed_count,
+                    "last_trained_completed_trade_sample_count": completed_trade_count,
                     "preflight_candidate_readiness": preflight_candidate_readiness,
                     "candidate_readiness": trained_readiness,
                     "preflight_candidate_influence_policy": candidate_influence,
@@ -4804,6 +4823,7 @@ class MLSignalService:
         row = models.get(LOCAL_ML_MODEL_IDS[0]) if isinstance(models, dict) else {}
         row = row if isinstance(row, dict) else {}
         return {
+            **training_timeline(row),
             "auto_train_enabled": True,
             "auto_train_check_interval_seconds": AUTO_TRAIN_CHECK_INTERVAL_SECONDS,
             "auto_train_trigger": (
@@ -4853,7 +4873,7 @@ class MLSignalService:
         if not callable(resolve_challenger):
             return selected
         try:
-            challenger = resolve_challenger()
+            challenger = resolve_challenger(load_bundle=False)
         except Exception as exc:
             logger.warning(
                 "failed to resolve rejected ML challenger cursor",
@@ -4888,11 +4908,13 @@ class MLSignalService:
             challenger_raw_group_cursor,
             challenger_cursor,
             challenger_trade_cursor,
+            str(challenger_metadata.get("trained_at") or ""),
         ) > (
             current_group_cursor,
             current_raw_group_cursor,
             current_cursor,
             current_trade_cursor,
+            str(selected.get("trained_at") or ""),
         ):
             return challenger_metadata
         return selected

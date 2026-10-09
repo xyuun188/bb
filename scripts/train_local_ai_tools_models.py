@@ -50,7 +50,10 @@ from scripts.run_phase3_paper_resume_observation import (
 )
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.execution_cost_model import round_trip_fee_pct  # noqa: E402
-from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX  # noqa: E402
+from services.local_ai_training_contract import (  # noqa: E402
+    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
+    LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
+)
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
@@ -75,12 +78,12 @@ load_training_epoch_start = load_training_data_start
 
 _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
-_REMOTE_TRAINING_TRANSPORT_VERSION = "2026-08-14.bounded-training-transport.v1"
-_REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 2_048
-_REMOTE_TRAINING_MAX_TRADE_SAMPLES = 512
-_REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 128
-_REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 256
-_REMOTE_TRAINING_MAX_TEXT_SAMPLES = 512
+_REMOTE_TRAINING_TRANSPORT_VERSION = LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+_REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 512
+_REMOTE_TRAINING_MAX_TRADE_SAMPLES = 128
+_REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 32
+_REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 128
+_REMOTE_TRAINING_MAX_TEXT_SAMPLES = 128
 _SEQUENCE_ROWS_PER_SERIES_LIMIT = _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
@@ -1055,7 +1058,10 @@ async def _load_sequence_samples() -> list[dict[str, Any]]:
             closes.append(_as_float(row.get("close")))
             volumes.append(_as_float(row.get("volume")))
     flush_series()
-    return samples
+    # Keep the local process bounded by the same transport contract used for
+    # the model-server request.  Loading every historical series here defeats
+    # the remote payload limit and was the source of repeatable trainer OOMs.
+    return _evenly_spaced_rows(samples, _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES)
 
 
 def _lock_file(handle: TextIO) -> None:
@@ -1100,50 +1106,83 @@ def _symbols_from_json(value: Any) -> list[str]:
 async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
     epoch_start = load_training_data_start()
     async with get_session_ctx() as session:
-        news_stmt = select(NewsArticle).order_by(
+        # Text is auxiliary supervision.  Bound the database result before
+        # materializing rows; limiting only after ``scalars().all()`` still
+        # loads the entire news/social history and can exhaust the trainer.
+        news_stmt = select(
+            NewsArticle.source,
+            NewsArticle.title,
+            NewsArticle.summary,
+            NewsArticle.sentiment_score,
+            NewsArticle.symbols_mentioned,
+            NewsArticle.published_at,
+        ).order_by(
             NewsArticle.published_at.desc().nullslast(), NewsArticle.id.desc()
         )
-        social_stmt = select(SocialPost).order_by(
+        social_stmt = select(
+            SocialPost.platform,
+            SocialPost.content,
+            SocialPost.sentiment_score,
+            SocialPost.engagement_count,
+            SocialPost.symbols,
+            SocialPost.posted_at,
+        ).order_by(
             SocialPost.posted_at.desc().nullslast(), SocialPost.id.desc()
         )
-        news_stmt = news_stmt.where(NewsArticle.published_at >= epoch_start)
-        social_stmt = social_stmt.where(SocialPost.posted_at >= epoch_start)
+        news_stmt = news_stmt.where(
+            NewsArticle.published_at >= epoch_start
+        ).limit(_REMOTE_TRAINING_MAX_TEXT_SAMPLES)
+        social_stmt = social_stmt.where(
+            SocialPost.posted_at >= epoch_start
+        ).limit(_REMOTE_TRAINING_MAX_TEXT_SAMPLES)
         news_result = await session.execute(news_stmt)
         social_result = await session.execute(social_stmt)
-        news_rows = list(news_result.scalars().all())
-        social_rows = list(social_result.scalars().all())
+        news_rows = list(news_result.mappings().all())
+        social_rows = list(social_result.mappings().all())
 
     samples: list[dict[str, Any]] = []
     for news_row in news_rows:
-        text = " ".join(part for part in [news_row.title, news_row.summary] if part)
+        text = " ".join(
+            part for part in [news_row.get("title"), news_row.get("summary")] if part
+        )
         if not text.strip():
             continue
         samples.append(
             {
                 "source": "news",
-                "platform": news_row.source,
+                "platform": news_row.get("source"),
                 "text": text[:1200],
-                "sentiment_score": _as_float(news_row.sentiment_score),
-                "symbols": _symbols_from_json(news_row.symbols_mentioned),
-                "created_at": news_row.published_at.isoformat() if news_row.published_at else None,
+                "sentiment_score": _as_float(news_row.get("sentiment_score")),
+                "symbols": _symbols_from_json(news_row.get("symbols_mentioned")),
+                "created_at": (
+                    news_row.get("published_at").isoformat()
+                    if news_row.get("published_at")
+                    else None
+                ),
             }
         )
     for social_row in social_rows:
-        text = str(social_row.content or "").strip()
+        text = str(social_row.get("content") or "").strip()
         if not text:
             continue
         samples.append(
             {
                 "source": "social",
-                "platform": social_row.platform,
+                "platform": social_row.get("platform"),
                 "text": text[:1200],
-                "sentiment_score": _as_float(social_row.sentiment_score),
-                "engagement_count": int(social_row.engagement_count or 0),
-                "symbols": _symbols_from_json(social_row.symbols),
-                "created_at": social_row.posted_at.isoformat() if social_row.posted_at else None,
+                "sentiment_score": _as_float(social_row.get("sentiment_score")),
+                "engagement_count": int(social_row.get("engagement_count") or 0),
+                "symbols": _symbols_from_json(social_row.get("symbols")),
+                "created_at": (
+                    social_row.get("posted_at").isoformat()
+                    if social_row.get("posted_at")
+                    else None
+                ),
             }
         )
-    return samples
+    # Text is auxiliary supervision; retain a deterministic chronological
+    # sample instead of materializing an unbounded news/social history.
+    return _evenly_spaced_rows(samples, _REMOTE_TRAINING_MAX_TEXT_SAMPLES)
 
 
 async def _main() -> None:
@@ -1293,6 +1332,35 @@ async def _run_cli() -> None:
 
     try:
         await _main()
+    except MemoryError:
+        safe_print(
+            LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
+            + json.dumps(
+                {
+                    "trained": False,
+                    "reason": "resource_error",
+                    "error": "MemoryError",
+                    "training_process_isolated": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+    except Exception as exc:
+        # Always emit the structured frame consumed by the scheduler.  A bare
+        # traceback makes the scheduler classify the run as an opaque failure
+        # and leaves the dashboard without a retryable result.
+        safe_print(
+            LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX
+            + json.dumps(
+                {
+                    "trained": False,
+                    "reason": "error",
+                    "error": safe_error_text(exc, limit=700),
+                    "training_process_isolated": True,
+                },
+                ensure_ascii=False,
+            )
+        )
     finally:
         # The scheduler invokes this module in an isolated worker thread.  The
         # asyncpg pool is bound to that thread's event loop and must be

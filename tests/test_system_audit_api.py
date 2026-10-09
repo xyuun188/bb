@@ -1673,6 +1673,60 @@ async def test_phase3_paper_resume_observation_audit_reuses_fresh_timer_report(
 
 
 @pytest.mark.asyncio
+async def test_phase3_paper_resume_observation_audit_force_live_bypasses_timer_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(minutes=2)
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "critical",
+        "read_only": True,
+        "audit_only": True,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "paper_active": True,
+        "blockers": [{"code": "stale_old_observation"}],
+        "warnings": [],
+        "summary": {},
+    }
+
+    monkeypatch.setattr(
+        system_audit,
+        "_read_latest_phase3_report",
+        lambda _path: dict(persisted),
+    )
+
+    class FreshLiveProbe:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def report(self) -> dict[str, Any]:
+            return {
+                "status": "healthy",
+                "read_only": True,
+                "audit_only": True,
+                "starts_trading_service": False,
+                "submits_orders": False,
+                "paper_active": True,
+                "blockers": [],
+                "warnings": [],
+                "summary": {},
+            }
+
+    monkeypatch.setattr(
+        system_audit,
+        "Phase3PaperResumeObservationService",
+        FreshLiveProbe,
+    )
+
+    card = await system_audit._phase3_paper_resume_observation_audit(force_live=True)
+
+    assert card["status"] == "ok"
+    assert card["details"]["report_source"] == "live_probe"
+    assert card["details"]["report_refresh_reason"] == "explicit_fresh_system_audit"
+
+
+@pytest.mark.asyncio
 async def test_model_training_runtime_probe_rechecks_transient_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

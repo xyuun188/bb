@@ -6,6 +6,7 @@ import pytest
 
 from scripts import run_local_ai_tools_training_cursors as script
 from services.local_ai_training_contract import (
+    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
     TRAINING_CURSOR_VERSION,
     TRAINING_DISTRIBUTION_PROFILE_VERSION,
 )
@@ -111,6 +112,7 @@ async def test_run_once_returns_canonical_training_cursors(
     assert result["completed_shadow_sample_count"] == 14
     assert result["completed_trade_sample_count"] == 2
     assert result["version"] == TRAINING_CURSOR_VERSION
+    assert result["training_transport_version"] == LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
     assert result["completed_market_sample_count"] == 3
     assert result["completed_authoritative_cost_sample_count"] == 2
     assert result["completed_market_decision_group_count"] == 2

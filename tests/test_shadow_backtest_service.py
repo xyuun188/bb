@@ -824,6 +824,88 @@ async def test_shadow_backtest_market_facts_are_deduplicated_per_symbol() -> Non
 
 
 @pytest.mark.asyncio
+async def test_shadow_backtest_uses_historical_due_at_path_without_current_quote() -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=97,
+        decision_id=997,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        decision_action="long",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        due_at=datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC),
+        feature_snapshot={
+            "market_fact": _market_fact("BTC/USDT", 100.0, _ENTRY_TIMESTAMP_MS),
+        },
+    )
+    repo.due_rows = [row]
+    current_fact_calls = 0
+    historical_calls: list[tuple[str, datetime, int]] = []
+
+    async def current_fact(_symbol: str) -> dict[str, Any]:
+        nonlocal current_fact_calls
+        current_fact_calls += 1
+        return _market_fact("BTC/USDT", 999.0, _RESULT_TIMESTAMP_MS)
+
+    async def historical_path(
+        symbol: str,
+        _entry_fact: dict[str, Any],
+        due_at: datetime,
+        horizon: int,
+    ) -> dict[str, Any]:
+        historical_calls.append((symbol, due_at, horizon))
+        entry_fact = _market_fact(symbol, 100.0, _ENTRY_TIMESTAMP_MS)
+        result_fact = _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS)
+        return {
+            "result_fact": result_fact,
+            "price_path": {
+                "status": "clean",
+                "path_low": 99.0,
+                "path_high": 101.0,
+                "_ordered_bar_ranges": [],
+            },
+            "market_fact_contract": {
+                "version": "2026-09-14",
+                "status": "historical_ohlcv_only",
+                "provenance": {"strategy_version": "historical-v1"},
+                "entry_fact": entry_fact,
+                "result_fact": result_fact,
+            },
+            "training_market_fact_contract": {
+                "version": "2026-09-14",
+                "status": "historical_ohlcv_only",
+                "path_status": "clean",
+            },
+        }
+
+    service = ShadowBacktestService(
+        latest_price_provider=lambda _symbol: _completed_float(999.0),
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=_SessionCtx,
+        repository_factory=lambda _session: repo,
+        latest_market_fact_provider=current_fact,
+        historical_market_path_provider=historical_path,
+        horizons_minutes=(10,),
+    )
+
+    assert await service.update_due() == 1
+    assert current_fact_calls == 0
+    assert historical_calls == [
+        ("BTC/USDT", datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC), 10)
+    ]
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
+    assert row.feature_snapshot["historical_market_path_only"] is True
+
+
+async def _completed_float(value: float) -> float:
+    return value
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_path_timeout_falls_back_to_endpoint_prices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

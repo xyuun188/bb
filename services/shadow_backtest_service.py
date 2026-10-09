@@ -55,6 +55,10 @@ SHADOW_RESULT_PATH_RETRY_DELAY_SECONDS = 0.05
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
 PricePathProvider = Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any]]]
+HistoricalMarketPathProvider = Callable[
+    [str, dict[str, Any], datetime, int],
+    Awaitable[dict[str, Any]],
+]
 SymbolNormalizer = Callable[[str | None], str]
 FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
@@ -507,6 +511,7 @@ class ShadowBacktestService:
     execution_cost_facts_provider: ExecutionCostFactsProvider | None = None
     latest_market_fact_provider: LatestMarketFactProvider | None = None
     price_path_provider: PricePathProvider | None = None
+    historical_market_path_provider: HistoricalMarketPathProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
     _market_fact_retry_after: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
@@ -734,11 +739,80 @@ class ShadowBacktestService:
             # ORM context so low-priority shadow maintenance cannot exhaust the pool.
             # Fetch each symbol once and in parallel; the old row-by-row loop made a
             # 25-row batch exceed the 30-second trading-service maintenance budget.
+            historical_outcome_cache: dict[int, dict[str, Any]] = {}
+            historical_rows = (
+                rows if self.historical_market_path_provider is not None else []
+            )
+            historical_path_semaphore = asyncio.Semaphore(
+                max(1, SHADOW_RESULT_PATH_CONCURRENCY)
+            )
+
+            async def fetch_historical_outcome(row: Any) -> tuple[int, dict[str, Any]]:
+                row_id = int(getattr(row, "id", 0) or 0)
+                due_at = getattr(row, "due_at", None)
+                snapshot = getattr(row, "feature_snapshot", None)
+                snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
+                entry_fact = snapshot.get("market_fact")
+                if not isinstance(entry_fact, dict):
+                    entry_fact = build_market_fact(
+                        str(getattr(row, "symbol", "") or ""),
+                        {
+                            **snapshot,
+                            "last_price": self.float_parser(
+                                getattr(row, "entry_price", 0.0), 0.0
+                            ),
+                            "source": "legacy_shadow_entry_snapshot",
+                        },
+                        contract_spec=snapshot.get("contract_spec"),
+                    )
+                if row_id <= 0 or not isinstance(due_at, datetime):
+                    return row_id, {}
+                try:
+                    async with historical_path_semaphore:
+                        outcome = await asyncio.wait_for(
+                            self.historical_market_path_provider(
+                                self.symbol_normalizer(getattr(row, "symbol", ""))
+                                or str(getattr(row, "symbol", "") or ""),
+                                entry_fact,
+                                due_at,
+                                int(getattr(row, "horizon_minutes", 0) or 0),
+                            ),
+                            timeout=SHADOW_RESULT_PATH_TIMEOUT_SECONDS,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "historical shadow market path unavailable",
+                        shadow_backtest_id=row_id,
+                        error=safe_error_text(exc),
+                    )
+                    return row_id, {}
+                return row_id, dict(outcome) if isinstance(outcome, dict) else {}
+
+            if historical_rows:
+                historical_results, historical_timed_out = await _bounded_task_gather(
+                    (fetch_historical_outcome(row) for row in historical_rows),
+                    budget_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                )
+                if historical_timed_out:
+                    logger.warning(
+                        "historical shadow market path batch timed out",
+                        row_count=len(historical_rows),
+                        timeout_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                    )
+                for item in historical_results:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        row_id, outcome = item
+                        if row_id > 0 and isinstance(outcome, dict) and outcome:
+                            historical_outcome_cache[row_id] = outcome
+
             market_fact_cache: dict[str, dict[str, Any]] = {}
             symbols = {
                 self.symbol_normalizer(getattr(row, "symbol", ""))
                 or str(getattr(row, "symbol", "") or "")
                 for row in rows
+                if self.historical_market_path_provider is None
             }
             symbols.discard("")
             fact_semaphore = asyncio.Semaphore(max(1, SHADOW_RESULT_FACT_CONCURRENCY))
@@ -903,9 +977,27 @@ class ShadowBacktestService:
                     return cache_key, verify_market_fact_path(entry_fact, result_fact, [])
 
             path_tasks: list[Awaitable[tuple[tuple[str, int, int], dict[str, Any]]]] = []
-            path_task_rows: list[tuple[Any, str, dict[str, Any], dict[str, Any], tuple[str, int, int]]] = []
+            path_task_rows: list[
+                tuple[Any, str, dict[str, Any], dict[str, Any], tuple[Any, ...]]
+            ] = []
+            scheduled_path_keys: set[tuple[str, int, int]] = set()
             for row in rows:
+                row_id = int(getattr(row, "id", 0) or 0)
                 symbol = self.symbol_normalizer(row.symbol) or row.symbol
+                historical_outcome = historical_outcome_cache.get(row_id)
+                if self.historical_market_path_provider is not None and not historical_outcome:
+                    continue
+                if historical_outcome:
+                    result_fact = historical_outcome.get("result_fact")
+                    price_path = historical_outcome.get("price_path")
+                    if (
+                        isinstance(result_fact, dict)
+                        and isinstance(price_path, dict)
+                    ):
+                        path_task_rows.append(
+                            (row, symbol, {}, result_fact, ("historical", row_id, 0))
+                        )
+                    continue
                 result_fact = market_fact_cache.get(symbol, {})
                 result_prices = (
                     result_fact.get("prices")
@@ -936,7 +1028,8 @@ class ShadowBacktestService:
                 result_ms = int(result_fact.get("source_timestamp_ms") or 0)
                 cache_key = (symbol, entry_ms, result_ms)
                 path_task_rows.append((row, symbol, entry_fact, result_fact, cache_key))
-                if cache_key not in path_cache:
+                if cache_key not in path_cache and cache_key not in scheduled_path_keys:
+                    scheduled_path_keys.add(cache_key)
                     path_tasks.append(fetch_path(row, symbol, entry_fact, result_fact))
             if path_tasks:
                 path_results, paths_timed_out = await _bounded_task_gather(
@@ -978,15 +1071,29 @@ class ShadowBacktestService:
                 feature_snapshot = (
                     dict(feature_snapshot) if isinstance(feature_snapshot, dict) else {}
                 )
-                feature_snapshot.setdefault("market_fact", entry_fact)
-                price_path = path_cache.get(cache_key) or verify_market_fact_path(
-                    entry_fact, result_fact, []
-                )
-                market_contract = build_shadow_market_fact_contract(
-                    entry_fact,
-                    result_fact,
-                    price_path,
-                )
+                historical_outcome = historical_outcome_cache.get(row_id)
+                if historical_outcome:
+                    price_path = dict(historical_outcome.get("price_path") or {})
+                    market_contract = dict(
+                        historical_outcome.get("market_fact_contract") or {}
+                    )
+                    feature_snapshot["historical_market_path_only"] = True
+                    feature_snapshot["historical_shadow_rebuild_version"] = (
+                        market_contract.get("provenance", {}).get("strategy_version")
+                    )
+                    feature_snapshot["training_market_fact_contract"] = (
+                        historical_outcome.get("training_market_fact_contract") or {}
+                    )
+                else:
+                    feature_snapshot.setdefault("market_fact", entry_fact)
+                    price_path = path_cache.get(cache_key) or verify_market_fact_path(
+                        entry_fact, result_fact, []
+                    )
+                    market_contract = build_shadow_market_fact_contract(
+                        entry_fact,
+                        result_fact,
+                        price_path,
+                    )
                 feature_snapshot["market_fact_contract"] = market_contract
                 feature_snapshot["training_market_fact_contract"] = (
                     compact_market_fact_contract(market_contract)

@@ -41,6 +41,8 @@ from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
     LOCAL_ML_MODEL_IDS,
     ModelTrainingStateStore,
+    TRANSIENT_ERROR_RETRY_SECONDS,
+    classify_training_failure,
     training_input_fingerprint,
 )
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -91,6 +93,8 @@ def training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str,
         env[key] = worker_count
     env["BB_TRAINING_MAX_WORKERS"] = worker_count
     env["MALLOC_ARENA_MAX"] = "2"
+    env.setdefault("BB_TRAINING_READ_STATEMENT_TIMEOUT_MS", "120000")
+    env.setdefault("BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS", "180000")
     return env
 
 
@@ -225,12 +229,26 @@ class ModelTrainingCoordinatorMixin:
 
     def _auto_train_failure_delay(self, results: list[dict[str, Any]]) -> float:
         """Back off repeated failures while keeping normal checks on their cadence."""
-        failed = any(
-            str(result.get("reason") or "")
-            in {"error", "invalid_training_response", "load_samples_error", "timeout"}
+        failed_results = [
+            result
             for result in results
             if isinstance(result, dict)
-        )
+            and str(result.get("reason") or "")
+            in {
+                "error",
+                "invalid_training_response",
+                "load_samples_error",
+                "timeout",
+                "resource_error",
+            }
+        ]
+        failed = bool(failed_results)
+        if any(classify_training_failure(result) == "transient" for result in failed_results):
+            # A dropped database connection or cancelled read is recoverable.
+            # Retry it on the short service interval instead of feeding it into
+            # the exponential resource backoff used for genuine OOM failures.
+            self._auto_train_failure_count = 0
+            return float(TRANSIENT_ERROR_RETRY_SECONDS)
         if not failed:
             self._auto_train_failure_count = 0
             return float(AUTO_TRAIN_CHECK_INTERVAL_SECONDS)
@@ -658,6 +676,7 @@ class ModelTrainingCoordinatorMixin:
                 "error",
                 "load_samples_error",
                 "timeout",
+                "resource_error",
             }
             delay = (
                 AUTO_TRAIN_RETRY_INTERVAL_SECONDS if failed else AUTO_TRAIN_CHECK_INTERVAL_SECONDS
@@ -1041,19 +1060,6 @@ class ModelTrainingCoordinatorMixin:
             }
         finally:
             active_processes.discard(process)
-        if process.returncode != 0:
-            return {
-                "trained": False,
-                "reason": "error",
-                "error": safe_error_tail(
-                    stderr.decode("utf-8", errors="replace"),
-                    limit=500,
-                    fallback=(
-                        "isolated local AI tools training exited with code "
-                        f"{process.returncode} without stderr"
-                    ),
-                ),
-            }
         try:
             stdout_text = stdout.decode("utf-8")
             result_frame = next(
@@ -1071,16 +1077,46 @@ class ModelTrainingCoordinatorMixin:
             return {
                 "trained": False,
                 "reason": "invalid_training_response",
-                "error": safe_error_text(exc, limit=180),
+                "error": (
+                    safe_error_text(exc, limit=180)
+                    if process.returncode == 0
+                    else safe_error_tail(
+                        stderr.decode("utf-8", errors="replace"),
+                        limit=500,
+                        fallback=(
+                            "isolated local AI tools training exited with code "
+                            f"{process.returncode} without stderr"
+                        ),
+                    )
+                ),
             }
-        return (
-            dict(payload)
-            if isinstance(payload, dict)
-            else {
+        if not isinstance(payload, dict):
+            return {
                 "trained": False,
                 "reason": "invalid_training_response",
+                "error": (
+                    "isolated local AI tools training result was not an object"
+                ),
             }
-        )
+
+        # The worker deliberately emits a structured failure frame before
+        # exiting non-zero.  Parse that frame first so MemoryError, database
+        # disconnects, and timeouts retain their retry classification instead
+        # of being collapsed into the opaque "no structured result" error.
+        result = dict(payload)
+        if process.returncode != 0 and not str(result.get("error") or "").strip():
+            result["error"] = safe_error_tail(
+                stderr.decode("utf-8", errors="replace"),
+                limit=500,
+                fallback=(
+                    "isolated local AI tools training exited with code "
+                    f"{process.returncode}"
+                ),
+            )
+        result.setdefault("trained", False)
+        if process.returncode != 0:
+            result.setdefault("reason", "error")
+        return result
 
     async def _run_local_ai_tools_training_cursor_subprocess(self) -> dict[str, Any]:
         command = [

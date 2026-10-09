@@ -83,7 +83,11 @@ from services.exchange_position_state import (
 from services.execution_reason_localizer import localize_execution_reason
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
 from services.model_training_registry import build_model_training_registry
-from services.model_training_state import LOCAL_AI_TOOL_MODEL_IDS, ModelTrainingStateStore
+from services.model_training_state import (
+    LOCAL_AI_TOOL_MODEL_IDS,
+    ModelTrainingStateStore,
+    training_timeline,
+)
 from services.observability_contract import build_snapshot, status_from_sections
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
@@ -100,7 +104,11 @@ from services.training_effectiveness_report import (
     report_directory,
     should_preserve_cached_report,
 )
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import (
+    CURRENT_TRAINING_EPOCH_POLICY,
+    load_training_epoch_start,
+    training_data_scope,
+)
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api import model_observability_sections as _model_observability_sections
 from web_dashboard.api.model_training_status import load_model_training_report
@@ -323,6 +331,8 @@ def _compact_training_scheduler_state(value: Any) -> dict[str, Any]:
             "timed_out_model_ids",
             "training_timeout_exceeded",
             "failed_model_ids",
+            "transient_failed_model_ids",
+            "hard_failed_model_ids",
             "interrupted_model_ids",
             "unhealthy_model_ids",
             "model_state_counts",
@@ -362,6 +372,8 @@ def _compact_training_scheduler_state(value: Any) -> dict[str, Any]:
                     "last_started_at",
                     "last_finished_at",
                     "last_successful_training_at",
+                    "last_training_attempt_state",
+                    "last_training_attempt_error",
                     "next_check_at",
                     "last_error",
                     "error",
@@ -372,6 +384,7 @@ def _compact_training_scheduler_state(value: Any) -> dict[str, Any]:
                     "active_sample_cursor",
                     "sample_cursor",
                     "retry_count",
+                    "failure_class",
                     "resource_failure_count",
                     "resource_error_class",
                     "running_age_seconds",
@@ -382,6 +395,10 @@ def _compact_training_scheduler_state(value: Any) -> dict[str, Any]:
             if isinstance(row.get("last_result"), dict):
                 compact["last_result"] = _bounded_dashboard_payload(
                     row["last_result"], max_depth=3, max_items=28, max_text=320
+                )
+            if isinstance(row.get("last_successful_result"), dict):
+                compact["last_successful_result"] = _bounded_dashboard_payload(
+                    row["last_successful_result"], max_depth=3, max_items=40, max_text=320
                 )
             history = row.get("history")
             if isinstance(history, list):
@@ -8454,17 +8471,17 @@ async def _build_ml_signal_status() -> dict[str, Any]:
             )
         completed_total = int(completed_total or 0)
         trained_cursor = _trained_shadow_cursor(status, completed_total)
-        status["training_policy"] = "current_training_epoch_only"
-        status["training_epoch_started_at"] = epoch_started_at
-        status["pre_epoch_data_training_allowed"] = False
+        try:
+            status.update(training_data_scope())
+        except Exception:
+            status["training_epoch_started_at"] = epoch_started_at
         status["artifact_training_shadow_sample_count"] = artifact_training_count
         status["training_shadow_sample_count"] = completed_total
         status["completed_shadow_sample_count"] = completed_total
         status["total_shadow_sample_count"] = completed_total
         status["last_trained_completed_shadow_sample_count"] = trained_cursor
         status["new_shadow_sample_count"] = max(completed_total - trained_cursor, 0)
-        status["completed_shadow_sample_count_source"] = "current_training_epoch"
-        status["training_window_policy"] = "all_current_epoch_cost_complete_samples"
+        status["completed_shadow_sample_count_source"] = "canonical_clean_training_scope"
     except Exception as exc:
         _log_dashboard_fallback("ml signal sample count fallback", exc)
         status["training_shadow_sample_count"] = None
@@ -8595,9 +8612,12 @@ async def get_ml_signal_status():
 
 
 def _trained_shadow_cursor(status: dict[str, Any], completed_total: int) -> int:
-    """Return the explicit current-epoch cursor; stale values fail closed to zero."""
+    """Use the evaluated training cursor, not just the retained Champion."""
 
-    cursor = _optional_non_negative_int(status.get("last_trained_completed_shadow_sample_count"))
+    value = status.get("latest_training_shadow_cursor")
+    if value is None:
+        value = status.get("last_trained_completed_shadow_sample_count")
+    cursor = _optional_non_negative_int(value)
     return cursor if cursor is not None and cursor <= completed_total else 0
 
 
@@ -8722,20 +8742,24 @@ async def get_local_ai_tools_status():
                 0,
             )
             artifact_trade_count = _safe_int_value(status.get("trade_sample_count"), 0)
-            # Training counters remain useful even before the epoch marker has
-            # been initialized (for example during a fresh deployment).  Read
-            # the marker independently so one missing diagnostic cannot erase
-            # the rest of the stable status contract.
+            # Counters are supplemental diagnostics. Read the canonical scope
+            # so the dashboard and trainer expose the same approved history.
             try:
-                epoch_started_at = load_training_epoch_start().isoformat()
+                scope = training_data_scope()
             except Exception as exc:
-                _log_dashboard_fallback("local ai training epoch marker fallback", exc)
-                epoch_started_at = None
+                _log_dashboard_fallback("local ai training data scope fallback", exc)
+                scope = {
+                    "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+                    "training_epoch_started_at": None,
+                    "pre_epoch_data_training_allowed": False,
+                    "training_data_started_at": None,
+                    "historical_migration_status": "unavailable",
+                    "approved_sample_counts": {},
+                    "approved_sample_count_total": 0,
+                }
             status.update(
                 {
-                    "training_policy": "current_training_epoch_only",
-                    "training_epoch_started_at": epoch_started_at,
-                    "pre_epoch_data_training_allowed": False,
+                    **scope,
                     "shadow_sample_count": int(completed_shadow_count),
                     "completed_shadow_sample_count": int(completed_shadow_count),
                     "training_shadow_sample_count": int(completed_shadow_count),
@@ -8745,8 +8769,8 @@ async def get_local_ai_tools_status():
                     "training_trade_sample_count": int(completed_trade_count),
                     "artifact_training_shadow_sample_count": artifact_shadow_count,
                     "artifact_training_trade_sample_count": artifact_trade_count,
-                    "training_sample_source": "current_training_epoch",
-                    "training_window_policy": "all_current_epoch_cost_complete_samples",
+                    "training_sample_source": "canonical_clean_training_scope",
+                    "training_window_policy": CURRENT_TRAINING_EPOCH_POLICY,
                 }
             )
         except TimeoutError:
@@ -8773,7 +8797,8 @@ async def get_local_ai_tools_status():
         # return-quality governance; hiding it made the UI look untrained.
         training_rows = [
             row
-            for row in scheduler_models.values()
+            for model_id in LOCAL_AI_TOOL_MODEL_IDS
+            for row in [scheduler_models.get(model_id)]
             if isinstance(row, dict) and row.get("last_successful_training_at")
         ]
         training_rows.sort(
@@ -8781,7 +8806,27 @@ async def get_local_ai_tools_status():
             reverse=True,
         )
         latest_row = training_rows[0] if training_rows else None
-        latest_result = latest_row.get("last_result") if isinstance(latest_row, dict) else {}
+        attempt_rows = [
+            row
+            for model_id in LOCAL_AI_TOOL_MODEL_IDS
+            for row in [scheduler_models.get(model_id)]
+            if isinstance(row, dict)
+            and (
+                training_timeline(row).get("latest_training_attempt_at")
+            )
+        ]
+        attempt_rows.sort(
+            key=lambda row: str(
+                training_timeline(row).get("latest_training_attempt_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        latest_attempt_row = attempt_rows[0] if attempt_rows else None
+        latest_result = latest_row.get("last_successful_result") if isinstance(latest_row, dict) else {}
+        if not isinstance(latest_result, dict) and latest_row:
+            result = latest_row.get("last_result")
+            latest_result = result if isinstance(result, dict) and result.get("trained") else {}
         latest_result = latest_result if isinstance(latest_result, dict) else {}
         latest_governance = latest_result.get("governance_report")
         latest_governance = latest_governance if isinstance(latest_governance, dict) else {}
@@ -8807,13 +8852,36 @@ async def get_local_ai_tools_status():
             "artifact_version": latest_artifact_version,
             "data_quality_version": latest_quality_version,
             "training_mode": latest_result.get("training_mode") or "walk_forward",
+            "reason": latest_result.get("reason"),
+            "champion_retained": bool(latest_result.get("champion_retained")),
+            "challenger_rejected": bool(latest_result.get("challenger_rejected")),
             "promotion_blocked": bool(
+                latest_result.get("challenger_rejected")
+                or latest_result.get("reason") == "trained_challenger_rejected"
+                or
                 latest_result.get("promotion_ready") is False
                 or latest_result.get("live_ml_ready") is False
                 or latest_governance.get("blocked_reason_count")
             ),
             "sample_cursor": latest_row.get("sample_cursor") if latest_row else None,
         }
+        status.update(training_timeline(latest_attempt_row))
+        status["latest_training_success_at"] = (
+            latest_row.get("last_successful_training_at") if latest_row else None
+        )
+        check_rows = [
+            row for model_id in LOCAL_AI_TOOL_MODEL_IDS
+            for row in [scheduler_models.get(model_id)]
+            if isinstance(row, dict) and row.get("last_check_at")
+        ]
+        latest_check = max(check_rows, key=lambda row: str(row["last_check_at"]), default=None)
+        if latest_check:
+            check_timeline = training_timeline(latest_check)
+            for field in (
+                "latest_training_check_at", "latest_training_check_state",
+                "latest_training_check_reason", "latest_training_next_check_at",
+            ):
+                status[field] = check_timeline[field]
         status["latest_training_data_quality_version"] = latest_quality_version
         status["latest_training_artifact_version"] = latest_artifact_version
         status["latest_training_at"] = (

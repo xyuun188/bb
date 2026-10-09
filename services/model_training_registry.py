@@ -865,6 +865,8 @@ def _attach_scheduler_timestamps(
     rows: list[dict[str, Any]],
     scheduler_state: dict[str, Any],
 ) -> None:
+    from services.model_training_state import training_timeline
+
     model_states = _safe_dict(scheduler_state.get("models"))
     schedulers = _safe_dict(scheduler_state.get("schedulers"))
     for row in rows:
@@ -875,11 +877,11 @@ def _attach_scheduler_timestamps(
         row["last_successful_training_at"] = state.get(
             "last_successful_training_at"
         ) or (row.get("trained_at") if row.get("trainable") else None)
-        row["last_training_attempt_at"] = (
-            state.get("last_started_at")
-            or state.get("last_check_at")
-            or state.get("last_finished_at")
-        )
+        timeline = training_timeline(state)
+        row["last_training_attempt_at"] = timeline["latest_training_attempt_at"]
+        row["last_training_attempt_state"] = timeline["latest_training_attempt_state"]
+        row["last_training_attempt_error"] = timeline["latest_training_attempt_error"]
+        row["last_training_check_at"] = timeline["latest_training_check_at"]
         row["next_training_check_at"] = state.get("next_check_at")
         row["scheduler_heartbeat_at"] = state.get("scheduler_heartbeat_at") or scheduler.get(
             "heartbeat_at"

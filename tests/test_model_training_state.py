@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from services.ml_signal_service import MLSignalService
+from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 from services.model_artifact_registry import ModelArtifactRegistry
 from services.model_training_state import (
     LOCAL_AI_TOOL_MODEL_IDS,
@@ -13,6 +14,7 @@ from services.model_training_state import (
     MODEL_TRAINING_STATE_VERSION,
     ModelTrainingStateStore,
     training_input_fingerprint,
+    training_timeline,
 )
 
 
@@ -59,6 +61,23 @@ def test_training_input_fingerprint_changes_with_canonical_cursor() -> None:
 
     assert first == same
     assert changed != first
+
+
+def test_training_input_fingerprint_includes_current_transport_contract() -> None:
+    cursor = {
+        "reason": "cursor_probe_complete",
+        "completed_shadow_sample_count": 100,
+    }
+    current = training_input_fingerprint(cursor)
+    changed_transport = training_input_fingerprint(
+        {
+            **cursor,
+            "training_transport_version": "retired-transport",
+        }
+    )
+
+    assert current != changed_transport
+    assert LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 
 
 def test_state_persists_auditable_timeline_for_each_model(tmp_path) -> None:
@@ -156,6 +175,68 @@ def test_external_training_result_updates_scheduler_state_and_cursor(tmp_path) -
             "decision_group": 128,
         }
         assert row["history"][-1]["event"] == "external_succeeded"
+
+
+def test_training_timeline_separates_check_attempt_success_and_champion() -> None:
+    row = {
+        "last_check_at": "2026-10-08T23:59:37+00:00",
+        "state": "succeeded",
+        "last_result": {
+            "trained": False,
+            "reason": "not_due",
+        },
+        "last_started_at": "2026-10-08T23:59:30+00:00",
+        "last_training_attempt_state": "succeeded",
+        "last_training_attempt_error": None,
+        "last_successful_training_at": "2026-10-08T23:58:00+00:00",
+        "next_check_at": "2026-10-09T00:29:37+00:00",
+        "history": [
+            {
+                "event": "started",
+                "at": "2026-10-08T23:57:50+00:00",
+            },
+            {
+                "event": "external_succeeded",
+                "at": "2026-10-08T23:58:00+00:00",
+            },
+        ],
+    }
+
+    timeline = training_timeline(row)
+
+    assert timeline["latest_training_check_at"] == "2026-10-08T23:59:37+00:00"
+    assert timeline["latest_training_check_reason"] == "not_due"
+    assert timeline["latest_training_attempt_at"] == "2026-10-08T23:59:30+00:00"
+    assert timeline["latest_training_success_at"] == "2026-10-08T23:58:00+00:00"
+    assert timeline["latest_training_next_check_at"] == "2026-10-09T00:29:37+00:00"
+
+
+def test_rejected_challenger_is_recorded_as_successful_training(tmp_path) -> None:
+    now = [datetime(2026, 10, 8, 23, 59, 37, tzinfo=UTC)]
+    store = ModelTrainingStateStore(
+        tmp_path / "model_training_state.json",
+        now_provider=lambda: now[0],
+    )
+
+    store.record_external_result(
+        scheduler_id="local_ai_tools_auto_train",
+        model_ids=LOCAL_AI_TOOL_MODEL_IDS,
+        run_id="external-rejected-20261008",
+        result={
+            "trained": True,
+            "reason": "trained_challenger_rejected",
+            "challenger_rejected": True,
+            "champion_retained": True,
+            "artifact_persisted": True,
+        },
+        next_check_at=now[0] + timedelta(minutes=30),
+    )
+
+    row = store.read()["models"][LOCAL_AI_TOOL_MODEL_IDS[0]]
+    timeline = training_timeline(row)
+
+    assert timeline["latest_training_success_at"] == now[0].isoformat()
+    assert row["last_successful_result"]["reason"] == "trained_challenger_rejected"
 
 
 def test_resource_failures_backoff_and_open_circuit_until_input_changes(tmp_path) -> None:

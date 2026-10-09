@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -11,7 +9,6 @@ from typing import Any
 
 from sqlalchemy import exists, func, select
 
-from core.market_facts import MARKET_FACT_CONTRACT_VERSION
 from core.training_contracts import (
     HISTORICAL_SHADOW_REBUILD_VERSION,
     HISTORICAL_SHADOW_SOURCE,
@@ -24,6 +21,11 @@ from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.market_data import Kline
 from services.shadow_backtest_service import shadow_path_labels
+from services.historical_shadow_contract import (
+    build_historical_market_contract,
+    build_historical_market_fact,
+    compact_historical_market_contract,
+)
 
 DEFAULT_HISTORICAL_HORIZONS_MINUTES = (5, 15, 60, 240)
 
@@ -48,100 +50,6 @@ def _minute(value: datetime) -> datetime:
 
 def _timestamp_ms(value: datetime) -> int:
     return int(_as_utc(value).timestamp() * 1000)
-
-
-def _historical_fact(symbol: str, bar: dict[str, Any], *, role: str) -> dict[str, Any]:
-    close = float(bar["close"])
-    return {
-        "schema_version": "historical_ohlcv_fact.v1",
-        "symbol": symbol,
-        "native_identity": {"symbol": symbol, "source": "market_klines", "timeframe": "1m"},
-        "source_interface": "stored_market_klines",
-        "source_endpoint": "market_klines",
-        "source_channel": "1m",
-        "source_timestamp_ms": _timestamp_ms(bar["open_time"]),
-        "received_at": _as_utc(bar["open_time"]).isoformat(),
-        "prices": {"last": close, "open": float(bar["open"]), "high": float(bar["high"]), "low": float(bar["low"])},
-        "liquidity": {"notional_24h_usdt": 0.0, "volume_24h_contracts": 0.0, "volume_24h_base": float(bar["volume"])},
-        "stale": False,
-        "role": role,
-    }
-
-
-def _historical_market_contract(
-    *,
-    symbol: str,
-    entry_fact: dict[str, Any],
-    result_fact: dict[str, Any],
-    bars: list[dict[str, Any]],
-) -> dict[str, Any]:
-    path = {
-        "version": "historical_ohlcv_path.v1",
-        "status": "clean",
-        "identity_match": True,
-        "source": HISTORICAL_SHADOW_SOURCE,
-        "symbol": symbol,
-        "timeframe": "1m",
-        "entry_timestamp_ms": entry_fact["source_timestamp_ms"],
-        "result_timestamp_ms": result_fact["source_timestamp_ms"],
-        "bar_count": len(bars),
-        "expected_bar_count": len(bars),
-        "path_low": min(float(bar["low"]) for bar in bars),
-        "path_high": max(float(bar["high"]) for bar in bars),
-        "_ordered_bar_ranges": [
-            {"timestamp_ms": _timestamp_ms(bar["open_time"]), "open": bar["open"], "high": bar["high"], "low": bar["low"], "close": bar["close"]}
-            for bar in bars
-        ],
-    }
-    fingerprint_payload = {
-        "version": HISTORICAL_SHADOW_REBUILD_VERSION,
-        "symbol": symbol,
-        "entry_timestamp_ms": entry_fact["source_timestamp_ms"],
-        "result_timestamp_ms": result_fact["source_timestamp_ms"],
-        "bars": [
-            [
-                _timestamp_ms(bar["open_time"]),
-                bar["open"],
-                bar["high"],
-                bar["low"],
-                bar["close"],
-                bar["volume"],
-            ]
-            for bar in bars
-        ],
-    }
-    data_fingerprint = hashlib.sha256(
-        json.dumps(
-            fingerprint_payload,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    return {
-        "version": MARKET_FACT_CONTRACT_VERSION,
-        "status": "historical_ohlcv_only",
-        "violation_count": 0,
-        "violation_reasons": [],
-        "assertions": {
-            "native_instrument_identity_verified": True,
-            "same_contract_price_path_verified": True,
-            "executable_market_fact_verified": False,
-        },
-        "entry_fact": entry_fact,
-        "result_fact": result_fact,
-        "price_path": path,
-        "provenance": {
-            "source": HISTORICAL_SHADOW_SOURCE,
-            "observation_window": {"start": entry_fact["received_at"], "end": result_fact["received_at"]},
-            "sample_count": len(bars),
-            "effective_sample_size": 1.0,
-            "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": HISTORICAL_SHADOW_REBUILD_VERSION,
-            "fallback_reason": "historical_ohlcv_has_no_historical_orderbook",
-            "data_fingerprint": data_fingerprint,
-        },
-    }
 
 
 def build_historical_shadow_sample(
@@ -171,9 +79,14 @@ def build_historical_shadow_sample(
     result_price = _finite_float(window[-1]["close"], None)
     if entry_price is None or result_price is None or entry_price <= 0 or result_price <= 0:
         return None
-    entry_fact = _historical_fact(symbol, window[0], role="entry")
-    result_fact = _historical_fact(symbol, window[-1], role="result")
-    contract = _historical_market_contract(symbol=symbol, entry_fact=entry_fact, result_fact=result_fact, bars=window)
+    entry_fact = build_historical_market_fact(symbol, window[0], role="entry")
+    result_fact = build_historical_market_fact(symbol, window[-1], role="result")
+    contract = build_historical_market_contract(
+        symbol=symbol,
+        entry_fact=entry_fact,
+        result_fact=result_fact,
+        bars=window,
+    )
     path_labels = shadow_path_labels(
         entry_price=entry_price,
         price_path=contract["price_path"],
@@ -191,17 +104,7 @@ def build_historical_shadow_sample(
         "historical_shadow_rebuild_version": HISTORICAL_SHADOW_REBUILD_VERSION,
         "market_fact": entry_fact,
         "market_fact_contract": contract,
-        "training_market_fact_contract": {
-            "version": contract["version"],
-            "status": contract["status"],
-            "native_instrument_identity_verified": True,
-            "same_contract_price_path_verified": True,
-            "executable_market_fact_verified": False,
-            "source": HISTORICAL_SHADOW_SOURCE,
-            "path_status": "clean",
-            "path_fingerprint": contract["provenance"]["data_fingerprint"],
-            "data_fingerprint": contract["provenance"]["data_fingerprint"],
-        },
+        "training_market_fact_contract": compact_historical_market_contract(contract),
     }
     label_contract = compact_shadow_label_contract(
         build_shadow_label_contract(

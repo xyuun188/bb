@@ -41,6 +41,48 @@ def _extract_training_result(output: str) -> dict[str, object] | None:
     return None
 
 
+def _training_result_summary(payload: object) -> dict[str, object]:
+    """Keep the cross-host reconciliation frame bounded and auditable."""
+
+    if not isinstance(payload, dict):
+        return {}
+    scalar_keys = (
+        "trained",
+        "reason",
+        "error",
+        "artifact_version",
+        "challenger_artifact_version",
+        "model_version",
+        "training_mode",
+        "training_policy",
+        "completed_shadow_sample_count",
+        "completed_trade_sample_count",
+        "completed_training_decision_group_count",
+        "last_trained_completed_shadow_sample_count",
+        "last_trained_completed_trade_sample_count",
+        "last_trained_completed_training_decision_group_count",
+        "training_input_fingerprint",
+        "promotion_ready",
+        "challenger_rejected",
+        "champion_retained",
+    )
+    summary: dict[str, object] = {
+        key: payload[key]
+        for key in scalar_keys
+        if key in payload and not isinstance(payload[key], (list, str))
+    }
+    for key in ("reason", "error", "artifact_version", "challenger_artifact_version",
+                "model_version", "training_mode", "training_input_fingerprint"):
+        if key in payload and isinstance(payload[key], str):
+            summary[key] = payload[key][:1000]
+    for key in ("training_transport_report", "promotion_recommendation"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            summary[key] = value
+    summary["trained"] = bool(payload.get("trained"))
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-app-dir", default="/data/bb/app")
@@ -52,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _should_manage_trading_service(args: argparse.Namespace) -> bool:
+    """Only stop trading for the operation that can mutate historical state."""
+
+    return not bool(args.training_only or args.counts_only)
+
+
 def main() -> None:
     args = parse_args()
     remote_root = _quote(args.remote_app_dir)
@@ -61,22 +109,31 @@ def main() -> None:
         "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "
     )
     result: dict[str, object] = {}
+    trading_was_active = False
+    manage_trading_service = _should_manage_trading_service(args)
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
-        result["trading_service"] = _tail(
-            run_remote_text(
-                ssh,
-                (
-                    "systemctl stop bb-paper-trading.service 2>/dev/null || true; "
-                    "state=$(systemctl is-active bb-paper-trading.service 2>/dev/null || true); "
-                    'printf "%s\n" "$state"; '
-                    '[ "$state" = inactive ] || [ "$state" = failed ]'
+        if manage_trading_service:
+            trading_state = _tail(
+                run_remote_text(
+                    ssh,
+                    (
+                        "previous=$(systemctl is-active bb-paper-trading.service 2>/dev/null || true); "
+                        'printf "previous=%s\\n" "$previous"; '
+                        '[ "$previous" = active ] && systemctl stop bb-paper-trading.service 2>/dev/null || true; '
+                        "state=$(systemctl is-active bb-paper-trading.service 2>/dev/null || true); "
+                        'printf "%s\n" "$state"; '
+                        '[ "$state" = inactive ] || [ "$state" = failed ]'
+                    ),
+                    timeout=60,
+                    check=True,
                 ),
-                timeout=60,
-                check=True,
-            ),
-            500,
-        ).strip()
+                500,
+            ).strip()
+            trading_was_active = trading_state.splitlines()[0].strip() == "previous=active"
+            result["trading_service"] = trading_state
+        else:
+            result["trading_service"] = "unchanged"
         if not args.training_only and not args.counts_only:
             small_command = (
                 f"cd {remote_root} && {python_bin}"
@@ -110,12 +167,47 @@ def main() -> None:
                 f"cd {remote_root} && {python_bin}"
                 "for i in $(seq 1 30); do "
                 "pg_isready -q && break; sleep 2; done; pg_isready -q; "
-                "attempt=1; rc=1; while [ $attempt -le 3 ]; do "
+                "attempt=1; rc=1; output_file=$(mktemp); error_file=$(mktemp); "
+                "while [ $attempt -le 3 ]; do "
+                ": > \"$output_file\"; : > \"$error_file\"; "
                 f"PYTHONPATH=. timeout {max(args.training_timeout, 60)} "
                 "$PYBIN scripts/train_local_ai_tools_models.py "
                 "--training-mode formal --persist-artifact --confirm-phase3-rebuild "
-                "&& { rc=0; break; }; rc=$?; attempt=$((attempt + 1)); sleep 10; "
-                "done; exit $rc"
+                ">\"$output_file\" 2>\"$error_file\"; rc=$?; "
+                "if [ $rc -eq 0 ]; then break; fi; "
+                "attempt=$((attempt + 1)); sleep 10; done; "
+                "$PYBIN - \"$output_file\" \"$error_file\" \"$rc\" <<'PY'\n"
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "prefix = 'BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON='\n"
+                "stdout = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')\n"
+                "stderr = Path(sys.argv[2]).read_text(encoding='utf-8', errors='replace')\n"
+                "rc = int(sys.argv[3])\n"
+                "payload = None\n"
+                "for line in reversed(stdout.splitlines()):\n"
+                "    if line.startswith(prefix):\n"
+                "        try: payload = json.loads(line[len(prefix):])\n"
+                "        except json.JSONDecodeError: payload = None\n"
+                "        break\n"
+                "if not isinstance(payload, dict):\n"
+                "    payload = {'trained': False, 'reason': 'error', "
+                "'error': (stderr.strip() or f'trainer exited with code {rc}')[:1000]}\n"
+                "keys = ('trained','reason','error','artifact_version',"
+                "'challenger_artifact_version','model_version','training_mode',"
+                "'completed_shadow_sample_count','completed_trade_sample_count',"
+                "'completed_training_decision_group_count',"
+                "'last_trained_completed_shadow_sample_count',"
+                "'last_trained_completed_trade_sample_count',"
+                "'last_trained_completed_training_decision_group_count',"
+                "'training_input_fingerprint','promotion_ready',"
+                "'challenger_rejected','champion_retained')\n"
+                "summary = {key: payload[key] for key in keys if key in payload}\n"
+                "for key in ('training_transport_report','promotion_recommendation'):\n"
+                "    if isinstance(payload.get(key), dict): summary[key] = payload[key]\n"
+                "summary['trained'] = bool(payload.get('trained'))\n"
+                "print(prefix + json.dumps(summary, ensure_ascii=False, separators=(',', ':')))\n"
+                "PY\n"
+                "rm -f \"$output_file\" \"$error_file\"; exit $rc"
             )
             training_result = exec_remote_command(
                 ssh,
@@ -208,6 +300,25 @@ PY
             2000,
         ).strip()
     finally:
+        if manage_trading_service and trading_was_active:
+            try:
+                restored = _tail(
+                    run_remote_text(
+                        ssh,
+                        (
+                            "systemctl start bb-paper-trading.service; "
+                            "state=$(systemctl is-active bb-paper-trading.service 2>/dev/null || true); "
+                            'printf "%s\n" "$state"; '
+                            '[ "$state" = active ]'
+                        ),
+                        timeout=90,
+                        check=True,
+                    ),
+                    500,
+                ).strip()
+                result["trading_service_restored"] = restored
+            except Exception as exc:
+                result["trading_service_restore_error"] = str(exc)[:500]
         ssh.close()
     safe_print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 

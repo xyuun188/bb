@@ -53,6 +53,7 @@ from scripts.train_local_ai_tools_models import (  # noqa: E402
     _snapshot,
 )
 from services.local_ai_training_contract import (  # noqa: E402
+    LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
     TRAINING_CURSOR_VERSION,
     TRAINING_DISTRIBUTION_PROFILE_VERSION,
     authoritative_cost_training_identity,
@@ -238,6 +239,7 @@ async def _streaming_cursor_probe() -> dict[str, Any]:
         profile[key] = {"count": int(count), "mean": mean, "std": math.sqrt(variance)}
     return {
         "version": TRAINING_CURSOR_VERSION,
+        "training_transport_version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
         "completed_market_sample_count": market_count,
         "completed_trade_sample_count": len(trade_payload["trade_samples"]),
         "completed_authoritative_cost_sample_count": cost_count,
@@ -260,6 +262,7 @@ async def run_streaming_once() -> dict[str, Any]:
         return {
             "trained": False,
             "reason": "cursor_probe_complete",
+            "training_transport_version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
             "completed_shadow_sample_count": int(shadow_count),
             **cursor,
             "training_process_isolated": True,
@@ -303,6 +306,7 @@ async def run_once(
         return {
             "trained": False,
             "reason": "cursor_probe_complete",
+            "training_transport_version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
             "completed_shadow_sample_count": int(shadow_count),
             "completed_trade_sample_count": len(payload["trade_samples"]),
             **cursor,

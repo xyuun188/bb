@@ -10,7 +10,7 @@ import json
 import math
 import re
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -41,6 +41,12 @@ from data_feed.sentiment_scraper import SentimentScraper
 from data_feed.technical_indicators import compute_all_indicators, extract_latest_features
 from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
+from models.market_data import Kline
+from services.historical_shadow_contract import (
+    build_historical_market_contract,
+    build_historical_market_fact,
+    compact_historical_market_contract,
+)
 from models.news import NewsArticle, SocialPost
 from services.external_event_service import ExternalEventService
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryMarketDataQualityParams
@@ -2108,6 +2114,123 @@ class DataService:
             )
             rows = []
         return verify_native_market_fact_path(entry_fact, result_fact, rows)
+
+    async def get_historical_shadow_market_path(
+        self,
+        symbol: str,
+        entry_fact: dict[str, Any],
+        due_at: datetime,
+        horizon_minutes: int,
+    ) -> dict[str, Any]:
+        """Return a due-at historical path from preserved 1m facts, never today's quote."""
+
+        normalized = self._normalize_symbols([symbol])[0]
+        entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
+        result_at = due_at if due_at.tzinfo is not None else due_at.replace(tzinfo=UTC)
+        result_at = result_at.astimezone(UTC)
+        result_open = result_at.replace(second=0, microsecond=0)
+        entry_open = (
+            datetime.fromtimestamp(entry_ms / 1000.0, tz=UTC).replace(second=0, microsecond=0)
+            if entry_ms > 0
+            else result_open - timedelta(minutes=max(int(horizon_minutes or 0), 1))
+        )
+        expected = max(int((result_open - entry_open).total_seconds() // 60) + 1, 1)
+
+        async def load_cached() -> list[dict[str, Any]]:
+            async with get_session_ctx() as session:
+                result = await session.execute(
+                    select(Kline)
+                    .where(
+                        Kline.symbol == normalized,
+                        Kline.timeframe == "1m",
+                        Kline.open_time >= entry_open,
+                        Kline.open_time <= result_open,
+                    )
+                    .order_by(Kline.open_time.asc())
+                )
+                rows = list(result.scalars().all())
+            return [
+                {
+                    "open_time": (
+                        row.open_time.replace(tzinfo=UTC)
+                        if row.open_time.tzinfo is None
+                        else row.open_time.astimezone(UTC)
+                    ),
+                    "open": row.open,
+                    "high": row.high,
+                    "low": row.low,
+                    "close": row.close,
+                    "volume": row.volume,
+                }
+                for row in rows
+            ]
+
+        bars = await load_cached()
+        if len(bars) != expected:
+            limit = min(expected + 2, 300)
+            rows: list[Any] = []
+            try:
+                native_fetcher = getattr(
+                    self.rest_client, "fetch_native_consistency_ohlcv", None
+                )
+                if callable(native_fetcher):
+                    rows = await native_fetcher(
+                        normalized,
+                        limit=limit,
+                        end_timestamp_ms=int(result_open.timestamp() * 1000),
+                    )
+                else:
+                    rows = await self.rest_client.fetch_ohlcv(
+                        normalized,
+                        timeframe="1m",
+                        limit=limit,
+                        end_timestamp_ms=int(result_open.timestamp() * 1000) + 60_000,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "historical shadow kline refresh failed",
+                    symbol=normalized,
+                    error=safe_error_text(exc),
+                )
+                rows = []
+            if rows:
+                await self._persist_klines(normalized, "1m", rows)
+                bars = await load_cached()
+
+        by_minute = {
+            item["open_time"].replace(second=0, microsecond=0): item
+            for item in bars
+            if isinstance(item.get("open_time"), datetime)
+        }
+        window = [
+            by_minute.get(entry_open + timedelta(minutes=offset))
+            for offset in range(expected)
+        ]
+        if any(item is None for item in window):
+            return {}
+        complete_window = [dict(item) for item in window if item is not None]
+        historical_entry = build_historical_market_fact(
+            normalized,
+            complete_window[0],
+            role="entry",
+        )
+        historical_result = build_historical_market_fact(
+            normalized,
+            complete_window[-1],
+            role="result",
+        )
+        contract = build_historical_market_contract(
+            symbol=normalized,
+            entry_fact=historical_entry,
+            result_fact=historical_result,
+            bars=complete_window,
+        )
+        return {
+            "result_fact": historical_result,
+            "price_path": contract["price_path"],
+            "market_fact_contract": contract,
+            "training_market_fact_contract": compact_historical_market_contract(contract),
+        }
 
     @staticmethod
     def _ticker_timestamp_from_raw(raw_ticker: dict[str, Any]) -> int:

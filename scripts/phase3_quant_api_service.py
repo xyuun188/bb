@@ -533,7 +533,7 @@ class TrainRequest(BaseModel):
     confirm_phase3_rebuild: bool = False
 
 
-_RESOURCE_RECOVERY_FRACTIONS = (0.50, 0.25)
+_RESOURCE_RECOVERY_FRACTIONS = (0.25, 0.125)
 
 
 def _bounded_training_rows(rows: list[dict[str, Any]], fraction: float) -> list[dict[str, Any]]:

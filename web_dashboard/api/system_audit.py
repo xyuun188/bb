@@ -5132,7 +5132,10 @@ async def _phase3_paper_resume_preflight_audit(
     )
 
 
-async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
+async def _phase3_paper_resume_observation_audit(
+    *,
+    force_live: bool = False,
+) -> dict[str, Any]:
     report = _read_latest_phase3_report(PHASE3_PAPER_RESUME_OBSERVATION_REPORT_REL_PATH)
     checked_at = _report_checked_at(report)
     age_seconds = (
@@ -5140,7 +5143,7 @@ async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
         if checked_at is not None
         else None
     )
-    if _report_fresh(
+    if not force_live and _report_fresh(
         report,
         max_age_seconds=PHASE3_PAPER_RESUME_OBSERVATION_REPORT_MAX_AGE_SECONDS,
     ):
@@ -5158,6 +5161,8 @@ async def _phase3_paper_resume_observation_audit() -> dict[str, Any]:
         report.setdefault("report_source", "live_probe")
         if age_seconds is not None:
             report["superseded_report_age_seconds"] = round(age_seconds, 3)
+        if force_live:
+            report["report_refresh_reason"] = "explicit_fresh_system_audit"
     blockers = report.get("blockers") if isinstance(report.get("blockers"), list) else []
     warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
     status_value = str(report.get("status") or "unknown")
@@ -6935,7 +6940,12 @@ async def _collect_system_audit_status_unlocked(
                 force_live=fresh_required_audits,
             ),
         ),
-        ("phase3_paper_resume_observation", _phase3_paper_resume_observation_audit),
+        (
+            "phase3_paper_resume_observation",
+            lambda: _phase3_paper_resume_observation_audit(
+                force_live=fresh_required_audits,
+            ),
+        ),
         ("position_price_integrity", _position_price_integrity_audit),
         ("market_data", _market_data_audit),
         ("strategy_quality", _strategy_quality_audit),

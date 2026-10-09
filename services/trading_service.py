@@ -911,6 +911,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             execution_cost_facts_provider=self._shadow_execution_cost_facts,
             latest_market_fact_provider=self.data_service.get_latest_market_fact,
             price_path_provider=self.data_service.verify_market_fact_path,
+            historical_market_path_provider=self.data_service.get_historical_shadow_market_path,
         )
         self.stale_entry_candidate_expirer = StaleEntryCandidateExpirer(self._safe_float)
         self.decision_final_state_ensurer = DecisionFinalStateEnsurer(

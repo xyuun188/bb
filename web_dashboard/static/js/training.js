@@ -70,6 +70,7 @@
     diagnostic_warming: '状态刷新中', optional_disabled: '可选本地增强未部署',
     optional_blocked: '本地模型已配置，预检未通过', cloud_unconfigured: '云端未配置',
     cloud_configured_unverified: '云端已配置，连接未验证',
+    succeeded: '训练完成', failed: '训练失败', resource_blocked: '资源退避', interrupted: '训练中断', skipped: '未触发训练',
     warning: '需要关注', error: '运行异常', ok: '正常',
   });
   const taskText = Object.freeze({
@@ -216,8 +217,17 @@
     setText('[data-metric="quarantined-samples"]', fmt(quarantined));
     setText('[data-metric="model-influence"]', ml.paper_trading_permission === true ? '模拟盘允许' : '模拟盘不可用');
     setText('[data-detail="model-influence"]', ml.live_ml_ready === true ? '实盘候选已就绪，逐笔生产门禁仍生效' : '实盘未授权；不阻断模拟盘分析和正常交易');
-    setText('[data-metric="last-training"]', time(ml.trained_at));
-    setText('[data-detail="last-training"]', ml.artifact_version ? `Artifact ${ml.artifact_version}` : 'Artifact 版本未提供');
+    const latestTraining = ml.latest_training || {};
+    const latestAttemptAt = ml.latest_training_attempt_at;
+    const latestAt = ml.latest_training_at || latestTraining.trained_at;
+    const attemptState = lifecycleText[ml.latest_training_attempt_state] || '状态未提供';
+    const attemptError = ml.latest_training_attempt_error;
+    setText('[data-metric="last-training"]', time(ml.latest_training_success_at || latestAt));
+    setText('[data-detail="last-training"]', latestAttemptAt
+      ? `检查 ${time(ml.latest_training_check_at)}；尝试 ${time(latestAttemptAt)}；${attemptState}${attemptError ? `：${attemptError}` : ''}；当前使用模型 ${time(ml.trained_at)}`
+      : latestTraining.artifact_version
+        ? `最近候选 ${latestTraining.artifact_version}${latestTraining.champion_retained ? '，当前 Champion 保持不变' : ''}`
+        : (ml.artifact_version ? `Artifact ${ml.artifact_version}` : '暂无训练记录'));
     renderTrainingEvidence();
   }
 

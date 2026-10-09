@@ -712,6 +712,10 @@ async def _local_ai_training_status() -> dict[str, Any]:
             "latest_training_artifact_version"
         ),
         "latest_training_at": status.get("latest_training_at"),
+        "latest_training_attempt_at": status.get("latest_training_attempt_at"),
+        "latest_training_attempt_state": status.get("latest_training_attempt_state"),
+        "latest_training_attempt_error": status.get("latest_training_attempt_error"),
+        "latest_training_next_check_at": status.get("latest_training_next_check_at"),
         "latest_training_data_quality_version": status.get(
             "latest_training_data_quality_version"
         ),
