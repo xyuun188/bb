@@ -2484,6 +2484,106 @@ async def test_feature_market_fact_proves_rest_ws_book_reference_and_native_path
     assert vector.market_fact["quality"]["status"] == "clean"
 
 
+@pytest.mark.parametrize("derivative_age_ms", [-60_000, 60_000])
+def test_source_merge_keeps_the_newest_complete_orderbook(derivative_age_ms) -> None:
+    service = _service()
+    timestamp = 1_700_000_040_000
+    book = {
+        "inst_id": "BTC-USDT-SWAP", "inst_type": "SWAP",
+        "source_timestamp_ms": timestamp, "bid": 99.9, "ask": 100.1,
+        "bid_depth_usdt": 50_000.0, "ask_depth_usdt": 60_000.0,
+    }
+    ticker = {
+        "timestamp": timestamp, "last_price": 100.0, "bid": 99.9, "ask": 100.1,
+        "orderbook_fact": book, "orderbook_bid_depth": 50_000.0,
+        "orderbook_ask_depth": 60_000.0,
+    }
+    derivative_book = {
+        **book, "source_timestamp_ms": timestamp + derivative_age_ms,
+        "bid_depth_usdt": 20_000.0, "ask_depth_usdt": 30_000.0,
+    }
+    merged = service._attach_market_source_consistency(
+        "BTC/USDT", ticker, {
+            "orderbook_fact": derivative_book,
+            "orderbook_bid_depth": 20_000.0, "orderbook_ask_depth": 30_000.0,
+        },
+    )
+    selected = book if derivative_age_ms < 0 else derivative_book
+    assert merged["orderbook_fact"] == selected
+    assert merged["orderbook_bid_depth"] == selected["bid_depth_usdt"]
+    assert merged["orderbook_ask_depth"] == selected["ask_depth_usdt"]
+
+
+@pytest.mark.asyncio
+async def test_cached_native_path_covers_book_time_without_reference_clock_extension() -> None:
+    service = _service()
+    minute = 1_700_000_040_000
+    rows = [[minute, 99.0, 101.0, 98.0, 100.0, 10.0]]
+    service._native_consistency_bars_cache = {
+        "BTC/USDT": (asyncio.get_running_loop().time(), rows),
+    }
+    snapshot = {
+        "timestamp": minute + 1_000,
+        "orderbook_fact": {"source_timestamp_ms": minute + 2_000},
+        "mark_price_fact": {"source_timestamp_ms": minute - 180_000},
+    }
+    assert service._cached_native_consistency_bars("BTC/USDT", [snapshot]) == rows
+    snapshot["orderbook_fact"]["source_timestamp_ms"] = minute - 60_000
+    assert service._cached_native_consistency_bars("BTC/USDT", [snapshot]) == []
+
+
+@pytest.mark.asyncio
+async def test_feature_vector_uses_canonical_merged_book_without_second_stale_overwrite() -> None:
+    service = _service()
+    timestamp = 1_700_000_040_000
+    book = {
+        "source_timestamp_ms": timestamp, "bid": 99.9, "ask": 100.1,
+        "bid_depth_usdt": 50_000.0, "ask_depth_usdt": 60_000.0,
+    }
+    ticker = {
+        "timestamp": timestamp, "last_price": 100.0, "bid": 99.9, "ask": 100.1,
+        "orderbook_fact": book, "orderbook_bid_depth": 50_000.0,
+        "orderbook_ask_depth": 60_000.0,
+    }
+    derivatives = {
+        "orderbook_fact": {**book, "source_timestamp_ms": timestamp - 120_000},
+        "orderbook_bid_depth": 20_000.0, "orderbook_ask_depth": 30_000.0,
+    }
+
+    async def no_sentiment(_symbol, **_kwargs):
+        return None
+
+    service._ensure_sentiment_for_analysis = no_sentiment
+    service._get_feature_ticker_snapshot = lambda *_a, **_kw: asyncio.sleep(0, result=ticker)
+    service._get_feature_indicator_snapshot = lambda *_a, **_kw: asyncio.sleep(0, result={})
+    service._get_feature_derivatives_snapshot = lambda *_a, **_kw: asyncio.sleep(0, result=derivatives)
+    vector = await service.get_feature_vector("BTC/USDT", wait_for_sentiment=False)
+    assert vector.orderbook_fact == book
+    assert vector.orderbook_bid_depth == 50_000.0
+    assert vector.orderbook_ask_depth == 60_000.0
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_fetch_includes_source_timestamp_book_window() -> None:
+    service = _service()
+    minute = 1_700_000_040_000
+    requests = []
+
+    async def fetch(_symbol, *, limit, end_timestamp_ms):
+        requests.append((limit, end_timestamp_ms))
+        return [[stamp, 99, 101, 98, 100, 10] for stamp in (minute - 60_000, minute)]
+
+    service.rest_client = SimpleNamespace(fetch_native_consistency_ohlcv=fetch)
+    rows = await service._fetch_native_consistency_bars(
+        "BTC/USDT", [{
+            "timestamp": minute + 1_000,
+            "orderbook_fact": {"source_timestamp_ms": minute - 1_000},
+        }],
+    )
+    assert len(rows) == 2
+    assert requests == [(4, minute)]
+
+
 @pytest.mark.asyncio
 async def test_attach_native_market_fact_maps_rest_depth_to_canonical_fields() -> None:
     service = _service()

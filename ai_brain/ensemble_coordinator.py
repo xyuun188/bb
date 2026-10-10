@@ -979,9 +979,9 @@ class EnsembleCoordinator:
                 )
                 reason = self._reason(
                     (
-                        "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做多"
+                        "模型方向明确且当前费后期望收益为正，按下行压力预算模拟盘做多"
                         if action == Action.LONG
-                        else "模型方向明确且稳健费后目标收益为正，按模拟盘正常策略做空"
+                        else "模型方向明确且当前费后期望收益为正，按下行压力预算模拟盘做空"
                     ),
                     decision_score,
                     disagreement,

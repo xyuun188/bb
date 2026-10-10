@@ -2986,6 +2986,33 @@ async def test_okx_pre_order_reports_demo_instrument_unavailable_before_sizing(
     assert "okx_pre_order_orderbook_incomplete" not in facts["reason"]
 
 
+@pytest.mark.asyncio
+async def test_okx_pre_order_reports_missing_execution_market_before_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(object())
+
+    async def resolve_symbol(_symbol: str) -> str:
+        return "ASTS/USDT:USDT"
+
+    async def market_probe(_symbol: str, *, app_symbol: str | None = None) -> dict[str, Any]:
+        raise ExchangeAPIError("OKX SDK market is not loaded: ASTS/USDT:USDT")
+
+    monkeypatch.setattr(executor, "_resolve_swap_symbol", resolve_symbol)
+    monkeypatch.setattr(executor, "_market_for_symbol", market_probe)
+
+    facts = await executor.pre_order_execution_facts("ASTS/USDT", "short")
+
+    assert facts["production_eligible"] is False
+    assert facts["reason"] == "okx_pre_order_execution_market_unavailable"
+    assert facts["environment_compatibility"]["blockers"] == [
+        "execution_market_unavailable"
+    ]
+    assert facts["policy_provenance"]["strategy_version"] == (
+        "2026-10-10.okx-pre-order-execution-market.v1"
+    )
+
+
 class _FloorAmountPrecisionCcxt:
     def amount_to_precision(self, _symbol: str, amount: float) -> str:
         return str(float(int(amount)))

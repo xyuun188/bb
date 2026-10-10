@@ -182,8 +182,9 @@ def _trade_contract_details_ok() -> dict[str, Any]:
         "can_bypass_risk_controls": False,
         "policy": {
             "paper_entry_requires_model_promotion": False,
-            "paper_normal_entry_requires_positive_return_lcb": True,
-            "paper_validated_entry_requires_positive_return_lcb": True,
+            "paper_normal_entry_requires_positive_return_lcb": False,
+            "paper_validated_entry_requires_positive_return_lcb": False,
+            "paper_downside_return_is_sizing_stress": True,
             "paper_quality_observation_requires_positive_expected_net_return": True,
             "paper_quality_observation_requires_positive_return_lcb": False,
                 "paper_quality_observation_allows_non_positive_return_lcb": True,

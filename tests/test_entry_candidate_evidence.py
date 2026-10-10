@@ -305,7 +305,7 @@ def test_positive_mean_without_positive_lcb_remains_observation_only() -> None:
     assert evidence["long"]["return_distribution_ready"] is True
 
 
-def test_paper_positive_mean_negative_lcb_exposes_diagnostic_observation_side() -> None:
+def test_paper_positive_mean_negative_downside_is_current_evidence_not_live_permission() -> None:
     def observation_score(decision: DecisionOutput, _strategy: dict | None) -> float:
         is_long = decision.action == Action.LONG
         expected_net = 0.30 if is_long else -0.10
@@ -329,9 +329,9 @@ def test_paper_positive_mean_negative_lcb_exposes_diagnostic_observation_side() 
 
     evidence = _policy(observation_score).build(_Feature(), {}, {}, {}, {}, {})
 
-    assert evidence["preferred_side_by_evidence"] == "neutral"
-    assert evidence["preferred_paper_observation_side"] == "long"
-    assert evidence["long"]["positive_fee_after_return_edge"] is False
+    assert evidence["preferred_side_by_evidence"] == "long"
+    assert evidence["preferred_paper_observation_side"] == "neutral"
+    assert evidence["long"]["positive_fee_after_return_edge"] is True
     assert evidence["long"]["production_eligible"] is False
 
 

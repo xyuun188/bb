@@ -1199,7 +1199,7 @@ def test_v13_micro_risk_history_is_normalized_and_remains_trainable() -> None:
         "2026-09-26.normal-paper-strategy-trade.v13"
     )
     assert sample["normal_paper_trade_evidence"]["version"] == (
-        "2026-10-09.normal-paper-strategy-trade.v15"
+        "2026-10-10.normal-paper-strategy-trade.v16"
     )
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True

@@ -18,6 +18,7 @@ from core.safe_output import safe_error_text
 from services.entry_direction_metrics import selected_entry_metrics
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
 )
 from services.trading_policies import PolicyGateResult
@@ -185,8 +186,10 @@ class EntryHighRiskReviewGatePolicy:
             violations.append("sizing_not_eligible")
         if _safe_float(sizing.get("expected_net_return_pct")) <= 0.0:
             violations.append("sizing_expected_net_not_positive")
-        if _safe_float(sizing.get("return_lcb_pct")) <= 0.0:
-            violations.append("sizing_return_lcb_not_positive")
+        if not normal_paper_current_return_ready(
+            sizing.get("expected_net_return_pct"), sizing.get("return_lcb_pct")
+        ):
+            violations.append("sizing_current_return_contract_invalid")
         advisory_risk_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         if not 0.0 < normal_risk_cap <= advisory_risk_cap:
             violations.append("normal_trade_risk_cap_exceeded")

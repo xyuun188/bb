@@ -16,7 +16,8 @@ def _decision(
     *,
     selection_reason: str = "strategy_edge_selected",
     score: float = 0.2,
-    expected_net: float = 0.3,
+    expected_net: float | None = 0.3,
+    downside_return: float | None = -0.2,
     evidence_at: datetime | None = None,
 ) -> DecisionOutput:
     return DecisionOutput(
@@ -34,6 +35,7 @@ def _decision(
             "opportunity_score": {
                 "score": score,
                 "expected_net_return_pct": expected_net,
+                "return_lcb_pct": downside_return,
             },
         },
         feature_snapshot={
@@ -133,37 +135,135 @@ def test_reentry_does_not_treat_decision_timestamp_as_market_evidence() -> None:
     assert result.decision_evidence_source == "decision.timestamp"
 
 
-def test_negative_lcb_never_authorizes_reentry_even_for_quality_observation() -> None:
+@pytest.mark.parametrize(
+    "selection_reason", ["paper_quality_observation", "paper_training_entry"]
+)
+def test_observation_or_training_selection_never_authorizes_reentry(
+    selection_reason: str,
+) -> None:
     now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
 
     observation = SameSymbolReentryGuard.assess(
         _decision(
             now,
-            selection_reason="paper_quality_observation",
+            selection_reason=selection_reason,
             score=-1.7,
             expected_net=0.2,
+            evidence_at=now,
         ),
         execution_mode="paper",
         latest_closed_lifecycle=None,
         now=now,
     )
-    invalid = SameSymbolReentryGuard.assess(
+    assert observation.allowed is False
+    assert observation.opportunity_contract_consistent is False
+    assert observation.reason == "entry_opportunity_contract_inconsistent"
+
+
+def test_paper_downside_lcb_does_not_block_positive_current_return_reentry() -> None:
+    now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
+    current = _decision(now, score=-1.7, expected_net=0.2, evidence_at=now)
+    current.raw_response["opportunity_score"]["return_lcb_pct"] = -0.4
+    allowed = SameSymbolReentryGuard.assess(
+        current,
+        execution_mode="paper",
+        latest_closed_lifecycle=None,
+        now=now,
+    )
+    assert allowed.allowed is True
+    assert allowed.opportunity_contract_consistent is True
+
+
+@pytest.mark.parametrize(
+    ("expected_net", "downside_return"),
+    [
+        (0.0, -0.4),
+        (-0.2, -0.4),
+        (None, -0.4),
+        (float("nan"), -0.4),
+        (float("inf"), -0.4),
+        (0.2, None),
+        (0.2, float("nan")),
+        (0.2, float("inf")),
+        (0.2, -float("inf")),
+    ],
+)
+def test_paper_reentry_requires_positive_current_mean_and_finite_downside(
+    expected_net: float | None,
+    downside_return: float | None,
+) -> None:
+    now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
+
+    result = SameSymbolReentryGuard.assess(
         _decision(
             now,
-            selection_reason="strategy_edge_selected",
-            score=-1.7,
-            expected_net=0.2,
+            expected_net=expected_net,
+            downside_return=downside_return,
         ),
         execution_mode="paper",
         latest_closed_lifecycle=None,
         now=now,
     )
 
-    assert observation.allowed is False
-    assert observation.opportunity_contract_consistent is False
-    assert observation.reason == "entry_opportunity_contract_inconsistent"
-    assert invalid.allowed is False
-    assert invalid.reason == "entry_opportunity_contract_inconsistent"
+    assert result.allowed is False
+    assert result.reason == "entry_opportunity_contract_inconsistent"
+    assert result.opportunity_contract_consistent is False
+
+
+@pytest.mark.parametrize(
+    ("elapsed_minutes", "evidence_offset_seconds", "allowed", "reason"),
+    [
+        (5, 60, False, "same_symbol_reentry_cooldown_active"),
+        (30, -1, False, "same_symbol_reentry_market_evidence_not_newer_than_close"),
+        (30, 60, True, "same_symbol_reentry_cooldown_elapsed"),
+    ],
+)
+def test_paper_negative_downside_keeps_cooldown_and_fresh_evidence_guards(
+    elapsed_minutes: int,
+    evidence_offset_seconds: int,
+    allowed: bool,
+    reason: str,
+) -> None:
+    closed_at = datetime(2026, 9, 22, 5, 0, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=elapsed_minutes)
+    result = SameSymbolReentryGuard.assess(
+        _decision(
+            now,
+            score=-1.7,
+            expected_net=0.2,
+            downside_return=-0.4,
+            evidence_at=closed_at + timedelta(seconds=evidence_offset_seconds),
+        ),
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+
+    assert result.allowed is allowed
+    assert result.reason == reason
+    assert result.opportunity_contract_consistent is True
+
+
+def test_negative_opportunity_score_is_paper_only() -> None:
+    now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
+    paper = SameSymbolReentryGuard.assess(
+        _decision(now, score=-1.7, expected_net=0.2, downside_return=-0.4),
+        execution_mode="paper",
+        latest_closed_lifecycle=None,
+        now=now,
+    )
+    live = SameSymbolReentryGuard.assess(
+        _decision(now, score=-1.7, expected_net=0.2, downside_return=-0.4),
+        execution_mode="live",
+        latest_closed_lifecycle=None,
+        now=now,
+    )
+
+    assert paper.allowed is True
+    assert paper.opportunity_contract_consistent is True
+    assert live.allowed is False
+    assert live.reason == "entry_opportunity_contract_inconsistent"
+    assert live.opportunity_contract_consistent is False
 
 
 @pytest.mark.asyncio

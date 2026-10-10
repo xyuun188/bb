@@ -42,6 +42,7 @@ def _decision(
                 "prediction_horizon_minutes": 15,
                 "expected_net_return_pct": 0.1,
                 "objective_net_return_pct": 0.05,
+                "loss_probability": 0.3,
                 "quant_quality_permissions": paper_quality_permissions(),
             },
         )

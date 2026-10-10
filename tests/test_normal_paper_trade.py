@@ -253,13 +253,16 @@ def test_unauthorized_shadow_observation_cannot_be_reused_as_entry_permission() 
     assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(contract)
 
 
-def test_negative_lcb_validated_strategy_still_cannot_authorize_entry() -> None:
-    assert build_normal_paper_trade_contract(
+def test_negative_downside_does_not_veto_positive_mean_normal_paper_entry() -> None:
+    contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
         selection_reason="strategy_edge_selected",
         direction_support=_support("long", expected_net=0.2, objective_net=-0.3),
-    ) == {}
+    )
+    assert contract["authorized"] is True
+    assert contract["objective_net_return_pct"] == -0.3
+    assert normal_paper_trade_contract_reasons(contract) == []
 
 
 def test_current_positive_edge_does_not_inherit_historical_quality_observation_cap() -> None:

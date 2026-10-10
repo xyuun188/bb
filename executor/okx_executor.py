@@ -7529,6 +7529,46 @@ class OKXExecutor(AbstractExecutor):
                         "fallback_reason": ",".join(blockers),
                     },
                 }
+        try:
+            # The native endpoints can return valid quotes for a symbol that
+            # the execution SDK cannot submit. Resolve the actual CCXT market
+            # before declaring the pre-order contract eligible so a missing
+            # execution market becomes a local blocker instead of an OKX
+            # submission-time rejection.
+            await self._market_for_symbol(okx_symbol, app_symbol=symbol)
+        except Exception as exc:
+            error_text = safe_error_text(exc, limit=220)
+            if not self._is_missing_market_symbol_error(error_text):
+                # Lightweight adapters may not expose CCXT market parsing even
+                # though their native quote/spec endpoints are authoritative.
+                # Keep those adapters on the native-facts path; only a proven
+                # missing execution market is a pre-submit blocker.
+                error_text = ""
+            else:
+                return {
+                    "production_eligible": False,
+                    "reason": "okx_pre_order_execution_market_unavailable",
+                    "symbol": normalize_trading_symbol(symbol),
+                    "side": str(side or "").lower(),
+                    "okx_symbol": okx_symbol,
+                    "inst_id": inst_id,
+                    "feature_snapshot": {},
+                    "environment_compatibility": {
+                        "checked": True,
+                        "compatible": False,
+                        "reason": "okx_execution_market_unavailable",
+                        "blockers": ["execution_market_unavailable"],
+                        "error": error_text,
+                    },
+                    "policy_provenance": {
+                        "source": "okx_pre_order_execution_market_probe",
+                        "observation_window": "current_immediate_pre_order_refresh",
+                        "sample_count": 0,
+                        "generated_at": datetime.now(UTC).isoformat(),
+                        "strategy_version": "2026-10-10.okx-pre-order-execution-market.v1",
+                        "fallback_reason": "okx_pre_order_execution_market_unavailable",
+                    },
+                }
         fetch_order_book = getattr(ccxt, "fetch_order_book", None)
         if not callable(fetch_order_book):
             fetch_order_book = ccxt.executionFetchOrderBook

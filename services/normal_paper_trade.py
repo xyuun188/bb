@@ -11,18 +11,20 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-09.normal-paper-strategy-trade.v15"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-09.normal-paper-dynamic-risk.v7"
+NORMAL_PAPER_TRADE_VERSION = "2026-10-10.normal-paper-strategy-trade.v16"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-10.normal-paper-dynamic-risk.v8"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
         "2026-08-25.normal-paper-dynamic-risk.v5",
         "2026-10-07.normal-paper-dynamic-risk.v6",
+        "2026-10-09.normal-paper-dynamic-risk.v7",
     }
 )
 NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1"
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-09.normal-paper-strategy-trade.v15",
         "2026-09-26.normal-paper-strategy-trade.v14",
         "2026-09-26.normal-paper-strategy-trade.v13",
         "2026-09-19.normal-paper-strategy-trade.v12",
@@ -65,6 +67,13 @@ def _float(value: Any, default: float | None = 0.0) -> float | None:
     except (TypeError, ValueError):
         return default
     return number if isfinite(number) else default
+
+
+def normal_paper_current_return_ready(expected_net: Any, downside_return: Any) -> bool:
+    """A loss quantile is sizing evidence, not a confidence bound on the mean."""
+    expected = _float(expected_net, None)
+    downside = _float(downside_return, None)
+    return expected is not None and expected > 0.0 and downside is not None
 
 
 def _fingerprint(value: Any) -> str:
@@ -378,8 +387,6 @@ def select_normal_paper_trade_side(
         objective_net = _float(support.get("objective_net_return_pct"), None)
         if objective_net is None:
             reasons.append("direction_support_objective_net_missing")
-        elif objective_net <= 0.0:
-            reasons.append("direction_support_objective_net_not_positive")
         if not support.get("quant_evidence_families"):
             reasons.append("direction_support_quant_evidence_missing")
         if support.get("execution_cost_complete") is False:
@@ -396,11 +403,10 @@ def select_normal_paper_trade_side(
             continue
         expected_net = _float(support.get("expected_net_return_pct"), None)
         objective_net = _float(support.get("objective_net_return_pct"), None)
-        loss_probability = _float(support.get("loss_probability"), 1.0) or 1.0
+        loss_probability = _float(support.get("loss_probability"), 1.0)
         current_edge = bool(
             support.get("current_edge_validated") is True
-            and objective_net is not None
-            and objective_net > 0.0
+            and normal_paper_current_return_ready(expected_net, objective_net)
         )
         families = sorted(
             {
@@ -551,10 +557,7 @@ def build_normal_paper_trade_contract(
         current_edge_signal = not bool(support.get("paper_quality_observation_only"))
     current_edge_validated = bool(
         current_edge_signal is True
-        and expected_net is not None
-        and expected_net > 0.0
-        and objective_net is not None
-        and objective_net > 0.0
+        and normal_paper_current_return_ready(expected_net, objective_net)
         and support.get("strong_expert_opposition") is not True
     )
     quality_observation_only = bool(
@@ -605,10 +608,8 @@ def build_normal_paper_trade_contract(
         or (expected_net <= 0.0 and not paper_training_only)
         or (paper_training_only and (current_raw_expected is None or current_raw_expected <= 0.0))
         or objective_net is None
-        or (
-            objective_net <= 0.0
-            and selection_reason not in {"paper_quality_observation", "paper_training_entry"}
-        )
+        or loss_probability is None
+        or not 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
@@ -710,6 +711,8 @@ def ensure_normal_paper_trade_contract(
     # survive into the authorization path for a new submission.
     raw.pop("normal_paper_trade", None)
     decision.raw_response = raw
+    if existing:
+        return {}
 
     selection = _dict(raw.get("paper_trade_selection"))
     # Quality observations are shadow/training evidence only. They must not
@@ -767,7 +770,7 @@ def build_normal_paper_position_lifecycle(decision: Any) -> dict[str, Any]:
 def _normal_strategy_trade_contract_reasons(
     value: Any,
     *,
-    require_positive_objective: bool,
+    require_new_entry_permission: bool,
     require_quality_permission: bool = True,
     allow_unauthorized_observation: bool = False,
 ) -> list[str]:
@@ -784,10 +787,7 @@ def _normal_strategy_trade_contract_reasons(
         contract.get("current_edge_validated") is True
         or (
             selection_reason == "strategy_edge_selected"
-            and expected_net is not None
-            and expected_net > 0.0
-            and objective_net is not None
-            and objective_net > 0.0
+            and normal_paper_current_return_ready(expected_net, objective_net)
         )
     )
     observation_only = bool(
@@ -810,7 +810,7 @@ def _normal_strategy_trade_contract_reasons(
     if selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS:
         reasons.append("normal_paper_trade_selection_reason_invalid")
     if (
-        require_positive_objective
+        require_new_entry_permission
         and selection_reason not in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
     ):
         reasons.append("normal_paper_trade_quality_observation_shadow_only")
@@ -829,11 +829,6 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_raw_return_not_positive")
     if objective_net is None:
         reasons.append("normal_paper_trade_objective_net_missing")
-    elif (
-        require_positive_objective
-        and objective_net <= 0.0
-    ):
-        reasons.append("normal_paper_trade_objective_net_not_positive")
     if contract.get("uses_shared_order_pipeline") is not True:
         reasons.append("normal_paper_trade_order_pipeline_split")
     if contract.get("uses_shared_position_ledger") is not True:
@@ -863,12 +858,8 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_reason_missing")
     loss_probability = _float(contract.get("loss_probability"), None)
     if (
-        (observation_mode or training_mode)
-        and (
-            loss_probability is None
-            or loss_probability
-            > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
-        )
+        loss_probability is None
+        or not 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
     ):
         reasons.append(
             "normal_paper_trade_quality_observation_loss_probability_too_high"
@@ -921,7 +912,7 @@ def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
 
     return _normal_strategy_trade_contract_reasons(
         value,
-        require_positive_objective=True,
+        require_new_entry_permission=True,
         require_quality_permission=True,
     )
 
@@ -931,7 +922,7 @@ def normal_paper_trade_observation_contract_reasons(value: Any) -> list[str]:
 
     return _normal_strategy_trade_contract_reasons(
         value,
-        require_positive_objective=False,
+        require_new_entry_permission=False,
         require_quality_permission=True,
         allow_unauthorized_observation=True,
     )

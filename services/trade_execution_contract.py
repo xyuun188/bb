@@ -444,8 +444,9 @@ def trade_execution_policy() -> dict[str, Any]:
     return {
         "optimization_target": PROFIT_TRAINING_TARGET,
         "paper_entry_requires_model_promotion": False,
-        "paper_normal_entry_requires_positive_return_lcb": True,
-        "paper_validated_entry_requires_positive_return_lcb": True,
+        "paper_normal_entry_requires_positive_return_lcb": False,
+        "paper_validated_entry_requires_positive_return_lcb": False,
+        "paper_downside_return_is_sizing_stress": True,
         "paper_quality_observation_requires_positive_expected_net_return": True,
         "paper_quality_observation_requires_positive_return_lcb": False,
         "paper_quality_observation_allows_non_positive_return_lcb": True,
@@ -1457,9 +1458,9 @@ def validate_normal_paper_entry_contract(
         not historical_normal_trade
         and not confirmed_observation_settlement
         and not (allow_historical_settlement and executed and filled_order_present is True)
-        and _safe_float(sizing.get("return_lcb_pct"), 0.0) <= 0.0
+        and not isfinite(_safe_float(sizing.get("return_lcb_pct"), float("nan")))
     ):
-        reasons.append("normal_paper_size_aware_return_lcb_not_positive")
+        reasons.append("normal_paper_size_aware_downside_return_missing")
     if not (
         _provenance_complete(sizing.get("policy_provenance"))
         or (

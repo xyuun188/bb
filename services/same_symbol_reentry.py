@@ -15,8 +15,9 @@ from ai_brain.base_model import DecisionOutput
 from core.symbols import normalize_trading_symbol, trading_symbol_variants
 from db.session import get_read_session_ctx
 from models.trade import OkxPositionHistory, Position
+from services.normal_paper_trade import normal_paper_current_return_ready
 
-SAME_SYMBOL_REENTRY_CONTRACT_VERSION = "2026-09-22.same-symbol-reentry.v1"
+SAME_SYMBOL_REENTRY_CONTRACT_VERSION = "2026-10-10.same-symbol-reentry.v2"
 MIN_PROFITABLE_REENTRY_SECONDS = 10 * 60
 MIN_NON_PROFITABLE_REENTRY_SECONDS = 20 * 60
 
@@ -152,15 +153,24 @@ class SameSymbolReentryGuard:
                 opportunity.get("expected_net_return_pct"),
             )
         )
-        opportunity_consistent = bool(
-            selection_reason not in {"paper_quality_observation", "paper_training_entry"}
-            and (
+        paper_scope = str(execution_mode or "").lower() == "paper"
+        downside_return = _safe_float(
+            opportunity.get("realized_net_lcb_pct", opportunity.get("return_lcb_pct"))
+        )
+        return_contract_consistent = (
+            normal_paper_current_return_ready(expected_net, downside_return)
+            if paper_scope
+            else (
                 expected_net is None
                 or (
                     expected_net > 0.0
                     and (opportunity_score is None or opportunity_score > 0.0)
                 )
             )
+        )
+        opportunity_consistent = bool(
+            selection_reason not in {"paper_quality_observation", "paper_training_entry"}
+            and return_contract_consistent
         )
         evidence_at, evidence_source = cls._decision_evidence_time(decision)
         horizon_minutes = cls._prediction_horizon_minutes(raw)

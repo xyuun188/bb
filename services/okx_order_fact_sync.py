@@ -1139,7 +1139,7 @@ class OkxOrderFactSyncService:
             stage_errors=tuple(stage_errors),
             skipped_old_count=skipped_old_count,
             error=pull_error,
-            samples=tuple(samples[:8]),
+            samples=_diagnostic_samples(samples),
         ).as_dict()
 
     async def _sync_from_stored_facts(
@@ -1235,7 +1235,7 @@ class OkxOrderFactSyncService:
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
             error=pull_error,
-            samples=tuple(samples[:8]),
+            samples=_diagnostic_samples(samples),
         ).as_dict()
 
     async def _refresh_stored_slippage_from_rows(
@@ -1787,9 +1787,14 @@ class OkxOrderFactSyncService:
                 None,
             )
             if fill is not None and not _fill_can_replace_order_fact(order, fill, order_row):
-                unverified_count += 1
-                samples.append(_sample(order, kind="local_order_incomplete_fill_pull_deferred"))
-                continue
+                if _stored_fill_matches_order_history(order, order_row, fill):
+                    # A bounded pull cannot invalidate the same trade rows in
+                    # an already complete, exchange-confirmed execution.
+                    fill = None
+                else:
+                    unverified_count += 1
+                    samples.append(_sample(order, kind="local_order_incomplete_fill_pull_deferred"))
+                    continue
             if fill is not None and canonical_orders_by_exchange_id:
                 canonical = canonical_orders_by_exchange_id.get(str(fill.order_id or "").strip())
                 if canonical is not None and canonical is not order:
@@ -3852,11 +3857,7 @@ def _stored_fill_matches_order_history(
     ):
         return False
     raw = order.okx_raw_fills
-    if not isinstance(row, dict):
-        if observed is None or str(order.status or "").lower() != "filled":
-            return False
-        # Account fills and order history have independent page caps. A
-        # terminal complete fact may cover a page only through exact trade rows.
+    if observed is not None:
         stored_rows = {
             str(value.get("tradeId") or ""): _authoritative_fill_row(value)
             for value in raw.get("rows") or []
@@ -3868,6 +3869,11 @@ def _stored_fill_matches_order_history(
             for value in observed.rows
         ):
             return False
+    if not isinstance(row, dict):
+        if observed is None or str(order.status or "").lower() != "filled":
+            return False
+        # Account fills and order history have independent page caps. A
+        # terminal complete fact may cover a page only through exact trade rows.
         row = {
             "ordId": raw.get("order_id"),
             "instId": raw.get("inst_id"),
@@ -4402,6 +4408,17 @@ def _sample(order: Order, *, kind: str) -> dict[str, Any]:
         "exchange_order_id": getattr(order, "exchange_order_id", None),
         "okx_sync_status": getattr(order, "okx_sync_status", None),
     }
+
+
+def _diagnostic_samples(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    ordered = sorted(
+        samples,
+        key=lambda item: not any(
+            marker in str(item.get("kind") or "")
+            for marker in ("unverified", "incomplete", "waiting", "pending", "deferred")
+        ),
+    )
+    return tuple(ordered[:8])
 
 
 def _fill_sample(fill: OkxNativeFillGroup, *, kind: str) -> dict[str, Any]:

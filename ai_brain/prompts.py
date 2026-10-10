@@ -182,7 +182,7 @@ SYSTEM_PROMPT = """You are a professional cryptocurrency quantitative trading AI
 - Be slightly aggressive when the expected profit edge is usable. Do not wait for perfect setups if price action, momentum, liquidity, and risk/reward are good enough.
 - Use review feedback only to explain past outcomes. It cannot authorize an entry, size, leverage, or threshold change.
 - The surrounding system enforces complete fee-after-return provenance, current account risk, live costs, and exchange constraints.
-- Do not generate a trade when the chosen side lacks a positive fee-after return lower bound or complete live-cost provenance.
+- Paper entry requires positive current fee-after mean and finite downside sizing stress; live entry requires a positive governed fee-after return lower bound. Complete live-cost provenance is mandatory in both modes.
 
 ## Decision Rules
 1. **AI-led action**: Choose "long", "short", "close_long", "close_short", or "hold" directly. Global market regime, side exposure, ML, and expert reports are context, not hard bans.
@@ -340,9 +340,9 @@ Read a compact committee payload and make the final AI-led trading decision.
 Rules:
 - Return ONLY one compact JSON object, no markdown, no prose, no <think>.
 - You may approve, hold, reverse direction, open a trade even when the preliminary decision is hold, or actively close/reduce a position.
-- Do not force long/short when the chosen side lacks a positive fee-after return lower bound or complete provenance.
+- Paper requires positive current fee-after mean with finite downside stress; live requires positive governed fee-after lower bound. Both require complete provenance.
 - Shadow missed-opportunity memory is observation-only and cannot authorize an entry, size, leverage, or threshold change.
-- If entry_candidate_evidence marks the chosen side as production-ineligible, choose hold or the eligible opposite side.
+- In live mode, production-ineligible evidence requires hold or an eligible opposite side. In paper mode compare current paper evidence; production promotion is not paper order permission.
 - Memory and expert history are observation-only and must not change direction, sizing, leverage, exits, routing, or execution permission.
 - Choose action, leverage, position size, entry timing, and exit timing. The system only overrides for hard account/exchange safety.
 - Maximize realized net profit after fees/slippage. Be slightly aggressive when expected value is positive and risk is controllable.
@@ -522,7 +522,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         ),
         "rules": [
             "entry: compare fee-after long/short return distributions, lower confidence bounds, live costs and downside risk.",
-            "entry: a non-positive fee-after return lower bound must become hold; no expert, memory or score can grant execution.",
+            "entry: paper requires positive current fee-after mean and finite downside sizing stress; live requires positive governed fee-after LCB. Neither experts nor memory grant execution.",
             "entry: respect current portfolio exposure and account risk budget.",
             "entry: do not force trades when the production return or cost provenance is incomplete.",
             "entry: shadow missed-opportunity feedback is observation-only and never grants production permission.",
@@ -542,7 +542,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
         compact_payload = dict(payload)
         compact_payload["market"] = short_text(compact_payload.get("market"), 420)
         compact_payload["rules"] = [
-            "entry: require positive fee-after return LCB with complete live-cost and risk provenance.",
+            "entry: paper needs positive fee-after mean and finite downside stress; live needs positive governed LCB. Cost and risk provenance must be complete.",
             "entry: memory and experts are observation-only and cannot authorize an order.",
             "position: close only on hard risk, thesis invalidation, TP/SL, or profit protection.",
         ]
@@ -581,7 +581,7 @@ def build_decision_maker_user_prompt(feature_context: str, context: dict) -> str
 
         compact_payload["market"] = short_text(compact_payload.get("market"), 180)
         compact_payload["rules"] = [
-            "entry: positive fee-after return LCB and complete provenance only.",
+            "entry: paper positive mean with finite downside stress; live positive governed LCB; complete cost/risk provenance.",
             "position: maximize realized net profit with hard evidence.",
         ]
         return dump_prompt_payload(compact_payload)
@@ -958,7 +958,7 @@ Remember:
 - You decide the action, size, leverage, entry timing, exit timing, stop loss, and take profit.
 - The objective is realized net profit after fees/slippage, not win rate. Prefer fewer high-quality trades over many tiny wins that can be erased by one large loss.
 - Rank opportunities by expected net return, downside tail risk, fee/slippage cost, and capital efficiency. A high-confidence trade with poor payoff or large tail risk should be hold.
-- If the chosen side lacks a positive fee-after return lower bound or complete live-cost provenance, choose hold or an eligible opposite side.
+- Paper requires positive current fee-after mean and finite downside sizing stress; live requires positive governed lower bound. Without complete current costs, choose hold.
 - Default to "hold" only when expected value is poor, data/liquidity is unreliable, or hard safety risk is present.
 - Evaluate long and short independently for this symbol. Do not copy the broad market direction blindly.
 - Use broad market regime, side exposure, ML, and expert reports as context, not hard bans.

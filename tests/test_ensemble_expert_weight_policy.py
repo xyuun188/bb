@@ -110,6 +110,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
+                        "return_distribution_contract": {"tail_loss_probability": 0.3},
                         "paper_return_quality_governance": _quality_governance(),
                     },
                     {
@@ -118,6 +119,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
+                        "return_distribution_contract": {"tail_loss_probability": 0.3},
                         "paper_return_quality_governance": _quality_governance(),
                     },
                 ]
@@ -373,18 +375,33 @@ def test_live_entry_keeps_legacy_execution_values() -> None:
     assert "multidimensional_recommendation" not in decision.raw_response
 
 
-def test_uncertain_training_candidate_remains_shadow_and_cannot_open_paper_order() -> None:
+def test_positive_current_paper_mean_uses_downside_as_risk_not_promotion_gate() -> None:
     decision = _coordinator().combine(
         _features(),
         _paper_exploration_context("paper"),
         _strong_long_opinions(),
     )
 
+    assert decision.action == Action.LONG
+    contract = decision.raw_response["normal_paper_trade"]
+    assert contract["authorized"] is True
+    assert contract["selection_reason"] == "strategy_edge_selected"
+    assert contract["expected_net_return_pct"] == pytest.approx(0.2)
+    assert contract["objective_net_return_pct"] < 0
+    assert contract["paper_training_only"] is False
+    assert contract["production_permission"] is False
+    assert decision.raw_response["entry_permission"]["granted"] is True
+
+
+def test_nonpositive_current_paper_net_return_cannot_open_for_training() -> None:
+    context = _paper_exploration_context("paper")
+    context["direction_competition"]["long"]["evidence"][0]["raw_expected_return_pct"] = 0.05
+
+    decision = _coordinator().combine(_features(), context, _strong_long_opinions())
+
     assert decision.action == Action.HOLD
     assert "normal_paper_trade" not in decision.raw_response
-    assert decision.raw_response["paper_trade_selection"]["selected"] is False
     assert decision.raw_response["entry_permission"]["granted"] is False
-    assert "paper_trade_selection" in decision.raw_response
 
 
 def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:

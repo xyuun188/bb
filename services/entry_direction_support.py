@@ -8,12 +8,19 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-09-18.paper-model-direction.v13"
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY,
+    normal_paper_current_return_ready,
+)
+
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-10-10.paper-model-direction.v14"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
 MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
-MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
+MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
+    NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+)
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -104,7 +111,6 @@ def _quant_family_summaries(
     for (family, horizon), rows in sorted(grouped.items()):
         raw_expected = _weighted_mean(rows, "raw_expected_return_pct")
         objective_expected = _weighted_mean(rows, "objective_expected_return_pct")
-        explicit_net_expected = _weighted_mean(rows, "expected_net_return_pct")
         loss_probability = _weighted_mean(
             [
                 {
@@ -131,11 +137,7 @@ def _quant_family_summaries(
                 ),
                 "raw_expected_return_pct": raw_expected,
                 "objective_expected_return_pct": objective_expected,
-                "expected_net_return_pct": (
-                    explicit_net_expected
-                    if explicit_net_expected is not None
-                    else raw_expected - execution_cost_pct
-                ),
+                "expected_net_return_pct": raw_expected - execution_cost_pct,
                 "objective_net_return_pct": objective_expected - execution_cost_pct,
                 "loss_probability": loss_probability,
                 "horizon_minutes": horizon,
@@ -449,14 +451,8 @@ def assess_directional_entry_support(
             positive_expected_net = bool(
                 (_float(item.get("expected_net_return_pct")) or 0.0) > 0.0
             )
-            positive_objective_net = bool(
-                (_float(item.get("objective_net_return_pct")) or 0.0) > 0.0
-            )
             current_contract_ready = bool(
-                (
-                    positive_expected_net
-                    and (positive_objective_net or quality_permission_missing)
-                )
+                positive_expected_net
                 if not training_scope
                 else (
                     selected_raw is not None
@@ -518,17 +514,13 @@ def assess_directional_entry_support(
     strong_expert_opposition = bool(
         len(opposition_groups) >= 2 and len(opposition) > len(aligned)
     )
-    # Historical model quality is a promotion signal, not a veto on a
-    # current paper opportunity. Once the current direction has complete
-    # execution-cost evidence and both the current expected return and its
-    # current lower bound are positive, it is a validated paper edge even if
-    # the trailing quality report is still below break-even.
+    # Historical quality governs promotion. Current negative loss quantiles
+    # increase the sizing stress budget; they do not negate a positive mean.
     current_edge_validated = bool(
         execution_cost_complete
-        and expected_net_return_pct is not None
-        and expected_net_return_pct > 0.0
-        and objective_net_return_pct is not None
-        and objective_net_return_pct > 0.0
+        and normal_paper_current_return_ready(
+            expected_net_return_pct, objective_net_return_pct
+        )
         and quant_families
         and not strong_expert_opposition
     )
@@ -546,16 +538,9 @@ def assess_directional_entry_support(
         blockers.append("direction_support_expected_net_not_positive")
     if paper_scope and not training_scope and objective_net_return_pct is None:
         blockers.append("direction_support_objective_net_missing")
-    elif (
-        paper_scope
-        and not training_scope
-        and objective_net_return_pct <= 0.0
-        and not quality_observation_only
-    ):
-        blockers.append("direction_support_objective_net_not_positive")
     if (
         paper_scope
-        and quality_observation_only
+        and not training_scope
         and (
             loss_probability is None
             or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -697,11 +682,8 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             if expected_net is None or expected_net <= 0.0:
                 reasons.append("direction_support_expected_net_not_positive")
             objective_net = _float(support.get("objective_net_return_pct"))
-            observation_only = support.get("paper_quality_observation_only") is True
             if objective_net is None:
                 reasons.append("direction_support_objective_net_missing")
-            elif objective_net <= 0.0 and not observation_only:
-                reasons.append("direction_support_objective_net_not_positive")
         elif support.get("paper_training_only") is not True:
             reasons.append("paper_training_scope_marker_missing")
     if not support.get("quant_evidence_families"):
@@ -734,7 +716,9 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         if (
             (
                 observation_only
-                or support.get("support_scope") == PAPER_TRAINING_ENTRY_SCOPE
+                or support.get("support_scope") in {
+                    PAPER_MODEL_TRADE_SCOPE, PAPER_TRAINING_ENTRY_SCOPE
+                }
             )
             and (
             loss_probability is None

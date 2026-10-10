@@ -42,13 +42,13 @@ from data_feed.technical_indicators import compute_all_indicators, extract_lates
 from db.repositories.market_repo import MarketRepository
 from db.session import get_session_ctx
 from models.market_data import Kline
+from models.news import NewsArticle, SocialPost
+from services.external_event_service import ExternalEventService
 from services.historical_shadow_contract import (
     build_historical_market_contract,
     build_historical_market_fact,
     compact_historical_market_contract,
 )
-from models.news import NewsArticle, SocialPost
-from services.external_event_service import ExternalEventService
 from services.trading_params import DEFAULT_TRADING_PARAMS, EntryMarketDataQualityParams
 
 logger = structlog.get_logger(__name__)
@@ -1043,7 +1043,7 @@ class DataService:
             indicators=indicators,
             sentiment_data=sentiment,
             headlines=headlines,
-            derivatives=derivatives,
+            derivatives={key: ticker.get(key, value) for key, value in derivatives.items()},
         )
 
     async def prewarm_indicator_snapshots(
@@ -1736,7 +1736,7 @@ class DataService:
             timestamp = self._ticker_timestamp_from_raw(snapshot)
             if timestamp > 0:
                 timestamps.append(timestamp)
-            for key in ("orderbook_fact", "mark_price_fact", "index_price_fact"):
+            for key in ("orderbook_fact",):
                 nested = snapshot.get(key)
                 if isinstance(nested, dict):
                     timestamp = self._ticker_timestamp_from_raw(nested)
@@ -2025,10 +2025,19 @@ class DataService:
 
             snapshot_orderbook = snapshot.get("orderbook_fact")
             derivative_orderbook = derivatives.get("orderbook_fact")
-            if usable_orderbook_fact(snapshot_orderbook) and not usable_orderbook_fact(
-                derivative_orderbook
+            if usable_orderbook_fact(snapshot_orderbook) and (
+                not usable_orderbook_fact(derivative_orderbook)
+                or self._ticker_timestamp_from_raw(snapshot_orderbook)
+                > self._ticker_timestamp_from_raw(derivative_orderbook)
             ):
                 merged["orderbook_fact"] = snapshot_orderbook
+                merged["orderbook_bid_depth"] = snapshot_orderbook["bid_depth_usdt"]
+                merged["orderbook_ask_depth"] = snapshot_orderbook["ask_depth_usdt"]
+                merged["bid_depth_usdt"] = snapshot_orderbook["bid_depth_usdt"]
+                merged["ask_depth_usdt"] = snapshot_orderbook["ask_depth_usdt"]
+                for key in ("orderbook_imbalance", "bid_depth_native", "ask_depth_native"):
+                    if key in snapshot:
+                        merged[key] = snapshot[key]
 
             for key in ("mark_price_fact", "index_price_fact"):
                 snapshot_fact = snapshot.get(key)
@@ -2235,7 +2244,11 @@ class DataService:
     @staticmethod
     def _ticker_timestamp_from_raw(raw_ticker: dict[str, Any]) -> int:
         info = raw_ticker.get("info") if isinstance(raw_ticker, dict) else {}
-        value = raw_ticker.get("timestamp") or (info or {}).get("ts")
+        value = (
+            raw_ticker.get("source_timestamp_ms")
+            or raw_ticker.get("timestamp")
+            or (info or {}).get("ts")
+        )
         try:
             return int(value or 0)
         except (TypeError, ValueError):

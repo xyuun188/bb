@@ -337,7 +337,7 @@ def test_two_independent_quant_families_must_prefer_the_same_side() -> None:
     ]
 
 
-def test_v7_single_aligned_family_still_requires_positive_objective_net() -> None:
+def test_paper_positive_mean_uses_negative_downside_as_risk_evidence() -> None:
     competition = {
         "selected_horizon_minutes": 5.0,
         "horizon_cohort_selection": {"selected_horizon_minutes": 5.0},
@@ -369,13 +369,12 @@ def test_v7_single_aligned_family_still_requires_positive_objective_net() -> Non
         execution_cost_pct=0.1,
     )
 
-    assert support["eligible"] is False
+    assert support["eligible"] is True
     assert support["expected_net_return_pct"] == pytest.approx(0.27)
     assert support["objective_net_return_pct"] == pytest.approx(-0.71)
-    assert support["quant_evidence_families"] == []
-    assert "direction_support_objective_net_not_positive" in support[
-        "blocking_reasons"
-    ]
+    assert support["quant_evidence_families"] == ["local_ml"]
+    assert support["current_edge_validated"] is True
+    assert directional_entry_support_reasons(support, "short") == []
 
 
 def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
@@ -405,9 +404,26 @@ def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
     assert support["eligible"] is True
     assert support["expected_net_return_pct"] == pytest.approx(0.35)
     assert support["objective_net_return_pct"] == pytest.approx(-0.30)
-    assert support["paper_quality_observation_only"] is True
+    assert support["paper_quality_observation_only"] is False
     assert support["blocking_reasons"] == []
     assert directional_entry_support_reasons(support, "long") == []
+
+
+def test_current_execution_cost_replaces_stale_counterfactual_net_return() -> None:
+    row = _row("local_ml", raw=0.45, objective=-0.2)
+    row["expected_net_return_pct"] = -0.5
+    support = assess_paper_model_trade_support(
+        {
+            "long": {"evidence": [row]},
+            "short": {"evidence": [_row("local_ml", raw=-0.45, objective=-0.7)]},
+        },
+        [],
+        "long",
+        execution_cost_pct=0.1,
+    )
+    assert support["eligible"] is True
+    assert support["expected_net_return_pct"] == pytest.approx(0.35)
+    assert support["objective_net_return_pct"] == pytest.approx(-0.3)
 
 
 def test_current_positive_lcb_overrides_stale_quality_observation_permission() -> None:

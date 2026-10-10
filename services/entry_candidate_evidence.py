@@ -9,6 +9,7 @@ from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.normal_paper_trade import normal_paper_current_return_ready
 
 CandidateScorer = Callable[[DecisionOutput, dict[str, Any] | None], float]
 FeatureOpportunityScorer = Callable[[Any], float]
@@ -135,8 +136,8 @@ class EntryCandidateEvidencePolicy:
         feature_score = _safe_float(self.feature_opportunity_score(feature_vector), 0.0)
         # ``decision_eligible`` is scoped to the current execution mode:
         # paper eligibility in paper mode and production eligibility in live
-        # mode. Require a positive fee-after mean and LCB as well so a merely
-        # less-bad side cannot leak a directional bias into later AI context.
+        # mode. Paper uses current positive mean with finite downside stress;
+        # live still requires a positive governed objective.
         execution_sides = [
             item
             for item in (long_evidence, short_evidence)
@@ -150,7 +151,15 @@ class EntryCandidateEvidencePolicy:
             if item["decision_eligible"] is True and item["score"] is not None
         ]
         preferred = (
-            max(execution_sides, key=lambda item: item["return_lcb_pct"])["side"]
+            max(
+                execution_sides,
+                key=lambda item: (
+                    item["expected_net_return_pct"]
+                    if item["execution_scope"] == "paper"
+                    else item["return_lcb_pct"],
+                    item["return_lcb_pct"],
+                ),
+            )["side"]
             if execution_sides
             else "neutral"
         )
@@ -213,9 +222,9 @@ class EntryCandidateEvidencePolicy:
                 ),
             },
             "policy": (
-                "Compare fee-after return LCB for long and short. This context cannot grant "
-                "execution, position size, or leverage. A paper observation side is diagnostic "
-                "only and remains subject to the signed quality-observation contract."
+                "Paper compares current fee-after mean and finite downside sizing stress; "
+                "live requires positive governed fee-after objective. This context cannot "
+                "grant execution, position size, or leverage."
             ),
         }
 
@@ -253,7 +262,14 @@ class EntryCandidateEvidencePolicy:
             )
         )
         decision_eligible = opportunity.get("decision_eligible") is True
-        positive_edge = bool(expected_net > 0.0 and return_lcb > 0.0)
+        execution_scope = opportunity.get("execution_scope")
+        positive_edge = (
+            normal_paper_current_return_ready(
+                opportunity.get("expected_net_return_pct"), opportunity.get("return_lcb_pct")
+            )
+            if execution_scope == "paper"
+            else bool(expected_net > 0.0 and return_lcb > 0.0)
+        )
         components = _safe_dict(opportunity.get("expected_net_breakdown")).get(
             "components"
         )
@@ -305,7 +321,7 @@ class EntryCandidateEvidencePolicy:
                 symbol=symbol,
                 side=side,
             ),
-            "execution_scope": opportunity.get("execution_scope"),
+            "execution_scope": execution_scope,
             "decision_source_count": source_count,
             "paper_source_count": source_count if paper_eligible else 0,
             "production_source_count": production_source_count,
@@ -315,7 +331,9 @@ class EntryCandidateEvidencePolicy:
             "production_eligible": production_eligible,
             "positive_fee_after_return_edge": positive_edge,
             "recommendation": (
-                "positive_fee_after_return_lcb"
+                "positive_current_paper_mean_with_downside_stress"
+                if positive_edge and execution_scope == "paper"
+                else "positive_fee_after_return_lcb"
                 if positive_edge
                 else "coverage_candidate_or_non_positive_return_lcb"
                 if decision_eligible

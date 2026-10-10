@@ -1469,6 +1469,61 @@ def test_complete_stored_fact_covers_only_exact_account_rows_without_order_histo
     )
 
 
+@pytest.mark.parametrize("order_history", [False, True])
+@pytest.mark.parametrize("changed_fee", [False, True])
+def test_priority_partial_fill_preserves_only_exact_stored_complete_execution(
+    order_history, changed_fee,
+) -> None:
+    now = datetime.now(UTC)
+    rows = tuple(
+        {**_fill_row(now, order_id="known"), "tradeId": f"trade-{index}",
+         "fillSz": "1", "fee": "-0.06"}
+        for index in range(2)
+    )
+    complete = OkxNativeFillGroup(
+        order_id="known", trade_ids=("trade-0", "trade-1"),
+        inst_id="BTC-USDT-SWAP", symbol="BTC/USDT", side="buy", pos_side="long",
+        contracts=2, avg_price=60000, fee_abs=0.12, fill_pnl=0,
+        timestamp_ms=now.timestamp() * 1000, timestamp=now, raw_count=2, rows=rows,
+    )
+    order = Order(
+        id=7, exchange_order_id="known", side="buy", symbol="BTC/USDT",
+        quantity=0.02, price=60000, status="filled", created_at=now,
+    )
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order, complete, now=now, sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=0.01, contract_size_source="okx_public_instruments",
+    )
+    partial = replace(
+        complete, contracts=1, trade_ids=("trade-0",), raw_count=1,
+        rows=({**rows[0], "fee": "-0.13"} if changed_fee else rows[0],),
+        pagination_complete=False,
+    )
+    result = OkxOrderFactSyncService(mode="paper")._apply_local_order_facts(
+        [order], fills=[partial], fills_by_order_id={"known": partial},
+        order_rows_by_id=(
+            {"known": {**_order_row(now, order_id="known"), "accFillSz": "2"}}
+            if order_history else {}
+        ),
+        protection_execution_by_order_id={}, contract_sizes={"BTC-USDT-SWAP": 0.01},
+        now=now, since=now - timedelta(days=1), authoritative_absence_order_ids=set(),
+    )
+    assert result[1] == (1 if changed_fee else 0)
+    assert order.okx_sync_status == OKX_SYNC_CONFIRMED
+    assert order.okx_fill_contracts == pytest.approx(2)
+    assert order.okx_raw_fills["rows"] == [
+        order_fact_sync_module._authoritative_fill_row(row) for row in rows
+    ]
+
+
+def test_order_fact_report_prioritizes_blocking_samples() -> None:
+    samples = [{"kind": "local_order_stored_fill_already_verified"} for _ in range(20)]
+    issue = {"kind": "local_order_incomplete_fill_pull_deferred", "local_order_id": 7}
+    selected = order_fact_sync_module._diagnostic_samples([*samples, issue])
+    assert selected[0] == issue
+    assert len(selected) == 8
+
+
 @pytest.mark.parametrize("change", [None, "inst_id", "contracts", "generated_order_id"])
 def test_fill_refresh_preserves_only_identity_matching_confirmed_protection(change) -> None:
     now = datetime.now(UTC)

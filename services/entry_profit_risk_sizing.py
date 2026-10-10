@@ -27,6 +27,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     is_normal_paper_trade_decision,
+    normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
 )
 from services.okx_native_facts import okx_minimum_order_notional_usdt
@@ -169,12 +170,11 @@ def solve_size_aware_positive_expected_net(
         # Some paper snapshots only contain the pre-sizing spread/fee facts,
         # without enough native order-book levels for a second size-specific
         # VWAP pass.  Preserve that existing audited cost contract when its
-        # expected return and lower bound are already positive; never use this
+        # expected return is positive and downside is finite; never use this
         # fallback to authorize a negative opportunity.
         if (
             execution_cost.get("production_eligible") is True
-            and original_expected > 0.0
-            and original_lcb > 0.0
+            and normal_paper_current_return_ready(original_expected, original_lcb)
         ):
             result.update(
                 {
@@ -263,14 +263,6 @@ def solve_size_aware_positive_expected_net(
     if selected["expected"] <= 0.0:
         result["reason"] = "no_positive_expected_net_at_exchange_minimum"
         return result
-    if selected["lcb"] <= 0.0:
-        result["reason"] = (
-            "reduced_size_return_lcb_not_positive"
-            if reduced
-            else "full_risk_size_return_lcb_not_positive"
-        )
-        return result
-
     result.update(
         {
             "production_eligible": True,
@@ -1898,7 +1890,12 @@ class EntryProfitRiskSizingPolicy:
             normal_trade.get("objective_net_return_pct"),
             0.0,
         )
-        negative_lcb_stress_fraction = max(-contract_return_lcb_pct / 100.0, 0.0)
+        negative_lcb_stress_fraction = max(
+            -contract_return_lcb_pct / 100.0,
+            -_safe_float(distribution.get("objective_expected_return_pct"), 0.0) / 100.0,
+            -_safe_float(opportunity.get("return_lcb_pct"), 0.0) / 100.0,
+            0.0,
+        )
         stress_fraction = max(
             declared_stop,
             volatility,
@@ -2080,6 +2077,22 @@ class EntryProfitRiskSizingPolicy:
                     risk_and_liquidity_ceiling,
                     model_requested_notional_cap,
                 )
+        negative_lcb_stress_fraction = max(
+            negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
+        )
+        stress_fraction = max(stress_fraction, negative_lcb_stress_fraction)
+        risk_limited_notional = risk_budget / stress_fraction
+        risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
+        fill_notional_ceiling = min(fill_notional_ceiling, risk_and_liquidity_ceiling)
+        target_notional = min(
+            target_notional,
+            fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction),
+        )
+        minimum_order_supported = bool(
+            minimum_order_supported
+            and fill_notional_ceiling
+            >= minimum_order_notional * (1.0 + fill_drift_reserve_fraction)
+        )
         expected_loss = max(
             _safe_float(opportunity.get("expected_loss_pct"), 0.0),
             _safe_float(distribution.get("tail_loss_penalty_pct"), 0.0),
@@ -2219,8 +2232,8 @@ class EntryProfitRiskSizingPolicy:
             reasons.append(f"normal_paper_size_aware_{size_reason}")
         if not isfinite(expected_net) or expected_net <= 0.0:
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
-        if not isfinite(return_lcb) or return_lcb <= 0.0:
-            reasons.append("normal_paper_return_lcb_not_positive_after_size_cost")
+        if not isfinite(return_lcb):
+            reasons.append("normal_paper_downside_return_missing_after_size_cost")
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:

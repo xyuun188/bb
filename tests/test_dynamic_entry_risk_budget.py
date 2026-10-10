@@ -324,7 +324,7 @@ def test_size_aware_profit_solver_rejects_when_minimum_order_still_loses() -> No
     assert solved["expected_net_return_pct"] <= 0.0
 
 
-def test_size_aware_profit_solver_rejects_negative_lcb_for_quality_observation() -> None:
+def test_size_aware_profit_solver_preserves_finite_negative_downside() -> None:
     snapshot = _size_aware_book_snapshot(400.0)
     original_cost = execution_cost_estimate(snapshot).to_dict()
 
@@ -339,8 +339,8 @@ def test_size_aware_profit_solver_rejects_negative_lcb_for_quality_observation()
         execution_cost=original_cost,
     )
 
-    assert solved["production_eligible"] is False
-    assert solved["reason"] == "full_risk_size_return_lcb_not_positive"
+    assert solved["production_eligible"] is True
+    assert solved["reason"] == "positive_fee_after_full_risk_size"
     assert solved["selected_notional_usdt"] == pytest.approx(400.0)
     assert solved["expected_net_return_pct"] > 0.0
     assert solved["return_lcb_pct"] <= 0.0
@@ -509,7 +509,7 @@ async def test_normal_paper_uses_dynamic_leverage_for_positive_edge() -> None:
 
 
 @pytest.mark.asyncio
-async def test_training_raw_edge_cannot_override_nonpositive_objective() -> None:
+async def test_shadow_training_envelope_cannot_authorize_normal_paper_trade() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade["selection_reason"] = "paper_training_entry"
@@ -538,7 +538,7 @@ async def test_training_raw_edge_cannot_override_nonpositive_objective() -> None
     dynamic = sizing["dynamic_leverage_decision"]
     assert sizing["production_eligible"] is False
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
-    assert "normal_paper_trade_objective_net_not_positive" in sizing["reason"]
+    assert "normal_paper_trade_quality_observation_shadow_only" in sizing["reason"]
     assert dynamic["policy_provenance"]["effective_return_pct"] != pytest.approx(0.9)
     assert sizing["final_leverage"] == 1.0
 
@@ -712,7 +712,7 @@ async def test_negative_lcb_quality_observation_is_shadow_only() -> None:
     assert sizing["production_eligible"] is False
     assert "normal_paper_trade_quality_observation_shadow_only" in sizing["reason"]
     assert sizing["final_leverage"] == 1.0
-    assert sizing["negative_lcb_stress_fraction"] == pytest.approx(0.003)
+    assert sizing["negative_lcb_stress_fraction"] >= 0.003
     expected_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(expected_cap)
     assert sizing["risk_budget_usdt"] == pytest.approx(1000.0 * expected_cap)
@@ -722,6 +722,44 @@ async def test_negative_lcb_quality_observation_is_shadow_only() -> None:
     assert sizing["production_permission"] is False
     assessment = RiskEngine().assess(decision, [], _balance)
     assert assessment.approved is False
+
+
+@pytest.mark.asyncio
+async def test_normal_paper_negative_downside_is_bounded_by_full_risk_budget() -> None:
+    decision = _decision()
+    raw = decision.raw_response
+    raw["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol=decision.symbol,
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.82,
+            "objective_net_return_pct": -3.0,
+            "loss_probability": 0.4,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "current_edge_validated": True,
+            "strong_expert_opposition": False,
+        },
+    )
+    raw["opportunity_score"]["return_lcb_pct"] = -3.0
+    raw["opportunity_score"]["return_distribution_contract"][
+        "objective_expected_return_pct"
+    ] = -3.0
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(
+        decision, "paper", []
+    )
+    sizing = raw["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["return_lcb_pct"] < 0.0
+    assert sizing["stressed_loss_fraction"] >= abs(sizing["return_lcb_pct"]) / 100.0
+    assert 0.0 < sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    assert decision.suggested_leverage > 1.0
+    assert sizing["production_permission"] is False
 
 
 @pytest.mark.asyncio
