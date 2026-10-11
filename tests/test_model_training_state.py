@@ -73,6 +73,12 @@ def test_state_lock_is_exclusive_and_released_by_close(tmp_path, monkeypatch) ->
     assert classify_training_failure(error="model training state write lock timed out") == "transient"
 
 
+def test_default_state_lock_wait_allows_normal_writer_overlap() -> None:
+    from services import model_training_state
+
+    assert model_training_state.WRITE_LOCK_WAIT_SECONDS >= 10.0
+
+
 def test_state_lock_is_released_when_writer_process_exits(tmp_path) -> None:
     store = ModelTrainingStateStore(tmp_path / "state.json")
     code = (

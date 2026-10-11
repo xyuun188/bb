@@ -31,7 +31,10 @@ LOCAL_AI_TOOL_MODEL_IDS = (
 )
 ALL_TRAINABLE_MODEL_IDS = LOCAL_ML_MODEL_IDS + LOCAL_AI_TOOL_MODEL_IDS
 MAX_HISTORY_EVENTS = 30
-WRITE_LOCK_WAIT_SECONDS = 3.0
+# Training and dashboard heartbeat writers share one bounded JSON state file.
+# A three-second window turns normal concurrent writes into false training
+# failures; keep the lock bounded but allow the active writer to finish.
+WRITE_LOCK_WAIT_SECONDS = 15.0
 INTERRUPTED_RETRY_INTERVAL_SECONDS = 5 * 60
 RESOURCE_ERROR_RETRY_DELAYS_SECONDS = (5 * 60, 15 * 60, 30 * 60, 60 * 60, 3 * 60 * 60)
 RESOURCE_ERROR_CIRCUIT_THRESHOLD = 3

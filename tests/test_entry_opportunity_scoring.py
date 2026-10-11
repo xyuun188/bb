@@ -630,6 +630,9 @@ def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -
         initial_net - max(0.3 - initial_slippage, 0.0)
     )
     assert opportunity["expected_net_breakdown"]["authoritative_trade_calibration_count"] == 1
+    context["execution_trade_calibration"]["profiles"] = {"*|long": {**profile, "symbol": "*"}}
+    _scorer().score_candidate(decision, context)
+    assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] == pytest.approx(initial_net)
     context["execution_trade_calibration"]["execution_mode"] = "live"
     _scorer().score_candidate(decision, context)
     assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] == pytest.approx(initial_net)

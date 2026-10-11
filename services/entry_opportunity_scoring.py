@@ -647,7 +647,7 @@ class EntryOpportunityScoringPolicy:
                 [current_profile]
                 if current_calibration.get("execution_mode") == "paper"
                 and current_profile.get("execution_mode") == "paper"
-                and current_profile.get("profile_source") in {"symbol_side", "global_side"}
+                and current_profile.get("profile_source") == "symbol_side"
                 else []
             )
         valid_calibrations = calibrations
