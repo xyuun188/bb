@@ -361,6 +361,7 @@ def sync_evidence() -> dict:
         "specialization_required": True,
         "specialization_target": MODEL_NAME,
         "specialization_status": manifest.get("specialization_status"),
+        "specialization_evidence_verified": True,
         "base_model_carrier": INFERENCE_BASE,
         **{key: value for key, value in specialization.items() if value is not None},
         "specialization_evidence": {

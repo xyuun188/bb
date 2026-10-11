@@ -95,6 +95,7 @@ class StrategySignalRootCauseAuditService:
         blocker_counts: Counter[str] = Counter()
         lifecycle_blocker_counts: Counter[tuple[str, str]] = Counter()
         pre_sizing_blocker_counts: Counter[str] = Counter()
+        economic_blocker_counts: Counter[str] = Counter()
         expected_returns: list[float] = []
         return_lcbs: list[float] = []
         ready_count = 0
@@ -108,6 +109,10 @@ class StrategySignalRootCauseAuditService:
                 continue
             lifecycle = entry_contract_lifecycle(raw)
             lifecycle_counts[lifecycle] += 1
+            economic_blocker = _economic_sizing_guard_blocker(row, raw)
+            if economic_blocker is not None:
+                economic_blocker_counts[economic_blocker] += 1
+                continue
             if lifecycle == "live_ml":
                 policy = _safe_dict(raw.get("live_ml_profit_contract"))
                 expected = _maybe_float(policy.get("expected_net_return_pct"))
@@ -154,6 +159,8 @@ class StrategySignalRootCauseAuditService:
                 if causes
                 else "Entries were stopped by authoritative pre-sizing guards."
                 if pre_sizing_blocker_counts
+                else "Entries with nonpositive fee-after expected returns were rejected."
+                if economic_blocker_counts
                 else "审计窗口内的生产收益契约完整。"
             ),
             "audit_only": True,
@@ -167,10 +174,14 @@ class StrategySignalRootCauseAuditService:
             "can_bypass_risk_controls": False,
             "entry_decision_count": len(entries),
             "contract_validation_entry_count": (
-                len(entries) - sum(pre_sizing_blocker_counts.values())
+                len(entries)
+                - sum(pre_sizing_blocker_counts.values())
+                - sum(economic_blocker_counts.values())
             ),
             "pre_sizing_guard_blocked_count": sum(pre_sizing_blocker_counts.values()),
             "pre_sizing_blocker_counts": dict(pre_sizing_blocker_counts),
+            "economic_guard_blocked_count": sum(economic_blocker_counts.values()),
+            "economic_guard_blocker_counts": dict(economic_blocker_counts),
             "entry_contract_ready_count": ready_count,
             "high_quality_entry_count": lifecycle_ready_counts["live_ml"],
             "live_ml_ready_count": lifecycle_ready_counts["live_ml"],
@@ -297,6 +308,36 @@ def _pre_sizing_guard_blocker(row: Any) -> str | None:
                 return native_reasons[0]
         return fallback
     return None
+
+
+def _economic_sizing_guard_blocker(row: Any, raw: dict[str, Any]) -> str | None:
+    """Recognize a proven refusal, without excusing an executed or malformed entry."""
+
+    if bool(getattr(row, "was_executed", False)):
+        return None
+    reason = str(getattr(row, "execution_reason", None) or "").strip()
+    if not reason.startswith("Normal paper risk budget is not eligible:"):
+        return None
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    if sizing.get("production_eligible") is not False:
+        return None
+    if sizing.get("contract_lifecycle") != "normal_paper_trade":
+        return None
+    expected_net = _maybe_float(sizing.get("expected_net_return_pct"))
+    if expected_net is None or expected_net > 0:
+        return None
+    if _maybe_float(sizing.get("final_notional_usdt")) != 0:
+        return None
+    economic_reasons = {
+        "positive_fee_after_return_missing",
+        "normal_paper_size_aware_no_positive_expected_net_at_exchange_minimum",
+        "normal_paper_expected_net_not_positive_after_size_cost",
+    }
+    declared = {item.strip() for item in str(sizing.get("reason") or "").split(",") if item.strip()}
+    recorded = {item.strip().rstrip(".") for item in reason.split(":", 1)[1].split(",")}
+    if not declared or not declared <= economic_reasons or declared != recorded:
+        return None
+    return "normal_paper_expected_net_not_positive_after_size_cost"
 
 
 def _cause_message(code: str) -> str:

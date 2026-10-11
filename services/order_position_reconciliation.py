@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import (
@@ -330,7 +331,7 @@ async def _close_order_for_execution(
 
 
 async def _matching_entry_order(session: Any, close_order: Order, side: str) -> Order | None:
-    entry_action = Action.LONG if side == "long" else Action.SHORT
+    entry_action = "long" if side == "long" else "short"
     entry_side = "buy" if side == "long" else "sell"
     symbol_variants = trading_symbol_variants(close_order.symbol)
     close_time = _order_time(close_order)
@@ -340,6 +341,7 @@ async def _matching_entry_order(session: Any, close_order: Order, side: str) -> 
 
     rows = await session.execute(
         select(Order)
+        .join(AIDecision, AIDecision.id == Order.decision_id)
         .where(
             Order.model_name == close_order.model_name,
             Order.execution_mode == close_order.execution_mode,
@@ -349,20 +351,37 @@ async def _matching_entry_order(session: Any, close_order: Order, side: str) -> 
             Order.exchange_order_id.is_not(None),
             Order.exchange_order_id != "",
             Order.filled_at <= close_time,
+            AIDecision.action == entry_action,
         )
-        .order_by(Order.filled_at.desc(), Order.created_at.desc())
-        .limit(20)
+        .order_by(Order.filled_at.desc(), Order.id.desc())
+        .limit(1)
     )
-    fallback: Order | None = None
-    for order in rows.scalars().all():
-        if not _quantity_covers(_safe_float(order.quantity), close_quantity):
-            continue
-        decision = await _decision_for_order(session, order)
-        if _decision_action(decision) == entry_action:
-            return order
-        if decision is None and fallback is None:
-            fallback = order
-    return fallback
+    order = rows.scalars().first()
+    if order is None:
+        return None
+    entry_time = _order_time(order)
+    if entry_time is None:
+        return None
+    # Never search an older, larger entry when the newest entry is too small.
+    # Earlier opposite fills have already consumed this entry's quantity.
+    consumed = await session.execute(
+        select(func.coalesce(func.sum(Order.quantity), 0.0)).where(
+            Order.model_name == close_order.model_name,
+            Order.execution_mode == close_order.execution_mode,
+            Order.symbol.in_(symbol_variants),
+            Order.side == _close_order_side(side),
+            Order.status == FILLED_STATUS,
+            Order.exchange_order_id.is_not(None),
+            Order.exchange_order_id != "",
+            Order.id != close_order.id,
+            Order.filled_at >= entry_time,
+            Order.filled_at <= close_time,
+        )
+    )
+    remaining = _safe_float(order.quantity) - _safe_float(consumed.scalar_one())
+    if not _quantity_covers(remaining, close_quantity):
+        return None
+    return order
 
 
 async def _matching_closed_position_exists(
@@ -406,11 +425,29 @@ async def _matching_closed_position_exists(
     return covered_quantity >= quantity * POSITION_COVERAGE_DUPLICATE_RATIO
 
 
-async def _decision_for_order(session: Any, order: Order) -> AIDecision | None:
+async def _decision_for_order(session: Any, order: Order) -> Any | None:
     decision_id = getattr(order, "decision_id", None)
     if not decision_id:
         return None
-    return await session.get(AIDecision, int(decision_id))
+    result = await session.execute(
+        select(
+            AIDecision.action,
+            AIDecision.suggested_leverage,
+            AIDecision.stop_loss_pct,
+            AIDecision.take_profit_pct,
+            AIDecision.raw_llm_response["execution_result"].label("execution_result"),
+        ).where(AIDecision.id == int(decision_id))
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return SimpleNamespace(
+        action=row.action,
+        suggested_leverage=row.suggested_leverage,
+        stop_loss_pct=row.stop_loss_pct,
+        take_profit_pct=row.take_profit_pct,
+        raw_llm_response={"execution_result": row.execution_result},
+    )
 
 
 def _order_okx_inst_id(order: Order, decision: AIDecision | None) -> str:
@@ -425,7 +462,9 @@ def _order_okx_inst_id(order: Order, decision: AIDecision | None) -> str:
         inst_id = okx_inst_id_from_payload(payload, include_fallback=False)
         if inst_id:
             return inst_id
-    return okx_inst_id_from_symbol(getattr(order, "symbol", None))
+    return str(getattr(order, "okx_inst_id", "") or "").strip().upper() or (
+        okx_inst_id_from_symbol(getattr(order, "symbol", None))
+    )
 
 
 def _decision_action(decision: AIDecision | None) -> Action | None:

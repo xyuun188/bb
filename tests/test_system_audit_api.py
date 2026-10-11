@@ -3904,6 +3904,53 @@ async def test_trade_loop_recent_restart_without_decisions_is_observing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "controlled"),
+    [("paper", "critical", False), ("live", "warning", True)],
+)
+async def test_trade_loop_production_no_go_does_not_hide_stalled_paper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    mode: str,
+    expected_status: str,
+    controlled: bool,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'audit.db').as_posix()}"
+    )
+    now = datetime.now(UTC)
+    monkeypatch.setattr(system_audit, "_now", lambda: now)
+    monkeypatch.setattr(
+        system_audit.mode_manager, "get_state", lambda: {"mode": mode, "paused": False}
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_trading_runtime_audit_window",
+        lambda: {
+            "mode": mode,
+            "running": True,
+            "started_at": now - timedelta(hours=1),
+            "heartbeat_at": now - timedelta(minutes=20),
+            "decision_interval": 30,
+        },
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_phase3_dynamic_return_gate_status",
+        lambda: {"ready": False, "controlled_no_go": True},
+    )
+    await init_db()
+    try:
+        card = await system_audit._trade_loop_audit()
+        assert card["status"] == expected_status
+        assert card["details"]["controlled_no_go"] is controlled
+        assert card["details"]["stale_runtime_heartbeat"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_trade_loop_paused_market_analysis_is_observing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -4758,8 +4805,10 @@ async def test_okx_trade_fact_integrity_warns_when_position_links_are_repairable
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authoritative_observation_count", [0, 2])
 async def test_okx_trade_fact_integrity_ignores_superseded_link_candidates(
     monkeypatch: pytest.MonkeyPatch,
+    authoritative_observation_count: int,
 ) -> None:
     class FakeTradeFactIntegrityService:
         async def audit(self) -> dict[str, Any]:
@@ -4820,7 +4869,17 @@ async def test_okx_trade_fact_integrity_ignores_superseded_link_candidates(
             "read_only": True,
             "audit_only": True,
             "okx_pull_available": True,
-            "issue_count": 0,
+            "issue_count": authoritative_observation_count,
+            "observation_count": authoritative_observation_count,
+            "issues": [
+                {
+                    "kind": "local_order_verified_from_persisted_okx_fills",
+                    "severity": "info",
+                    "classification": "observation",
+                    "exchange_order_id": str(index),
+                }
+                for index in range(authoritative_observation_count)
+            ],
             "repairable_count": 0,
             "manual_review_count": 0,
             "okx_fill_order_count": 0,

@@ -13,9 +13,64 @@ from scripts.repair_missing_closed_positions_from_orders import (
     collect_missing_closed_position_scan,
 )
 from services.order_position_reconciliation import (
+    _matching_entry_order,
     apply_missing_closed_position_plan,
     plan_missing_closed_position,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_quantity", "previous_close", "target_close", "expected"),
+    [(10, 10, 1, False), (10, 4, 7, False), (10, 4, 6, True), (1, 0, 5, False)],
+)
+async def test_order_pair_does_not_reuse_consumed_or_older_entry(
+    tmp_path, monkeypatch, entry_quantity, previous_close, target_close, expected
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'lifecycle.db').as_posix()}"
+    )
+    await init_db()
+    try:
+        start = datetime(2026, 10, 10, tzinfo=UTC)
+        async with get_session_ctx() as session:
+            entry = AIDecision(
+                model_name="ensemble_trader", symbol="INJ/USDT", action="short", confidence=0.8
+            )
+            session.add(entry)
+            await session.flush()
+            common = {
+                "model_name": "ensemble_trader", "execution_mode": "paper",
+                "symbol": "INJ/USDT", "order_type": "market", "price": 10.0, "status": "filled",
+            }
+            orders = [
+                Order(
+                    **common, side="sell", quantity=100, decision_id=entry.id,
+                    exchange_order_id="old-entry", filled_at=start - timedelta(days=1),
+                ),
+                Order(
+                    **common, side="sell", quantity=entry_quantity, decision_id=entry.id,
+                    exchange_order_id="current-entry", filled_at=start,
+                ),
+            ]
+            if previous_close:
+                orders.append(Order(
+                    **common, side="buy", quantity=previous_close,
+                    exchange_order_id="previous-close", filled_at=start + timedelta(minutes=1),
+                ))
+            close = Order(
+                **common, side="buy", quantity=target_close,
+                exchange_order_id="target-close", filled_at=start + timedelta(minutes=2),
+            )
+            session.add_all([*orders, close])
+            await session.flush()
+            match = await _matching_entry_order(session, close, "short")
+            assert (match is not None) is expected
+            if match is not None:
+                assert match.exchange_order_id == "current-entry"
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

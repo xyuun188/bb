@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +20,11 @@ from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.news import NewsArticle
 from services.training_epoch import load_training_epoch_start
-from services.vector_memory.store import VectorMemoryStore, build_vector_memory_store
+from services.vector_memory.store import (
+    VectorMemorySnapshotNotReady,
+    VectorMemoryStore,
+    build_vector_memory_store,
+)
 from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
 logger = structlog.get_logger(__name__)
@@ -27,6 +33,8 @@ _VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX = "vector_memory_raw__"
 _VECTOR_MEMORY_MAX_DECISION_INDEX_ROWS = 400
 _VECTOR_MEMORY_MAX_NEWS_INDEX_ROWS = 500
 _VECTOR_MEMORY_REINDEX_FAILURE_BACKOFF_SECONDS = 300
+_VECTOR_MEMORY_MAINTENANCE_TIMEOUT_SECONDS = 30.0
+_VECTOR_MEMORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bb-vector-memory")
 
 
 class _VectorMemoryStoreBusy(RuntimeError):
@@ -69,6 +77,7 @@ class VectorMemoryService:
         self._next_reindex_retry_at: datetime | None = None
         self._auto_reindex_task: asyncio.Task | None = None
         self._auto_reindex_started_at: datetime | None = None
+        self._snapshot_refresh_task: asyncio.Task | None = None
         self._cached_document_count: int | None = None
         self._store_call_lock = asyncio.Lock()
 
@@ -129,6 +138,7 @@ class VectorMemoryService:
         """Reload the configured backend after settings change."""
 
         await self._cancel_auto_reindex()
+        await self._cancel_snapshot_refresh()
         async with self._lock:
             self._store = None
             self._last_error = ""
@@ -141,6 +151,7 @@ class VectorMemoryService:
         operation: Any,
         *args: Any,
         defer_if_locked: bool = False,
+        timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run blocking vector-store work away from the trading event loop."""
@@ -154,10 +165,19 @@ class VectorMemoryService:
         if defer_if_locked and self._store_call_lock.locked():
             raise _VectorMemoryStoreBusy
         await self._store_call_lock.acquire()
-        worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
-        timeout = max(float(settings.vector_memory_operation_timeout_seconds or 2.0), 0.1)
+        worker = asyncio.get_running_loop().run_in_executor(
+            _VECTOR_MEMORY_EXECUTOR, partial(operation, *args, **kwargs)
+        )
+        timeout = max(
+            float(
+                settings.vector_memory_operation_timeout_seconds or 2.0
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            0.1,
+        )
 
-        def release_gate(_task: asyncio.Task[Any]) -> None:
+        def release_gate(_task: asyncio.Future[Any]) -> None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 _task.exception()
             if self._store_call_lock.locked():
@@ -172,7 +192,10 @@ class VectorMemoryService:
                 worker.add_done_callback(release_gate)
 
     async def _store_stats(self) -> dict[str, Any]:
-        stats = await self._store_call(self._get_store().stats)
+        stats = await self._store_call(
+            self._get_store().stats,
+            timeout_seconds=_VECTOR_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+        )
         if isinstance(stats, dict):
             try:
                 self._cached_document_count = int(stats.get("document_count") or 0)
@@ -181,10 +204,49 @@ class VectorMemoryService:
             return stats
         return {"backend": self._get_store().backend_name, "document_count": 0}
 
+    def _schedule_snapshot_refresh(self) -> None:
+        task = self._snapshot_refresh_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._snapshot_refresh_task = loop.create_task(self._refresh_snapshot())
+
+    async def _refresh_snapshot(self) -> None:
+        try:
+            stats = await self._store_call(
+                self._get_store().stats,
+                timeout_seconds=_VECTOR_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+            )
+            if isinstance(stats, dict):
+                self._cached_document_count = int(stats.get("document_count") or 0)
+            self._last_error = ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_error = safe_error_text(exc, limit=180)
+        finally:
+            self._snapshot_refresh_task = None
+
+    async def _cancel_snapshot_refresh(self) -> None:
+        task = self._snapshot_refresh_task
+        if task is None:
+            return
+        if task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._snapshot_refresh_task = None
+
     async def clear_index(self, *, reason: str = "training_derived_state_reset") -> dict[str, Any]:
         """Clear vector documents before rebuilding from the current training epoch."""
 
         await self._cancel_auto_reindex()
+        await self._cancel_snapshot_refresh()
         async with self._lock:
             try:
                 reset_at = self._load_reset_at()
@@ -321,7 +383,11 @@ class VectorMemoryService:
             try:
                 reset_at = self._load_reset_at()
                 documents = await self._load_recent_documents(since=reset_at)
-                indexed = await self._store_call(self._get_store().upsert, documents)
+                indexed = await self._store_call(
+                    self._get_store().upsert,
+                    documents,
+                    timeout_seconds=_VECTOR_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+                )
                 store_stats = await self._store_stats()
                 self._last_reindex_at = datetime.now(UTC)
                 self._last_error = ""
@@ -343,7 +409,11 @@ class VectorMemoryService:
                     try:
                         reset_at = self._load_reset_at()
                         documents = await self._load_recent_documents(since=reset_at)
-                        indexed = await self._store_call(self._get_store().upsert, documents)
+                        indexed = await self._store_call(
+                            self._get_store().upsert,
+                            documents,
+                            timeout_seconds=_VECTOR_MEMORY_MAINTENANCE_TIMEOUT_SECONDS,
+                        )
                         store_stats = await self._store_stats()
                         self._last_reindex_at = datetime.now(UTC)
                         self._last_error = ""
@@ -427,13 +497,14 @@ class VectorMemoryService:
             if value
         }
         try:
-                hits = await self._store_call(
-                    self._get_store().search,
-                    text,
-                    top_k=top_k,
-                    filters=filters,
-                    defer_if_locked=True,
-                )
+            hits = await self._store_call(
+                self._get_store().search,
+                text,
+                top_k=top_k,
+                filters=filters,
+                defer_snapshot_load=True,
+                defer_if_locked=True,
+            )
         except _VectorMemoryStoreBusy:
             return {
                 "enabled": True,
@@ -442,6 +513,17 @@ class VectorMemoryService:
                 "warming": True,
                 "deferred": True,
                 "reason": "vector_memory_store_busy",
+                "selection_policy": "observation_only",
+            }
+        except VectorMemorySnapshotNotReady:
+            self._schedule_snapshot_refresh()
+            return {
+                "enabled": True,
+                "status": "warming",
+                "hits": [],
+                "warming": True,
+                "deferred": True,
+                "reason": "vector_memory_snapshot_loading",
                 "selection_policy": "observation_only",
             }
         except Exception as exc:
@@ -635,7 +717,7 @@ class VectorMemoryService:
                 AIDecision.outcome_pnl_pct,
                 AIDecision.created_at,
                 *(
-                    AIDecision.raw_llm_response[key].label(
+                    AIDecision.decision_learning_snapshot[key].label(
                         f"{_VECTOR_MEMORY_DECISION_RAW_COLUMN_PREFIX}{key}"
                     )
                     for key in _VECTOR_MEMORY_DECISION_RAW_KEYS

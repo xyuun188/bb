@@ -162,6 +162,61 @@ def test_json_vector_memory_store_reuses_snapshot_until_file_changes(tmp_path, m
     assert reads == 1
 
 
+def test_vector_search_matches_cosine_and_only_materializes_top_hits(tmp_path, monkeypatch) -> None:
+    from services.vector_memory import store as store_module
+    from services.vector_memory.embedding import cosine_similarity
+
+    store = JsonVectorMemoryStore(tmp_path / "memory.jsonl", dimension=32, max_documents=100)
+    documents = [
+        VectorMemoryDocument(
+            id=f"decision:{index}", kind="decision", text=f"BTC trend return {index}",
+            symbol="BTC/USDT",
+        )
+        for index in range(100)
+    ]
+    store.upsert(documents)
+    query = "BTC trend return 22"
+    vector = deterministic_text_vector(query, dimension=32)
+    expected = sorted(
+        documents,
+        key=lambda doc: round(
+            cosine_similarity(vector, deterministic_text_vector(doc.text, dimension=32)), 6
+        ),
+        reverse=True,
+    )[:5]
+    materialized = []
+    original = store_module.fields_to_hit
+
+    def record_hit(doc_id, score, fields):
+        materialized.append(doc_id)
+        return original(doc_id, score, fields)
+
+    monkeypatch.setattr(store_module, "fields_to_hit", record_hit)
+    hits = store.search(query, top_k=5)
+    assert [hit.id for hit in hits] == [doc.id for doc in expected]
+    assert len(materialized) == 5
+    assert all("vector" not in row for row in store._rows)
+    reopened = JsonVectorMemoryStore(store.path, dimension=32, max_documents=100)
+    assert reopened.search(query, top_k=5) == hits
+
+
+def test_reindex_keeps_updated_documents_in_recent_bounded_index(tmp_path) -> None:
+    store = JsonVectorMemoryStore(tmp_path / "memory.jsonl", dimension=32, max_documents=100)
+    store.upsert([
+        VectorMemoryDocument(id=str(index), kind="decision", text=f"entry {index}")
+        for index in range(100)
+    ])
+    store.upsert([
+        VectorMemoryDocument(id="0", kind="decision", text="refreshed recent entry"),
+        VectorMemoryDocument(id="100", kind="decision", text="new entry"),
+    ])
+    reopened = JsonVectorMemoryStore(store.path, dimension=32, max_documents=100)
+    assert reopened.stats()["document_count"] == 100
+    ids = {row["id"] for row in reopened._rows}
+    assert {"0", "100"} <= ids
+    assert "1" not in ids
+
+
 @pytest.mark.asyncio
 async def test_vector_memory_search_runs_store_io_off_event_loop(
     monkeypatch: pytest.MonkeyPatch,
@@ -203,6 +258,109 @@ async def test_vector_memory_search_runs_store_io_off_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_search_loads_changed_snapshot_in_background_and_returns_fresh_hits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_backend", "jsonl")
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    monkeypatch.setattr(settings, "vector_memory_operation_timeout_seconds", 0.1)
+    service = VectorMemoryService(data_dir=tmp_path)
+    store = service._get_store()
+    writer = JsonVectorMemoryStore(store.path, dimension=store.dimension, max_documents=100)
+    document = VectorMemoryDocument(
+        id="decision:first", kind="decision", text="BTC profitable sample",
+    )
+    writer.upsert([document])
+    original_read = store._read_rows_from_disk
+    read_count = 0
+
+    def slow_read():
+        nonlocal read_count
+        read_count += 1
+        time.sleep(0.2)
+        return original_read()
+
+    monkeypatch.setattr(store, "_read_rows_from_disk", slow_read)
+    for document_id in ("decision:first", "decision:updated"):
+        if document_id == "decision:updated":
+            writer.clear()
+            writer.upsert([VectorMemoryDocument(
+                id=document_id, kind="decision", text="BTC updated profitable sample",
+            )])
+        started = time.perf_counter()
+        result = await service.search("BTC profit")
+        assert time.perf_counter() - started < 0.18
+        assert result["reason"] == "vector_memory_snapshot_loading"
+        task = service._snapshot_refresh_task
+        assert task is not None
+        await asyncio.sleep(0)
+        assert (await service.search("BTC profit"))["deferred"] is True
+        assert service._snapshot_refresh_task is task
+        await task
+        result = await service.search("BTC profit")
+        assert result["status"] == "ok"
+        assert [hit["id"] for hit in result["hits"]] == [document_id]
+        assert service._last_error == ""
+    assert read_count == 2
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_status_uses_reload_budget_without_fabricating_empty_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    class SlowStats:
+        backend_name = "jsonl"
+
+        def stats(self):
+            time.sleep(0.2)
+            return {"backend": "jsonl", "document_count": 20000}
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    monkeypatch.setattr(settings, "vector_memory_operation_timeout_seconds", 0.1)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._store = SlowStats()
+    status = await service.status()
+    assert status["status"] == "ready"
+    assert status["document_count"] == 20000
+    assert status["last_error"] == ""
+
+
+@pytest.mark.asyncio
+async def test_vector_search_is_not_queued_behind_shared_worker_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from services.vector_memory.service import VectorMemoryService
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    monkeypatch.setattr(settings, "vector_memory_operation_timeout_seconds", 0.1)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    release = threading.Event()
+    occupied = loop.run_in_executor(None, release.wait)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._get_store().upsert([
+        VectorMemoryDocument(id="decision:1", kind="decision", text="BTC sample"),
+    ])
+    try:
+        result = await asyncio.wait_for(service.search("BTC"), timeout=0.5)
+        assert result["status"] == "ok"
+        assert result["hits"][0]["id"] == "decision:1"
+    finally:
+        release.set()
+        await occupied
+
+
+@pytest.mark.asyncio
 async def test_vector_memory_store_timeout_does_not_block_following_calls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -233,6 +391,50 @@ async def test_vector_memory_store_timeout_does_not_block_following_calls(
     assert elapsed < 0.18
     await asyncio.sleep(0.2)
     assert service._store_call_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_vector_memory_rebuild_has_maintenance_budget_and_keeps_search_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from services.vector_memory.service import VectorMemoryService
+
+    class SlowWriter:
+        backend_name = "jsonl"
+
+        def search(self, *_args, **_kwargs):
+            return []
+
+        def upsert(self, documents):
+            time.sleep(0.2)
+            return len(documents)
+
+        def stats(self):
+            return {"backend": "jsonl", "document_count": 1}
+
+    monkeypatch.setattr(settings, "vector_memory_enabled", True)
+    monkeypatch.setattr(settings, "vector_memory_auto_reindex_enabled", False)
+    monkeypatch.setattr(settings, "vector_memory_operation_timeout_seconds", 0.1)
+    service = VectorMemoryService(data_dir=tmp_path)
+    service._store = SlowWriter()
+    started = asyncio.Event()
+
+    async def documents(**_kwargs):
+        started.set()
+        return [VectorMemoryDocument(id="decision:1", kind="decision", text="BTC long")]
+
+    monkeypatch.setattr(service, "_load_recent_documents", documents)
+    rebuild = asyncio.create_task(service.reindex_recent())
+    await started.wait()
+    assert service._store_call_lock.locked()
+    result = await service.search("BTC long")
+    assert result["deferred"] is True
+    result = await rebuild
+    assert result["status"] == "ok"
+    assert result["indexed"] == 1
+    assert service._last_reindex_at is not None
+    assert service._next_reindex_retry_at is None
 
 
 @pytest.mark.asyncio

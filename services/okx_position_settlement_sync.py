@@ -604,6 +604,25 @@ class OkxPositionSettlementSyncService:
                 ]
             candidates: list[SettlementCandidate] = []
             restored_superseded = bool(duplicate_rows or exact_projection_duplicates)
+            terminal_repair_keys: set[tuple[str, ...]] = set()
+            evidence_groups: dict[tuple[str, ...], list[SettlementCandidate]] = {}
+            for row in rows:
+                if _has_superseded_position_metadata(row, _safe_dict(row.settlement_raw)):
+                    continue
+                evidence_groups.setdefault(_position_lifecycle_group_key(row), []).append(
+                    _candidate_with_order_facts(row, order_facts)
+                )
+            terminal_groups = [
+                (key, group) for key, group in evidence_groups.items()
+                if len(group) > 1
+                and any(member.settlement_status == SETTLEMENT_STATUS_UNRESOLVED for member in group)
+            ]
+            if terminal_groups:
+                history_rows = await self._load_position_history_rows()
+                for key, group in terminal_groups:
+                    _prepare_lifecycle_allocations(group, history_rows)
+                    if all(member.allocation_complete for member in group):
+                        terminal_repair_keys.add(key)
             # A shared OKX posId is one settlement unit.  Select due lifecycle
             # keys first, then include every local fragment in each selected
             # lifecycle.  The previous row-by-row limit selected only the
@@ -622,6 +641,7 @@ class OkxPositionSettlementSyncService:
                 if is_final_settlement_status(getattr(position, "settlement_status", None))
                 and _final_fragment_requires_settlement_repair(position)
             )
+            pending_lifecycle_keys.update(terminal_repair_keys)
             due_lifecycle_keys: list[tuple[str, ...]] = []
             due_lifecycle_seen: set[tuple[str, ...]] = set()
             for pending_row in rows:
@@ -629,12 +649,15 @@ class OkxPositionSettlementSyncService:
                 pending_key = _position_lifecycle_group_key(pending_row)
                 if pending_key not in pending_lifecycle_keys or pending_key in due_lifecycle_seen:
                     continue
-                if _is_non_retryable_settlement_status(pending_row):
+                if (
+                    _is_non_retryable_settlement_status(pending_row)
+                    and pending_key not in terminal_repair_keys
+                ):
                     continue
                 pending_pos_id = str(getattr(pending_row, "okx_pos_id", "") or "").strip()
                 if pending_pos_id and pending_pos_id in open_pos_ids:
                     continue
-                if _retry_after(pending_raw, now):
+                if _retry_after(pending_raw, now) and pending_key not in terminal_repair_keys:
                     continue
                 due_lifecycle_seen.add(pending_key)
                 due_lifecycle_keys.append(pending_key)
@@ -658,7 +681,13 @@ class OkxPositionSettlementSyncService:
                     and lifecycle_key not in pending_lifecycle_keys
                 ):
                     continue
-                if _is_non_retryable_settlement_status(row):
+                evidence_only_fragment = (
+                    str(getattr(row, "settlement_status", "") or "")
+                    == SETTLEMENT_STATUS_UNRESOLVED
+                    and lifecycle_key in selected_lifecycle_keys
+                    and bool(_split_exchange_order_ids(row.close_exchange_order_id))
+                )
+                if _is_non_retryable_settlement_status(row) and not evidence_only_fragment:
                     continue
                 okx_pos_id = str(getattr(row, "okx_pos_id", "") or "").strip()
                 if okx_pos_id and okx_pos_id in open_pos_ids:
@@ -668,54 +697,7 @@ class OkxPositionSettlementSyncService:
                 if lifecycle_key not in selected_lifecycle_keys:
                     continue
                 if lifecycle_key:
-                    candidate = _candidate_from_position(row, raw)
-                    entry_contracts = sum(
-                        order_contracts.get(order_id, 0.0)
-                        for order_id in _split_exchange_order_ids(candidate.entry_exchange_order_id)
-                    )
-                    close_contracts = sum(
-                        order_contracts.get(order_id, 0.0)
-                        for order_id in _split_exchange_order_ids(candidate.close_exchange_order_id)
-                    )
-                    entry_ids = _split_exchange_order_ids(candidate.entry_exchange_order_id)
-                    close_ids = _split_exchange_order_ids(candidate.close_exchange_order_id)
-                    entry_fact_fees = [
-                        order_facts[order_id]["fee"]
-                        for order_id in entry_ids
-                        if order_id in order_facts and order_facts[order_id]["fee"] is not None
-                    ]
-                    close_fact_fees = [
-                        order_facts[order_id]["fee"]
-                        for order_id in close_ids
-                        if order_id in order_facts and order_facts[order_id]["fee"] is not None
-                    ]
-                    close_fill_pnls = [
-                        order_facts[order_id]["fill_pnl"]
-                        for order_id in close_ids
-                        if order_id in order_facts and order_facts[order_id]["fill_pnl"] is not None
-                    ]
-                    candidates.append(
-                        replace(
-                            candidate,
-                            entry_contracts=entry_contracts,
-                            close_contracts=close_contracts,
-                            entry_fee_authoritative=(
-                                sum(float(value) for value in entry_fact_fees)
-                                if entry_fact_fees
-                                else None
-                            ),
-                            close_fee_authoritative=(
-                                sum(float(value) for value in close_fact_fees)
-                                if close_fact_fees
-                                else None
-                            ),
-                            close_fill_pnl_authoritative=(
-                                sum(float(value) for value in close_fill_pnls)
-                                if close_fill_pnls
-                                else None
-                            ),
-                        )
-                    )
+                    candidates.append(_candidate_with_order_facts(row, order_facts))
             if restored_superseded:
                 await session.flush()
         return candidates
@@ -936,9 +918,21 @@ class OkxPositionSettlementSyncService:
                 )
                 if already_current and not _final_fragment_requires_settlement_repair(position):
                     return False, None
-            if _is_non_retryable_settlement_status(position):
+            proven_terminal_repair = (
+                str(getattr(position, "settlement_status", "") or "")
+                == SETTLEMENT_STATUS_UNRESOLVED
+                and candidate.lifecycle_group_size > 1
+                and candidate.allocation_complete
+                and candidate.allocation_basis == "okx_close_fill_contracts_and_order_economics"
+            )
+            if _is_non_retryable_settlement_status(position) and not proven_terminal_repair:
                 return False, None
             apply_position_settlement_snapshot(position, success.snapshot)
+            if isinstance(raw.get("entry_identity_repair"), dict):
+                position.settlement_raw = {
+                    **_safe_dict(position.settlement_raw),
+                    "entry_identity_repair": raw["entry_identity_repair"],
+                }
             authoritative_quantity = _authoritative_fragment_quantity(candidate, success.row)
             if authoritative_quantity > 0 and not _quantities_close(
                 _safe_float(getattr(position, "quantity", None), 0.0),
@@ -1154,10 +1148,25 @@ def _deduplicate_closed_lifecycle_rows(
     *,
     now: datetime,
 ) -> tuple[list[Position], list[Position]]:
+    proven_pos_ids: dict[tuple[Any, ...], set[str]] = {}
+    for position in rows:
+        projection = _closed_order_projection_identity(position)
+        pos_id = str(getattr(position, "okx_pos_id", "") or "").strip()
+        if projection is not None and pos_id:
+            proven_pos_ids.setdefault(projection, set()).add(pos_id)
     grouped: dict[tuple[Any, ...], list[Position]] = {}
     retained_without_identity: list[Position] = []
     for position in rows:
         identity = _closed_lifecycle_identity(position)
+        if identity is None:
+            # A sync race can leave one projection without posId. Exact entry
+            # and close orders plus quantity must prove a single lifecycle.
+            projection = _closed_order_projection_identity(position)
+            matching_pos_ids = proven_pos_ids.get(projection, set())
+            if len(matching_pos_ids) == 1:
+                identity = _closed_lifecycle_identity(
+                    position, resolved_pos_id=next(iter(matching_pos_ids))
+                )
         if identity is None:
             retained_without_identity.append(position)
             continue
@@ -1249,6 +1258,7 @@ def _deduplicate_closed_lifecycle_rows(
             candidates,
             key=lambda item: (
                 -len(_split_exchange_order_ids(getattr(item, "close_exchange_order_id", None))),
+                -int(bool(str(getattr(item, "okx_pos_id", "") or "").strip())),
                 -int(
                     str(getattr(item, "settlement_status", "") or "").lower()
                     in {"reconciled", "okx_position_history"}
@@ -1375,6 +1385,61 @@ def _deduplicate_exact_close_order_projections(
                 "deduplication_evidence": "unique_exact_okx_close_fill_quantity",
             }
             duplicates.append(duplicate)
+    lifecycle_rows: dict[tuple[str, ...], list[Position]] = {}
+    duplicate_ids = {int(row.id) for row in duplicates}
+    for row in rows:
+        if int(row.id) in duplicate_ids or _has_superseded_position_metadata(
+            row, _safe_dict(getattr(row, "settlement_raw", None))
+        ):
+            continue
+        lifecycle_key = _position_lifecycle_group_key(row)
+        if lifecycle_key[2] and lifecycle_key[4]:
+            lifecycle_rows.setdefault(lifecycle_key, []).append(row)
+    for group in lifecycle_rows.values():
+        fragments = [
+            row for row in group
+            if _split_exchange_order_ids(row.close_exchange_order_id)
+        ]
+        if not fragments:
+            continue
+        seen_close_ids: set[str] = set()
+        total_quantity = 0.0
+        for fragment in fragments:
+            close_ids = _split_exchange_order_ids(fragment.close_exchange_order_id)
+            quantity = sum(
+                _safe_float(order_facts.get(order_id, {}).get("base_quantity"), 0.0)
+                for order_id in close_ids
+            )
+            if (
+                seen_close_ids.intersection(close_ids)
+                or any(
+                    _safe_float(order_facts.get(order_id, {}).get("base_quantity"), 0.0) <= 0
+                    for order_id in close_ids
+                )
+                or not _quantities_close(quantity, _safe_float(fragment.quantity, 0.0))
+            ):
+                break
+            seen_close_ids.update(close_ids)
+            total_quantity += quantity
+        else:
+            canonical = min(fragments, key=lambda row: int(row.id))
+            for aggregate in group:
+                if _split_exchange_order_ids(aggregate.close_exchange_order_id):
+                    continue
+                if not _quantities_close(_safe_float(aggregate.quantity, 0.0), total_quantity):
+                    continue
+                _mark_closed_position_superseded(
+                    aggregate, canonical=canonical,
+                    reason=DUPLICATE_EXACT_LIFECYCLE_PROJECTION_REASON, now=now,
+                )
+                aggregate.settlement_raw = {
+                    **_safe_dict(aggregate.settlement_raw),
+                    "canonical_position_ids": sorted(int(row.id) for row in fragments),
+                    "authoritative_close_order_ids": sorted(seen_close_ids),
+                    "authoritative_base_quantity": total_quantity,
+                    "deduplication_evidence": "disjoint_okx_close_fills_conserve_aggregate_quantity",
+                }
+                duplicates.append(aggregate)
     return duplicates
 
 
@@ -1444,8 +1509,37 @@ def _reactivate_selected_canonical_projection(
     canonical.updated_at = now
 
 
-def _closed_lifecycle_identity(position: Position) -> tuple[Any, ...] | None:
-    pos_id = str(getattr(position, "okx_pos_id", "") or "").strip()
+def _closed_order_projection_identity(position: Position) -> tuple[Any, ...] | None:
+    mode = str(getattr(position, "execution_mode", "") or "").lower()
+    symbol = normalize_trading_symbol(str(getattr(position, "symbol", "") or ""))
+    side = str(getattr(position, "side", "") or "").lower()
+    entry_ids = tuple(
+        sorted(_split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None)))
+    )
+    close_ids = tuple(
+        sorted(_split_exchange_order_ids(getattr(position, "close_exchange_order_id", None)))
+    )
+    quantity = abs(_safe_float(getattr(position, "quantity", None), 0.0))
+    if mode not in {"paper", "live"} or not symbol or side not in {"long", "short"}:
+        return None
+    if not entry_ids or not close_ids or quantity <= 0:
+        return None
+    return (
+        mode,
+        symbol,
+        side,
+        str(getattr(position, "okx_inst_id", "") or "").upper()
+        or okx_inst_id_from_symbol(symbol),
+        entry_ids,
+        close_ids,
+        format(quantity, ".12g"),
+    )
+
+
+def _closed_lifecycle_identity(
+    position: Position, *, resolved_pos_id: str = ""
+) -> tuple[Any, ...] | None:
+    pos_id = str(getattr(position, "okx_pos_id", "") or "").strip() or resolved_pos_id
     entry_ids = tuple(
         sorted(_split_exchange_order_ids(getattr(position, "entry_exchange_order_id", None)))
     )
@@ -1488,6 +1582,29 @@ def _candidate_from_position(position: Position, raw: dict[str, Any]) -> Settlem
         closed_at=_aware_utc(getattr(position, "closed_at", None)),
         settlement_status=str(getattr(position, "settlement_status", "") or "").strip(),
         settlement_raw=dict(raw),
+    )
+
+
+def _candidate_with_order_facts(
+    position: Position, order_facts: dict[str, dict[str, float | None]],
+) -> SettlementCandidate:
+    candidate = _candidate_from_position(position, _safe_dict(position.settlement_raw))
+    entry_ids = _split_exchange_order_ids(candidate.entry_exchange_order_id)
+    close_ids = _split_exchange_order_ids(candidate.close_exchange_order_id)
+
+    def sum_fact(order_ids: set[str], field: str) -> float | None:
+        values = [order_facts.get(order_id, {}).get(field) for order_id in order_ids]
+        if not values or any(value is None for value in values):
+            return None
+        return sum(float(value) for value in values)
+
+    return replace(
+        candidate,
+        entry_contracts=sum_fact(entry_ids, "contracts") or 0.0,
+        close_contracts=sum_fact(close_ids, "contracts") or 0.0,
+        entry_fee_authoritative=sum_fact(entry_ids, "fee"),
+        close_fee_authoritative=sum_fact(close_ids, "fee"),
+        close_fill_pnl_authoritative=sum_fact(close_ids, "fill_pnl"),
     )
 
 
@@ -2213,7 +2330,10 @@ def _split_exchange_order_ids(value: Any) -> set[str]:
         for token in tokens:
             pieces.update(part.strip() for part in token.split(separator) if part.strip())
         tokens = pieces
-    return {token for token in tokens if token}
+    return {
+        token for token in tokens
+        if token and not token.startswith("okx_orphan_quarantine:")
+    }
 
 
 def _merge_history_links(existing: Any, incoming: set[str]) -> list[str]:
@@ -2223,7 +2343,7 @@ def _merge_history_links(existing: Any, incoming: set[str]) -> list[str]:
         if str(value or "").strip()
     }
     values.update(str(value).strip() for value in incoming if str(value).strip())
-    return sorted(values)
+    return sorted(value for value in values if not value.startswith("okx_orphan_quarantine:"))
 
 
 def _time_delta_seconds(left: datetime | None, right: datetime | None) -> float | None:

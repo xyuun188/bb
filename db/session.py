@@ -1464,6 +1464,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'production_permission',
                             'reason',
                             'remaining_portfolio_risk_budget_usdt',
+                            'return_lcb_pct',
                             'risk_budget_usdt',
                             'selected_contract_spec',
                             'stressed_loss_fraction',
@@ -1557,7 +1558,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         ),
                         '{}'::JSONB
                     );
-                    NEW.decision_learning_snapshot_version := 5;
+                    NEW.decision_learning_snapshot_version := 6;
                     RETURN NEW;
                 END;
                 $$
@@ -1583,26 +1584,8 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                 """
             )
         )
-        # Backfill only the most recent rows needed by health reports. The trigger
-        # handles all future writes without re-reading large historic payloads.
-        await conn.execute(
-            text(
-                """
-                WITH recent_unprojected AS (
-                    SELECT id
-                    FROM ai_decisions
-                    WHERE model_health_snapshot_version < 1
-                       OR decision_learning_snapshot_version < 5
-                    ORDER BY created_at DESC NULLS LAST, id DESC
-                    LIMIT 1500
-                )
-                UPDATE ai_decisions AS decision
-                SET raw_llm_response = decision.raw_llm_response
-                FROM recent_unprojected
-                WHERE decision.id = recent_unprojected.id
-                """
-            )
-        )
+        # Historical JSON repair runs in bounded maintenance transactions,
+        # outside the startup schema lock. New writes use the trigger above.
         return
 
     if "sqlite" not in settings.database_url:

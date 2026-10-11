@@ -3,27 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import re
 import shutil
 import tempfile
 import threading
+from collections import deque
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import numpy as np
 import structlog
 
 from core.safe_output import safe_error_text
-from services.vector_memory.embedding import cosine_similarity, deterministic_text_vector
+from services.vector_memory.embedding import deterministic_text_vector
 from services.vector_memory.types import VectorMemoryDocument, VectorMemoryHit
 
 logger = structlog.get_logger(__name__)
 
 _CONTROL_TEXT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ZVEC_ID_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+class VectorMemorySnapshotNotReady(RuntimeError):
+    """A changed disk index needs background loading before bounded search."""
 
 
 class VectorMemoryStore(Protocol):
@@ -35,7 +42,8 @@ class VectorMemoryStore(Protocol):
         """Persist or update documents and return the accepted count."""
 
     def search(
-        self, query: str, *, top_k: int = 8, filters: dict[str, str] | None = None
+        self, query: str, *, top_k: int = 8, filters: dict[str, str] | None = None,
+        defer_snapshot_load: bool = False,
     ) -> list[VectorMemoryHit]:
         """Search for similar documents."""
 
@@ -117,27 +125,34 @@ class JsonVectorMemoryStore:
         self.max_documents = max(int(max_documents), 100)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._rows: tuple[dict[str, Any], ...] = ()
+        self._vectors = np.empty((0, self.dimension), dtype=np.float64)
         self._file_signature: tuple[int, int] | None = None
         self._snapshot_lock = threading.RLock()
 
     def upsert(self, documents: Iterable[VectorMemoryDocument]) -> int:
         with self._snapshot_lock:
-            existing = {item["id"]: item for item in self._load_rows()}
-        accepted = 0
-        for document in documents:
-            if not document.text.strip():
-                continue
-            fields = document_to_fields(document)
-            existing[document.id] = {
-                "id": document.id,
-                "fields": fields,
-                "vector": deterministic_text_vector(fields["text"], dimension=self.dimension),
+            rows = self._load_rows()
+            existing = {
+                item["id"]: {**item, "vector": self._vectors[index]}
+                for index, item in enumerate(rows)
             }
-            accepted += 1
-        rows = list(existing.values())[-self.max_documents :]
-        self._write_rows(rows)
-        with self._snapshot_lock:
-            self._rows = tuple(rows)
+            accepted = 0
+            for document in documents:
+                if not document.text.strip():
+                    continue
+                fields = document_to_fields(document)
+                # Refreshed documents belong at the recent end of the bounded
+                # index, even when their id was already present.
+                existing.pop(document.id, None)
+                existing[document.id] = {
+                    "id": document.id,
+                    "fields": fields,
+                    "vector": deterministic_text_vector(fields["text"], dimension=self.dimension),
+                }
+                accepted += 1
+            rows = list(existing.values())[-self.max_documents :]
+            self._write_rows(rows)
+            self._publish_rows(rows)
             self._file_signature = self._stat_signature()
         return accepted
 
@@ -147,56 +162,94 @@ class JsonVectorMemoryStore:
         *,
         top_k: int = 8,
         filters: dict[str, str] | None = None,
+        defer_snapshot_load: bool = False,
     ) -> list[VectorMemoryHit]:
-        rows = self._load_rows()
-        query_vector = deterministic_text_vector(query, dimension=self.dimension)
-        hits: list[VectorMemoryHit] = []
-        for row in rows:
-            fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
-            if not self._matches_filters(fields, filters):
-                continue
-            score = cosine_similarity(query_vector, row.get("vector") or [])
-            hits.append(fields_to_hit(str(row.get("id") or ""), score, fields))
-        hits.sort(key=lambda item: item.score, reverse=True)
-        return hits[: max(int(top_k or 8), 1)]
+        with self._snapshot_lock:
+            rows = self._load_rows(defer_snapshot_load=defer_snapshot_load)
+            vectors = self._vectors
+        if not rows:
+            return []
+        query_vector = np.asarray(
+            deterministic_text_vector(query, dimension=self.dimension), dtype=np.float64
+        )
+        norm = np.linalg.norm(query_vector)
+        if norm > 0:
+            query_vector /= norm
+        # Elementwise reduction avoids creating a BLAS thread pool for this
+        # small matrix and keeps CPU contention out of the trading process.
+        scores = np.einsum("ij,j->i", vectors, query_vector)
+        indices = (
+            index
+            for index, row in enumerate(rows)
+            if self._matches_filters(row.get("fields") or {}, filters)
+        )
+        selected = heapq.nlargest(
+            max(int(top_k or 8), 1),
+            indices,
+            key=lambda index: (round(float(scores[index]), 6), -index),
+        )
+        return [
+            fields_to_hit(
+                str(rows[index].get("id") or ""),
+                float(scores[index]),
+                rows[index].get("fields") or {},
+            )
+            for index in selected
+        ]
 
     def stats(self) -> dict[str, Any]:
         rows = self._load_rows()
         return {"backend": self.backend_name, "document_count": len(rows), "path": str(self.path)}
 
     def clear(self) -> int:
-        rows = self._load_rows()
-        removed = len(rows)
-        self._write_rows([])
         with self._snapshot_lock:
-            self._rows = ()
+            removed = len(self._load_rows())
+            self._write_rows([])
+            self._publish_rows([])
             self._file_signature = self._stat_signature()
         return removed
 
-    def _load_rows(self) -> tuple[dict[str, Any], ...]:
-        signature = self._stat_signature()
+    def _load_rows(
+        self, *, defer_snapshot_load: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
         with self._snapshot_lock:
+            signature = self._stat_signature()
             if signature == self._file_signature:
                 return self._rows
+            if defer_snapshot_load:
+                raise VectorMemorySnapshotNotReady
             rows = self._read_rows_from_disk()
-            self._rows = tuple(rows)
+            self._publish_rows(rows)
             self._file_signature = signature
             return self._rows
+
+    def _publish_rows(self, rows: list[dict[str, Any]]) -> None:
+        vectors = np.zeros((len(rows), self.dimension), dtype=np.float64)
+        for index, row in enumerate(rows):
+            values = np.asarray(row.pop("vector", []), dtype=np.float64).reshape(-1)
+            size = min(values.size, self.dimension)
+            vectors[index, :size] = values[:size]
+        norms = np.linalg.norm(vectors, axis=1)
+        np.divide(vectors, norms[:, None], out=vectors, where=norms[:, None] > 0)
+        vectors.setflags(write=False)
+        self._rows = tuple(rows)
+        self._vectors = vectors
 
     def _read_rows_from_disk(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        rows: list[dict[str, Any]] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict) and parsed.get("id"):
-                rows.append(parsed)
-        return rows
+        rows: deque[dict[str, Any]] = deque(maxlen=self.max_documents)
+        with self.path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict) and parsed.get("id"):
+                    rows.append(parsed)
+        return list(rows)
 
     def _stat_signature(self) -> tuple[int, int] | None:
         try:
@@ -206,13 +259,6 @@ class JsonVectorMemoryStore:
         return (int(stat.st_mtime_ns), int(stat.st_size))
 
     def _write_rows(self, rows: list[dict[str, Any]]) -> None:
-        payload = (
-            "\n".join(
-                json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-                for row in rows
-            )
-            + ("\n" if rows else "")
-        )
         temp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -224,7 +270,16 @@ class JsonVectorMemoryStore:
                 delete=False,
             ) as handle:
                 temp_path = Path(handle.name)
-                handle.write(payload)
+                for row in rows:
+                    vector = row.get("vector", [])
+                    if isinstance(vector, np.ndarray):
+                        vector = vector.tolist()
+                    handle.write(json.dumps(
+                        {**row, "vector": vector},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ))
+                    handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
@@ -384,7 +439,9 @@ class ZvecVectorMemoryStore:
         *,
         top_k: int = 8,
         filters: dict[str, str] | None = None,
+        defer_snapshot_load: bool = False,
     ) -> list[VectorMemoryHit]:
+        del defer_snapshot_load
         fetch_limit = _zvec_fetch_limit(top_k, filters)
         collection = self._open_or_create()
         try:

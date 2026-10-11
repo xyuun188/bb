@@ -1263,14 +1263,9 @@ class StrategyLearningService:
         self.champion_service = champion_service or PaperStrategyChampionService()
         self._replay_model_service = replay_model_service
         self.routing_store = routing_store or ContinuousStrategyRoutingStore()
-        # Reuse one bounded outcome read after a caller timeout. This prevents
-        # each market/position round from leaving another database query active.
-        self._outcome_read_task: asyncio.Task[list[dict[str, Any]]] | None = None
-        # The time window is part of the contract, rather than the computed
-        # wall-clock cutoff.  Using ``since`` here made every polling round
-        # cancel the previous query and start another one a few milliseconds
-        # later.
-        self._outcome_read_task_key: tuple[str, int, int, bool] | None = None
+        self._outcome_read_tasks: dict[
+            tuple[str, int, int, bool], asyncio.Task[list[dict[str, Any]]]
+        ] = {}
 
     def _default_model_replay_context(
         self,
@@ -1445,14 +1440,12 @@ class StrategyLearningService:
             effective_limit,
             bool(include_decision_evidence),
         )
-        outcome_task = self._outcome_read_task
-        if (
-            outcome_task is None
-            or outcome_task.done()
-            or self._outcome_read_task_key != task_key
-        ):
-            if outcome_task is not None and not outcome_task.done():
-                outcome_task.cancel()
+        outcome_task = self._outcome_read_tasks.get(task_key)
+        if outcome_task is None or outcome_task.done():
+            # Keep distinct report/runtime reads alive until SQL finishes;
+            # switching callers must not cancel an asyncpg operation.
+            if len(self._outcome_read_tasks) >= 4:
+                raise RuntimeError("strategy outcome read capacity is busy")
             outcome_task = asyncio.create_task(
                 load_authoritative_trade_outcomes(
                     mode=selected_mode,
@@ -1462,13 +1455,11 @@ class StrategyLearningService:
                     include_decision_evidence=bool(include_decision_evidence),
                 )
             )
-            self._outcome_read_task = outcome_task
-            self._outcome_read_task_key = task_key
+            self._outcome_read_tasks[task_key] = outcome_task
 
             def _clear_finished_outcome_task(task: asyncio.Task[Any]) -> None:
-                if self._outcome_read_task is task:
-                    self._outcome_read_task = None
-                    self._outcome_read_task_key = None
+                if self._outcome_read_tasks.get(task_key) is task:
+                    self._outcome_read_tasks.pop(task_key, None)
                 _consume_background_outcome_task(task)
 
             outcome_task.add_done_callback(_clear_finished_outcome_task)

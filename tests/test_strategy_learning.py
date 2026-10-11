@@ -220,11 +220,60 @@ async def test_feedback_reuses_inflight_outcome_read_for_same_window(
         await service._feedback(mode="paper", hours=24, limit=7)
         await service._feedback(mode="paper", hours=24, limit=7)
         assert len(calls) == 1
-        assert service._outcome_read_task_key == ("paper", 24, 7, True)
+        assert list(service._outcome_read_tasks) == [("paper", 24, 7, True)]
     finally:
-        if service._outcome_read_task is not None:
-            service._outcome_read_task.cancel()
-            await asyncio.gather(service._outcome_read_task, return_exceptions=True)
+        tasks = list(service._outcome_read_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_and_report_outcome_reads_do_not_cancel_each_other(monkeypatch) -> None:
+    started = []
+    completed = []
+    release = asyncio.Event()
+
+    async def outcomes(**kwargs):
+        evidence = kwargs["include_decision_evidence"]
+        started.append(evidence)
+        await release.wait()
+        completed.append(evidence)
+        return []
+
+    class Result:
+        def all(self):
+            return []
+
+    class Context:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+    monkeypatch.setattr(strategy_learning_module, "load_authoritative_trade_outcomes", outcomes)
+    monkeypatch.setattr(strategy_learning_module, "get_read_session_ctx", Context)
+    monkeypatch.setattr(strategy_learning_module, "STRATEGY_LEARNING_READ_TIMEOUT_SECONDS", 0.001)
+    service = StrategyLearningService()
+    try:
+        for evidence in (False, True, False):
+            await service._feedback(
+                mode="paper", hours=24, limit=7, include_decision_evidence=evidence
+            )
+        assert started == [False, True]
+        tasks = list(service._outcome_read_tasks.values())
+        assert all(not task.cancelled() for task in tasks)
+        release.set()
+        await asyncio.gather(*tasks)
+        assert completed == [False, True]
+        assert service._outcome_read_tasks == {}
+    finally:
+        release.set()
+        await asyncio.gather(*service._outcome_read_tasks.values(), return_exceptions=True)
 
 
 @pytest.mark.asyncio

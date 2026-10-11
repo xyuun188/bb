@@ -86,3 +86,40 @@ def test_activate_shadow_rejects_pointer_outside_shadow_directory(
 
     with pytest.raises(ValueError, match="inside the registry shadow directory"):
         registry.activate_shadow(outside)
+
+
+def test_verified_registry_evidence_survives_inventory_refresh(tmp_path, monkeypatch) -> None:
+    from scripts.sync_phase3_model_inventory import render_target_inventory_sync
+
+    pointer = {
+        "adapter_version": "verified-adapter",
+        "adapter_path": "/data/BB/models/finquant_target_27b/versions/verified-adapter",
+        "manifest_path": "/data/BB/models/finquant_target_27b/versions/verified-adapter/manifest.json",
+        "specialization_id": "verified-specialization",
+    }
+    monkeypatch.setattr(registry, "validate_current", lambda **_kwargs: pointer)
+    monkeypatch.setattr(
+        registry,
+        "validate_pointer",
+        lambda _pointer: ({"specialization_status": "trained_shadow_not_live"}, tmp_path),
+    )
+    monkeypatch.setattr(registry, "DOWNLOAD_MANIFEST", tmp_path / "download.json")
+    monkeypatch.setattr(registry, "VALIDATION_MANIFEST", tmp_path / "validation.json")
+
+    result = registry.sync_evidence()
+    namespace = {"__name__": "inventory_contract_test"}
+    exec(  # noqa: S102 - exercise the repository-owned generated consumer.
+        compile(render_target_inventory_sync(), "<inventory-sync>", "exec"),
+        namespace,
+    )
+    refreshed = namespace["update"](
+        json.loads((tmp_path / "validation.json").read_text()),
+        {
+            "slot": "llm_decision_and_expert_carrier",
+            "served_model_name": registry.MODEL_NAME,
+        },
+    )
+    row = refreshed["models"][0]
+    assert row["specialization_evidence_verified"] is True
+    assert row["specialization_evidence"] == result["evidence"]["specialization_evidence"]
+    assert row["adapter_path"] == pointer["adapter_path"]

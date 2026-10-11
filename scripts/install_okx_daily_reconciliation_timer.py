@@ -23,7 +23,7 @@ TIMER_NAME = "bb-okx-daily-reconciliation.timer"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REPORT_DIR_REL = "data/okx_daily_reconciliation_reports"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* 00:10:00"
+DEFAULT_ON_CALENDAR = "*-*-* *:10,40:00"
 
 
 def _remote_quote(value: str) -> str:
@@ -58,12 +58,12 @@ ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then
 
 def render_timer(*, on_calendar: str = DEFAULT_ON_CALENDAR) -> str:
     return f"""[Unit]
-Description=Run BB OKX daily dry-run reconciliation report
+Description=Refresh BB OKX reconciliation and training facts
 
 [Timer]
 OnCalendar={on_calendar}
 Persistent=true
-RandomizedDelaySec=300
+RandomizedDelaySec=60
 Unit={SERVICE_NAME}
 
 [Install]

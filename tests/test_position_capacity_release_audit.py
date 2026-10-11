@@ -302,6 +302,95 @@ def test_capacity_audit_checks_fragmented_positions_as_one_net_position_group() 
     assert group == []
 
 
+def _recent_partial_reduction():
+    now = datetime.now(UTC)
+    position = _position(
+        created_at=now - timedelta(hours=2), execution_mode="paper",
+    )
+    contract = position.current_management_contract
+    contract["refreshed_at"] = (now - timedelta(seconds=30)).isoformat()
+    contract["exit_execution_intent"] = {
+        "state": "exchange_progress_confirmed", "result_status": "filled",
+        "exchange_order_id": "close-verified", "decision_id": 21,
+    }
+    contract["profit_lock_exit_ledger"] = {
+        "last_exchange_order_id": "close-verified", "last_filled_quantity": 0.5,
+    }
+    position.quantity = 1.5
+    order = SimpleNamespace(
+        decision_id=21, exchange_order_id="close-verified", status="filled",
+        okx_sync_status="okx_confirmed", quantity=0.5, model_name="ensemble_trader",
+        execution_mode="paper", symbol="BTC/USDT", side="sell",
+        filled_at=now - timedelta(seconds=10),
+    )
+    return position, order
+
+
+def test_confirmed_partial_reduction_waits_for_bounded_management_refresh() -> None:
+    position, order = _recent_partial_reduction()
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [order])
+    assert report["position_economics_pending_count"] == 1
+    assert report["position_economics_complete_count"] == 0
+    assert report["position_economics_incomplete_count"] == 0
+    row = report["position_economics_pending"][0]
+    assert row["authoritative_exit_fact_sync_pending"] is True
+    assert row["local_fragment_quantity_matches_contract"] is False
+    assert row["authoritative_entry_fact_sync_pending"] is False
+
+
+def test_confirmed_reduction_protection_refresh_is_observation_only() -> None:
+    position, order = _recent_partial_reduction()
+    position.quantity = 2.0
+    contract = position.current_management_contract
+    contract["refreshed_at"] = datetime.now(UTC).isoformat()
+    contract["management_eligible"] = False
+    contract["blockers"] = [
+        "okx_protection_evidence_incomplete"
+    ]
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [order])
+    assert report["position_economics_pending_count"] == 1
+    assert report["position_economics_incomplete_count"] == 0
+    assert report["position_economics_pending"][0][
+        "authoritative_exit_fact_sync_pending_reason"
+    ] == "confirmed_reduction_protection_refresh"
+
+
+def test_reduction_protection_grace_never_hides_missing_fees() -> None:
+    position, order = _recent_partial_reduction()
+    position.quantity = 2.0
+    contract = position.current_management_contract
+    contract["refreshed_at"] = datetime.now(UTC).isoformat()
+    contract["management_eligible"] = False
+    contract["blockers"] = [
+        "okx_protection_evidence_incomplete", "authoritative_entry_fee_evidence_incomplete",
+    ]
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], [order])
+    assert report["position_economics_pending_count"] == 0
+    assert report["position_economics_incomplete_count"] == 1
+
+
+@pytest.mark.parametrize("defect", ["missing_order", "stale", "wrong_size", "wrong_side", "unconfirmed"])
+def test_reduction_grace_does_not_hide_unproven_or_stale_drift(defect) -> None:
+    position, order = _recent_partial_reduction()
+    orders = [order]
+    if defect == "missing_order":
+        orders = []
+    elif defect == "stale":
+        order.filled_at = datetime.now(UTC) - timedelta(minutes=20)
+        position.current_management_contract["refreshed_at"] = (
+            order.filled_at - timedelta(seconds=30)
+        ).isoformat()
+    elif defect == "wrong_size":
+        order.quantity = 0.6
+    elif defect == "wrong_side":
+        order.side = "buy"
+    elif defect == "unconfirmed":
+        order.okx_sync_status = "pending"
+    report = PositionCapacityReleaseAuditService()._summarize([position], [], orders)
+    assert report["position_economics_pending_count"] == 0
+    assert report["position_economics_incomplete_count"] == 1
+
+
 def test_capacity_audit_requires_dynamic_exit_provenance_and_filled_order_link() -> None:
     service = PositionCapacityReleaseAuditService()
     decision = _decision(

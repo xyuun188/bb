@@ -159,6 +159,32 @@ def test_merge_compact_outcomes_keeps_history_and_prefers_refreshed_rows() -> No
     assert merged[1]["value"] == 2
 
 
+def test_compact_cache_remains_bounded_after_repeated_refreshes(monkeypatch) -> None:
+    monkeypatch.setattr(authoritative_trade_outcome, "_COMPACT_OUTCOME_MAX_HISTORY_ROWS", 3)
+    rows = [
+        {"outcome_id": str(index), "label_timestamp": f"2026-10-{index + 1:02d}T00:00:00Z"}
+        for index in range(8)
+    ]
+    cached = []
+    for row in rows:
+        cached = authoritative_trade_outcome._merge_compact_outcomes(cached, [row])
+    assert [row["outcome_id"] for row in cached] == ["5", "6", "7"]
+
+
+@pytest.mark.asyncio
+async def test_cold_outcome_cache_backoff_does_not_start_database_query(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(authoritative_trade_outcome, "_compact_outcome_cache", None)
+    monkeypatch.setattr(authoritative_trade_outcome, "_compact_outcome_refresh_task", None)
+    monkeypatch.setattr(
+        authoritative_trade_outcome, "_compact_outcome_refresh_failed_until", time.monotonic() + 60
+    )
+    def fail_create(_coroutine):
+        raise AssertionError("cold cache backoff must not start another refresh")
+    monkeypatch.setattr(authoritative_trade_outcome.asyncio, "create_task", fail_create)
+    assert await load_authoritative_trade_outcomes(mode="paper", compact=True) == []
+
+
 def test_compact_decision_projection_keeps_contract_without_full_snapshot() -> None:
     normal_contract = {
         "version": "2026-09-26.normal-paper-strategy-trade.v14",

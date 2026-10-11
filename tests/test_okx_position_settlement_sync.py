@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
-from models.trade import OkxPositionHistory, Position
+from models.trade import OkxPositionHistory, Order, Position
 from services.okx_position_history_store import upsert_okx_position_history_row
 from services.okx_position_settlement_sync import (
     DISTINCT_CLOSED_FRAGMENT_REACTIVATED_REASON,
@@ -24,6 +24,7 @@ from services.okx_position_settlement_sync import (
     OkxPositionSettlementSyncService,
     SettlementCandidate,
     SettlementFailure,
+    _candidate_from_position,
     _claim_history_row_for_position,
     _deduplicate_closed_lifecycle_rows,
     _deduplicate_exact_close_order_projections,
@@ -34,6 +35,8 @@ from services.okx_position_settlement_sync import (
     _position_history_side,
     _prepare_lifecycle_allocations,
     _reactivate_distinct_superseded_fragment,
+    _scale_settlement_success,
+    _split_exchange_order_ids,
 )
 from services.position_settlement import SETTLEMENT_STATUS_UNRESOLVED
 
@@ -261,6 +264,10 @@ async def test_position_settlement_reads_only_local_settlement_fact_mirror(
                 match_status="okx_account_position_history",
                 synced_at=now,
             )
+            history = (await session.execute(select(OkxPositionHistory))).scalars().one()
+            history.close_order_ids = ["okx_orphan_quarantine:11"]
+            history.linked_order_ids = ["okx_orphan_quarantine:11"]
+            history.raw_row = {**history.raw_row, "original_audit_marker": "preserved"}
 
         report = await OkxPositionSettlementSyncService(mode="paper").sync_once()
 
@@ -281,6 +288,7 @@ async def test_position_settlement_reads_only_local_settlement_fact_mirror(
         assert history.entry_order_ids == ["entry-1"]
         assert history.close_order_ids == ["close-1"]
         assert history.linked_order_ids == ["close-1", "entry-1"]
+        assert history.raw_row["original_audit_marker"] == "preserved"
         assert history.match_status == "okx_position_settlement_linked"
     finally:
         await close_db()
@@ -929,7 +937,8 @@ def test_preferred_history_identity_overrides_stale_position_link() -> None:
     assert not isinstance(matched, SettlementFailure)
 
 
-def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_exists() -> None:
+@pytest.mark.parametrize("close_id", [None, "okx_orphan_quarantine:501"])
+def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_exists(close_id) -> None:
     now = datetime.now(UTC)
     aggregate = Position(
         id=501,
@@ -940,7 +949,7 @@ def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_ex
         okx_inst_id="DOGE-USDT-SWAP",
         okx_pos_id="doge-pos",
         entry_exchange_order_id="entry-doge",
-        close_exchange_order_id=None,
+        close_exchange_order_id=close_id,
         settlement_status="reconciled",
         settlement_raw={},
     )
@@ -965,6 +974,165 @@ def test_dedup_retires_no_close_aggregate_when_authoritative_close_projection_ex
     assert aggregate.settlement_status == SUPERSEDED_POSITION_STATUS
     assert aggregate.settlement_raw["reason"] == DUPLICATE_CLOSED_ORDER_POSITION_REASON
     assert aggregate.settlement_raw["canonical_position_id"] == 502
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("close-1,okx_orphan_quarantine:11", {"close-1"}),
+        ("okx_orphan_quarantine:11", set()),
+    ],
+)
+def test_orphan_quarantine_markers_never_become_exchange_order_links(value, expected) -> None:
+    assert _split_exchange_order_ids(value) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_sibling", [False, True])
+async def test_unresolved_fragment_only_joins_a_due_lifecycle(
+    tmp_path, monkeypatch, pending_sibling,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "terminal-fragment-evidence.db")
+    now = datetime.now(UTC)
+    try:
+        terminal_id = await _seed_closed_position(
+            now - timedelta(minutes=2),
+            settlement_status=SETTLEMENT_STATUS_UNRESOLVED,
+            settlement_raw={"original_audit_fact": "preserved"},
+        )
+        sibling_id = None
+        if pending_sibling:
+            sibling_id = await _seed_closed_position(now)
+            async with get_session_ctx() as session:
+                sibling = await session.get(Position, sibling_id)
+                sibling.close_exchange_order_id = "close-2"
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(now)
+        assert {item.position_id for item in candidates} == (
+            {terminal_id, sibling_id} if pending_sibling else set()
+        )
+        async with get_session_ctx() as session:
+            terminal = await session.get(Position, terminal_id)
+            assert terminal.settlement_status == SETTLEMENT_STATUS_UNRESOLVED
+            assert terminal.settlement_raw == {"original_audit_fact": "preserved"}
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete_economics", [True, False])
+async def test_all_terminal_fragments_recover_when_official_evidence_is_complete(
+    tmp_path, monkeypatch, complete_economics,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "all-terminal-fragment-recovery.db")
+    now = datetime.now(UTC)
+    try:
+        ids = [
+            await _seed_closed_position(now, settlement_status=SETTLEMENT_STATUS_UNRESOLVED)
+            for _ in range(2)
+        ]
+        async with get_session_ctx() as session:
+            sibling = await session.get(Position, ids[1])
+            sibling.close_exchange_order_id = "close-2"
+            for order_id, contracts, fee, pnl in (
+                ("entry-1", 200.0, 0.1, 0.0),
+                ("close-1", 100.0, 0.05, 2.1),
+                ("close-2", 100.0, 0.05, 2.1 if complete_economics else None),
+            ):
+                session.add(Order(
+                    model_name="rule_strategy", execution_mode="paper",
+                    symbol="ADA/USDT", side="buy" if order_id == "entry-1" else "sell",
+                    order_type="market", quantity=contracts, price=0.6,
+                    status="filled", fee=fee, okx_fill_contracts=contracts,
+                    okx_fill_pnl=pnl, exchange_order_id=order_id,
+                    filled_at=now - timedelta(minutes=20) if order_id == "entry-1" else now,
+                ))
+            await upsert_okx_position_history_row(
+                session,
+                {
+                    "instId": "ADA-USDT-SWAP", "posId": "ada-pos-1", "posSide": "long",
+                    "type": "2", "cTime": _ms(now - timedelta(minutes=20)),
+                    "uTime": _ms(now), "openMaxPos": "200", "closeTotalPos": "200",
+                    "realizedPnl": "4.0", "pnl": "4.2", "fee": "-0.2", "fundingFee": "0",
+                },
+                mode="paper", source="okx_settlement_fact_mirror",
+                match_status="okx_account_position_history", synced_at=now,
+            )
+        report = await OkxPositionSettlementSyncService(mode="paper").sync_once()
+        assert report["reconciled_count"] == (2 if complete_economics else 0)
+        assert report["exception_count"] == 0
+        async with get_session_ctx() as session:
+            positions = list((await session.execute(select(Position))).scalars())
+            assert {position.settlement_status for position in positions} == {
+                "reconciled" if complete_economics else SETTLEMENT_STATUS_UNRESOLVED,
+            }
+            assert sum(position.realized_pnl for position in positions) == pytest.approx(
+                4.0 if complete_economics else 0.0
+            )
+        if complete_economics:
+            assert (await OkxPositionSettlementSyncService(mode="paper").sync_once())[
+                "reconciled_count"
+            ] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("official_contracts", [200.0, 250.0])
+async def test_terminal_fragment_recovers_only_after_official_conservation(
+    tmp_path, monkeypatch, official_contracts,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "terminal-fragment-conservation.db")
+    now = datetime.now(UTC)
+    try:
+        terminal_id = await _seed_closed_position(
+            now - timedelta(minutes=2), settlement_status=SETTLEMENT_STATUS_UNRESOLVED,
+            settlement_raw={"entry_identity_repair": {"previous_entry_order_ids": "prior-entry"}},
+        )
+        sibling_id = await _seed_closed_position(now)
+        async with get_session_ctx() as session:
+            terminal = await session.get(Position, terminal_id)
+            sibling = await session.get(Position, sibling_id)
+            sibling.close_exchange_order_id = "close-2"
+            candidates = [
+                replace(
+                    _candidate_from_position(position, {}),
+                    close_contracts=100.0,
+                    entry_fee_authoritative=0.1,
+                    close_fee_authoritative=0.05,
+                    close_fill_pnl_authoritative=2.1,
+                )
+                for position in (terminal, sibling)
+            ]
+        row = {
+            "instId": "ADA-USDT-SWAP", "posId": "ada-pos-1", "posSide": "long",
+            "cTime": _ms(now - timedelta(minutes=22)), "uTime": _ms(now),
+            "closeTotalPos": str(official_contracts), "realizedPnl": "4.0",
+            "pnl": "4.2", "fundingFee": "0", "fee": "-0.2",
+        }
+        _prepare_lifecycle_allocations(candidates, [row])
+        complete = official_contracts == 200.0
+        assert candidates[0].allocation_complete is complete
+        service = OkxPositionSettlementSyncService(mode="paper")
+        success = await service._success_from_position_history_row(
+            candidates[0], row, now=now, match_reason="test",
+            inst_id="ADA-USDT-SWAP",
+            created_at=now - timedelta(minutes=22), closed_at=now,
+        )
+        changed, _ = await service._apply_success(
+            candidates[0], _scale_settlement_success(success, candidates[0]), now,
+        )
+        assert changed is complete
+        async with get_session_ctx() as session:
+            terminal = await session.get(Position, terminal_id)
+            assert terminal.settlement_status == (
+                "reconciled" if complete else SETTLEMENT_STATUS_UNRESOLVED
+            )
+            assert terminal.realized_pnl == pytest.approx(2.0 if complete else 0.0)
+            assert terminal.settlement_raw["entry_identity_repair"] == {
+                "previous_entry_order_ids": "prior-entry",
+            }
+    finally:
+        await close_db()
 
 
 def test_dedup_groups_float_rounding_duplicates_without_merging_partial_fragments() -> None:
@@ -1018,6 +1186,141 @@ def test_dedup_groups_float_rounding_duplicates_without_merging_partial_fragment
     assert [item.id for item in duplicates] == [702]
     assert duplicate.settlement_status == SUPERSEDED_POSITION_STATUS
     assert duplicate.settlement_raw["canonical_position_id"] == 701
+
+
+@pytest.mark.parametrize("fill_quantity", [50.0, 40.0, 0.0])
+def test_aggregate_retires_only_when_disjoint_close_fills_conserve_quantity(fill_quantity) -> None:
+    common = {
+        "execution_mode": "paper", "symbol": "LPT/USDT", "side": "long",
+        "okx_inst_id": "LPT-USDT-SWAP", "okx_pos_id": "lpt-pos",
+        "entry_exchange_order_id": "entry-lpt",
+    }
+    aggregate = Position(
+        id=1, **common, quantity=100.0,
+        close_exchange_order_id="okx_orphan_quarantine:1",
+        settlement_status=SETTLEMENT_STATUS_QUARANTINED,
+        realized_pnl=12.0, settlement_raw={"original_fact": "preserved"},
+    )
+    fragments = [
+        Position(id=2, **common, quantity=50.0, close_exchange_order_id="close-a"),
+        Position(id=3, **common, quantity=50.0, close_exchange_order_id="close-b"),
+    ]
+    duplicates = _deduplicate_exact_close_order_projections(
+        [aggregate, *fragments],
+        {"close-a": {"base_quantity": 50.0}, "close-b": {"base_quantity": fill_quantity}},
+        now=datetime.now(UTC),
+    )
+    assert duplicates == ([aggregate] if fill_quantity == 50.0 else [])
+    assert aggregate.realized_pnl == 12.0
+    assert aggregate.settlement_raw["original_fact"] == "preserved"
+    if duplicates:
+        assert aggregate.settlement_status == SUPERSEDED_POSITION_STATUS
+        assert aggregate.settlement_raw["canonical_position_ids"] == [2, 3]
+        assert [row.settlement_status for row in fragments] == [None, None]
+
+
+@pytest.mark.parametrize("canonical_status", ["reconciled", "settling"])
+def test_dedup_links_missing_pos_id_by_exact_exchange_order_projection(canonical_status) -> None:
+    now = datetime.now(UTC)
+    common = {
+        "execution_mode": "paper",
+        "side": "short",
+        "okx_inst_id": "NOT-USDT-SWAP",
+        "entry_exchange_order_id": "entry-not",
+        "close_exchange_order_id": "close-not",
+        "closed_at": now,
+    }
+    quarantined = Position(
+        id=901,
+        **common,
+        symbol="NOT/USDT:USDT",
+        quantity=44_699.99999999999,
+        okx_pos_id=None,
+        settlement_status=SETTLEMENT_STATUS_QUARANTINED,
+        realized_pnl=-0.9537,
+        settlement_raw={"last_error_code": "positions_history_no_matching_row"},
+    )
+    canonical = Position(
+        id=902,
+        **common,
+        symbol="NOT/USDT",
+        quantity=44_700.0,
+        okx_pos_id="not-pos",
+        settlement_status=canonical_status,
+        realized_pnl=-0.9489,
+        settlement_raw={"official_fact": "preserved"},
+    )
+
+    retained, duplicates = _deduplicate_closed_lifecycle_rows(
+        [quarantined, canonical], now=now
+    )
+
+    assert [row.id for row in retained] == [902]
+    assert [row.id for row in duplicates] == [901]
+    assert quarantined.settlement_status == SUPERSEDED_POSITION_STATUS
+    assert quarantined.settlement_raw["canonical_position_id"] == 902
+    assert quarantined.settlement_raw["last_error_code"] == "positions_history_no_matching_row"
+    assert quarantined.realized_pnl == -0.9537
+    assert canonical.realized_pnl == -0.9489
+    assert canonical.settlement_status == canonical_status
+    assert canonical.settlement_raw == {"official_fact": "preserved"}
+    retained_again, _ = _deduplicate_closed_lifecycle_rows(
+        [canonical, quarantined], now=now
+    )
+    assert [row.id for row in retained_again] == [902]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"execution_mode": "live"},
+        {"symbol": "ADA/USDT"},
+        {"side": "long"},
+        {"okx_inst_id": "NOT-USDT"},
+        {"entry_exchange_order_id": "other-entry"},
+        {"entry_exchange_order_id": None},
+        {"close_exchange_order_id": "other-close"},
+        {"close_exchange_order_id": None},
+        {"quantity": 30.0},
+    ],
+)
+def test_dedup_keeps_unproven_missing_pos_id_projection(override) -> None:
+    common = {
+        "execution_mode": "paper", "symbol": "NOT/USDT", "side": "short",
+        "okx_inst_id": "NOT-USDT-SWAP", "entry_exchange_order_id": "entry-not",
+        "close_exchange_order_id": "close-not", "quantity": 44_700.0,
+    }
+    quarantined = Position(
+        id=911, **(common | override), okx_pos_id=None,
+        settlement_status=SETTLEMENT_STATUS_QUARANTINED,
+    )
+    canonical = Position(id=912, **common, okx_pos_id="not-pos", settlement_status="reconciled")
+
+    retained, duplicates = _deduplicate_closed_lifecycle_rows(
+        [quarantined, canonical], now=datetime.now(UTC)
+    )
+
+    assert {row.id for row in retained} == {911, 912}
+    assert duplicates == []
+    assert quarantined.settlement_status == SETTLEMENT_STATUS_QUARANTINED
+
+
+def test_dedup_keeps_missing_pos_id_when_order_evidence_points_to_multiple_lifecycles() -> None:
+    common = {
+        "execution_mode": "paper", "symbol": "NOT/USDT", "side": "short",
+        "entry_exchange_order_id": "entry-not", "close_exchange_order_id": "close-not",
+        "quantity": 44_700.0,
+    }
+    rows = [
+        Position(id=921, **common, okx_pos_id=None, settlement_status=SETTLEMENT_STATUS_QUARANTINED),
+        Position(id=922, **common, okx_pos_id="not-pos-a", settlement_status="reconciled"),
+        Position(id=923, **common, okx_pos_id="not-pos-b", settlement_status="reconciled"),
+    ]
+
+    retained, duplicates = _deduplicate_closed_lifecycle_rows(rows, now=datetime.now(UTC))
+
+    assert {row.id for row in retained} == {921, 922, 923}
+    assert duplicates == []
 
 
 def test_dedup_breaks_mutual_superseded_cycle_for_same_close_order() -> None:

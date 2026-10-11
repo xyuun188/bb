@@ -108,6 +108,7 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "production_permission",
     "reason",
     "remaining_portfolio_risk_budget_usdt",
+    "return_lcb_pct",
     "risk_budget_usdt",
     "selected_contract_spec",
     "stressed_loss_fraction",
@@ -239,4 +240,4 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     target.model_health_has_local_ai_tools = _model_health_snapshot_present(raw, "local_ai_tools")
     target.model_health_snapshot_version = 1
     target.decision_learning_snapshot = _compact_decision_learning_snapshot(raw)
-    target.decision_learning_snapshot_version = 5
+    target.decision_learning_snapshot_version = 6

@@ -796,6 +796,25 @@ def test_compact_decision_projection_retains_large_execution_contract_fields() -
     assert report["summary"]["contract_violation_count"] == 0
 
 
+@pytest.mark.parametrize("downside_return", [-0.6222926, 0.0, 0.4])
+def test_learning_projection_preserves_size_aware_downside_return(downside_return) -> None:
+    raw = {
+        "profit_risk_sizing": {
+            "contract_lifecycle": "normal_paper_trade",
+            "expected_net_return_pct": 0.2,
+            "return_lcb_pct": downside_return,
+            "large_market_diagnostics": "x" * 20_000,
+        }
+    }
+
+    compact = _compact_decision_learning_snapshot(raw)
+
+    assert compact["profit_risk_sizing"]["return_lcb_pct"] == downside_return
+    assert compact["profit_risk_sizing"]["expected_net_return_pct"] == 0.2
+    assert "large_market_diagnostics" not in compact["profit_risk_sizing"]
+    assert raw["profit_risk_sizing"]["return_lcb_pct"] == downside_return
+
+
 def test_malformed_executed_paper_canary_still_fails_closed() -> None:
     raw = complete_paper_canary_raw()
     raw["paper_bootstrap_canary"]["production_permission"] = True

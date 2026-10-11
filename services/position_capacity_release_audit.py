@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime, timedelta
-from math import isfinite
+from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
@@ -194,7 +194,7 @@ class PositionCapacityReleaseAuditService:
         orders: list[Order],
     ) -> dict[str, Any]:
         fragment_rows = [self._position_row(position) for position in positions]
-        position_rows = self._position_group_rows(positions)
+        position_rows = self._position_group_rows(positions, orders)
         capacity = self.capacity_policy.evaluate(open_positions=fragment_rows).as_dict()
         orders_by_decision: dict[int, list[Order]] = {}
         orders_by_exchange_id: dict[str, list[Order]] = {}
@@ -218,13 +218,17 @@ class PositionCapacityReleaseAuditService:
             row
             for row in position_rows
             if not row["position_economics_complete"]
-            and row.get("authoritative_entry_fact_sync_pending") is True
+            and (
+                row.get("authoritative_entry_fact_sync_pending") is True
+                or row.get("authoritative_exit_fact_sync_pending") is True
+            )
         ]
         incomplete_positions = [
             row
             for row in position_rows
             if not row["position_economics_complete"]
             and row.get("authoritative_entry_fact_sync_pending") is not True
+            and row.get("authoritative_exit_fact_sync_pending") is not True
         ]
         executed_exit_gaps = [
             row
@@ -283,7 +287,9 @@ class PositionCapacityReleaseAuditService:
         }
 
     @classmethod
-    def _position_group_rows(cls, positions: list[Position]) -> list[dict[str, Any]]:
+    def _position_group_rows(
+        cls, positions: list[Position], orders: list[Order] | None = None,
+    ) -> list[dict[str, Any]]:
         """Audit management economics against the exchange net-position scope.
 
         A single OKX net position can have multiple local persistence fragments.
@@ -374,7 +380,34 @@ class PositionCapacityReleaseAuditService:
             row["local_fragment_quantity"] = round(local_quantity, 8)
             row["local_fragment_quantity_matches_contract"] = quantity_matches
             if not quantity_matches:
+                if row["position_economics_complete"]:
+                    deadline = _confirmed_reduction_sync_deadline(
+                        primary, management, local_quantity, orders or [],
+                    )
+                    if deadline is not None:
+                        row["authoritative_exit_fact_sync_pending"] = True
+                        row["authoritative_exit_fact_sync_pending_reason"] = (
+                            "confirmed_reduction_management_refresh"
+                        )
+                        row["authoritative_exit_fact_sync_deadline_at"] = deadline.isoformat()
                 row["position_economics_complete"] = False
+            elif not row["position_economics_complete"]:
+                deadline = _confirmed_reduction_sync_deadline(
+                    primary, management, local_quantity, orders or [],
+                    protection_refresh=True,
+                )
+                blockers = set(management.get("blockers") or [])
+                if (
+                    deadline is not None
+                    and blockers == {"okx_protection_evidence_incomplete"}
+                    and local_quantity > 0 and entry_price > 0 and current_price > 0
+                ):
+                    row["authoritative_exit_fact_sync_pending"] = True
+                    row["authoritative_exit_fact_sync_pending_reason"] = (
+                        "confirmed_reduction_protection_refresh"
+                    )
+                    row["authoritative_exit_fact_sync_deadline_at"] = deadline.isoformat()
+                    row["position_economics_complete"] = False
             rows.append(row)
         return rows
 
@@ -511,6 +544,58 @@ class PositionCapacityReleaseAuditService:
         }
 
 
+def _confirmed_reduction_sync_deadline(
+    position: Any,
+    management: dict[str, Any],
+    local_quantity: float,
+    orders: list[Order],
+    *,
+    protection_refresh: bool = False,
+) -> datetime | None:
+    intent = _safe_dict(management.get("exit_execution_intent"))
+    ledger = _safe_dict(management.get("profit_lock_exit_ledger"))
+    if intent.get("state") != "exchange_progress_confirmed" or intent.get("result_status") != "filled":
+        return None
+    exchange_id = str(intent.get("exchange_order_id") or "").strip()
+    if not exchange_id or exchange_id != str(ledger.get("last_exchange_order_id") or ""):
+        return None
+    quantity_delta = _safe_float(management.get("quantity")) - local_quantity
+    filled_quantity = _safe_float(ledger.get("last_filled_quantity"))
+    if filled_quantity <= 0 or not isclose(
+        quantity_delta, 0.0 if protection_refresh else filled_quantity,
+        rel_tol=1e-8, abs_tol=1e-8,
+    ):
+        return None
+    refreshed_at = _as_utc(management.get("refreshed_at"))
+    if refreshed_at is None:
+        return None
+    now = datetime.now(UTC)
+    for order in orders:
+        if (
+            str(getattr(order, "exchange_order_id", "") or "") != exchange_id
+            or getattr(order, "status", None) != "filled"
+            or getattr(order, "okx_sync_status", None) != "okx_confirmed"
+            or getattr(order, "decision_id", None) != intent.get("decision_id")
+            or getattr(order, "model_name", None) != getattr(position, "model_name", None)
+            or getattr(order, "execution_mode", None) != getattr(position, "execution_mode", None)
+            or normalize_trading_symbol(getattr(order, "symbol", "")) != management.get("symbol")
+            or getattr(order, "side", None) != ("sell" if management.get("side") == "long" else "buy")
+            or not isclose(_safe_float(getattr(order, "quantity", 0)), filled_quantity, rel_tol=1e-8, abs_tol=1e-8)
+        ):
+            continue
+        filled_at = _as_utc(getattr(order, "filled_at", None))
+        if (
+            filled_at is None or filled_at > now
+            or (not protection_refresh and filled_at < refreshed_at)
+            or (protection_refresh and refreshed_at < filled_at)
+        ):
+            continue
+        deadline = filled_at + timedelta(seconds=AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS)
+        if now <= deadline:
+            return deadline
+    return None
+
+
 def _action(row: Any) -> str:
     value = getattr(row, "action", "")
     return str(getattr(value, "value", value) or "").lower()
@@ -555,6 +640,11 @@ def _iso(value: Any) -> str | None:
 
 
 def _as_utc(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
     if not isinstance(value, datetime):
         return None
     return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)

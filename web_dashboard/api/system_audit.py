@@ -1746,13 +1746,20 @@ async def _trade_loop_audit() -> dict[str, Any]:
     market_analysis_paused = (
         runtime_running and bool(control_state.get("paused")) and runtime_heartbeat_fresh
     )
+    # The dynamic-return gate controls model promotion/live permission.  It is
+    # intentionally not a paper-loop stop condition: paper must keep sampling
+    # and training while the model is below the production profitability gate.
     dynamic_return_gate = (
         _phase3_dynamic_return_gate_status() if not runtime_running else {"ready": False}
     )
-    controlled_no_go = bool(dynamic_return_gate.get("controlled_no_go"))
+    execution_mode = str(
+        runtime_window.get("mode") or control_state.get("mode") or "paper"
+    ).lower()
+    controlled_no_go = (
+        execution_mode == "live" and bool(dynamic_return_gate.get("controlled_no_go"))
+    )
     stalled = (
-        not bool(dynamic_return_gate.get("ready"))
-        and not controlled_no_go
+        not controlled_no_go
         and not market_analysis_paused
         and not cold_start
         and (recent_count == 0 or (latest_decision_age is not None and latest_decision_age > 600))
@@ -1795,15 +1802,15 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "Market analysis is paused; treat zero new entries as an operator/runtime "
             "pause before diagnosing strategy thresholds."
         )
-    if dynamic_return_gate.get("ready"):
+    if dynamic_return_gate.get("ready") and not stalled:
         summary = (
             "The dynamic return gate is ready, but the trading service is stopped; "
             "this card remains an observation and grants no production permission."
         )
     elif controlled_no_go:
         summary = (
-            "Trading is intentionally stopped by a fresh Phase 3 No-Go/preflight gate; "
-            "this is a controlled fail-closed state, not a stalled analysis loop."
+        "Trading is intentionally stopped by a fresh Phase 3 operator control; "
+        "model promotion No-Go does not by itself stop paper sampling."
         )
     return _audit_card(
         "trade_loop",
@@ -1823,6 +1830,7 @@ async def _trade_loop_audit() -> dict[str, Any]:
             "market_analysis_paused": market_analysis_paused,
             "dynamic_return_gate_ready": bool(dynamic_return_gate.get("ready")),
             "controlled_no_go": controlled_no_go,
+            "production_gate_controls_runtime": execution_mode == "live",
             "dynamic_return_gate": dynamic_return_gate,
             "stale_runtime_heartbeat": stale_runtime_heartbeat,
             "runtime_heartbeat_fresh": runtime_heartbeat_fresh,
@@ -2613,7 +2621,10 @@ async def _okx_trade_fact_integrity_audit() -> dict[str, Any]:
     warning_count = int(details.get("warning_count") or 0)
     unresolved_link_candidate_count = _okx_unresolved_link_candidate_count(details, link_repair)
     details["unresolved_position_fact_link_candidate_count"] = unresolved_link_candidate_count
-    authoritative_issue_count = int(authoritative_sync.get("issue_count") or 0)
+    authoritative_blockers, authoritative_warnings = partition_okx_integrity_issues(
+        authoritative_sync
+    )
+    authoritative_issue_count = len(authoritative_blockers) + len(authoritative_warnings)
     authoritative_manual_review_count = int(authoritative_sync.get("manual_review_count") or 0)
     authoritative_repairable_count = int(authoritative_sync.get("repairable_count") or 0)
     authoritative_pull_available = bool(authoritative_sync.get("okx_pull_available"))

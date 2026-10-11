@@ -659,7 +659,7 @@ async def test_postgres_duplicate_exchange_fact_repair_selects_canonical_order_b
 
 
 @pytest.mark.asyncio
-async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_backfill(
+async def test_postgres_model_health_snapshot_schema_uses_trigger_without_history_rewrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -693,11 +693,16 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     assert "WHEN 'portfolio_risk_snapshot'" in projection_function
     assert "'current_stressed_loss_usdt'" in projection_function
     assert "'exchange_contract_specs'" not in projection_function
+    from models.decision import _PROFIT_RISK_SIZING_SNAPSHOT_KEYS
+
+    for key in _PROFIT_RISK_SIZING_SNAPSHOT_KEYS:
+        assert f"'{key}'" in projection_function
     assert any(
         "trg_ai_decisions_model_health_snapshot" in statement
         for statement in fake_conn.statements
     )
-    assert any("LIMIT 1500" in statement for statement in fake_conn.statements)
+    assert not any("WITH recent_unprojected" in statement for statement in fake_conn.statements)
+    assert not any("UPDATE ai_decisions AS decision" in statement for statement in fake_conn.statements)
     assert any(
         "decision_learning_snapshot_version" in statement for statement in fake_conn.statements
     )
@@ -711,11 +716,7 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_and_bounded_ba
     assert "bb_compact_ai_decision_learning_value" in retention_trigger
     assert "bb_project_profit_risk_sizing_snapshot" in retention_trigger
     assert "item.key = 'normal_paper_trade'" in retention_trigger
-    assert "decision_learning_snapshot_version := 5" in retention_trigger
-    assert any(
-        "decision_learning_snapshot_version < 5" in statement
-        for statement in fake_conn.statements
-    )
+    assert "decision_learning_snapshot_version := 6" in retention_trigger
 
 
 @pytest.mark.asyncio

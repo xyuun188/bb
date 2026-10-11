@@ -20,13 +20,21 @@ REMOTE_APP_DIR = "/data/bb/app"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--decision-id", action="append", type=int, required=True)
+    parser.add_argument("--decision-id", action="append", type=int, default=[])
+    parser.add_argument("--backfill-downside-return", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--max-rows", type=int, default=10_000)
+    parser.add_argument("--before-id", type=int)
     parser.add_argument(
         "--compact",
         action="store_true",
         help="Print the execution-critical fields instead of the full raw payload.",
     )
     args = parser.parse_args()
+    if not args.decision_id and not args.backfill_downside_return:
+        parser.error("provide --decision-id or --backfill-downside-return")
+    if args.apply and not args.backfill_downside_return:
+        parser.error("--apply requires --backfill-downside-return")
     script = f"""
 import asyncio, json
 from pathlib import Path
@@ -37,6 +45,15 @@ drop_privileges_to_runtime_user_if_needed(project_root=root)
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 async def main():
+    if {bool(args.backfill_downside_return)!r}:
+        from services.decision_learning_projection import backfill_downside_return_projection
+        result = await backfill_downside_return_projection(
+            apply={bool(args.apply)!r},
+            max_rows={max(1, min(args.max_rows, 100_000))!r},
+            before_id={args.before_id!r},
+        )
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return
     result = []
     async with get_read_session_ctx(statement_timeout_ms=30000) as session:
         for decision_id in {sorted(set(args.decision_id))!r}:

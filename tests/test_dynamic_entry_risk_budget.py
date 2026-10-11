@@ -276,7 +276,7 @@ def _size_aware_book_snapshot(notional: float) -> dict:
     }
 
 
-def test_size_aware_profit_solver_selects_largest_profitable_order() -> None:
+def test_size_aware_profit_solver_maximizes_profit_instead_of_breakeven_size() -> None:
     snapshot = _size_aware_book_snapshot(5_000.0)
     original_cost = execution_cost_estimate(snapshot).to_dict()
     gross_expected = 0.35
@@ -300,6 +300,55 @@ def test_size_aware_profit_solver_selects_largest_profitable_order() -> None:
     assert solved["return_lcb_pct"] > 0.0
     assert solved["execution_cost"]["order_size_complete"] is True
     assert solved["reduced"] is True
+    profits = []
+    for notional in range(100, 5001, 100):
+        candidate = dict(snapshot, planned_order_notional_usdt=notional)
+        cost = execution_cost_estimate(candidate).total_pct
+        profits.append(notional * (gross_expected - cost) / 100.0)
+    assert solved["expected_net_profit_usdt"] == pytest.approx(max(profits), abs=1e-5)
+    assert solved["selected_notional_usdt"] == pytest.approx(500.0)
+    assert solved["expected_net_return_pct"] > 0.2
+
+
+def test_size_aware_profit_solver_reduces_even_when_full_size_is_positive() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+    gross_expected = 0.46
+    assert gross_expected - original_cost["total_pct"] > 0.0
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=gross_expected - original_cost["total_pct"],
+        return_lcb_pct=-0.5,
+        execution_cost=original_cost,
+    )
+
+    assert solved["production_eligible"] is True
+    assert solved["selected_notional_usdt"] == pytest.approx(500.0)
+    assert solved["expected_net_profit_usdt"] > (
+        5_000.0 * (gross_expected - original_cost["total_pct"]) / 100.0
+    )
+
+
+def test_size_aware_profit_solver_never_rounds_up_past_risk_budget() -> None:
+    snapshot = _size_aware_book_snapshot(155.0)
+    cost = execution_cost_estimate(snapshot).to_dict()
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=155.0,
+        minimum_notional_usdt=110.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.5,
+        return_lcb_pct=-0.2,
+        execution_cost=cost,
+    )
+    assert solved["production_eligible"] is False
+    assert solved["reason"] == "exchange_step_exceeds_risk_budget"
 
 
 def test_size_aware_profit_solver_rejects_when_minimum_order_still_loses() -> None:
@@ -506,6 +555,53 @@ async def test_normal_paper_uses_dynamic_leverage_for_positive_edge() -> None:
     )
     assert sizing["dynamic_leverage_decision"]["version"] == "dynamic_leverage_allocator_v5"
     assert sizing["dynamic_leverage_decision"]["policy_provenance"]["policy_scope"] == "paper"
+
+
+@pytest.mark.asyncio
+async def test_normal_paper_clamps_to_native_tier_capacity_before_profit_and_leverage() -> None:
+    decision = _decision()
+    decision.raw_response["exchange_risk_facts"]["leverage_tiers"] = [
+        {"tier": "1", "maxSz": "1", "maxLeverage": 5},
+    ]
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert 0 < sizing["final_notional_usdt"] <= 100
+    assert sizing["fill_notional_ceiling_usdt"] <= 100
+    assert sizing["leverage_tier_selection"]["production_eligible"] is True
+    assert decision.suggested_leverage <= 5
+
+
+@pytest.mark.asyncio
+async def test_normal_paper_native_tier_capacity_subtracts_current_same_side_exposure() -> None:
+    decision = _decision()
+    decision.raw_response["exchange_risk_facts"]["leverage_tiers"] = [
+        {"tier": "1", "maxSz": "1", "maxLeverage": 5},
+    ]
+    positions = [{
+        "symbol": "BTC/USDT", "side": "long", "contracts": 0.4,
+        "quantity": 0.4, "entry_price": 100.0, "current_price": 100.0,
+        "leverage": 1.0, "stop_loss_price": 98.0, "execution_mode": "paper",
+    }]
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(
+        decision, "paper", positions,
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert 0 < sizing["final_notional_usdt"] <= 60
+    assert sizing["leverage_tier_selection"]["projected_position_contracts"] <= 1
+
+
+@pytest.mark.asyncio
+async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity() -> None:
+    decision = _decision()
+    decision.raw_response["exchange_risk_facts"]["leverage_tiers"] = [
+        {"tier": "1", "maxSz": "0.005", "maxLeverage": 5},
+    ]
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 import services.strategy_signal_root_cause_audit as root_cause_module
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.strategy_signal_root_cause_audit import StrategySignalRootCauseAuditService
@@ -270,3 +272,63 @@ def test_pre_sizing_native_fact_block_is_not_reported_as_sizing_contract_failure
     }
     assert report["contract_blocker_counts"] == {}
     assert report["normal_paper_blocked_count"] == 0
+
+
+def _economic_rejection() -> SimpleNamespace:
+    reason = (
+        "positive_fee_after_return_missing,"
+        "normal_paper_size_aware_no_positive_expected_net_at_exchange_minimum,"
+        "normal_paper_expected_net_not_positive_after_size_cost"
+    )
+    return SimpleNamespace(
+        action="short",
+        was_executed=False,
+        execution_reason=f"Normal paper risk budget is not eligible: {reason}.",
+        raw_llm_response={
+            "normal_paper_trade": {"version": "normal-paper"},
+            "profit_risk_sizing": {
+                "contract_lifecycle": "normal_paper_trade",
+                "production_eligible": False,
+                "final_notional_usdt": 0.0,
+                "expected_net_return_pct": -0.08,
+                "reason": reason,
+            },
+        },
+    )
+
+
+def test_nonpositive_economic_refusal_is_not_an_execution_contract_gap() -> None:
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[_economic_rejection()], shadows=[], ml_status={},
+    )
+    assert report["status"] == "ok"
+    assert report["contract_validation_entry_count"] == 0
+    assert report["economic_guard_blocked_count"] == 1
+    assert report["normal_paper_blocked_count"] == 1
+    assert report["entry_contract_ready_count"] == 0
+    assert report["contract_blocker_counts"] == {}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("was_executed", True),
+        ("expected_net_return_pct", 0.1),
+        ("expected_net_return_pct", float("nan")),
+        ("final_notional_usdt", 1.0),
+        ("reason", "native_exchange_contract_missing"),
+    ],
+)
+def test_economic_refusal_never_masks_execution_or_incomplete_evidence(field, value) -> None:
+    decision = _economic_rejection()
+    if field == "was_executed":
+        decision.was_executed = value
+    else:
+        decision.raw_llm_response["profit_risk_sizing"][field] = value
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[decision], shadows=[], ml_status={},
+    )
+    assert report["status"] == "warning"
+    assert report["economic_guard_blocked_count"] == 0
+    assert report["contract_validation_entry_count"] == 1
+    assert report["contract_blocker_counts"]

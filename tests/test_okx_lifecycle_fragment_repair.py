@@ -10,6 +10,8 @@ from db.session import close_db, get_session_ctx, init_db
 from models.trade import Order, Position
 from services.okx_lifecycle_fragment_repair import (
     REPAIR_SOURCE,
+    _history_lifecycle,
+    _repair_linked_lifecycle_identity,
     repair_missing_okx_lifecycle_fragments,
 )
 from services.okx_position_settlement_sync import (
@@ -86,6 +88,66 @@ def _order(
             position_side="short" if protection else None,
         ),
     )
+
+
+@pytest.mark.parametrize("evidence_gap", ["", "ambiguous_close", "quantity_mismatch", "unconfirmed"])
+@pytest.mark.parametrize("settlement_status", ["settlement_quarantined", "reconciled"])
+def test_stale_entry_identity_requires_unique_conserved_fill_evidence(
+    evidence_gap, settlement_status,
+) -> None:
+    opened_at = datetime(2026, 10, 8, 11, 0, tzinfo=UTC)
+    closed_at = opened_at + timedelta(hours=4)
+    row = {
+        "instId": "SLX-USDT-SWAP", "posId": "reused-pos", "direction": "short",
+        "cTime": str(int(opened_at.timestamp() * 1000)),
+        "uTime": str(int(closed_at.timestamp() * 1000)),
+        "openMaxPos": "100", "closeTotalPos": "100", "openAvgPx": "0.07",
+        "_dashboard_entry_order_ids": ["entry-current"],
+        "_dashboard_close_order_ids": ["close-current"],
+        "_dashboard_history_record_id": 123,
+    }
+    entry = _order(
+        order_id="entry-current", side="sell", quantity=1000, contracts=100,
+        price=0.07, filled_at=opened_at, pnl=0,
+    )
+    close = _order(
+        order_id="close-current", side="buy", quantity=1000,
+        contracts=90 if evidence_gap == "quantity_mismatch" else 100,
+        price=0.066, filled_at=closed_at, pnl=4,
+    )
+    if evidence_gap == "unconfirmed":
+        close.okx_raw_fills["fills_history_confirmed"] = False
+    position = Position(
+        id=1, symbol="SLX/USDT", side="short", quantity=1000,
+        okx_inst_id="SLX-USDT-SWAP", okx_pos_id="reused-pos",
+        entry_exchange_order_id="entry-previous", close_exchange_order_id="close-current",
+        created_at=opened_at - timedelta(days=1), entry_price=0.09,
+        settlement_status=settlement_status, realized_pnl=4.0,
+        settlement_raw={"original_fact": "preserved"},
+    )
+    lifecycle = _history_lifecycle(row, mode="paper")
+    owners = {"close-current": {"current", "other"} if evidence_gap == "ambiguous_close" else {"current"}}
+    result = _repair_linked_lifecycle_identity(
+        lifecycle, positions_by_close_id={"close-current": [position]},
+        orders_by_id={"entry-current": entry, "close-current": close},
+        close_owners=owners, now=closed_at,
+    )
+    assert len(result) == (0 if evidence_gap else 1)
+    assert position.realized_pnl == 4.0
+    assert position.settlement_raw["original_fact"] == "preserved"
+    if not evidence_gap:
+        assert position.entry_exchange_order_id == "entry-current"
+        assert position.created_at == opened_at
+        assert position.entry_price == 0.07
+        assert position.settlement_raw["entry_identity_repair"]["previous_entry_order_ids"] == "entry-previous"
+        assert position.settlement_status == settlement_status
+        assert _repair_linked_lifecycle_identity(
+            lifecycle, positions_by_close_id={"close-current": [position]},
+            orders_by_id={"entry-current": entry, "close-current": close},
+            close_owners=owners, now=closed_at,
+        ) == []
+    else:
+        assert position.entry_exchange_order_id == "entry-previous"
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import isclose, isfinite, sqrt
+from math import ceil, floor, isclose, isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -89,13 +89,11 @@ def solve_size_aware_positive_expected_net(
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
 ) -> dict[str, Any]:
-    """Choose the largest executable size whose current net return is positive.
+    """Maximize expected net profit within the risk budget and native book.
 
-    The risk budget is still the upper bound.  When the full risk-sized order
-    consumes too many book levels and turns a positive opportunity negative,
-    search downward using the exchange minimum and contract step.  This keeps
-    paper training flowing through the same order/cost contract without
-    authorizing a known losing order or applying a global "small order" cap.
+    VWAP cost makes profit piecewise linear in size. Evaluate executable sizes
+    on both sides of each book boundary, plus the minimum and risk ceiling,
+    instead of filling to the point where the remaining edge is almost zero.
     """
 
     maximum = max(_safe_float(maximum_notional_usdt, 0.0), 0.0)
@@ -116,6 +114,7 @@ def solve_size_aware_positive_expected_net(
         "original_return_lcb_pct": original_lcb,
         "iterations": 0,
         "reduced": False,
+        "objective": "maximize_expected_net_profit_usdt",
     }
     normalized_side = str(side or "").lower()
     if (
@@ -131,12 +130,18 @@ def solve_size_aware_positive_expected_net(
 
     step = max(_safe_float(contract_step_notional_usdt, 0.0), 0.0)
     executable_minimum = max(minimum, step)
+    if step > 0.0:
+        executable_minimum = ceil(executable_minimum / step - 1e-10) * step
+        maximum = floor(maximum / step + 1e-10) * step
+    if maximum + 1e-9 < executable_minimum:
+        result["reason"] = "exchange_step_exceeds_risk_budget"
+        return result
 
     def _quantize(notional: float) -> float:
         candidate = min(max(_safe_float(notional, 0.0), executable_minimum), maximum)
         if step <= 0.0:
             return candidate
-        units = max(int(candidate / step), 1)
+        units = max(floor(candidate / step + 1e-10), 1)
         quantized = units * step
         if quantized < executable_minimum:
             quantized = executable_minimum
@@ -191,64 +196,53 @@ def solve_size_aware_positive_expected_net(
         result["reason"] = "full_risk_size_cost_incomplete"
         return result
 
-    selected = upper
-    iterations = 1
-    reduced = False
-    if upper["expected"] <= 0.0:
-        minimum_candidate = evaluate(executable_minimum)
-        iterations += 1
-        if minimum_candidate is None or minimum_candidate["expected"] <= 0.0:
-            result.update(
-                {
-                    "selected_notional_usdt": (
-                        minimum_candidate["notional"]
-                        if minimum_candidate is not None
-                        else upper["notional"]
-                    ),
-                    "expected_net_return_pct": (
-                        minimum_candidate["expected"]
-                        if minimum_candidate is not None
-                        else upper["expected"]
-                    ),
-                    "return_lcb_pct": (
-                        minimum_candidate["lcb"]
-                        if minimum_candidate is not None
-                        else upper["lcb"]
-                    ),
-                    "execution_cost": (
-                        minimum_candidate["cost"]
-                        if minimum_candidate is not None
-                        else upper["cost"]
-                    ),
-                    "iterations": iterations,
-                    "reduced": False,
-                }
-            )
-            result["reason"] = "no_positive_expected_net_at_exchange_minimum"
-            return result
+    candidates = {executable_minimum, maximum}
+    bid = _safe_float(feature_snapshot.get("bid"), 0.0)
+    ask = _safe_float(feature_snapshot.get("ask"), 0.0)
+    reference = (bid + ask) / 2.0 if bid > 0.0 and ask >= bid else 0.0
+    contract_base = _safe_float(feature_snapshot.get("contract_value_base"), 0.0)
+    levels = feature_snapshot.get(
+        "orderbook_asks" if normalized_side == "long" else "orderbook_bids"
+    )
+    cumulative_base = 0.0
+    for level in _safe_list(levels):
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        price = _safe_float(level[0], 0.0)
+        contracts = _safe_float(level[1], 0.0)
+        if price <= 0.0 or contracts <= 0.0:
+            continue
+        cumulative_base += contracts * contract_base
+        boundary = cumulative_base * reference
+        if boundary < executable_minimum or boundary > maximum:
+            continue
+        lower = _quantize(boundary)
+        candidates.add(lower)
+        if step > 0.0 and lower + step <= maximum:
+            candidates.add(lower + step)
 
-        # Cost is monotonic for a bounded order-book snapshot. Find the largest
-        # positive point rather than falling all the way to a probe-sized order.
-        low = minimum_candidate["notional"]
-        high = upper["notional"]
-        selected = minimum_candidate
-        for _ in range(16):
-            iterations += 1
-            if high - low <= max(step, 1e-9):
-                break
-            midpoint = _quantize((low + high) / 2.0)
-            if midpoint <= low or midpoint >= high:
-                break
-            candidate = evaluate(midpoint)
-            if candidate is None:
-                high = midpoint
-                continue
-            if candidate["expected"] > 0.0:
-                selected = candidate
-                low = candidate["notional"]
-            else:
-                high = candidate["notional"]
-        reduced = selected["notional"] + 1e-9 < maximum
+    evaluated = [upper]
+    for notional in sorted(candidates):
+        if abs(notional - upper["notional"]) <= 1e-9:
+            continue
+        candidate = evaluate(notional)
+        if candidate is not None:
+            evaluated.append(candidate)
+    profitable = [candidate for candidate in evaluated if candidate["expected"] > 0.0]
+    selected = (
+        max(
+            profitable,
+            key=lambda candidate: (
+                candidate["notional"] * candidate["expected"] / 100.0,
+                candidate["expected"],
+                -candidate["notional"],
+            ),
+        )
+        if profitable
+        else min(evaluated, key=lambda candidate: candidate["notional"])
+    )
+    iterations = len(evaluated)
+    reduced = selected["notional"] + 1e-9 < result["original_notional_usdt"]
 
     result.update(
         {
@@ -258,6 +252,7 @@ def solve_size_aware_positive_expected_net(
             "execution_cost": selected["cost"],
             "iterations": iterations,
             "reduced": reduced,
+            "expected_net_profit_usdt": selected["notional"] * selected["expected"] / 100.0,
         }
     )
     if selected["expected"] <= 0.0:
@@ -327,6 +322,19 @@ def select_okx_leverage_tier(
         row for row in valid_rows if _tier_value(row, "maxNotional", "max_notional") > 0
     ]
     size_bounded = [row for row in valid_rows if _tier_value(row, "maxSz", "max_size") > 0]
+    maximum_additional_notional: float | None = None
+    if notional_bounded:
+        maximum_additional_notional = max(
+            max(_tier_value(row, "maxNotional", "max_notional") for row in notional_bounded)
+            - current_notional,
+            0.0,
+        )
+    elif size_bounded and contract_unit_notional > 0:
+        maximum_additional_notional = max(
+            max(_tier_value(row, "maxSz", "max_size") for row in size_bounded)
+            - current_contracts,
+            0.0,
+        ) * contract_unit_notional
     if not reasons and notional_bounded:
         selected = min(
             (
@@ -386,6 +394,7 @@ def select_okx_leverage_tier(
         "target_notional_usdt": target_notional,
         "current_position_notional_usdt": current_notional,
         "projected_position_notional_usdt": projected_notional,
+        "maximum_additional_notional_usdt": maximum_additional_notional,
         "mark_price": price,
         "contract_spec": spec,
         "contract_unit_notional_usdt": contract_unit_notional,
@@ -1951,6 +1960,22 @@ class EntryProfitRiskSizingPolicy:
             current_position_notional_usdt=existing_exposure["notional_usdt"],
             current_position_contracts=existing_exposure["contracts"],
         )
+        tier_entry_capacity = leverage_tier_selection.get("maximum_additional_notional_usdt")
+        if tier_entry_capacity is not None:
+            risk_and_liquidity_ceiling = min(
+                risk_and_liquidity_ceiling, max(_safe_float(tier_entry_capacity), 0.0),
+            )
+            tier_target_notional = (
+                risk_and_liquidity_ceiling / (1.0 + fill_drift_reserve_fraction)
+            )
+            leverage_tier_selection = select_okx_leverage_tier(
+                facts.get("leverage_tiers"),
+                target_notional_usdt=tier_target_notional,
+                mark_price=target_price,
+                contract_spec=target_contract_spec,
+                current_position_notional_usdt=existing_exposure["notional_usdt"],
+                current_position_contracts=existing_exposure["contracts"],
+            )
         max_leverage = max(
             _safe_float(leverage_tier_selection.get("max_leverage"), 0.0),
             0.0,

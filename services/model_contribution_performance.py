@@ -306,8 +306,10 @@ class ModelContributionPerformanceService:
                         select(
                             AIDecision.id,
                             AIDecision.action,
-                            AIDecision.raw_llm_response["opportunity_score"].label(
-                                "opportunity_score"
+                            AIDecision.raw_llm_response["opportunity_score"][
+                                "expected_net_breakdown"
+                            ]["components"].label(
+                                "components"
                             ),
                             AIDecision.model_health_opinions.label("opinions"),
                         )
@@ -318,7 +320,11 @@ class ModelContributionPerformanceService:
                             id=int(row.id),
                             action=row.action,
                             raw_llm_response={
-                                "opportunity_score": _safe_dict(row.opportunity_score),
+                                "opportunity_score": {
+                                    "expected_net_breakdown": {
+                                        "components": _safe_list(row.components)
+                                    }
+                                },
                                 "opinions": _safe_list(row.opinions),
                             },
                         )

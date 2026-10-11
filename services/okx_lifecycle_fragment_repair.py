@@ -85,8 +85,23 @@ async def repair_missing_okx_lifecycle_fragments(
         for position in positions
         for close_id in _split_ids(getattr(position, "close_exchange_order_id", None))
     }
+    positions_by_close_id: dict[str, list[Position]] = {}
+    for position in positions:
+        if bool(position.is_open) or position.settlement_status in POSITION_SETTLEMENT_SUPERSEDED:
+            continue
+        for close_id in _split_ids(position.close_exchange_order_id):
+            positions_by_close_id.setdefault(close_id, []).append(position)
+    close_owners: dict[str, set[tuple[Any, ...]]] = {}
+    for row in history_rows:
+        identity = (
+            _text(row.get("instId")), _text(row.get("posId")),
+            _history_side(row), _history_opened_at(row),
+        )
+        for close_id in _split_ids(row.get("_dashboard_close_order_ids")):
+            close_owners.setdefault(close_id, set()).add(identity)
 
     created = 0
+    repaired_identity = 0
     skipped = 0
     samples: list[dict[str, Any]] = []
     seen_lifecycles: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
@@ -96,6 +111,12 @@ async def repair_missing_okx_lifecycle_fragments(
         lifecycle = _history_lifecycle(row, mode=selected_mode)
         if lifecycle is None:
             continue
+        identity_samples = _repair_linked_lifecycle_identity(
+            lifecycle, positions_by_close_id=positions_by_close_id,
+            orders_by_id=orders_by_id, close_owners=close_owners, now=checked_at,
+        )
+        repaired_identity += len(identity_samples)
+        samples.extend(identity_samples)
         lifecycle_key, lifecycle_positions = _select_lifecycle_positions(
             lifecycle,
             positions,
@@ -217,13 +238,101 @@ async def repair_missing_okx_lifecycle_fragments(
         await session.flush()
     return {
         "created_count": created,
+        "repaired_identity_count": repaired_identity,
         "skipped_count": skipped,
         "samples": samples[:10],
     }
 
 
 def _summary() -> dict[str, Any]:
-    return {"created_count": 0, "skipped_count": 0, "samples": []}
+    return {"created_count": 0, "repaired_identity_count": 0, "skipped_count": 0, "samples": []}
+
+
+def _repair_linked_lifecycle_identity(
+    lifecycle: tuple[tuple[str, str, str, str, tuple[str, ...]], dict[str, Any]],
+    *,
+    positions_by_close_id: dict[str, list[Position]],
+    orders_by_id: dict[str, Order],
+    close_owners: dict[str, set[tuple[Any, ...]]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Restore entry identity only from a uniquely linked, fully proven lifecycle."""
+    _key, facts = lifecycle
+    entry_ids = _split_ids(facts["row"].get("_dashboard_entry_order_ids"))
+    close_ids = _split_ids(facts["row"].get("_dashboard_close_order_ids"))
+    if not entry_ids or not close_ids or entry_ids.intersection(close_ids):
+        return []
+    if any(len(close_owners.get(order_id, set())) != 1 for order_id in close_ids):
+        return []
+    entry_side = "sell" if facts["side"] == "short" else "buy"
+    close_side = "buy" if facts["side"] == "short" else "sell"
+    for ids, side, target in (
+        (entry_ids, entry_side, facts["open_contracts"]),
+        (close_ids, close_side, facts["close_contracts"]),
+    ):
+        linked_orders = [orders_by_id.get(order_id) for order_id in ids]
+        if any(
+            order is None
+            or _text(order.okx_inst_id).upper() != facts["inst_id"]
+            or not _order_is_authoritative(order, expected_side=side, position_side=facts["side"])
+            or order.filled_at is None
+            or not (
+                facts["opened_at"] - timedelta(seconds=TIME_TOLERANCE_SECONDS)
+                <= _aware_utc(order.filled_at)
+                <= facts["closed_at"] + timedelta(seconds=TIME_TOLERANCE_SECONDS)
+            )
+            for order in linked_orders
+        ):
+            return []
+        if abs(sum(_order_contracts(order) for order in linked_orders) - target) > max(
+            target * CONTRACT_TOLERANCE_RATIO, 1e-8
+        ):
+            return []
+    first_entry_at = min(_aware_utc(orders_by_id[order_id].filled_at) for order_id in entry_ids)
+    if abs((first_entry_at - facts["opened_at"]).total_seconds()) > TIME_TOLERANCE_SECONDS:
+        return []
+    if facts["entry_price"] <= 0:
+        return []
+    selected = {
+        int(position.id): position
+        for close_id in close_ids
+        for position in positions_by_close_id.get(close_id, [])
+    }
+    samples = []
+    for position in selected.values():
+        position_close_ids = _split_ids(position.close_exchange_order_id)
+        if (
+            position.okx_pos_id != facts["pos_id"]
+            or _text(position.okx_inst_id).upper() != facts["inst_id"]
+            or str(position.side or "").lower() != facts["side"]
+            or not position_close_ids
+            or not position_close_ids.issubset(close_ids)
+            or _split_ids(position.entry_exchange_order_id) == entry_ids
+        ):
+            continue
+        raw = _dict(position.settlement_raw)
+        position.settlement_raw = {
+            **raw,
+            "entry_identity_repair": {
+                "source": REPAIR_SOURCE, "repaired_at": now.isoformat(),
+                "history_record_id": facts["row"].get("_dashboard_history_record_id"),
+                "previous_entry_order_ids": position.entry_exchange_order_id,
+                "previous_created_at": _aware_utc(position.created_at).isoformat(),
+                "previous_entry_price": position.entry_price,
+                "authoritative_entry_order_ids": sorted(entry_ids),
+                "authoritative_close_order_ids": sorted(position_close_ids),
+            },
+            "next_settlement_retry_at": now.isoformat(),
+        }
+        position.entry_exchange_order_id = ",".join(sorted(entry_ids))
+        position.created_at = facts["opened_at"]
+        position.entry_price = facts["entry_price"]
+        position.updated_at = now
+        samples.append({
+            "kind": "okx_lifecycle_entry_identity_repaired",
+            "position_id": int(position.id), "symbol": facts["symbol"],
+        })
+    return samples
 
 
 def _history_lifecycle(

@@ -20,12 +20,12 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
 from models.market_data import Kline
-from services.shadow_backtest_service import shadow_path_labels
 from services.historical_shadow_contract import (
     build_historical_market_contract,
     build_historical_market_fact,
     compact_historical_market_contract,
 )
+from services.shadow_backtest_service import shadow_path_labels
 
 DEFAULT_HISTORICAL_HORIZONS_MINUTES = (5, 15, 60, 240)
 

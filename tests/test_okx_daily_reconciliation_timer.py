@@ -35,3 +35,5 @@ def test_okx_daily_reconciliation_timer_dry_run_does_not_connect(
     assert "bb-okx-daily-reconciliation.service" in output
     assert "bb-okx-daily-reconciliation.timer" in output
     assert "run_phase3_okx_fact_sync.py" in output
+    assert "OnCalendar=*-*-* *:10,40:00" in output
+    assert "RandomizedDelaySec=60" in output

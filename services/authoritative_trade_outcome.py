@@ -185,7 +185,7 @@ def _merge_compact_outcomes(
     return sorted(
         merged.values(),
         key=lambda outcome: str(outcome.get("label_timestamp") or ""),
-    )
+    )[-_COMPACT_OUTCOME_MAX_HISTORY_ROWS:]
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -694,6 +694,9 @@ async def load_authoritative_trade_outcomes(
                     since=since,
                     limit=limit,
                 )
+            # A failed cold refresh also observes backoff. Falling through
+            # would let every caller reconstruct the same failed query.
+            return []
     if cache_enabled and _compact_outcome_cache is not None:
         cached_at, cached_outcomes = _compact_outcome_cache
         cache_age = time.monotonic() - cached_at
@@ -804,7 +807,17 @@ async def load_authoritative_trade_outcomes(
         }
         positions = (
             list(
-                (await session.execute(select(Position).where(Position.id.in_(position_ids))))
+                (await session.execute(
+                    select(Position)
+                    .where(Position.id.in_(position_ids))
+                    .options(load_only(
+                        Position.id,
+                        Position.model_name,
+                        Position.stop_loss_price,
+                        Position.take_profit_price,
+                        raiseload=True,
+                    ))
+                ))
                 .scalars()
                 .all()
             )
