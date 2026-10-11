@@ -8284,6 +8284,11 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     service._recent_symbol_side_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
     service._recent_model_contribution_performance = lambda _mode: _async_value({})  # type: ignore[method-assign]
     service._strategy_context_account_equity = lambda _mode: _async_value(200.0)  # type: ignore[method-assign]
+    calibration = {"execution_mode": "paper", "data_fingerprint": "fresh-fill-costs"}
+    service._recent_strategy_context_performance_snapshot = lambda _mode: (
+        {"execution_trade_calibration": calibration},
+        {"status": "fresh"},
+    )
 
     async def unexpected_bounded_context(*_args, **_kwargs):
         raise AssertionError("market/position cached equity must not enter the shared I/O queue")
@@ -8319,6 +8324,7 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     assert result["current_production_strategy"]["id"] == "cached_production_strategy"
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
     assert result["execution_mode"] == "paper"
+    assert result["execution_trade_calibration"] == calibration
     assert "paper_training_mode" not in result
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()

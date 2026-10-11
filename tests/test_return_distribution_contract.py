@@ -8,7 +8,9 @@ from services.return_objective import (
     RETURN_DISTRIBUTION_CONTRACT_VERSION,
     RETURN_LABEL_VERSION,
     RETURN_OBJECTIVE_VERSION,
+    combine_paper_return_distribution,
     combine_production_return_distribution,
+    reprice_execution_return_distribution,
     risk_adjusted_expected_return,
     standardized_return_distribution,
 )
@@ -48,6 +50,42 @@ def test_standardized_return_distribution_keeps_raw_and_objective_separate() -> 
     assert contract["uncertainty_penalty_pct"] == pytest.approx(0.4)
     assert contract["tail_loss_penalty_pct"] == pytest.approx(0.05)
     assert contract["objective_expected_return_pct"] == pytest.approx(0.35)
+
+
+def test_paper_cost_learning_keeps_negative_outcomes_out_of_mean_and_cost_deducted_once() -> None:
+    args = {
+        "side": "long",
+        "model_contracts": [_distribution()],
+        "current_execution_cost_pct": 0.1,
+        "current_slippage_pct": 0.02,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "source_authority": "test_paper",
+    }
+    cold = combine_paper_return_distribution(**args)
+    assert cold["paper_eligible"] is True
+    assert cold["raw_expected_return_pct"] == pytest.approx(0.7)
+    learned = combine_paper_return_distribution(
+        **args,
+        actual_trade_calibrations=[{
+            "source_authority": "okx_position_history",
+            "side": "long",
+            "net_return_after_all_cost_pct": {
+                "count": 2, "expected": -3.0, "lower_hinge": -4.0,
+            },
+            "slippage_pct": {"count": 2, "expected": 0.2, "upper_hinge": 0.4},
+        }],
+    )
+    assert learned["paper_eligible"] is True
+    assert learned["raw_expected_return_pct"] == pytest.approx(0.52)
+    assert learned["transformations"]["cost_deduction_count"] == 1
+    repriced = reprice_execution_return_distribution(
+        learned, execution_cost={"total_pct": 0.09, "slippage_pct": 0.01}
+    )
+    # A smaller book order cannot erase the measured execution cost floor.
+    assert repriced["raw_expected_return_pct"] == pytest.approx(0.52)
+    for key in ("median_return_pct", "lower_quantile_return_pct", "upper_quantile_return_pct"):
+        assert repriced[key] == pytest.approx(learned[key])
+    assert repriced["transformations"]["live_execution_cost_pct"] == pytest.approx(0.09)
 
 
 def test_lower_quantile_above_raw_expected_is_blocked_not_clamped() -> None:

@@ -699,3 +699,68 @@ def select_trade_calibration(
         "profile_source": "missing",
         "fallback_reason": "authoritative_trade_calibration_missing",
     }
+
+
+def authoritative_execution_cost_calibration(
+    outcomes: list[dict[str, Any]], *, execution_mode: str
+) -> dict[str, Any]:
+    """Reprice execution from settled lifecycles, including costly losing fills.
+
+    Execution anomalies may be excluded from market-prediction training. Their
+    verified fill costs still belong in the execution cost model.
+    """
+
+    if execution_mode not in {"paper", "live"}:
+        raise ValueError("execution_mode_must_be_paper_or_live")
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[str] = set()
+    for outcome in outcomes:
+        label = _safe_dict(outcome.get("training_label_contract"))
+        lifecycle = _safe_text(outcome.get("lifecycle_key"))
+        slippage = _safe_float(label.get("slippage_pct"))
+        net = _safe_float(label.get(PROFIT_TRAINING_TARGET))
+        side = _safe_text(outcome.get("side")).lower()
+        symbol = normalize_trading_symbol(outcome.get("symbol"))
+        if (
+            outcome.get("execution_mode") != execution_mode
+            or label.get("execution_mode") != execution_mode
+            or outcome.get("source") not in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
+            or outcome.get("outcome_complete") is not True
+            or outcome.get("trade_fact_trusted") is not True
+            or label.get("complete") is not True
+            or label.get("slippage_source") != OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+            or slippage is None
+            or slippage < 0.0
+            or net is None
+            or side not in {"long", "short"}
+            or not symbol
+            or not lifecycle
+            or lifecycle in seen
+        ):
+            continue
+        seen.add(lifecycle)
+        buckets[f"{symbol}|{side}"].append(label)
+        buckets[f"*|{side}"].append(label)
+    profiles = {
+        key: {
+            "source_authority": "okx_position_history",
+            "execution_mode": execution_mode,
+            "symbol": key.rsplit("|", 1)[0],
+            "side": key.rsplit("|", 1)[-1],
+            PROFIT_TRAINING_TARGET: weighted_distribution(
+                [(label[PROFIT_TRAINING_TARGET], 1.0) for label in labels]
+            ),
+            "slippage_pct": weighted_distribution(
+                [(label["slippage_pct"], 1.0) for label in labels]
+            ),
+        }
+        for key, labels in buckets.items()
+    }
+    result = {
+        "version": PROFIT_SUPERVISION_VERSION,
+        "execution_mode": execution_mode,
+        "profiles": profiles,
+        "actual_realized_return_sample_count": len(seen),
+    }
+    result["data_fingerprint"] = _fingerprint(result)
+    return result

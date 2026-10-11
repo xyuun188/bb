@@ -2764,7 +2764,12 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
             }
 
         async def executionFetchOrderBook(self, _symbol: str) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must use live public order book")
+            self.live_market_calls.append("execution_orderbook")
+            return {
+                "bids": [[99.8, 1.0]],
+                "asks": [[100.2, 2.0]],
+                "timestamp": 1780000000001,
+            }
 
         async def publicGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
@@ -2780,7 +2785,10 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
             }
 
         async def executionGetPublicMarkPrice(self, _params: dict[str, Any]) -> dict[str, Any]:
-            raise AssertionError("paper execution facts must use live public mark price")
+            self.live_market_calls.append("execution_mark_price")
+            return {
+                "data": [{"instId": "BTC-USDT-SWAP", "markPx": "100.06", "ts": "1780000000002"}]
+            }
 
         async def publicGetPublicInstruments(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params == {"instType": "SWAP", "instId": "BTC-USDT-SWAP"}
@@ -2856,18 +2864,19 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
     assert snapshot["market_fact"]["fact_id"].startswith("sha256:")
     assert snapshot["market_fact"]["source_endpoint"] == "okx_rest_market_books"
     assert snapshot["market_fact"]["source_timestamp_ms"] == 1780000000001
-    assert snapshot["market_contract_spec"]["tickSz"] == "0.1"
+    assert snapshot["market_contract_spec"]["tickSz"] == "0.01"
+    assert snapshot["analysis_market_contract_spec"]["tickSz"] == "0.1"
     assert snapshot["contract_spec"]["tickSz"] == "0.01"
     assert snapshot["contract_value_base"] == pytest.approx(0.01)
-    assert snapshot["orderbook_bid_depth"] == pytest.approx(99.9 * 2.0 * 0.01)
-    assert snapshot["orderbook_ask_depth"] == pytest.approx(100.1 * 3.0 * 0.01)
-    assert snapshot["mark_price"] == pytest.approx(100.05)
+    assert snapshot["orderbook_bid_depth"] == pytest.approx(99.8 * 1.0 * 0.01)
+    assert snapshot["orderbook_ask_depth"] == pytest.approx(100.2 * 2.0 * 0.01)
+    assert snapshot["mark_price"] == pytest.approx(100.06)
     assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
     assert exchange.live_market_calls == [
         "ticker",
         "ticker",
-        "orderbook",
-        "mark_price",
+        "execution_orderbook",
+        "execution_mark_price",
     ]
 
 

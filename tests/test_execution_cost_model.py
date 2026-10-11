@@ -15,7 +15,7 @@ def test_execution_cost_uses_dynamic_spread() -> None:
         }
     )
 
-    assert estimate.slippage_pct == pytest.approx(0.008576)
+    assert estimate.slippage_pct == pytest.approx(0.017152)
     assert estimate.slippage_source == "pre_sizing_live_spread_depth_imbalance"
     assert estimate.order_size_complete is False
     assert estimate.production_eligible is True
@@ -34,7 +34,7 @@ def test_execution_cost_reports_extreme_microstructure_without_fixed_cap() -> No
         }
     )
 
-    assert estimate.slippage_pct == pytest.approx(2.34)
+    assert estimate.slippage_pct == pytest.approx(4.68)
     assert estimate.slippage_source == "pre_sizing_live_spread_depth_imbalance"
     assert estimate.production_eligible is True
 
@@ -93,10 +93,12 @@ def test_execution_cost_consumes_orderbook_levels_for_planned_order_size() -> No
         (estimate.estimated_vwap - estimate.reference_price)
         / estimate.reference_price
         * 100.0
+        + (estimate.reference_price - 99.0) / estimate.reference_price * 100.0
     )
     assert estimate.book_levels_consumed == 2
     assert estimate.order_notional_usdt == 150.0
     assert estimate.policy_provenance["orderbook_fingerprint"] == "book-fingerprint"
+    assert estimate.policy_provenance["exit_slippage_pct"] == pytest.approx(1.0)
 
 
 def test_execution_cost_fails_when_order_exceeds_observed_book_depth() -> None:
@@ -118,6 +120,22 @@ def test_execution_cost_fails_when_order_exceeds_observed_book_depth() -> None:
     assert estimate.production_eligible is False
     assert estimate.order_size_complete is False
     assert estimate.reason == "planned_order_exceeds_observed_orderbook_depth"
+
+
+def test_round_trip_cost_requires_close_side_depth() -> None:
+    snapshot = {
+        "bid": 99.99,
+        "ask": 100.01,
+        "orderbook_bids": [[99.99, 1.0]],
+        "orderbook_asks": [[100.01, 10.0]],
+        "contract_value_base": 1.0,
+        "planned_order_notional_usdt": 500.0,
+        "planned_order_side": "long",
+        "taker_fee_rate": 0.0004,
+    }
+    estimate = execution_cost_estimate(snapshot)
+    assert estimate.production_eligible is False
+    assert estimate.reason == "planned_close_exceeds_observed_orderbook_depth"
 
 
 def test_exchange_fee_rate_contract_does_not_guess_percent_units() -> None:

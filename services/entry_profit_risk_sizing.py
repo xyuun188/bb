@@ -32,6 +32,10 @@ from services.normal_paper_trade import (
 )
 from services.okx_native_facts import okx_minimum_order_notional_usdt
 from services.production_trade_gate import validate_production_trade_gate
+from services.return_objective import (
+    execution_cost_with_slippage_floor,
+    reprice_execution_return_distribution,
+)
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
 LIVE_RULES_CANARY_SIZING_VERSION = "2026-07-23.live-rules-canary-sizing.v2"
@@ -88,6 +92,7 @@ def solve_size_aware_positive_expected_net(
     expected_net_return_pct: float,
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
+    execution_slippage_floor_pct: float = 0.0,
 ) -> dict[str, Any]:
     """Maximize expected net profit within the risk budget and native book.
 
@@ -162,7 +167,15 @@ def solve_size_aware_positive_expected_net(
             _safe_float(candidate_cost.get("total_pct"), 0.0),
             0.0,
         )
-        cost_delta = candidate_cost_pct - original_cost_pct
+        cost_delta = execution_cost_with_slippage_floor(
+            candidate_cost_pct,
+            candidate_cost.get("slippage_pct"),
+            execution_slippage_floor_pct,
+        ) - execution_cost_with_slippage_floor(
+            original_cost_pct,
+            execution_cost.get("slippage_pct"),
+            execution_slippage_floor_pct,
+        )
         return {
             "notional": candidate_notional,
             "cost": candidate_cost,
@@ -171,7 +184,9 @@ def solve_size_aware_positive_expected_net(
         }
 
     upper = evaluate(maximum)
-    if upper is None:
+    if upper is None and not (
+        feature_snapshot.get("orderbook_bids") or feature_snapshot.get("orderbook_asks")
+    ):
         # Some paper snapshots only contain the pre-sizing spread/fee facts,
         # without enough native order-book levels for a second size-specific
         # VWAP pass.  Preserve that existing audited cost contract when its
@@ -201,33 +216,34 @@ def solve_size_aware_positive_expected_net(
     ask = _safe_float(feature_snapshot.get("ask"), 0.0)
     reference = (bid + ask) / 2.0 if bid > 0.0 and ask >= bid else 0.0
     contract_base = _safe_float(feature_snapshot.get("contract_value_base"), 0.0)
-    levels = feature_snapshot.get(
-        "orderbook_asks" if normalized_side == "long" else "orderbook_bids"
-    )
-    cumulative_base = 0.0
-    for level in _safe_list(levels):
-        if not isinstance(level, (list, tuple)) or len(level) < 2:
-            continue
-        price = _safe_float(level[0], 0.0)
-        contracts = _safe_float(level[1], 0.0)
-        if price <= 0.0 or contracts <= 0.0:
-            continue
-        cumulative_base += contracts * contract_base
-        boundary = cumulative_base * reference
-        if boundary < executable_minimum or boundary > maximum:
-            continue
-        lower = _quantize(boundary)
-        candidates.add(lower)
-        if step > 0.0 and lower + step <= maximum:
-            candidates.add(lower + step)
+    for book_side in ("orderbook_asks", "orderbook_bids"):
+        cumulative_base = 0.0
+        for level in _safe_list(feature_snapshot.get(book_side)):
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            price = _safe_float(level[0], 0.0)
+            contracts = _safe_float(level[1], 0.0)
+            if price <= 0.0 or contracts <= 0.0:
+                continue
+            cumulative_base += contracts * contract_base
+            boundary = cumulative_base * reference
+            if boundary < executable_minimum or boundary > maximum:
+                continue
+            lower = _quantize(boundary)
+            candidates.add(lower)
+            if step > 0.0 and lower + step <= maximum:
+                candidates.add(lower + step)
 
-    evaluated = [upper]
+    evaluated = [upper] if upper is not None else []
     for notional in sorted(candidates):
-        if abs(notional - upper["notional"]) <= 1e-9:
+        if upper is not None and abs(notional - upper["notional"]) <= 1e-9:
             continue
         candidate = evaluate(notional)
         if candidate is not None:
             evaluated.append(candidate)
+    if not evaluated:
+        result["reason"] = "round_trip_size_cost_incomplete"
+        return result
     profitable = [candidate for candidate in evaluated if candidate["expected"] > 0.0]
     selected = (
         max(
@@ -2042,6 +2058,12 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
+            execution_slippage_floor_pct=_safe_float(
+                _safe_dict(distribution.get("transformations")).get(
+                    "authoritative_slippage_expected_pct"
+                ),
+                0.0,
+            ),
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2060,9 +2082,17 @@ class EntryProfitRiskSizingPolicy:
             opportunity["execution_cost"] = execution_cost
             opportunity["expected_net_return_pct"] = expected_net
             opportunity["return_lcb_pct"] = return_lcb
+            distribution = reprice_execution_return_distribution(
+                distribution, execution_cost=execution_cost
+            )
             distribution["raw_expected_return_pct"] = expected_net
             distribution["objective_expected_return_pct"] = return_lcb
             opportunity["return_distribution_contract"] = distribution
+            breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
+            if breakdown:
+                breakdown.update(_safe_dict(distribution.get("transformations")))
+                breakdown["net_pct"] = expected_net
+                opportunity["expected_net_breakdown"] = breakdown
             raw["opportunity_score"] = opportunity
             if size_aware_solution_eligible:
                 target_notional = max(

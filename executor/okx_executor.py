@@ -7569,12 +7569,12 @@ class OKXExecutor(AbstractExecutor):
                         "fallback_reason": "okx_pre_order_execution_market_unavailable",
                     },
                 }
-        fetch_order_book = getattr(ccxt, "fetch_order_book", None)
+        fetch_order_book = getattr(ccxt, "executionFetchOrderBook", None)
         if not callable(fetch_order_book):
-            fetch_order_book = ccxt.executionFetchOrderBook
-        fetch_mark_price = getattr(ccxt, "publicGetPublicMarkPrice", None)
+            fetch_order_book = ccxt.fetch_order_book
+        fetch_mark_price = getattr(ccxt, "executionGetPublicMarkPrice", None)
         if not callable(fetch_mark_price):
-            fetch_mark_price = ccxt.executionGetPublicMarkPrice
+            fetch_mark_price = ccxt.publicGetPublicMarkPrice
         (
             ticker,
             book,
@@ -7608,9 +7608,11 @@ class OKXExecutor(AbstractExecutor):
             else None
         )
         market_spec = market_spec if isinstance(market_spec, dict) else {}
-        # Public ticker/order-book facts are validated against the public
-        # market contract.  Quantity, minimums and order formatting use the
-        # execution-account contract.  These may differ on OKX paper mode.
+        # Analysis uses the live public market. Pre-order cost and quantity
+        # must both use the account's execution book and contract; demo depth
+        # and tick sizes can differ even when instrument identity is compatible.
+        analysis_market_spec = market_spec
+        market_spec = execution_spec
         ct_val = max(
             self._safe_float(execution_spec.get("ctVal"), 0.0),
             0.0,
@@ -7796,7 +7798,7 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("okx_pre_order_available_margin_missing")
         generated_at = datetime.now(UTC).isoformat()
         feature_snapshot = {
-            "current_price": max(self._safe_float(ticker.get("last"), 0.0), 0.0),
+            "current_price": (bid + ask) / 2.0 if bid > 0 and ask >= bid else 0.0,
             "bid": bid,
             "ask": ask,
             "mark_price": mark_price,
@@ -7811,6 +7813,8 @@ class OKXExecutor(AbstractExecutor):
             "contract_value_base": contract_value_base,
             "contract_spec": execution_spec,
             "market_contract_spec": market_spec,
+            "analysis_market_contract_spec": analysis_market_spec,
+            "execution_mode": self.executor_mode,
             "notional_24h_usdt": notional_24h_usdt,
             "volume_24h_contracts": volume_24h_contracts,
             "volume_24h_base": volume_24h_base,

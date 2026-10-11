@@ -457,7 +457,7 @@ def _combine_execution_return_distribution(
     actual_uncertainties: list[float] = []
     slippage_expected_values: list[float] = []
     slippage_upper_values: list[float] = []
-    for row in calibration_rows if live_scope else []:
+    for row in calibration_rows:
         realized = row.get("net_return_after_all_cost_pct")
         slippage = row.get("slippage_pct")
         realized = realized if isinstance(realized, dict) else {}
@@ -480,14 +480,15 @@ def _combine_execution_return_distribution(
             or slippage_expected is None
             or slippage_upper is None
             or slippage_expected < 0
-            or slippage_upper < slippage_expected
+            or (live_scope and slippage_upper < slippage_expected)
+            or slippage_upper < 0.0
         ):
             blockers.append("authoritative_trade_calibration_invalid")
             continue
-        if actual_lower > actual_expected:
+        if live_scope and actual_lower > actual_expected:
             blockers.append("authoritative_realized_lower_above_expected")
             continue
-        actual_uncertainties.append(actual_expected - actual_lower)
+        actual_uncertainties.append(max(actual_expected - actual_lower, 0.0))
         slippage_expected_values.append(slippage_expected)
         slippage_upper_values.append(slippage_upper)
     if live_scope and not actual_uncertainties:
@@ -508,15 +509,25 @@ def _combine_execution_return_distribution(
     if funding_cashflow is None:
         blockers.append("current_funding_cashflow_invalid")
     authoritative_slippage_upper = max(slippage_upper_values) if slippage_upper_values else None
-    slippage_tail_excess = (
-        authoritative_slippage_upper - live_slippage
-        if authoritative_slippage_upper is not None
-        and live_slippage is not None
-        and authoritative_slippage_upper > live_slippage
-        else 0.0
-        if authoritative_slippage_upper is not None and live_slippage is not None
+    authoritative_slippage_expected = (
+        sum(slippage_expected_values) / len(slippage_expected_values)
+        if slippage_expected_values
         else None
-    ) if live_scope else 0.0
+    )
+    # Live promotion uses the cost tail. Paper learns the central execution
+    # cost without turning historical losses into a permission gate.
+    slippage_cost_reference = (
+        authoritative_slippage_upper if live_scope else authoritative_slippage_expected
+    )
+    slippage_tail_excess = (
+        slippage_cost_reference - live_slippage
+        if slippage_cost_reference is not None
+        and live_slippage is not None
+        and slippage_cost_reference > live_slippage
+        else 0.0
+        if not live_scope or slippage_cost_reference is not None and live_slippage is not None
+        else None
+    )
 
     net_expected = (
         gross_expected + funding_cashflow - live_cost - slippage_tail_excess
@@ -616,19 +627,18 @@ def _combine_execution_return_distribution(
         "formula": (
             "gross_market_expected+current_funding_cashflow-live_execution_cost-authoritative_slippage_tail_excess"
             if live_scope
-            else "gross_market_expected+current_funding_cashflow-current_execution_cost"
+            else "gross_market_expected+current_funding_cashflow-current_execution_cost-authoritative_slippage_expected_excess"
         ),
         "live_execution_cost_pct": live_cost,
         "current_adverse_funding_cost_pct": adverse_funding_cost,
         "current_funding_cashflow_pct": funding_cashflow,
         "live_slippage_pct": live_slippage,
         "authoritative_slippage_expected_pct": (
-            sum(slippage_expected_values) / len(slippage_expected_values)
-            if slippage_expected_values
-            else None
+            authoritative_slippage_expected
         ),
         "authoritative_slippage_upper_hinge_pct": authoritative_slippage_upper,
         "authoritative_slippage_tail_excess_pct": slippage_tail_excess,
+        "authoritative_slippage_cost_basis": "upper_hinge" if live_scope else "expected",
         "market_dispersion_pct": market_dispersion,
         "counterfactual_cost_uncertainty_pct": (
             max(historical_cost_uncertainties) if historical_cost_uncertainties else None
@@ -705,6 +715,7 @@ def combine_paper_return_distribution(
     model_weights: Iterable[Any] | None = None,
     current_adverse_funding_cost_pct: Any = 0.0,
     current_funding_cashflow_pct: Any = None,
+    actual_trade_calibrations: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Build a paper decision distribution without live promotion evidence."""
 
@@ -715,7 +726,7 @@ def combine_paper_return_distribution(
         live_execution_cost_pct=current_execution_cost_pct,
         live_slippage_pct=current_slippage_pct,
         counterfactual_cost_distributions=(),
-        actual_trade_calibrations=(),
+        actual_trade_calibrations=actual_trade_calibrations,
         profit_supervision_version=profit_supervision_version,
         source_authority=source_authority,
         input_blockers=input_blockers,
@@ -723,6 +734,62 @@ def combine_paper_return_distribution(
         current_adverse_funding_cost_pct=current_adverse_funding_cost_pct,
         current_funding_cashflow_pct=current_funding_cashflow_pct,
     )
+
+
+def execution_cost_with_slippage_floor(
+    total_cost_pct: Any, slippage_pct: Any, slippage_floor_pct: Any
+) -> float:
+    cost = float(safe_float(total_cost_pct, 0.0) or 0.0)
+    slippage = float(safe_float(slippage_pct, 0.0) or 0.0)
+    floor = float(safe_float(slippage_floor_pct, 0.0) or 0.0)
+    return cost + max(floor - slippage, 0.0)
+
+
+def reprice_execution_return_distribution(
+    contract: dict[str, Any], *, execution_cost: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep one return contract when sizing changes the executable book cost."""
+
+    result = dict(contract)
+    transformations = dict(result.get("transformations") or {})
+    old_cost = safe_float(transformations.get("live_execution_cost_pct"), None)
+    new_cost = safe_float(execution_cost.get("total_pct"), None)
+    if old_cost is None or new_cost is None:
+        return result
+    reference_key = (
+        "authoritative_slippage_upper_hinge_pct"
+        if result.get("execution_scope") == "live"
+        else "authoritative_slippage_expected_pct"
+    )
+    reference = transformations.get(reference_key)
+    cost_delta = execution_cost_with_slippage_floor(
+        new_cost, execution_cost.get("slippage_pct"), reference
+    ) - execution_cost_with_slippage_floor(
+        old_cost, transformations.get("live_slippage_pct"), reference
+    )
+    for key in (
+        "raw_expected_return_pct",
+        "median_return_pct",
+        "lower_quantile_return_pct",
+        "upper_quantile_return_pct",
+        "objective_expected_return_pct",
+    ):
+        value = safe_float(result.get(key), None)
+        if value is not None:
+            result[key] = value - cost_delta
+    transformations.update(
+        {
+            "live_execution_cost_pct": new_cost,
+            "live_slippage_pct": execution_cost.get("slippage_pct"),
+            "authoritative_slippage_tail_excess_pct": max(
+                float(safe_float(reference, 0.0) or 0.0)
+                - float(safe_float(execution_cost.get("slippage_pct"), 0.0) or 0.0),
+                0.0,
+            ),
+        }
+    )
+    result["transformations"] = transformations
+    return result
 
 
 def profit_factor(returns: Iterable[float]) -> float | None:

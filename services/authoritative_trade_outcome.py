@@ -824,19 +824,16 @@ async def load_authoritative_trade_outcomes(
             if position_ids
             else []
         )
-        orders = (
-            list(
-                (
-                    await session.execute(
-                        select(Order).where(Order.exchange_order_id.in_(exchange_order_ids))
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if exchange_order_ids
-            else []
-        )
+        orders: list[Order] = []
+        ordered_exchange_ids = sorted(exchange_order_ids)
+        for offset in range(0, len(ordered_exchange_ids), _DECISION_PROJECTION_QUERY_BATCH_SIZE):
+            exchange_batch = ordered_exchange_ids[
+                offset : offset + _DECISION_PROJECTION_QUERY_BATCH_SIZE
+            ]
+            order_stmt = select(Order).where(Order.exchange_order_id.in_(exchange_batch))
+            if history_modes:
+                order_stmt = order_stmt.where(Order.execution_mode.in_(history_modes))
+            orders.extend((await session.execute(order_stmt)).scalars().all())
         decision_ids = {
             int(order.decision_id or 0) for order in orders if int(order.decision_id or 0) > 0
         }

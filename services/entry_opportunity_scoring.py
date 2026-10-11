@@ -36,6 +36,7 @@ from services.paper_prediction_horizon import select_paper_horizon_cohort
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
+    select_trade_calibration,
 )
 from services.return_objective import (
     PAPER_RETURN_COMBINATION_VERSION,
@@ -633,6 +634,22 @@ class EntryOpportunityScoringPolicy:
                 "_slippage_upper_hinge",
             ),
         )
+        if execution_scope == "paper":
+            current_calibration = safe_dict(
+                safe_dict(strategy).get("execution_trade_calibration")
+            )
+            current_profile = select_trade_calibration(
+                current_calibration, symbol=decision.symbol, side=side
+            )
+            # Artifact metadata may mix execution modes or predate recent fills.
+            # Paper execution uses only the current same-account cost snapshot.
+            calibrations = (
+                [current_profile]
+                if current_calibration.get("execution_mode") == "paper"
+                and current_profile.get("execution_mode") == "paper"
+                and current_profile.get("profile_source") in {"symbol_side", "global_side"}
+                else []
+            )
         valid_calibrations = calibrations
         historical_cost_expected = (
             _mean([float(row["expected_pct"]) for row in cost_distributions])
@@ -695,6 +712,7 @@ class EntryOpportunityScoringPolicy:
                     if funding_cost.production_eligible
                     else None
                 ),
+                actual_trade_calibrations=valid_calibrations,
             )
             if execution_scope == "paper"
             else combine_production_return_distribution(

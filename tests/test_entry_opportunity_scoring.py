@@ -599,6 +599,42 @@ def test_shadow_server_models_participate_in_normal_paper_scoring() -> None:
     assert all(component["included_in_return_distribution"] is True for component in components[1:])
 
 
+def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": _paper_payload(side="long", long_return=1.0, short_return=-0.4),
+    }
+    _scorer().score_candidate(decision, {"execution_mode": "paper"})
+    initial_net = decision.raw_response["opportunity_score"]["expected_net_return_pct"]
+    initial_slippage = decision.raw_response["opportunity_score"]["execution_cost"]["slippage_pct"]
+    profile = {
+        "source_authority": "okx_position_history",
+        "execution_mode": "paper",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "net_return_after_all_cost_pct": {"count": 2, "expected": -1.0, "lower_hinge": -2.0},
+        "slippage_pct": {"count": 2, "expected": 0.3, "upper_hinge": 0.5},
+    }
+    context = {
+        "execution_mode": "paper",
+        "execution_trade_calibration": {
+            "execution_mode": "paper",
+            "profiles": {"BTC/USDT|long": profile},
+        },
+    }
+    _scorer().score_candidate(decision, context)
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["paper_eligible"] is True
+    assert opportunity["expected_net_return_pct"] == pytest.approx(
+        initial_net - max(0.3 - initial_slippage, 0.0)
+    )
+    assert opportunity["expected_net_breakdown"]["authoritative_trade_calibration_count"] == 1
+    context["execution_trade_calibration"]["execution_mode"] = "live"
+    _scorer().score_candidate(decision, context)
+    assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] == pytest.approx(initial_net)
+
+
 def test_paper_scoring_uses_only_the_authorized_prediction_horizon() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}

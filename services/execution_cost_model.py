@@ -1,9 +1,4 @@
-"""Execution-cost estimation used by entry scoring.
-
-The configured maximum slippage is a safety ceiling, not the ordinary cost of
-every order. Entry scoring estimates realistic executable cost from current
-market microstructure and only uses the configured max as a cap.
-"""
+"""Round-trip execution cost from the account's current executable book."""
 
 from __future__ import annotations
 
@@ -260,6 +255,16 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
     liquidity_penalty_pct = half_spread_pct * depth_asymmetry
     imbalance_penalty_pct = half_spread_pct * abs(imbalance)
     impact = _orderbook_market_impact(snapshot)
+    exit_snapshot = {
+        **snapshot,
+        "planned_order_side": (
+            "short" if snapshot.get("planned_order_side") == "long" else "long"
+        ),
+    }
+    exit_impact = _orderbook_market_impact(exit_snapshot)
+    round_trip_impact_ready = bool(
+        impact.get("eligible") is True and exit_impact.get("eligible") is True
+    )
     market_impact_pct = max(_safe_float(impact.get("market_impact_pct"), 0.0), 0.0)
     order_size_slippage_pct = max(
         _safe_float(impact.get("execution_slippage_pct"), 0.0),
@@ -267,13 +272,14 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
     )
     raw_slippage_pct = (
         order_size_slippage_pct
-        if impact.get("eligible") is True
-        else half_spread_pct + liquidity_penalty_pct + imbalance_penalty_pct
+        + max(_safe_float(exit_impact.get("execution_slippage_pct"), 0.0), 0.0)
+        if round_trip_impact_ready
+        else 2.0 * (half_spread_pct + liquidity_penalty_pct + imbalance_penalty_pct)
     )
     slippage_pct = raw_slippage_pct
     fee_pct, fee_source = round_trip_fee_pct(snapshot)
     order_notional = max(_safe_float(snapshot.get("planned_order_notional_usdt"), 0.0), 0.0)
-    order_size_complete = order_notional > 0 and impact.get("eligible") is True
+    order_size_complete = order_notional > 0 and round_trip_impact_ready
     base_eligible = bool(spread_source != "missing" and spread_pct > 0 and fee_pct > 0)
     production_eligible = bool(
         base_eligible and (order_notional <= 0 or order_size_complete)
@@ -283,7 +289,11 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
         if fee_pct <= 0
         else "live_spread_missing"
         if spread_source == "missing" or spread_pct <= 0
-        else str(impact.get("reason") or "order_size_market_impact_incomplete")
+        else str(
+            impact.get("reason")
+            if impact.get("eligible") is not True
+            else "planned_close_exceeds_observed_orderbook_depth"
+        )
         if order_notional > 0 and not order_size_complete
         else ""
     )
@@ -341,7 +351,14 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
                 + max(int(_safe_float(impact.get("book_levels_consumed"), 0.0)), 0)
             ),
             "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-07-15.order-size-execution-cost.v2",
+            "strategy_version": "2026-10-12.round-trip-order-size-execution-cost.v3",
+            "execution_mode": snapshot.get("execution_mode"),
+            "entry_slippage_pct": (
+                impact.get("execution_slippage_pct") if round_trip_impact_ready else None
+            ),
+            "exit_slippage_pct": (
+                exit_impact.get("execution_slippage_pct") if round_trip_impact_ready else None
+            ),
             "fallback_reason": "" if production_eligible else failure_reason,
             "orderbook_fingerprint": str(
                 _safe_dict(snapshot.get("pre_order_execution_facts")).get(

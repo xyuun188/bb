@@ -59,6 +59,7 @@ from services.analysis_services import (
     PositionReviewService,
     round_cancellation_state,
 )
+from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
 from services.continuous_model_weight import (
     ContinuousModelWeightEvidenceService,
     ContinuousModelWeightPolicy,
@@ -219,6 +220,7 @@ from services.position_settlement import (
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.production_trade_gate import evaluate_production_trade_gate
+from services.profit_supervision import authoritative_execution_cost_calibration
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.same_symbol_reentry import SameSymbolReentryGuard
 from services.shadow_backtest_service import ShadowBacktestService
@@ -3461,6 +3463,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     selected_mode
                 ),
                 "model_contribution_perf": lambda: self._recent_model_contribution_performance(
+                    selected_mode
+                ),
+                "execution_trade_calibration": lambda: self._execution_trade_calibration(
                     selected_mode
                 ),
             }
@@ -7032,6 +7037,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         context["execution_mode"] = selected_mode
         context["account_equity"] = account_equity
         context["strategy_context_performance"] = performance_snapshot
+        context["execution_trade_calibration"] = self._safe_dict(
+            performance_values.get("execution_trade_calibration")
+        )
         if continuous_weight_report:
             context["continuous_model_weights"] = continuous_weight_report
         if _analysis_scope_context.get() == "market":
@@ -7079,6 +7087,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                                 else {}
                             ),
                             "strategy_learning_cache_status": "stale_background_refresh",
+                            "execution_trade_calibration": context["execution_trade_calibration"],
                             "strategy_learning_error": (
                                 "市场扫描轮使用最近一次策略学习上下文，后台刷新学习结果，"
                                 "不让慢学习查询阻塞开仓候选发现。"
@@ -7107,6 +7116,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             market_regime=market_regime,
                             account_equity=account_equity,
                         )
+                        refreshed_context["execution_trade_calibration"] = context[
+                            "execution_trade_calibration"
+                        ]
                         self._strategy_learning_context_cache_store()[selected_mode] = {
                             "created_at": datetime.now(UTC),
                             "context": self._json_safe_payload(refreshed_context),
@@ -7144,6 +7156,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 market_regime=market_regime,
                 account_equity=account_equity,
             )
+            refreshed_context["execution_trade_calibration"] = context[
+                "execution_trade_calibration"
+            ]
             self._strategy_learning_context_cache_store()[selected_mode] = {
                 "created_at": datetime.now(UTC),
                 "context": self._json_safe_payload(refreshed_context),
@@ -7163,6 +7178,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             else {}
                         ),
                         "strategy_learning_cache_status": "stale_timeout",
+                        "execution_trade_calibration": context["execution_trade_calibration"],
                         "strategy_learning_error": (
                             "策略学习上下文超过交易轮次预算，已使用最近一次可用学习上下文，"
                             "后台继续刷新，不阻塞开仓决策。"
@@ -7707,6 +7723,19 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
             self.model_contribution_performance_service = service
         return await service.recent(mode)
+
+    async def _execution_trade_calibration(self, mode: str) -> dict[str, Any]:
+        outcomes = await load_authoritative_trade_outcomes(
+            mode=mode,
+            since=datetime.now(UTC) - timedelta(hours=72),
+            limit=500,
+            compact=True,
+        )
+        calibration = authoritative_execution_cost_calibration(
+            outcomes, execution_mode=mode
+        )
+        calibration["generated_at"] = datetime.now(UTC).isoformat()
+        return calibration
 
     async def _continuous_model_weight_evidence(self, mode: str) -> dict[str, Any]:
         service = getattr(self, "continuous_model_weight_evidence_service", None)

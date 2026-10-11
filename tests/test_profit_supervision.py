@@ -7,6 +7,7 @@ from services.profit_supervision import (
     MARKET_OPPORTUNITY_TASK,
     PROFIT_SUPERVISION_VERSION,
     apply_correlation_group_weights,
+    authoritative_execution_cost_calibration,
     authoritative_trade_calibration,
     build_profit_supervision_contract,
     profit_supervision_report,
@@ -184,6 +185,38 @@ def test_trade_calibration_selects_symbol_side_then_global_side() -> None:
     assert exact[PROFIT_TRAINING_TARGET]["count"] == 1
     assert "net_return_after_cost_pct" not in exact
     assert exact["slippage_pct"]["count"] == 1
+
+
+def test_execution_calibration_learns_costs_of_excluded_losing_trades_only_in_own_mode() -> None:
+    outcome = {
+        "symbol": "BTC/USDT",
+        "side": "short",
+        "source": "okx_position_history",
+        "execution_mode": "paper",
+        "lifecycle_key": "paper|BTC|one",
+        "outcome_complete": True,
+        "trade_fact_trusted": True,
+        "exclude_from_training": True,
+        "training_label_contract": {
+            "complete": True,
+            "execution_mode": "paper",
+            PROFIT_TRAINING_TARGET: -2.0,
+            "slippage_pct": 0.3,
+            "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+        },
+    }
+    calibration = authoritative_execution_cost_calibration(
+        [outcome, dict(outcome), {**outcome, "execution_mode": "live"}],
+        execution_mode="paper",
+    )
+    profile = select_trade_calibration(calibration, symbol="BTC/USDT", side="short")
+    assert calibration["actual_realized_return_sample_count"] == 1
+    assert profile["slippage_pct"]["expected"] == pytest.approx(0.3)
+    assert profile["execution_mode"] == "paper"
+    incomplete = {**outcome, "outcome_complete": False}
+    assert authoritative_execution_cost_calibration(
+        [incomplete], execution_mode="paper"
+    )["profiles"] == {}
 
 
 def test_authoritative_return_rejects_old_net_return_label_without_contract() -> None:

@@ -19,6 +19,7 @@ from services.normal_paper_trade import (
     build_normal_paper_trade_contract,
 )
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
+from services.return_objective import execution_cost_with_slippage_floor
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
@@ -395,6 +396,48 @@ def test_size_aware_profit_solver_preserves_finite_negative_downside() -> None:
     assert solved["return_lcb_pct"] <= 0.0
     assert solved["execution_cost"]["order_size_complete"] is True
     assert solved["reduced"] is False
+
+
+def test_size_solver_cannot_remove_measured_execution_slippage_by_shrinking() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    original = execution_cost_estimate(snapshot).to_dict()
+    floor = 0.6
+    original_total = execution_cost_with_slippage_floor(
+        original["total_pct"], original["slippage_pct"], floor
+    )
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.65 - original_total,
+        return_lcb_pct=-0.5,
+        execution_cost=original,
+        execution_slippage_floor_pct=floor,
+    )
+    assert solved["production_eligible"] is False
+    assert solved["expected_net_return_pct"] < 0.0
+
+
+def test_size_solver_uses_both_book_boundaries_when_full_close_depth_is_missing() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    snapshot["orderbook_bids"] = [[99.99, 7.0]]
+    snapshot["planned_order_notional_usdt"] = 500.0
+    cost = execution_cost_estimate(snapshot).to_dict()
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=1.0,
+        return_lcb_pct=-0.5,
+        execution_cost=cost,
+    )
+    assert solved["production_eligible"] is True
+    assert solved["selected_notional_usdt"] <= 700.0
+    assert solved["execution_cost"]["order_size_complete"] is True
 
 
 @pytest.mark.asyncio
