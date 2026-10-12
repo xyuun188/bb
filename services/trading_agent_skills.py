@@ -292,6 +292,34 @@ class TradingAgentSkillBook:
             ),
         )
 
+    def _tool_nonexecution_skill(
+        self,
+        payload: dict[str, Any],
+        *,
+        name: str,
+        label: str,
+    ) -> SkillResult | None:
+        status = str(payload.get("status") or "").lower()
+        reasons = {
+            "deferred": "本轮推理名额不足，未发起请求；本条记录没有模型预测结果。",
+            "timeout": "本轮已发起请求，但在分析预算内未取得响应。",
+            "error": "本轮服务器量化请求失败，没有取得预测结果。",
+            "circuit_open": "服务器量化请求处于熔断冷却，本轮未发起。",
+            "disabled": "服务器量化预测已关闭，本轮未发起。",
+        }
+        if payload.get("available") is True or status not in reasons:
+            return None
+        return SkillResult(
+            name=name,
+            label=label,
+            status=status,
+            reason=reasons[status],
+            data=self._compact(
+                payload,
+                ["available", "status", "error", "path", "duration_sec", "request_attempted"],
+            ),
+        )
+
     def _server_profit_skill(self, tools: dict[str, Any] | None) -> SkillResult:
         profit = self._tool_section(
             tools,
@@ -309,6 +337,11 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到服务器盈利模型预测。",
             )
+        nonexecution = self._tool_nonexecution_skill(
+            profit, name="server_profit_model", label="服务器盈利预测"
+        )
+        if nonexecution is not None:
+            return nonexecution
         side = payload_side(profit)
         available = signal_paper_eligibility(profit, side).get("eligible") is True
         returned = (
@@ -382,6 +415,11 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到时序预测。",
             )
+        nonexecution = self._tool_nonexecution_skill(
+            series, name="time_series_model", label="时序预测"
+        )
+        if nonexecution is not None:
+            return nonexecution
         side = payload_side(series)
         available = signal_paper_eligibility(series, side).get("eligible") is True
         returned = (
@@ -448,6 +486,11 @@ class TradingAgentSkillBook:
                 decision="neutral",
                 reason="本轮没有拿到情绪模型预测。",
             )
+        nonexecution = self._tool_nonexecution_skill(
+            sentiment, name="sentiment_model", label="情绪预测"
+        )
+        if nonexecution is not None:
+            return nonexecution
         available = signal_analysis_eligibility(sentiment).get("eligible") is True
         returned = (
             sentiment.get("available", True) is not False
@@ -503,6 +546,11 @@ class TradingAgentSkillBook:
         )
         if not advice:
             return None
+        nonexecution = self._tool_nonexecution_skill(
+            advice, name="exit_advice_model", label="平仓建议模型"
+        )
+        if nonexecution is not None:
+            return nonexecution
         action = str(advice.get("action") or advice.get("recommendation") or "hold").lower()
         reason = self._humanize_exit_reason(
             str(advice.get("reason") or advice.get("note") or ""),

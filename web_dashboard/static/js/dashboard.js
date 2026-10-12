@@ -3117,6 +3117,10 @@ const SENSITIVE_DATA_KEY_RE = /(api[_-]?key|secret|password|passphrase|token|aut
 function skillDataValueLabel(key, value) {
     if (value === null || value === undefined || value === '') return '';
     if (SENSITIVE_DATA_KEY_RE.test(String(key || ''))) return '';
+    if (key === 'status') return analysisToolPlainStatus({ status: value });
+    if (key === 'error' && /inference (capacity exhausted|queue exhausted the batch budget)/i.test(String(value))) {
+        return '推理名额等待超出本轮预算，未发起请求';
+    }
     if (typeof value === 'boolean') return value ? '是' : '否';
     if (['expected_return_pct', 'expected_net_return_pct', 'expected_move_pct', 'profit_edge_pct'].includes(key)) {
         return signedPctValueLabel(value, 4);
@@ -3190,6 +3194,10 @@ function renderAnalysisAgentSkills(agentSkills) {
         warning: '提醒',
         partial: '部分可用',
         unavailable: '不可用',
+        deferred: '本轮未执行',
+        timeout: '已调用未返回',
+        error: '调用失败',
+        returned_but_governance_blocked: '已返回（治理不可交易）',
         blocked: '拦截',
         inactive: '未触发',
     }[String(status || '').toLowerCase()] || status || '-');
@@ -3202,19 +3210,28 @@ function renderAnalysisAgentSkills(agentSkills) {
     const skillRows = phases.map(phase => {
         const skills = Array.isArray(phase.skills) ? phase.skills : [];
         const rows = skills.map(skill => {
-            const tone = statusTone(skill);
+            const transportStatus = String(skill.data?.status || '').toLowerCase();
+            const displayStatus = skill.data?.available === false
+                && ['deferred', 'timeout'].includes(transportStatus)
+                ? transportStatus : skill.status;
+            const reason = displayStatus === 'deferred'
+                ? '本轮推理名额不足，未发起请求；本条记录没有模型预测结果。'
+                : displayStatus === 'timeout'
+                    ? '本轮已发起请求，但在分析预算内未取得响应。'
+                    : skill.reason;
+            const tone = statusTone({ ...skill, status: displayStatus });
             return `
                 <div class="analysis-skill-item">
                     <div class="analysis-skill-head">
                         <strong class="analysis-skill-title">${escHtml(skill.label || skill.name || '-')}</strong>
                         <div class="analysis-skill-badges">
-                            ${analysisPill(statusLabel(skill.status), tone)}
+                            ${analysisPill(statusLabel(displayStatus), tone)}
                             ${skill.decision ? analysisPill(analysisDecisionLabel(skill.decision), tone) : ''}
                             ${skill.confidence !== undefined ? analysisPill(`信心 ${(Number(skill.confidence || 0) * 100).toFixed(0)}%`, 'muted') : ''}
                         </div>
                     </div>
                     <div class="analysis-skill-body">
-                        <div class="analysis-skill-reason"><span>结论</span>${analysisText(analysisReasonLabel(skill.reason || '-'))}</div>
+                        <div class="analysis-skill-reason"><span>结论</span>${analysisText(analysisReasonLabel(reason || '-'))}</div>
                         ${renderSkillDataSummary(skill.data)}
                     </div>
                 </div>

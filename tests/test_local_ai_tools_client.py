@@ -233,7 +233,7 @@ async def test_local_ai_tools_recovers_transport_route_after_batch_drains(
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_defers_excess_capacity_for_single_worker_backend(
+async def test_local_ai_tools_waits_for_capacity_without_overlapping_batches(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -269,20 +269,136 @@ async def test_local_ai_tools_defers_excess_capacity_for_single_worker_backend(
         client.enrich_with_context({"symbol": "ETH/USDT"})
     )
     await asyncio.wait_for(first_batch_started.wait(), timeout=0.5)
-    second = await second_task
+    await asyncio.sleep(0.03)
+    assert not second_task.done()
     release_calls.set()
-    first = await first_task
+    first, second = await asyncio.gather(first_task, second_task)
 
     assert first["status"] == "completed"
-    assert second["status"] == "analysis_budget_deferred"
-    assert second["deferred_tools"] == [
-        "profit_prediction",
-        "sentiment_analysis",
-        "time_series_prediction",
-    ]
+    assert second["status"] == "completed"
+    assert second["queue_wait_seconds"] >= 0.02
+    assert second["queue_policy"] == "fifo_within_shared_batch_deadline"
     assert max_active_calls == 3
+    assert len(calls) == 6
+    assert [symbol for symbol, _path in calls] == ["BTC/USDT"] * 3 + ["ETH/USDT"] * 3
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_queued_calls_keep_fifo_order_and_remaining_budget(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls: list[tuple[str, float]] = []
+
+    async def post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        symbol = payload["symbol"]
+        calls.append((symbol, float(request_timeout or 0)))
+        if symbol == "BTC/USDT":
+            first_started.set()
+            await release_first.wait()
+        return {"available": True, "path": path}
+
+    monkeypatch.setattr(client, "_post", post)
+    first = asyncio.create_task(client.enrich({"symbol": "BTC/USDT"}))
+    await first_started.wait()
+    second = asyncio.create_task(client.enrich({"symbol": "ETH/USDT"}))
+    await asyncio.sleep(0)
+    third = asyncio.create_task(client.enrich({"symbol": "SOL/USDT"}))
+    await asyncio.sleep(0.08)
+    release_first.set()
+    results = await asyncio.gather(first, second, third)
+
+    assert all(result["status"] == "completed" for result in results)
+    assert [symbol for symbol, _budget in calls] == (
+        ["BTC/USDT"] * 3 + ["ETH/USDT"] * 3 + ["SOL/USDT"] * 3
+    )
+    for result in results[1:]:
+        route = result["profit_prediction"]
+        assert result["queue_wait_seconds"] >= 0.06
+        assert route["allocated_timeout_sec"] + result["queue_wait_seconds"] <= 0.51
+    assert all(budget < 0.43 for _symbol, budget in calls[3:])
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_queue_deadline_does_not_send_requests_or_trip_breaker(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+    await client._inference_gate.acquire()
+    calls: list[str] = []
+
+    async def post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        calls.append(path)
+        return {"available": True}
+
+    monkeypatch.setattr(client, "_post", post)
+    started = monotonic()
+    result = await client.enrich({"symbol": "ETH/USDT"})
+    elapsed = monotonic() - started
+    client._inference_gate.release()
+    recovered = await client.enrich({"symbol": "ETH/USDT"})
+
+    assert 0.35 <= elapsed < 0.65
+    assert result["status"] == "analysis_budget_deferred"
+    assert result["failure_count"] == 0
+    assert result["queue_wait_seconds"] >= 0.35
+    assert result["profit_prediction"]["request_attempted"] is False
+    assert result["profit_prediction"]["duration_sec"] == 0
+    assert recovered["status"] == "completed"
     assert len(calls) == 3
-    assert {symbol for symbol, _path in calls} == {"BTC/USDT"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_active", [False, True])
+async def test_local_ai_tools_cancellation_releases_capacity_for_next_batch(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_active: bool,
+) -> None:
+    client = LocalAIToolsClient()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls: list[str] = []
+
+    async def post(
+        path: str,
+        payload: dict[str, Any],
+        request_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        calls.append(payload["symbol"])
+        if payload["symbol"] == "BTC/USDT":
+            first_started.set()
+            await release_first.wait()
+        return {"available": True, "path": path}
+
+    monkeypatch.setattr(client, "_post", post)
+    first = asyncio.create_task(client.enrich({"symbol": "BTC/USDT"}))
+    await first_started.wait()
+    queued = asyncio.create_task(client.enrich({"symbol": "ETH/USDT"}))
+    await asyncio.sleep(0.01)
+    cancelled = first if cancel_active else queued
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    release_first.set()
+    survivor = queued if cancel_active else first
+    assert (await survivor)["status"] == "completed"
+    assert (await client.enrich({"symbol": "SOL/USDT"}))["status"] == "completed"
+    assert client._active_inference_batches == 0
+    if not cancel_active:
+        assert "ETH/USDT" not in calls
 
 
 @pytest.mark.asyncio

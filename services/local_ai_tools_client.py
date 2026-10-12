@@ -87,11 +87,9 @@ class LocalAIToolsClient:
         # A transient tunnel/HTTP timeout must not erase a known-good artifact
         # and make the dashboard claim that the model service is offline.
         self._last_successful_status: tuple[float, dict[str, Any]] | None = None
-        self._inference_slots: asyncio.Queue[int] = asyncio.Queue(
-            maxsize=_MAX_CONCURRENT_INFERENCE_BATCHES
+        self._inference_gate = asyncio.BoundedSemaphore(
+            _MAX_CONCURRENT_INFERENCE_BATCHES
         )
-        for slot in range(_MAX_CONCURRENT_INFERENCE_BATCHES):
-            self._inference_slots.put_nowait(slot)
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_base: str = ""
         self._active_inference_batches = 0
@@ -282,20 +280,30 @@ class LocalAIToolsClient:
         # Keep routes concurrent inside one complete batch, but never overlap
         # separate market/position batches against the single-worker service.
         results: list[dict[str, Any]] = []
-        inference_slot: int | None = None
+        inference_acquired = False
         queue_started = monotonic()
         queue_wait_seconds = 0.0
         http_connection_reset = False
         try:
-            # Never queue a whole market round behind the active capacity. The
-            # next scheduled round will retry a deferred batch.
+            # Market and position review share this gate. Wait fairly within
+            # the existing batch deadline instead of dropping every collision.
+            queue_budget = max(
+                batch_deadline - monotonic() - _MIN_INFERENCE_ATTEMPT_SECONDS,
+                0.0,
+            )
             try:
-                inference_slot = self._inference_slots.get_nowait()
-            except asyncio.QueueEmpty:
-                inference_slot = None
+                async with asyncio.timeout(queue_budget):
+                    await self._inference_gate.acquire()
+                inference_acquired = True
+            except TimeoutError:
+                pass
             queue_wait_seconds = max(monotonic() - queue_started, 0.0)
-            if inference_slot is not None:
+            if inference_acquired:
                 self._active_inference_batches += 1
+                route_timeout = max(
+                    batch_deadline - monotonic(),
+                    _MIN_INFERENCE_ATTEMPT_SECONDS,
+                )
                 results = list(
                     await asyncio.gather(
                         *(
@@ -343,20 +351,21 @@ class LocalAIToolsClient:
                     {
                         "available": False,
                         "status": "deferred",
-                        "error": "local AI tools inference capacity exhausted",
+                        "error": "local AI tools inference queue exhausted the batch budget",
                         "path": path,
-                        "duration_sec": 0.0001,
+                        "request_attempted": False,
+                        "duration_sec": 0.0,
                     }
                     for _name, path in tool_specs
                 )
         finally:
-            if inference_slot is not None:
+            if inference_acquired:
                 self._active_inference_batches = max(
                     self._active_inference_batches - 1,
                     0,
                 )
+                self._inference_gate.release()
                 self._close_deferred_http_clients_if_idle()
-                self._inference_slots.put_nowait(inference_slot)
         data: dict[str, Any] = {
             "enabled": True,
             "status": "completed",
@@ -366,6 +375,7 @@ class LocalAIToolsClient:
             "execution_mode": "concurrent_routes_bounded_batches",
             "max_concurrent_batches": _MAX_CONCURRENT_INFERENCE_BATCHES,
             "batch_budget_policy": "shared_batch_deadline_concurrent_routes",
+            "queue_policy": "fifo_within_shared_batch_deadline",
             "batch_budget_seconds": round(request_timeout, 3),
             "optional_route_budget_seconds": {
                 "sentiment_analysis": round(
