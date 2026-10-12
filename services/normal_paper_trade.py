@@ -432,13 +432,6 @@ def select_normal_paper_trade_side(
         )
         quality_permissions = _dict(support.get("quant_quality_permissions"))
         observation_only = support.get("paper_quality_observation_only") is True
-        validated_edge = bool(
-            current_edge
-            and expected_net is not None
-            and expected_net > 0.0
-            and not observation_only
-            and not support["blocking_reasons"]
-        )
         quality_permission_denied = bool(
             quality_permissions
             and any(
@@ -447,17 +440,32 @@ def select_normal_paper_trade_side(
                 if isinstance(permission, dict)
             )
         )
-        training_edge = bool(
+        training_candidate = bool(
             current_edge
             and expected_net is not None
             and expected_net > 0.0
             and raw_expected is not None
             and raw_expected > 0.0
             and loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
-            and observation_only
             and not support["blocking_reasons"]
             and support.get("strong_expert_opposition") is not True
-            and (objective_net <= 0.0 or quality_permission_denied)
+            and (
+                observation_only
+                or (
+                    quality_permission_denied
+                    and (objective_net or 0.0) <= 0.0
+                    and int(support.get("aligned_expert_count") or 0) < 2
+                )
+            )
+        )
+        training_edge = training_candidate
+        validated_edge = bool(
+            current_edge
+            and expected_net is not None
+            and expected_net > 0.0
+            and not training_candidate
+            and not observation_only
+            and not support["blocking_reasons"]
         )
         if validated_edge or training_edge:
             selection_reason = (

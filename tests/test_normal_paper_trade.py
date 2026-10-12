@@ -252,6 +252,25 @@ def test_current_positive_signal_enters_bounded_training_route() -> None:
     assert normal_paper_trade_contract_reasons(contract) == []
 
 
+def test_current_positive_signal_with_negative_lcb_enters_training_route() -> None:
+    support = _support(
+        "short",
+        expected_net=0.08,
+        objective_net=-0.45,
+    )
+    support["raw_expected_return_pct"] = 0.22
+    permission = support["quant_quality_permissions"]["local_ml"]
+    permission["paper_execution_permission"] = False
+    permission["paper_execution_reason"] = "fee_after_return_lcb_not_positive"
+    permission["paper_execution_blockers"] = ["fee_after_return_lcb_not_positive"]
+
+    selection = select_normal_paper_trade_side({"short": support})
+
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_support"]["paper_training_only"] is True
+
+
 def test_negative_lcb_quality_observation_cannot_authorize_a_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
