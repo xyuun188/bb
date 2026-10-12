@@ -26,6 +26,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION,
     is_normal_paper_trade_decision,
     normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
@@ -1782,6 +1783,10 @@ class EntryProfitRiskSizingPolicy:
 
         raw = _safe_dict(decision.raw_response)
         normal_trade = _safe_dict(raw.get("normal_paper_trade"))
+        training_mode = (
+            str(normal_trade.get("selection_reason") or "").strip()
+            == "paper_training_entry"
+        )
         strategy = _safe_dict(raw.get("strategy_mode"))
         drawdown_pressure = _clamp(
             _safe_float(strategy.get("drawdown_pressure"), 0.0)
@@ -1932,7 +1937,11 @@ class EntryProfitRiskSizingPolicy:
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
                 0.0,
             ),
-            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+            (
+                NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+                if training_mode
+                else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            ),
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
         # Paper observations retain the paper risk cap. An uncertain lower bound
@@ -2069,6 +2078,17 @@ class EntryProfitRiskSizingPolicy:
         size_aware_solution_eligible = (
             size_aware_solution.get("production_eligible") is True
         )
+        raw_signal_return = _safe_float(
+            normal_trade.get("current_raw_expected_return_pct"),
+            _safe_float(distribution.get("raw_expected_return_pct"), 0.0),
+        )
+        training_size_allowed = bool(
+            training_mode
+            and raw_signal_return > 0.0
+            and execution_cost.get("production_eligible") is True
+            and _safe_float(execution_cost.get("total_pct"), 0.0) > 0.0
+            and minimum_order_supported
+        )
         if selected_size_cost.get("order_size_complete") is True:
             expected_net = _safe_float(
                 size_aware_solution.get("expected_net_return_pct"),
@@ -2132,6 +2152,55 @@ class EntryProfitRiskSizingPolicy:
                     risk_and_liquidity_ceiling,
                     model_requested_notional_cap,
                 )
+            elif training_size_allowed:
+                # A training sample may be negative after fees at the native
+                # minimum. Keep the smallest executable size so settlement can
+                # teach the model the actual net outcome.
+                training_notional = max(
+                    _safe_float(
+                        size_aware_solution.get("selected_notional_usdt"),
+                        minimum_order_notional,
+                    ),
+                    minimum_order_notional,
+                )
+                target_notional = min(
+                    training_notional,
+                    fill_notional_ceiling / (1.0 + fill_drift_reserve_fraction),
+                )
+                if target_notional >= minimum_order_notional:
+                    selected_size_cost = _safe_dict(
+                        size_aware_solution.get("execution_cost")
+                    )
+                    if selected_size_cost.get("order_size_complete") is True:
+                        execution_cost = selected_size_cost
+                        opportunity["execution_cost"] = execution_cost
+                        raw["opportunity_score"] = opportunity
+                        distribution = reprice_execution_return_distribution(
+                            distribution, execution_cost=execution_cost
+                        )
+                        expected_net = _safe_float(
+                            size_aware_solution.get("expected_net_return_pct"),
+                            expected_net,
+                        )
+                        return_lcb = _safe_float(
+                            size_aware_solution.get("return_lcb_pct"),
+                            return_lcb,
+                        )
+                        distribution["raw_expected_return_pct"] = raw_signal_return
+                        distribution["objective_expected_return_pct"] = return_lcb
+                        opportunity["return_distribution_contract"] = distribution
+                        opportunity["expected_net_return_pct"] = expected_net
+                        opportunity["return_lcb_pct"] = return_lcb
+                        decision.feature_snapshot = {
+                            **snapshot,
+                            "planned_order_notional_usdt": target_notional,
+                            "planned_order_side": side,
+                        }
+                        fill_notional_ceiling = min(
+                            available_margin * requested_leverage,
+                            risk_and_liquidity_ceiling,
+                            model_requested_notional_cap,
+                        )
         negative_lcb_stress_fraction = max(
             negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
         )
@@ -2185,7 +2254,11 @@ class EntryProfitRiskSizingPolicy:
                 target_notional_usdt=target_notional,
                 available_margin_usdt=available_margin,
                 stressed_loss_fraction=stress_fraction,
-                expected_net_return_pct=expected_net,
+                # Training uses the current raw signal for leverage discovery;
+                # the fee-after realized return remains the immutable label.
+                expected_net_return_pct=(
+                    raw_signal_return if training_size_allowed else expected_net
+                ),
                 return_lcb_pct=return_lcb,
                 expected_loss_pct=expected_loss,
                 profit_quality_ratio=profit_quality,
@@ -2277,15 +2350,21 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_orderbook_depth_missing")
         if leverage_tier_selection.get("production_eligible") is not True:
             reasons.append("normal_paper_leverage_tier_incomplete")
-        if leverage_decision.policy_provenance.get("production_eligible") is not True:
+        if (
+            leverage_decision.policy_provenance.get("production_eligible") is not True
+            and not training_mode
+        ):
             reasons.extend(leverage_decision.reasons)
-        if not size_aware_solution_eligible:
+        if not size_aware_solution_eligible and not training_size_allowed:
             size_reason = str(
                 size_aware_solution.get("reason")
                 or "full_risk_size_profitability_not_proven"
             )
             reasons.append(f"normal_paper_size_aware_{size_reason}")
-        if not isfinite(expected_net) or expected_net <= 0.0:
+        if (
+            (not isfinite(expected_net) or expected_net <= 0.0)
+            and not training_size_allowed
+        ):
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_downside_return_missing_after_size_cost")
@@ -2303,7 +2382,10 @@ class EntryProfitRiskSizingPolicy:
             _safe_float(execution_cost.get("total_pct"), 0.0) <= 0.0
         ):
             reasons.append("normal_paper_execution_cost_incomplete")
-        eligible = not reasons
+        eligible = not reasons and (
+            not training_mode
+            or raw_signal_return > 0.0
+        )
         generated_at = datetime.now(UTC).isoformat()
         audit_inputs = {
             "account_equity_usdt": account_equity,
@@ -2321,7 +2403,7 @@ class EntryProfitRiskSizingPolicy:
             "model_position_cap_applied": model_position_cap_applied,
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": False,
-            "paper_training_entry_mode": False,
+            "paper_training_entry_mode": training_mode,
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": False,
             "paper_quality_observation_leverage_cap": None,
@@ -2427,7 +2509,7 @@ class EntryProfitRiskSizingPolicy:
             ),
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": False,
-            "paper_training_entry_mode": False,
+            "paper_training_entry_mode": training_mode,
             "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": False,
             "paper_quality_observation_leverage_cap": None,
@@ -2452,7 +2534,7 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "dynamic_take_profit_fraction": round(dynamic_take_profit, 8),
-            "paper_profitability_gate_applied": True,
+            "paper_profitability_gate_applied": not training_mode,
             "size_aware_profitability": size_aware_solution,
             "selection_reason": normal_trade.get("selection_reason"),
             "single_trade_risk_fraction_cap": round(single_trade_risk_fraction, 8),

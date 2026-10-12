@@ -48,9 +48,13 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 }
 # Observation envelopes are learning evidence, never order authorization.
 NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
-    {"strategy_edge_selected"}
+    {"strategy_edge_selected", "paper_training_entry"}
 )
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
+# Training entries are real paper orders, but their risk is deliberately
+# bounded below the normal validated-paper cap.  This is an exploration
+# budget, not a profitability override or a fixed leverage rule.
+NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION = 0.001
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD = 0.80
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
@@ -365,7 +369,14 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def select_normal_paper_trade_side(
     support_by_side: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Select only a cost-complete positive current edge for a new paper order."""
+    """Select a validated edge or a bounded current-signal training entry.
+
+    Historical profitability permission governs promotion, not whether the
+    system may collect a new authoritative paper outcome.  A training entry
+    still requires a positive current expected return, complete execution
+    cost, directional evidence, and a bounded loss probability; it only
+    relaxes the historical positive-LCB/quality-permission requirement.
+    """
 
     by_side = {
         side: dict(_dict(_dict(support_by_side).get(side)))
@@ -404,6 +415,10 @@ def select_normal_paper_trade_side(
         expected_net = _float(support.get("expected_net_return_pct"), None)
         objective_net = _float(support.get("objective_net_return_pct"), None)
         loss_probability = _float(support.get("loss_probability"), 1.0)
+        raw_expected = _float(
+            support.get("raw_expected_return_pct"),
+            expected_net,
+        )
         current_edge = bool(
             support.get("current_edge_validated") is True
             and normal_paper_current_return_ready(expected_net, objective_net)
@@ -415,21 +430,59 @@ def select_normal_paper_trade_side(
                 if str(item).strip()
             }
         )
-        if (
+        quality_permissions = _dict(support.get("quant_quality_permissions"))
+        observation_only = support.get("paper_quality_observation_only") is True
+        validated_edge = bool(
             current_edge
             and expected_net is not None
             and expected_net > 0.0
+            and not observation_only
             and not support["blocking_reasons"]
-        ):
+        )
+        quality_permission_denied = bool(
+            quality_permissions
+            and any(
+                permission.get("paper_execution_permission") is not True
+                for permission in quality_permissions.values()
+                if isinstance(permission, dict)
+            )
+        )
+        training_edge = bool(
+            current_edge
+            and expected_net is not None
+            and expected_net > 0.0
+            and raw_expected is not None
+            and raw_expected > 0.0
+            and loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+            and observation_only
+            and not support["blocking_reasons"]
+            and support.get("strong_expert_opposition") is not True
+            and (objective_net <= 0.0 or quality_permission_denied)
+        )
+        if validated_edge or training_edge:
+            selection_reason = (
+                "strategy_edge_selected" if validated_edge else "paper_training_entry"
+            )
+            selected_support = dict(support)
+            if selection_reason == "paper_training_entry":
+                selected_support.update(
+                    {
+                        "paper_training_only": True,
+                        "paper_training_reasons": [
+                            "historical_quality_gate_is_observation_only",
+                            "current_directional_evidence_is_training_eligible",
+                        ],
+                    }
+                )
             candidates.append(
                 {
                     "side": side,
-                    "support": support,
+                    "support": selected_support,
                     "expected_net_return_pct": expected_net,
                     "objective_net_return_pct": objective_net,
                     "loss_probability": loss_probability,
                     "quant_evidence_families": families,
-                    "selection_reason": "strategy_edge_selected",
+                    "selection_reason": selection_reason,
                 }
             )
 
@@ -636,9 +689,12 @@ def build_normal_paper_trade_contract(
                 or loss_probability is None
                 or loss_probability > NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
                 or support.get("paper_training_only") is not True
-                or int(support.get("aligned_expert_count") or 0) < 2
-                or int(support.get("aligned_expert_count") or 0)
-                <= int(support.get("opposition_expert_count") or 0)
+                or not support.get("quant_evidence_families")
+                or (
+                    int(support.get("aligned_expert_count") or 0) < 2
+                    and _float(support.get("raw_expected_return_pct"), 0.0) <= 0.0
+                )
+                or support.get("strong_expert_opposition") is True
             )
         )
     ):
@@ -670,7 +726,11 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+        "single_trade_risk_fraction_cap": (
+            NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+            if paper_training_only
+            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        ),
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -889,10 +949,15 @@ def _normal_strategy_trade_contract_reasons(
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
         reasons.append("normal_paper_trade_horizon_invalid")
+    expected_single_cap = (
+        NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+        if training_mode
+        else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     if not isclose(
         single_cap,
-        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+        expected_single_cap,
         abs_tol=1e-12,
     ):
         reasons.append("normal_paper_trade_single_risk_cap_invalid")

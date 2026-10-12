@@ -487,9 +487,9 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
-        "paper_training_entry_allows_non_positive_fee_after_return": False,
-        "paper_training_entry_is_shadow_only": True,
-        "paper_training_entry_authorizes_normal_entry": False,
+        "paper_training_entry_allows_non_positive_fee_after_return": True,
+        "paper_training_entry_is_shadow_only": False,
+        "paper_training_entry_authorizes_normal_entry": True,
         "paper_training_entry_production_permission": False,
         "paper_entry_requires_profit_factor": False,
         "paper_entry_requires_positive_expected_net_return": True,
@@ -1372,6 +1372,10 @@ def validate_normal_paper_entry_contract(
         and normalized_normal_trade.get("protocol_state") == "historical_normalized"
     )
     normal_trade = normalized_normal_trade or source_normal_trade
+    training_entry = (
+        str(normal_trade.get("selection_reason") or "").strip()
+        == "paper_training_entry"
+    )
     if historical_normal_trade:
         raw = dict(raw)
         raw["normal_paper_trade"] = normal_trade
@@ -1471,12 +1475,14 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_production_permission_invalid")
     if (
         sizing.get("production_eligible") is not True
+        and not training_entry
         and not confirmed_partial_fill
         and not confirmed_drift_settlement
     ):
         reasons.append("normal_paper_sizing_ineligible")
     if (
         not historical_normal_trade
+        and not training_entry
         and not confirmed_observation_settlement
         and not (
             allow_historical_settlement

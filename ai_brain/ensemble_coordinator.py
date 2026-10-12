@@ -968,6 +968,10 @@ class EnsembleCoordinator:
             )
             if normal_contract.get("authorized") is True:
                 action = Action.LONG if selected_side == "long" else Action.SHORT
+                training_entry = (
+                    str(normal_contract.get("selection_reason") or "").strip()
+                    == "paper_training_entry"
+                )
                 loss_probability = self._finite_or_none(selected_support.get("loss_probability"))
                 confidence = (
                     min(
@@ -1008,7 +1012,7 @@ class EnsembleCoordinator:
                     "granted": True,
                     "scope": "paper_only",
                     "reason": normal_contract["selection_reason"],
-                    "training_only": False,
+                    "training_only": training_entry,
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(

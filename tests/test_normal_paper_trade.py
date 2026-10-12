@@ -226,6 +226,32 @@ def test_unpromoted_quality_model_stays_shadow_only() -> None:
     assert selection["selection_reason"] == "no_direction"
 
 
+def test_current_positive_signal_enters_bounded_training_route() -> None:
+    support = _quality_observation_support(
+        "short",
+        expected_net=0.08,
+        objective_net=-0.45,
+    )
+    support["current_edge_validated"] = True
+    support["raw_expected_return_pct"] = 0.22
+
+    selection = select_normal_paper_trade_side({"short": support})
+
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_support"]["paper_training_only"] is True
+
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="short",
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    assert contract["authorized"] is True
+    assert contract["paper_training_only"] is True
+    assert normal_paper_trade_contract_reasons(contract) == []
+
+
 def test_negative_lcb_quality_observation_cannot_authorize_a_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
