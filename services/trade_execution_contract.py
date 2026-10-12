@@ -101,7 +101,7 @@ class TradeExecutionContractService:
 
         from db.session import get_read_session_ctx
         from models.decision import AIDecision
-        from models.trade import Order, Position
+        from models.trade import OkxPositionHistory, Order
 
         capped_hours = max(1, min(int(hours or 24), 168))
         capped_limit = max(1, min(int(limit or 500), 5000))
@@ -226,58 +226,55 @@ class TradeExecutionContractService:
                     .mappings()
                     .all()
                 ]
-            position_id_rows = [
-                row["id"]
+            # OKX position history is the only authoritative source for
+            # realized PnL.  Local Position.realized_pnl is an execution
+            # bookkeeping field and can diverge after exchange-side partial
+            # fills, funding, or reconciliation repairs.
+            history_rows = [
+                dict(row)
                 for row in (
                     await session.execute(
-                        select(Position.id)
+                        select(
+                            OkxPositionHistory.id,
+                            OkxPositionHistory.side,
+                            OkxPositionHistory.pos_side,
+                            OkxPositionHistory.realized_pnl,
+                            OkxPositionHistory.close_status,
+                            OkxPositionHistory.updated_at_okx,
+                        )
                         .where(
                             or_(
-                                Position.created_at >= since_naive,
-                                Position.closed_at >= since_naive,
+                                OkxPositionHistory.updated_at_okx >= since_naive,
+                                OkxPositionHistory.opened_at >= since_naive,
                             )
                         )
-                        .order_by(Position.id.desc())
+                        .order_by(
+                            OkxPositionHistory.updated_at_okx.desc().nullslast(),
+                            OkxPositionHistory.id.desc(),
+                        )
                         .limit(capped_limit + 1)
                     )
                 )
                 .mappings()
                 .all()
             ]
-            position_truncated = len(position_id_rows) > capped_limit
-            position_ids = position_id_rows[:capped_limit]
-            positions = []
-            if position_ids:
-                positions = [
-                    dict(row)
-                    for row in (
-                        await session.execute(
-                            select(
-                                Position.side,
-                                Position.realized_pnl,
-                                Position.closed_at,
-                            )
-                            .where(Position.id.in_(position_ids))
-                            .order_by(Position.id.desc())
-                        )
-                    )
-                    .mappings()
-                    .all()
-                ]
+            history_truncated = len(history_rows) > capped_limit
+            histories = history_rows[:capped_limit]
         report = summarize_trade_execution_contract(
             decisions,
             orders=orders,
-            positions=positions,
+            authoritative_histories=histories,
         )
         report["window_start"] = since_utc.isoformat()
         report["training_epoch_started_at"] = epoch_start.isoformat()
         report["pre_epoch_contracts_can_block_entries"] = False
         report["coverage"] = {
-            "complete": not (decision_truncated or order_truncated or position_truncated),
-            "truncated": bool(decision_truncated or order_truncated or position_truncated),
+            "complete": not (decision_truncated or order_truncated or history_truncated),
+            "truncated": bool(decision_truncated or order_truncated or history_truncated),
             "decision_truncated": decision_truncated,
             "order_truncated": order_truncated,
-            "position_truncated": position_truncated,
+            "history_truncated": history_truncated,
+            "position_truncated": False,
             "requested_limit": capped_limit,
             "window_hours": capped_hours,
         }
@@ -304,6 +301,7 @@ def summarize_trade_execution_contract(
     *,
     orders: Sequence[Any] | None = None,
     positions: Sequence[Any] | None = None,
+    authoritative_histories: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     checked_at = datetime.now(UTC)
     orders_by_decision = _orders_by_decision(orders or [])
@@ -376,18 +374,43 @@ def summarize_trade_execution_contract(
         and row.get("contract_lifecycle") == "normal_paper_trade"
         and len(row.get("quant_evidence_families") or []) < 2
     )
+    # ``authoritative_histories`` deliberately distinguishes "no authoritative
+    # rows found" (an empty sequence) from the legacy test-only ``positions``
+    # argument being omitted.  Production callers always pass the sequence,
+    # so local Position PnL can never silently override exchange facts.
+    pnl_rows = (
+        list(authoritative_histories)
+        if authoritative_histories is not None
+        else [
+            position
+            for position in positions or []
+            if _row_get(position, "closed_at") is not None
+        ]
+    )
+    authoritative_pnl = authoritative_histories is not None
     realized_values = [
-        _safe_float(_row_get(position, "realized_pnl"), 0.0)
-        for position in positions or []
-        if _row_get(position, "closed_at") is not None
+        _safe_float(_row_get(row, "realized_pnl"), 0.0)
+        for row in pnl_rows
+        if (
+            _is_closed_history_row(row)
+            if authoritative_pnl
+            else True
+        )
     ]
     realized_by_side: dict[str, list[float]] = {"long": [], "short": []}
-    for position in positions or []:
-        side = str(_row_get(position, "side") or "").lower()
-        if _row_get(position, "closed_at") is not None and side in realized_by_side:
-            realized_by_side[side].append(
-                _safe_float(_row_get(position, "realized_pnl"), 0.0)
+    for row in pnl_rows:
+        side = str(
+            _row_get(row, "side") or _row_get(row, "pos_side") or ""
+        ).lower()
+        if (
+            side in realized_by_side
+            and (
+                _is_closed_history_row(row)
+                if authoritative_pnl
+                else True
             )
+        ):
+            realized_by_side[side].append(_safe_float(_row_get(row, "realized_pnl"), 0.0))
     summary = {
         "decision_count": len(decisions),
         "executed_entry_count": executed_entry_count,
@@ -423,6 +446,15 @@ def summarize_trade_execution_contract(
             NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
         ),
         "single_family_authorized_entry_count": single_family_authorized_entry_count,
+        "realized_pnl_source": (
+            "okx_position_history_realized_pnl"
+            if authoritative_pnl
+            else "local_position_realized_pnl_test_fallback"
+        ),
+        "authoritative_history_count": len(authoritative_histories or [])
+        if authoritative_pnl
+        else 0,
+        "local_position_pnl_ignored": authoritative_pnl,
     }
     return {
         "audit_only": True,
@@ -2585,6 +2617,13 @@ def _orders_by_decision(orders: Sequence[Any]) -> dict[int, list[Any]]:
         if decision_id:
             grouped.setdefault(decision_id, []).append(order)
     return grouped
+
+
+def _is_closed_history_row(row: Any) -> bool:
+    """Return whether an OKX history row represents a realized lifecycle."""
+
+    status = str(_row_get(row, "close_status") or "").strip().lower()
+    return status in {"full", "partial", "closed", "complete", ""}
 
 
 def _was_executed(decision: Any, orders: list[Any]) -> bool:

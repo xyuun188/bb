@@ -126,7 +126,7 @@ async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
     assert " LIMIT " in statements[0]
     assert "raw_llm_response" not in statements[0]
     assert "SELECT orders.id" in statements[1]
-    assert "SELECT positions.id" in statements[2]
+    assert "SELECT okx_position_history.id" in statements[2]
     assert "LIMIT" in statements[0]
 
 
@@ -1116,6 +1116,57 @@ def test_realized_pnl_summary_uses_closed_positions_only() -> None:
 
     assert report["summary"]["realized_net_pnl_usdt"] == 1.8
     assert report["summary"]["negative_realized_position_count"] == 1
+
+
+def test_realized_pnl_summary_prefers_okx_history_over_local_positions() -> None:
+    report = summarize_trade_execution_contract(
+        [],
+        positions=[
+            SimpleNamespace(realized_pnl=250.0, closed_at="2026-07-12T08:00:00Z"),
+        ],
+        authoritative_histories=[
+            SimpleNamespace(
+                side="short",
+                pos_side="short",
+                realized_pnl=-173.8893,
+                close_status="full",
+            ),
+            SimpleNamespace(
+                side="long",
+                pos_side="long",
+                realized_pnl=4.25,
+                close_status="partial",
+            ),
+        ],
+    )
+
+    summary = report["summary"]
+    assert summary["realized_pnl_source"] == "okx_position_history_realized_pnl"
+    assert summary["authoritative_history_count"] == 2
+    assert summary["local_position_pnl_ignored"] is True
+    assert summary["closed_position_count"] == 2
+    assert summary["realized_net_pnl_usdt"] == pytest.approx(-169.6393)
+    assert summary["realized_net_pnl_by_side_usdt"] == {
+        "long": 4.25,
+        "short": -173.8893,
+    }
+
+
+def test_empty_okx_history_does_not_fall_back_to_local_positions() -> None:
+    report = summarize_trade_execution_contract(
+        [],
+        positions=[
+            SimpleNamespace(realized_pnl=250.0, closed_at="2026-07-12T08:00:00Z"),
+        ],
+        authoritative_histories=[],
+    )
+
+    summary = report["summary"]
+    assert summary["realized_pnl_source"] == "okx_position_history_realized_pnl"
+    assert summary["authoritative_history_count"] == 0
+    assert summary["local_position_pnl_ignored"] is True
+    assert summary["closed_position_count"] == 0
+    assert summary["realized_net_pnl_usdt"] == 0.0
 
 
 def test_partial_order_requires_authoritative_fill_evidence() -> None:
