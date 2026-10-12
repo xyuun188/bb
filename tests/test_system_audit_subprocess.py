@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +135,32 @@ async def test_audit_reads_persisted_data_collection_snapshot_before_warming(
     assert payload["status"] == "ok"
     assert payload["cache"]["persisted_snapshot"] is True
     assert payload["training"]["local_ai_tools"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_audit_treats_stale_persisted_data_collection_snapshot_as_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(seconds=120)
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "stale",
+        "source": "dashboard.data_collection",
+        "freshness": {"is_stale": True, "state": "stale"},
+        "cache": {"persisted_snapshot": True, "stale_snapshot": True},
+        "training": {"local_ai_tools": {"status": "ready"}},
+    }
+
+    monkeypatch.setattr(
+        system_audit.data_collection_api,
+        "_persisted_status_payload",
+        lambda include_feature_coverage=False: persisted,
+    )
+
+    payload = await system_audit._data_collection_status_for_audit()
+
+    assert payload["status"] == "stale"
+    assert payload["freshness"]["is_stale"] is True
 
 
 @pytest.mark.asyncio

@@ -1509,6 +1509,46 @@ async def test_data_collection_status_runs_independent_sections_concurrently(
 
 
 @pytest.mark.asyncio
+async def test_data_collection_status_basic_snapshot_does_not_wait_for_skipped_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def section(name: str) -> dict[str, Any]:
+        return {"status": "ok", "section": name}
+
+    monkeypatch.setattr(
+        data_collection_module,
+        "_source_breakdown",
+        lambda: section("source_breakdown"),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_training_sample_quality",
+        lambda: section("training_sample_quality"),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_local_ai_training_status",
+        lambda: section("local_ai_training_status"),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_training_governance_snapshot_for_status",
+        lambda _trade_count: section("training_governance"),
+    )
+
+    body = await asyncio.wait_for(
+        data_collection_module._build_data_collection_status(
+            include_feature_coverage=False,
+        ),
+        timeout=1.0,
+    )
+
+    assert body["status"] == "ok"
+    assert body["feature_coverage"]["status"] == "skipped"
+    assert body["training"]["governance"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_data_collection_status_reuses_runtime_snapshot_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1614,6 +1654,43 @@ async def test_data_collection_status_audit_read_does_not_build_on_sqlite(
     assert body["cache"]["cold_start"] is True
 
 
+@pytest.mark.asyncio
+async def test_data_collection_status_audit_read_uses_persisted_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(seconds=5)
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "ok",
+        "source": "dashboard.data_collection",
+        "training": {"local_ai_tools": {"status": "ready", "shadow_sample_count": 12}},
+    }
+    monkeypatch.setattr(
+        data_collection_module,
+        "load_persisted_data_collection_status",
+        lambda _include: (checked_at, persisted),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "settings",
+        type("Settings", (), {"database_url": "sqlite+aiosqlite:///runtime.db"})(),
+    )
+    monkeypatch.setattr(
+        data_collection_module,
+        "_build_data_collection_status",
+        lambda *_args, **_kwargs: pytest.fail("audit read must use persisted data"),
+    )
+
+    body = await data_collection_module.get_data_collection_status(
+        include_feature_coverage=False,
+        start_background_refresh=False,
+    )
+
+    assert body["status"] == "ok"
+    assert body["cache"]["persisted_snapshot"] is True
+    assert body["training"]["local_ai_tools"]["status"] == "ready"
+
+
 def test_persisted_data_collection_status_round_trips(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1637,6 +1714,34 @@ def test_persisted_data_collection_status_round_trips(
     checked_at, loaded_payload = loaded
     assert checked_at == datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
     assert loaded_payload["training"]["local_ai_tools"]["status"] == "ready"
+
+
+def test_persisted_data_collection_status_marks_expired_snapshot_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(
+        seconds=data_collection_module.STATUS_CACHE_TTL_SECONDS + 5
+    )
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "source": "dashboard.data_collection",
+        "status": "ok",
+        "freshness": {"state": "ok", "is_stale": False},
+    }
+    monkeypatch.setattr(
+        data_collection_module,
+        "load_persisted_data_collection_status",
+        lambda _include: (checked_at, persisted),
+    )
+
+    payload = data_collection_module._persisted_status_payload(False)
+
+    assert payload is not None
+    assert payload["status"] == "stale"
+    assert payload["freshness"]["state"] == "stale"
+    assert payload["freshness"]["is_stale"] is True
+    assert payload["cache"]["stale_snapshot"] is True
+    assert "persisted_snapshot_stale" in payload["degraded_reason"]
 
 
 async def _async_value(value: Any) -> Any:

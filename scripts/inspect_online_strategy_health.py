@@ -449,7 +449,11 @@ async def main():
     }
     payload["data_collection"] = await _read_stage(
         "data_collection",
-        get_data_collection_status(include_feature_coverage=False),
+        get_data_collection_status(
+            include_feature_coverage=False,
+            start_background_refresh=False,
+            wait_for_initial_refresh=False,
+        ),
     )
     payload["shadow_maturity"] = await _read_stage(
         "shadow_maturity",

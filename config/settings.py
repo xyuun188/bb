@@ -376,6 +376,7 @@ class Settings(BaseSettings):
     system_audit_history_enabled: bool = True
     system_audit_history_interval_seconds: int = 300
     system_audit_history_max_records: int = 500
+    data_collection_status_refresh_interval_seconds: int = 300
 
     # --- Notifications ---
 

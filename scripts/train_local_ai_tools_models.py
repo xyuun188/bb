@@ -35,7 +35,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
 from core.url_safety import normalize_http_base_url  # noqa: E402
-from db.session import close_db, get_read_session_ctx, get_session_ctx  # noqa: E402
+from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from models.market_data import Kline  # noqa: E402
 from models.news import NewsArticle, SocialPost  # noqa: E402
@@ -936,7 +936,7 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
 
 async def _completed_shadow_sample_count() -> int:
     epoch_start = load_training_data_start()
-    async with get_session_ctx() as session:
+    async with _training_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
                 ShadowBacktest.status == "completed",
@@ -1106,7 +1106,7 @@ def _symbols_from_json(value: Any) -> list[str]:
 
 async def _load_text_sentiment_samples() -> list[dict[str, Any]]:
     epoch_start = load_training_data_start()
-    async with get_session_ctx() as session:
+    async with _training_read_session_ctx() as session:
         # Text is auxiliary supervision.  Bound the database result before
         # materializing rows; limiting only after ``scalars().all()`` still
         # loads the entire news/social history and can exhaust the trainer.

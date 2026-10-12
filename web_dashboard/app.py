@@ -124,6 +124,33 @@ async def _system_audit_history_loop() -> None:
             )
 
 
+async def _data_collection_status_loop() -> None:
+    """Keep durable data-collection snapshots current for pages and audits."""
+
+    from web_dashboard.api.data_collection import (
+        refresh_data_collection_status_snapshot,
+    )
+
+    interval = max(
+        120,
+        int(settings.data_collection_status_refresh_interval_seconds or 300),
+    )
+    # Give the Dashboard a short startup window to initialize its database
+    # runtime before the first snapshot build.
+    await asyncio.sleep(1.0)
+    while True:
+        try:
+            await refresh_data_collection_status_snapshot(include_feature_coverage=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "data collection status loop failed",
+                error=safe_error_text(exc, limit=240),
+            )
+        await asyncio.sleep(interval)
+
+
 async def _continuous_observation_loop() -> None:
     """Run acceptance sampling outside the HTTP event loop."""
 
@@ -170,6 +197,7 @@ async def lifespan(app: FastAPI):
         if settings.system_audit_history_enabled
         else None
     )
+    data_collection_task = asyncio.create_task(_data_collection_status_loop())
     observation_task = asyncio.create_task(_continuous_observation_loop())
     from web_dashboard.api.data_collection import (
         start_external_event_collector,
@@ -199,6 +227,11 @@ async def lifespan(app: FastAPI):
                 await audit_task
             except asyncio.CancelledError:
                 pass
+        data_collection_task.cancel()
+        try:
+            await data_collection_task
+        except asyncio.CancelledError:
+            pass
         observation_task.cancel()
         try:
             await observation_task

@@ -35,6 +35,8 @@ def test_remote_template_compiles_and_uses_dynamic_return_contract() -> None:
     assert "get_model_training_registry_status" in template
     assert "okx_training_refresh_gate" in template
     assert "get_data_collection_status" in template
+    assert "start_background_refresh=False" in template
+    assert "wait_for_initial_refresh=False" in template
     assert "get_strategy_learning" in template
     assert "get_expert_memories" in template
     assert "get_shadow_backtests" in template

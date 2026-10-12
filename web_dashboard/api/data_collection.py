@@ -1486,6 +1486,7 @@ async def _build_data_collection_status(
 ) -> dict[str, Any]:
     section_barrier = asyncio.Event()
     section_started = 0
+    section_count = 4 if include_feature_coverage else 3
 
     async def run_independent_section(
         factory: Callable[[], Awaitable[dict[str, Any]]],
@@ -1494,7 +1495,7 @@ async def _build_data_collection_status(
     ) -> dict[str, Any] | Exception:
         nonlocal section_started
         section_started += 1
-        if section_started >= 4:
+        if section_started >= section_count:
             section_barrier.set()
         await section_barrier.wait()
         return await _run_status_section(factory, timeout=timeout)
@@ -1674,6 +1675,61 @@ def _warming_data_collection_status(include_feature_coverage: bool) -> dict[str,
     return sanitize_payload(payload)
 
 
+def _persisted_status_payload(
+    include_feature_coverage: bool,
+) -> dict[str, Any] | None:
+    """Return a persisted real snapshot for isolated read-only callers."""
+
+    persisted = load_persisted_data_collection_status(include_feature_coverage)
+    if persisted is None:
+        return None
+    checked_at, payload = persisted
+    result = dict(payload)
+    age_seconds = max((datetime.now(UTC) - checked_at).total_seconds(), 0.0)
+    freshness = result.get("freshness")
+    freshness = dict(freshness) if isinstance(freshness, dict) else {}
+    freshness.update(
+        {
+            "age_seconds": round(age_seconds, 3),
+            "is_stale": age_seconds > STATUS_CACHE_TTL_SECONDS,
+        }
+    )
+    if freshness["is_stale"] and str(result.get("status") or "").lower() in {
+        "ok",
+        "ready",
+        "healthy",
+    }:
+        result["status"] = "stale"
+        existing_reason = str(result.get("degraded_reason") or "").strip()
+        result["degraded_reason"] = ",".join(
+            item
+            for item in (existing_reason, "persisted_snapshot_stale")
+            if item
+        )
+    freshness["state"] = "stale" if freshness["is_stale"] else (
+        freshness.get("state") or "ok"
+    )
+    result["freshness"] = freshness
+    result["cache"] = {
+        "age_seconds": round(age_seconds, 3),
+        "ttl_seconds": STATUS_CACHE_TTL_SECONDS,
+        "refresh_in_progress": False,
+        "cold_start": False,
+        "persisted_snapshot": True,
+        "stale_snapshot": bool(freshness["is_stale"]),
+    }
+    return sanitize_payload(result)
+
+
+async def refresh_data_collection_status_snapshot(
+    *,
+    include_feature_coverage: bool = False,
+) -> dict[str, Any]:
+    """Build and persist one real status snapshot for background observers."""
+
+    return await _refresh_data_collection_status(include_feature_coverage)
+
+
 @router.get("/data-collection/status")
 async def get_data_collection_status(
     include_feature_coverage: bool = True,
@@ -1688,6 +1744,9 @@ async def get_data_collection_status(
         # branch ignored ``start_background_refresh=False`` and could block
         # the whole audit until its global deadline.
         if not start_background_refresh:
+            persisted = _persisted_status_payload(include_feature_coverage)
+            if persisted is not None:
+                return persisted
             return _warming_data_collection_status(include_feature_coverage)
         return await _build_data_collection_status(include_feature_coverage)
     cached = _status_cache.get(include_feature_coverage)
@@ -1708,6 +1767,9 @@ async def get_data_collection_status(
         # the system-audit process is already checking database-backed cards.
         # The regular dashboard/background loop remains responsible for warming
         # this cache.
+        persisted = _persisted_status_payload(include_feature_coverage)
+        if persisted is not None:
+            return persisted
         return _warming_data_collection_status(include_feature_coverage)
     refresh_task = _start_data_collection_status_refresh(include_feature_coverage)
     if wait_for_initial_refresh:

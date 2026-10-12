@@ -8232,7 +8232,15 @@ async def test_stop_cancels_strategy_context_refresh_tasks() -> None:
 
 
 def test_training_subprocess_environment_bounds_native_thread_pools() -> None:
-    env = trading_service._training_process_env({"PATH": "test"})
+    env = trading_service._training_process_env(
+        {
+            "PATH": "test",
+            "BB_TRAINING_READ_STATEMENT_TIMEOUT_MS": "120000",
+            "BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS": "180000",
+            "DATABASE_POOL_SIZE": "16",
+            "DATABASE_MAX_OVERFLOW": "24",
+        }
+    )
 
     assert env["PATH"] == "test"
     assert env["BB_TRAINING_MAX_WORKERS"] == "1"
@@ -8240,6 +8248,12 @@ def test_training_subprocess_environment_bounds_native_thread_pools() -> None:
     assert env["MKL_NUM_THREADS"] == "1"
     assert env["TORCH_NUM_THREADS"] == "1"
     assert env["MALLOC_ARENA_MAX"] == "2"
+    assert env["DATABASE_POOL_SIZE"] == "2"
+    assert env["DATABASE_MAX_OVERFLOW"] == "0"
+    assert env["DATABASE_SESSION_CONCURRENCY"] == "2"
+    assert env["DATABASE_POOL_TIMEOUT_SECONDS"] == "3"
+    assert env["BB_TRAINING_READ_STATEMENT_TIMEOUT_MS"] == "30000"
+    assert env["BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS"] == "15000"
 
 
 @pytest.mark.asyncio

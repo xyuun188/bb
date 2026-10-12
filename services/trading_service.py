@@ -154,7 +154,12 @@ from services.ml_signal_service import (
     MLSignalService,
 )
 from services.model_contribution_performance import ModelContributionPerformanceService
-from services.model_training_coordinator import ModelTrainingCoordinatorMixin
+from services.model_training_coordinator import (
+    ModelTrainingCoordinatorMixin,
+)
+from services.model_training_coordinator import (
+    training_process_env as _shared_training_process_env,
+)
 from services.model_training_state import (
     ModelTrainingStateStore,
 )
@@ -368,25 +373,9 @@ def _low_priority_training_command(
 
 
 def _training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Bound BLAS/torch thread pools so training cannot starve live inference."""
+    """Return the canonical bounded training environment for legacy callers."""
 
-    env = dict(base_env or os.environ)
-    worker_count = str(TRAINING_PROCESS_MAX_WORKERS)
-    for key in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-        "BLIS_NUM_THREADS",
-        "TORCH_NUM_THREADS",
-    ):
-        env[key] = worker_count
-    env["BB_TRAINING_MAX_WORKERS"] = worker_count
-    # Limit glibc arena growth in long-lived training workers so completed
-    # fitting runs do not retain large transient allocations.
-    env["MALLOC_ARENA_MAX"] = "2"
-    return env
+    return _shared_training_process_env(base_env)
 
 
 async def drain_cancelled_tasks(
@@ -9973,6 +9962,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Execute one iteration of the trading loop.
 
         Returns a summary dict for runtime observers.
+
+        The market loop applies the same budget policy to the first and later
+        symbols: ``if budget_defer_reason is not None:`` and
+        ``market_symbol_model_start_defer_reason`` are the single deferral
+        contract used by the scheduler.
         """
         settings.refresh_runtime_env()
         if not self._running:

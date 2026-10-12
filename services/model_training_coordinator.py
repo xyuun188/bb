@@ -54,6 +54,10 @@ logger = structlog.get_logger(__name__)
 
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
+TRAINING_DATABASE_POOL_SIZE = 2
+TRAINING_DATABASE_MAX_OVERFLOW = 0
+TRAINING_DATABASE_SESSION_CONCURRENCY = 2
+TRAINING_DATABASE_POOL_TIMEOUT_SECONDS = 3
 TRAINING_STARTUP_GRACE_SECONDS = 180.0
 TRAINING_BUSY_RETRY_SECONDS = 30.0
 TRAINING_MAX_BUSY_DEFERRAL_SECONDS = 15 * 60.0
@@ -78,7 +82,7 @@ def low_priority_training_command(
 
 
 def training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Bound native thread pools so training cannot starve live inference."""
+    """Bound CPU and database resources so training cannot starve trading."""
 
     env = dict(base_env or os.environ)
     worker_count = str(TRAINING_PROCESS_MAX_WORKERS)
@@ -94,8 +98,17 @@ def training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str,
         env[key] = worker_count
     env["BB_TRAINING_MAX_WORKERS"] = worker_count
     env["MALLOC_ARENA_MAX"] = "2"
-    env.setdefault("BB_TRAINING_READ_STATEMENT_TIMEOUT_MS", "120000")
-    env.setdefault("BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS", "180000")
+    # A training subprocess has its own SQLAlchemy pool, but it still connects
+    # to the production database. Override the inherited service pool instead
+    # of allowing a rebuild to consume the trading process's 16+24 capacity.
+    env["DATABASE_POOL_SIZE"] = str(TRAINING_DATABASE_POOL_SIZE)
+    env["DATABASE_MAX_OVERFLOW"] = str(TRAINING_DATABASE_MAX_OVERFLOW)
+    env["DATABASE_SESSION_CONCURRENCY"] = str(TRAINING_DATABASE_SESSION_CONCURRENCY)
+    env["DATABASE_POOL_TIMEOUT_SECONDS"] = str(TRAINING_DATABASE_POOL_TIMEOUT_SECONDS)
+    # Read-only training scans must fail and retry rather than hold database
+    # connections across a market watchdog window.
+    env["BB_TRAINING_READ_STATEMENT_TIMEOUT_MS"] = "30000"
+    env["BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS"] = "15000"
     return env
 
 

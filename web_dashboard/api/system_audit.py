@@ -4294,38 +4294,11 @@ async def _data_collection_status_for_audit() -> dict[str, Any]:
     transient ``warming`` placeholder.
     """
 
-    persisted_loader = getattr(
-        data_collection_api,
-        "load_persisted_data_collection_status",
-        None,
-    )
-    if callable(persisted_loader):
-        persisted = persisted_loader(include_feature_coverage=False)
+    persisted_reader = getattr(data_collection_api, "_persisted_status_payload", None)
+    if callable(persisted_reader):
+        persisted = persisted_reader(include_feature_coverage=False)
         if persisted is not None:
-            checked_at, payload = persisted
-            result = copy.deepcopy(payload)
-            age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
-            freshness = result.get("freshness")
-            freshness = dict(freshness) if isinstance(freshness, dict) else {}
-            freshness.update(
-                {
-                    "age_seconds": round(age_seconds, 3),
-                    "is_stale": age_seconds > float(
-                        getattr(data_collection_api, "STATUS_CACHE_TTL_SECONDS", 60.0)
-                    ),
-                }
-            )
-            result["freshness"] = freshness
-            result["cache"] = {
-                "age_seconds": round(age_seconds, 3),
-                "ttl_seconds": float(
-                    getattr(data_collection_api, "STATUS_CACHE_TTL_SECONDS", 60.0)
-                ),
-                "refresh_in_progress": False,
-                "cold_start": False,
-                "persisted_snapshot": True,
-            }
-            return sanitize_payload(result)
+            return persisted
 
     getter = data_collection_api.get_data_collection_status
     kwargs: dict[str, Any] = {
@@ -4539,8 +4512,14 @@ async def _model_training_audit() -> dict[str, Any]:
     runtime_probe_timeout = bool(runtime_probe.get("timeout"))
     local_tools_status = str(local_tools.get("status") or "").lower()
     data_collection_status = str(data_status.get("status") or "").lower()
+    data_collection_freshness = _safe_dict(data_status.get("freshness"))
+    data_collection_stale = (
+        data_collection_status == "stale"
+        or bool(data_collection_freshness.get("is_stale"))
+    )
     data_collection_warming = (
-        data_collection_status == "warming" or local_tools_status == "warming"
+        data_collection_status == "warming"
+        or local_tools_status == "warming"
     )
     local_tools_probe_timeout = local_tools_status in {"timeout", "status_error", "error"} and (
         str(local_tools.get("section") or "") == "local_ai_training_status"
@@ -4652,6 +4631,7 @@ async def _model_training_audit() -> dict[str, Any]:
         local_tools_status == "learning_only"
         or local_tools_status_probe_slow
         or local_tools_unconfigured
+        or data_collection_stale
         or data_collection_warming
         or runtime_probe_timeout
         or historical_trade_fact_audit_warning
@@ -4722,6 +4702,8 @@ async def _model_training_audit() -> dict[str, Any]:
             observing_reasons.append("模型仍在学习观察")
         if local_tools_unconfigured:
             observing_reasons.append("本地量化工具未配置")
+        if data_collection_stale:
+            observing_reasons.append("data_collection_snapshot_stale")
         if data_collection_warming:
             observing_reasons.append("训练状态首次快照刷新中")
         if artifact_retirement_required:
@@ -4830,6 +4812,7 @@ async def _model_training_audit() -> dict[str, Any]:
             "local_tools_probe_timeout": local_tools_probe_timeout,
             "runtime_probe_timeout_is_observing": runtime_probe_timeout_is_observing,
             "data_collection_status": data_collection_status or "unknown",
+            "data_collection_stale": data_collection_stale,
             "data_collection_warming": data_collection_warming,
             "source_warnings": hard_source_warnings[:8],
             "optional_source_warnings": optional_source_warnings[:8],
