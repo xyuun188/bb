@@ -237,6 +237,8 @@ def _filled_order(
     contracts = quantity / 0.01
     return SimpleNamespace(
         decision_id=decision_id,
+        execution_mode="paper",
+        symbol="BTC/USDT",
         status="filled",
         quantity=quantity,
         price=price,
@@ -451,6 +453,8 @@ def test_settled_legacy_notional_drift_is_observation_only() -> None:
         authoritative_histories=[
             SimpleNamespace(
                 close_status="full",
+                mode="paper",
+                symbol="BTC/USDT",
                 entry_order_ids=[order.exchange_order_id],
                 realized_pnl=0.2,
                 side="long",

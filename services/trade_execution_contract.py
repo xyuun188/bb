@@ -357,7 +357,6 @@ def summarize_trade_execution_contract(
             )
             row["effective_reasons"] = effective_reasons
             if row["historical_settlement_observation_only"]:
-                row["contract_complete"] = True
                 row["contract_status"] = "historical_settlement_observation_only"
             pending_deadline = _authoritative_fill_sync_pending_deadline(
                 decision_orders,
@@ -667,58 +666,45 @@ def _historical_settlement_observation_reasons(
     )
     if filled_notional <= 0.0 or fill_fact_reasons or not fill_source:
         return []
-    entry_order_ids = {
-        str(_row_get(order, "exchange_order_id") or "").strip()
-        for order in orders
-        if _is_authoritative_filled_order(order)
-        and str(_row_get(order, "exchange_order_id") or "").strip()
-    }
-    if not entry_order_ids:
+    filled_orders = [
+        order for order in orders if _is_authoritative_filled_order(order)
+    ]
+    if not filled_orders:
         return []
-    order_modes = {
-        str(_row_get(order, "execution_mode") or "").strip().lower()
-        for order in orders
-        if str(_row_get(order, "execution_mode") or "").strip()
-    }
-    order_symbols = {
-        normalize_trading_symbol(_row_get(order, "symbol"))
-        for order in orders
-        if normalize_trading_symbol(_row_get(order, "symbol"))
-    }
     decision_symbol = normalize_trading_symbol(_row_get(decision, "symbol"))
-
-    covered_entry_order_ids: set[str] = set()
-    for history in authoritative_histories:
-        status = str(_row_get(history, "close_status") or "").strip().lower()
-        if status not in {"full", "closed", "complete"}:
-            continue
-        history_mode = str(_row_get(history, "mode") or "").strip().lower()
-        if order_modes and history_mode and history_mode not in order_modes:
-            continue
-        history_symbol = normalize_trading_symbol(_row_get(history, "symbol"))
-        if (
-            order_symbols
-            and history_symbol
-            and history_symbol not in order_symbols
-        ) or (
-            decision_symbol
-            and history_symbol
-            and history_symbol != decision_symbol
-        ):
-            continue
-        raw_entry_ids = _row_get(history, "entry_order_ids")
-        history_entry_ids = (
-            {
-                str(value).strip()
-                for value in raw_entry_ids
-                if str(value).strip()
-            }
-            if isinstance(raw_entry_ids, (list, tuple, set))
-            else set()
-        )
-        covered_entry_order_ids.update(entry_order_ids.intersection(history_entry_ids))
-    if not entry_order_ids.issubset(covered_entry_order_ids):
+    if not decision_symbol:
         return []
+    for order in filled_orders:
+        order_id = str(_row_get(order, "exchange_order_id") or "").strip()
+        order_mode = str(_row_get(order, "execution_mode") or "").strip().lower()
+        order_symbol = normalize_trading_symbol(_row_get(order, "symbol"))
+        if (
+            not order_id
+            or not order_mode
+            or not order_symbol
+            or order_symbol != decision_symbol
+        ):
+            return []
+        linked_to_closed_history = False
+        for history in authoritative_histories:
+            if str(_row_get(history, "close_status") or "").strip().lower() not in {
+                "full",
+                "closed",
+                "complete",
+            }:
+                continue
+            if str(_row_get(history, "mode") or "").strip().lower() != order_mode:
+                continue
+            if normalize_trading_symbol(_row_get(history, "symbol")) != order_symbol:
+                continue
+            raw_entry_ids = _row_get(history, "entry_order_ids")
+            if isinstance(raw_entry_ids, (list, tuple, set)) and order_id in {
+                str(value).strip() for value in raw_entry_ids if str(value).strip()
+            }:
+                linked_to_closed_history = True
+                break
+        if not linked_to_closed_history:
+            return []
 
     sizing = _safe_dict(raw.get("profit_risk_sizing"))
     risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
