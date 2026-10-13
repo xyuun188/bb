@@ -4411,6 +4411,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
+        facts = await self._hydrate_entry_balance_facts(model_mode, facts)
         return self._entry_facts_with_verified_balance(model_mode, facts, pre_order=False)
 
     async def pre_order_execution_facts(
@@ -4426,7 +4427,79 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
+        facts = await self._hydrate_entry_balance_facts(model_mode, facts)
         return self._entry_facts_with_verified_balance(model_mode, facts, pre_order=True)
+
+    async def _hydrate_entry_balance_facts(
+        self,
+        model_mode: str,
+        facts: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete one transiently empty native balance fact from the shared provider."""
+
+        if balance_snapshot_verified(facts.get("balance_snapshot")):
+            return facts
+        reason_text = str(
+            facts.get("reason")
+            or self._safe_dict(facts.get("policy_provenance")).get("fallback_reason")
+            or ""
+        )
+        missing_balance = (
+            "account_equity_missing" in reason_text
+            or "available_margin_missing" in reason_text
+            or self._safe_float(facts.get("account_equity_usdt"), 0.0) <= 0.0
+            or self._safe_float(facts.get("available_margin_usdt"), 0.0) <= 0.0
+        )
+        if not missing_balance:
+            return facts
+        # Preserve the existing cache provenance when a verified snapshot is
+        # already available; the downstream boundary annotates its age and
+        # final-recheck requirement precisely.
+        cached = self.peek_okx_balance_snapshot_for_mode(
+            "live" if model_mode == "live" else "paper",
+            allow_stale=True,
+        )
+        if balance_snapshot_verified(cached):
+            return facts
+        snapshot = await self._get_okx_balance_snapshot_for_mode(
+            "live" if model_mode == "live" else "paper",
+            allow_stale_while_refresh=False,
+        )
+        if not balance_snapshot_verified(snapshot):
+            return facts
+        repaired = dict(facts)
+        repaired["balance_snapshot"] = dict(snapshot)
+        repaired["account_equity_usdt"] = max(
+            self._safe_float(snapshot.get("equity"), 0.0),
+            0.0,
+        )
+        repaired["available_margin_usdt"] = max(
+            self._safe_float(snapshot.get("free"), 0.0),
+            0.0,
+        )
+        repaired["balance_source"] = "shared_okx_balance_provider"
+        repaired["requires_final_balance_recheck"] = True
+        reasons = [
+            item.strip()
+            for item in reason_text.split(",")
+            if item.strip()
+            and "account_equity_missing" not in item
+            and "available_margin_missing" not in item
+        ]
+        repaired["production_eligible"] = not reasons
+        repaired["reason"] = ",".join(reasons) if reasons else (
+            "okx_native_entry_facts_ready_shared_balance"
+        )
+        provenance = dict(self._safe_dict(repaired.get("policy_provenance")))
+        provenance.update(
+            {
+                "balance_source": "shared_okx_balance_provider",
+                "requires_final_balance_recheck": True,
+                "fallback_reason": ",".join(reasons),
+            }
+        )
+        repaired["policy_provenance"] = provenance
+        return repaired
 
     def _entry_facts_with_verified_balance(
         self,
@@ -12037,9 +12110,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         status = result.status.value if result is not None else "missing_result"
         exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        no_exchange_position = self._result_has_no_exchange_position(result)
         policy_terminal_status = self._policy_execution_terminal_status(result)
-        event_status = "executed" if exchange_confirmed else "rejected"
-        severity = "info" if exchange_confirmed else "warn"
+        event_status = (
+            "executed"
+            if exchange_confirmed
+            else "reconciled"
+            if no_exchange_position
+            else "rejected"
+        )
+        severity = "info" if exchange_confirmed or no_exchange_position else "warn"
         if policy_terminal_status:
             event_status = policy_terminal_status
             severity = "info" if policy_terminal_status == "skipped" else "warn"
@@ -12073,6 +12153,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "status": status,
                 **execution_links,
                 "exchange_confirmed": exchange_confirmed,
+                "no_exchange_position": no_exchange_position,
                 "execution_skipped": policy_terminal_status == "skipped",
                 "policy_terminal_status": policy_terminal_status,
                 "skip_kind": (
@@ -12118,9 +12199,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
             refresh_exit_positions=refresh_exit_positions,
         )
         exchange_confirmed = self._is_exchange_confirmed_execution(result)
+        no_exchange_position = self._result_has_no_exchange_position(result)
         policy_terminal_status = self._policy_execution_terminal_status(result)
-        event_status = "executed" if exchange_confirmed else "rejected"
-        severity = "info" if exchange_confirmed else "warn"
+        event_status = (
+            "executed"
+            if exchange_confirmed
+            else "reconciled"
+            if no_exchange_position
+            else "rejected"
+        )
+        severity = "info" if exchange_confirmed or no_exchange_position else "warn"
         if policy_terminal_status:
             event_status = policy_terminal_status
             severity = "info" if policy_terminal_status == "skipped" else "warn"
@@ -12154,6 +12242,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "status": result.status.value if result is not None else "missing_result",
                 **execution_links,
                 "exchange_confirmed": exchange_confirmed,
+                "no_exchange_position": no_exchange_position,
                 "execution_skipped": policy_terminal_status == "skipped",
                 "policy_terminal_status": policy_terminal_status,
                 "skip_kind": (

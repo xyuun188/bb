@@ -691,7 +691,7 @@ async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_training_negative_fee_after_return_is_bounded_sample() -> None:
+async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade["selection_reason"] = "paper_training_entry"
@@ -720,10 +720,12 @@ async def test_paper_training_negative_fee_after_return_is_bounded_sample() -> N
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["production_eligible"] is True
-    assert sizing["final_notional_usdt"] > 0.0
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0.0
     assert sizing["paper_profitability_gate_applied"] is False
     assert sizing["paper_training_entry_mode"] is True
+    assert sizing["paper_training_shadow_only"] is True
+    assert "normal_paper_training_shadow_only" in sizing["reason"]
 
 
 @pytest.mark.asyncio

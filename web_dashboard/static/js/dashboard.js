@@ -8584,9 +8584,12 @@ function executionStatusPresentation(record, explicitSuccess = null) {
     const success = explicitSuccess ?? (record?.success === true || record?.status === 'filled');
     const kind = String(record?.execution_failure_kind || record?.final_result?.status || '').toLowerCase();
     const isTransientExchange = kind === 'transient_exchange_error';
+    const isNoExchangePosition = kind === 'no_exchange_position';
     const label = record?.execution_status_label || (success ? '执行成功' : (isTransientExchange ? '交易所临时不可用' : '执行失败'));
-    const color = success ? 'var(--green)' : (isTransientExchange ? 'var(--orange)' : 'var(--red)');
-    return { label, color, kind, success, isTransientExchange };
+    const color = success || isNoExchangePosition
+        ? 'var(--green)'
+        : (isTransientExchange ? 'var(--orange)' : 'var(--red)');
+    return { label, color, kind, success, isTransientExchange, isNoExchangePosition };
 }
 function fmtPrice(p) { return p ? Number(p).toFixed(4) : '0.0000'; }
 function fmtPct(p) { return p ? Number(p).toFixed(2) + '%' : '0.00%'; }

@@ -8,6 +8,8 @@ state-machine event and dashboard row.
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +41,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _contract_fingerprint(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(slots=True)
@@ -332,6 +345,54 @@ class EntryPolicy:
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
             sizing = sizing if isinstance(sizing, dict) else {}
+        # The refreshed sizing pass is the single authority for both notional
+        # and stressed loss.  Older queued envelopes could retain the former
+        # notional after a final minimum/market refresh, which made execution
+        # reject an otherwise valid order as an algebra mismatch.  Normalize
+        # the pair here before any downstream contract sees it.
+        final_notional = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
+        stress_fraction = max(
+            _safe_float(sizing.get("stressed_loss_fraction"), 0.0),
+            0.0,
+        )
+        risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
+        if final_notional > 0.0 and stress_fraction > 0.0:
+            canonical_planned_loss = round(final_notional * stress_fraction, 8)
+            recorded_planned_loss = _safe_float(
+                sizing.get("planned_stressed_loss_usdt"), 0.0
+            )
+            if not math.isclose(
+                recorded_planned_loss,
+                canonical_planned_loss,
+                rel_tol=1e-9,
+                abs_tol=1e-8,
+            ):
+                sizing["planned_stressed_loss_usdt"] = canonical_planned_loss
+                sizing["expected_profit_usdt"] = round(
+                    final_notional
+                    * _safe_float(sizing.get("expected_net_return_pct"), 0.0)
+                    / 100.0,
+                    8,
+                )
+                provenance = dict(sizing.get("policy_provenance") or {})
+                provenance["fallback_reason"] = ""
+                fingerprint_payload = dict(sizing)
+                fingerprint_provenance = dict(provenance)
+                fingerprint_provenance.pop("contract_fingerprint", None)
+                fingerprint_payload["policy_provenance"] = fingerprint_provenance
+                provenance["contract_fingerprint"] = _contract_fingerprint(
+                    fingerprint_payload
+                )
+                sizing["policy_provenance"] = provenance
+                raw["profit_risk_sizing"] = sizing
+                decision.raw_response = raw
+        if (
+            final_notional > 0.0
+            and stress_fraction > 0.0
+            and risk_budget > 0.0
+            and final_notional * stress_fraction > risk_budget + 1e-8
+        ):
+            return "dynamic_risk_contract_stressed_loss_exceeds_budget"
         # The second pass is the only sizing authority for the refreshed
         # market facts.  Do not run execution reconciliation here: that
         # boundary is reserved for the actual order shape or a confirmed fill

@@ -1524,6 +1524,16 @@ def validate_normal_paper_entry_contract(
         and normal_trade.get("selection_reason")
         in {"paper_quality_observation", "paper_training_entry"}
     )
+    # A historical training fill may still need settlement/replay validation,
+    # but a new training decision must not bypass the current fee-after-return
+    # and sizing contract.  The old unconditional training bypass was the
+    # path that allowed a negative-net sample to become a real minimum order.
+    training_settlement = bool(
+        training_entry
+        and executed
+        and filled_order_present is True
+        and authoritative_fill_complete
+    )
     reasons = (
         historical_normalized_contract_reasons(source_normal_trade)
         if historical_normal_trade
@@ -1602,14 +1612,14 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_sizing_production_permission_invalid")
     if (
         sizing.get("production_eligible") is not True
-        and not training_entry
+        and not training_settlement
         and not confirmed_partial_fill
         and not confirmed_drift_settlement
     ):
         reasons.append("normal_paper_sizing_ineligible")
     if (
         not historical_normal_trade
-        and not training_entry
+        and not training_settlement
         and not confirmed_observation_settlement
         and not (
             allow_historical_settlement
@@ -1644,6 +1654,7 @@ def validate_normal_paper_entry_contract(
     if (
         (planned_loss <= 0.0 or planned_loss > risk_budget + 1e-8)
         and not confirmed_drift_settlement
+        and not training_settlement
     ):
         reasons.append("normal_paper_planned_loss_invalid")
     if (

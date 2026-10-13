@@ -1811,6 +1811,19 @@ class ExecutionService:
                         ),
                     },
                 )
+            elif decision.is_exit and result_has_no_exchange_position(execution_result):
+                await mark_stage(
+                    DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStageStatus.SKIPPED,
+                    "OKX 当前已无该方向持仓；不重复提交平仓，正在刷新本地持仓状态。",
+                    {
+                        "order_id": execution_result.order_id,
+                        "exchange_order_id": execution_result.exchange_order_id,
+                        "status": execution_result.status.value,
+                        "error_type": "position_already_closed",
+                        "position_reconciliation_required": True,
+                    },
+                )
             else:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,

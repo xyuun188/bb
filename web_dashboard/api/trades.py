@@ -328,13 +328,19 @@ def _translate_execution_text(message: str | None) -> str:
 def _execution_failure_kind(message: str | None) -> str | None:
     if is_okx_temporary_service_error(message):
         return "transient_exchange_error"
+    if ExecutionResultClassifier.is_no_exchange_position_error(message):
+        return "no_exchange_position"
     return None
 
 
 def _execution_status_label(status: str | None, reason: str | None) -> str:
+    """Return a stable, human-readable terminal state for execution history."""
+
     normalized_status = str(status or "").lower()
     if normalized_status == "filled":
         return "执行成功"
+    if _execution_failure_kind(reason) == "no_exchange_position":
+        return "\u5df2\u540c\u6b65\uff0c\u65e0\u9700\u91cd\u590d\u5e73\u4ed3"
     if _execution_failure_kind(reason) == "transient_exchange_error":
         return "交易所临时不可用"
     return "执行失败"

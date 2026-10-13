@@ -28,6 +28,7 @@ from web_dashboard.api.dashboard import (
 )
 from web_dashboard.api.trades import (
     _deduplicate_execution_orders,
+    _execution_failure_kind,
     _execution_status_label,
     _readable_execution_reason,
     _repair_position_reason_hold_hours,
@@ -3869,6 +3870,13 @@ def test_trade_history_translates_okx_50001_as_temporary_exchange_failure() -> N
 
     assert "交易所服务临时不可用" in translated
     assert _execution_status_label("rejected", translated) == "交易所临时不可用"
+
+
+def test_trade_history_marks_no_position_exit_as_reconciled_terminal_state() -> None:
+    reason = "OKX no matching position to close"
+
+    assert _execution_failure_kind(reason) == "no_exchange_position"
+    assert _execution_status_label("rejected", reason) == "已同步，无需重复平仓"
 
 
 def test_trade_detail_does_not_use_numeric_order_id_as_reason() -> None:
