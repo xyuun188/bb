@@ -8,6 +8,8 @@ SSH hosts are rejected; add the server fingerprint to system known_hosts or
 from __future__ import annotations
 
 import codecs
+import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,10 +96,42 @@ def _remember_reconnect_metadata(
     project_root: Path,
     connect_kwargs: dict[str, Any],
     keepalive_interval: int,
+    tcp_max_segment: int = 0,
 ) -> None:
     ssh._bb_project_root = project_root
     ssh._bb_connect_kwargs = dict(connect_kwargs)
     ssh._bb_keepalive_interval = keepalive_interval
+    ssh._bb_tcp_max_segment = tcp_max_segment
+
+
+def _connect_ssh_client(
+    ssh: Any, connect_kwargs: dict[str, Any], *, tcp_max_segment: int = 0
+) -> None:
+    if not tcp_max_segment:
+        ssh.connect(**connect_kwargs)
+        return
+    # Negotiate the segment size before the SYN.  Changing it after SSH
+    # connects cannot fix oversized replies from a port-forwarded model host.
+    last_error: OSError | None = None
+    for family, socktype, proto, _name, address in socket.getaddrinfo(
+        connect_kwargs["hostname"], connect_kwargs["port"], type=socket.SOCK_STREAM
+    ):
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(connect_kwargs.get("timeout"))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, tcp_max_segment)
+            sock.connect(address)
+        except OSError as exc:
+            sock.close()
+            last_error = exc
+            continue
+        try:
+            ssh.connect(**connect_kwargs, sock=sock)
+        except BaseException:
+            sock.close()
+            raise
+        return
+    raise last_error or OSError("SSH hostname resolved to no stream addresses.")
 
 
 def connect_remote_ssh(
@@ -110,11 +144,21 @@ def connect_remote_ssh(
     connect_retries: int = DEFAULT_SSH_CONNECT_RETRIES,
     retry_delay_seconds: float = DEFAULT_SSH_CONNECT_RETRY_DELAY_SECONDS,
     info: RemoteServerInfo | None = None,
+    tcp_max_segment: int | None = None,
 ) -> Any:
     """Create a strict SSH connection from the local ignored server-info file."""
     import paramiko
 
     server_info = info or load_remote_server_info(project_root)
+    segment_size = int(
+        tcp_max_segment
+        if tcp_max_segment is not None
+        else os.environ.get("BB_REMOTE_SSH_TCP_MAX_SEGMENT") or 0
+    )
+    if segment_size and not 536 <= segment_size <= 65535:
+        raise ValueError("SSH TCP segment size must be zero or between 536 and 65535.")
+    if segment_size and not hasattr(socket, "TCP_MAXSEG"):
+        raise RuntimeError("Configured SSH TCP segment size is unsupported on this host.")
     connect_kwargs: dict[str, Any] = {
         "hostname": server_info.host,
         "port": server_info.port,
@@ -135,13 +179,14 @@ def connect_remote_ssh(
         ssh = paramiko.SSHClient()
         configure_ssh_host_keys(ssh, project_root)
         try:
-            ssh.connect(**connect_kwargs)
+            _connect_ssh_client(ssh, connect_kwargs, tcp_max_segment=segment_size)
             _enable_ssh_keepalive(ssh, keepalive_interval)
             _remember_reconnect_metadata(
                 ssh,
                 project_root,
                 connect_kwargs,
                 keepalive_interval,
+                segment_size,
             )
             return ssh
         except Exception as exc:
@@ -268,7 +313,9 @@ def _reconnect_ssh_client(ssh: Any) -> bool:
 
     ssh.close()
     configure_ssh_host_keys(ssh, project_root)
-    ssh.connect(**connect_kwargs)
+    _connect_ssh_client(
+        ssh, connect_kwargs, tcp_max_segment=getattr(ssh, "_bb_tcp_max_segment", 0)
+    )
     _enable_ssh_keepalive(ssh, keepalive_interval)
     return True
 

@@ -493,6 +493,9 @@ values['USE_FAKEREDIS'] = 'false'
 values['REDIS_URL'] = 'redis://127.0.0.1:6379/0'
 values['AI_MODELS'] = online_ai_models
 values['BB_MODEL_TOPOLOGY_PROFILE'] = topology_profile
+# The model host's public SSH forwarding drops larger segments on this path.
+# Apply the same verified transport contract to tunnels, probes and reconnects.
+values['BB_REMOTE_SSH_TCP_MAX_SEGMENT'] = '1200'
 values['LOCAL_AI_TOOLS_ENABLED'] = 'true'
 values['LOCAL_AI_TOOLS_API_BASE'] = 'http://127.0.0.1:18001'
 # Keep all platform processes aligned with the single-worker Qwen3.8-27B

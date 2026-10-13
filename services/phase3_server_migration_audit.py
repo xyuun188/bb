@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from core.phase3_model_contract import PHASE3_APPROVED_RUNTIME_MODEL_PATHS
+from core.remote_json_probe import collect_remote_json_snapshot
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from services.model_server_config import (
@@ -747,9 +748,14 @@ class Phase3ServerMigrationAuditService:
 
         try:
             info = await self._load_remote_info()
-            snapshot = await asyncio.wait_for(
-                asyncio.to_thread(self._collect_remote_snapshot, info),
-                timeout=max(int(self.timeout_seconds or 1), 1),
+            snapshot = await collect_remote_json_snapshot(
+                self.project_root,
+                info,
+                _remote_command(),
+                ssh_connector=self.ssh_connector,
+                command_executor=self.command_executor,
+                timeout_seconds=max(int(self.timeout_seconds or 1), 1),
+                max_output_chars=20_000,
             )
         except Exception as exc:
             return self._unavailable_report(exc, started_at=started_at)
@@ -761,40 +767,6 @@ class Phase3ServerMigrationAuditService:
         if inspect.isawaitable(result):
             return await result
         return result
-
-    def _collect_remote_snapshot(self, info: Any) -> dict[str, Any]:
-        ssh = self.ssh_connector(
-            self.project_root,
-            timeout=8,
-            banner_timeout=8,
-            auth_timeout=8,
-            info=info,
-        )
-        try:
-            result = self.command_executor(
-                ssh,
-                _remote_command(),
-                timeout=max(int(self.timeout_seconds or 18), 5),
-                max_output_chars=20_000,
-            )
-        finally:
-            ssh.close()
-        if result.status != 0:
-            raise RuntimeError(
-                safe_error_text(
-                    result.stderr or result.stdout or "phase3 server probe failed",
-                    fallback="phase3 server probe failed",
-                )
-            )
-        try:
-            payload = json.loads(str(result.stdout or "{}"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                safe_error_text(result.stdout or result.stderr or "invalid phase3 probe payload")
-            ) from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("phase3 server probe payload was not an object")
-        return payload
 
     def _evaluated_report(
         self,

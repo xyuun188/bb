@@ -13,10 +13,13 @@ from web_dashboard.api import system_audit
 
 
 @pytest.fixture(autouse=True)
-def _reset_system_audit_process_state() -> None:
+def _reset_system_audit_process_state(monkeypatch) -> None:
     system_audit._system_audit_status_cache = None
     system_audit._system_audit_refresh_task = None
     system_audit._system_audit_subprocess_task = None
+    async def loaded():
+        return {"loaded_keys": [], "error": ""}
+    monkeypatch.setattr(run_system_audit_snapshot, "load_secure_settings_into_runtime", loaded)
 
 
 def test_system_audit_runner_bootstraps_online_runtime_before_settings_imports() -> None:
@@ -45,6 +48,26 @@ async def test_system_audit_runner_reuses_recent_required_cards_by_default() -> 
     )
 
     assert calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_system_audit_loads_encrypted_runtime_credentials_before_probes(monkeypatch):
+    events = []
+
+    async def load_credentials():
+        events.append("credentials")
+        return {"loaded_keys": ["high_risk_review.api_key"], "error": ""}
+
+    async def collector(**_kwargs):
+        assert events == ["credentials"]
+        events.append("probe")
+        return {"status": "ok"}
+
+    monkeypatch.setattr(run_system_audit_snapshot, "load_secure_settings_into_runtime", load_credentials)
+    await run_system_audit_snapshot.run_once(
+        record_history=False, source="test", collector=collector
+    )
+    assert events == ["credentials", "probe"]
 
 
 @pytest.mark.asyncio

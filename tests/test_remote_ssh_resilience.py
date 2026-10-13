@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from core import remote_ssh
 from core.remote_server_info import RemoteServerInfo
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 
@@ -202,3 +204,78 @@ def test_exec_remote_command_reconnects_before_retrying_channel_timeout(
     assert fake_client.system_loaded is True
     assert fake_client.policy is reject_policy
     assert fake_client.transport.keepalive_interval == 19
+
+
+def test_segment_limit_is_negotiated_before_connect_and_reapplied_on_reconnect(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    events: list[tuple] = []
+    sockets = []
+
+    class FakeSocket:
+        def __init__(self, *_args):
+            sockets.append(self)
+
+        def settimeout(self, value):
+            events.append(("timeout", value))
+
+        def setsockopt(self, level, option, value):
+            assert (level, option) == (socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+            events.append(("segment", value))
+
+        def connect(self, address):
+            events.append(("tcp_connect", address))
+
+        def close(self):
+            events.append(("socket_close",))
+
+    monkeypatch.setattr(remote_ssh.socket, "socket", FakeSocket)
+    monkeypatch.setattr(remote_ssh.socket, "getaddrinfo", lambda *_a, **_k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.17", 22))
+    ])
+    client = FakeSSHClient()
+    monkeypatch.setitem(sys.modules, "paramiko", SimpleNamespace(
+        RejectPolicy=object, SSHClient=lambda: client,
+    ))
+    info = RemoteServerInfo("203.0.113.17", 22, "linux", "secret", Path("<test>"))
+    ssh = connect_remote_ssh(tmp_path, info=info, tcp_max_segment=1200, timeout=7)
+    assert client.connect_kwargs["sock"] is sockets[0]
+    assert "sock" not in client._bb_connect_kwargs
+    assert remote_ssh._reconnect_ssh_client(ssh) is True
+    assert client.connect_kwargs["sock"] is sockets[1]
+    assert events == [
+        ("timeout", 7), ("segment", 1200), ("tcp_connect", ("203.0.113.17", 22)),
+        ("timeout", 7), ("segment", 1200), ("tcp_connect", ("203.0.113.17", 22)),
+    ]
+
+
+def test_segment_limited_socket_is_closed_when_ssh_authentication_fails(monkeypatch):
+    closed = []
+
+    class FakeSocket:
+        def settimeout(self, _value):
+            pass
+
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, _address):
+            pass
+
+        def close(self):
+            closed.append(True)
+
+    class FailedSsh:
+        def connect(self, **_kwargs):
+            raise ValueError("authentication failed")
+
+    monkeypatch.setattr(remote_ssh.socket, "socket", lambda *_args: FakeSocket())
+    monkeypatch.setattr(remote_ssh.socket, "getaddrinfo", lambda *_a, **_k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.17", 22))
+    ])
+    import pytest
+    with pytest.raises(ValueError, match="authentication failed"):
+        remote_ssh._connect_ssh_client(
+            FailedSsh(), {"hostname": "203.0.113.17", "port": 22}, tcp_max_segment=1200
+        )
+    assert closed == [True]

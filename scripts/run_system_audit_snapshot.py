@@ -33,6 +33,7 @@ if os.name != "nt":
 
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db  # noqa: E402
+from services.secure_runtime_config import load_secure_settings_into_runtime  # noqa: E402
 from web_dashboard.api.system_audit import (  # noqa: E402
     SYSTEM_AUDIT_RUNNER_RESULT_PREFIX,
     collect_system_audit_status,
@@ -47,6 +48,7 @@ async def run_once(
     collector: Callable[..., Awaitable[dict[str, Any]]] = collect_system_audit_status,
 ) -> dict[str, Any]:
     try:
+        await load_secure_settings_into_runtime()
         payload = await collector(
             record_history=record_history,
             source=source,

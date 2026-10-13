@@ -14,6 +14,7 @@ from typing import Any
 
 from core.model_candidate_manifest import ModelCandidateManifest
 from core.model_topology import qwen27_candidate_topology
+from core.remote_json_probe import collect_remote_json_snapshot
 from core.remote_ssh import connect_remote_ssh, exec_remote_command
 from core.safe_output import safe_error_text
 from services.model_server_config import (
@@ -744,11 +745,6 @@ def render_phase3_model_server_probe() -> str:
                 "| grep -Ei 'bb-phase3-llm-target|phase3|quant|local-ai|redis' || true",
                 timeout=10,
             )["stdout"], 120),
-            "unit_files": lines(run(
-                "systemctl list-unit-files --type=service --no-pager "
-                "| grep -Ei 'bb-phase3-llm-target|phase3|quant|local-ai|redis' || true",
-                timeout=10,
-            )["stdout"], 120),
             "listening_ports": lines(run(
                 "ss -ltnp 2>/dev/null | grep -E ':(8000|8101|18000|18001)\\\\b' || true",
                 timeout=5,
@@ -763,16 +759,24 @@ def render_phase3_model_server_probe() -> str:
                 "--format=csv,noheader,nounits 2>/dev/null || true",
                 timeout=8,
             )["stdout"], 80),
-            "model_paths": lines(run(
-                "find /data/BB/models -maxdepth 3 -mindepth 1 -printf '%y %p\\\\n' 2>/dev/null | sort | head -240 || true",
-                timeout=10,
-            )["stdout"], 240),
-            "manifest_files": lines(run(
-                "find /data/BB/manifests -maxdepth 2 -type f -printf '%p\\\\n' 2>/dev/null | sort || true",
-                timeout=5,
-            )["stdout"], 80),
+            "manifest_files": [
+                path for path in (
+                    DOWNLOAD_MANIFEST_PATH, VALIDATION_MANIFEST_PATH,
+                    SERVICE_MANIFEST_PATH, TARGET_CANDIDATE_MANIFEST_PATH,
+                ) if os.path.isfile(path)
+            ],
             "port_probes": [port_probe(port) for port in PROBED_RUNTIME_PORTS],
         }}
+        # Inspect the declared model paths, rather than enumerating retired
+        # versions and caches unrelated to the active readiness contract.
+        candidate = payload["target_candidate_manifest"].get("data", {{}})
+        payload["model_paths"] = [
+            "%s %s" % ("directory" if os.path.isdir(path) else "missing", path)
+            for path in dict.fromkeys(
+                str(candidate.get(key) or "")
+                for key in ("model_path", "tokenizer_path")
+            ) if path
+        ]
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         """).strip()
 
@@ -814,9 +818,14 @@ class Phase3ModelServerReadinessAuditService:
 
         try:
             info = await self._load_remote_info()
-            snapshot = await asyncio.wait_for(
-                asyncio.to_thread(self._collect_remote_snapshot, info),
-                timeout=max(int(self.timeout_seconds or 1), 1),
+            snapshot = await collect_remote_json_snapshot(
+                self.project_root,
+                info,
+                _remote_command(),
+                ssh_connector=self.ssh_connector,
+                command_executor=self.command_executor,
+                timeout_seconds=max(int(self.timeout_seconds or 1), 1),
+                max_output_chars=80_000,
             )
         except Exception as exc:
             return self._unavailable_report(exc, started_at=started_at)
@@ -838,42 +847,6 @@ class Phase3ModelServerReadinessAuditService:
                 load_model_server_info_from_platform,
                 self.project_root,
             )
-
-    def _collect_remote_snapshot(self, info: Any) -> dict[str, Any]:
-        ssh = self.ssh_connector(
-            self.project_root,
-            timeout=8,
-            banner_timeout=8,
-            auth_timeout=8,
-            info=info,
-        )
-        try:
-            result = self.command_executor(
-                ssh,
-                _remote_command(),
-                timeout=max(int(self.timeout_seconds or 24), 5),
-                max_output_chars=80_000,
-            )
-        finally:
-            ssh.close()
-        if result.status != 0:
-            raise RuntimeError(
-                safe_error_text(
-                    result.stderr or result.stdout or "phase3 model-server probe failed",
-                    fallback="phase3 model-server probe failed",
-                )
-            )
-        try:
-            payload = json.loads(str(result.stdout or "{}"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                safe_error_text(
-                    result.stdout or result.stderr or "invalid phase3 model-server payload"
-                )
-            ) from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("phase3 model-server probe payload was not an object")
-        return payload
 
     def _evaluated_report(
         self,
