@@ -294,6 +294,29 @@ class TradeRepository(BaseRepository):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_closed_positions_for_exchange_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        execution_mode: str,
+        exchange_order_id: str,
+    ) -> list[Position]:
+        """Read canonical projections of one confirmed exit fill."""
+
+        stmt = select(Position).where(
+            Position.symbol.in_(trading_symbol_variants(symbol) or {symbol}),
+            Position.side == side,
+            Position.execution_mode == execution_mode,
+            Position.is_open.is_(False),
+            Position.close_exchange_order_id == exchange_order_id,
+        )
+        result = await self.session.execute(stmt.order_by(Position.id.asc()))
+        return [
+            row for row in result.scalars().all()
+            if str(row.settlement_status or "") != "superseded_position_residual"
+        ]
+
     async def get_positions_for_update(self, position_ids: tuple[int, ...]) -> list[Position]:
         if not position_ids:
             return []

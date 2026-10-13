@@ -275,7 +275,7 @@ class ExecutionResultClassifier:
             or "no matching position to close" in text
             or "没有对应方向" in text
             or "没有可平" in text
-            or "可平仓位" in text
+            or "没有这个方向的可平仓位" in text
         )
 
     def result_has_no_exchange_position(self, result: ExecutionResult | None) -> bool:

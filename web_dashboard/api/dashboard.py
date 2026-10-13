@@ -4004,6 +4004,24 @@ def _dashboard_open_position_evidence_key(
                 )
                 if value is not None
             ),
+            "quantity": item.get("quantity"),
+            "entry_price": item.get("entry_price"),
+            "entry_exchange_order_id": item.get("entry_exchange_order_id"),
+            "stop_loss": item.get("stop_loss"),
+            "take_profit": item.get("take_profit"),
+            "management": {
+                key: _safe_dict(item.get("current_management_contract")).get(key)
+                for key in (
+                    "contract_version",
+                    "management_eligible",
+                    "blockers",
+                    "quantity",
+                    "current_price",
+                    "input_fingerprint",
+                    "entry_fee_evidence_complete",
+                    "protection_evidence_complete",
+                )
+            },
         }
         for item in positions
         if isinstance(item, dict)
@@ -4013,6 +4031,7 @@ def _dashboard_open_position_evidence_key(
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
+        default=str,
     )
     fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
     providers = (
@@ -4020,6 +4039,27 @@ def _dashboard_open_position_evidence_key(
         id(_dashboard_open_position_protection_evidence),
     )
     return f"{selected_mode}:{settings.database_url}:{fingerprint}:{providers[0]}:{providers[1]}"
+
+
+def _merge_dashboard_position_evidence(
+    positions: list[dict[str, Any]],
+    cached_positions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    # Evidence may be reused, but cached rows must never replace current marks,
+    # quantities or management contracts from this request.
+    evidence_by_key = {
+        _dashboard_open_position_evidence_key([item], mode=item.get("mode")): item
+        for item in cached_positions
+    }
+    result = copy.deepcopy(positions)
+    for item in result:
+        cached = evidence_by_key.get(
+            _dashboard_open_position_evidence_key([item], mode=item.get("mode")), {}
+        )
+        for field in ("risk_contract", "protection_contract"):
+            if field in cached:
+                item[field] = copy.deepcopy(cached[field])
+    return result
 
 
 def _dashboard_pending_risk_evidence(positions: list[dict[str, Any]]) -> None:
@@ -4134,10 +4174,12 @@ async def _get_dashboard_open_position_evidence_snapshot(
         cached_at, cached_positions, cached_inventory = cached
         age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
         if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_CACHE_TTL_SECONDS:
-            return copy.deepcopy(cached_positions), copy.deepcopy(cached_inventory)
+            return _merge_dashboard_position_evidence(
+                positions, cached_positions
+            ), copy.deepcopy(cached_inventory)
         if age_seconds <= _DASHBOARD_OPEN_POSITION_EVIDENCE_STALE_TTL_SECONDS:
             _start_dashboard_open_position_evidence_refresh(cache_key, positions, mode=mode)
-            stale_positions = copy.deepcopy(cached_positions)
+            stale_positions = _merge_dashboard_position_evidence(positions, cached_positions)
             for item in stale_positions:
                 item["evidence_stale"] = True
                 item["evidence_refresh_in_background"] = True
@@ -10757,49 +10799,10 @@ async def get_positions(
             exchange_mark_map,
             mode=mode,
         )
-        risk_result, protection_result = await _dashboard_open_position_evidence_bounded(
+        positions, protection_inventory = await _build_dashboard_open_position_evidence_snapshot(
             positions,
             mode=mode,
         )
-        if isinstance(risk_result, BaseException):
-            _log_dashboard_fallback(
-                "open position risk evidence unavailable",
-                risk_result,
-                mode=mode,
-            )
-            blocker = (
-                f"position_risk_evidence_unavailable:{safe_error_text(risk_result, limit=120)}"
-            )
-            for item in positions:
-                item["risk_contract"] = {
-                    "available": False,
-                    "contracts": [],
-                    "blockers": [blocker],
-                }
-        if isinstance(protection_result, BaseException):
-            _log_dashboard_fallback(
-                "open position OCO evidence unavailable",
-                protection_result,
-                mode=mode,
-            )
-            blocker = (
-                "okx_protection_evidence_unavailable:"
-                f"{safe_error_text(protection_result, limit=120)}"
-            )
-            for item in positions:
-                item["protection_contract"] = {
-                    "available": False,
-                    "orders": [],
-                    "blockers": [blocker],
-                }
-            protection_inventory = {
-                "available": False,
-                "blockers": [blocker],
-                "orphan_keys": [],
-                "split_coverage_keys": [],
-            }
-        else:
-            protection_inventory = protection_result
 
     display_total = len(positions) if open_only or closed_only else total
     display_open_count = len(positions) if open_only else open_count

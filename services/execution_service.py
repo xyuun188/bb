@@ -1678,6 +1678,7 @@ class ExecutionService:
             local_order_fact_created = True
             local_order_fact_owner_decision_id = decision_db_id
             local_order_persistence_error: str | None = None
+            local_position_persistence_error: str | None = None
             recovery_requested = False
             try:
                 order_log_outcome = await log_trade(
@@ -1857,13 +1858,39 @@ class ExecutionService:
                     increment_trade_count()
                 if local_order_persisted:
                     if local_order_fact_created:
-                        await persist_position_from_execution(
-                            model_name,
-                            decision,
-                            execution_result,
-                            model_mode,
-                        )
-                        if open_positions is not None:
+                        try:
+                            await persist_position_from_execution(
+                                model_name,
+                                decision,
+                                execution_result,
+                                model_mode,
+                            )
+                        except Exception as exc:
+                            local_position_persistence_error = safe_error_text(exc, limit=180)
+                            recovery_requested = self._trigger_order_fact_recovery(model_mode)
+                            raw = dict(_safe_dict(decision.raw_response))
+                            raw["local_position_persistence"] = {
+                                "status": "failed",
+                                "error": local_position_persistence_error,
+                                "exchange_order_id": execution_result.exchange_order_id,
+                                "recovery_requested": recovery_requested,
+                            }
+                            decision.raw_response = raw
+                            warning = (
+                                "OKX 成交与本地订单已确认，但持仓写入失败；"
+                                "已请求成交事实补偿，本次未提前更新内存持仓。"
+                            )
+                            results["warnings"].append(
+                                {"model": model_name, "symbol": symbol, "warning": warning}
+                            )
+                            await log_risk_event("warning", symbol, warning, model_name)
+                        if (
+                            open_positions is not None
+                            and not local_position_persistence_error
+                            and not _safe_dict(execution_result.raw_response).get(
+                                "position_projection_reconciled"
+                            )
+                        ):
                             apply_execution_to_open_positions(
                                 open_positions,
                                 model_name,
@@ -1904,9 +1931,15 @@ class ExecutionService:
                             decision.raw_response = raw
                     await mark_stage(
                         DecisionStage.LOCAL_SYNC,
-                        DecisionStageStatus.COMPLETED,
                         (
-                            "成交结果已写入本地订单/持仓记录。"
+                            DecisionStageStatus.FAILED
+                            if local_position_persistence_error
+                            else DecisionStageStatus.COMPLETED
+                        ),
+                        (
+                            "OKX 成交已确认，但本地持仓写入失败；正在通过成交事实补偿恢复。"
+                            if local_position_persistence_error
+                            else "成交结果已写入本地订单/持仓记录。"
                             if local_order_fact_created
                             else "该 OKX 成交事实已存在；本次重复回调仅合并证据，未重复改动持仓。"
                         ),
@@ -1914,6 +1947,8 @@ class ExecutionService:
                             "exit_progress": bool(exit_progress),
                             "exchange_confirmed": bool(exchange_confirmed),
                             "order_fact_created": local_order_fact_created,
+                            "local_position_persistence_error": local_position_persistence_error,
+                            "recovery_requested": recovery_requested,
                             "order_fact_owner_decision_id": (
                                 local_order_fact_owner_decision_id
                             ),

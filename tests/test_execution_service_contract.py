@@ -1586,6 +1586,51 @@ async def test_execution_service_recovers_when_confirmed_order_fact_write_fails(
 
 
 @pytest.mark.asyncio
+async def test_execution_service_keeps_fill_and_recovers_failed_position_write() -> None:
+    recovery_requests = []
+    memory_updates = []
+    stages = []
+
+    class FilledExecutor:
+        async def place_order(self, decision, **_kwargs):
+            return ExecutionResult(
+                order_id="local-position-error", exchange_order_id="okx-position-error",
+                symbol=decision.symbol, side="sell", order_type="market",
+                quantity=2.0, price=100.0, status=OrderStatus.FILLED, raw_response={},
+            )
+
+    async def executor_provider(_mode):
+        return FilledExecutor()
+
+    async def failed_position_persist(*_args, **_kwargs):
+        raise RuntimeError("position write failed")
+
+    service = _test_execution_service(
+        okx_executor_provider=executor_provider,
+        position_execution_persister=failed_position_persist,
+        order_fact_recovery_trigger=lambda mode: recovery_requests.append(mode),
+        open_positions_execution_applier=lambda *_args: memory_updates.append(True),
+        stages=stages,
+    )
+    results = {"warnings": [], "decisions": [], "executions": []}
+    decision = _profit_first_ready_position_review_decision()
+    result = await service.execute_candidate(
+        decision.symbol, "ensemble_trader", decision, SimpleNamespace(warnings=[]),
+        992, results, open_positions=[],
+    )
+
+    assert result.status == OrderStatus.FILLED
+    assert recovery_requests and set(recovery_requests) == {"paper"}
+    assert memory_updates == []
+    assert decision.raw_response["local_position_persistence"]["status"] == "failed"
+    assert results["warnings"]
+    assert any(stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.FAILED
+               for stage, status, _reason in stages)
+    assert not any(stage == DecisionStage.LOCAL_SYNC and status == DecisionStageStatus.COMPLETED
+                   for stage, status, _reason in stages)
+
+
+@pytest.mark.asyncio
 async def test_execution_service_requests_authoritative_facts_after_confirmed_write() -> None:
     recovery_requests: list[str] = []
 

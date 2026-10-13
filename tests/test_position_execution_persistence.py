@@ -63,6 +63,18 @@ class FakeTradeRepo:
             and position.is_open
         ]
 
+    async def get_closed_positions_for_exchange_order(
+        self, *, symbol, side, execution_mode, exchange_order_id,
+    ):
+        rows = [*self.positions, *[SimpleNamespace(**item) for item in self.opened]]
+        return [
+            row for row in rows
+            if row.symbol == symbol and row.side == side
+            and row.execution_mode == execution_mode and not row.is_open
+            and getattr(row, "close_exchange_order_id", None) == exchange_order_id
+            and getattr(row, "settlement_status", None) != "superseded_position_residual"
+        ]
+
 
 def _decision(action: Action) -> DecisionOutput:
     return DecisionOutput(
@@ -772,4 +784,84 @@ async def test_persist_skips_unconfirmed_or_invalid_execution() -> None:
         execution_mode="paper",
     )
 
+    assert repo.opened == []
+
+
+@pytest.mark.asyncio
+async def test_persist_surfaces_position_write_failure() -> None:
+    class FailingRepo(FakeTradeRepo):
+        async def open_position(self, data: dict[str, Any]) -> Any:
+            raise RuntimeError("position write failed")
+
+    with pytest.raises(RuntimeError, match="position write failed"):
+        await _service(session=FakeSession(), repo=FailingRepo()).persist(
+            model_name="ensemble_trader",
+            decision=_decision(Action.LONG),
+            result=_result(quantity=1.0),
+            execution_mode="paper",
+        )
+
+
+@pytest.mark.asyncio
+async def test_exit_sync_projection_prevents_second_reduction() -> None:
+    session = FakeSession()
+    position = _position(quantity=3.0)
+    already_closed = _position(
+        id=2, quantity=2.0, is_open=False, close_exchange_order_id="close-123",
+        settlement_status="settling",
+    )
+    retired_duplicate = _position(
+        id=3, quantity=2.0, is_open=False, close_exchange_order_id="close-123",
+        settlement_status="superseded_position_residual",
+    )
+    repo = FakeTradeRepo([position, already_closed, retired_duplicate])
+    reflections = []
+    result = _result(quantity=2.0, exchange_order_id="close-123")
+    await _service(session=session, repo=repo, reflections=reflections).persist(
+        model_name="ensemble_trader", decision=_decision(Action.CLOSE_LONG),
+        result=result, execution_mode="paper",
+    )
+
+    assert position.quantity == 3.0
+    assert repo.opened == []
+    assert reflections == []
+    assert result.raw_response["position_projection_reconciled"] is True
+
+
+@pytest.mark.asyncio
+async def test_exit_replay_only_applies_unprojected_quantity() -> None:
+    session = FakeSession()
+    position = _position(quantity=3.0)
+    already_closed = _position(
+        id=2, quantity=1.0, is_open=False, close_exchange_order_id="close-123",
+        settlement_status="settling",
+    )
+    retired_duplicate = _position(
+        id=3, quantity=1.0, is_open=False, close_exchange_order_id="close-123",
+        settlement_status="superseded_position_residual",
+    )
+    repo = FakeTradeRepo([position, already_closed, retired_duplicate])
+    await _service(session=session, repo=repo).persist(
+        model_name="ensemble_trader", decision=_decision(Action.CLOSE_LONG),
+        result=_result(quantity=2.0, exchange_order_id="close-123"), execution_mode="paper",
+    )
+
+    assert position.quantity == 2.0
+    assert repo.opened[0]["quantity"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_exit_replay_surfaces_conflicting_projection_quantity() -> None:
+    position = _position(quantity=3.0)
+    closed = _position(
+        id=2, quantity=3.0, is_open=False, close_exchange_order_id="close-123",
+        settlement_status="settling",
+    )
+    repo = FakeTradeRepo([position, closed])
+    with pytest.raises(RuntimeError, match="conflicting canonical"):
+        await _service(session=FakeSession(), repo=repo).persist(
+            model_name="ensemble_trader", decision=_decision(Action.CLOSE_LONG),
+            result=_result(quantity=2.0, exchange_order_id="close-123"), execution_mode="paper",
+        )
+    assert position.quantity == 3.0
     assert repo.opened == []

@@ -3879,6 +3879,50 @@ def test_trade_history_marks_no_position_exit_as_reconciled_terminal_state() -> 
     assert _execution_status_label("rejected", reason) == "已同步，无需重复平仓"
 
 
+@pytest.mark.asyncio
+async def test_no_position_trade_list_and_detail_agree(tmp_path, monkeypatch) -> None:
+    from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+
+    await close_db()
+    monkeypatch.setattr(settings, "database_url",
+                        f"sqlite+aiosqlite:///{(tmp_path / 'no-position.db').as_posix()}")
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            reason = "OKX 当前没有对应方向的可平仓位。"
+            decision = AIDecision(
+                model_name="ensemble_trader", symbol="MAGIC/USDT",
+                action="close_short", confidence=0.8, reasoning=reason,
+                position_size_pct=1.0, suggested_leverage=3.0,
+                is_paper=True, was_executed=False, execution_reason=reason,
+                raw_llm_response=append_decision_stage(
+                    {}, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.FAILED,
+                    reason, data={"order_id": "no_position"},
+                ),
+            )
+            session.add(decision)
+            await session.flush()
+            order = await TradeRepository(session).create_order({
+                "model_name": "ensemble_trader", "execution_mode": "paper",
+                "symbol": "MAGIC/USDT", "side": "buy", "order_type": "market",
+                "quantity": 1.0, "price": 0.12, "status": "rejected",
+                "decision_id": decision.id, "exchange_order_id": "no_position",
+            })
+            order_id = order.id
+
+        listing = await get_trades(model_name=None, symbol=None, mode="paper", limit=10, page=1)
+        detail = await get_trade_detail(order_id)
+        row = next(item for item in listing["trades"] if item["id"] == order_id)
+
+        assert row["execution_failure_kind"] == detail["execution_failure_kind"] == "no_exchange_position"
+        assert detail["final_result"]["status"] == "no_exchange_position"
+        assert detail["failed_step"] is None
+        assert detail["repair_suggestions"] == []
+        assert detail["stage_events"][0]["status"] == "failed"
+    finally:
+        await close_db()
+
+
 def test_trade_detail_does_not_use_numeric_order_id_as_reason() -> None:
     reason = _readable_execution_reason(
         execution_reason="",

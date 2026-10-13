@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.repositories.trade_repo import TradeRepository
 from models.decision import AIDecision
-from models.trade import Order
+from models.trade import Order, Position
 
 
 class _RaceResult:
@@ -55,6 +55,37 @@ class _RaceSession:
 
     async def get(self, _model, _id):
         return None
+
+
+async def test_exit_projection_query_excludes_retired_and_other_groups() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Position.__table__.create)
+        async with sessions() as session:
+            common = {
+                "model_name": "ensemble_trader", "execution_mode": "paper",
+                "symbol": "SLX/USDT", "side": "long", "quantity": 140.0,
+                "entry_price": 0.0526, "current_price": 0.0523, "is_open": False,
+                "close_exchange_order_id": "close-123",
+            }
+            canonical = Position(**common, settlement_status="settling")
+            session.add_all([
+                canonical,
+                Position(**common, settlement_status="superseded_position_residual"),
+                Position(**{**common, "execution_mode": "live"}),
+                Position(**{**common, "side": "short"}),
+                Position(**{**common, "close_exchange_order_id": "close-other"}),
+            ])
+            await session.flush()
+            rows = await TradeRepository(session).get_closed_positions_for_exchange_order(
+                symbol="SLX/USDT", side="long", execution_mode="paper",
+                exchange_order_id="close-123",
+            )
+            assert [row.id for row in rows] == [canonical.id]
+    finally:
+        await engine.dispose()
 
 
 async def test_same_exchange_order_from_different_decisions_reuses_one_fact() -> None:

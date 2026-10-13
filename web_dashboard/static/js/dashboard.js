@@ -8591,7 +8591,13 @@ function executionStatusPresentation(record, explicitSuccess = null) {
         : (isTransientExchange ? 'var(--orange)' : 'var(--red)');
     return { label, color, kind, success, isTransientExchange, isNoExchangePosition };
 }
-function fmtPrice(p) { return p ? Number(p).toFixed(4) : '0.0000'; }
+function fmtPrice(p) {
+    if (p === null || p === undefined || p === '') return '-';
+    const price = Number(p);
+    if (!Number.isFinite(price) || price <= 0) return '-';
+    const decimals = Math.max(4, Math.min(20, 3 - Math.floor(Math.log10(price))));
+    return price.toFixed(decimals);
+}
 function fmtPct(p) { return p ? Number(p).toFixed(2) + '%' : '0.00%'; }
 function fmtNum(n) { return n ? Number(n).toFixed(4) : '0'; }
 function compactIdentifier(value, maxLength = 20) {
@@ -10888,9 +10894,11 @@ function renderExecutionDetailModal(trade, detailData = null) {
     );
     const finalTitle = finalResult?.success
         ? '执行成功'
+        : detailStatusInfo.isNoExchangePosition ? '无需重复平仓'
         : (detailStatusInfo.isTransientExchange ? '交易所临时不可用' : '执行未完成/失败');
     const reasonLabel = success
         ? '执行原因'
+        : detailStatusInfo.isNoExchangePosition ? '同步说明'
         : (detailStatusInfo.isTransientExchange ? '临时故障原因' : '失败原因');
     const finalHtml = finalResult ? `
         <div class="reason-block">

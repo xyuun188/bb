@@ -532,9 +532,11 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     )
 
 
+@pytest.mark.parametrize("mark_price", [101.0, 99.0])
 @pytest.mark.asyncio
 async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
     monkeypatch: pytest.MonkeyPatch,
+    mark_price: float,
 ) -> None:
     opened_at = datetime(2026, 8, 15, 0, 0, tzinfo=UTC)
     position = SimpleNamespace(
@@ -642,8 +644,8 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
                 "contracts": 2.0,
                 "contractSize": 1.0,
                 "entryPrice": 100.0,
-                "markPrice": 101.0,
-                "notional": 202.0,
+                "markPrice": mark_price,
+                "notional": mark_price * 2.0,
                 "info": {"instId": "BTC-USDT-SWAP", "pos": "2", "posSide": "long"},
             }
         ],
@@ -677,6 +679,7 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
     assert contract["funding_evidence_complete"] is True
     assert contract["funding_evidence_eligible"] is True
     assert contract["funding_window_opened_at"] == opened_at.isoformat()
+    assert contract["current_price"] == pytest.approx(mark_price)
 
 
 @pytest.mark.asyncio

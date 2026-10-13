@@ -1720,7 +1720,7 @@ def test_persisted_data_collection_status_marks_expired_snapshot_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checked_at = datetime.now(UTC) - timedelta(
-        seconds=data_collection_module.STATUS_CACHE_TTL_SECONDS + 5
+        seconds=data_collection_module._persisted_status_stale_after_seconds(False) + 5
     )
     persisted = {
         "checked_at": checked_at.isoformat(),
@@ -1742,6 +1742,27 @@ def test_persisted_data_collection_status_marks_expired_snapshot_stale(
     assert payload["freshness"]["is_stale"] is True
     assert payload["cache"]["stale_snapshot"] is True
     assert "persisted_snapshot_stale" in payload["degraded_reason"]
+
+
+@pytest.mark.parametrize("interval", [120, 300, 600])
+def test_persisted_basic_snapshot_matches_background_refresh_cadence(
+    monkeypatch: pytest.MonkeyPatch, interval: int,
+) -> None:
+    monkeypatch.setattr(settings, "data_collection_status_refresh_interval_seconds", interval)
+    checked_at = datetime.now(UTC) - timedelta(seconds=interval - 1)
+    persisted = {
+        "checked_at": checked_at.isoformat(), "source": "dashboard.data_collection",
+        "status": "ok", "freshness": {"state": "ok", "is_stale": False},
+    }
+    monkeypatch.setattr(data_collection_module, "load_persisted_data_collection_status",
+                        lambda _include: (checked_at, persisted))
+
+    payload = data_collection_module._persisted_status_payload(False)
+
+    assert payload["status"] == "ok"
+    assert payload["freshness"]["is_stale"] is False
+    assert payload["freshness"]["stale_after_seconds"] > interval
+    assert data_collection_module._persisted_status_payload(True)["freshness"]["is_stale"] is True
 
 
 async def _async_value(value: Any) -> Any:

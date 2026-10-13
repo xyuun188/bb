@@ -184,6 +184,10 @@ class PositionExecutionPersistenceService:
                     )
         except Exception as exc:
             logger.error("failed to persist position", error=safe_error_text(exc))
+            # The execution boundary owns LOCAL_SYNC. Re-raise so a confirmed
+            # exchange fill cannot be reported as synchronized after a failed
+            # position write; the caller can then request fact recovery.
+            raise
 
     @staticmethod
     def _result_symbol(result: Any, decision: DecisionOutput) -> str:
@@ -440,6 +444,33 @@ class PositionExecutionPersistenceService:
         result_okx_inst_id = self._result_okx_inst_id(result, symbol)
         result_okx_pos_id = self._result_okx_pos_id(result)
         close_exchange_order_id = self._result_exchange_order_id(result)
+        projected_quantity = 0.0
+        if close_exchange_order_id:
+            projected = await repo.get_closed_positions_for_exchange_order(
+                symbol=symbol,
+                side=side,
+                execution_mode=execution_mode,
+                exchange_order_id=close_exchange_order_id,
+            )
+            projected_quantity = sum(max(float(row.quantity or 0.0), 0.0) for row in projected)
+            if projected_quantity > result.quantity and not _quantity_is_dust(
+                projected_quantity - result.quantity, result.quantity
+            ):
+                raise RuntimeError("exit fill has conflicting canonical position quantities")
+            if projected_quantity > 0:
+                raw = dict(getattr(result, "raw_response", None) or {})
+                raw["position_projection_reconciled"] = True
+                result.raw_response = raw
+            if projected_quantity > 0 and (
+                projected_quantity >= result.quantity
+                or _quantity_is_dust(result.quantity - projected_quantity, result.quantity)
+            ):
+                logger.info(
+                    "exit fill position projection already applied",
+                    exchange_order_id=close_exchange_order_id,
+                    projected_quantity=projected_quantity,
+                )
+                return
         positions = await repo.get_matching_open_positions(
             model_name=model_name,
             symbol=symbol,
@@ -485,7 +516,7 @@ class PositionExecutionPersistenceService:
                 position.created_at or datetime.min,
             ),
         )
-        remaining_qty = result.quantity
+        remaining_qty = max(result.quantity - projected_quantity, 0.0)
         total_pnl = 0.0
         for position in positions:
             if remaining_qty <= 0 or _quantity_is_dust(remaining_qty, result.quantity):

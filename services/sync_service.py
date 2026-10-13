@@ -36,7 +36,10 @@ from services.current_position_management import (
     build_current_position_management_contract,
 )
 from services.entry_fee_provider import entry_fee_from_orders
-from services.exchange_position_state import parse_exchange_position_snapshot
+from services.exchange_position_state import (
+    exchange_snapshot_price,
+    parse_exchange_position_snapshot,
+)
 from services.exit_execution_singleflight import preserve_exit_execution_intent
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
@@ -2621,11 +2624,7 @@ class OkxSyncService:
                     "contracts": contracts,
                     "quantity": quantity,
                     "entry_price": entry_price,
-                    "current_price": max(
-                        float_parser(snapshot.get("mark_price"), 0.0),
-                        float_parser(snapshot.get("last_price"), 0.0),
-                        entry_price,
-                    ),
+                    "current_price": exchange_snapshot_price(snapshot) or entry_price,
                     "position_notional_usdt": max(
                         float_parser(snapshot.get("notional"), 0.0),
                         0.0,

@@ -94,6 +94,22 @@ _status_refresh_tasks: dict[bool, asyncio.Task[Any]] = {}
 _status_refresh_locks: dict[bool, asyncio.Lock] = {}
 
 
+def data_collection_status_refresh_interval_seconds() -> int:
+    return max(
+        120,
+        int(getattr(settings, "data_collection_status_refresh_interval_seconds", 300) or 300),
+    )
+
+
+def _persisted_status_stale_after_seconds(include_feature_coverage: bool) -> float:
+    if include_feature_coverage:
+        return STATUS_CACHE_TTL_SECONDS
+    return max(
+        STATUS_CACHE_TTL_SECONDS,
+        data_collection_status_refresh_interval_seconds() + STATUS_INITIAL_REFRESH_TIMEOUT_SECONDS,
+    )
+
+
 def _status_snapshot_path(include_feature_coverage: bool) -> Path:
     scope = "full" if include_feature_coverage else "basic"
     return settings.data_dir / f"{STATUS_SNAPSHOT_FILE_PREFIX}_{scope}.json"
@@ -1686,12 +1702,14 @@ def _persisted_status_payload(
     checked_at, payload = persisted
     result = dict(payload)
     age_seconds = max((datetime.now(UTC) - checked_at).total_seconds(), 0.0)
+    stale_after_seconds = _persisted_status_stale_after_seconds(include_feature_coverage)
     freshness = result.get("freshness")
     freshness = dict(freshness) if isinstance(freshness, dict) else {}
     freshness.update(
         {
             "age_seconds": round(age_seconds, 3),
-            "is_stale": age_seconds > STATUS_CACHE_TTL_SECONDS,
+            "is_stale": age_seconds > stale_after_seconds,
+            "stale_after_seconds": stale_after_seconds,
         }
     )
     if freshness["is_stale"] and str(result.get("status") or "").lower() in {
@@ -1712,7 +1730,7 @@ def _persisted_status_payload(
     result["freshness"] = freshness
     result["cache"] = {
         "age_seconds": round(age_seconds, 3),
-        "ttl_seconds": STATUS_CACHE_TTL_SECONDS,
+        "ttl_seconds": stale_after_seconds,
         "refresh_in_progress": False,
         "cold_start": False,
         "persisted_snapshot": True,

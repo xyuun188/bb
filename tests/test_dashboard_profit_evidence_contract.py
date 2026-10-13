@@ -208,6 +208,74 @@ def test_open_position_evidence_budget_exceeds_protection_read_budget() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_cached_position_evidence_keeps_current_marks_and_pnl(monkeypatch) -> None:
+    rows = [{
+        "id": 7, "symbol": "SLX/USDT", "side": "long", "quantity": 1060.0,
+        "current_price": 0.0526, "unrealized_pnl": 0.0,
+    }]
+    cached_rows = [{
+        **rows[0],
+        "risk_contract": {"effective_available": True},
+        "protection_contract": {"available": True, "blockers": []},
+    }]
+    key = dashboard._dashboard_open_position_evidence_key(rows, mode="paper")
+    monkeypatch.setattr(dashboard, "_dashboard_open_position_evidence_cache", {
+        key: (datetime.now(UTC), cached_rows, {"available": True}),
+    })
+    rows[0]["current_price"] = 0.0523
+    rows[0]["unrealized_pnl"] = -0.318
+
+    result, inventory = await dashboard._get_dashboard_open_position_evidence_snapshot(
+        rows, mode="paper"
+    )
+
+    assert result[0]["current_price"] == 0.0523
+    assert result[0]["unrealized_pnl"] == -0.318
+    assert result[0]["protection_contract"]["available"] is True
+    assert inventory["available"] is True
+    assert cached_rows[0]["current_price"] == 0.0526
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [
+    {"quantity": 920.0},
+    {"current_management_contract": {"management_eligible": True, "blockers": []}},
+    {"entry_exchange_order_id": "new-entry"},
+])
+async def test_position_evidence_refreshes_after_state_change(monkeypatch, changed) -> None:
+    old = [{
+        "id": 7, "symbol": "SLX/USDT", "side": "long", "quantity": 1060.0,
+        "current_management_contract": {
+            "management_eligible": False, "blockers": ["stale_quantity"],
+        },
+    }]
+    old_key = dashboard._dashboard_open_position_evidence_key(old, mode="paper")
+    monkeypatch.setattr(dashboard, "_dashboard_open_position_evidence_cache", {
+        old_key: (datetime.now(UTC), old, {"available": False}),
+    })
+    monkeypatch.setattr(dashboard, "_dashboard_open_position_evidence_refresh_tasks", {})
+    calls = []
+
+    async def build(rows, *, mode):
+        calls.append(rows)
+        rows[0]["risk_contract"] = {"effective_available": True}
+        return rows, {"available": True}
+
+    monkeypatch.setattr(dashboard, "_build_dashboard_open_position_evidence_snapshot", build)
+    current = [{**old[0], **changed}]
+
+    result, inventory = await dashboard._get_dashboard_open_position_evidence_snapshot(
+        current, mode="paper"
+    )
+
+    assert len(calls) == 1
+    assert result[0]["quantity"] == current[0]["quantity"]
+    assert result[0]["current_management_contract"] == current[0]["current_management_contract"]
+    assert inventory["available"] is True
+    await asyncio.sleep(0)
+
+
 def test_market_direction_without_execution_permission_is_displayed_as_observation() -> None:
     decision = SimpleNamespace(
         action="long",

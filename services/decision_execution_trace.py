@@ -13,6 +13,7 @@ from services.decision_state import (
     DecisionStageStatus,
     decision_state_from_raw,
 )
+from services.execution_result_classifier import ExecutionResultClassifier
 from services.okx_error_classifier import is_okx_temporary_service_error
 
 PROBLEM_STATUSES = {DecisionStageStatus.BLOCKED, DecisionStageStatus.FAILED}
@@ -60,6 +61,16 @@ def _status_label(status: str) -> str:
 
 def _stage_label(stage: str) -> str:
     return STAGE_LABELS.get(stage, stage or "未知步骤")
+
+
+def _is_no_position_step(step: dict[str, Any]) -> bool:
+    data = _safe_dict(step.get("data"))
+    return (
+        data.get("order_id") == "no_position"
+        or data.get("error_type") == "position_already_closed"
+        or data.get("skip_kind") == "position_already_closed"
+        or ExecutionResultClassifier.is_no_exchange_position_error(step.get("reason"))
+    )
 
 
 def _normal_event(event: dict[str, Any], index: int) -> dict[str, Any]:
@@ -176,6 +187,38 @@ def build_execution_trace(
         )
         steps.append(event)
 
+    # Preserve the original events for audit, but project obsolete no-position
+    # failures as skipped reconciliation rather than a failed order.
+    no_position = str(order_status or "").lower() != "filled" and (
+        ExecutionResultClassifier.is_no_exchange_position_error(fallback_reason)
+        or any(
+            str(step.get("stage") or "") in {
+                DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM
+            }
+            and _is_no_position_step(step)
+            for step in steps
+        )
+    )
+    if no_position:
+        for step in steps:
+            synthesized = step["data"].get("source") == "order_snapshot"
+            if step["stage"] in {
+                DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM,
+            } and step["status"] in PROBLEM_STATUSES and (
+                _is_no_position_step(step) or synthesized
+            ):
+                step["status"] = DecisionStageStatus.SKIPPED
+                step["status_label"] = _status_label(DecisionStageStatus.SKIPPED)
+                step["data"] = {**step["data"], "error_type": "position_already_closed"}
+                if synthesized:
+                    step["reason"] = fallback_reason
+
+    no_position = no_position and any(
+        step["status"] == DecisionStageStatus.SKIPPED
+        and _is_no_position_step(step)
+        for step in steps
+    )
+
     failed_step = next(
         (step for step in steps if str(step.get("status") or "") in PROBLEM_STATUSES),
         None,
@@ -183,6 +226,7 @@ def build_execution_trace(
     final_step = failed_step or (steps[-1] if steps else None)
     success = bool(
         not failed_step
+        and not no_position
         and final_step
         and (
             str(final_step.get("status") or "") in SUCCESS_STATUSES
@@ -205,6 +249,12 @@ def build_execution_trace(
         order_status=order_status,
         fallback_reason=fallback_reason,
     )
+    if no_position and failed_step is None:
+        repair_suggestions = []
+        final_reason = (
+            fallback_reason
+            or "OKX 当前已无对应方向持仓，本次未重复提交平仓；本地状态已刷新。"
+        )
     return {
         "execution_steps": steps,
         "stage_events": events,
@@ -213,6 +263,8 @@ def build_execution_trace(
             "status": (
                 "success"
                 if success
+                else "no_exchange_position"
+                if no_position and failed_step is None
                 else ("transient_exchange_error" if transient_exchange_error else "failed")
             ),
             "stage": final_step.get("stage") if final_step else None,
@@ -220,9 +272,12 @@ def build_execution_trace(
             "status_label": (
                 "交易所临时不可用"
                 if transient_exchange_error
+                else "已同步，无需重复平仓"
+                if no_position and failed_step is None
                 else (final_step.get("status_label") if final_step else "")
             ),
-            "reason": final_step.get("reason") if final_step else fallback_reason,
+            "reason": final_reason if no_position and failed_step is None
+            else (final_step.get("reason") if final_step else fallback_reason),
             "total_duration_sec": round(total_duration, 3),
         },
         "failed_step": failed_step,

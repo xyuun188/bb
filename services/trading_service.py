@@ -14972,12 +14972,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
         result,
         execution_mode: str,
     ) -> None:
-        await self.position_execution_persistence.persist(
-            model_name=model_name,
-            decision=decision,
-            result=result,
-            execution_mode=execution_mode,
-        )
+        async with self._exchange_reconcile_lock:
+            await self.position_execution_persistence.persist(
+                model_name=model_name,
+                decision=decision,
+                result=result,
+                execution_mode=execution_mode,
+            )
 
     async def _log_risk_event(
         self,

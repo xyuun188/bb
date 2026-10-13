@@ -65,3 +65,71 @@ def test_execution_trace_labels_okx_50001_as_transient_exchange_error() -> None:
     assert trace["repair_suggestions"] == [
         "OKX 交易所服务临时不可用：系统未拿到成交确认，本地仓位未改动；已临时跳过该币种，稍后自动重试。"
     ]
+
+
+def test_no_position_projects_historical_failure_without_inventing_fill() -> None:
+    raw = append_decision_stage(
+        {}, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.FAILED,
+        "OKX 当前没有对应方向的可平仓位。",
+        data={"order_id": "no_position", "status": "rejected"},
+    )
+    trace = build_execution_trace(raw, order_status="rejected",
+                                  fallback_reason="OKX 当前没有对应方向的可平仓位。")
+
+    assert trace["final_result"]["status"] == "no_exchange_position"
+    assert trace["final_result"]["success"] is False
+    assert trace["final_result"]["status_label"] == "已同步，无需重复平仓"
+    assert "没有对应方向" in trace["final_result"]["reason"]
+    assert trace["failed_step"] is None
+    assert trace["repair_suggestions"] == []
+    assert trace["execution_steps"][0]["status"] == "skipped"
+    assert trace["stage_events"][0]["status"] == "failed"
+
+
+def test_no_position_does_not_hide_other_failure() -> None:
+    raw = append_decision_stage(
+        {}, DecisionStage.RISK_CHECK, DecisionStageStatus.FAILED, "invalid risk contract"
+    )
+    raw = append_decision_stage(
+        raw, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.FAILED,
+        "No matching position to close", data={"order_id": "no_position"},
+    )
+    trace = build_execution_trace(raw, order_status="rejected")
+
+    assert trace["final_result"]["status"] == "failed"
+    assert trace["failed_step"]["stage"] == DecisionStage.RISK_CHECK
+
+
+def test_no_position_keeps_local_sync_failure_visible() -> None:
+    raw = append_decision_stage(
+        {}, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.FAILED,
+        "No matching position to close", data={"order_id": "no_position"},
+    )
+    raw = append_decision_stage(
+        raw, DecisionStage.LOCAL_SYNC, DecisionStageStatus.FAILED,
+        "position reconciliation database write failed",
+    )
+    trace = build_execution_trace(raw, order_status="rejected")
+
+    assert trace["final_result"]["status"] == "failed"
+    assert trace["failed_step"]["stage"] == DecisionStage.LOCAL_SYNC
+    assert trace["stage_events"][0]["status"] == "failed"
+
+
+def test_no_position_snapshot_without_stage_events_is_terminal_skip() -> None:
+    trace = build_execution_trace(
+        {}, order_status="rejected", fallback_reason="No matching position to close"
+    )
+
+    assert trace["final_result"]["status"] == "no_exchange_position"
+    assert trace["final_result"]["success"] is False
+    assert trace["failed_step"] is None
+
+
+def test_close_quantity_error_is_not_no_position() -> None:
+    trace = build_execution_trace(
+        {}, order_status="rejected", fallback_reason="可平仓位数量不符合交易所步长"
+    )
+
+    assert trace["final_result"]["status"] == "failed"
+    assert trace["failed_step"] is not None

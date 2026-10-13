@@ -128,13 +128,11 @@ async def _data_collection_status_loop() -> None:
     """Keep durable data-collection snapshots current for pages and audits."""
 
     from web_dashboard.api.data_collection import (
+        data_collection_status_refresh_interval_seconds,
         refresh_data_collection_status_snapshot,
     )
 
-    interval = max(
-        120,
-        int(settings.data_collection_status_refresh_interval_seconds or 300),
-    )
+    interval = data_collection_status_refresh_interval_seconds()
     # Give the Dashboard a short startup window to initialize its database
     # runtime before the first snapshot build.
     await asyncio.sleep(1.0)
