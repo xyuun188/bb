@@ -527,8 +527,13 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_training_entry_requires_current_raw_return": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
         "paper_training_entry_allows_non_positive_fee_after_return": True,
-        "paper_training_entry_is_shadow_only": False,
-        "paper_training_entry_authorizes_normal_entry": True,
+        # Training observations with non-positive fee-after-return are
+        # shadow-only.  Keep this public policy contract aligned with the
+        # sizing owner; a contradictory audit flag made the dashboard report
+        # that training entries could authorize normal orders even though the
+        # execution path correctly withheld them.
+        "paper_training_entry_is_shadow_only": True,
+        "paper_training_entry_authorizes_normal_entry": False,
         "paper_training_entry_production_permission": False,
         "paper_entry_requires_profit_factor": False,
         "paper_entry_requires_positive_expected_net_return": True,

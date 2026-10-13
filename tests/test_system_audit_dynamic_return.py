@@ -38,6 +38,8 @@ def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
 
     assert projected["policy"] == canonical
     assert stale["policy"]["paper_quality_observation_allows_non_positive_return_lcb"] is False
+    assert canonical["paper_training_entry_is_shadow_only"] is True
+    assert canonical["paper_training_entry_authorizes_normal_entry"] is False
 
 
 def test_removed_fixed_policy_and_global_fallback_tokens_cannot_return_to_production() -> None:
