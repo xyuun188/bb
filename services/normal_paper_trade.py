@@ -451,11 +451,7 @@ def select_normal_paper_trade_side(
             and support.get("strong_expert_opposition") is not True
             and (
                 observation_only
-                or (
-                    quality_permission_denied
-                    and (objective_net or 0.0) <= 0.0
-                    and int(support.get("aligned_expert_count") or 0) < 2
-                )
+                or quality_permission_denied
             )
         )
         training_edge = training_candidate

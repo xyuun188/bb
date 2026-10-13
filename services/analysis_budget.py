@@ -334,10 +334,13 @@ class AnalysisBudgetPolicy:
         roster_underfilled: bool,
         new_pair_pause_reason: str | None,
     ) -> tuple[int, str]:
+        # ``new_pair_pause_reason`` is an execution-only state.  It can stop
+        # an order at the final submit boundary, but it must never stop market
+        # observation or training.  Keeping that distinction here prevents a
+        # transient balance/sync/risk pause from creating an analysis deadlock.
+        del new_pair_pause_reason
         if not run_market_analysis:
             return 0, "market_disabled"
-        if new_pair_pause_reason:
-            return 0, "new_pair_pause"
         if base_market_limit <= 0:
             return 0, "no_market_budget"
         dynamic_cap = max(
@@ -361,10 +364,12 @@ class AnalysisBudgetPolicy:
         roster_underfilled: bool,
         new_pair_pause_reason: str | None,
     ) -> tuple[int, str]:
+        # The position/entry execution pause is deliberately not a market
+        # budget gate.  Existing positions and new opportunities still need
+        # to be observed so the model can learn and recover automatically.
+        del new_pair_pause_reason
         if not run_market_analysis:
             return 0, "market_disabled"
-        if new_pair_pause_reason:
-            return 0, "new_pair_pause"
         if base_market_limit <= 0:
             return 0, "no_market_budget"
         if risk_level == "high":

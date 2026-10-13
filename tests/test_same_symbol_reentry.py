@@ -135,18 +135,13 @@ def test_reentry_does_not_treat_decision_timestamp_as_market_evidence() -> None:
     assert result.decision_evidence_source == "decision.timestamp"
 
 
-@pytest.mark.parametrize(
-    "selection_reason", ["paper_quality_observation", "paper_training_entry"]
-)
-def test_observation_or_training_selection_never_authorizes_reentry(
-    selection_reason: str,
-) -> None:
+def test_quality_observation_selection_never_authorizes_reentry() -> None:
     now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
 
     observation = SameSymbolReentryGuard.assess(
         _decision(
             now,
-            selection_reason=selection_reason,
+            selection_reason="paper_quality_observation",
             score=-1.7,
             expected_net=0.2,
             evidence_at=now,
@@ -158,6 +153,57 @@ def test_observation_or_training_selection_never_authorizes_reentry(
     assert observation.allowed is False
     assert observation.opportunity_contract_consistent is False
     assert observation.reason == "entry_opportunity_contract_inconsistent"
+
+
+def test_training_selection_uses_current_contract_for_reentry() -> None:
+    now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
+
+    training = SameSymbolReentryGuard.assess(
+        _decision(
+            now,
+            selection_reason="paper_training_entry",
+            score=-1.7,
+            expected_net=0.2,
+            evidence_at=now,
+        ),
+        execution_mode="paper",
+        latest_closed_lifecycle=None,
+        now=now,
+    )
+
+    assert training.allowed is True
+    assert training.opportunity_contract_consistent is True
+    assert training.reason == "no_recent_closed_symbol_lifecycle"
+
+
+def test_training_selection_rejects_non_positive_current_contract() -> None:
+    now = datetime(2026, 9, 22, 5, 30, tzinfo=UTC)
+
+    decision = _decision(
+        now,
+        selection_reason="paper_training_entry",
+        score=0.2,
+        expected_net=-0.01,
+        downside_return=-0.2,
+        evidence_at=now,
+    )
+    decision.raw_response["normal_paper_trade"].update(
+        {
+            "expected_net_return_pct": -0.01,
+            "current_raw_expected_return_pct": -0.01,
+            "objective_net_return_pct": -0.2,
+        }
+    )
+    blocked = SameSymbolReentryGuard.assess(
+        decision,
+        execution_mode="paper",
+        latest_closed_lifecycle=None,
+        now=now,
+    )
+
+    assert blocked.allowed is False
+    assert blocked.opportunity_contract_consistent is False
+    assert blocked.reason == "entry_opportunity_contract_inconsistent"
 
 
 def test_paper_downside_lcb_does_not_block_positive_current_return_reentry() -> None:

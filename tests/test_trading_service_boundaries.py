@@ -2797,7 +2797,7 @@ def test_entry_market_data_quality_is_not_a_trading_service_private_rule():
 
 
 @pytest.mark.asyncio
-async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None:
+async def test_okx_authoritative_sync_warning_pauses_execution_only() -> None:
     service = TradingService.__new__(TradingService)
     service.risk_engine = SimpleNamespace(
         circuit_breaker=SimpleNamespace(is_open=False, get_state=lambda: {}),
@@ -2812,6 +2812,13 @@ async def test_okx_authoritative_sync_warning_pauses_new_pair_analysis() -> None
 
     assert "OKX 自动对账异常" in reason
     assert "OKX timeout" in reason
+    assert (
+        service._market_analysis_pause_reason(
+            reason,
+            run_market_analysis=True,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -2867,7 +2874,6 @@ async def test_okx_authoritative_sync_failure_keeps_market_observation_running()
     )
 
     assert "OKX 自动对账异常" in str(reason)
-    assert service._is_authoritative_sync_entry_pause(reason) is True
     assert (
         service._market_analysis_pause_reason(
             reason,

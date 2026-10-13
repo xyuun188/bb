@@ -61,7 +61,7 @@ def test_market_only_budget_is_independent_from_open_position_snapshot() -> None
     assert result["position_group_count"] == 1
 
 
-def test_account_pause_still_zeroes_analysis_budget() -> None:
+def test_execution_pause_does_not_zero_market_analysis_budget() -> None:
     result = _policy().context(
         [],
         {},
@@ -70,5 +70,19 @@ def test_account_pause_still_zeroes_analysis_budget() -> None:
         run_market_analysis=True,
         new_pair_pause_reason="account hard risk",
     )
-    assert result["market_symbol_limit"] == 0
-    assert result["market_limit_policy"] == "new_pair_pause"
+    assert result["market_symbol_limit"] == 8
+    assert result["market_limit_policy"] == "market_only_independent_budget"
+
+
+def test_execution_pause_does_not_zero_market_budget_with_open_positions() -> None:
+    result = _policy().context(
+        [{"symbol": "BTC/USDT", "model_name": "ensemble_trader"}],
+        {},
+        base_market_limit=8,
+        run_position_analysis=True,
+        run_market_analysis=True,
+        new_pair_pause_reason="risk breaker open",
+    )
+
+    assert result["market_symbol_limit"] == 8
+    assert result["market_limit_policy"] == "position_first_low_risk"

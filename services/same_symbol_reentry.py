@@ -157,19 +157,58 @@ class SameSymbolReentryGuard:
         downside_return = _safe_float(
             opportunity.get("realized_net_lcb_pct", opportunity.get("return_lcb_pct"))
         )
-        return_contract_consistent = (
-            normal_paper_current_return_ready(expected_net, downside_return)
-            if paper_scope
-            else (
+        training_entry = selection_reason == "paper_training_entry"
+        if paper_scope and training_entry:
+            # Training entries use the signed current-signal contract.  The
+            # opportunity score is an older ranking signal and may be stale or
+            # negative even when the current audited return is eligible.
+            contract_expected = _safe_float(
+                normal_trade.get("expected_net_return_pct")
+            )
+            contract_downside = _safe_float(
+                normal_trade.get("objective_net_return_pct")
+            )
+            contract_raw = _safe_float(
+                normal_trade.get("current_raw_expected_return_pct")
+            )
+            expected_net = (
+                contract_expected
+                if contract_expected is not None
+                else expected_net
+            )
+            downside_return = (
+                contract_downside
+                if contract_downside is not None
+                else downside_return
+            )
+            current_raw = (
+                contract_raw
+                if contract_raw is not None
+                else expected_net
+            )
+            return_contract_consistent = bool(
+                current_raw is not None
+                and current_raw > 0.0
+                and normal_paper_current_return_ready(
+                    expected_net,
+                    downside_return,
+                )
+            )
+        elif paper_scope:
+            return_contract_consistent = normal_paper_current_return_ready(
+                expected_net,
+                downside_return,
+            )
+        else:
+            return_contract_consistent = (
                 expected_net is None
                 or (
                     expected_net > 0.0
                     and (opportunity_score is None or opportunity_score > 0.0)
                 )
             )
-        )
         opportunity_consistent = bool(
-            selection_reason not in {"paper_quality_observation", "paper_training_entry"}
+            selection_reason != "paper_quality_observation"
             and return_contract_consistent
         )
         evidence_at, evidence_source = cls._decision_evidence_time(decision)

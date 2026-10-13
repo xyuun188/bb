@@ -271,6 +271,34 @@ def test_current_positive_signal_with_negative_lcb_enters_training_route() -> No
     assert selection["selected_support"]["paper_training_only"] is True
 
 
+def test_current_positive_signal_with_strong_expert_support_still_trains_before_promotion() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.12,
+        objective_net=0.04,
+    )
+    support["current_edge_validated"] = True
+    support["raw_expected_return_pct"] = 0.28
+    support["aligned_expert_count"] = 3
+    support["opposition_expert_count"] = 0
+
+    selection = select_normal_paper_trade_side({"long": support})
+
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_support"]["paper_training_only"] is True
+
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    assert contract["authorized"] is True
+    assert contract["paper_training_only"] is True
+    assert normal_paper_trade_contract_reasons(contract) == []
+
+
 def test_negative_lcb_quality_observation_cannot_authorize_a_paper_entry() -> None:
     support = _quality_observation_support(
         "long",
@@ -318,6 +346,22 @@ def test_current_positive_edge_does_not_inherit_historical_quality_observation_c
     )
     support["current_edge_validated"] = True
     support["paper_quality_observation_only"] = False
+    support["quant_quality_permissions"]["local_ml"].update(
+        {
+            "paper_execution_permission": True,
+            "paper_execution_reason": (
+                "authoritative_fee_after_quality_above_break_even"
+            ),
+            "paper_execution_blockers": [],
+            "paper_execution_evidence": {
+                "sample_count": 20,
+                "average_return": 0.2,
+                "return_lcb": 0.1,
+                "profit_factor": 1.5,
+                "profit_factor_above_break_even": True,
+            },
+        }
+    )
 
     selection = select_normal_paper_trade_side({"long": support})
     contract = build_normal_paper_trade_contract(

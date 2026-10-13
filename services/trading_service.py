@@ -1994,23 +1994,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return None
 
     @staticmethod
-    def _is_authoritative_sync_entry_pause(reason: str | None) -> bool:
-        """Return whether a pause is caused by the exchange truth sync only."""
-
-        return str(reason or "").strip().startswith("OKX 自动对账")
-
-    @classmethod
     def _market_analysis_pause_reason(
-        cls,
         entry_pause_reason: str | None,
         *,
         run_market_analysis: bool,
     ) -> str | None:
-        """Keep market observations running while preserving the entry pause."""
+        """Return only a true market-data pause, never an execution pause.
 
-        if run_market_analysis and cls._is_authoritative_sync_entry_pause(
-            entry_pause_reason
-        ):
+        Entry safety (account mode, OKX reconciliation, balance, and risk
+        state) is enforced again at the final submit boundary.  Reusing that
+        state to stop market observation creates a feedback loop: losses pause
+        entries, paused entries stop training data, and the model never gets
+        new evidence to recover.  Market analysis therefore continues whenever
+        the caller requested it; the original reason remains available through
+        ``entry_pause_reason`` for execution diagnostics.
+        """
+
+        if run_market_analysis:
             return None
         return entry_pause_reason
 
@@ -9614,7 +9614,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
             return
 
-        if new_pair_pause_reason and executed.is_entry:
+        # A manually paused trading account is a deliberate operator command
+        # and must stop submission.  Other reasons (OKX sync, stale balance,
+        # risk state, or a prior round's advisory check) are revalidated at
+        # the final execution boundary; blocking here would preserve stale
+        # state for the whole round and recreate the no-training deadlock.
+        if (
+            new_pair_pause_reason
+            and executed.is_entry
+            and str(new_pair_pause_reason).startswith("当前执行账户已暂停投资")
+        ):
             raw_response = self._annotate_candidate_selection(
                 decision,
                 selected=False,
