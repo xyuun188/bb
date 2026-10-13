@@ -5651,6 +5651,92 @@ async def test_entry_policy_reprices_execution_cost_with_planned_order_notional(
 
 
 @pytest.mark.asyncio
+async def test_entry_policy_keeps_authoritative_refresh_notional_when_it_increases() -> None:
+    events: list[tuple[str, float]] = []
+
+    class FakePriceGuard:
+        async def guard_reason(
+            self,
+            decision: DecisionOutput,
+            _model_mode: str,
+        ) -> None:
+            decision.feature_snapshot = {
+                **(decision.feature_snapshot or {}),
+                "bid": 99.9,
+                "ask": 100.1,
+                "contract_value_base": 1.0,
+                "orderbook_bids": [[99.9, 100.0]],
+                "orderbook_asks": [[100.1, 100.0]],
+            }
+
+    def fake_score(decision: DecisionOutput, _strategy: dict[str, Any] | None) -> float:
+        planned = float(
+            (decision.feature_snapshot or {}).get("planned_order_notional_usdt") or 0.0
+        )
+        events.append(("score", planned))
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        raw["opportunity_score"] = {
+            "score": 1.0,
+            "execution_cost": {"order_size_complete": planned > 0},
+        }
+        decision.raw_response = raw
+        return 1.0
+
+    async def fake_sizing(
+        decision: DecisionOutput,
+        _model_mode: str,
+        _open_positions: list[dict[str, Any]],
+    ) -> None:
+        sizing_count = sum(name == "sizing" for name, _value in events)
+        final_notional = 0.117535 if sizing_count == 0 else 55.43876
+        events.append(("sizing", final_notional))
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        risk_budget = 303.40144
+        stressed_loss_fraction = 0.05
+        raw["profit_risk_sizing"] = {
+            "production_eligible": True,
+            "risk_budget_usdt": risk_budget,
+            "stressed_loss_fraction": stressed_loss_fraction,
+            "planned_stressed_loss_usdt": final_notional * stressed_loss_fraction,
+            "target_notional_usdt": final_notional,
+            "model_requested_notional_cap_usdt": risk_budget,
+            "final_notional_usdt": final_notional,
+        }
+        decision.raw_response = raw
+        decision.position_size_pct = final_notional / 1000.0
+
+    policy = EntryPolicy(
+        entry_opportunity_score=EntryOpportunityScorePolicy(fake_score),
+        entry_profit_risk_sizing=EntryProfitRiskSizingPolicy(fake_sizing),
+        entry_price_guard=FakePriceGuard(),
+    )
+    decision = _decision(Action.LONG)
+    decision.feature_snapshot = {"current_price": 100.0}
+
+    await policy.prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert events == [
+        ("score", 0.0),
+        ("sizing", 0.117535),
+        ("score", 0.117535),
+        ("sizing", 55.43876),
+    ]
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] == pytest.approx(
+        55.43876
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["final_notional_usdt"] <= sizing["target_notional_usdt"]
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assert sizing["final_notional_usdt"] <= sizing["model_requested_notional_cap_usdt"]
+    assert decision.raw_response["execution_cost_sizing_pass"] == {
+        "impact_basis_notional_usdt": pytest.approx(0.117535),
+        "final_notional_usdt": 55.43876,
+        "order_size_complete": True,
+    }
+    assert decision.position_size_pct == pytest.approx(0.05543876)
+
+
+@pytest.mark.asyncio
 async def test_entry_policy_preserves_supported_exchange_minimum_after_vwap_rounding() -> None:
     planned_values: list[float] = []
 

@@ -17,7 +17,6 @@ from services.dynamic_exit_policy import (
     evaluate_dynamic_exit_execution_contract,
 )
 from services.entry_profit_risk_sizing import (
-    reconcile_profit_risk_sizing,
     uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.live_ml_profit_contract import apply_live_ml_profit_contract
@@ -309,7 +308,6 @@ class EntryPolicy:
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
         sizing = sizing if isinstance(sizing, dict) else {}
-        final_notional = max(_safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0)
         # The sizing pass above may refresh execution cost and reintroduce a
         # fractional underflow after the initial planning clamp. Re-apply the
         # same exchange-minimum contract at the final sizing boundary so a
@@ -334,20 +332,10 @@ class EntryPolicy:
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
             sizing = sizing if isinstance(sizing, dict) else {}
-            final_notional = max(
-                _safe_float(sizing.get("final_notional_usdt"), 0.0), 0.0
-            )
-        if final_notional > impact_basis_notional:
-            reconcile_profit_risk_sizing(
-                decision,
-                final_notional_usdt=impact_basis_notional,
-                final_leverage=decision.suggested_leverage,
-                source="size_aware_execution_cost_non_enlargement",
-                execution_facts={
-                    "impact_basis_notional_usdt": impact_basis_notional,
-                    "calculated_final_notional_usdt": final_notional,
-                },
-            )
+        # The second pass is the only sizing authority for the refreshed
+        # market facts.  Do not run execution reconciliation here: that
+        # boundary is reserved for the actual order shape or a confirmed fill
+        # and would incorrectly restore an obsolete queued notional.
         self._record_execution_cost_sizing_pass(decision, impact_basis_notional)
         return None
 

@@ -1,8 +1,10 @@
 """Authoritative dynamic risk budget and entry sizing.
 
-Risk budget is generated before position size.  The final notional is solved
-from that independent budget and a stressed loss fraction; downstream callers
-may only reconcile the contract to a smaller executable notional.
+Risk budget is generated before position size.  Each sizing pass solves one
+current authoritative notional from that independent budget and a stressed
+loss fraction.  Only an actual order shape or confirmed fill may reconcile
+that contract to the executable notional; execution reconciliation never
+feeds a stale queued size back into a fresh sizing pass.
 """
 
 from __future__ import annotations
@@ -764,7 +766,14 @@ def reconcile_profit_risk_sizing(
     source: str,
     execution_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild the authoritative contract for a smaller executable notional."""
+    """Reconcile an actual executable order shape with the sizing contract.
+
+    This boundary is intentionally downstream-only.  It may reduce the
+    current authorized notional for exchange limits, protection-derived
+    ceilings, or a confirmed partial fill.  Fresh market facts must call the
+    sizing policy again instead of using this function to restore a queued
+    value.
+    """
 
     raw = _safe_dict(decision.raw_response)
     sizing = dict(_safe_dict(raw.get("profit_risk_sizing")))

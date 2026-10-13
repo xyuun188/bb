@@ -8,6 +8,10 @@ import pytest
 
 from models.decision import _compact_decision_learning_snapshot
 from services import trade_execution_contract as trade_execution_contract_module
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_SIZING_VERSION,
+    build_normal_paper_trade_contract,
+)
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trade_execution_contract import (
     TradeExecutionContractService,
@@ -370,6 +374,162 @@ def test_complete_dynamic_return_entry_contract_is_clean() -> None:
     assert report["summary"]["executed_entry_count"] == 1
     assert report["summary"]["entry_contract_ready_count"] == 1
     assert report["summary"]["contract_violation_count"] == 0
+
+
+def _normal_paper_historical_observation_raw() -> dict[str, object]:
+    raw = _entry_raw()
+    sizing = raw["profit_risk_sizing"]
+    sizing.update(
+        {
+            "contract_version": NORMAL_PAPER_TRADE_SIZING_VERSION,
+            "contract_lifecycle": "normal_paper_trade",
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "account_equity_usdt": 1000.0,
+            "risk_budget_usdt": 3.0,
+            "planned_stressed_loss_usdt": 2.02,
+            "stressed_loss_fraction": 0.02,
+            "target_notional_usdt": 100.0,
+            "final_notional_usdt": 101.0,
+            "fill_notional_ceiling_usdt": 101.5,
+            "minimum_order_notional_usdt": 1.0,
+            "final_leverage": 3.0,
+            "model_requested_leverage": 3.0,
+            "model_leverage_is_explicit": True,
+            "dynamic_leverage_decision": {
+                "version": "dynamic_leverage_allocator_v5",
+            },
+            "leverage_tier_selection": {
+                "production_eligible": True,
+                "max_leverage": 20.0,
+            },
+        }
+    )
+    sizing["policy_provenance"]["contract_fingerprint"] = "historical-sizing-fingerprint"
+    raw["opportunity_score"]["execution_cost"].update(
+        {
+            "order_size_complete": True,
+            "order_notional_usdt": 100.0,
+        }
+    )
+    raw["execution_cost_sizing_pass"] = {"order_size_complete": True}
+    raw["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 10.0,
+            "expected_net_return_pct": 0.2,
+            "objective_net_return_pct": 0.2,
+            "raw_expected_return_pct": 0.3,
+            "loss_probability": 0.2,
+            "current_edge_validated": True,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {
+                "local_ml": {
+                    "paper_execution_permission": True,
+                    "paper_execution_evidence": {"sample_count": 10},
+                }
+            },
+        },
+    )
+    return raw
+
+
+def test_settled_legacy_notional_drift_is_observation_only() -> None:
+    decision_id = 629746
+    raw = _normal_paper_historical_observation_raw()
+    order = _filled_order(decision_id, quantity=1.01, price=100.0)
+    decision = _decision(decision_id, "long", raw)
+    decision.was_executed = True
+
+    report = summarize_trade_execution_contract(
+        [decision],
+        orders=[order],
+        authoritative_histories=[
+            SimpleNamespace(
+                close_status="full",
+                entry_order_ids=[order.exchange_order_id],
+                realized_pnl=0.2,
+                side="long",
+                pos_side="long",
+            )
+        ],
+    )
+
+    assert report["summary"]["contract_violation_count"] == 0
+    assert report["summary"]["historical_settlement_observation_count"] == 1
+    assert report["summary"]["historical_settlement_observation_reason_counts"] == {
+        "normal_paper_execution_cost_notional_too_small": 1,
+        "normal_paper_notional_invalid": 1,
+    }
+    entry = report["entry_contracts"][0]
+    assert entry["historical_settlement_observation_only"] is True
+    assert entry["contract_status"] == "historical_settlement_observation_only"
+    assert set(entry["historical_settlement_observation_reasons"]) == {
+        "normal_paper_notional_invalid",
+        "normal_paper_execution_cost_notional_too_small",
+    }
+
+
+def test_settled_legacy_notional_drift_stays_blocking_when_risk_exceeds_budget() -> None:
+    decision_id = 629747
+    raw = _normal_paper_historical_observation_raw()
+    raw["profit_risk_sizing"]["risk_budget_usdt"] = 1.0
+    order = _filled_order(decision_id, quantity=1.01, price=100.0)
+    decision = _decision(decision_id, "long", raw)
+    decision.was_executed = True
+
+    report = summarize_trade_execution_contract(
+        [decision],
+        orders=[order],
+        authoritative_histories=[
+            SimpleNamespace(
+                close_status="full",
+                entry_order_ids=[order.exchange_order_id],
+                realized_pnl=-3.0,
+                side="long",
+                pos_side="long",
+            )
+        ],
+    )
+
+    assert report["summary"]["contract_violation_count"] >= 1
+    assert report["summary"]["historical_settlement_observation_count"] == 0
+    assert "normal_paper_planned_loss_invalid" in report["violation_reason_counts"]
+
+
+def test_settled_legacy_notional_drift_requires_matching_history_identity() -> None:
+    decision_id = 629748
+    raw = _normal_paper_historical_observation_raw()
+    order = _filled_order(decision_id, quantity=1.01, price=100.0)
+    decision = _decision(decision_id, "long", raw)
+    decision.was_executed = True
+
+    report = summarize_trade_execution_contract(
+        [decision],
+        orders=[order],
+        authoritative_histories=[
+            SimpleNamespace(
+                close_status="full",
+                mode="live",
+                symbol="ETH/USDT",
+                entry_order_ids=[order.exchange_order_id],
+                realized_pnl=0.2,
+                side="long",
+                pos_side="long",
+            )
+        ],
+    )
+
+    assert report["summary"]["historical_settlement_observation_count"] == 0
+    assert report["summary"]["contract_violation_count"] == 2
+    assert report["violation_reason_counts"] == {
+        "normal_paper_execution_cost_notional_too_small": 1,
+        "normal_paper_notional_invalid": 1,
+    }
 
 
 def test_projected_adverse_funding_cannot_exceed_planned_trade_loss() -> None:

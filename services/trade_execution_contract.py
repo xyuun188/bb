@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from core.contract_math import persisted_product_isclose
+from core.symbols import normalize_trading_symbol
 from services.entry_profit_risk_sizing import confirmed_fill_has_valid_submission
 from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
@@ -208,6 +209,8 @@ class TradeExecutionContractService:
                     for row in (
                         await session.execute(
                             select(
+                                Order.execution_mode,
+                                Order.symbol,
                                 Order.decision_id,
                                 Order.status,
                                 Order.quantity,
@@ -236,10 +239,13 @@ class TradeExecutionContractService:
                     await session.execute(
                         select(
                             OkxPositionHistory.id,
+                            OkxPositionHistory.mode,
+                            OkxPositionHistory.symbol,
                             OkxPositionHistory.side,
                             OkxPositionHistory.pos_side,
                             OkxPositionHistory.realized_pnl,
                             OkxPositionHistory.close_status,
+                            OkxPositionHistory.entry_order_ids,
                             OkxPositionHistory.updated_at_okx,
                         )
                         .where(
@@ -310,6 +316,8 @@ def summarize_trade_execution_contract(
     exit_rows: list[dict[str, Any]] = []
     executed_entry_count = 0
     executed_exit_count = 0
+    historical_settlement_observation_count = 0
+    historical_settlement_observation_reason_counts: Counter[str] = Counter()
 
     for decision in decisions:
         action = _action(decision)
@@ -326,27 +334,55 @@ def summarize_trade_execution_contract(
 
         if action in ENTRY_ACTIONS:
             row, reasons = _entry_contract_row(decision, raw, decision_orders, executed)
-            pending_deadline = _authoritative_fill_sync_pending_deadline(
+            historical_observation_reasons = _historical_settlement_observation_reasons(
+                decision,
+                raw,
                 decision_orders,
                 reasons,
+                authoritative_histories=authoritative_histories,
+            )
+            effective_reasons = [
+                reason for reason in reasons if reason not in historical_observation_reasons
+            ]
+            if historical_observation_reasons:
+                historical_settlement_observation_count += 1
+                historical_settlement_observation_reason_counts.update(
+                    historical_observation_reasons
+                )
+            row["historical_settlement_observation_only"] = bool(
+                historical_observation_reasons and not effective_reasons
+            )
+            row["historical_settlement_observation_reasons"] = (
+                historical_observation_reasons
+            )
+            row["effective_reasons"] = effective_reasons
+            if row["historical_settlement_observation_only"]:
+                row["contract_complete"] = True
+                row["contract_status"] = "historical_settlement_observation_only"
+            pending_deadline = _authoritative_fill_sync_pending_deadline(
+                decision_orders,
+                effective_reasons,
                 now=checked_at,
             )
             row["authoritative_fill_sync_pending"] = pending_deadline is not None
             row["authoritative_fill_sync_deadline_at"] = (
                 pending_deadline.isoformat() if pending_deadline is not None else None
             )
-            row["contract_status"] = (
-                "pending_authoritative_fill_sync"
-                if pending_deadline is not None
-                else "complete"
-                if not reasons
-                else "violation"
-            )
+            if not row["historical_settlement_observation_only"]:
+                row["contract_status"] = (
+                    "pending_authoritative_fill_sync"
+                    if pending_deadline is not None
+                    else "complete"
+                    if not effective_reasons
+                    else "violation"
+                )
             entry_rows.append(row)
             if executed:
                 executed_entry_count += 1
                 if pending_deadline is None:
-                    violations.extend(_violation(decision, reason, row) for reason in reasons)
+                    violations.extend(
+                        _violation(decision, reason, row) for reason in effective_reasons
+                    )
         else:
             row, reasons = _exit_contract_row(decision, raw, decision_orders, executed)
             exit_rows.append(row)
@@ -427,6 +463,10 @@ def summarize_trade_execution_contract(
             1 for row in exit_rows if row["executed"] and row["contract_complete"]
         ),
         "contract_violation_count": len(violations),
+        "historical_settlement_observation_count": historical_settlement_observation_count,
+        "historical_settlement_observation_reason_counts": dict(
+            historical_settlement_observation_reason_counts
+        ),
         "obsolete_policy_payload_count": reason_counts["obsolete_policy_payload_present"],
         "closed_position_count": len(realized_values),
         "realized_net_pnl_usdt": round(sum(realized_values), 8),
@@ -593,6 +633,107 @@ def _entry_contract_row(
         "reasons": reasons,
     }
     return row, reasons
+
+
+def _historical_settlement_observation_reasons(
+    decision: Any,
+    raw: dict[str, Any],
+    orders: Sequence[Any],
+    reasons: Sequence[str],
+    *,
+    authoritative_histories: Sequence[Any] | None,
+) -> list[str]:
+    """Classify bounded legacy field drift on an already-settled OKX fill.
+
+    This is an audit projection only.  It never authorizes a new entry and it
+    only suppresses the two legacy notional observations when the exchange
+    identity, entry-order link, closed history, and stressed-loss budget are
+    all independently proven.
+    """
+
+    observation_reasons = {
+        "normal_paper_notional_invalid",
+        "normal_paper_execution_cost_notional_too_small",
+    }
+    reason_set = {str(reason or "").strip() for reason in reasons if str(reason or "").strip()}
+    if not reason_set or not reason_set.issubset(observation_reasons):
+        return []
+    if authoritative_histories is None:
+        return []
+
+    filled_notional, fill_fact_reasons, fill_source = _okx_filled_order_notional_usdt(
+        raw,
+        list(orders),
+    )
+    if filled_notional <= 0.0 or fill_fact_reasons or not fill_source:
+        return []
+    entry_order_ids = {
+        str(_row_get(order, "exchange_order_id") or "").strip()
+        for order in orders
+        if _is_authoritative_filled_order(order)
+        and str(_row_get(order, "exchange_order_id") or "").strip()
+    }
+    if not entry_order_ids:
+        return []
+    order_modes = {
+        str(_row_get(order, "execution_mode") or "").strip().lower()
+        for order in orders
+        if str(_row_get(order, "execution_mode") or "").strip()
+    }
+    order_symbols = {
+        normalize_trading_symbol(_row_get(order, "symbol"))
+        for order in orders
+        if normalize_trading_symbol(_row_get(order, "symbol"))
+    }
+    decision_symbol = normalize_trading_symbol(_row_get(decision, "symbol"))
+
+    covered_entry_order_ids: set[str] = set()
+    for history in authoritative_histories:
+        status = str(_row_get(history, "close_status") or "").strip().lower()
+        if status not in {"full", "closed", "complete"}:
+            continue
+        history_mode = str(_row_get(history, "mode") or "").strip().lower()
+        if order_modes and history_mode and history_mode not in order_modes:
+            continue
+        history_symbol = normalize_trading_symbol(_row_get(history, "symbol"))
+        if (
+            order_symbols
+            and history_symbol
+            and history_symbol not in order_symbols
+        ) or (
+            decision_symbol
+            and history_symbol
+            and history_symbol != decision_symbol
+        ):
+            continue
+        raw_entry_ids = _row_get(history, "entry_order_ids")
+        history_entry_ids = (
+            {
+                str(value).strip()
+                for value in raw_entry_ids
+                if str(value).strip()
+            }
+            if isinstance(raw_entry_ids, (list, tuple, set))
+            else set()
+        )
+        covered_entry_order_ids.update(entry_order_ids.intersection(history_entry_ids))
+    if not entry_order_ids.issubset(covered_entry_order_ids):
+        return []
+
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    risk_budget = _safe_float(sizing.get("risk_budget_usdt"), 0.0)
+    stressed_loss_fraction = _safe_float(sizing.get("stressed_loss_fraction"), 0.0)
+    planned_loss = _safe_float(sizing.get("planned_stressed_loss_usdt"), 0.0)
+    filled_stressed_loss = filled_notional * stressed_loss_fraction
+    if (
+        risk_budget <= 0.0
+        or stressed_loss_fraction <= 0.0
+        or planned_loss <= 0.0
+        or planned_loss > risk_budget + 1e-8
+        or filled_stressed_loss > risk_budget + 1e-8
+    ):
+        return []
+    return sorted(reason_set)
 
 
 def validate_entry_contract_lineage(
