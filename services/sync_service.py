@@ -111,6 +111,34 @@ def _float_value(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _protection_coverage_evidence(
+    protection_orders: list[dict[str, Any]],
+    current_contracts: float,
+) -> tuple[bool, float, float]:
+    """Validate live reduce-only protection and report any safe overcoverage."""
+
+    covered_contracts = sum(
+        abs(_float_value(item.get("contracts"), 0.0))
+        for item in protection_orders
+    )
+    overcoverage_contracts = max(covered_contracts - abs(current_contracts), 0.0)
+    complete = bool(
+        protection_orders
+        and all(
+            str(item.get("algo_id") or "").strip()
+            and item.get("reduce_only") is True
+            and str(item.get("state") or "").lower()
+            in {"live", "effective", "partially_effective", "open", "pending"}
+            and _float_value(item.get("contracts"), 0.0) > 0
+            and _float_value(item.get("stop_loss_price"), 0.0) > 0
+            and _float_value(item.get("take_profit_price"), 0.0) > 0
+            for item in protection_orders
+        )
+        and covered_contracts + 1e-9 >= abs(current_contracts)
+    )
+    return complete, covered_contracts, overcoverage_contracts
+
+
 def _entry_order_persistence_pending(
     order: Any,
     *,
@@ -2768,22 +2796,13 @@ class OkxSyncService:
                 if order is not None
             )
             protection_orders = row["protection_orders"]
-            protection_contracts = sum(
-                abs(float_parser(item.get("contracts"), 0.0)) for item in protection_orders
-            )
-            protection_evidence_complete = bool(
-                protection_orders
-                and all(
-                    str(item.get("algo_id") or "").strip()
-                    and item.get("reduce_only") is True
-                    and str(item.get("state") or "").lower()
-                    in {"live", "effective", "partially_effective", "open", "pending"}
-                    and float_parser(item.get("contracts"), 0.0) > 0
-                    and float_parser(item.get("stop_loss_price"), 0.0) > 0
-                    and float_parser(item.get("take_profit_price"), 0.0) > 0
-                    for item in protection_orders
-                )
-                and isclose(protection_contracts, row["contracts"], rel_tol=1e-9, abs_tol=1e-12)
+            (
+                protection_evidence_complete,
+                protection_contracts,
+                protection_overcoverage_contracts,
+            ) = _protection_coverage_evidence(
+                protection_orders,
+                contracts,
             )
             facts = {
                 "symbol": key[0],
@@ -2821,6 +2840,8 @@ class OkxSyncService:
                 "take_profit_price": row["protection"].get("take_profit_price"),
                 "protection_evidence_complete": protection_evidence_complete,
                 "protection_orders": protection_orders,
+                "protection_contracts": protection_contracts,
+                "protection_overcoverage_contracts": protection_overcoverage_contracts,
                 "position_stressed_loss_usdt": abs(row["entry_price"] - row["stop_loss"])
                 * row["quantity"],
                 "portfolio_stressed_loss_usdt": portfolio_stressed_loss,

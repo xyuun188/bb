@@ -18,6 +18,7 @@ from services.sync_service import (
     _confirmed_local_close_fill_for_position,
     _merge_local_position_candidates,
     _okx_close_fill_order_payload,
+    _protection_coverage_evidence,
     normalized_open_position_context,
 )
 
@@ -27,6 +28,46 @@ def _float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def test_protection_evidence_accepts_safe_oco_overcoverage_after_partial_close() -> None:
+    complete, covered, overcoverage = _protection_coverage_evidence(
+        [
+            {
+                "algo_id": "oco-1",
+                "state": "live",
+                "contracts": "1767",
+                "reduce_only": True,
+                "stop_loss_price": "0.11526",
+                "take_profit_price": "0.10893",
+            }
+        ],
+        883.0,
+    )
+
+    assert complete is True
+    assert covered == pytest.approx(1767.0)
+    assert overcoverage == pytest.approx(884.0)
+
+
+def test_protection_evidence_rejects_undercovered_oco() -> None:
+    complete, covered, overcoverage = _protection_coverage_evidence(
+        [
+            {
+                "algo_id": "oco-1",
+                "state": "live",
+                "contracts": "882",
+                "reduce_only": True,
+                "stop_loss_price": "0.11526",
+                "take_profit_price": "0.10893",
+            }
+        ],
+        883.0,
+    )
+
+    assert complete is False
+    assert covered == pytest.approx(882.0)
+    assert overcoverage == 0.0
 
 
 @pytest.mark.asyncio
