@@ -292,6 +292,10 @@ MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS = 6 * 60 * 60
 # window while allowing the instrument to be rechecked automatically.
 MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS = 10 * 60
 MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS = 60
+# Contract-fact mismatches and missing execution metadata are also retryable.
+# They can be caused by a transient OKX/cache refresh race and must never
+# quarantine a symbol for hours merely because one probe was incomplete.
+MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS = 60
 MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
 OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
 MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
@@ -8356,22 +8360,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         reason = str(payload.get("reason") or "")
         if error_code == "51001" or reason == "okx_private_entry_instrument_unavailable":
             return True
-        if reason != "okx_entry_live_execution_environment_incompatible":
-            return False
-        compatibility = payload.get("environment_compatibility")
-        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
-        blockers = {
-            str(item)
-            for item in compatibility.get("blockers", [])
-        }
-        # Price drift/missing ticker is transient and should be retried quickly;
-        # contract identity or missing execution instrument is durable enough to
-        # keep out of the candidate budget until the cache expires.
-        transient_blockers = {
-            "environment_price_drift_exceeded",
-            "environment_price_missing",
-        }
-        return bool(blockers - transient_blockers)
+        # Every other compatibility result is a retryable observation failure.
+        # In particular, execution_instrument_missing and contract-fact
+        # mismatches can recover after the next OKX metadata refresh.
+        return False
 
     @staticmethod
     def _entry_unavailable_cache_ttl(
@@ -8390,11 +8382,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
         compatibility = compatibility if isinstance(compatibility, Mapping) else {}
         blockers = {str(item) for item in compatibility.get("blockers", [])}
         if blockers - {"environment_price_drift_exceeded", "environment_price_missing"}:
-            return MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
+            return MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
         if "environment_price_drift_exceeded" in blockers:
             return MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
         if "environment_price_missing" in blockers:
             return MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS
+        if blockers:
+            return MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
         return None
 
     def _entry_unavailable_cache_path(self) -> Path:
@@ -8419,12 +8413,38 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol, facts in rows.items():
                 if not isinstance(facts, Mapping):
                     continue
+                # Migrate the persisted cache to the single current policy.
+                # Older releases stored transient compatibility failures with
+                # multi-hour expirations; retaining those rows would keep
+                # recovered instruments out of the candidate pool after a
+                # restart.
+                cache_ttl = self._entry_unavailable_cache_ttl(facts)
+                if cache_ttl is None:
+                    continue
                 expires_at = str(facts.get("expires_at") or "")
                 try:
                     expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                     expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
                 except (TypeError, ValueError):
                     continue
+                if (
+                    str(facts.get("error_code") or "") != "51001"
+                    and str(facts.get("reason") or "")
+                    != "okx_private_entry_instrument_unavailable"
+                ):
+                    cached_at = str(facts.get("cached_at") or "")
+                    try:
+                        cached = datetime.fromisoformat(
+                            cached_at.replace("Z", "+00:00")
+                        )
+                        cached = (
+                            cached
+                            if cached.tzinfo
+                            else cached.replace(tzinfo=UTC)
+                        )
+                    except (TypeError, ValueError):
+                        cached = now
+                    expires = min(expires, cached + timedelta(seconds=cache_ttl))
                 if expires <= now:
                     continue
                 normalized_symbol = self._normalize_position_symbol(str(symbol))
@@ -10581,6 +10601,80 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 feature_vectors = {
                     s: fv for s, fv in feature_vectors.items() if self._is_valid_feature_vector(fv)
                 }
+
+            if not feature_vectors:
+                # The websocket ticker stream is an optimization, not the
+                # market-analysis authority.  When it is disconnected or its
+                # cache is incomplete, the cache-only discovery pass can
+                # otherwise return an empty batch and leave the market loop
+                # producing no decisions for hours.  Recover a small rotating
+                # slice through the bounded native REST gate.  This is still
+                # observation-only; the entry pipeline performs its own
+                # authoritative pre-order market-fact check.
+                if run_market_analysis and market_scan_symbols:
+                    recovery_limit = min(
+                        len(market_scan_symbols),
+                        max(4, min(8, int(settings.auto_scan_symbol_limit or 8))),
+                    )
+                    recovery_symbols = list(market_scan_symbols[:recovery_limit])
+                    recovery_sem = asyncio.Semaphore(2)
+
+                    async def recover_feature_vector(sym: str) -> tuple[str, Any | None]:
+                        async with recovery_sem:
+                            try:
+                                recovered = await asyncio.wait_for(
+                                    self._get_feature_vector_snapshot(
+                                        sym,
+                                        wait_for_sentiment=False,
+                                        block_on_remote_ticker=True,
+                                        block_on_remote_indicators=False,
+                                        block_on_remote_derivatives=False,
+                                        allow_cached_indicator_build=True,
+                                        allow_indicator_background_refresh=True,
+                                        allow_derivatives_background_refresh=True,
+                                        prioritize_native_market_data=True,
+                                    ),
+                                    timeout=max(
+                                        1.0,
+                                        float(AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS),
+                                    ),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "market feature recovery failed",
+                                    symbol=sym,
+                                    error=safe_error_text(exc),
+                                )
+                                return sym, None
+                            return (
+                                sym,
+                                recovered
+                                if self._is_valid_feature_vector(recovered)
+                                else None,
+                            )
+
+                    recovered_rows = await asyncio.gather(
+                        *(recover_feature_vector(sym) for sym in recovery_symbols)
+                    )
+                    feature_vectors = {
+                        sym: fv
+                        for sym, fv in recovered_rows
+                        if fv is not None
+                    }
+                    results["market_feature_recovery"] = {
+                        "read_only": True,
+                        "is_entry_gate": False,
+                        "attempted_count": len(recovery_symbols),
+                        "recovered_count": len(feature_vectors),
+                        "symbols": recovery_symbols,
+                        "source": "bounded_native_market_rest",
+                    }
+                    if feature_vectors:
+                        logger.warning(
+                            "market feature cache empty; recovered bounded REST slice",
+                            attempted=len(recovery_symbols),
+                            recovered=len(feature_vectors),
+                        )
 
             if not feature_vectors:
                 logger.warning("no feature vectors available")

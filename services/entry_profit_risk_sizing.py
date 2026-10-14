@@ -2121,12 +2121,11 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            execution_slippage_floor_pct=_safe_float(
-                _safe_dict(distribution.get("transformations")).get(
-                    "authoritative_slippage_expected_pct"
-                ),
-                0.0,
-            ),
+            # Paper sizing is governed by the current executable book and fee
+            # facts. Historical OKX slippage remains training evidence and
+            # promotion input, but must not be applied a second time as a
+            # current-entry permission gate.
+            execution_slippage_floor_pct=0.0,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (

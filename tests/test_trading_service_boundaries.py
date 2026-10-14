@@ -4708,7 +4708,7 @@ def test_entry_unavailable_classification_keeps_transient_failures_retryable() -
             "blockers": ["environment_price_drift_exceeded"]
         },
     }
-    durable_mismatch = {
+    compatibility_mismatch = {
             "available": False,
             "reason": "okx_entry_live_execution_environment_incompatible",
             "environment_compatibility": {
@@ -4725,9 +4725,9 @@ def test_entry_unavailable_classification_keeps_transient_failures_retryable() -
     assert TradingService._entry_unavailable_cache_ttl(price_drift) == (
         trading_service.MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
     )
-    assert TradingService._is_definitive_entry_unavailable(durable_mismatch) is True
-    assert TradingService._entry_unavailable_cache_ttl(durable_mismatch) == (
-        trading_service.MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
+    assert TradingService._is_definitive_entry_unavailable(compatibility_mismatch) is False
+    assert TradingService._entry_unavailable_cache_ttl(compatibility_mismatch) == (
+        trading_service.MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
     )
 
 
@@ -4808,6 +4808,46 @@ def test_entry_unavailable_cache_survives_restart_and_expires(
         datetime.now(UTC) - timedelta(seconds=1)
     ).isoformat()
     assert restored._entry_unavailable_cache_for_mode("paper") == {}
+
+
+def test_legacy_transient_entry_cache_is_clamped_during_restart_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    data_dir.mkdir(parents=True)
+    (data_dir / "entry_instrument_unavailable_cache.json").write_text(
+        json.dumps(
+            {
+                "paper": {
+                    "BIO/USDT": {
+                        "available": False,
+                        "reason": "okx_entry_live_execution_environment_incompatible",
+                        "environment_compatibility": {
+                            "blockers": ["execution_instrument_missing"]
+                        },
+                        "cached_at": (
+                            datetime.now(UTC) - timedelta(hours=2)
+                        ).isoformat(),
+                        "expires_at": (
+                            datetime.now(UTC) + timedelta(hours=4)
+                        ).isoformat(),
+                    }
+                },
+                "live": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    service = TradingService.__new__(TradingService)
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    service._load_unavailable_entry_symbol_cache()
+
+    assert service._unavailable_entry_symbols_by_mode["paper"] == {}
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():

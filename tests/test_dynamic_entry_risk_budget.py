@@ -728,6 +728,49 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
 
 
 @pytest.mark.asyncio
+async def test_paper_training_uses_current_cost_without_historical_slippage_floor() -> None:
+    decision = _quality_observation_decision(return_lcb_pct=0.2)
+    normal_trade = decision.raw_response["normal_paper_trade"]
+    normal_trade["selection_reason"] = "paper_training_entry"
+    normal_trade["paper_quality_observation_only"] = False
+    normal_trade["paper_training_only"] = True
+    normal_trade["paper_quality_mode"] = "training"
+    normal_trade["current_raw_expected_return_pct"] = 0.9
+    normal_trade["paper_training_reasons"] = [
+        "historical_quality_gate_is_observation_only",
+        "current_directional_evidence_is_training_eligible",
+    ]
+    normal_trade["authorized"] = True
+    normal_trade["single_trade_risk_fraction_cap"] = (
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+    )
+    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
+
+    normal_trade["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(normal_trade)
+    )
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["return_distribution_contract"].update(
+        {
+            "raw_expected_return_pct": 0.9,
+            "objective_expected_return_pct": 0.2,
+            "transformations": {
+                "authoritative_slippage_expected_pct": 2.0,
+            },
+        }
+    )
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["paper_training_shadow_only"] is False
+    assert sizing["expected_net_return_pct"] > 0.0
+    assert sizing["execution_cost"]["total_pct"] < 1.0
+
+
+@pytest.mark.asyncio
 async def test_fallback_one_x_is_not_treated_as_model_leverage_cap() -> None:
     decision = _decision()
     decision.suggested_leverage = 1.0

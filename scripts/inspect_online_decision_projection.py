@@ -69,6 +69,7 @@ async def main():
                 sizing = raw.get("profit_risk_sizing") if isinstance(raw.get("profit_risk_sizing"), dict) else {{}}
                 facts = raw.get("pre_order_execution_facts") if isinstance(raw.get("pre_order_execution_facts"), dict) else {{}}
                 exchange_facts = raw.get("exchange_risk_facts") if isinstance(raw.get("exchange_risk_facts"), dict) else {{}}
+                opportunity = raw.get("opportunity_score") if isinstance(raw.get("opportunity_score"), dict) else {{}}
                 stage_machine = raw.get("decision_state_machine") if isinstance(raw.get("decision_state_machine"), dict) else {{}}
                 execution = raw.get("execution_result") if isinstance(raw.get("execution_result"), dict) else {{}}
                 result.append({{
@@ -103,6 +104,16 @@ async def main():
                             "paper_training_reasons",
                         )
                     }},
+                    "opportunity_score": {{
+                        key: opportunity.get(key)
+                        for key in (
+                            "expected_net_return_pct",
+                            "return_lcb_pct",
+                            "execution_cost",
+                            "return_distribution_contract",
+                            "expected_net_breakdown",
+                        )
+                    }},
                     "sizing": {{
                         key: sizing.get(key)
                         for key in (
@@ -115,6 +126,15 @@ async def main():
                             "account_equity_usdt",
                             "policy_provenance",
                             "dynamic_leverage_decision",
+                            "size_aware_profitability",
+                            "execution_cost",
+                            "minimum_order_evidence",
+                            "risk_budget_usdt",
+                            "fill_notional_ceiling_usdt",
+                            "target_notional_usdt",
+                            "contract_step_notional_usdt",
+                            "expected_net_return_pct",
+                            "return_lcb_pct",
                         )
                     }},
                     "pre_order_execution_facts": {{
