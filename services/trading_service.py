@@ -8326,6 +8326,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
         feature_vectors: dict[str, Any],
         limit: int,
     ) -> dict[str, Any]:
+        execution_availability = self._safe_dict(
+            self._safe_dict(
+                getattr(self, "_last_auto_feature_rank_diagnostics", None)
+            ).get("execution_availability")
+        )
         result = self.entry_feature_ranker.rank(
             feature_vectors,
             limit,
@@ -8375,6 +8380,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     if diagnostics["rank_underfilled"]
                     else ""
                 )
+        # Indicator hydration re-ranks the same round after its capability
+        # probe. Preserve that probe's audit snapshot; each new round clears
+        # _last_auto_feature_rank_diagnostics before its first ranking pass.
+        if execution_availability:
+            result.diagnostics["execution_availability"] = dict(execution_availability)
         logger.info(
             "auto opportunity shortlist",
             **result.diagnostics,

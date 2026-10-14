@@ -802,6 +802,79 @@ async def test_paper_training_reprices_against_distribution_slippage_floor_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gross_return", "entry_eligible"),
+    [(0.35, True), (0.05, False)],
+)
+async def test_paper_training_uses_solved_return_for_execution_permission(
+    gross_return: float,
+    entry_eligible: bool,
+) -> None:
+    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    normal_trade = decision.raw_response["normal_paper_trade"]
+    normal_trade.update(
+        {
+            "selection_reason": "paper_training_entry",
+            "paper_quality_observation_only": False,
+            "paper_training_only": True,
+            "paper_quality_mode": "training",
+            "current_raw_expected_return_pct": gross_return,
+            "paper_training_reasons": [
+                "historical_quality_gate_is_observation_only",
+                "current_directional_evidence_is_training_eligible",
+            ],
+            "authorized": True,
+            "single_trade_risk_fraction_cap": (
+                NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+            ),
+        }
+    )
+    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
+
+    normal_trade["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(normal_trade)
+    )
+    decision.feature_snapshot.update(_size_aware_book_snapshot(5_000.0))
+    opportunity = decision.raw_response["opportunity_score"]
+    original_cost = execution_cost_estimate(decision.feature_snapshot).to_dict()
+    original_net = gross_return - original_cost["total_pct"]
+    assert original_net < 0.0
+    opportunity["execution_cost"] = original_cost
+    opportunity["return_distribution_contract"].update(
+        {
+            "raw_expected_return_pct": original_net,
+            "objective_expected_return_pct": -0.5,
+            "transformations": {
+                "live_execution_cost_pct": original_cost["total_pct"],
+                "live_slippage_pct": original_cost["slippage_pct"],
+                "authoritative_slippage_cost_basis": "expected",
+            },
+        }
+    )
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    solution = sizing["size_aware_profitability"]
+    assert solution["production_eligible"] is entry_eligible
+    assert sizing["production_eligible"] is entry_eligible
+    assert sizing["paper_training_shadow_only"] is not entry_eligible
+    assert sizing["expected_net_return_pct"] == pytest.approx(
+        gross_return - sizing["execution_cost"]["total_pct"]
+    )
+    if entry_eligible:
+        assert sizing["expected_net_return_pct"] > 0.0
+        assert sizing["final_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
+        assert sizing["final_notional_usdt"] <= solution["original_notional_usdt"]
+        assert "normal_paper_training_shadow_only" not in sizing["reason"]
+    else:
+        assert sizing["expected_net_return_pct"] <= 0.0
+        assert sizing["final_notional_usdt"] == 0.0
+        assert "normal_paper_training_shadow_only" in sizing["reason"]
+
+
+@pytest.mark.asyncio
 async def test_fallback_one_x_is_not_treated_as_model_leverage_cap() -> None:
     decision = _decision()
     decision.suggested_leverage = 1.0

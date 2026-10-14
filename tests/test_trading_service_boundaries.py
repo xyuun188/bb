@@ -6927,6 +6927,43 @@ def test_auto_scan_feature_budget_keeps_verified_execution_symbols_in_discovery_
     assert diagnostics["execution_mode"] == model_mode
 
 
+def test_market_reranking_preserves_same_round_execution_capability_evidence() -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_analysis_only_symbols = set()
+    availability = {
+        "mode": "paper",
+        "available_count": 1,
+        "known_unavailable_count": 1,
+        "unavailable": [{"symbol": "PI/USDT", "error_code": "51001"}],
+        "analysis_only_execution_unverified": [{"symbol": "ETH/USDT"}],
+        "background_refresh_status": {"status": "ok"},
+    }
+    service._last_auto_feature_rank_diagnostics = {
+        "execution_availability": availability,
+    }
+
+    def rank(features, _limit, **_kwargs):
+        return SimpleNamespace(
+            selected=dict(features),
+            diagnostics={
+                "selected": len(features),
+                "analysis_only_selected_symbols": [],
+            },
+        )
+
+    service.entry_feature_ranker = SimpleNamespace(rank=rank)
+    features = {"BTC/USDT": object(), "ETH/USDT": object()}
+
+    assert service._rank_auto_feature_vectors(features, 2) == features
+    diagnostics = service._last_auto_feature_rank_diagnostics
+    assert diagnostics["execution_availability"] == availability
+    assert diagnostics["execution_availability"] is not availability
+
+    service._last_auto_feature_rank_diagnostics = {}
+    service._rank_auto_feature_vectors(features, 2)
+    assert "execution_availability" not in service._last_auto_feature_rank_diagnostics
+
+
 def test_market_analysis_value_selection_populates_runtime_budget_diagnostics() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = lambda symbol: str(symbol or "")

@@ -2154,19 +2154,6 @@ class EntryProfitRiskSizingPolicy:
             normal_trade.get("current_raw_expected_return_pct"),
             _safe_float(distribution.get("raw_expected_return_pct"), 0.0),
         )
-        # A training label is still useful when the raw directional signal is
-        # positive but the current executable net return is negative.  It must
-        # remain a shadow observation, though: submitting the exchange
-        # minimum in that case creates a real fee-drag position and teaches
-        # the model a sizing artefact instead of a tradable opportunity.
-        training_shadow_only = bool(
-            training_mode
-            and (
-                not isfinite(expected_net)
-                or expected_net <= 0.0
-                or not size_aware_solution_eligible
-            )
-        )
         if selected_size_cost.get("order_size_complete") is True:
             expected_net = _safe_float(
                 size_aware_solution.get("expected_net_return_pct"),
@@ -2230,6 +2217,17 @@ class EntryProfitRiskSizingPolicy:
                     risk_and_liquidity_ceiling,
                     model_requested_notional_cap,
                 )
+        # Only the solved executable return determines shadow-only status.
+        # A negative full-size estimate can become profitable at a smaller
+        # native book boundary; do not carry its pre-sizing veto forward.
+        training_shadow_only = bool(
+            training_mode
+            and (
+                not isfinite(expected_net)
+                or expected_net <= 0.0
+                or not size_aware_solution_eligible
+            )
+        )
         negative_lcb_stress_fraction = max(
             negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
         )
