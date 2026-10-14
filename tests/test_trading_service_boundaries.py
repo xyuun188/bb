@@ -13132,6 +13132,39 @@ async def test_pre_order_facts_reuse_recent_balance_after_temporary_okx_error() 
 
 
 @pytest.mark.asyncio
+async def test_pre_order_51001_is_written_to_candidate_negative_cache() -> None:
+    service = TradingService.__new__(TradingService)
+    service._entry_unavailable_cache_persist_enabled = False
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+
+    class UnavailableInstrumentExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": "okx_private_entry_instrument_unavailable",
+                "error_code": "51001",
+                "symbol": "WAL/USDT",
+                "inst_id": "WAL-USDT-SWAP",
+                "feature_snapshot": {},
+            }
+
+    async def get_executor(_mode: str) -> UnavailableInstrumentExecutor:
+        return UnavailableInstrumentExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.SHORT)
+    decision.symbol = "WAL/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is False
+    cached = service._unavailable_entry_symbols_by_mode["paper"]["WAL/USDT"]
+    assert cached["error_code"] == "51001"
+    assert cached["reason"] == "okx_private_entry_instrument_unavailable"
+    assert cached["analysis_only"] is True
+
+
+@pytest.mark.asyncio
 async def test_pre_order_facts_reuse_recent_balance_after_empty_okx_snapshot() -> None:
     service = TradingService.__new__(TradingService)
     service._okx_balance_snapshot_cache = {

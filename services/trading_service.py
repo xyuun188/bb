@@ -4432,6 +4432,21 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
+        # A definitive OKX capability rejection can happen during the
+        # immediate pre-order environment refresh without reaching
+        # ``place_order``.  Feed that result into the same candidate-pool
+        # negative cache used by shortlist probes and submit-time failures;
+        # otherwise the next market round can select the same unsupported
+        # instrument again.
+        unavailable_ttl = self._entry_unavailable_cache_ttl(facts)
+        if unavailable_ttl is not None and self._is_definitive_entry_unavailable(facts):
+            self._remember_unavailable_entry_symbol(
+                model_mode,
+                decision.symbol,
+                facts,
+                ttl_seconds=unavailable_ttl,
+            )
+
         facts = await self._hydrate_entry_balance_facts(model_mode, facts)
         return self._entry_facts_with_verified_balance(model_mode, facts, pre_order=True)
 
