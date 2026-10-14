@@ -28,7 +28,10 @@ from sqlalchemy import Float, cast, select
 from ai_brain.analysis_quality import build_expert_call_contract
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
-from ai_brain.model_registry import ModelRegistry
+from ai_brain.model_registry import (
+    TARGET_QWEN_CALL_TIMEOUT_SECONDS,
+    ModelRegistry,
+)
 from config.settings import (
     DECISION_MAKER_NAME,
     ENSEMBLE_TRADER_NAME,
@@ -1457,10 +1460,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # that is merely "slow". Keep the outer market budget aligned
             # with the carrier's configured generation boundary.
             if target_qwen_configured:
-                batch_window = min(
-                    batch_window,
-                    max(float(settings.ai_target_qwen_timeout_seconds or 26.0), 8.0),
-                )
+                batch_window = TARGET_QWEN_CALL_TIMEOUT_SECONDS
         if batch_window > 0.0:
             independent_window = 0.0
         decision_timeout = max(

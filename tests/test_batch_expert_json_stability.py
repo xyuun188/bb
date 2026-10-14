@@ -967,9 +967,11 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
     decisions = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), context)
 
     assert decisions == {}
-    assert _BatchTimeoutExpert.batch_calls == 1
+    assert _BatchTimeoutExpert.batch_calls == 0
     assert _BatchTimeoutExpert.individual_calls == 0
-    assert {row["status"] for row in context["_model_timings"]} == {"timeout"}
+    assert {row["status"] for row in context["_model_timings"]} == {
+        "analysis_budget_deferred"
+    }
 
 
 @pytest.mark.asyncio

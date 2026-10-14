@@ -51,6 +51,7 @@ from services.entry_signal_extraction import (
 )
 
 logger = structlog.get_logger(__name__)
+TARGET_QWEN_CALL_TIMEOUT_SECONDS = 30.0
 
 # Kept as a patchable module attribute for tests. The real LangChain/OpenAI
 # stack is imported only when an LLM call is actually constructed; importing
@@ -1119,8 +1120,18 @@ class LLMAgent(AbstractAIModel):
             # cover both phases; otherwise a normal queued request is recorded
             # as a model outage before the carrier can answer.
             request_timeout = min(
-                max(float(getattr(settings, "ai_target_qwen_timeout_seconds", 26.0) or 26.0), 8.0),
-                30.0,
+                max(
+                    float(
+                        getattr(
+                            settings,
+                            "ai_target_qwen_timeout_seconds",
+                            TARGET_QWEN_CALL_TIMEOUT_SECONDS,
+                        )
+                        or TARGET_QWEN_CALL_TIMEOUT_SECONDS
+                    ),
+                    TARGET_QWEN_CALL_TIMEOUT_SECONDS,
+                ),
+                TARGET_QWEN_CALL_TIMEOUT_SECONDS,
             )
         elif fast_expert:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 18.0)

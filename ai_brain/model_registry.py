@@ -29,6 +29,7 @@ BatchExpertDecider = Callable[
     [FeatureVector, dict[str, Any], list[str]],
     Awaitable[dict[str, DecisionOutput]],
 ]
+TARGET_QWEN_CALL_TIMEOUT_SECONDS = 30.0
 
 
 class BatchExpertModel(Protocol):
@@ -730,16 +731,13 @@ class ModelRegistry:
             requested_batch_timeout = float(
                 settings.ai_batch_expert_timeout_seconds
                 or settings.ai_target_qwen_timeout_seconds
-                or 26.0
+                or TARGET_QWEN_CALL_TIMEOUT_SECONDS
             )
             if _is_target_qwen_provider(batch_model):
                 # Include the target carrier's bounded queue wait and
                 # generation deadline in the caller budget.  Otherwise a
                 # queued but healthy request is recorded as a timeout.
-                requested_batch_timeout = min(
-                    requested_batch_timeout,
-                    float(settings.ai_target_qwen_timeout_seconds or 26.0),
-                )
+                requested_batch_timeout = TARGET_QWEN_CALL_TIMEOUT_SECONDS
             requested_batch_timeout = max(requested_batch_timeout, 8.0)
             batch_timeout, budget_snapshot = _bounded_analysis_timeout(
                 context,

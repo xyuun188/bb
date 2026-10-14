@@ -8003,7 +8003,8 @@ def test_target_qwen_market_budget_has_no_unused_model_windows(
     assert service._target_qwen_single_call_route() is True
     assert service._independent_expert_window_seconds() == 0.0
     assert service.market_model_inference_timeout_seconds() == pytest.approx(
-        target_timeout + trading_service.MARKET_MODEL_COMPLETION_RESERVE_SECONDS
+        max(target_timeout, trading_service.TARGET_QWEN_CALL_TIMEOUT_SECONDS)
+        + trading_service.MARKET_MODEL_COMPLETION_RESERVE_SECONDS
     )
 
 
