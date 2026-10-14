@@ -278,6 +278,7 @@ MARKET_LOCAL_AI_TOOLS_STAGE_GRACE_SECONDS = 2.0
 MARKET_SYMBOL_CONTEXT_MAX_SECONDS = 18.0
 MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
+MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS = 2.5
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
 AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
 AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS = 3
@@ -8622,6 +8623,48 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # next round observes an empty capability cache and repeats the
             # same unverified shortlist.
             await asyncio.sleep(0)
+
+        # If this round has no verified executable candidate at all, consume
+        # the refresh already started above for a very short bounded wait.
+        # This prevents an unsupported instrument from reaching model analysis
+        # first and failing only at the final entry gate, while preserving the
+        # non-blocking path whenever a verified candidate is already available.
+        if not verified_symbols.intersection(feature_vectors):
+            refresh_tasks = getattr(self, "_market_instrument_refresh_tasks", {})
+            refresh_task = (
+                refresh_tasks.get(selected_mode)
+                if isinstance(refresh_tasks, dict)
+                else None
+            )
+            if isinstance(refresh_task, asyncio.Task) and not refresh_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(refresh_task),
+                        timeout=MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS,
+                    )
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+                unavailable_by_mode = dict(
+                    self._entry_unavailable_cache_for_mode(selected_mode)
+                )
+                refreshed_verified_by_mode = getattr(
+                    self, "_verified_entry_symbols_by_mode", {}
+                )
+                if isinstance(refreshed_verified_by_mode, dict):
+                    verified_by_mode = refreshed_verified_by_mode
+                verified_symbols = set(
+                    verified_by_mode.get(selected_mode, set()) or set()
+                )
+                verified_symbols.difference_update(unavailable_by_mode)
+                if verified_symbols.intersection(feature_vectors):
+                    logger.info(
+                        "market instrument shortlist consumed bounded availability refresh",
+                        mode=selected_mode,
+                        verified_count=len(
+                            verified_symbols.intersection(feature_vectors)
+                        ),
+                        unavailable_count=len(unavailable_by_mode),
+                    )
 
         selected = [symbol for symbol in feature_vectors if symbol in verified_symbols]
         selected.extend(
