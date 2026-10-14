@@ -756,9 +756,88 @@ def test_start_online_model_tunnels_bound_ssh_channel_open_time() -> None:
     handler.handle()
 
     assert server.ssh_transport.timeout == tunnels.FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS
-    assert server.ssh_transport.timeout > tunnels.TUNNEL_HEALTH_TIMEOUT_SECONDS
-    assert server.ssh_transport.timeout <= 30.0
+    assert server.ssh_transport.timeout <= tunnels.TUNNEL_HEALTH_TIMEOUT_SECONDS
+    assert tunnels.FORWARD_CHANNEL_OPEN_BUDGET_SECONDS <= 15.0
     assert tunnels.FORWARD_CHANNELS_PER_TRANSPORT <= 10
+
+
+def test_tunnel_switches_transport_before_forwarding_request_bytes(monkeypatch) -> None:
+    from scripts import start_online_model_tunnels as tunnels
+
+    class FakeRequest:
+        reads = 0
+
+        def settimeout(self, _seconds):
+            pass
+
+        def getpeername(self):
+            return ("127.0.0.1", 12345)
+
+        def recv(self, _size):
+            self.reads += 1
+            return b"POST /v1/chat/completions HTTP/1.1\r\n" if self.reads == 1 else b""
+
+        def shutdown(self, *_args):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeChannel:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+        def settimeout(self, _seconds):
+            pass
+
+        def shutdown_write(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class FakeTransport:
+        def __init__(self, channel=None):
+            self.channel = channel
+            self.closed = False
+            self.opens = 0
+
+        def is_active(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+        def open_channel(self, *_args, **_kwargs):
+            self.opens += 1
+            assert request.reads == 0
+            if self.channel is None:
+                raise TimeoutError("channel open stalled")
+            return self.channel
+
+    request = FakeRequest()
+    channel = FakeChannel()
+    failed = FakeTransport()
+    healthy = FakeTransport(channel)
+    server = object.__new__(tunnels.ForwardServer)
+    server.spec = tunnels.build_default_tunnels()[0]
+    server.transport_pool = tunnels.TransportPool([failed, healthy], slots_per_transport=1)
+    handler = object.__new__(tunnels.ForwardHandler)
+    handler.server = server
+    handler.request = request
+    monkeypatch.setattr(tunnels.select, "select", lambda *_args: ([request], [], []))
+
+    handler.handle()
+
+    assert failed.closed is True
+    assert failed.opens == healthy.opens == 1
+    assert channel.sent == [b"POST /v1/chat/completions HTTP/1.1\r\n"]
+    assert channel.closed is True
+    assert server.transport_pool.acquire(0) is healthy
 
 
 def test_start_online_model_tunnels_drain_timeout_without_cutting_active_channel() -> None:

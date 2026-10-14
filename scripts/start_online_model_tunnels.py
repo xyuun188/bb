@@ -57,7 +57,8 @@ TUNNEL_HEALTH_TIMEOUT_SECONDS = 5.0
 # eventually make the loopback listener look alive while it cannot accept
 # useful traffic.
 FORWARD_CHANNEL_IO_TIMEOUT_SECONDS = 10.0
-FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS = 15.0
+FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS = 5.0
+FORWARD_CHANNEL_OPEN_BUDGET_SECONDS = 15.0
 # Spread busy endpoints across more than one SSH session and keep each session
 # below the model server's sshd MaxSessions limit.
 FORWARD_CHANNELS_PER_TRANSPORT = 5
@@ -340,47 +341,69 @@ class ForwardHandler(socketserver.BaseRequestHandler):
         except Exception:
             return False
 
-    def handle(self) -> None:
-        server = self.server
-        self.request.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
-        assert isinstance(server, ForwardServer)
-        transport_pool = getattr(server, "transport_pool", None)
-        ssh_transport = (
-            transport_pool.acquire(FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS)
-            if transport_pool is not None
-            else getattr(server, "ssh_transport", None)
-        )
-        if ssh_transport is None:
-            _log(f"{server.spec.name} tunnel channel capacity exhausted or unavailable")
-            return
-        try:
+    def _open_forward_channel(self, server: ForwardServer) -> tuple[Any, Any]:
+        """Fail over before reading client bytes; an HTTP request is never replayed."""
+
+        pool = getattr(server, "transport_pool", None)
+        attempts = len(pool.transports) if pool is not None else 1
+        deadline = time.monotonic() + FORWARD_CHANNEL_OPEN_BUDGET_SECONDS
+        peer = self.request.getpeername()
+        for attempt in range(attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            transport = (
+                pool.acquire(remaining if attempt == 0 else 0)
+                if pool is not None
+                else getattr(server, "ssh_transport", None)
+            )
+            if transport is None:
+                break
             try:
-                peer = self.request.getpeername()
-                channel = ssh_transport.open_channel(
+                channel = transport.open_channel(
                     "direct-tcpip",
                     (server.spec.remote_host, server.spec.remote_port),
                     peer,
-                    timeout=FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS,
+                    timeout=min(
+                        FORWARD_CHANNEL_OPEN_TIMEOUT_SECONDS,
+                        max(deadline - time.monotonic(), 0.05),
+                    ),
                 )
+                if channel is not None:
+                    return transport, channel
+                _log(f"{server.spec.name} tunnel rejected by SSH server")
+                if pool is not None:
+                    pool.release(transport)
+                return None, None
             except Exception as exc:  # pragma: no cover - live SSH transport only.
                 _log(f"{server.spec.name} tunnel open failed: {safe_error_text(exc)}")
-                if _should_retire_transport(exc, ssh_transport):
-                    immediate = _should_retire_transport_immediately(exc, ssh_transport)
-                    if transport_pool is not None:
-                        closed = transport_pool.request_retirement(
-                            ssh_transport,
-                            immediate=immediate,
-                        )
+                retryable = _should_retire_transport(exc, transport)
+                if retryable:
+                    immediate = _should_retire_transport_immediately(exc, transport)
+                    if pool is not None:
+                        closed = pool.request_retirement(transport, immediate=immediate)
                         if not closed:
                             _log(
                                 f"{server.spec.name} tunnel transport draining; "
                                 "active channels preserved"
                             )
                     elif immediate:
-                        TransportPool._close_transport(ssh_transport)
-                return
+                        TransportPool._close_transport(transport)
+                if pool is not None:
+                    pool.release(transport)
+                if not retryable:
+                    return None, None
+        _log(f"{server.spec.name} tunnel has no usable channel within the open budget")
+        return None, None
+
+    def handle(self) -> None:
+        server = self.server
+        self.request.settimeout(FORWARD_CHANNEL_IO_TIMEOUT_SECONDS)
+        assert isinstance(server, ForwardServer)
+        transport_pool = getattr(server, "transport_pool", None)
+        ssh_transport, channel = self._open_forward_channel(server)
+        try:
             if channel is None:
-                _log(f"{server.spec.name} tunnel rejected by SSH server")
                 return
             deadline = time.monotonic() + max(
                 float(server.spec.max_connection_seconds),
@@ -426,7 +449,7 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                 except (AttributeError, OSError):
                     pass
         finally:
-            if transport_pool is not None:
+            if transport_pool is not None and ssh_transport is not None:
                 transport_pool.release(ssh_transport)
             try:
                 self.request.shutdown(socket.SHUT_RDWR)

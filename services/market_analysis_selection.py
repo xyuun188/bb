@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-08-22.coverage-backlog.v8"
+    VERSION = "2026-10-15.execution-aware-coverage.v9"
 
     def __init__(
         self,
@@ -107,6 +107,7 @@ class MarketAnalysisSelectionPolicy:
         limit: int,
         *,
         now: datetime | None = None,
+        execution_verified_symbols: set[str] | None = None,
     ) -> MarketAnalysisSelectionResult:
         final_limit = min(max(0, int(limit or 0)), len(candidates or {}))
         selected_at = _as_utc(now) or datetime.now(UTC)
@@ -120,9 +121,15 @@ class MarketAnalysisSelectionPolicy:
             self._candidate_row(symbol, feature, rank=index + 1, now=selected_at)
             for index, (symbol, feature) in enumerate((candidates or {}).items())
         ]
+        verified_keys = {
+            self.normalize_symbol(symbol) for symbol in (execution_verified_symbols or set())
+        }
+        for row in rows:
+            row["execution_verified"] = row["symbol_key"] in verified_keys
         ranked = sorted(
             rows,
             key=lambda row: (
+                bool(row["execution_verified"]),
                 _safe_float(row["evaluation_score"]),
                 _safe_float(row["base_advantage_score"]),
                 -int(row["rank_before_selection"]),
@@ -170,6 +177,7 @@ class MarketAnalysisSelectionPolicy:
         coverage_ranked = sorted(
             (row for row in coverage_candidates if str(row["symbol_key"]) not in selected_keys),
             key=lambda row: (
+                bool(row["execution_verified"]),
                 # Previously observed overdue symbols must converge before a
                 # never-analyzed discovery row can consume the same coverage
                 # slot.  Fresh discovery still remains eligible through the
@@ -419,6 +427,12 @@ class MarketAnalysisSelectionPolicy:
             "candidate_count": len(rows),
             "final_limit": int(final_limit),
             "selected_count": len(selected_rows),
+            "execution_verified_candidate_count": sum(
+                bool(row.get("execution_verified")) for row in rows
+            ),
+            "execution_verified_selected_count": sum(
+                bool(row.get("execution_verified")) for row in selected_rows
+            ),
             "selected_symbols": [str(row["symbol"]) for row in selected_rows],
             "cooldown_excluded_count": len(cooldown_excluded),
             "cooldown_excluded_symbols": [
@@ -509,6 +523,7 @@ class MarketAnalysisSelectionPolicy:
             key: row.get(key)
             for key in (
                 "symbol",
+                "execution_verified",
                 "selection_role",
                 "rank_before_selection",
                 "base_advantage_score",

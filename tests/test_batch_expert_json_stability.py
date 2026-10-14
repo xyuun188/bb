@@ -973,6 +973,43 @@ async def test_market_analysis_deadline_skips_independent_retry_after_slow_batch
 
 
 @pytest.mark.asyncio
+async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 26.0)
+    monkeypatch.setattr(settings, "ai_target_qwen_queue_wait_seconds", 0.01)
+    _BatchTimeoutExpert.batch_calls = 0
+    registry = ModelRegistry()
+    for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    ):
+        registry.register(_BatchTimeoutExpert(name))
+
+    lock = asyncio.Lock()
+    await lock.acquire()
+    registry._batch_provider_locks[("", "qwen3.8-27b")] = lock
+    context: dict[str, Any] = {}
+    started = asyncio.get_running_loop().time()
+    try:
+        decisions = await registry.decide_all(
+            FeatureVector(symbol="BTC/USDT"),
+            context,
+        )
+    finally:
+        lock.release()
+
+    assert decisions == {}
+    assert asyncio.get_running_loop().time() - started < 0.5
+    assert _BatchTimeoutExpert.batch_calls == 0
+    assert {row["status"] for row in context["_model_timings"]} == {"provider_queue_deferred"}
+    assert not context.get("_attempted_models")
+
+
+@pytest.mark.asyncio
 async def test_batch_timeout_activates_minimum_circuit_breaker_when_config_is_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

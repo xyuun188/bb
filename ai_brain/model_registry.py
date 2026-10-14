@@ -18,7 +18,7 @@ from ai_brain.expert_diversity_policy import (
     ExpertDiversityReview,
     review_batch_expert_consensus,
 )
-from ai_brain.llm_agent import ensure_llm_call_budget
+from ai_brain.llm_agent import LLMCapacityQueueDeferred, ensure_llm_call_budget
 from config.settings import settings
 from core.safe_output import safe_error_text
 from data_feed.feature_vector import FeatureVector
@@ -516,6 +516,22 @@ class ModelRegistry:
                     model.decide(features, context),
                     timeout=timeout_seconds,
                 )
+            except LLMCapacityQueueDeferred as exc:
+                duration = round(time.perf_counter() - perf_started, 3)
+                return (
+                    model,
+                    exc,
+                    {
+                        "stage": "expert_initial",
+                        "name": model.name,
+                        "status": "provider_queue_deferred",
+                        "started_at": started_at.isoformat(),
+                        "duration_sec": duration,
+                        "provider_model": _provider_model_name(model),
+                        "attempted": False,
+                        "reason": safe_error_text(exc, limit=240),
+                    },
+                )
             except TimeoutError:
                 duration = round(time.perf_counter() - perf_started, 3)
                 return (
@@ -584,6 +600,21 @@ class ModelRegistry:
             model, result, timing = item
             model_timings.append(timing)
             if isinstance(result, Exception):
+                if isinstance(result, LLMCapacityQueueDeferred):
+                    context["_attempted_models"] = [
+                        name
+                        for name in context.get("_attempted_models", [])
+                        if name != model.name
+                    ]
+                    context["_model_failures"].append(
+                        {
+                            "expert_name": model.name,
+                            "provider_model": _provider_model_name(model),
+                            "reason": safe_error_text(result, limit=240),
+                            "status": "provider_queue_deferred",
+                        }
+                    )
+                    continue
                 error_text = safe_error_text(result)
                 logger.error("model decide failed", name=model.name, error=error_text)
                 context["_model_failures"].append(
@@ -757,6 +788,18 @@ class ModelRegistry:
                 # second symbol enter the single-worker carrier while the
                 # first request is still recovering.
                 lock_remaining = batch_timeout
+                if _is_target_qwen_provider(batch_model):
+                    # The target carrier has one worker and advertises a
+                    # separate queue budget. Waiting for the full inference
+                    # deadline behind another symbol turns queue pressure into
+                    # a false model timeout; defer before admission instead.
+                    lock_remaining = min(
+                        lock_remaining,
+                        max(
+                            float(settings.ai_target_qwen_queue_wait_seconds or 0.0),
+                            0.05,
+                        ),
+                    )
                 deadline = context.get("_analysis_deadline_monotonic")
                 try:
                     if deadline:
@@ -899,10 +942,19 @@ class ModelRegistry:
         except Exception as exc:
             duration = round(time.perf_counter() - perf_started, 3)
             error_text = safe_error_text(exc, limit=240)
+            provider_queue_deferred = provider_queue_deferred or isinstance(
+                exc,
+                LLMCapacityQueueDeferred,
+            )
             if provider_queue_deferred:
+                attempted_models = context.get("_attempted_models")
+                if isinstance(attempted_models, list):
+                    context["_attempted_models"] = [
+                        name for name in attempted_models if name not in expert_names
+                    ]
                 reason = (
-                    "single-worker model provider queue wait exceeded this symbol's "
-                    "analysis budget; deferred without opening"
+                    "single-worker model queue wait exceeded its admission budget; "
+                    "deferred without opening"
                 )
                 context.setdefault("_model_failures", []).extend(
                     {

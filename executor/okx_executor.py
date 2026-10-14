@@ -47,6 +47,7 @@ from services.normal_paper_trade import normal_paper_order_identity_reasons
 from services.okx_balance_snapshot import finite_balance_value
 from services.okx_entry_environment_compatibility import (
     assess_okx_entry_environment_compatibility,
+    entry_instrument_unavailable_cache_ttl,
 )
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_native_facts import OkxNativeFactsClient
@@ -69,7 +70,6 @@ EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_EXIT_INSTRUMENT_REJECTION_COOLDOWN_SECONDS = 900.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
-OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 21600.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
 OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS = 60.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
@@ -7055,20 +7055,9 @@ class OKXExecutor(AbstractExecutor):
                     "generated_at": generated_at,
                     "cache_hit": False,
                 }
-                blockers = set(compatibility.get("blockers") or ())
-                # Contract identity/instrument absence is durable, while a
-                # missing or drifting ticker is transient. Keep the executor
-                # cache aligned with the candidate-pool retry policy so a
-                # temporary market-data outage cannot suppress entries for
-                # hours after the market recovers.
-                transient_blockers = {
-                    "environment_price_drift_exceeded",
-                    "environment_price_missing",
-                }
                 ttl = (
-                    OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
-                    if blockers - transient_blockers
-                    else OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
+                    entry_instrument_unavailable_cache_ttl(result)
+                    or OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
                 )
                 self._entry_instrument_availability_cache[inst_id] = (
                     dict(result),
@@ -7144,9 +7133,8 @@ class OKXExecutor(AbstractExecutor):
                 "execution_verified": False,
             }
             ttl = (
-                OKX_ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
-                if unavailable
-                else OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
+                entry_instrument_unavailable_cache_ttl(result)
+                or OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS
             )
         if result.get("available") is True and compatibility.get("checked") is True:
             ttl = min(ttl, OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS)

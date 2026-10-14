@@ -2314,6 +2314,50 @@ async def test_okx_entry_instrument_price_missing_uses_transient_cache_ttl() -> 
 
 
 @pytest.mark.asyncio
+async def test_okx_missing_execution_metadata_recovers_after_short_retry(
+) -> None:
+    exchange = _EntryInstrumentAvailabilityCcxt()
+    executor = _executor(exchange)
+    compatibility = {
+        "checked": True,
+        "compatible": False,
+        "blockers": ["execution_instrument_missing", "environment_price_missing"],
+    }
+    first = await executor.entry_instrument_availability(
+        "BTC/USDT",
+        environment_compatibility=compatibility,
+    )
+    assert first["available"] is False
+    assert exchange.fetch_leverage_calls == []
+    inst_id = okx_module.okx_inst_id_from_symbol("BTC/USDT")
+    cached_result, _cached_at, ttl = executor._entry_instrument_availability_cache[inst_id]
+    executor._entry_instrument_availability_cache[inst_id] = (
+        cached_result,
+        okx_module.time.monotonic() - ttl + 1,
+        ttl,
+    )
+    cached = await executor.entry_instrument_availability(
+        "BTC/USDT",
+        environment_compatibility={"checked": True, "compatible": True},
+    )
+    assert cached["available"] is False
+    assert cached["cache_hit"] is True
+
+    executor._entry_instrument_availability_cache[inst_id] = (
+        cached_result,
+        okx_module.time.monotonic() - ttl - 1,
+        ttl,
+    )
+    recovered = await executor.entry_instrument_availability(
+        "BTC/USDT",
+        environment_compatibility={"checked": True, "compatible": True},
+    )
+    assert recovered["available"] is True
+    assert recovered["cache_hit"] is False
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_instrument_shortlist_stops_after_ranked_target() -> None:
     exchange = _EntryInstrumentAvailabilityCcxt()
     executor = _executor(exchange)

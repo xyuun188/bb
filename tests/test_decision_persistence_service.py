@@ -233,6 +233,45 @@ async def test_log_decision_marks_incomplete_analysis_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason_code", "counts", "expected_status", "expected_reason_code"),
+    [
+        ("direction_conflict", {"completed": 4}, DecisionStageStatus.BLOCKED, "SIGNAL_UNAVAILABLE"),
+        ("funding_evidence_unavailable", {"completed": 4}, DecisionStageStatus.BLOCKED, "SIGNAL_UNAVAILABLE"),
+        ("cross_validation_unresolved", {"completed": 4}, DecisionStageStatus.BLOCKED, "SIGNAL_UNAVAILABLE"),
+        ("insufficient_evidence", {"skipped": 4}, DecisionStageStatus.SKIPPED, "SIGNAL_UNAVAILABLE"),
+        ("model_unavailable", {}, DecisionStageStatus.FAILED, "MODEL_UNAVAILABLE"),
+        ("model_timeout", {}, DecisionStageStatus.FAILED, "MODEL_TIMEOUT"),
+        ("insufficient_evidence", {"parse_failed": 1, "skipped": 3}, DecisionStageStatus.FAILED, "MODEL_INVALID_OUTPUT"),
+    ],
+)
+async def test_log_decision_distinguishes_evidence_blocks_from_model_failures(
+    reason_code: str,
+    counts: dict[str, int],
+    expected_status: str,
+    expected_reason_code: str,
+) -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision(Action.HOLD)
+    decision.raw_response["analysis_quality_contract"] = {
+        "analysis_complete": False,
+        "decision_eligible": False,
+        "reason_code": reason_code,
+        "reason": "Analysis evidence is incomplete.",
+        "status_counts": counts,
+    }
+
+    await service.log_decision(decision, is_paper=True)
+
+    machine = repo.logged[0]["raw_llm_response"]["decision_state_machine"]
+    assert machine["current_status"] == expected_status
+    assert machine["last_reason_code"] == expected_reason_code
+    assert machine["summary"]["failed"] is (expected_status == DecisionStageStatus.FAILED)
+    assert machine["stages"][-1]["data"]["decision_eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_log_decision_recovers_missing_quality_for_market_model_timeout() -> None:
     repo = FakeDecisionRepo()
     service = _service(FakeSession(), repo)

@@ -1,5 +1,9 @@
+import pytest
+
 from services.okx_entry_environment_compatibility import (
     assess_okx_entry_environment_compatibility,
+    entry_instrument_definitively_unavailable,
+    entry_instrument_unavailable_cache_ttl,
 )
 
 
@@ -103,3 +107,54 @@ def test_missing_execution_fact_fails_closed() -> None:
     assert result["compatible"] is False
     assert "execution_instrument_missing" in result["blockers"]
     assert "environment_price_missing" in result["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("facts", "definitive", "ttl"),
+    [
+        ({"error_code": "51001"}, True, 21600),
+        ({"reason": "okx_private_entry_instrument_unavailable"}, True, 21600),
+        (
+            {
+                "reason": "okx_private_entry_instrument_temporarily_unverified",
+                "error_code": "50001",
+            },
+            False,
+            None,
+        ),
+        (
+            {
+                "reason": "okx_entry_live_execution_environment_incompatible",
+                "environment_compatibility": {
+                    "blockers": ["environment_price_drift_exceeded"],
+                },
+            },
+            False,
+            600,
+        ),
+        (
+            {
+                "reason": "okx_entry_live_execution_environment_incompatible",
+                "environment_compatibility": {
+                    "blockers": [
+                        "environment_price_drift_exceeded",
+                        "execution_instrument_missing",
+                    ],
+                },
+            },
+            False,
+            60,
+        ),
+        (
+            {
+                "reason": "okx_entry_live_execution_environment_incompatible",
+                "environment_compatibility": {"blockers": ["ctVal_mismatch"]},
+            },
+            False,
+            60,
+        ),
+    ],
+)
+def test_negative_capability_cache_uses_one_retry_policy(facts, definitive, ttl) -> None:
+    assert entry_instrument_definitively_unavailable(facts) is definitive
+    assert entry_instrument_unavailable_cache_ttl(facts) == ttl

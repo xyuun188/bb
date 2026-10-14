@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from core.reason_codes import ReasonCode
 
 EXPERT_CALL_STATUSES = (
     "completed",
@@ -15,6 +16,40 @@ EXPERT_CALL_STATUSES = (
     "unavailable",
     "skipped",
 )
+
+
+def analysis_quality_reason_code(quality: dict[str, Any]) -> str | None:
+    """Map the canonical quality contract to its operational reason."""
+
+    if not quality or quality.get("analysis_complete") is True:
+        return None
+    counts = quality.get("status_counts")
+    counts = counts if isinstance(counts, dict) else {}
+    reason = str(quality.get("reason_code") or "").lower()
+    if counts.get("timeout") or reason == "model_timeout":
+        return ReasonCode.MODEL_TIMEOUT
+    if counts.get("parse_failed") or counts.get("empty"):
+        return ReasonCode.MODEL_INVALID_OUTPUT
+    if counts.get("unavailable") or reason == "model_unavailable":
+        return ReasonCode.MODEL_UNAVAILABLE
+    return ReasonCode.SIGNAL_UNAVAILABLE
+
+
+def analysis_quality_stage_status(quality: dict[str, Any]) -> str:
+    """Keep model faults distinct from healthy analysis without a usable signal."""
+
+    if quality.get("analysis_complete") is True:
+        return "completed"
+    if analysis_quality_reason_code(quality) in {
+        ReasonCode.MODEL_TIMEOUT,
+        ReasonCode.MODEL_INVALID_OUTPUT,
+        ReasonCode.MODEL_UNAVAILABLE,
+    }:
+        return "failed"
+    counts = quality.get("status_counts")
+    if isinstance(counts, dict) and counts.get("skipped"):
+        return "skipped"
+    return "blocked"
 
 
 def _text_status(status: Any) -> str:
@@ -52,6 +87,7 @@ def _normalized_status(
         "analysis_budget_deferred",
         "pre_expert_skipped",
         "circuit_breaker_deferred",
+        "provider_queue_deferred",
     }:
         return "skipped"
     if raw_status in {

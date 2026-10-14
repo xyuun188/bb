@@ -17,8 +17,8 @@ from typing import Any
 import structlog
 from sqlalchemy import func, select
 
+from ai_brain.analysis_quality import analysis_quality_reason_code, analysis_quality_stage_status
 from ai_brain.base_model import DecisionOutput
-from core.reason_codes import ReasonCode
 from core.safe_output import safe_error_text
 from db.repositories.decision_repo import DecisionRepository
 from db.session import get_session_ctx
@@ -80,15 +80,7 @@ class DecisionPersistenceService:
                         else "AI 已完成分析并生成裁决。"
                     )
                 else:
-                    status_counts = quality.get("status_counts")
-                    status_counts = status_counts if isinstance(status_counts, dict) else {}
-                    only_skipped = bool(status_counts.get("skipped")) and not any(
-                        status_counts.get(name)
-                        for name in ("timeout", "parse_failed", "empty", "unavailable")
-                    )
-                    analysis_status = (
-                        DecisionStageStatus.SKIPPED if only_skipped else DecisionStageStatus.FAILED
-                    )
+                    analysis_status = analysis_quality_stage_status(quality)
                     analysis_reason = str(
                         quality.get("reason") or "AI 分析证据不完整，本轮不可用于开仓。"
                     )
@@ -204,18 +196,7 @@ class DecisionPersistenceService:
 
     @staticmethod
     def _analysis_reason_code(quality: dict[str, Any]) -> str | None:
-        if not quality or quality.get("analysis_complete") is True:
-            return None
-        status_counts = quality.get("status_counts")
-        counts = status_counts if isinstance(status_counts, dict) else {}
-        reason_code = str(quality.get("reason_code") or "").lower()
-        if counts.get("timeout") or reason_code == "model_timeout":
-            return ReasonCode.MODEL_TIMEOUT
-        if counts.get("parse_failed") or counts.get("empty"):
-            return ReasonCode.MODEL_INVALID_OUTPUT
-        if counts.get("unavailable") or reason_code == "model_unavailable":
-            return ReasonCode.MODEL_UNAVAILABLE
-        return ReasonCode.SIGNAL_UNAVAILABLE
+        return analysis_quality_reason_code(quality)
 
     @staticmethod
     def analysis_type(decision: DecisionOutput, raw_response: dict[str, Any]) -> str:

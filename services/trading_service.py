@@ -168,6 +168,10 @@ from services.okx_balance_snapshot import (
     balance_snapshot_recovery_reason,
     balance_snapshot_verified,
 )
+from services.okx_entry_environment_compatibility import (
+    entry_instrument_definitively_unavailable,
+    entry_instrument_unavailable_cache_ttl,
+)
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
@@ -287,16 +291,12 @@ AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
 # instrument) must not be rediscovered on every market round.  Keep this
 # separate from the executor's per-request cache so the ranked candidate pool
 # also remembers the negative result and stops wasting analysis slots.
-MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS = 6 * 60 * 60
 # Demo/live price divergence is retryable, but repeatedly reselecting the same
 # symbol every market round wastes the candidate budget. Keep a short cooling
 # window while allowing the instrument to be rechecked automatically.
-MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS = 10 * 60
-MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS = 60
 # Contract-fact mismatches and missing execution metadata are also retryable.
 # They can be caused by a transient OKX/cache refresh race and must never
 # quarantine a symbol for hours merely because one probe was incomplete.
-MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS = 60
 MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
 OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
 MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
@@ -1443,6 +1443,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """
 
         settings.refresh_runtime_env()
+        target_qwen_configured = self._target_qwen_single_call_route()
         independent_window = self._independent_expert_window_seconds()
         batch_window = 0.0
         if bool(settings.ai_batch_experts_enabled):
@@ -1453,9 +1454,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # The target topology has one local Qwen3.8-27B carrier.  The
             # generic 35-second batch setting is for cloud/multi-provider
             # callers and makes a stale response look like a healthy model
-            # that is merely "slow".  Keep the outer market budget aligned
-            # with the carrier's hard 18-second generation boundary.
-            target_qwen_configured = self._target_qwen_single_call_route()
+            # that is merely "slow". Keep the outer market budget aligned
+            # with the carrier's configured generation boundary.
             if target_qwen_configured:
                 batch_window = min(
                     batch_window,
@@ -1467,7 +1467,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             float(settings.ai_decision_maker_timeout_seconds or 0.0),
             0.0,
         )
-        cross_validation_timeout = min(max(decision_timeout * 0.60, 6.0), 12.0)
+        # The target batch uses deterministic cross-validation and skips a
+        # second model consultation. Reserve only the completion window.
+        cross_validation_timeout = (
+            0.0
+            if target_qwen_configured
+            else min(max(decision_timeout * 0.60, 6.0), 12.0)
+        )
         return round(
             batch_window
             + independent_window
@@ -4438,8 +4444,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # negative cache used by shortlist probes and submit-time failures;
         # otherwise the next market round can select the same unsupported
         # instrument again.
-        unavailable_ttl = self._entry_unavailable_cache_ttl(facts)
-        if unavailable_ttl is not None and self._is_definitive_entry_unavailable(facts):
+        unavailable_ttl = entry_instrument_unavailable_cache_ttl(facts)
+        if unavailable_ttl is not None and entry_instrument_definitively_unavailable(facts):
             self._remember_unavailable_entry_symbol(
                 model_mode,
                 decision.symbol,
@@ -8195,8 +8201,31 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "reason": "cooldown_history_not_ready",
             }
             return {}
-        result = policy.select(feature_vectors, limit)
+        model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
+        unavailable_symbols = set(self._entry_unavailable_cache_for_mode(model_mode))
+        excluded_symbols = [
+            symbol
+            for symbol in feature_vectors
+            if self._normalize_position_symbol(symbol) in unavailable_symbols
+        ]
+        candidates = {
+            symbol: feature
+            for symbol, feature in feature_vectors.items()
+            if self._normalize_position_symbol(symbol) not in unavailable_symbols
+        }
+        verified_by_mode = self._safe_dict(
+            getattr(self, "_verified_entry_symbols_by_mode", {})
+        )
+        verified_symbols = set(verified_by_mode.get(model_mode, set()) or set())
+        verified_symbols.difference_update(unavailable_symbols)
+        result = policy.select(
+            candidates,
+            limit,
+            execution_verified_symbols=verified_symbols,
+        )
         diagnostics = self._safe_dict(result.diagnostics)
+        diagnostics["execution_unavailable_excluded_symbols"] = excluded_symbols
+        diagnostics["execution_unavailable_excluded_count"] = len(excluded_symbols)
         self._last_market_analysis_selection_diagnostics = diagnostics
         analysis_budget_context["market_analysis_selection"] = diagnostics
         analysis_budget_context["recent_market_analysis_dedupe"] = {
@@ -8367,46 +8396,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._market_analysis_only_symbols.update(analysis_only_symbols)
         return result.selected
 
-    @staticmethod
-    def _is_definitive_entry_unavailable(facts: Mapping[str, Any] | None) -> bool:
-        """Classify only durable capability failures as negative-cache entries."""
-
-        payload = facts if isinstance(facts, Mapping) else {}
-        error_code = str(payload.get("error_code") or "")
-        reason = str(payload.get("reason") or "")
-        if error_code == "51001" or reason == "okx_private_entry_instrument_unavailable":
-            return True
-        # Every other compatibility result is a retryable observation failure.
-        # In particular, execution_instrument_missing and contract-fact
-        # mismatches can recover after the next OKX metadata refresh.
-        return False
-
-    @staticmethod
-    def _entry_unavailable_cache_ttl(
-        facts: Mapping[str, Any] | None,
-    ) -> float | None:
-        """Return a bounded retry TTL for an execution capability failure."""
-
-        payload = facts if isinstance(facts, Mapping) else {}
-        error_code = str(payload.get("error_code") or "")
-        reason = str(payload.get("reason") or "")
-        if error_code == "51001" or reason == "okx_private_entry_instrument_unavailable":
-            return MARKET_ENTRY_UNAVAILABLE_CACHE_SECONDS
-        if reason != "okx_entry_live_execution_environment_incompatible":
-            return None
-        compatibility = payload.get("environment_compatibility")
-        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
-        blockers = {str(item) for item in compatibility.get("blockers", [])}
-        if blockers - {"environment_price_drift_exceeded", "environment_price_missing"}:
-            return MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
-        if "environment_price_drift_exceeded" in blockers:
-            return MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
-        if "environment_price_missing" in blockers:
-            return MARKET_ENTRY_PRICE_MISSING_CACHE_SECONDS
-        if blockers:
-            return MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
-        return None
-
     def _entry_unavailable_cache_path(self) -> Path:
         return settings.data_dir / "entry_instrument_unavailable_cache.json"
 
@@ -8434,7 +8423,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 # multi-hour expirations; retaining those rows would keep
                 # recovered instruments out of the candidate pool after a
                 # restart.
-                cache_ttl = self._entry_unavailable_cache_ttl(facts)
+                cache_ttl = entry_instrument_unavailable_cache_ttl(facts)
                 if cache_ttl is None:
                     continue
                 expires_at = str(facts.get("expires_at") or "")
@@ -8443,30 +8432,30 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     expires = expires if expires.tzinfo else expires.replace(tzinfo=UTC)
                 except (TypeError, ValueError):
                     continue
-                if (
-                    str(facts.get("error_code") or "") != "51001"
-                    and str(facts.get("reason") or "")
-                    != "okx_private_entry_instrument_unavailable"
-                ):
-                    cached_at = str(facts.get("cached_at") or "")
+                observed_at = None
+                for timestamp_key in ("generated_at", "cached_at"):
                     try:
-                        cached = datetime.fromisoformat(
-                            cached_at.replace("Z", "+00:00")
+                        observed = datetime.fromisoformat(
+                            str(facts.get(timestamp_key) or "").replace("Z", "+00:00")
                         )
-                        cached = (
-                            cached
-                            if cached.tzinfo
-                            else cached.replace(tzinfo=UTC)
+                        observed_at = min(
+                            observed if observed.tzinfo else observed.replace(tzinfo=UTC),
+                            now,
                         )
                     except (TypeError, ValueError):
-                        cached = now
-                    expires = min(expires, cached + timedelta(seconds=cache_ttl))
+                        continue
+                    break
+                if observed_at is None:
+                    continue
+                expires = min(expires, observed_at + timedelta(seconds=cache_ttl))
                 if expires <= now:
                     continue
                 normalized_symbol = self._normalize_position_symbol(str(symbol))
                 if not normalized_symbol:
                     continue
-                restored[mode][normalized_symbol] = dict(facts)
+                restored_facts = dict(facts)
+                restored_facts["expires_at"] = expires.isoformat()
+                restored[mode][normalized_symbol] = restored_facts
         self._unavailable_entry_symbols_by_mode = restored
 
     def _persist_unavailable_entry_symbol_cache(self) -> None:
@@ -8536,11 +8525,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
         ttl = (
             float(ttl_seconds)
             if ttl_seconds is not None
-            else self._entry_unavailable_cache_ttl(facts)
+            else entry_instrument_unavailable_cache_ttl(facts)
         )
         if ttl is None or ttl <= 0:
             return
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
+        now = datetime.now(UTC)
+        observed_at = now
+        try:
+            generated_at = datetime.fromisoformat(
+                str(facts.get("generated_at") or "").replace("Z", "+00:00")
+            )
+            generated_at = (
+                generated_at if generated_at.tzinfo else generated_at.replace(tzinfo=UTC)
+            )
+            observed_at = min(generated_at, now)
+        except (TypeError, ValueError):
+            pass
+        expires_at = observed_at + timedelta(seconds=ttl)
+        if expires_at <= now:
+            return
         payload = dict(facts)
         payload.update(
             {
@@ -8550,7 +8553,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "analysis_only": True,
                 "execution_verified": False,
                 "source": "trading_service_negative_entry_capability_cache",
-                "cached_at": datetime.now(UTC).isoformat(),
+                "cached_at": observed_at.isoformat(),
                 "expires_at": expires_at.isoformat(),
             }
         )
@@ -8583,10 +8586,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         unavailable_symbols = set(unavailable_by_mode)
         verified_symbols.difference_update(unavailable_symbols)
-        # Private OKX capability checks are execution permissions, not market
-        # observation data. Never wait for a batch of private probes inside
-        # the market-analysis critical path; refresh them independently and
-        # consume only the cache that is already available for this round.
+        # Refresh independently; use a bounded wait only when no verified
+        # candidate is available, then consume one current cache snapshot.
         executor = (
             getattr(self, "_okx_live", None)
             if selected_mode == "live"
@@ -8644,7 +8645,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # This prevents an unsupported instrument from reaching model analysis
         # first and failing only at the final entry gate, while preserving the
         # non-blocking path whenever a verified candidate is already available.
-        if not verified_symbols.intersection(feature_vectors):
+        feature_keys = {
+            self._normalize_position_symbol(symbol) for symbol in feature_vectors
+        }
+        if not verified_symbols.intersection(feature_keys):
             refresh_tasks = getattr(self, "_market_instrument_refresh_tasks", {})
             refresh_task = (
                 refresh_tasks.get(selected_mode)
@@ -8657,52 +8661,50 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         asyncio.shield(refresh_task),
                         timeout=MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS,
                     )
-                except (TimeoutError, asyncio.CancelledError):
+                except TimeoutError:
                     pass
-                unavailable_by_mode = dict(
-                    self._entry_unavailable_cache_for_mode(selected_mode)
-                )
-                refreshed_verified_by_mode = getattr(
-                    self, "_verified_entry_symbols_by_mode", {}
-                )
-                if isinstance(refreshed_verified_by_mode, dict):
-                    verified_by_mode = refreshed_verified_by_mode
-                verified_symbols = set(
-                    verified_by_mode.get(selected_mode, set()) or set()
-                )
-                verified_symbols.difference_update(unavailable_by_mode)
-                if verified_symbols.intersection(feature_vectors):
-                    logger.info(
-                        "market instrument shortlist consumed bounded availability refresh",
-                        mode=selected_mode,
-                        verified_count=len(
-                            verified_symbols.intersection(feature_vectors)
-                        ),
-                        unavailable_count=len(unavailable_by_mode),
-                    )
 
-        selected = [symbol for symbol in feature_vectors if symbol in verified_symbols]
+        # A fast refresh can already be done after the scheduling yield. Its
+        # result must be consumed just like a refresh completed during a wait.
+        unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
+        unavailable_symbols = set(unavailable_by_mode)
+        refreshed_verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        if isinstance(refreshed_verified_by_mode, dict):
+            verified_by_mode = refreshed_verified_by_mode
+        verified_symbols = set(verified_by_mode.get(selected_mode, set()) or set())
+        verified_symbols.difference_update(unavailable_symbols)
+
+        selected = [
+            symbol
+            for symbol in feature_vectors
+            if self._normalize_position_symbol(symbol) in verified_symbols
+        ]
         selected.extend(
             symbol
             for symbol in feature_vectors
-            if symbol not in selected and symbol not in unavailable_symbols
+            if symbol not in selected
+            and self._normalize_position_symbol(symbol) not in unavailable_symbols
         )
         selected = selected[:target]
         availability = {
             symbol: {
                 **(
-                    dict(unavailable_by_mode[symbol])
-                    if symbol in unavailable_by_mode
+                    dict(unavailable_by_mode[self._normalize_position_symbol(symbol)])
+                    if self._normalize_position_symbol(symbol) in unavailable_by_mode
                     else {
-                        "available": True if symbol in verified_symbols else None,
+                        "available": (
+                            True
+                            if self._normalize_position_symbol(symbol) in verified_symbols
+                            else None
+                        ),
                         "reason": (
                             "cached_okx_private_account_instrument_verified"
-                            if symbol in verified_symbols
+                            if self._normalize_position_symbol(symbol) in verified_symbols
                             else "okx_private_entry_instrument_probe_deferred"
                         ),
-                        "cache_hit": symbol in verified_symbols,
-                        "analysis_only": symbol not in verified_symbols,
-                        "execution_verified": symbol in verified_symbols,
+                        "cache_hit": self._normalize_position_symbol(symbol) in verified_symbols,
+                        "analysis_only": self._normalize_position_symbol(symbol) not in verified_symbols,
+                        "execution_verified": self._normalize_position_symbol(symbol) in verified_symbols,
                     }
                 ),
             }
@@ -8764,41 +8766,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
         selected_states = {symbol: candidate_state(symbol) for symbol in selected_order}
-        for symbol, facts in availability.items():
-            availability_facts = self._safe_dict(facts)
-            if availability_facts.get("available") is True:
-                verified_symbols.add(str(symbol))
-                unavailable_by_mode.pop(str(symbol), None)
-            else:
-                cache_ttl = self._entry_unavailable_cache_ttl(availability_facts)
-                if cache_ttl is None:
-                    continue
-                verified_symbols.discard(str(symbol))
-                self._remember_unavailable_entry_symbol(
-                    selected_mode,
-                    str(symbol),
-                    availability_facts,
-                    ttl_seconds=cache_ttl,
-                )
-        # The background refresh may have completed while this round was
-        # building its immutable shortlist snapshot. Merge that newer result
-        # instead of overwriting it with the stale local copy.
-        current_verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
-        current_verified_by_mode = (
-            dict(current_verified_by_mode)
-            if isinstance(current_verified_by_mode, dict)
-            else {}
-        )
-        persisted_verified_symbols = set(
-            current_verified_by_mode.get(selected_mode, set()) or set()
-        )
-        persisted_unavailable_symbols = set(
-            self._entry_unavailable_cache_for_mode(selected_mode)
-        )
-        persisted_verified_symbols.update(verified_symbols)
-        persisted_verified_symbols.difference_update(persisted_unavailable_symbols)
-        current_verified_by_mode[selected_mode] = persisted_verified_symbols
-        self._verified_entry_symbols_by_mode = current_verified_by_mode
+        # This is a read-only cache snapshot. Only a fresh executor probe or
+        # execution rejection may update capability state and its expiry.
         selected_unavailable_symbols = {
             symbol
             for symbol in selected_order
@@ -8972,7 +8941,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             or unavailable_changed
                         )
                     else:
-                        cache_ttl = self._entry_unavailable_cache_ttl(facts)
+                        cache_ttl = entry_instrument_unavailable_cache_ttl(facts)
                         if cache_ttl is None:
                             continue
                         # A capability response revokes a previously cached

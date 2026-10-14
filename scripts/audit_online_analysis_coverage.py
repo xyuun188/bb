@@ -20,6 +20,31 @@ from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
 
+def classify_analysis_status(raw: Any) -> str:
+    """Read the same quality contract used to persist the AI-analysis stage."""
+
+    from ai_brain.analysis_quality import (
+        analysis_quality_reason_code,
+        analysis_quality_stage_status,
+    )
+    from core.reason_codes import ReasonCode
+
+    payload = raw if isinstance(raw, dict) else {}
+    quality = payload.get("analysis_quality_contract")
+    quality = quality if isinstance(quality, dict) else {}
+    if payload.get("market_model_timeout") or (
+        analysis_quality_reason_code(quality) == ReasonCode.MODEL_TIMEOUT
+    ):
+        return "retryable_failure"
+    if analysis_quality_stage_status(quality) == "failed" or (
+        not quality and payload.get("expert_failures")
+    ):
+        return "model_failure"
+    if analysis_quality_stage_status(quality) == "completed":
+        return "completed"
+    return "incomplete"
+
+
 def _remote_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
@@ -48,6 +73,7 @@ from core.trading_mode import mode_manager
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.trade import Position
+from scripts.audit_online_analysis_coverage import classify_analysis_status
 
 WINDOW_MINUTES = {max(int(window_minutes), 1)!r}
 RAW_RESPONSE_BATCH_SIZE = 200
@@ -233,45 +259,12 @@ async def run():
     analysis_status_counts = Counter()
     retry_within_cooldown = []
 
-    def _dict(value):
-        return value if isinstance(value, dict) else {{}}
-
-    def _analysis_status(row):
-        raw = _dict(row.raw_llm_response)
-        timeout = _dict(raw.get("market_model_timeout"))
-        quality = _dict(raw.get("analysis_quality"))
-        state = _dict(raw.get("decision_state_summary"))
-        reason = " ".join(
-            str(value or "")
-            for value in (
-                row.reasoning,
-                timeout.get("reason"),
-                quality.get("reason"),
-                state.get("final_reason"),
-            )
-        ).lower()
-        retry_later = timeout.get("retry_later") is True
-        incomplete = (
-            retry_later
-            or quality.get("analysis_complete") is False
-            or quality.get("decision_eligible") is False
-            or state.get("failed") is True
-            or "timeout" in reason
-            or "超时" in reason
-            or "connection error" in reason
-        )
-        if retry_later or "timeout" in reason or "超时" in reason:
-            return "retryable_failure"
-        if incomplete:
-            return "incomplete"
-        return "completed"
-
     for row in market_rows:
         symbol = str(row.symbol or "")
         timestamp = as_utc(row.created_at)
         if symbol and timestamp is not None:
             symbol_times[symbol].append(timestamp)
-            status = _analysis_status(row)
+            status = classify_analysis_status(row.raw_llm_response)
             analysis_status_counts[status] += 1
             if status == "completed":
                 completed_symbol_times[symbol].append(timestamp)
@@ -347,6 +340,10 @@ async def run():
             "top_symbol_share": round(top_count / len(market_rows), 6) if market_rows else None,
             "symbol_counts": dict(market_symbol_counts.most_common()),
             "analysis_status_counts": dict(analysis_status_counts),
+            "model_failure_count": sum(
+                analysis_status_counts.get(status, 0)
+                for status in ("retryable_failure", "model_failure")
+            ),
             "entry_funnel": {{
                 "signal_count": len(entry_rows),
                 "executed_count": sum(1 for row in entry_rows if bool(row.was_executed)),
@@ -476,6 +473,8 @@ def assess_coverage_report(
         blockers.append("market_analysis_activity_gap_too_large")
     if int(market.get("duplicate_within_cooldown_count") or 0) > 0:
         blockers.append("market_analysis_duplicate_within_cooldown")
+    if int(market.get("model_failure_count") or 0) > 0:
+        blockers.append("market_analysis_model_failures")
 
     position = (
         report.get("position_review") if isinstance(report.get("position_review"), dict) else {}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
@@ -10,6 +11,38 @@ ENTRY_ENVIRONMENT_PRICE_MAX_DRIFT_FRACTION = 0.01
 ENTRY_ENVIRONMENT_COMPATIBILITY_VERSION = (
     "2026-08-24.okx-entry-environment-compatibility.v2"
 )
+ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 6 * 60 * 60
+ENTRY_ENVIRONMENT_PRICE_DRIFT_RETRY_SECONDS = 10 * 60
+ENTRY_ENVIRONMENT_COMPATIBILITY_RETRY_SECONDS = 60
+
+
+def entry_instrument_definitively_unavailable(facts: Mapping[str, Any] | None) -> bool:
+    """Only an explicit OKX capability rejection warrants the long retry window."""
+
+    payload = facts if isinstance(facts, Mapping) else {}
+    return (
+        str(payload.get("error_code") or "") == "51001"
+        or str(payload.get("reason") or "") == "okx_private_entry_instrument_unavailable"
+    )
+
+
+def entry_instrument_unavailable_cache_ttl(facts: Mapping[str, Any] | None) -> float | None:
+    """Use one retry policy for the executor and candidate capability cache."""
+
+    payload = facts if isinstance(facts, Mapping) else {}
+    if entry_instrument_definitively_unavailable(payload):
+        return ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS
+    if payload.get("reason") != "okx_entry_live_execution_environment_incompatible":
+        return None
+    compatibility = payload.get("environment_compatibility")
+    compatibility = compatibility if isinstance(compatibility, Mapping) else {}
+    blockers = set(compatibility.get("blockers") or ())
+    if not blockers:
+        return None
+    if blockers == {"environment_price_drift_exceeded"}:
+        return ENTRY_ENVIRONMENT_PRICE_DRIFT_RETRY_SECONDS
+    return ENTRY_ENVIRONMENT_COMPATIBILITY_RETRY_SECONDS
+
 
 _HARD_TEXT_FIELDS = (
     "instId",

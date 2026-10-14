@@ -84,6 +84,10 @@ class LLMCallBudgetExceeded(ModelInferenceError):
     """Raised when one analysis has exhausted its provider-call budget."""
 
 
+class LLMCapacityQueueDeferred(TimeoutError):
+    """Raised when shared provider capacity is busy before a request is sent."""
+
+
 def ensure_llm_call_budget(context: dict[str, Any] | None) -> dict[str, Any]:
     """Create or return the mutable per-analysis provider-call budget."""
 
@@ -307,7 +311,11 @@ def shared_llm_capacity_slot(context: dict[str, Any]) -> _ScopedLLMSlot:
 
 
 @asynccontextmanager
-async def _bounded_llm_capacity_slot(context: dict[str, Any]):
+async def _bounded_llm_capacity_slot(
+    context: dict[str, Any],
+    *,
+    max_queue_wait_seconds: float = 0.0,
+):
     """Acquire shared capacity without allowing queue wait to consume a round.
 
     Model inference already honors ``_analysis_deadline_monotonic``.  The
@@ -321,13 +329,30 @@ async def _bounded_llm_capacity_slot(context: dict[str, Any]):
             deadline = float(context.get("_analysis_deadline_monotonic"))
         except (TypeError, ValueError):
             deadline = 0.0
+        queue_budget = max(float(max_queue_wait_seconds or 0.0), 0.0)
         if deadline > 0:
-            remaining = max(
+            deadline_remaining = max(
                 deadline - asyncio.get_running_loop().time() - 0.1,
                 0.05,
             )
-            async with asyncio.timeout(remaining):
-                await slot.__aenter__()
+            queue_limited = queue_budget > 0 and queue_budget < deadline_remaining
+            remaining = min(deadline_remaining, queue_budget) if queue_limited else deadline_remaining
+        elif queue_budget > 0:
+            remaining = queue_budget
+            queue_limited = True
+        else:
+            remaining = 0.0
+            queue_limited = False
+        if remaining > 0:
+            try:
+                async with asyncio.timeout(remaining):
+                    await slot.__aenter__()
+            except TimeoutError as exc:
+                if queue_limited:
+                    raise LLMCapacityQueueDeferred(
+                        "shared LLM capacity admission queue is busy"
+                    ) from exc
+                raise
         else:
             await slot.__aenter__()
         yield
@@ -1347,7 +1372,15 @@ class LLMAgent(AbstractAIModel):
             try:
                 messages = _messages_for_model(system_prompt, user_prompt, model_name)
                 _claim_llm_call(context, "expert" if expert_mode else "decision")
-                async with _bounded_llm_capacity_slot(context):
+                capacity_slot = _bounded_llm_capacity_slot(
+                    context,
+                    max_queue_wait_seconds=(
+                        settings.ai_target_qwen_queue_wait_seconds or 6.0
+                        if target_qwen
+                        else 0.0
+                    ),
+                )
+                async with capacity_slot:
                     if _LLM_CALL_DELAY and not target_qwen:
                         await asyncio.sleep(_LLM_CALL_DELAY)
                     request = llm.ainvoke(messages)
@@ -1387,6 +1420,8 @@ class LLMAgent(AbstractAIModel):
                 )
                 return decision
 
+            except LLMCapacityQueueDeferred:
+                raise
             except LLMResponseParseError as e:
                 last_error = safe_error_text(e)
                 logger.warning(
@@ -1451,7 +1486,15 @@ class LLMAgent(AbstractAIModel):
                 context,
                 "batch_expert_repair" if repair else "batch_expert",
             )
-            async with _bounded_llm_capacity_slot(context):
+            capacity_slot = _bounded_llm_capacity_slot(
+                context,
+                max_queue_wait_seconds=(
+                    settings.ai_target_qwen_queue_wait_seconds or 6.0
+                    if target_single_call
+                    else 0.0
+                ),
+            )
+            async with capacity_slot:
                 if _LLM_CALL_DELAY and not target_single_call:
                     await asyncio.sleep(_LLM_CALL_DELAY)
                 batch_llm = self._create_llm(

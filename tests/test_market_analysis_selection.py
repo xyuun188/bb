@@ -54,6 +54,45 @@ def test_fresh_candidates_keep_advantage_order() -> None:
     assert result.diagnostics["is_entry_gate"] is False
 
 
+def test_execution_verified_candidates_survive_score_and_coverage_reranking() -> None:
+    policy = _policy()
+    candidates = {
+        "PI/USDT": _feature("PI/USDT", 100.0),
+        "LUNA/USDT": _feature("LUNA/USDT", 90.0),
+        "BTC/USDT": _feature("BTC/USDT", 10.0),
+        "ETH/USDT": _feature("ETH/USDT", 9.0),
+    }
+
+    result = policy.select(
+        candidates,
+        2,
+        execution_verified_symbols={"BTC/USDT", "ETH/USDT"},
+    )
+
+    assert list(result.selected) == ["BTC/USDT", "ETH/USDT"]
+    assert result.diagnostics["execution_verified_selected_count"] == 2
+    assert result.diagnostics["coverage_selected_symbols"] == ["ETH/USDT"]
+    assert result.diagnostics["is_entry_gate"] is False
+
+
+def test_execution_priority_preserves_cooldown_and_observation_fallback() -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    policy = _policy()
+    btc = _feature("BTC/USDT", 10.0)
+    policy.remember("BTC/USDT", btc, observed_at=now - timedelta(seconds=30))
+
+    result = policy.select(
+        {"BTC/USDT": btc, "ETH/USDT": _feature("ETH/USDT", 9.0)},
+        2,
+        now=now,
+        execution_verified_symbols={"BTC/USDT"},
+    )
+
+    assert list(result.selected) == ["ETH/USDT"]
+    assert result.diagnostics["cooldown_excluded_symbols"] == ["BTC/USDT"]
+    assert result.diagnostics["execution_verified_selected_count"] == 0
+
+
 def test_unchanged_recent_candidates_are_excluded_when_fresh_alternatives_exist() -> None:
     now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
     policy = _policy(unchanged_repeat_penalty_ratio=0.35)

@@ -165,6 +165,50 @@ def test_assessment_ignores_planned_retry_inside_cooldown() -> None:
     assert assessment["blockers"] == []
 
 
+def test_assessment_rejects_real_model_failures() -> None:
+    now = datetime(2026, 10, 15, 0, 0, tzinfo=UTC)
+    report = _report(now)
+    report["market"]["model_failure_count"] = 1
+
+    assert audit.assess_coverage_report(report, now=now)["blockers"] == [
+        "market_analysis_model_failures"
+    ]
+
+
+def test_analysis_status_reads_timeout_from_canonical_contract() -> None:
+    raw = {
+        "analysis_quality_contract": {
+            "analysis_complete": False,
+            "reason_code": "insufficient_evidence",
+            "status_counts": {"timeout": 4},
+        }
+    }
+
+    assert audit.classify_analysis_status(raw) == "retryable_failure"
+
+
+def test_analysis_status_keeps_direction_conflict_distinct_from_model_failure() -> None:
+    raw = {
+        "analysis_quality_contract": {
+            "analysis_complete": False,
+            "reason_code": "direction_conflict",
+            "status_counts": {"completed": 4},
+        }
+    }
+
+    assert audit.classify_analysis_status(raw) == "incomplete"
+
+
+def test_analysis_status_does_not_guess_success_when_evidence_is_missing() -> None:
+    assert audit.classify_analysis_status({}) == "incomplete"
+    assert audit.classify_analysis_status(
+        {"analysis_quality_contract": {"analysis_complete": True}}
+    ) == "completed"
+    assert audit.classify_analysis_status(
+        {"expert_failures": [{"reason": "connection error"}]}
+    ) == "model_failure"
+
+
 def test_assessment_rejects_stale_candidate_selection_evidence() -> None:
     now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
     report = _report(now)

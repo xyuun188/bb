@@ -6,8 +6,11 @@ from typing import Any
 
 import pytest
 
+import ai_brain.llm_agent as llm_agent_module
 from ai_brain.llm_agent import (
     LLMAgent,
+    LLMCapacityQueueDeferred,
+    _bounded_llm_capacity_slot,
     _extract_json,
     _format_local_ai_tools,
     _provider_response_contract,
@@ -143,6 +146,44 @@ async def test_capacity_slot_release_completes_when_context_exit_is_cancelled(
         await exit_task
     assert capacity._active == 0
     assert capacity._consultation_overflow_active is False
+
+
+@pytest.mark.asyncio
+async def test_target_capacity_queue_timeout_is_marked_as_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacity = _ScopedLLMCapacity(1)
+    holder = capacity.slot({"_analysis_budget_scope": "market:holder"})
+    await holder.__aenter__()
+    monkeypatch.setattr(llm_agent_module, "_LLM_CAPACITY", capacity)
+    context = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 1.0,
+    }
+
+    with pytest.raises(LLMCapacityQueueDeferred):
+        async with _bounded_llm_capacity_slot(context, max_queue_wait_seconds=0.01):
+            raise AssertionError("capacity must not be acquired")
+
+    await holder.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_target_capacity_wait_is_bounded_without_analysis_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacity = _ScopedLLMCapacity(1)
+    holder = capacity.slot({"_analysis_budget_scope": "market:holder"})
+    await holder.__aenter__()
+    monkeypatch.setattr(llm_agent_module, "_LLM_CAPACITY", capacity)
+    context: dict[str, Any] = {}
+    started = asyncio.get_running_loop().time()
+
+    with pytest.raises(LLMCapacityQueueDeferred):
+        async with _bounded_llm_capacity_slot(context, max_queue_wait_seconds=0.01):
+            raise AssertionError("capacity must not be acquired")
+
+    assert asyncio.get_running_loop().time() - started < 0.5
+    await holder.__aexit__(None, None, None)
 
 
 def test_shadow_quant_model_is_visible_to_llm_analysis_without_live_permission() -> None:

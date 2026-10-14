@@ -61,6 +61,24 @@ def test_quality_contract_classifies_invalid_empty_and_unavailable() -> None:
     assert contract["reason_code"] == "insufficient_evidence"
 
 
+def test_provider_queue_deferral_is_scheduling_skip_without_model_failure() -> None:
+    contract = build_expert_call_contract(
+        expected_names=("trend_expert",),
+        attempted_names=(),
+        opinions={},
+        timings=[{
+            "name": "trend_expert",
+            "status": "provider_queue_deferred",
+            "reason": "single-worker model provider queue wait exceeded",
+        }],
+        failures=[],
+    )
+
+    assert contract["status_counts"]["skipped"] == 1
+    assert contract["status_counts"]["unavailable"] == 0
+    assert contract["attempted_expert_count"] == 0
+
+
 @pytest.mark.asyncio
 async def test_automatic_pairwise_cross_validation_has_full_coverage_without_llm() -> None:
     opinions = {

@@ -4501,12 +4501,12 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
 
     selected = await service._filter_entry_instrument_shortlist(features, 2, model_mode)
 
-    assert list(selected) == ["PI/USDT", "BTC/USDT"]
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     assert selected_modes == [model_mode]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["selected"] == 2
     assert diagnostics["execution_availability"]["probed_count"] == 0
-    assert diagnostics["execution_availability"]["available_count"] == 0
+    assert diagnostics["execution_availability"]["available_count"] == 2
     assert diagnostics["execution_availability"]["mode"] == model_mode
     await asyncio.sleep(0)
     assert service._verified_entry_symbols_by_mode[model_mode] == {"BTC/USDT", "ETH/USDT"}
@@ -4515,8 +4515,9 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
         "LUNA/USDT",
     }
     pi = next(item for item in diagnostics["ranked_symbol_sample"] if item["symbol"] == "PI/USDT")
-    assert pi["selected"] is True
-    assert pi["analysis_only"] is True
+    assert pi["selected"] is False
+    assert pi["execution_candidate_state"] == "execution_unavailable"
+    assert diagnostics["execution_availability"]["known_unavailable_count"] == 2
     selected_next_round = await service._filter_entry_instrument_shortlist(
         features,
         2,
@@ -4578,6 +4579,37 @@ async def test_market_shortlist_timeout_returns_verified_cache_without_waiting_c
     assert diagnostics["execution_verified_selected_count"] == 1
     assert diagnostics["analysis_only_selected_count"] == 1
     await asyncio.sleep(0.06)
+
+
+def test_final_market_selection_consumes_capability_updated_after_hydration() -> None:
+    service = TradingService.__new__(TradingService)
+    service._get_model_execution_mode = lambda _name: "paper"
+    service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT", "ETH/USDT"}}
+    service._unavailable_entry_symbols_by_mode = {
+        "paper": {
+            "PI/USDT": {
+                "available": False,
+                "error_code": "51001",
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            }
+        }
+    }
+    policy = service._market_analysis_selector_policy()
+    policy.history_loaded = True
+    context: dict[str, Any] = {}
+    candidates = {
+        symbol: SimpleNamespace(symbol=symbol, current_price=100.0)
+        for symbol in ("PI/USDT", "LUNA/USDT", "BTC/USDT", "ETH/USDT")
+    }
+
+    selected = service._select_market_analysis_candidates(
+        candidates, 2, analysis_budget_context=context,
+    )
+
+    assert set(selected) == {"BTC/USDT", "ETH/USDT"}
+    diagnostics = context["market_analysis_selection"]
+    assert diagnostics["execution_verified_selected_count"] == 2
+    assert diagnostics["execution_unavailable_excluded_symbols"] == ["PI/USDT"]
 
 
 @pytest.mark.asyncio
@@ -4677,7 +4709,7 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
         "paper",
     )
 
-    assert list(selected) == ["BTC/USDT", "PI/USDT"]
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 2
     assert diagnostics["execution_availability"]["execution_verified_selected_count"] == 0
@@ -4686,49 +4718,13 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
     assert ranked["BTC/USDT"]["execution_candidate_state"] == (
         "analysis_only_execution_unverified"
     )
-    assert ranked["PI/USDT"]["selected"] is True
-    assert ranked["PI/USDT"]["analysis_only"] is True
+    assert ranked["PI/USDT"]["selected"] is False
+    assert ranked["PI/USDT"]["execution_candidate_state"] == "execution_unavailable"
     assert service._market_analysis_only_symbols == set()
     await asyncio.sleep(0)
     assert "PI/USDT" in service._unavailable_entry_symbols_by_mode["paper"]
     assert "BTC/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
     assert "ETH/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
-
-
-def test_entry_unavailable_classification_keeps_transient_failures_retryable() -> None:
-    temporary_outage = {
-        "available": False,
-        "reason": "okx_private_entry_instrument_temporarily_unverified",
-        "error_code": "50001",
-    }
-    price_drift = {
-        "available": False,
-        "reason": "okx_entry_live_execution_environment_incompatible",
-        "environment_compatibility": {
-            "blockers": ["environment_price_drift_exceeded"]
-        },
-    }
-    compatibility_mismatch = {
-            "available": False,
-            "reason": "okx_entry_live_execution_environment_incompatible",
-            "environment_compatibility": {
-                "blockers": [
-                    "environment_price_drift_exceeded",
-                    "execution_instrument_missing",
-                ]
-            },
-    }
-
-    assert TradingService._is_definitive_entry_unavailable(temporary_outage) is False
-    assert TradingService._entry_unavailable_cache_ttl(temporary_outage) is None
-    assert TradingService._is_definitive_entry_unavailable(price_drift) is False
-    assert TradingService._entry_unavailable_cache_ttl(price_drift) == (
-        trading_service.MARKET_ENTRY_TRANSIENT_UNAVAILABLE_CACHE_SECONDS
-    )
-    assert TradingService._is_definitive_entry_unavailable(compatibility_mismatch) is False
-    assert TradingService._entry_unavailable_cache_ttl(compatibility_mismatch) == (
-        trading_service.MARKET_ENTRY_COMPATIBILITY_RETRY_CACHE_SECONDS
-    )
 
 
 @pytest.mark.asyncio
@@ -4757,6 +4753,10 @@ async def test_market_shortlist_skips_cached_demo_unavailable_symbols_for_altern
         }
     }
     service._market_analysis_only_symbols = set()
+    original_expiries = {
+        symbol: facts["expires_at"]
+        for symbol, facts in service._unavailable_entry_symbols_by_mode["paper"].items()
+    }
     monkeypatch.setattr(
         service,
         "_schedule_market_instrument_availability_refresh",
@@ -4776,6 +4776,10 @@ async def test_market_shortlist_skips_cached_demo_unavailable_symbols_for_altern
 
     assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     assert service._market_analysis_only_symbols == set()
+    assert {
+        symbol: facts["expires_at"]
+        for symbol, facts in service._unavailable_entry_symbols_by_mode["paper"].items()
+    } == original_expiries
 
 
 def test_entry_unavailable_cache_survives_restart_and_expires(
@@ -4848,6 +4852,73 @@ def test_legacy_transient_entry_cache_is_clamped_during_restart_migration(
     service._load_unavailable_entry_symbol_cache()
 
     assert service._unavailable_entry_symbols_by_mode["paper"] == {}
+
+
+def test_restart_migration_stores_shortened_future_cache_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from config.settings import settings
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(settings.__class__, "data_dir", property(lambda _self: data_dir))
+    data_dir.mkdir(parents=True)
+    observed_at = datetime.now(UTC) - timedelta(seconds=10)
+    (data_dir / "entry_instrument_unavailable_cache.json").write_text(
+        json.dumps(
+            {
+                "paper": {
+                    "BIO/USDT:USDT": {
+                        "available": False,
+                        "reason": "okx_entry_live_execution_environment_incompatible",
+                        "environment_compatibility": {
+                            "blockers": ["execution_instrument_missing"]
+                        },
+                        "generated_at": observed_at.isoformat(),
+                        "cached_at": datetime.now(UTC).isoformat(),
+                        "expires_at": (
+                            datetime.now(UTC) + timedelta(hours=6)
+                        ).isoformat(),
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = TradingService.__new__(TradingService)
+    service._load_unavailable_entry_symbol_cache()
+
+    restored = service._entry_unavailable_cache_for_mode("paper")["BIO/USDT"]
+    assert datetime.fromisoformat(restored["expires_at"]) == (
+        observed_at + timedelta(seconds=60)
+    )
+
+
+def test_repeated_cached_probe_does_not_renew_negative_capability_expiry() -> None:
+    service = TradingService.__new__(TradingService)
+    observed_at = datetime.now(UTC) - timedelta(seconds=20)
+    facts = {
+        "available": False,
+        "reason": "okx_entry_live_execution_environment_incompatible",
+        "environment_compatibility": {"blockers": ["execution_instrument_missing"]},
+        "generated_at": observed_at.isoformat(),
+        "cache_hit": True,
+    }
+
+    service._remember_unavailable_entry_symbol("paper", "BIO/USDT", facts, persist=False)
+    first_expiry = service._entry_unavailable_cache_for_mode("paper")["BIO/USDT"]["expires_at"]
+    service._remember_unavailable_entry_symbol("paper", "BIO/USDT", facts, persist=False)
+
+    assert service._entry_unavailable_cache_for_mode("paper")["BIO/USDT"]["expires_at"] == (
+        first_expiry
+    )
+    assert datetime.fromisoformat(first_expiry) == observed_at + timedelta(seconds=60)
+    expired_facts = {
+        **facts,
+        "generated_at": (datetime.now(UTC) - timedelta(seconds=61)).isoformat(),
+    }
+    service._remember_unavailable_entry_symbol("paper", "ETH/USDT", expired_facts, persist=False)
+    assert "ETH/USDT" not in service._entry_unavailable_cache_for_mode("paper")
 
 
 def test_decision_final_state_ensurer_is_not_a_trading_service_private_rule():
@@ -7899,11 +7970,19 @@ def test_market_model_budget_covers_live_batch_failure_and_independent_retry(
     assert service.market_model_inference_timeout_seconds() == pytest.approx(50.0)
 
 
-def test_target_qwen_market_budget_has_no_independent_retry_window(monkeypatch) -> None:
+@pytest.mark.parametrize("target_timeout", [24.0, 26.0, 30.0])
+def test_target_qwen_market_budget_has_no_unused_model_windows(
+    monkeypatch, target_timeout: float,
+) -> None:
     service = TradingService.__new__(TradingService)
+    monkeypatch.setattr(
+        trading_service.settings.__class__,
+        "refresh_runtime_env",
+        lambda _self, force=False: True,
+    )
     monkeypatch.setattr(trading_service.settings, "ai_batch_experts_enabled", True)
     monkeypatch.setattr(trading_service.settings, "ai_batch_expert_timeout_seconds", 35.0)
-    monkeypatch.setattr(trading_service.settings, "ai_target_qwen_timeout_seconds", 12.0)
+    monkeypatch.setattr(trading_service.settings, "ai_target_qwen_timeout_seconds", target_timeout)
     monkeypatch.setattr(trading_service.settings, "ai_expert_timeout_seconds", 30.0)
     monkeypatch.setattr(trading_service.settings, "ai_decision_maker_timeout_seconds", 20.0)
     monkeypatch.setattr(
@@ -7923,7 +8002,9 @@ def test_target_qwen_market_budget_has_no_independent_retry_window(monkeypatch) 
 
     assert service._target_qwen_single_call_route() is True
     assert service._independent_expert_window_seconds() == 0.0
-    assert service.market_model_inference_timeout_seconds() < 30.0
+    assert service.market_model_inference_timeout_seconds() == pytest.approx(
+        target_timeout + trading_service.MARKET_MODEL_COMPLETION_RESERVE_SECONDS
+    )
 
 
 def test_market_symbol_timeout_is_persistable_non_trading_hold() -> None:
