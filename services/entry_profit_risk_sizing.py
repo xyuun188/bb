@@ -2112,6 +2112,26 @@ class EntryProfitRiskSizingPolicy:
             return_lcb = _safe_float(
                 normal_trade.get("objective_net_return_pct"), 0.0
             )
+        distribution_transformations = _safe_dict(
+            distribution.get("transformations")
+        )
+        slippage_cost_basis = str(
+            distribution_transformations.get("authoritative_slippage_cost_basis")
+            or ""
+        )
+        execution_slippage_floor_pct = (
+            max(
+                _safe_float(
+                    distribution_transformations.get(
+                        "authoritative_slippage_expected_pct"
+                    ),
+                    0.0,
+                ),
+                0.0,
+            )
+            if slippage_cost_basis == "expected"
+            else 0.0
+        )
         size_aware_solution = solve_size_aware_positive_expected_net(
             feature_snapshot=snapshot,
             side=side,
@@ -2121,11 +2141,10 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            # Paper sizing is governed by the current executable book and fee
-            # facts. Historical OKX slippage remains training evidence and
-            # promotion input, but must not be applied a second time as a
-            # current-entry permission gate.
-            execution_slippage_floor_pct=0.0,
+            # The return distribution already prices this same-mode expected
+            # slippage floor. Reuse it while repricing size so its delta is
+            # applied once, not once in scoring and again in sizing.
+            execution_slippage_floor_pct=execution_slippage_floor_pct,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (

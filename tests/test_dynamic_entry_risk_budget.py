@@ -728,7 +728,7 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
 
 
 @pytest.mark.asyncio
-async def test_paper_training_uses_current_cost_without_historical_slippage_floor() -> None:
+async def test_paper_training_reprices_against_distribution_slippage_floor_once() -> None:
     decision = _quality_observation_decision(return_lcb_pct=0.2)
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade["selection_reason"] = "paper_training_entry"
@@ -755,18 +755,49 @@ async def test_paper_training_uses_current_cost_without_historical_slippage_floo
             "raw_expected_return_pct": 0.9,
             "objective_expected_return_pct": 0.2,
             "transformations": {
+                "authoritative_slippage_cost_basis": "expected",
                 "authoritative_slippage_expected_pct": 2.0,
             },
         }
     )
+    original_execution_cost = dict(opportunity["execution_cost"])
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
 
     sizing = decision.raw_response["profit_risk_sizing"]
+    opportunity = decision.raw_response["opportunity_score"]
+    distribution = opportunity["return_distribution_contract"]
+    solution = sizing["size_aware_profitability"]
+    final_execution_cost = opportunity["execution_cost"]
+    slippage_floor = distribution["transformations"][
+        "authoritative_slippage_expected_pct"
+    ]
+    expected_net_after_repricing = solution["original_expected_net_return_pct"] - (
+        execution_cost_with_slippage_floor(
+            final_execution_cost["total_pct"],
+            final_execution_cost["slippage_pct"],
+            slippage_floor,
+        )
+        - execution_cost_with_slippage_floor(
+            solution["original_execution_cost_pct"],
+            original_execution_cost["slippage_pct"],
+            slippage_floor,
+        )
+    )
+
     assert sizing["production_eligible"] is True
     assert sizing["paper_training_shadow_only"] is False
     assert sizing["expected_net_return_pct"] > 0.0
+    assert sizing["expected_net_return_pct"] == pytest.approx(
+        expected_net_after_repricing
+    )
+    assert distribution["raw_expected_return_pct"] == pytest.approx(
+        sizing["expected_net_return_pct"]
+    )
+    assert distribution["objective_expected_return_pct"] == pytest.approx(
+        sizing["return_lcb_pct"]
+    )
     assert sizing["execution_cost"]["total_pct"] < 1.0
 
 
