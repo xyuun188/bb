@@ -28,7 +28,6 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
-    NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION,
     is_normal_paper_trade_decision,
     normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
@@ -818,6 +817,10 @@ def reconcile_profit_risk_sizing(
         _safe_float(sizing.get("model_requested_leverage"), 0.0),
         0.0,
     )
+    reserve = max(
+        _safe_float(sizing.get("estimated_fill_drift_reserve_fraction"), 0.0),
+        0.0,
+    )
     # Missing legacy flags must not default to "explicit". A historical 1x
     # value is only a schema baseline, never a fresh model hard cap.
     model_leverage_is_explicit = (
@@ -827,6 +830,50 @@ def reconcile_profit_risk_sizing(
     model_position_fraction = _clamp(
         _safe_float(sizing.get("model_requested_position_fraction"), 0.0)
     )
+    model_notional_cap = max(
+        _safe_float(sizing.get("model_requested_notional_cap_usdt"), 0.0),
+        _safe_float(sizing.get("model_final_notional_cap_usdt"), 0.0),
+        0.0,
+    )
+    if model_notional_cap <= 0.0 and model_position_fraction > 0.0:
+        model_notional_cap = (
+            margin_basis * model_position_fraction * max(model_requested_leverage, 1.0)
+        )
+    canonicalized_protection_contract = False
+    canonical_target = original_target
+    canonical_fill_ceiling = fill_notional_ceiling
+    canonical_risk_limited_target = max(
+        _safe_float(sizing.get("risk_limited_target_notional_usdt"), 0.0),
+        0.0,
+    )
+    # Native stop formatting can widen the actual stressed loss after the
+    # original sizing pass. Reconcile that fresh pressure into the same
+    # contract before validating the order; otherwise execution would consume
+    # a smaller temporary limit while the persisted target still advertises
+    # the stale larger amount.
+    if protection_risk and risk_budget > 0.0 and stress > 0.0:
+        canonical_risk_limited_target = risk_budget / stress
+        ceiling_candidates = [canonical_risk_limited_target]
+        if fill_notional_ceiling > 0.0:
+            ceiling_candidates.append(fill_notional_ceiling)
+        if margin_basis > 0.0 and leverage > 0.0:
+            ceiling_candidates.append(margin_basis * leverage)
+        if model_notional_cap > 0.0:
+            ceiling_candidates.append(model_notional_cap)
+        canonical_fill_ceiling = min(ceiling_candidates)
+        reserved_target = (
+            canonical_fill_ceiling / (1.0 + reserve)
+            if canonical_fill_ceiling > 0.0
+            else 0.0
+        )
+        canonical_target = (
+            min(original_target, reserved_target)
+            if original_target > 0.0
+            else reserved_target
+        )
+        canonicalized_protection_contract = True
+        original_target = canonical_target
+        fill_notional_ceiling = canonical_fill_ceiling
     reasons: list[str] = []
     if sizing.get("production_eligible") is not True:
         reasons.append("upstream_sizing_ineligible")
@@ -849,14 +896,6 @@ def reconcile_profit_risk_sizing(
     )
     if original_target <= 0 or notional > notional_ceiling + 1e-8:
         reasons.append("execution_notional_exceeds_authoritative_target")
-    model_notional_cap = max(
-        _safe_float(sizing.get("model_requested_notional_cap_usdt"), 0.0),
-        0.0,
-    )
-    if model_notional_cap <= 0.0 and model_position_fraction > 0.0:
-        model_notional_cap = (
-            margin_basis * model_position_fraction * max(model_requested_leverage, 1.0)
-        )
     if model_notional_cap > 0.0 and notional > model_notional_cap + 1e-8:
         reasons.append("execution_position_exceeds_model_request")
     settled_fill = bool(
@@ -889,8 +928,7 @@ def reconcile_profit_risk_sizing(
         }
     )
     position_size = notional / max(margin_basis * leverage, 1e-12) if eligible else 0.0
-    sizing.update(
-        {
+    contract_updates = {
             "production_eligible": eligible,
             "reason": "execution_notional_reconciled" if eligible else ",".join(reasons),
             "position_size_pct": round(position_size, 8),
@@ -902,8 +940,19 @@ def reconcile_profit_risk_sizing(
             "stressed_loss_fraction": stress,
             "expected_profit_usdt": round(notional * expected_net / 100.0, 8),
             "execution_reconciliations": history,
-        }
-    )
+    }
+    if canonicalized_protection_contract:
+        contract_updates.update(
+            {
+                "risk_limited_target_notional_usdt": round(
+                    canonical_risk_limited_target,
+                    8,
+                ),
+                "target_notional_usdt": round(canonical_target, 8),
+                "fill_notional_ceiling_usdt": round(canonical_fill_ceiling, 8),
+            }
+        )
+    sizing.update(contract_updates)
     provenance = dict(_safe_dict(sizing.get("policy_provenance")))
     strategy_version = str(
         sizing.get("contract_version") or provenance.get("strategy_version") or RISK_SIZING_VERSION
@@ -1946,11 +1995,7 @@ class EntryProfitRiskSizingPolicy:
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
                 0.0,
             ),
-            (
-                NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
-                if training_mode
-                else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            ),
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
         # Paper observations retain the paper risk cap. An uncertain lower bound

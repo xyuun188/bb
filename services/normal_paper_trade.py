@@ -11,10 +11,11 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-10.normal-paper-strategy-trade.v16"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-10.normal-paper-dynamic-risk.v8"
+NORMAL_PAPER_TRADE_VERSION = "2026-10-14.normal-paper-strategy-trade.v17"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-14.normal-paper-dynamic-risk.v9"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
+        "2026-10-10.normal-paper-dynamic-risk.v8",
         "2026-08-25.normal-paper-dynamic-risk.v5",
         "2026-10-07.normal-paper-dynamic-risk.v6",
         "2026-10-09.normal-paper-dynamic-risk.v7",
@@ -24,6 +25,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-10.normal-paper-strategy-trade.v16",
         "2026-10-09.normal-paper-strategy-trade.v15",
         "2026-09-26.normal-paper-strategy-trade.v14",
         "2026-09-26.normal-paper-strategy-trade.v13",
@@ -51,10 +53,6 @@ NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
     {"strategy_edge_selected", "paper_training_entry"}
 )
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
-# Training entries are real paper orders, but their risk is deliberately
-# bounded below the normal validated-paper cap.  This is an exploration
-# budget, not a profitability override or a fixed leverage rule.
-NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION = 0.001
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD = 0.80
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
@@ -730,11 +728,9 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        "single_trade_risk_fraction_cap": (
-            NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
-            if paper_training_only
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
+        # Training eligibility controls whether the signal may enter; it does
+        # not silently turn an otherwise valid entry into a micro-order.
+        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -953,11 +949,7 @@ def _normal_strategy_trade_contract_reasons(
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
         reasons.append("normal_paper_trade_horizon_invalid")
-    expected_single_cap = (
-        NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
-        if training_mode
-        else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
+    expected_single_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     if not isclose(
         single_cap,

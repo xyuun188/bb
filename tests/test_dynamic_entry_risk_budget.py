@@ -16,7 +16,6 @@ from services.entry_profit_risk_sizing import (
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION,
     build_normal_paper_trade_contract,
 )
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
@@ -663,7 +662,7 @@ async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
     ]
     normal_trade["authorized"] = True
     normal_trade["single_trade_risk_fraction_cap"] = (
-        NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
     normal_trade["contract_fingerprint"] = ""
     from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
@@ -684,7 +683,7 @@ async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
-        NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
@@ -705,7 +704,7 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     ]
     normal_trade["authorized"] = True
     normal_trade["single_trade_risk_fraction_cap"] = (
-        NORMAL_PAPER_TRADE_TRAINING_RISK_FRACTION
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
     from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
 
@@ -1345,6 +1344,58 @@ async def test_execution_reconciliation_rebuilds_every_notional_dependent_field(
     )
     assert sizing["execution_reconciliations"][-1]["source"] == "test_exchange_precision"
     assert sizing["policy_provenance"]["contract_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_protection_pressure_rewrites_single_sizing_contract() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    sizing = decision.raw_response["profit_risk_sizing"]
+    # Simulate the stale target observed in production: the stop formatter
+    # later proves that only a smaller notional fits the same risk budget.
+    sizing.update(
+        {
+            "target_notional_usdt": 400.0,
+            "fill_notional_ceiling_usdt": 400.0,
+            "risk_limited_target_notional_usdt": 400.0,
+        }
+    )
+    decision.raw_response["profit_risk_sizing"] = sizing
+    actual_notional = min(float(sizing["final_notional_usdt"]), 40.0)
+
+    result = reconcile_profit_risk_sizing(
+        decision,
+        final_notional_usdt=actual_notional,
+        final_leverage=decision.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+        execution_facts={
+            "okx_order_rules": {"min_notional_usdt": 1.0},
+            "protection_risk": {
+                "stressed_loss_fraction": 0.10,
+                "maximum_notional_usdt": 49.875,
+            },
+        },
+    )
+
+    assert result["eligible"] is True
+    sizing = decision.raw_response["profit_risk_sizing"]
+    expected_risk_limited = sizing["risk_budget_usdt"] / 0.10
+    assert sizing["risk_limited_target_notional_usdt"] == pytest.approx(
+        expected_risk_limited
+    )
+    assert sizing["fill_notional_ceiling_usdt"] == pytest.approx(
+        expected_risk_limited
+    )
+    assert sizing["target_notional_usdt"] == pytest.approx(
+        expected_risk_limited
+        / (1.0 + sizing["estimated_fill_drift_reserve_fraction"])
+    )
+    assert sizing["target_notional_usdt"] < 400.0
+    assert sizing["final_notional_usdt"] == pytest.approx(actual_notional)
+    assert sizing["planned_stressed_loss_usdt"] == pytest.approx(
+        actual_notional * 0.10
+    )
 
 
 @pytest.mark.asyncio
