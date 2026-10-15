@@ -85,6 +85,50 @@ def test_takeover_contract_is_reduce_only_and_preserves_historical_gap() -> None
     assert contract["policy_provenance"]["contract_fingerprint"]
 
 
+def test_takeover_contract_recomputes_protection_from_normalized_orders() -> None:
+    contract = build_current_position_management_contract(
+        _facts(protection_evidence_complete=False)
+    )
+
+    assert contract["protection_evidence_complete"] is True
+    assert contract["protection_contracts"] == pytest.approx(20.0)
+    assert contract["protection_overcoverage_contracts"] == pytest.approx(0.0)
+    assert contract["management_eligible"] is True
+    assert "okx_protection_evidence_incomplete" not in contract["blockers"]
+
+
+def test_takeover_contract_accepts_safe_protection_overcoverage() -> None:
+    contract = build_current_position_management_contract(
+        _facts(
+            quantity=10.0,
+            contracts=10.0,
+            protection_orders=[
+                {
+                    "algo_id": "oco-1",
+                    "state": "live",
+                    "contracts": 20.0,
+                    "reduce_only": True,
+                    "stop_loss_price": 98.0,
+                    "take_profit_price": 110.0,
+                }
+            ],
+        )
+    )
+    position = SimpleNamespace(
+        symbol="BTC/USDT",
+        side="long",
+        quantity=10.0,
+        entry_price=100.0,
+        entry_fee=0.12,
+        stop_loss_price=98.0,
+        take_profit_price=110.0,
+        current_management_contract=contract,
+    )
+
+    assert contract["protection_overcoverage_contracts"] == pytest.approx(10.0)
+    assert current_position_management_contract_complete(position) is True
+
+
 def test_takeover_timestamp_is_stable_while_current_facts_refresh() -> None:
     first_at = datetime(2026, 7, 15, 1, 0, tzinfo=UTC)
     first = build_current_position_management_contract(_facts(), now=first_at)
@@ -174,6 +218,7 @@ def test_takeover_contract_fails_closed_without_current_oco_or_account_equity() 
     contract = build_current_position_management_contract(
         _facts(
             protection_evidence_complete=False,
+            protection_orders=[],
             account_equity_usdt=0.0,
         )
     )

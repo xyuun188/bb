@@ -18,6 +18,9 @@ ALLOWED_MANAGEMENT_ACTIONS = (
     "close",
     "protection_repair",
 )
+PROTECTION_LIVE_STATES = frozenset(
+    {"live", "effective", "partially_effective", "open", "pending"}
+)
 PROFIT_LOCK_LEDGER_KEY = "profit_lock_exit_ledger"
 PROFIT_LOCK_LEDGER_VERSION = "2026-09-19.profit-lock-exit-ledger.v1"
 
@@ -58,6 +61,46 @@ def _row_value(row: Any, *names: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def protection_coverage_evidence(
+    protection_orders: list[dict[str, Any]],
+    current_contracts: float,
+) -> tuple[bool, float, float]:
+    """Validate one normalized live reduce-only protection contract.
+
+    The exchange snapshot is the authority.  A stale boolean carried by a
+    caller must not contradict complete normalized order evidence.
+    """
+
+    rows = [item for item in protection_orders if isinstance(item, dict)]
+    covered_contracts = sum(
+        abs(_safe_float(item.get("contracts"), 0.0))
+        for item in rows
+    )
+    overcoverage_contracts = max(
+        covered_contracts - abs(_safe_float(current_contracts)),
+        0.0,
+    )
+    complete = bool(
+        rows
+        and all(
+            str(item.get("algo_id") or "").strip()
+            and (
+                item.get("reduce_only") is True
+                or str(item.get("reduce_only") or "").lower().strip()
+                in {"true", "1", "yes"}
+            )
+            and str(item.get("state") or "").lower().strip()
+            in PROTECTION_LIVE_STATES
+            and _safe_float(item.get("contracts"), 0.0) > 0
+            and _safe_float(item.get("stop_loss_price"), 0.0) > 0
+            and _safe_float(item.get("take_profit_price"), 0.0) > 0
+            for item in rows
+        )
+        and covered_contracts + 1e-9 >= abs(_safe_float(current_contracts))
+    )
+    return complete, covered_contracts, overcoverage_contracts
 
 
 def build_current_position_management_contract(
@@ -226,6 +269,11 @@ def build_current_position_management_contract(
         }
     )
     fragment_count = max(_safe_int(facts.get("position_fragment_count")), len(fragment_ids), 1)
+    (
+        protection_evidence_complete,
+        protection_contracts,
+        protection_overcoverage_contracts,
+    ) = protection_coverage_evidence(protection_orders, contracts)
 
     blockers: list[str] = []
     if not symbol or side not in {"long", "short"}:
@@ -247,7 +295,7 @@ def build_current_position_management_contract(
         blockers.append("authoritative_entry_fee_evidence_incomplete")
     if not entry_order_ids:
         blockers.append("entry_order_lineage_missing")
-    if facts.get("protection_evidence_complete") is not True:
+    if not protection_evidence_complete:
         blockers.append("okx_protection_evidence_incomplete")
     if stop_loss <= 0 or take_profit <= 0 or position_stressed_loss <= 0:
         blockers.append("current_oco_stressed_loss_incomplete")
@@ -388,7 +436,9 @@ def build_current_position_management_contract(
         "settled_funding_evidence_status": settled_funding_evidence_status,
         "future_funding_evidence_status": future_funding_evidence_status,
         "entry_fee_evidence_complete": facts.get("entry_fee_evidence_complete") is True,
-        "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
+        "protection_evidence_complete": protection_evidence_complete,
+        "protection_contracts": protection_contracts,
+        "protection_overcoverage_contracts": protection_overcoverage_contracts,
         "paper_canary_lifecycle": paper_canary_lifecycle,
         "paper_training_lifecycle": paper_training_lifecycle,
     }
@@ -446,7 +496,12 @@ def build_current_position_management_contract(
         "exit_fee_rate_source": "authoritative_entry_fill_fee_rate_proxy",
         "stop_loss_price": round(stop_loss, 12),
         "take_profit_price": round(take_profit, 12),
-        "protection_evidence_complete": facts.get("protection_evidence_complete") is True,
+        "protection_evidence_complete": protection_evidence_complete,
+        "protection_contracts": round(protection_contracts, 12),
+        "protection_overcoverage_contracts": round(
+            protection_overcoverage_contracts,
+            12,
+        ),
         "protection_orders": protection_orders,
         "contract_size": round(contract_size, 12),
         "contract_valuation": contract_valuation,
@@ -554,7 +609,6 @@ def current_position_management_contract_complete(
         or value.get("management_eligible") is not True
         or value.get("entry_fee_evidence_complete") is not True
         or not funding_contract_valid
-        or value.get("protection_evidence_complete") is not True
         or value.get("can_expand_position") is not False
         or value.get("can_increase_leverage") is not False
         or value.get("blockers")
@@ -593,32 +647,13 @@ def current_position_management_contract_complete(
     protection_orders = [
         item for item in value.get("protection_orders") or [] if isinstance(item, dict)
     ]
-    protection_quantity = sum(
-        abs(_safe_float(item.get("contracts"))) for item in protection_orders
-    )
-    protection_rows_complete = bool(
-        protection_orders
-        and all(
-            str(item.get("algo_id") or "").strip()
-            and str(item.get("state") or "").lower() in {
-                "live",
-                "effective",
-                "partially_effective",
-                "open",
-                "pending",
-            }
-            and item.get("reduce_only") is True
-            and _safe_float(item.get("contracts")) > 0
-            and _safe_float(item.get("stop_loss_price")) > 0
-            and _safe_float(item.get("take_profit_price")) > 0
-            for item in protection_orders
-        )
-        and isclose(
-            protection_quantity,
-            abs(_safe_float(value.get("contracts"))),
-            rel_tol=1e-9,
-            abs_tol=1e-12,
-        )
+    (
+        protection_rows_complete,
+        protection_quantity,
+        _protection_overcoverage,
+    ) = protection_coverage_evidence(
+        protection_orders,
+        _safe_float(value.get("contracts")),
     )
     scalar_protection_matches = bool(
         len(protection_orders) > 1

@@ -25,6 +25,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--exchange-order-id", action="append", default=[])
+    parser.add_argument("--open-only", action="store_true")
     args = parser.parse_args()
     remote_code = f"""  # noqa: S608
 import asyncio
@@ -37,6 +38,7 @@ load_runtime_env_files(project_root=Path("/data/bb/app"))
 from sqlalchemy import select
 from db.session import get_read_session_ctx
 from models.trade import OkxPositionHistory, Order, Position
+from services.current_position_management import protection_coverage_evidence
 
 async def main():
     symbol = {str(args.symbol).strip()!r}
@@ -45,6 +47,8 @@ async def main():
         positions = list((await session.execute(
             select(Position).where(Position.symbol == symbol).order_by(Position.created_at.desc(), Position.id.desc())
         )).scalars().all())
+        if {bool(args.open_only)!r}:
+            positions = [row for row in positions if row.is_open]
         orders = list((await session.execute(
             select(Order).where(Order.symbol == symbol).order_by(Order.filled_at.desc(), Order.id.desc())
         )).scalars().all())
@@ -54,6 +58,19 @@ async def main():
             .order_by(OkxPositionHistory.updated_at_okx.desc())
         )).scalars().all())
     def position_row(row):
+        contract = (
+            row.current_management_contract
+            if isinstance(row.current_management_contract, dict)
+            else {{}}
+        )
+        protection_orders = [
+            item for item in contract.get("protection_orders", [])
+            if isinstance(item, dict)
+        ]
+        coverage = protection_coverage_evidence(
+            protection_orders,
+            float(contract.get("contracts") or row.quantity or 0.0),
+        )
         return {{
             "id": row.id, "symbol": row.symbol, "side": row.side,
             "quantity": row.quantity, "entry_price": row.entry_price,
@@ -62,6 +79,12 @@ async def main():
             "okx_inst_id": row.okx_inst_id, "okx_pos_id": row.okx_pos_id,
             "is_open": row.is_open, "created_at": str(row.created_at),
             "closed_at": str(row.closed_at), "realized_pnl": row.realized_pnl,
+            "current_management_contract": row.current_management_contract,
+            "recomputed_protection_coverage": {{
+                "complete": coverage[0],
+                "covered_contracts": coverage[1],
+                "overcoverage_contracts": coverage[2],
+            }},
         }}
     def order_row(row):
         return {{
@@ -91,7 +114,12 @@ async def main():
         }}
     if order_ids:
         orders = [row for row in orders if any(item in str(row.exchange_order_id or "") for item in order_ids)]
-    print(json.dumps({{"symbol": symbol, "positions": [position_row(row) for row in positions], "orders": [order_row(row) for row in orders], "history": [history_row(row) for row in history]}}, ensure_ascii=False, default=str))
+    print(json.dumps({{
+        "symbol": symbol,
+        "positions": [position_row(row) for row in positions],
+        "orders": [] if {bool(args.open_only)!r} else [order_row(row) for row in orders],
+        "history": [] if {bool(args.open_only)!r} else [history_row(row) for row in history],
+    }}, ensure_ascii=False, default=str))
 
 asyncio.run(main())
 """

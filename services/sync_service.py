@@ -34,6 +34,7 @@ from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
     build_current_position_management_contract,
+    protection_coverage_evidence,
 )
 from services.entry_fee_provider import entry_fee_from_orders
 from services.exchange_position_state import (
@@ -109,34 +110,6 @@ def _float_value(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _protection_coverage_evidence(
-    protection_orders: list[dict[str, Any]],
-    current_contracts: float,
-) -> tuple[bool, float, float]:
-    """Validate live reduce-only protection and report any safe overcoverage."""
-
-    covered_contracts = sum(
-        abs(_float_value(item.get("contracts"), 0.0))
-        for item in protection_orders
-    )
-    overcoverage_contracts = max(covered_contracts - abs(current_contracts), 0.0)
-    complete = bool(
-        protection_orders
-        and all(
-            str(item.get("algo_id") or "").strip()
-            and item.get("reduce_only") is True
-            and str(item.get("state") or "").lower()
-            in {"live", "effective", "partially_effective", "open", "pending"}
-            and _float_value(item.get("contracts"), 0.0) > 0
-            and _float_value(item.get("stop_loss_price"), 0.0) > 0
-            and _float_value(item.get("take_profit_price"), 0.0) > 0
-            for item in protection_orders
-        )
-        and covered_contracts + 1e-9 >= abs(current_contracts)
-    )
-    return complete, covered_contracts, overcoverage_contracts
 
 
 def _entry_order_persistence_pending(
@@ -2800,7 +2773,7 @@ class OkxSyncService:
                 protection_evidence_complete,
                 protection_contracts,
                 protection_overcoverage_contracts,
-            ) = _protection_coverage_evidence(
+            ) = protection_coverage_evidence(
                 protection_orders,
                 contracts,
             )

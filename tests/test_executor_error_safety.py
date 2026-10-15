@@ -3127,6 +3127,34 @@ def test_okx_entry_amount_uses_reference_quote_for_minimum_after_price_band_refr
     assert base_quantity == 1000.0
 
 
+def test_okx_entry_amount_preserves_selected_contract_step_after_price_band_refresh() -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "CRV/USDT:USDT",
+        "contractSize": 1.0,
+        "limits": {"amount": {"min": 1.0}},
+        "info": {"minSz": "1", "lotSz": "1"},
+    }
+
+    # 0.6915 USDT at the conservative 0.3505 fill-risk quote is 1.97
+    # contracts, while the selected exchange step is two contracts at the
+    # current 0.3454 reference quote.  Precision must not silently floor it
+    # to one contract.
+    contracts, base_quantity = executor._entry_order_amount(
+        _FloorAmountPrecisionCcxt(),
+        market,
+        position_value=0.6915,
+        price=0.3505,
+        balance=100.0,
+        leverage=8.0,
+        reference_price=0.3454,
+        authorized_fill_ceiling_usdt=505.91130444,
+    )
+
+    assert contracts == 2.0
+    assert base_quantity == 2.0
+
+
 def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None:
     executor = OKXExecutor(mode="paper")
     market = {

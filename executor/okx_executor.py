@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from math import isclose
 from typing import Any
 
@@ -1065,6 +1065,7 @@ class OKXExecutor(AbstractExecutor):
                     balance,
                     decision.suggested_leverage,
                     reference_price=price,
+                    authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                 )
                 okx_order_rules = self._entry_order_rule_snapshot(
                     market,
@@ -1487,6 +1488,7 @@ class OKXExecutor(AbstractExecutor):
                         balance,
                         decision.suggested_leverage,
                         reference_price=price,
+                        authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                     )
                     okx_order_rules = self._entry_order_rule_snapshot(
                         market,
@@ -1729,6 +1731,7 @@ class OKXExecutor(AbstractExecutor):
                     balance,
                     decision.suggested_leverage,
                     reference_price=price,
+                    authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                 )
                 okx_order_rules = self._entry_order_rule_snapshot(
                     market,
@@ -4851,6 +4854,7 @@ class OKXExecutor(AbstractExecutor):
         leverage: float,
         *,
         reference_price: float | None = None,
+        authorized_fill_ceiling_usdt: float | None = None,
     ) -> tuple[float, float]:
         """Return (contracts, base_quantity) for OKX swap orders.
 
@@ -4879,8 +4883,31 @@ class OKXExecutor(AbstractExecutor):
         if min_contracts > 0 and position_value + 1e-8 < minimum_notional:
             return 0.0, 0.0
 
+        # The sizing contract is expressed in executable exchange steps. A
+        # downward precision round can silently turn a target such as 1.97
+        # contracts into 1 contract even though two contracts are within the
+        # signed fill ceiling. Round up when the next native step is covered;
+        # otherwise keep the largest step that remains within that ceiling.
+        step = self._amount_step(market)
+        if step > 0:
+            rounded_up = self._ceil_to_amount_step(contracts, market)
+            fill_ceiling = max(
+                self._safe_float(authorized_fill_ceiling_usdt, 0.0),
+                position_value,
+            )
+            ceiling_contracts = fill_ceiling / (price * contract_size)
+            if rounded_up * price * contract_size <= fill_ceiling + 1e-8:
+                contracts = rounded_up
+            else:
+                contracts = min(
+                    contracts,
+                    self._floor_to_amount_step(ceiling_contracts, market),
+                )
         try:
-            contracts = float(ccxt.amount_to_precision(market["symbol"], contracts))
+            precise_contracts = float(
+                ccxt.amount_to_precision(market["symbol"], contracts)
+            )
+            contracts = precise_contracts
         except Exception as exc:
             logger.debug(
                 "OKX amount precision failed for position size",
@@ -5442,6 +5469,20 @@ class OKXExecutor(AbstractExecutor):
             amount_decimal = Decimal(str(amount))
             step_decimal = Decimal(str(step))
             units = (amount_decimal / step_decimal).to_integral_value(rounding=ROUND_CEILING)
+            return float(units * step_decimal)
+        except (InvalidOperation, ValueError, ZeroDivisionError):
+            return amount
+
+    def _floor_to_amount_step(self, amount: float, market: dict[str, Any]) -> float:
+        step = self._amount_step(market)
+        if amount <= 0 or step <= 0:
+            return amount
+        try:
+            amount_decimal = Decimal(str(amount))
+            step_decimal = Decimal(str(step))
+            units = (amount_decimal / step_decimal).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
             return float(units * step_decimal)
         except (InvalidOperation, ValueError, ZeroDivisionError):
             return amount

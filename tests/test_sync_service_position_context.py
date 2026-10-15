@@ -12,13 +12,13 @@ from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
     current_position_management_contract_complete,
+    protection_coverage_evidence,
 )
 from services.sync_service import (
     OkxSyncService,
     _confirmed_local_close_fill_for_position,
     _merge_local_position_candidates,
     _okx_close_fill_order_payload,
-    _protection_coverage_evidence,
     normalized_open_position_context,
 )
 
@@ -31,7 +31,7 @@ def _float(value, default=0.0):
 
 
 def test_protection_evidence_accepts_safe_oco_overcoverage_after_partial_close() -> None:
-    complete, covered, overcoverage = _protection_coverage_evidence(
+    complete, covered, overcoverage = protection_coverage_evidence(
         [
             {
                 "algo_id": "oco-1",
@@ -51,7 +51,7 @@ def test_protection_evidence_accepts_safe_oco_overcoverage_after_partial_close()
 
 
 def test_protection_evidence_rejects_undercovered_oco() -> None:
-    complete, covered, overcoverage = _protection_coverage_evidence(
+    complete, covered, overcoverage = protection_coverage_evidence(
         [
             {
                 "algo_id": "oco-1",
