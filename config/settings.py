@@ -322,11 +322,11 @@ class Settings(BaseSettings):
     # their own longer low-frequency budget without allowing the single A100
     # hot path to regress to a 35-second request.
     ai_target_qwen_max_completion_tokens: int = 96
-    # The target carrier exposes a bounded queue (6s) in front of an
-    # 18s generation deadline.  Callers must budget both phases or a normal
-    # queued request is incorrectly recorded as a model outage.
+    # A target request shares one process-wide FIFO gate. Zero means the
+    # caller's remaining analysis deadline is the queue budget; a healthy
+    # request is not converted into a false model outage after a fixed wait.
     ai_target_qwen_timeout_seconds: float = 26.0
-    ai_target_qwen_queue_wait_seconds: float = 6.0
+    ai_target_qwen_queue_wait_seconds: float = 0.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_transient_circuit_breaker_seconds: float = 3.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0

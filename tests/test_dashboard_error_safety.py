@@ -895,6 +895,24 @@ async def test_execution_pnl_summary_includes_okx_authoritative_ledger_positions
                 ]
             )
 
+        await _seed_okx_position_history_rows(
+            [
+                {
+                    "instId": "ACT-USDT-SWAP",
+                    "posId": "act-pos",
+                    "posSide": "net",
+                    "type": "2",
+                    "openAvgPx": "0.01049",
+                    "closeAvgPx": "0.00908",
+                    "openMaxPos": "1270",
+                    "closeTotalPos": "1270",
+                    "realizedPnl": "1.77827305",
+                    "pnl": "1.77827305",
+                    "cTime": str(int(act_entry_at.timestamp() * 1000)),
+                    "uTime": str(int(act_close_at.timestamp() * 1000)),
+                }
+            ]
+        )
         summary = await dashboard._get_execution_pnl_summary("paper")
     finally:
         await close_db()

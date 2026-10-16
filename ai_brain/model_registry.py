@@ -18,7 +18,11 @@ from ai_brain.expert_diversity_policy import (
     ExpertDiversityReview,
     review_batch_expert_consensus,
 )
-from ai_brain.llm_agent import LLMCapacityQueueDeferred, ensure_llm_call_budget
+from ai_brain.llm_agent import (
+    LLMCapacityQueueDeferred,
+    _bounded_llm_capacity_slot,
+    ensure_llm_call_budget,
+)
 from config.settings import settings
 from core.safe_output import safe_error_text
 from data_feed.feature_vector import FeatureVector
@@ -254,11 +258,6 @@ class ModelRegistry:
         self._initialized = False
         self._batch_expert_disabled_until_by_provider: dict[tuple[str, str], float] = {}
         self._batch_expert_last_error_by_provider: dict[tuple[str, str], str] = {}
-        # A target Qwen carrier is single-worker.  One registry can serve
-        # market and position rounds concurrently, so the shared batch call
-        # needs a provider-level single-flight gate in addition to the generic
-        # LLM capacity pool.
-        self._batch_provider_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     def register(self, model: AbstractAIModel) -> None:
         """Register a model instance. Must have a unique name."""
@@ -319,7 +318,6 @@ class ModelRegistry:
         old_names = set(self._models.keys())
         self._models.clear()
         self._initialized = False
-        self._batch_provider_locks.clear()
 
         for m in create_models_from_config():
             self.register(m)
@@ -358,7 +356,6 @@ class ModelRegistry:
         """Shutdown all models gracefully."""
         tasks = [model.shutdown() for model in self._models.values()]
         await asyncio.gather(*tasks, return_exceptions=True)
-        self._batch_provider_locks.clear()
         self._initialized = False
         logger.info("all models shut down")
 
@@ -774,53 +771,11 @@ class ModelRegistry:
                 )
                 return {}, timings
 
-            provider_lock = self._batch_provider_locks.setdefault(
-                provider_key,
-                asyncio.Lock(),
-            )
-            lock_wait_started = time.perf_counter()
-            provider_lock_acquired = False
             try:
-                # Keep the lock across the bounded request and its one
-                # transport retry.  Releasing it between attempts would let a
-                # second symbol enter the single-worker carrier while the
-                # first request is still recovering.
-                lock_remaining = batch_timeout
-                if _is_target_qwen_provider(batch_model):
-                    # The target carrier has one worker and advertises a
-                    # separate queue budget. Waiting for the full inference
-                    # deadline behind another symbol turns queue pressure into
-                    # a false model timeout; defer before admission instead.
-                    lock_remaining = min(
-                        lock_remaining,
-                        max(
-                            float(settings.ai_target_qwen_queue_wait_seconds or 0.0),
-                            0.05,
-                        ),
-                    )
-                deadline = context.get("_analysis_deadline_monotonic")
-                try:
-                    if deadline:
-                        lock_remaining = min(
-                            lock_remaining,
-                            max(
-                                float(deadline) - asyncio.get_running_loop().time() - 0.1,
-                                0.05,
-                            ),
-                        )
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    await asyncio.wait_for(
-                        provider_lock.acquire(),
-                        timeout=max(lock_remaining, 0.05),
-                    )
-                except TimeoutError:
-                    provider_queue_deferred = True
-                    raise
-                provider_lock_acquired = True
-                # The shared request is admitted at this point.  Preserve that
-                # distinction for the persisted quality contract.
+                # Provider admission is handled by one process-wide gate in
+                # ``llm_agent``.  Keeping a second registry-local lock here
+                # created a priority inversion between market and position
+                # loops and turned healthy queueing into false failures.
                 context["_attempted_models"] = list(
                     dict.fromkeys(
                         [
@@ -829,11 +784,7 @@ class ModelRegistry:
                         ]
                     )
                 )
-                provider_queue_wait_seconds = round(
-                    time.perf_counter() - lock_wait_started,
-                    3,
-                )
-                context["_batch_provider_queue_wait_seconds"] = provider_queue_wait_seconds
+                deadline = context.get("_analysis_deadline_monotonic")
                 request_timeout = batch_timeout
                 try:
                     if deadline:
@@ -846,9 +797,25 @@ class ModelRegistry:
                         )
                 except (TypeError, ValueError):
                     pass
-                result = await asyncio.wait_for(
-                    batch_decider(features, context, expert_names),
-                    timeout=max(request_timeout, 0.05),
+                batch_context = dict(context)
+                batch_context["_llm_capacity_preacquired"] = True
+                capacity_slot = _bounded_llm_capacity_slot(
+                    context,
+                    max_queue_wait_seconds=(
+                        settings.ai_target_qwen_queue_wait_seconds or 0.0
+                        if _is_target_qwen_provider(batch_model)
+                        else 0.0
+                    ),
+                    provider_model=_provider_model_name(batch_model),
+                )
+                async with capacity_slot:
+                    result = await asyncio.wait_for(
+                        batch_decider(features, batch_context, expert_names),
+                        timeout=max(request_timeout, 0.05),
+                    )
+                provider_queue_wait_seconds = max(
+                    float(batch_context.get("_llm_provider_queue_wait_seconds") or 0.0),
+                    0.0,
                 )
             except Exception as first_exc:
                 first_error_text = safe_error_text(first_exc, limit=240)
@@ -880,16 +847,30 @@ class ModelRegistry:
                 context["_batch_transport_retry_limit"] = 1
                 try:
                     await asyncio.sleep(min(0.1, retry_timeout / 10.0))
-                    result = await asyncio.wait_for(
-                        batch_decider(features, context, expert_names),
-                        timeout=retry_timeout,
+                    retry_context = dict(context)
+                    retry_context["_llm_capacity_preacquired"] = True
+                    capacity_slot = _bounded_llm_capacity_slot(
+                        context,
+                        max_queue_wait_seconds=(
+                            settings.ai_target_qwen_queue_wait_seconds or 0.0
+                            if _is_target_qwen_provider(batch_model)
+                            else 0.0
+                        ),
+                        provider_model=_provider_model_name(batch_model),
+                    )
+                    async with capacity_slot:
+                        result = await asyncio.wait_for(
+                            batch_decider(features, retry_context, expert_names),
+                            timeout=retry_timeout,
+                        )
+                    provider_queue_wait_seconds = max(
+                        provider_queue_wait_seconds,
+                        float(retry_context.get("_llm_provider_queue_wait_seconds") or 0.0),
                     )
                 finally:
                     context.pop("_batch_transport_retry_active", None)
                     context.pop("_batch_transport_retry_limit", None)
-            finally:
-                if provider_lock_acquired:
-                    provider_lock.release()
+            context["_batch_provider_queue_wait_seconds"] = provider_queue_wait_seconds
             self._batch_expert_disabled_until_by_provider.pop(provider_key, None)
             self._batch_expert_last_error_by_provider.pop(provider_key, None)
             duration = round(time.perf_counter() - perf_started, 3)

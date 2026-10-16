@@ -850,7 +850,10 @@ class CrossValidator:
             f"consultation:{original_scope}"
         )
         _claim_llm_call(shared_capacity_context, "deep_consultation")
-        shared_slot = shared_llm_capacity_slot(shared_capacity_context)
+        shared_slot = shared_llm_capacity_slot(
+            shared_capacity_context,
+            provider_model=model,
+        )
         try:
             async with asyncio.timeout(queue_timeout):
                 await shared_slot.__aenter__()

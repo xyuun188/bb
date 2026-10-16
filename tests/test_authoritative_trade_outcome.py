@@ -582,3 +582,45 @@ async def test_position_history_loader_filters_evaluation_window_in_sql(
         }
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_position_history_full_ledger_is_not_limited_to_5000_rows(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy import insert
+
+    await close_db()
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'full-history.db').as_posix()}"
+    )
+    await init_db()
+    rows = [
+        {
+            "mode": "paper",
+            "row_identity": f"paper|BTC-USDT-SWAP|{index}|long|1782579311213",
+            "inst_id": "BTC-USDT-SWAP",
+            "symbol": "BTC/USDT",
+            "pos_id": str(index),
+            "pos_side": "long",
+            "side": "long",
+            "raw_row": {
+                "instId": "BTC-USDT-SWAP",
+                "posId": str(index),
+                "posSide": "long",
+                "cTime": "1782579311213",
+            },
+        }
+        for index in range(5001)
+    ]
+    try:
+        async with get_session_ctx() as session:
+            await session.execute(insert(OkxPositionHistory), rows)
+        async with get_session_ctx() as session:
+            bounded = await load_okx_position_history_records(session, mode="paper")
+            complete = await load_okx_position_history_records(session, mode="paper", limit=None)
+        assert len(bounded) == 5000
+        assert len(complete) == 5001
+        assert {record.pos_id for record in complete} == {str(index) for index in range(5001)}
+    finally:
+        await close_db()

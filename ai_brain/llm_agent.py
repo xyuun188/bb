@@ -301,14 +301,29 @@ class _ScopedLLMSlot:
                 raise
 
 
+# Generic providers may use the configured shared pool.  The production
+# Qwen3.8-27B carrier is a separate single-worker process, so every Qwen call
+# must enter one process-wide FIFO gate regardless of which registry requested
+# it.
 _LLM_CAPACITY = _ScopedLLMCapacity(_LLM_CONCURRENCY)
+_TARGET_QWEN_CAPACITY = _ScopedLLMCapacity(1)
 _LLM_CALL_DELAY = max(float(settings.ai_llm_call_delay_seconds or 0.0), 0.0)
 
 
-def shared_llm_capacity_slot(context: dict[str, Any]) -> _ScopedLLMSlot:
-    """Return the same provider-capacity slot used by every expert call."""
+def _capacity_for_provider(provider_model: str | None) -> _ScopedLLMCapacity:
+    if str(provider_model or "").strip().lower() == "qwen3.8-27b":
+        return _TARGET_QWEN_CAPACITY
+    return _LLM_CAPACITY
 
-    return _LLM_CAPACITY.slot(context)
+
+def shared_llm_capacity_slot(
+    context: dict[str, Any],
+    *,
+    provider_model: str | None = None,
+) -> _ScopedLLMSlot:
+    """Return the process-wide capacity slot for the requested provider."""
+
+    return _capacity_for_provider(provider_model).slot(context)
 
 
 @asynccontextmanager
@@ -316,6 +331,7 @@ async def _bounded_llm_capacity_slot(
     context: dict[str, Any],
     *,
     max_queue_wait_seconds: float = 0.0,
+    provider_model: str | None = None,
 ):
     """Acquire shared capacity without allowing queue wait to consume a round.
 
@@ -324,7 +340,15 @@ async def _bounded_llm_capacity_slot(
     saturated shared semaphore could consume the entire symbol budget first.
     """
 
-    slot = _LLM_CAPACITY.slot(context)
+    if isinstance(context, dict) and context.get("_llm_capacity_preacquired") is True:
+        # ModelRegistry owns the same provider gate for batch deciders.  The
+        # marker makes the LLMAgent call re-entrant without introducing a
+        # second queue or deadlocking on the single-worker carrier.
+        yield
+        return
+
+    slot = _capacity_for_provider(provider_model).slot(context)
+    queue_started = asyncio.get_running_loop().time()
     try:
         try:
             deadline = float(context.get("_analysis_deadline_monotonic"))
@@ -356,6 +380,11 @@ async def _bounded_llm_capacity_slot(
                 raise
         else:
             await slot.__aenter__()
+        if isinstance(context, dict) and provider_model:
+            context["_llm_provider_queue_wait_seconds"] = round(
+                max(asyncio.get_running_loop().time() - queue_started, 0.0),
+                3,
+            )
         yield
     finally:
         if getattr(slot, "_acquired", False):
@@ -1386,10 +1415,11 @@ class LLMAgent(AbstractAIModel):
                 capacity_slot = _bounded_llm_capacity_slot(
                     context,
                     max_queue_wait_seconds=(
-                        settings.ai_target_qwen_queue_wait_seconds or 6.0
+                        settings.ai_target_qwen_queue_wait_seconds or 0.0
                         if target_qwen
                         else 0.0
                     ),
+                    provider_model=model_name,
                 )
                 async with capacity_slot:
                     if _LLM_CALL_DELAY and not target_qwen:
@@ -1500,10 +1530,11 @@ class LLMAgent(AbstractAIModel):
             capacity_slot = _bounded_llm_capacity_slot(
                 context,
                 max_queue_wait_seconds=(
-                    settings.ai_target_qwen_queue_wait_seconds or 6.0
+                    settings.ai_target_qwen_queue_wait_seconds or 0.0
                     if target_single_call
                     else 0.0
                 ),
+                provider_model=self._model_name,
             )
             async with capacity_slot:
                 if _LLM_CALL_DELAY and not target_single_call:

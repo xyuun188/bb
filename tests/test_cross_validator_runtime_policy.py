@@ -411,9 +411,14 @@ async def test_consultation_can_use_one_controlled_overflow_slot(
 async def test_consultation_queue_timeout_is_audited_in_attempts(monkeypatch) -> None:
     validator = CrossValidator()
     shared_slots = [
-        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"}),
-        shared_llm_capacity_slot({"_analysis_budget_scope": "market_test"}),
-        shared_llm_capacity_slot({"_analysis_budget_scope": "consultation:holder"}),
+        shared_llm_capacity_slot(
+            {"_analysis_budget_scope": "market_test"},
+            provider_model="qwen3.8-27b",
+        ),
+        shared_llm_capacity_slot(
+            {"_analysis_budget_scope": "consultation:holder"},
+            provider_model="qwen3.8-27b",
+        ),
     ]
     for slot in shared_slots:
         await slot.__aenter__()

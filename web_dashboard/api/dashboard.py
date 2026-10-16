@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
@@ -201,12 +201,12 @@ _DASHBOARD_EXPERT_MEMORY_STALE_TTL_SECONDS = 15 * 60.0
 _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS = 60.0
 _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS = 600.0
 _DASHBOARD_PENDING_LEDGER_CACHE_TTL_SECONDS = 15.0
-_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 2
+_DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION = 3
 _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DASHBOARD_DAILY_PNL_MAX_ORDER_ROWS = 20000
 _DASHBOARD_PROFIT_ATTRIBUTION_MAX_ORDER_ROWS = 6000
 _DASHBOARD_MODEL_CONTRIBUTION_MAX_ORDER_ROWS = 5000
-_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 3
+_DASHBOARD_DAILY_PNL_SNAPSHOT_VERSION = 4
 _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 3600
 _dashboard_daily_pnl_refresh_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
 _DASHBOARD_OKX_CONFIRMED_ORDER_STATUSES = {
@@ -2359,66 +2359,20 @@ async def _phase3_equity_pnl_for_mode(
         }
 
 
-async def _get_execution_pnl_summary(mode: str) -> dict:
-    """Return local trade diagnostics plus OKX-backed margin usage.
-
-    This summary is intentionally not an account-profit source. Account equity
-    and displayed account PnL must come from OKX snapshots only.
-    """
-    from sqlalchemy import case, func, select
+async def _execution_open_position_metrics(mode: str) -> tuple[list[Any], dict[str, Any]]:
+    """Use the same OKX marks and temporary-outage fallback in both PnL views."""
+    from sqlalchemy import select
     from sqlalchemy.orm import load_only
 
-    from db.session import get_read_session_ctx, get_session_ctx
-    from models.trade import Order, Position
-    from services.trade_fact_trust import (
-        closed_position_trade_fact_trusted_with_orders,
-        orders_by_exchange_id,
-        split_exchange_order_ids,
-    )
+    from db.session import get_read_session_ctx
+    from models.trade import Position
 
     selected_mode = "live" if mode == "live" else "paper"
-    allocated = 0.0
-    okx_current_equity: float | None = None
-    realized_profit = 0.0
-    realized_loss = 0.0
-    today_realized_profit = 0.0
-    today_realized_loss = 0.0
-    unrealized_pnl = 0.0
-    used_margin = 0.0
-    open_count = 0
     position_rows = []
-    now_local = datetime.now(timezone(timedelta(hours=8)))
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_local.astimezone(UTC)
-
-    balance_result, marks_result, symbols_result = await asyncio.gather(
-        _dashboard_okx_balance_snapshot_for_mode(selected_mode),
+    marks_result, symbols_result = await asyncio.gather(
         _get_exchange_position_mark_map(selected_mode),
         _get_exchange_open_position_symbols(selected_mode),
         return_exceptions=True,
-    )
-    if isinstance(balance_result, Exception):
-        _log_dashboard_fallback(
-            "dashboard balance snapshot fallback",
-            balance_result,
-            mode=selected_mode,
-        )
-        snapshot = None
-    else:
-        snapshot = balance_result
-    okx_current_equity = _safe_float(
-        (snapshot or {}).get("equity") or (snapshot or {}).get("total"),
-        None,
-    )
-    allocated = (
-        _safe_float(
-            (snapshot or {}).get("allocatable")
-            or (snapshot or {}).get("equity")
-            or (snapshot or {}).get("total")
-            or (snapshot or {}).get("free"),
-            0.0,
-        )
-        or 0.0
     )
     if isinstance(marks_result, Exception):
         _log_dashboard_fallback(
@@ -2447,7 +2401,8 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         and not exchange_marks
         and _dashboard_okx_positions_temporarily_unavailable(selected_mode)
     )
-
+    fallback_margin_by_key: dict[tuple[str, str], float] = {}
+    fallback_unrealized_by_key: dict[tuple[str, str], float] = {}
     try:
         async with get_read_session_ctx() as session:
             filters = (
@@ -2465,127 +2420,13 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                         Position.entry_price,
                         Position.leverage,
                         Position.unrealized_pnl,
-                        Position.realized_pnl,
                         Position.is_open,
-                        Position.closed_at,
-                        Position.settlement_status,
-                        Position.settlement_source,
-                        Position.settlement_raw,
-                        Position.entry_exchange_order_id,
-                        Position.close_exchange_order_id,
                     )
                 )
-                .where(*filters)
+                .where(*filters, Position.is_open.is_(True))
                 .order_by(Position.created_at.asc(), Position.id.asc())
             )
             position_rows = list(all_result.scalars().all())
-            realized_result = await session.execute(
-                select(
-                    func.coalesce(
-                        func.sum(
-                            case(
-                                (Position.realized_pnl >= 0, Position.realized_pnl),
-                                else_=0.0,
-                            )
-                        ),
-                        0.0,
-                    ),
-                    func.coalesce(
-                        func.sum(
-                            case(
-                                (Position.realized_pnl < 0, -Position.realized_pnl),
-                                else_=0.0,
-                            )
-                        ),
-                        0.0,
-                    ),
-                ).where(*filters, Position.is_open.is_(False))
-            )
-            realized_profit, realized_loss = [
-                float(value or 0.0) for value in realized_result.one()
-            ]
-            today_result = await session.execute(
-                select(
-                    func.coalesce(
-                        func.sum(
-                            case(
-                                (Position.realized_pnl >= 0, Position.realized_pnl),
-                                else_=0.0,
-                            )
-                        ),
-                        0.0,
-                    ),
-                    func.coalesce(
-                        func.sum(
-                            case(
-                                (Position.realized_pnl < 0, -Position.realized_pnl),
-                                else_=0.0,
-                            )
-                        ),
-                        0.0,
-                    ),
-                ).where(
-                    *filters,
-                    Position.is_open.is_(False),
-                    Position.closed_at >= start_utc,
-                )
-            )
-            today_realized_profit, today_realized_loss = [
-                float(value or 0.0) for value in today_result.one()
-            ]
-            linked_order_ids = {
-                order_id
-                for pos in position_rows
-                if not pos.is_open
-                for value in (
-                    getattr(pos, "entry_exchange_order_id", None),
-                    getattr(pos, "close_exchange_order_id", None),
-                )
-                for order_id in split_exchange_order_ids(value)
-            }
-            linked_orders = []
-            if linked_order_ids:
-                linked_orders = list(
-                    (
-                        await session.execute(
-                            select(Order)
-                            .options(load_only(Order.exchange_order_id, Order.okx_sync_status))
-                            .where(
-                                Order.execution_mode == selected_mode,
-                                Order.exchange_order_id.in_(sorted(linked_order_ids)),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-            linked_orders_by_id = orders_by_exchange_id(linked_orders)
-            trusted_closed_rows = [
-                pos
-                for pos in position_rows
-                if not pos.is_open
-                and closed_position_trade_fact_trusted_with_orders(pos, linked_orders_by_id)
-            ]
-            realized_profit = sum(
-                max(float(pos.realized_pnl or 0.0), 0.0) for pos in trusted_closed_rows
-            )
-            realized_loss = sum(
-                abs(min(float(pos.realized_pnl or 0.0), 0.0)) for pos in trusted_closed_rows
-            )
-            today_trusted_closed_rows = [
-                pos
-                for pos in trusted_closed_rows
-                if (closed_at := _as_utc_datetime(pos.closed_at)) is not None
-                and closed_at >= start_utc
-            ]
-            today_realized_profit = sum(
-                max(float(pos.realized_pnl or 0.0), 0.0) for pos in today_trusted_closed_rows
-            )
-            today_realized_loss = sum(
-                abs(min(float(pos.realized_pnl or 0.0), 0.0)) for pos in today_trusted_closed_rows
-            )
-            fallback_margin_by_key: dict[tuple[str, str], float] = {}
-            fallback_unrealized_by_key: dict[tuple[str, str], float] = {}
             for pos in position_rows:
                 if not pos.is_open:
                     continue
@@ -2600,22 +2441,83 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
                 fallback_unrealized_by_key[key] = fallback_unrealized_by_key.get(key, 0.0) + (
                     _safe_float(pos.unrealized_pnl, 0.0) or 0.0
                 )
-            if exchange_marks:
-                exchange_totals = _exchange_position_totals(exchange_marks, fallback_margin_by_key)
-                open_count = int(exchange_totals["open_count"])
-                unrealized_pnl = float(exchange_totals["unrealized_pnl"])
-                used_margin = float(exchange_totals["used_margin"])
-            elif exchange_temporarily_unavailable:
-                open_count = len(fallback_margin_by_key)
-                unrealized_pnl = float(sum(fallback_unrealized_by_key.values()))
-                used_margin = float(sum(fallback_margin_by_key.values()))
     except Exception as exc:
         _log_dashboard_fallback(
             "execution pnl database summary fallback",
             exc,
             mode=selected_mode,
         )
+    if exchange_marks:
+        return position_rows, _exchange_position_totals(exchange_marks, fallback_margin_by_key)
+    return position_rows, {
+        "open_count": len(fallback_margin_by_key) if exchange_temporarily_unavailable else 0,
+        "unrealized_pnl": (
+            float(sum(fallback_unrealized_by_key.values()))
+            if exchange_temporarily_unavailable else 0.0
+        ),
+        "used_margin": (
+            float(sum(fallback_margin_by_key.values()))
+            if exchange_temporarily_unavailable else 0.0
+        ),
+    }
 
+
+async def _get_execution_pnl_summary(mode: str) -> dict:
+    """Return official trading PnL and separate account-equity movement."""
+    from db.repositories.trade_repo import TradeRepository
+    from db.session import get_read_session_ctx, get_session_ctx
+
+    selected_mode = "live" if mode == "live" else "paper"
+    today_local = datetime.now(BEIJING_TZ).date()
+    closed_ledger_rows = []
+    trade_pnl_available = False
+    balance_result, metrics_result = await asyncio.gather(
+        _dashboard_okx_balance_snapshot_for_mode(selected_mode),
+        _execution_open_position_metrics(selected_mode),
+        return_exceptions=True,
+    )
+    if isinstance(balance_result, Exception):
+        _log_dashboard_fallback(
+            "dashboard balance snapshot fallback", balance_result, mode=selected_mode
+        )
+        snapshot = {}
+    else:
+        snapshot = balance_result or {}
+    if isinstance(metrics_result, Exception):
+        raise metrics_result
+    position_rows, position_metrics = metrics_result
+    okx_current_equity = _safe_float(snapshot.get("equity") or snapshot.get("total"), None)
+    allocated = (
+        _safe_float(
+            snapshot.get("allocatable")
+            or snapshot.get("equity")
+            or snapshot.get("total")
+            or snapshot.get("free"),
+            0.0,
+        )
+        or 0.0
+    )
+    unrealized_pnl = float(position_metrics["unrealized_pnl"])
+    used_margin = float(position_metrics["used_margin"])
+    open_count = int(position_metrics["open_count"])
+    try:
+        async with get_read_session_ctx() as session:
+            closed_ledger_rows, *_ = await _dashboard_closed_position_ledger_rows(
+                session,
+                TradeRepository(session),
+                mode=selected_mode,
+                model_names=EXECUTION_LEDGER_MODEL_NAMES,
+                paginate=False,
+            )
+        trade_pnl_available = True
+    except Exception as exc:
+        _log_dashboard_fallback("execution trade ledger unavailable", exc, mode=selected_mode)
+    settled_by_day = _execution_settled_pnl_by_day(closed_ledger_rows, today=today_local)
+    today_settled = settled_by_day.get(today_local.isoformat(), {})
+    realized_profit = sum(row["realized_profit"] for row in settled_by_day.values())
+    realized_loss = sum(row["realized_loss"] for row in settled_by_day.values())
+    today_realized_profit = today_settled.get("realized_profit", 0.0)
+    today_realized_loss = today_settled.get("realized_loss", 0.0)
     realized_pnl = realized_profit - realized_loss
     today_realized_pnl = today_realized_profit - today_realized_loss
     total_pnl = realized_pnl + unrealized_pnl
@@ -2681,6 +2583,12 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
         "phase3_equity_series_complete": bool(phase3_equity.get("phase3_equity_series_complete")),
         "phase3_equity_scope": phase3_equity.get("phase3_equity_scope"),
         "today_total_pnl": today_total_pnl,
+        **_execution_trade_pnl_fields(
+            settled_by_day,
+            today=today_local,
+            unrealized_pnl=unrealized_pnl,
+            available=trade_pnl_available,
+        ),
         "today_risk_pnl": today_risk_pnl,
         "unrealized_pnl": unrealized_pnl,
         "total_pnl": total_pnl,
@@ -2899,6 +2807,7 @@ def _build_execution_account_status(
             _safe_float(pnl_summary.get("total_pnl"), 0.0),
         ),
         "local_trade_today_pnl": _safe_float(pnl_summary.get("today_closed_realized_pnl"), 0.0),
+        **_execution_trade_pnl_account_fields(pnl_summary),
         "positions": [],
         "open_positions": open_positions,
         "realized_profit": _safe_float(pnl_summary.get("realized_profit"), 0.0),
@@ -5006,7 +4915,7 @@ async def _dashboard_closed_position_ledger_rows_uncached(
     history_records = await load_okx_position_history_records(
         session,
         mode=mode,
-        limit=5000,
+        limit=None,
     )
     position_history_rows = okx_position_history_records_to_rows(history_records)
     official_history_source = "okx_settlement_fact_mirror"
@@ -14442,6 +14351,12 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
     # storms by the dashboard heavy-cache single-flight lock.
     if not str(settings.database_url or "").startswith("postgresql"):
         return await _build_daily_pnl_records(mode=selected_mode, days=capped_days)
+    cache_key = ("daily-pnl", selected_mode, capped_days)
+    cached = _dashboard_heavy_cache.get(cache_key)
+    if cached and _dashboard_daily_pnl_snapshot_obsolete(
+        cached[0], cached[1], mode=selected_mode
+    ):
+        _dashboard_heavy_cache.pop(cache_key, None)
     persisted = _load_dashboard_daily_pnl_snapshot(mode=selected_mode, days=capped_days)
     if persisted is not None:
         saved_at, payload = persisted
@@ -14460,7 +14375,7 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         result["snapshot_saved_at"] = saved_at.isoformat()
         return sanitize_payload(result)
     return await _dashboard_heavy_cached(
-        ("daily-pnl", selected_mode, capped_days),
+        cache_key,
         lambda: _build_daily_pnl_records(mode=selected_mode, days=capped_days),
         ttl_seconds=30.0,
     )
@@ -14472,6 +14387,17 @@ def _dashboard_daily_pnl_snapshot_path(*, mode: str, days: int) -> Path | None:
     safe_mode = "live" if mode == "live" else "paper"
     safe_days = max(1, min(int(days or 30), 180))
     return settings.data_dir / "dashboard_read_models" / f"daily_pnl_{safe_mode}_{safe_days}.json"
+
+
+def _dashboard_daily_pnl_snapshot_obsolete(
+    saved_at: datetime, payload: dict[str, Any], *, mode: str
+) -> bool:
+    from services.okx_position_history_store import load_okx_position_history_watermark
+
+    if payload.get("end_date") and payload["end_date"] != datetime.now(BEIJING_TZ).date().isoformat():
+        return True
+    watermark = load_okx_position_history_watermark(mode)
+    return watermark is not None and saved_at < watermark
 
 
 def _load_dashboard_daily_pnl_snapshot(
@@ -14487,6 +14413,8 @@ def _load_dashboard_daily_pnl_snapshot(
         saved_at = _as_utc_datetime(document.get("saved_at"))
         payload = document.get("payload")
         if saved_at is None or not isinstance(payload, dict):
+            return None
+        if _dashboard_daily_pnl_snapshot_obsolete(saved_at, payload, mode=mode):
             return None
         if (
             datetime.now(UTC) - saved_at
@@ -14558,6 +14486,82 @@ def _daily_pnl_component_totals(
     )
 
 
+def _execution_settled_pnl_by_day(
+    ledger_rows: list[dict[str, Any]], *, today: date
+) -> dict[str, dict[str, Any]]:
+    """Group confirmed settlement facts once for both dashboard views."""
+    by_day: dict[str, dict[str, Any]] = {}
+    for ledger_row in ledger_rows:
+        if not _daily_pnl_ledger_row_has_okx_realized_pnl(ledger_row):
+            continue
+        closed_at = _as_utc_datetime(ledger_row.get("closed_at"))
+        if closed_at is None or closed_at < PHASE3_CLEAN_START_UTC:
+            continue
+        local_day = closed_at.astimezone(BEIJING_TZ).date()
+        if local_day > today:
+            continue
+        pnl = _safe_float(ledger_row.get("realized_pnl"), None)
+        if pnl is None:
+            continue
+        row = by_day.setdefault(
+            local_day.isoformat(),
+            {
+                "realized_profit": 0.0,
+                "realized_loss": 0.0,
+                "realized_pnl": 0.0,
+                "trade_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "entries": [],
+            },
+        )
+        row["realized_profit"] += max(pnl, 0.0)
+        row["realized_loss"] += abs(min(pnl, 0.0))
+        row["realized_pnl"] += pnl
+        row["trade_count"] += 1
+        row["win_count" if pnl >= 0 else "loss_count"] += 1
+        row["entries"].append((ledger_row, pnl, closed_at))
+    return by_day
+
+
+def _execution_trade_pnl_fields(
+    settled_by_day: dict[str, dict[str, Any]],
+    *,
+    today: date,
+    unrealized_pnl: float,
+    available: bool = True,
+) -> dict[str, Any]:
+    today_settled = settled_by_day.get(today.isoformat(), {}).get("realized_pnl", 0.0)
+    cumulative_settled = sum(row["realized_pnl"] for row in settled_by_day.values())
+    today_total, cumulative_total = _daily_pnl_component_totals(
+        daily_settled_pnl=today_settled,
+        cumulative_settled_pnl=cumulative_settled,
+        current_unsettled_pnl=unrealized_pnl,
+    )
+    return {
+        "today_trade_total_pnl": today_total if available else None,
+        "cumulative_trade_total_pnl": cumulative_total if available else None,
+        "trade_pnl_available": available,
+        "trade_pnl_source": "okx_position_ledger_plus_current_unrealized",
+        "trade_pnl_start_date": min(settled_by_day, default=None),
+        "trade_pnl_as_of": datetime.now(UTC).isoformat(),
+    }
+
+
+def _execution_trade_pnl_account_fields(pnl_summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: pnl_summary.get(key)
+        for key in (
+            "today_trade_total_pnl",
+            "cumulative_trade_total_pnl",
+            "trade_pnl_available",
+            "trade_pnl_source",
+            "trade_pnl_start_date",
+            "trade_pnl_as_of",
+        )
+    }
+
+
 async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
     """Daily execution PnL grouped by Beijing calendar day."""
     from sqlalchemy import select
@@ -14611,15 +14615,8 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
     cumulative_before = 0.0
     open_unrealized = 0.0
 
-    try:
-        exchange_marks = await _get_exchange_position_mark_map(selected_mode)
-    except Exception as exc:
-        _log_dashboard_fallback(
-            "daily pnl exchange mark fallback",
-            exc,
-            mode=selected_mode,
-        )
-        exchange_marks = {}
+    _, position_metrics = await _execution_open_position_metrics(selected_mode)
+    open_unrealized = float(position_metrics["unrealized_pnl"])
     async with get_session_ctx() as session:
         repo = TradeRepository(session)
         (
@@ -14777,59 +14774,43 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
         if day in records:
             pending_settlement_by_date[day] = pending_settlement_by_date.get(day, 0) + 1
 
-    for ledger_row in closed_ledger_rows:
-        if not _daily_pnl_ledger_row_has_okx_realized_pnl(ledger_row):
+    settled_by_day = _execution_settled_pnl_by_day(closed_ledger_rows, today=today_local)
+    for day, settled in settled_by_day.items():
+        if day < start_day.isoformat():
+            cumulative_before += settled["realized_pnl"]
             continue
-        pnl = float(_safe_float(ledger_row.get("realized_pnl"), 0.0) or 0.0)
-        closed_at = _as_utc_datetime(ledger_row.get("closed_at"))
-        if closed_at is None or closed_at < PHASE3_CLEAN_START_UTC:
-            continue
-        if closed_at < start_utc:
-            cumulative_before += pnl
-            continue
-        day = closed_at.astimezone(BEIJING_TZ).date().isoformat()
         row = records.get(day)
         if not row:
             continue
-        if pnl >= 0:
-            row["realized_profit"] += pnl
-            row["win_count"] += 1
-        else:
-            row["realized_loss"] += abs(pnl)
-            row["loss_count"] += 1
-        row["realized_pnl"] += pnl
-        row["total_pnl"] += pnl
-        row["trade_count"] += 1
-        symbol = str(ledger_row.get("symbol") or "")
-        if symbol and symbol not in row["symbols"]:
-            row["symbols"].append(symbol)
-        row["position_details"].append(
-            _daily_pnl_ledger_position_detail(ledger_row, pnl=pnl, closed_at=closed_at)
-        )
-        if symbol:
-            symbol_row = row["symbol_pnl"].setdefault(
-                symbol,
-                {
-                    "symbol": symbol,
-                    "realized_profit": 0.0,
-                    "realized_loss": 0.0,
-                    "realized_pnl": 0.0,
-                    "trade_count": 0,
-                    "win_count": 0,
-                    "loss_count": 0,
-                },
+        row.update({key: value for key, value in settled.items() if key != "entries"})
+        for ledger_row, pnl, closed_at in settled["entries"]:
+            symbol = str(ledger_row.get("symbol") or "")
+            if symbol and symbol not in row["symbols"]:
+                row["symbols"].append(symbol)
+            row["position_details"].append(
+                _daily_pnl_ledger_position_detail(ledger_row, pnl=pnl, closed_at=closed_at)
             )
-            if pnl >= 0:
-                symbol_row["realized_profit"] += pnl
-                symbol_row["win_count"] += 1
-            else:
-                symbol_row["realized_loss"] += abs(pnl)
-                symbol_row["loss_count"] += 1
-            symbol_row["realized_pnl"] += pnl
-            symbol_row["trade_count"] += 1
-
-    if exchange_marks:
-        open_unrealized = float(_exchange_position_totals(exchange_marks)["unrealized_pnl"])
+            if symbol:
+                symbol_row = row["symbol_pnl"].setdefault(
+                    symbol,
+                    {
+                        "symbol": symbol,
+                        "realized_profit": 0.0,
+                        "realized_loss": 0.0,
+                        "realized_pnl": 0.0,
+                        "trade_count": 0,
+                        "win_count": 0,
+                        "loss_count": 0,
+                    },
+                )
+                if pnl >= 0:
+                    symbol_row["realized_profit"] += pnl
+                    symbol_row["win_count"] += 1
+                else:
+                    symbol_row["realized_loss"] += abs(pnl)
+                    symbol_row["loss_count"] += 1
+                symbol_row["realized_pnl"] += pnl
+                symbol_row["trade_count"] += 1
 
     current_okx_equity: float | None = None
     current_okx_equity_at: str | None = None
@@ -15005,6 +14986,9 @@ async def _build_daily_pnl_records(mode: str | None = None, days: int = 30):
 
     result_payload = {
         "mode": selected_mode,
+        **_execution_trade_pnl_fields(
+            settled_by_day, today=today_local, unrealized_pnl=open_unrealized
+        ),
         "timezone": "Asia/Shanghai",
         "phase3_start_date": PHASE3_FIRST_CLEAN_DAY,
         "okx_equity_series_start_date": equity_series_start_date,

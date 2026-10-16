@@ -117,6 +117,20 @@ def test_execution_account_ui_uses_okx_equity_pnl_not_local_trade_fallback() -> 
     assert "pending_settlement_close_count" in script
 
 
+def test_pnl_views_use_shared_trading_totals_and_refresh_while_visible() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert "valueNumber(account.today_trade_total_pnl)" in script
+    assert "valueNumber(account.cumulative_trade_total_pnl)" in script
+    assert "今日交易总盈亏" in script
+    assert "累计交易总盈亏" in script
+    assert "trade_pnl_start_date" in script
+    assert "isPageActive('daily-pnl')" in script
+    assert "fetchDailyPnlRecords({ silent: true })" in script
+    assert "pnl-ledger=20261016" in html
+
+
 def test_daily_pnl_table_uses_plain_language_metrics() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")

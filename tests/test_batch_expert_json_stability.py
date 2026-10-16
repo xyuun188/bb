@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import ai_brain.llm_agent as llm_agent_module
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.llm_agent import (
@@ -981,6 +982,8 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
     monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 26.0)
     monkeypatch.setattr(settings, "ai_target_qwen_queue_wait_seconds", 0.01)
+    target_capacity = llm_agent_module._ScopedLLMCapacity(1)
+    monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
     _BatchTimeoutExpert.batch_calls = 0
     registry = ModelRegistry()
     for name in (
@@ -991,9 +994,8 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
     ):
         registry.register(_BatchTimeoutExpert(name))
 
-    lock = asyncio.Lock()
-    await lock.acquire()
-    registry._batch_provider_locks[("", "qwen3.8-27b")] = lock
+    holder = target_capacity.slot({"_analysis_budget_scope": "market:holder"})
+    await holder.__aenter__()
     context: dict[str, Any] = {}
     started = asyncio.get_running_loop().time()
     try:
@@ -1002,13 +1004,65 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
             context,
         )
     finally:
-        lock.release()
+        await holder.__aexit__(None, None, None)
 
     assert decisions == {}
     assert asyncio.get_running_loop().time() - started < 0.5
     assert _BatchTimeoutExpert.batch_calls == 0
     assert {row["status"] for row in context["_model_timings"]} == {"provider_queue_deferred"}
     assert not context.get("_attempted_models")
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_queue_is_shared_across_registries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_target_qwen_queue_wait_seconds", 1.0)
+    target_capacity = llm_agent_module._ScopedLLMCapacity(1)
+    monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
+
+    _ProviderBatchExpert.batch_calls = []
+    _ProviderBatchExpert.running_batch_calls = 0
+    _ProviderBatchExpert.peak_batch_calls = 0
+    registries = []
+    contexts: list[dict[str, Any]] = [{}, {}]
+    for _ in range(2):
+        registry = ModelRegistry()
+        for name in (
+            "trend_expert",
+            "momentum_expert",
+            "sentiment_expert",
+            "risk_expert",
+        ):
+            registry.register(
+                _ProviderBatchExpert(
+                    name,
+                    base_url=LOCAL_QWEN_TEST_BASE,
+                    model_name="qwen3.8-27b",
+                    batch_delay_seconds=0.05,
+                )
+            )
+        registries.append(registry)
+
+    decisions = await asyncio.gather(
+        *(
+            registry.decide_all(FeatureVector(symbol=f"BTC/USDT:{index}"), context)
+            for index, (registry, context) in enumerate(zip(registries, contexts, strict=True))
+        )
+    )
+
+    assert all(set(result) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    } for result in decisions)
+    assert all(
+        {row["status"] for row in context["_model_timings"]} == {"completed"}
+        for context in contexts
+    )
+    assert _ProviderBatchExpert.peak_batch_calls == 1
 
 
 @pytest.mark.asyncio

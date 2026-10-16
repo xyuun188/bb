@@ -507,7 +507,9 @@ values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '26'
 values['AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS'] = '96'
 values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '26'
 values['AI_TARGET_QWEN_TIMEOUT_SECONDS'] = '26'
-values['AI_TARGET_QWEN_QUEUE_WAIT_SECONDS'] = '6'
+# Let the process-wide provider gate use each analysis round's remaining
+# deadline instead of turning normal cross-loop queueing into a fixed 6s error.
+values['AI_TARGET_QWEN_QUEUE_WAIT_SECONDS'] = '0'
 values['AI_DECISION_MAKER_MAX_COMPLETION_TOKENS'] = '96'
 # HIGH_RISK_REVIEW_* is edited atomically by the Dashboard and its secret is
 # stored in the encrypted settings service.  Keeping a second deployment-owned

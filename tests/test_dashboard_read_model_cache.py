@@ -656,6 +656,54 @@ async def test_daily_pnl_postgres_snapshot_is_single_flight(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["new_settlement", "beijing_midnight"])
+async def test_daily_pnl_rebuilds_persisted_and_memory_cache_after_accounting_changes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from services import okx_position_history_store
+
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_daily_pnl_snapshot_path",
+        lambda **_: tmp_path / "daily_pnl.json",
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {})
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache_locks", {})
+    now = datetime.now(UTC)
+    today = now.astimezone(dashboard.BEIJING_TZ).date()
+    old_day = today - timedelta(days=1) if reason == "beijing_midnight" else today
+    old_payload = {"end_date": old_day.isoformat(), "records": [], "revision": "old"}
+    dashboard._persist_dashboard_daily_pnl_snapshot(mode="paper", days=7, payload=old_payload)
+    dashboard._dashboard_heavy_cache_set(("daily-pnl", "paper", 7), old_payload)
+    monkeypatch.setattr(
+        okx_position_history_store,
+        "load_okx_position_history_watermark",
+        lambda _: (
+            datetime(2099, 1, 1, tzinfo=UTC) if reason == "new_settlement" else None
+        ),
+    )
+    if reason == "new_settlement":
+        assert dashboard._dashboard_daily_pnl_snapshot_obsolete(
+            datetime.now(UTC) - timedelta(seconds=1), old_payload, mode="paper"
+        )
+        assert dashboard._load_dashboard_daily_pnl_snapshot(mode="paper", days=7) is None
+        cached_at, cached_payload = dashboard._dashboard_heavy_cache[
+            ("daily-pnl", "paper", 7)
+        ]
+        assert dashboard._dashboard_daily_pnl_snapshot_obsolete(
+            cached_at, cached_payload, mode="paper"
+        )
+    fresh_payload = {"end_date": today.isoformat(), "records": [], "revision": "new"}
+
+    async def build(**kwargs):
+        return fresh_payload
+
+    monkeypatch.setattr(dashboard, "_build_daily_pnl_records", build)
+    assert await dashboard.get_daily_pnl_records(mode="paper", days=7) == fresh_payload
+
+
+@pytest.mark.asyncio
 async def test_fresh_persisted_closed_ledger_does_not_refresh_immediately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

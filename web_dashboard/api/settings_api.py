@@ -650,6 +650,7 @@ async def _execution_account_status(mode: str) -> dict:
             "total_pnl_pct": okx_pnl["total_pnl_pct"],
             "local_trade_total_pnl": pnl_summary.get("total_pnl", 0.0),
             "local_trade_today_pnl": pnl_summary.get("today_total_pnl", 0.0),
+            **_dash._execution_trade_pnl_account_fields(pnl_summary),
             "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
             "remaining_allocation": okx_available,
             "balance_error": blocking_balance_error,

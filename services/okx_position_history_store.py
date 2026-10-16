@@ -142,7 +142,7 @@ async def load_okx_position_history_records(
     *,
     mode: str | None,
     since: datetime | None = None,
-    limit: int = 5000,
+    limit: int | None = 5000,
 ) -> list[OkxPositionHistory]:
     stmt = select(OkxPositionHistory).order_by(
         OkxPositionHistory.updated_at_okx.desc().nullslast(),
@@ -164,8 +164,10 @@ async def load_okx_position_history_records(
                 ),
             )
         )
-    safe_limit = max(1, int(limit or 1))
-    result = await session.execute(stmt.limit(min(safe_limit * 4, 20000)))
+    safe_limit = max(1, int(limit or 1)) if limit is not None else None
+    if safe_limit is not None:
+        stmt = stmt.limit(min(safe_limit * 4, 20000))
+    result = await session.execute(stmt)
     records: list[OkxPositionHistory] = []
     seen_lifecycles: set[str] = set()
     for record in result.scalars().all():
@@ -177,7 +179,7 @@ async def load_okx_position_history_records(
             continue
         seen_lifecycles.add(stable_identity)
         records.append(record)
-        if len(records) >= safe_limit:
+        if safe_limit is not None and len(records) >= safe_limit:
             break
     return records
 

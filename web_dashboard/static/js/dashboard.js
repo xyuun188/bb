@@ -134,6 +134,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!document.hidden && isPageActive('dashboard')) {
             void fetchDashboardSummary();
         }
+        if (!document.hidden && isPageActive('daily-pnl')) {
+            void fetchDailyPnlRecords({ silent: true });
+        }
     }, 10000);
     document.addEventListener('visibilitychange', recoverDashboardSummaryPolling);
     window.addEventListener('online', recoverDashboardSummaryPolling);
@@ -614,17 +617,17 @@ async function fetchPnlHistory() {
     window._charts.updatePnLChart(data.history);
 }
 
-async function fetchDailyPnlRecords() {
+async function fetchDailyPnlRecords({ silent = false } = {}) {
     const tbody = document.getElementById('daily-pnl-tbody');
-    if (tbody) {
-        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);text-align:center;padding:24px;">加载每日盈亏中...</td></tr>';
+    if (tbody && !silent) {
+        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">加载每日盈亏中...</td></tr>';
     }
     const days = Number(document.getElementById('daily-pnl-days')?.value || 30);
     const mode = state.mode || 'paper';
     const data = await fetchJSON(`/api/dashboard/daily-pnl?mode=${mode}&days=${days}`);
     if (!data || !Array.isArray(data.records)) {
         if (tbody) {
-            tbody.innerHTML = '<tr><td colspan="7" style="color:var(--red);text-align:center;padding:24px;">每日盈亏加载失败</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="color:var(--red);text-align:center;padding:24px;">每日盈亏加载失败，正在重试</td></tr>';
         }
         return;
     }
@@ -636,7 +639,11 @@ async function fetchDailyPnlRecords() {
         const equityScope = data.okx_equity_series_complete
             ? '\u4e09\u671f\u5b8c\u6574 OKX \u6743\u76ca\u5feb\u7167'
             : (equityStart ? `OKX \u6743\u76ca\u5feb\u7167\u81ea ${equityStart} \u5f00\u59cb` : 'OKX \u6743\u76ca\u5feb\u7167\u672a\u7559\u5b58');
-        subtitle.textContent = `${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''} · ${equityScope}`;
+        const tradeScope = data.trade_pnl_start_date
+            ? `结算账本自 ${data.trade_pnl_start_date}`
+            : '暂无已结算交易';
+        const updatedAt = data.trade_pnl_as_of ? ` · 更新 ${shortBeijingTime(data.trade_pnl_as_of)}` : '';
+        subtitle.textContent = `${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''} · ${tradeScope} · ${equityScope}${updatedAt}`;
     }
     renderDailyPnlRecords(data.records);
 }
@@ -986,6 +993,11 @@ function updateExecutionAccountPanel(account) {
             ? `\u81ea ${phase3ObservedStart} \u9996\u4e2aOKX\u5feb\u7167\u6743\u76ca\u53d8\u5316`
             : '\u4e09\u671fOKX\u6743\u76ca\u53d8\u5316\u4e0d\u53ef\u7528');
     const todayTotalPnl = valueNumber(account.today_equity_pnl);
+    const todayTradePnl = valueNumber(account.today_trade_total_pnl);
+    const cumulativeTradePnl = valueNumber(account.cumulative_trade_total_pnl);
+    const tradeScope = account.trade_pnl_start_date
+        ? `累计交易总盈亏（自 ${escHtml(account.trade_pnl_start_date)}）`
+        : '累计交易总盈亏';
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
     const openPositionCount = Math.max(valueNumber(account.open_positions) || 0, 0);
@@ -1005,7 +1017,7 @@ function updateExecutionAccountPanel(account) {
             <div class="exec-account-head">
                 <div>
                     <div class="exec-account-name">${escHtml(account.account_name || '多专家执行账户')}</div>
-                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_age_seconds, 1)}秒` : ''}</div>
+                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_age_seconds, 1)}秒` : ''}${account.trade_pnl_as_of ? ` · 盈亏更新 ${shortBeijingTime(account.trade_pnl_as_of)}` : ''}</div>
                 </div>
                 <span class="badge ${account.risk_paused ? 'badge-short' : 'badge-long'}">${account.risk_paused ? (account.market_analysis_paused ? '暂停分析/开仓' : '分析中·暂停开仓') : '可分析可开仓'}</span>
             </div>
@@ -1014,6 +1026,8 @@ function updateExecutionAccountPanel(account) {
                 <div class="exec-status-cell"><span>${accountBalanceLabel}当前账户权益</span><strong>${accountMoneyText(accountEquity, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>持仓保证金占用</span><strong>${accountMoneyText(positionMarginUsed, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>浮动盈亏</span><strong style="color:${unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(unrealizedPnl)} USDT</strong></div>
+                <div class="exec-status-cell"><span>今日交易总盈亏</span><strong style="color:${signedMoneyColor(todayTradePnl)};">${signedMoneyWithUnit(todayTradePnl)}</strong></div>
+                <div class="exec-status-cell"><span>${tradeScope}</span><strong style="color:${signedMoneyColor(cumulativeTradePnl)};">${signedMoneyWithUnit(cumulativeTradePnl)}</strong></div>
                 <div class="exec-status-cell"><span>今日OKX权益变化</span><strong style="color:${signedMoneyColor(todayTotalPnl)};">${signedMoneyWithUnit(todayTotalPnl)}</strong></div>
                 <div class="exec-status-cell"><span>${phase3EquityLabel}</span><strong style="color:${signedMoneyColor(phase3TotalPnl)};">${signedMoneyWithUnit(phase3TotalPnl)}</strong></div>
             </div>
@@ -1046,17 +1060,16 @@ function updateAccounts(accounts, executionAccount = null) {
 
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
-    const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);
-    const unrealizedPnl = valueNumber(account.unrealized_pnl) || 0;
-    const todayTotalPnl = valueNumber(account.today_equity_pnl);
-    const pnlColor = signedMoneyColor(phase3TotalPnl);
+    const cumulativeTradePnl = valueNumber(account.cumulative_trade_total_pnl);
+    const todayTradePnl = valueNumber(account.today_trade_total_pnl);
+    const pnlColor = signedMoneyColor(cumulativeTradePnl);
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     container.innerHTML = `
         <div class="acct-row">
             <div class="acct-main">
                 <div class="acct-name">${escHtml(account.account_name || account.model_name || '多专家执行账户')}</div>
                 <div style="font-size:12px;color:var(--text);font-weight:700;">${accountBalanceLabel}可交易余额 ${accountMoneyText(remainingAllocation, account)} USDT</div>
-                <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${accountBalanceLabel}当前账户权益 ${accountMoneyText(accountEquity, account)} | 今日OKX权益变化（北京时间）${signedMoney(todayTotalPnl)}</div>
+                <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${accountBalanceLabel}当前账户权益 ${accountMoneyText(accountEquity, account)} | 今日交易总盈亏（北京时间）${signedMoney(todayTradePnl)}</div>
                 ${account.balance_error
                     ? `<div style="font-size:10px;color:var(--red);margin-top:4px;">${escHtml(account.balance_error)}</div>`
                     : account.balance_warning
@@ -1064,8 +1077,8 @@ function updateAccounts(accounts, executionAccount = null) {
                         : ''}
             </div>
             <div class="acct-side">
-                <div class="acct-side-label">三期OKX权益变化</div>
-                <div class="acct-side-value" style="color:${pnlColor};">${signedMoneyWithUnit(phase3TotalPnl)}</div>
+                <div class="acct-side-label">累计交易总盈亏</div>
+                <div class="acct-side-value" style="color:${pnlColor};">${signedMoneyWithUnit(cumulativeTradePnl)}</div>
             </div>
         </div>
     `;
