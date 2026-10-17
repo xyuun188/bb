@@ -26,6 +26,7 @@ from data_feed.external_event_scraper import (
     SCRAPLING_SOURCE_PREFIX,
     _normalize_source,
     configured_external_event_source_diagnostics,
+    normalize_external_event_source_configs,
 )
 from data_feed.news_fetcher import RSS_FEEDS
 from db.session import get_session_ctx
@@ -377,6 +378,8 @@ class ExternalEventSourcePayload(BaseModel):
     url: str
     symbols: list[str] = Field(default_factory=list)
     weight: float | None = None
+    category: str | None = None
+    description: str | None = None
 
 
 class DataCollectionSettingsRequest(BaseModel):
@@ -1966,12 +1969,24 @@ async def update_data_collection_settings(req: DataCollectionSettingsRequest) ->
         updates["EXTERNAL_EVENT_SCRAPER_MAX_ITEMS_PER_SOURCE"] = str(max_items)
 
     if req.external_event_scraper_sources is not None:
-        normalized_sources = []
-        for raw_source in req.external_event_scraper_sources:
+        raw_sources = [raw_source.model_dump() for raw_source in req.external_event_scraper_sources]
+        for raw_source in raw_sources:
             try:
-                normalized_sources.append(_safe_source_payload(raw_source.model_dump()))
+                _normalize_source(raw_source)
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+                error_text = safe_error_text(exc)
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "must be public",
+                        "globally routable",
+                        "must not include credentials",
+                    )
+                ):
+                    raise HTTPException(status_code=400, detail=error_text) from exc
+        normalized_sources, dropped_source_count = normalize_external_event_source_configs(
+            raw_sources
+        )
         settings.external_event_scraper_sources = normalized_sources
         updates["EXTERNAL_EVENT_SCRAPER_SOURCES"] = json.dumps(
             normalized_sources,
@@ -2002,7 +2017,18 @@ async def update_data_collection_settings(req: DataCollectionSettingsRequest) ->
         settings.update_env_file(strip_secret_env_updates(updates))
 
     runtime = await _sync_runtime_external_event_service(settings.external_event_scraper_enabled)
+    if req.external_event_scraper_sources is not None:
+        # Keep the request's canonical snapshot visible immediately even when
+        # the isolated collector is stopping or a test double does not persist
+        # the dotenv update.
+        settings.external_event_scraper_sources = normalized_sources
     payload = _data_collection_settings_payload()
-    payload["message"] = "数据采集配置已保存。"
+    payload["message"] = (
+        f"数据采集配置已保存，已清理 {dropped_source_count} 条无效或重复采集源。"
+        if req.external_event_scraper_sources is not None and dropped_source_count
+        else "数据采集配置已保存。"
+    )
+    if req.external_event_scraper_sources is not None:
+        payload["cleaned_source_count"] = dropped_source_count
     payload["runtime_sync"] = runtime
     return sanitize_payload(payload)

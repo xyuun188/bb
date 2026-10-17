@@ -427,10 +427,9 @@ def _normalize_source(raw: dict[str, Any]) -> ExternalEventSource:
 
 def configured_external_event_sources() -> list[ExternalEventSource]:
     raw_sources = settings.external_event_scraper_sources or list(DEFAULT_EXTERNAL_EVENT_SOURCES)
+    canonical_sources, _dropped_count = normalize_external_event_source_configs(raw_sources)
     sources: list[ExternalEventSource] = []
-    for raw in raw_sources[: max(int(settings.external_event_scraper_max_sources or 1), 1)]:
-        if not isinstance(raw, dict):
-            continue
+    for raw in canonical_sources[: max(int(settings.external_event_scraper_max_sources or 1), 1)]:
         try:
             sources.append(_normalize_source(raw))
         except ValueError as exc:
@@ -495,6 +494,42 @@ def _source_diagnostic_payload(source: ExternalEventSource) -> dict[str, Any]:
         "category": source.category,
         "description": source.description,
     }
+
+
+def normalize_external_event_source_configs(
+    raw_sources: Any,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return one canonical list of valid, unique public event sources."""
+
+    if isinstance(raw_sources, dict):
+        candidates: list[Any] = [raw_sources]
+    elif isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes)):
+        candidates = list(raw_sources)
+    else:
+        candidates = []
+
+    normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    seen_urls: set[str] = set()
+    dropped = 0
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            dropped += 1
+            continue
+        try:
+            source = _normalize_source(raw)
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        name_key = source.name.casefold()
+        url_key = source.url.casefold().rstrip("/")
+        if name_key in seen_names or url_key in seen_urls:
+            dropped += 1
+            continue
+        seen_names.add(name_key)
+        seen_urls.add(url_key)
+        normalized.append(_source_diagnostic_payload(source))
+    return normalized, dropped
 
 
 class ExternalEventScraper:

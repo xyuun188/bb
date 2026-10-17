@@ -14,6 +14,7 @@ from data_feed.external_event_scraper import (
     ExternalEventSource,
     _normalize_source,
     configured_external_event_source_diagnostics,
+    normalize_external_event_source_configs,
 )
 from db.session import close_db, get_session_ctx, init_db
 from models.news import NewsArticle
@@ -152,6 +153,29 @@ def test_external_event_source_diagnostics_exposes_invalid_source(
     assert diagnostics[1]["valid"] is False
     assert diagnostics[1]["status"] == "invalid"
     assert "too long" in diagnostics[1]["error"]
+
+
+def test_external_event_source_configs_drop_invalid_and_duplicate_rows() -> None:
+    normalized, dropped = normalize_external_event_source_configs(
+        [
+            {"name": "ethereum_blog", "url": "https://blog.ethereum.org/"},
+            {"name": "ETHEREUM_BLOG", "url": "https://blog.ethereum.org"},
+            {"name": "broken", "url": "\\"},
+            {"name": "different_name", "url": "https://blog.ethereum.org/"},
+        ]
+    )
+
+    assert dropped == 3
+    assert normalized == [
+        {
+            "name": "ethereum_blog",
+            "url": "https://blog.ethereum.org/",
+            "symbols": [],
+            "weight": 0.6,
+            "category": "project",
+            "description": "",
+        }
+    ]
 
 
 @pytest.mark.asyncio

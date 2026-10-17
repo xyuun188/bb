@@ -20,6 +20,7 @@ from core.url_safety import normalize_external_http_url
 from data_feed.external_event_scraper import (
     EXTERNAL_EVENT_MAX_SOURCES_LIMIT,
     ExternalEventScraper,
+    normalize_external_event_source_configs,
 )
 from db.session import get_session_ctx
 from models.news import NewsArticle
@@ -91,18 +92,26 @@ def _float_env(value: Any, default: float, *, minimum: float, maximum: float) ->
 
 
 def _sources_env(value: Any) -> list[dict[str, Any]]:
-    return parse_external_event_scraper_sources_value(value)
+    raw_sources = parse_external_event_scraper_sources_value(value)
+    normalized, _dropped_count = normalize_external_event_source_configs(raw_sources)
+    return normalized
 
 
 def load_external_event_settings_from_env() -> dict[str, Any]:
     """Reload external event collection settings from .env into this process."""
 
     env_path = _project_env_path()
-    values: dict[str, Any] = {}
+    env_file_values: dict[str, Any] = {}
     if env_path.exists():
-        values.update({key: value for key, value in dotenv_values(env_path).items() if key})
+        env_file_values.update({key: value for key, value in dotenv_values(env_path).items() if key})
+    values: dict[str, Any] = dict(env_file_values)
     values.update(
-        {key: os.environ.get(key) for key in _SCRAPER_SETTING_KEYS if os.environ.get(key)}
+        {
+            key: os.environ.get(key)
+            for key in _SCRAPER_SETTING_KEYS
+            if os.environ.get(key)
+            and not (key == "EXTERNAL_EVENT_SCRAPER_SOURCES" and key in env_file_values)
+        }
     )
 
     settings.external_event_scraper_enabled = _bool_env(
@@ -137,9 +146,27 @@ def load_external_event_settings_from_env() -> dict[str, Any]:
         minimum=1,
         maximum=50,
     )
-    settings.external_event_scraper_sources = _sources_env(
+    raw_sources = parse_external_event_scraper_sources_value(
         values.get("EXTERNAL_EVENT_SCRAPER_SOURCES")
     )
+    normalized_sources, dropped_source_count = normalize_external_event_source_configs(raw_sources)
+    settings.external_event_scraper_sources = normalized_sources
+    process_source_value = os.environ.get("EXTERNAL_EVENT_SCRAPER_SOURCES")
+    if (
+        dropped_source_count
+        and env_path.exists()
+        and "EXTERNAL_EVENT_SCRAPER_SOURCES" in env_file_values
+        and not process_source_value
+    ):
+        settings.update_env_file(
+            {
+                "EXTERNAL_EVENT_SCRAPER_SOURCES": json.dumps(
+                    normalized_sources,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            }
+        )
     for env_key, attr in (
         ("CRYPTOPANIC_API_KEY", "cryptopanic_api_key"),
         ("COINMARKETCAL_API_KEY", "coinmarketcal_api_key"),

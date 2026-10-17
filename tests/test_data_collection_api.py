@@ -876,6 +876,49 @@ async def test_data_collection_settings_persists_safe_values(
 
 
 @pytest.mark.asyncio
+async def test_data_collection_settings_cleans_invalid_and_duplicate_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    captured_updates: list[dict[str, Any]] = []
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "external_event_scraper_enabled", False)
+    monkeypatch.setattr(settings, "external_event_scraper_sources", [])
+
+    def capture_update_env_file(self: object, updates: dict[str, Any]) -> None:
+        captured_updates.append(updates)
+
+    monkeypatch.setattr(settings.__class__, "update_env_file", capture_update_env_file)
+
+    try:
+        app = create_app()
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/data-collection/settings",
+                json={
+                    "external_event_scraper_enabled": False,
+                    "external_event_scraper_sources": [
+                        {"name": "ethereum_blog", "url": "https://blog.ethereum.org/"},
+                        {"name": "duplicate", "url": "https://blog.ethereum.org"},
+                        {"name": "broken", "url": "\\"},
+                    ],
+                },
+            )
+    finally:
+        await close_db()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cleaned_source_count"] == 2
+    assert "已清理 2 条" in body["message"]
+    assert len(settings.external_event_scraper_sources) == 1
+    assert settings.external_event_scraper_sources[0]["url"] == "https://blog.ethereum.org/"
+    assert captured_updates[-1]["EXTERNAL_EVENT_SCRAPER_SOURCES"].count("ethereum_blog") == 1
+
+
+@pytest.mark.asyncio
 async def test_training_governance_refresh_triggers_clean_artifact_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
