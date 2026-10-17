@@ -96,6 +96,8 @@ def _normalized_status(
         "unavailable",
         "batch_failed_independent",
         "circuit_breaker_independent",
+        "batch_failure",
+        "failed_after_transport_retry",
     }:
         return _failure_status(reason)
     if failure_reason:

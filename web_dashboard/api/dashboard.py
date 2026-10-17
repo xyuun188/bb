@@ -3102,6 +3102,8 @@ def _humanize_expert_failure(reason: str | None) -> str:
         return "模型或接口权限不足，本轮没有返回结果。"
     if "429" in lower or "rate limit" in lower or "too many requests" in lower:
         return "接口限流，本轮没有返回结果。"
+    if "shared batch" in lower or "batch connection retry" in lower:
+        return "共享模型批量请求传输失败；这是本轮一次共享请求的故障，不代表各个专家模型分别不可用。"
     if "connect" in lower or "connection" in lower or "network" in lower:
         return "模型接口连接失败，本轮没有返回结果。"
     return "模型调用失败，本轮没有返回结果。"
@@ -11982,6 +11984,13 @@ async def _get_analysis_records_uncached(
                     else pre_expert_skip.get("reason")
                     if ensemble_timed_out
                     else failures_by_name.get(e["expert_name"])
+                    or (
+                        _humanize_expert_failure(
+                            str(_safe_dict(quality_slots.get(e["expert_name"])).get("reason") or "")
+                        )
+                        if str(_safe_dict(quality_slots.get(e["expert_name"])).get("reason") or "").strip()
+                        else ""
+                    )
                     or (
                         "本轮调度证据显示未发起该专家，没有证据表明是模型配置故障。"
                         if missing_status_by_name[e["expert_name"]] == "not_attempted"

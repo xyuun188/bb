@@ -686,14 +686,16 @@ class ModelRegistry:
                 reason=reason,
             )
             if _is_target_qwen_provider(batch_model):
-                context.setdefault("_model_failures", []).extend(
+                context.setdefault("_model_failures", []).append(
                     {
-                        "expert_name": model.name,
+                        "expert_name": "batch_experts",
                         "provider_model": _provider_model_name(batch_model),
+                        "experts": list(expert_names),
                         "reason": reason,
                         "status": "circuit_breaker_deferred",
+                        "failure_scope": "shared_batch",
+                        "shared_batch_call": True,
                     }
-                    for model in provider_group
                 )
                 return {}, [
                     {
@@ -821,7 +823,7 @@ class ModelRegistry:
                 first_error_text = safe_error_text(first_exc, limit=240)
                 retry_timeout, retry_budget = _bounded_analysis_timeout(
                     context,
-                    min(batch_timeout, 4.0),
+                    batch_timeout,
                 )
                 if (
                     not _is_target_qwen_provider(batch_model)
@@ -829,7 +831,6 @@ class ModelRegistry:
                         first_exc,
                         first_error_text,
                     )
-                    or retry_timeout < 0.75
                 ):
                     raise
                 transport_retry_attempted = True
@@ -843,6 +844,42 @@ class ModelRegistry:
                         "analysis_budget": retry_budget,
                     }
                 )
+                if retry_timeout < 0.75:
+                    reason = _analysis_budget_reason(retry_budget)
+                    context.setdefault("_model_failures", []).append(
+                        {
+                            "expert_name": "batch_experts",
+                            "provider_model": _provider_model_name(batch_model),
+                            "experts": list(expert_names),
+                            "reason": reason,
+                            "status": "analysis_budget_deferred",
+                            "failure_scope": "shared_batch",
+                            "shared_batch_call": True,
+                        }
+                    )
+                    return {}, [
+                        _attach_analysis_budget_timing(
+                            {
+                                "stage": "expert_initial",
+                                "name": model.name,
+                                "status": "analysis_budget_deferred",
+                                "started_at": started_at.isoformat(),
+                                "duration_sec": round(time.perf_counter() - perf_started, 3),
+                                "batch_expert": True,
+                                "shared_batch_call": True,
+                                "batch_model_count": len(provider_group),
+                                "batch_provider_group_count": provider_group_count,
+                                "provider_model": _provider_model_name(batch_model),
+                                "attempted": True,
+                                "reason": reason,
+                                "transport_retry_attempted": True,
+                                "transport_retry_deferred": True,
+                                "transport_retry_reason": first_error_text,
+                            },
+                            retry_budget,
+                        )
+                        for model in provider_group
+                    ]
                 context["_batch_transport_retry_active"] = True
                 context["_batch_transport_retry_limit"] = 1
                 try:
@@ -978,14 +1015,6 @@ class ModelRegistry:
                 experts=expert_names,
                 error=error_text,
             )
-            context["_model_failures"].append(
-                {
-                    "expert_name": "batch_experts",
-                    "provider_model": _provider_model_name(batch_model),
-                    "experts": expert_names,
-                    "reason": error_text,
-                }
-            )
             if _is_target_qwen_provider(batch_model):
                 failure_status = (
                     "batch_connection_retry_failed"
@@ -997,14 +1026,16 @@ class ModelRegistry:
                     if transport_retry_attempted
                     else error_text
                 )
-                context.setdefault("_model_failures", []).extend(
+                context.setdefault("_model_failures", []).append(
                     {
-                        "expert_name": model.name,
+                        "expert_name": "batch_experts",
                         "provider_model": _provider_model_name(batch_model),
-                        "reason": error_text,
+                        "experts": list(expert_names),
+                        "reason": failure_reason,
                         "status": failure_status,
+                        "failure_scope": "shared_batch",
+                        "shared_batch_call": True,
                     }
-                    for model in provider_group
                 )
                 return {}, [
                     {
@@ -1027,11 +1058,24 @@ class ModelRegistry:
                         "provider_model": _provider_model_name(batch_model),
                         "attempted": True,
                         "reason": failure_reason,
+                        "failure_scope": "shared_batch",
+                        "shared_batch_failure": True,
                         "transport_retry_attempted": transport_retry_attempted,
                         "transport_retry_reason": transport_retry_error or None,
                     }
                     for model in provider_group
                 ]
+            context.setdefault("_model_failures", []).append(
+                {
+                    "expert_name": "batch_experts",
+                    "provider_model": _provider_model_name(batch_model),
+                    "experts": list(expert_names),
+                    "reason": error_text,
+                    "status": "batch_failure",
+                    "failure_scope": "shared_batch",
+                    "shared_batch_call": True,
+                }
+            )
             return await self._retry_provider_group_independently(
                 features,
                 context,

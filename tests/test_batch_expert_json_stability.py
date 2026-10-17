@@ -21,6 +21,51 @@ from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
 
 
+class _RetryingTransportExpert(AbstractAIModel):
+    batch_calls = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._llm = object()
+        self._base_url = LOCAL_QWEN_TEST_BASE
+        self._model_name = "qwen3.8-27b"
+
+    async def initialize(self) -> None:
+        return None
+
+    async def decide(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any],
+    ) -> DecisionOutput:
+        raise AssertionError("transport recovery must stay on one shared batch")
+
+    async def decide_batch_experts(
+        self,
+        features: FeatureVector,
+        context: dict[str, Any],
+        expert_names: list[str],
+    ) -> dict[str, DecisionOutput]:
+        type(self).batch_calls += 1
+        if type(self).batch_calls == 1:
+            raise RuntimeError("Connection error.")
+        return {
+            name: DecisionOutput(
+                model_name=name,
+                symbol=features.symbol,
+                action=Action.HOLD,
+                confidence=0.6,
+                reasoning="recovered shared batch",
+                raw_response={"provider_model": self._model_name},
+                feature_snapshot=features.to_dict(),
+            )
+            for name in expert_names
+        }
+
+    async def shutdown(self) -> None:
+        return None
+
+
 def test_transient_transport_failure_does_not_inherit_long_generic_breaker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -144,6 +189,66 @@ async def test_target_qwen_retries_one_shared_batch_after_connection_failure(
         for row in context["_model_timings"]
     )
     assert len(context["_model_transport_retries"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_transport_retry_uses_remaining_analysis_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _RetryingTransportExpert.batch_calls = 0
+    registry = ModelRegistry()
+    names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in names:
+        registry.register(_RetryingTransportExpert(name))
+
+    context: dict[str, Any] = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 10.0,
+        "_analysis_budget_scope": "market_ai",
+        "_analysis_budget_seconds": 10.0,
+    }
+    decisions = await registry.decide_all(FeatureVector(symbol="HBAR/USDT"), context)
+
+    assert set(decisions) == set(names)
+    assert context["_model_transport_retries"][0]["retry_timeout_seconds"] > 4.0
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_transport_retry_defers_when_round_budget_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _RetryingTransportExpert.batch_calls = 0
+    registry = ModelRegistry()
+    names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in names:
+        registry.register(_RetryingTransportExpert(name))
+
+    context: dict[str, Any] = {
+        "_analysis_deadline_monotonic": asyncio.get_running_loop().time() + 0.8,
+        "_analysis_budget_scope": "market_ai",
+        "_analysis_budget_seconds": 0.8,
+    }
+    decisions = await registry.decide_all(FeatureVector(symbol="HBAR/USDT"), context)
+
+    assert decisions == {}
+    assert _RetryingTransportExpert.batch_calls == 1
+    assert {row["status"] for row in context["_model_timings"]} == {
+        "analysis_budget_deferred"
+    }
+    assert len(context["_model_failures"]) == 1
+    assert context["_model_failures"][0]["expert_name"] == "batch_experts"
+    assert context["_model_failures"][0]["status"] == "analysis_budget_deferred"
 
 
 def test_batch_expert_prompt_uses_compact_json_contract() -> None:
@@ -864,6 +969,9 @@ async def test_batch_format_failure_disables_batch_but_not_real_experts(
     assert _BatchFormatFailingExpert.individual_calls == 0
     assert first == {}
     assert {row["status"] for row in first_context["_model_timings"]} == {"batch_failure"}
+    assert len(first_context["_model_failures"]) == 1
+    assert first_context["_model_failures"][0]["expert_name"] == "batch_experts"
+    assert first_context["_model_failures"][0]["failure_scope"] == "shared_batch"
 
     second_context: dict[str, Any] = {}
     second = await registry.decide_all(FeatureVector(symbol="BTC/USDT"), second_context)
@@ -872,6 +980,8 @@ async def test_batch_format_failure_disables_batch_but_not_real_experts(
     assert _BatchFormatFailingExpert.individual_calls == 0
     assert second == {}
     assert {row["status"] for row in second_context["_model_timings"]} == {"circuit_breaker_deferred"}
+    assert len(second_context["_model_failures"]) == 1
+    assert second_context["_model_failures"][0]["expert_name"] == "batch_experts"
 
 
 @pytest.mark.asyncio
