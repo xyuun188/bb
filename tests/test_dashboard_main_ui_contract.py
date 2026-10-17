@@ -1988,6 +1988,7 @@ def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error
     assert "不是模型故障" in script
     assert "没有消耗大模型专家" in script
     assert "pre_expert_skipped" in script
+    assert "position_fast_scan.phase" in script
     assert "未配置 API Key" in script
     assert script.index("pre_expert_skipped") < script.index("cfg && cfg.loading")
     detail_start = script.index("async function showAnalysisReason")
@@ -2107,6 +2108,22 @@ def test_dashboard_api_normalizes_position_fast_scan_expert_status() -> None:
     assert status["kind"] == "position_fast_scan"
     assert status["label"] == "持仓快速扫描未进入专家"
     assert "强平仓" in status["reason"]
+
+
+def test_dashboard_api_normalizes_position_fast_scan_phase_without_skip_flag() -> None:
+    status = dashboard._analysis_pre_expert_skip(
+        {
+            "position_fast_scan": {
+                "phase": "position_fast_scan",
+                "reason": "持仓快速扫描未触发深度复盘。",
+            }
+        }
+    )
+
+    assert status["skipped"] is True
+    assert status["kind"] == "position_fast_scan"
+    assert status["label"] == "持仓快速扫描未进入专家"
+    assert "未触发深度复盘" in status["reason"]
 
 
 def test_dashboard_api_normalizes_market_ensemble_timeout_as_attempted() -> None:

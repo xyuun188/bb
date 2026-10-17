@@ -1370,7 +1370,11 @@ def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     position_fast_scan = _safe_dict(raw.get("position_fast_scan"))
-    if position_fast_scan.get("skipped_llm"):
+    if (
+        position_fast_scan.get("skipped_llm")
+        or str(position_fast_scan.get("phase") or "").strip().lower()
+        == "position_fast_scan"
+    ):
         return {
             "skipped": True,
             "kind": "position_fast_scan",

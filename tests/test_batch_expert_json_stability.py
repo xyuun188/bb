@@ -4,6 +4,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import openai
 import pytest
 
 import ai_brain.llm_agent as llm_agent_module
@@ -13,12 +15,34 @@ from ai_brain.llm_agent import (
     LLMAgent,
     _claim_llm_call,
 )
-from ai_brain.model_registry import ModelRegistry, _batch_failure_breaker_seconds
+from ai_brain.model_registry import (
+    ModelRegistry,
+    _batch_failure_breaker_seconds,
+    _is_retryable_batch_connection_failure,
+    _is_timeout_error,
+    _is_transient_batch_transport_failure,
+)
 from ai_brain.prompts import _compact_role_signal, build_batch_experts_user_prompt
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
 from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
+
+
+def test_openai_sdk_transient_errors_use_transport_recovery_contract() -> None:
+    request = httpx.Request("POST", "http://qwen.test/v1/chat/completions")
+    response = httpx.Response(503, request=request)
+    sdk_503 = openai.InternalServerError(
+        "backend unavailable",
+        response=response,
+        body=None,
+    )
+    sdk_timeout = openai.APITimeoutError(request)
+
+    assert _is_transient_batch_transport_failure(sdk_503, str(sdk_503))
+    assert _is_retryable_batch_connection_failure(sdk_503, str(sdk_503))
+    assert _is_timeout_error(sdk_timeout)
+    assert not _is_retryable_batch_connection_failure(sdk_timeout, str(sdk_timeout))
 
 
 class _RetryingTransportExpert(AbstractAIModel):

@@ -96,10 +96,30 @@ def _group_batchable_models_by_provider(
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
+    class_name = exc.__class__.__name__.lower()
     return (
         isinstance(exc, TimeoutError | asyncio.TimeoutError)
-        or exc.__class__.__name__ == "TimeoutError"
+        or "timeout" in class_name
+        or class_name.endswith("timedout")
     )
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    """Read an SDK/API status code without coupling the registry to one client."""
+
+    for name in ("status_code", "status"):
+        value = getattr(exc, name, None)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_batch_format_failure(exc: BaseException, error_text: str) -> bool:
@@ -115,6 +135,9 @@ def _is_batch_format_failure(exc: BaseException, error_text: str) -> bool:
 def _is_transient_batch_transport_failure(exc: BaseException, error_text: str) -> bool:
     class_name = exc.__class__.__name__.lower()
     lowered = str(error_text or "").lower()
+    status_code = _exception_status_code(exc)
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
     markers = (
         "connection error",
         "connection refused",
@@ -138,6 +161,8 @@ def _is_retryable_batch_connection_failure(
 
     if _is_timeout_error(exc) or _is_batch_format_failure(exc, error_text):
         return False
+    if _exception_status_code(exc) in {408, 429, 500, 502, 503, 504}:
+        return True
     class_name = exc.__class__.__name__.lower()
     lowered = str(error_text or "").lower()
     markers = (

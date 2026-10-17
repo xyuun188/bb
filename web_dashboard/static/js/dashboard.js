@@ -2462,7 +2462,9 @@ function analysisIsCurrentPositionRecord(record) {
 
 function analysisIsFastPositionScan(record) {
     return analysisRecordType(record) === 'position'
-        && !!(record?.position_fast_scan && record.position_fast_scan.skipped_llm);
+        && !!(record?.position_fast_scan
+            && (record.position_fast_scan.skipped_llm
+                || String(record.position_fast_scan.phase || '').toLowerCase() === 'position_fast_scan'));
 }
 
 function analysisPreExpertSkip(record) {
