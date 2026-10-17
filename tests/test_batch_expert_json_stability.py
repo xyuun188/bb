@@ -23,6 +23,7 @@ from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
 
 class _RetryingTransportExpert(AbstractAIModel):
     batch_calls = 0
+    first_error = "Connection error."
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -48,7 +49,7 @@ class _RetryingTransportExpert(AbstractAIModel):
     ) -> dict[str, DecisionOutput]:
         type(self).batch_calls += 1
         if type(self).batch_calls == 1:
-            raise RuntimeError("Connection error.")
+            raise RuntimeError(type(self).first_error)
         return {
             name: DecisionOutput(
                 model_name=name,
@@ -216,6 +217,37 @@ async def test_target_qwen_transport_retry_uses_remaining_analysis_budget(
 
     assert set(decisions) == set(names)
     assert context["_model_transport_retries"][0]["retry_timeout_seconds"] > 4.0
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_retries_transient_busy_503_as_shared_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    _RetryingTransportExpert.batch_calls = 0
+    _RetryingTransportExpert.first_error = "HTTP Error 503: Service Unavailable"
+    registry = ModelRegistry()
+    names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in names:
+        registry.register(_RetryingTransportExpert(name))
+
+    try:
+        context: dict[str, Any] = {}
+        decisions = await registry.decide_all(
+            FeatureVector(symbol="HBAR/USDT"),
+            context,
+        )
+    finally:
+        _RetryingTransportExpert.first_error = "Connection error."
+
+    assert set(decisions) == set(names)
+    assert _RetryingTransportExpert.batch_calls == 2
+    assert all(row["transport_retry_recovered"] is True for row in context["_model_timings"])
 
 
 @pytest.mark.asyncio

@@ -123,6 +123,9 @@ def _is_transient_batch_transport_failure(exc: BaseException, error_text: str) -
         "target model is warming up",
         "previous generation is still draining",
         "single model queue wait exceeded",
+        "http error 503",
+        "status code 503",
+        "service unavailable",
     )
     return any(marker in class_name or marker in lowered for marker in markers)
 
@@ -142,6 +145,12 @@ def _is_retryable_batch_connection_failure(
         "connection refused",
         "connecterror",
         "apiconnectionerror",
+        "http error 503",
+        "status code 503",
+        "service unavailable",
+        "single model queue wait exceeded",
+        "previous generation is still draining",
+        "target model is warming up",
     )
     return any(marker in class_name or marker in lowered for marker in markers)
 
@@ -883,7 +892,23 @@ class ModelRegistry:
                 context["_batch_transport_retry_active"] = True
                 context["_batch_transport_retry_limit"] = 1
                 try:
-                    await asyncio.sleep(min(0.1, retry_timeout / 10.0))
+                    retry_delay = (
+                        min(2.0, max(0.25, retry_timeout * 0.1))
+                        if any(
+                            marker in first_error_text.lower()
+                            for marker in (
+                                "503",
+                                "service unavailable",
+                                "queue wait exceeded",
+                                "generation is still draining",
+                                "warming up",
+                            )
+                        )
+                        else min(0.1, retry_timeout / 10.0)
+                    )
+                    await asyncio.sleep(
+                        min(retry_delay, max(retry_timeout - 0.05, 0.0))
+                    )
                     retry_context = dict(context)
                     retry_context["_llm_capacity_preacquired"] = True
                     capacity_slot = _bounded_llm_capacity_slot(
