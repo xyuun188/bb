@@ -21,18 +21,18 @@ SERVICE = "bb-phase3-llm-target.service"
 
 
 def _normalize_script(text: str) -> str:
-    """Keep the bounded target contract even when phase3.env is stale."""
+    """Enforce the one target-carrier contract even when phase3.env is stale."""
 
     patterns = {
         "BB_TARGET_MAX_NEW_TOKENS": 96,
-        "BB_TARGET_GENERATION_TIMEOUT_SECONDS": 18,
-        "BB_TARGET_QUEUE_WAIT_SECONDS": 6,
+        "BB_TARGET_GENERATION_TIMEOUT_SECONDS": 26,
+        "BB_TARGET_QUEUE_WAIT_SECONDS": 0.5,
     }
     updated = text
     for name, default in patterns.items():
-        pattern = rf"export {name}=\$\{{{name}:-[^}}]+}}"
-        replacement = f"export {name}=${{{name}:-{default}}}"
-        updated, count = re.subn(pattern, replacement, updated)
+        pattern = rf"^export {name}=.*$"
+        replacement = f"export {name}={default}"
+        updated, count = re.subn(pattern, replacement, updated, flags=re.MULTILINE)
         if count == 0:
             updated += f"\n{replacement}\n"
     return updated

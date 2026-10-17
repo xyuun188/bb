@@ -68,6 +68,37 @@ def test_model_server_maintenance_scripts_use_model_server_settings() -> None:
         assert "info=info" in source, rel_path
 
 
+def test_target_runtime_contract_cannot_inherit_stale_carrier_limits() -> None:
+    from core import model_host_deployment
+    from scripts.maintain_target_runtime import _normalize_script
+
+    stale = (
+        "export BB_TARGET_QUEUE_WAIT_SECONDS=${BB_TARGET_QUEUE_WAIT_SECONDS:-6}\n"
+        "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=${BB_TARGET_GENERATION_TIMEOUT_SECONDS:-18}\n"
+        "export BB_TARGET_MAX_NEW_TOKENS=${BB_TARGET_MAX_NEW_TOKENS:-96}\n"
+    )
+    normalized = _normalize_script(stale)
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5" in normalized
+    assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in normalized
+    assert "export BB_TARGET_MAX_NEW_TOKENS=96" in normalized
+    assert "${BB_TARGET_QUEUE_WAIT_SECONDS:-6}" not in normalized
+    assert "${BB_TARGET_GENERATION_TIMEOUT_SECONDS:-18}" not in normalized
+    assert _normalize_script(normalized) == normalized
+
+    script = model_host_deployment.target_start_script(
+        {
+            "model_id": "qwen3.8-27b",
+            "model_path": "/data/BB/models/qwen3.8-27b",
+            "tokenizer_path": "/data/BB/models/qwen3.8-27b",
+            "context_length": 4096,
+            "max_concurrency": 1,
+            "runtime": {"engine": "transformers"},
+        }
+    )
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5" in script
+    assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in script
+
+
 def test_sync_to_online_server_does_not_restore_legacy_local_ai_tools_key() -> None:
     source = (ROOT / "scripts" / "sync_to_online_server.py").read_text(encoding="utf-8")
 

@@ -642,9 +642,13 @@ def target_start_script(
         + "export TORCHINDUCTOR_CACHE_DIR=/data/BB/runtime/torchinductor-cache\n"
         + "export TRITON_CACHE_DIR=/data/BB/runtime/triton-cache\n"
         + "export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-8}\n"
-        + "export BB_TARGET_QUEUE_WAIT_SECONDS=${BB_TARGET_QUEUE_WAIT_SECONDS:-6}\n"
-        + "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=${BB_TARGET_GENERATION_TIMEOUT_SECONDS:-18}\n"
-        + "export BB_TARGET_MAX_NEW_TOKENS=${BB_TARGET_MAX_NEW_TOKENS:-96}\n"
+        # These values are the single target-carrier contract.  Do not inherit
+        # stale phase3.env overrides: the platform admission gate already
+        # serializes Qwen calls, and the carrier must fail fast when a prior
+        # generation is still draining.
+        + "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5\n"
+        + "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26\n"
+        + "export BB_TARGET_MAX_NEW_TOKENS=96\n"
         + "export BB_TARGET_ATTN_IMPLEMENTATION=${BB_TARGET_ATTN_IMPLEMENTATION:-sdpa}\n"
         + "export BB_TARGET_RESPONSE_CACHE_SECONDS=${BB_TARGET_RESPONSE_CACHE_SECONDS:-2}\n"
         + "mkdir -p /data/BB/runtime/torchinductor-cache /data/BB/runtime/triton-cache\n"
