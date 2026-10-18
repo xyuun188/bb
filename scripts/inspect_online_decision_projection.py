@@ -72,6 +72,68 @@ async def main():
                 opportunity = raw.get("opportunity_score") if isinstance(raw.get("opportunity_score"), dict) else {{}}
                 stage_machine = raw.get("decision_state_machine") if isinstance(raw.get("decision_state_machine"), dict) else {{}}
                 execution = raw.get("execution_result") if isinstance(raw.get("execution_result"), dict) else {{}}
+                funnel_raw = raw.get("market_candidate_funnel") if isinstance(raw.get("market_candidate_funnel"), dict) else {{}}
+                quality = raw.get("analysis_quality_contract") if isinstance(raw.get("analysis_quality_contract"), dict) else {{}}
+                model_timings = raw.get("model_timings") if isinstance(raw.get("model_timings"), list) else []
+                expert_failures = raw.get("expert_failures") if isinstance(raw.get("expert_failures"), list) else []
+                market_progress = raw.get("market_analysis_progress") if isinstance(raw.get("market_analysis_progress"), dict) else {{}}
+                entry_permission = raw.get("entry_permission") if isinstance(raw.get("entry_permission"), dict) else {{}}
+                direction_support = raw.get("independent_direction_support") if isinstance(raw.get("independent_direction_support"), dict) else {{}}
+                direction_competition_raw = raw.get("direction_competition") if isinstance(raw.get("direction_competition"), dict) else {{}}
+                direction_competition = {{
+                    side: {{
+                        **{{
+                            key: side_data.get(key)
+                            for key in (
+                                "score",
+                                "raw_expected_return_pct",
+                                "objective_expected_return_pct",
+                                "expected_net_return_pct",
+                                "decision_source_count",
+                                "selected_horizon_minutes",
+                                "loss_probability",
+                            )
+                        }},
+                        "evidence": [
+                            {{
+                                key: item.get(key)
+                                for key in (
+                                    "source",
+                                    "model_name",
+                                    "provider_model",
+                                    "decision_eligible",
+                                    "training_aggregate_eligible",
+                                    "raw_expected_return_pct",
+                                    "objective_expected_return_pct",
+                                    "expected_net_return_pct",
+                                    "horizon_minutes",
+                                    "loss_probability",
+                                    "return_distribution_contract",
+                                )
+                                if key in item
+                            }}
+                            for item in (side_data.get("evidence") or [])
+                            if isinstance(item, dict)
+                        ],
+                    }}
+                    for side, side_data in direction_competition_raw.items()
+                    if isinstance(side_data, dict) and side in {{"long", "short"}}
+                }}
+                funnel = {{
+                    key: funnel_raw.get(key)
+                    for key in (
+                        "round_id",
+                        "scan_symbol_count",
+                        "feature_valid_count",
+                        "feature_invalid_count",
+                        "rank_selected_count",
+                        "rank_tradable_candidates",
+                        "rank_secondary_candidates",
+                        "rank_filtered_out_reason_counts",
+                        "analysis_only_selected_symbols",
+                    )
+                    if key in funnel_raw
+                }}
                 result.append({{
                     "decision_id": decision_id,
                     "found": True,
@@ -93,16 +155,46 @@ async def main():
                         )
                     }},
                     "paper_trade_selection": {{
-                        key: selection.get(key)
-                        for key in (
-                            "selection_reason",
-                            "selected_side",
-                            "expected_net_return_pct",
-                            "current_raw_expected_return_pct",
-                            "objective_net_return_pct",
-                            "paper_training_only",
-                            "paper_training_reasons",
-                        )
+                        **{{
+                            key: selection.get(key)
+                            for key in (
+                                "selection_reason",
+                                "selected_side",
+                                "expected_net_return_pct",
+                                "current_raw_expected_return_pct",
+                                "objective_net_return_pct",
+                                "paper_training_only",
+                                "paper_training_reasons",
+                                "diagnostic_status",
+                                "blocking_category",
+                                "blocking_reasons",
+                                "blocking_reasons_by_side",
+                            )
+                        }},
+                        "by_side": {{
+                            side: {{
+                                key: side_support.get(key)
+                                for key in (
+                                    "eligible",
+                                    "reason",
+                                    "expected_net_return_pct",
+                                    "raw_expected_return_pct",
+                                    "objective_net_return_pct",
+                                    "loss_probability",
+                                    "prediction_horizon_minutes",
+                                    "quant_evidence_families",
+                                    "quant_family_summaries",
+                                    "aligned_expert_count",
+                                    "opposition_expert_count",
+                                    "hold_expert_count",
+                                    "blocking_reasons",
+                                    "paper_quality_observation_only",
+                                    "paper_quality_observation_reasons",
+                                )
+                            }}
+                            for side, side_support in (selection.get("by_side") or {{}}).items()
+                            if isinstance(side_support, dict)
+                        }},
                     }},
                     "opportunity_score": {{
                         key: opportunity.get(key)
@@ -113,6 +205,16 @@ async def main():
                             "return_distribution_contract",
                             "expected_net_breakdown",
                         )
+                    }},
+                    "analysis_diagnostics": {{
+                        "analysis_quality_contract": quality,
+                        "expert_failures": expert_failures,
+                        "model_timings": model_timings,
+                        "market_candidate_funnel": funnel,
+                        "market_analysis_progress": market_progress,
+                        "entry_permission": entry_permission,
+                        "independent_direction_support": direction_support,
+                        "direction_competition": direction_competition,
                     }},
                     "sizing": {{
                         key: sizing.get(key)

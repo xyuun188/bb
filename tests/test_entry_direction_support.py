@@ -377,6 +377,35 @@ def test_paper_positive_mean_uses_negative_downside_as_risk_evidence() -> None:
     assert directional_entry_support_reasons(support, "short") == []
 
 
+def test_negative_non_directional_family_does_not_veto_positive_direction() -> None:
+    support = assess_paper_model_trade_support(
+        {
+            "short": {
+                "evidence": [
+                    _row("local_ml", raw=0.25, objective=0.20),
+                    _row("timeseries", raw=-0.05, objective=-0.10),
+                ]
+            },
+            "long": {
+                "evidence": [
+                    _row("local_ml", raw=-0.25, objective=-0.30),
+                    _row("timeseries", raw=0.05, objective=0.10),
+                ]
+            },
+        },
+        [],
+        "short",
+        execution_cost_pct=0.10,
+    )
+
+    assert support["eligible"] is True
+    assert support["quant_evidence_families"] == ["local_ml"]
+    assert support["expected_net_return_pct"] == pytest.approx(0.15)
+    assert support["objective_net_return_pct"] == pytest.approx(0.10)
+    assert support["raw_expected_return_pct"] == pytest.approx(0.25)
+    assert support["blocking_reasons"] == []
+
+
 def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
     long_row = _row("local_ml", raw=0.45, objective=-0.20)
     long_row["paper_return_quality_governance"] = {

@@ -599,6 +599,45 @@ def test_shadow_server_models_participate_in_normal_paper_scoring() -> None:
     assert all(component["included_in_return_distribution"] is True for component in components[1:])
 
 
+def test_paper_scoring_keeps_only_direction_support_selected_quant_families() -> None:
+    decision = _decision()
+    decision.action = Action.SHORT
+    decision.raw_response["ml_signal"] = _paper_payload(
+        side="short",
+        long_return=-0.25,
+        short_return=0.25,
+    )
+    decision.raw_response["local_ai_tools"] = {
+        "time_series_prediction": _paper_payload(
+            side="long",
+            long_return=0.05,
+            short_return=-0.05,
+        )
+    }
+    decision.raw_response["normal_paper_trade"] = {
+        "selection_reason": "strategy_edge_selected",
+        "quant_evidence_families": ["local_ml"],
+        "current_edge_validated": True,
+    }
+
+    score = _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    components = {
+        item["key"]: item
+        for item in opportunity["expected_net_breakdown"]["components"]
+    }
+    assert score == pytest.approx(opportunity["return_lcb_pct"])
+    assert opportunity["expected_gross_return_pct"] == pytest.approx(0.25)
+    assert components["local_ml"]["included_in_return_distribution"] is True
+    assert components["local_ml"]["direction_support_selected"] is True
+    assert components["timeseries"]["decision_eligible"] is False
+    assert components["timeseries"]["direction_support_selected"] is False
+    assert components["timeseries"]["eligibility_reason"] == (
+        "direction_support_quant_family_not_selected"
+    )
+
+
 def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}

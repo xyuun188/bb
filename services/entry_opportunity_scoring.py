@@ -105,6 +105,15 @@ def _execution_scope(strategy: dict[str, Any] | None) -> str:
     return "paper" if mode == "paper" else "live"
 
 
+def _quant_family_for_component(key: Any) -> str:
+    source = str(key or "").strip().lower()
+    if source == "local_ml":
+        return "local_ml"
+    if source in {"server_profit", "timeseries", "sentiment"}:
+        return "local_ai_tools"
+    return source
+
+
 @dataclass(slots=True)
 class EntryOpportunityScoringPolicy:
     """Build and rank the current execution-scoped return distribution."""
@@ -445,6 +454,37 @@ class EntryOpportunityScoringPolicy:
                 direction_authorization=model_direction_authorizations["timeseries"],
             ),
         ]
+        # Direction support is the single owner of which quantitative families
+        # may authorize this side.  The opportunity scorer must price the same
+        # selected families; otherwise an excluded negative family is silently
+        # reintroduced here and the later reconciliation gate turns a valid
+        # direction back into ``current_execution_return_not_positive``.
+        normal_trade = safe_dict(raw.get("normal_paper_trade"))
+        selected_families = {
+            str(value).strip().lower()
+            for value in safe_list(normal_trade.get("quant_evidence_families"))
+            if str(value).strip()
+        }
+        direction_contract_active = bool(
+            execution_scope == "paper"
+            and normal_trade.get("selection_reason")
+            in {"strategy_edge_selected", "paper_training_entry"}
+            and selected_families
+        )
+        if direction_contract_active:
+            for component in components:
+                family = _quant_family_for_component(component.get("key"))
+                selected = family in selected_families
+                component["direction_support_selected"] = selected
+                if selected or component.get("decision_eligible") is not True:
+                    continue
+                component["decision_eligible"] = False
+                component["paper_eligible"] = False
+                component["aggregate_eligible"] = False
+                component["observation_only"] = True
+                component["eligibility_reason"] = (
+                    "direction_support_quant_family_not_selected"
+                )
         selected_components = [
             component for component in components if component["decision_eligible"]
         ]

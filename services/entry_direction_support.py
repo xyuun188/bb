@@ -258,7 +258,7 @@ def summarize_paper_quantitative_evidence(
     )
     return {
         "version": INDEPENDENT_DIRECTION_SUPPORT_VERSION,
-        "scope": PAPER_MODEL_TRADE_SCOPE,
+        "scope": support_scope,
         "selected_side": side if side in {"long", "short"} else "neutral",
         "execution_cost_pct": parsed_cost,
         "execution_cost_complete": execution_cost_complete,
@@ -472,17 +472,61 @@ def assess_directional_entry_support(
             and (_float(item.get("objective_expected_return_pct")) or 0.0) > 0.0
         ]
         conflicting_families = []
+    # The aggregate summary contains every model family at the selected
+    # horizon, including families that are counter-directional or whose
+    # current fee-after return is non-positive.  Those rows remain valuable
+    # diagnostics, but they must not be averaged back into the selected
+    # direction after the directional contract has already excluded them.
+    # Otherwise one valid positive family is silently vetoed by an unrelated
+    # negative family and the entry funnel collapses to ``no_direction``.
+    effective_families = list(directional_families)
+    effective_expected_net_return_pct = _weighted_mean(
+        effective_families,
+        "expected_net_return_pct",
+    )
+    effective_raw_expected_return_pct = _weighted_mean(
+        effective_families,
+        "raw_expected_return_pct",
+    )
+    effective_objective_net_return_pct = _weighted_mean(
+        effective_families,
+        "objective_net_return_pct",
+    )
+    effective_loss_probability = _weighted_mean(
+        effective_families,
+        "loss_probability",
+    )
     quantitative_sources = sorted(
         {
             source
-            for item in directional_families
+            for item in effective_families
             for source in item.get("sources") or []
         }
     )
-    quant_families = sorted(str(item["family"]) for item in directional_families)
-    expected_net_return_pct = _float(quantitative.get("expected_net_return_pct"))
-    objective_net_return_pct = _float(quantitative.get("objective_net_return_pct"))
-    loss_probability = _float(quantitative.get("loss_probability"))
+    quant_families = sorted(str(item["family"]) for item in effective_families)
+    # When no family survives directional screening, retain the complete
+    # aggregate values for diagnostics and blocking reasons.  They are never
+    # used to authorize an entry because ``quant_families`` remains empty.
+    expected_net_return_pct = _float(
+        effective_expected_net_return_pct
+        if effective_families
+        else quantitative.get("expected_net_return_pct")
+    )
+    raw_expected_return_pct = _float(
+        effective_raw_expected_return_pct
+        if effective_families
+        else quantitative.get("raw_expected_return_pct")
+    )
+    objective_net_return_pct = _float(
+        effective_objective_net_return_pct
+        if effective_families
+        else quantitative.get("objective_net_return_pct")
+    )
+    loss_probability = _float(
+        effective_loss_probability
+        if effective_families
+        else quantitative.get("loss_probability")
+    )
     auditable_experts = [
         item
         for item in expert_opinions or []
@@ -588,7 +632,7 @@ def assess_directional_entry_support(
         "execution_cost_pct": parsed_cost,
         "execution_cost_complete": execution_cost_complete,
         "expected_net_return_pct": expected_net_return_pct,
-        "raw_expected_return_pct": _float(quantitative.get("raw_expected_return_pct")),
+        "raw_expected_return_pct": raw_expected_return_pct,
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": loss_probability,
         "prediction_horizon_minutes": prediction_horizon_minutes,
