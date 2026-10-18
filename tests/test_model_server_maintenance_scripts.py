@@ -78,7 +78,7 @@ def test_target_runtime_contract_cannot_inherit_stale_carrier_limits() -> None:
         "export BB_TARGET_MAX_NEW_TOKENS=${BB_TARGET_MAX_NEW_TOKENS:-96}\n"
     )
     normalized = _normalize_script(stale)
-    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0" in normalized
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=8.0" in normalized
     assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in normalized
     assert "export BB_TARGET_MAX_NEW_TOKENS=96" in normalized
     assert "${BB_TARGET_QUEUE_WAIT_SECONDS:-6}" not in normalized
@@ -95,7 +95,7 @@ def test_target_runtime_contract_cannot_inherit_stale_carrier_limits() -> None:
             "runtime": {"engine": "transformers"},
         }
     )
-    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0" in script
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=8.0" in script
     assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in script
 
 

@@ -14,7 +14,11 @@ PHASE3_QUANT_API_ID = "phase3_quant_api"
 # Canonical contract for the single-worker target carrier.
 PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS = 26.0
 PHASE3_TARGET_MAX_NEW_TOKENS = 96
-PHASE3_TARGET_QUEUE_WAIT_SECONDS = 2.0
+# The target carrier is a single-worker model.  Two seconds was shorter than
+# the observed handoff when market and position loops crossed, so healthy
+# requests were recorded as queue failures.  Keep one bounded queue contract
+# that covers normal inference bursts without allowing an unbounded stall.
+PHASE3_TARGET_QUEUE_WAIT_SECONDS = 8.0
 PHASE3_TARGET_RESPONSE_MARGIN_SECONDS = 2.0
 PHASE3_TARGET_HTTP_TIMEOUT_SECONDS = (
     PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS

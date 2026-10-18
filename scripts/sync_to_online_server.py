@@ -369,6 +369,18 @@ app_env_ai_route_keys = {{
     'AI_API_BASE',
     'AI_MODEL',
     'AI_TARGET_QWEN_QUEUE_WAIT_SECONDS',
+    'AI_LLM_CONCURRENCY',
+    'AI_LLM_MAX_CALLS_PER_ANALYSIS',
+    'AI_EXPERT_TIMEOUT_SECONDS',
+    'AI_DECISION_MAKER_TIMEOUT_SECONDS',
+    'AI_EXPERT_MAX_COMPLETION_TOKENS',
+    'AI_DECISION_MAKER_MAX_COMPLETION_TOKENS',
+    'AI_BATCH_EXPERTS_ENABLED',
+    'AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS',
+    'AI_BATCH_EXPERT_TIMEOUT_SECONDS',
+    'AI_BATCH_EXPERT_CIRCUIT_BREAKER_SECONDS',
+    'AI_BATCH_EXPERT_FORMAT_FAILURE_CIRCUIT_BREAKER_SECONDS',
+    'AI_TARGET_QWEN_TIMEOUT_SECONDS',
     'LOCAL_AI_TOOLS_ENABLED',
     'LOCAL_AI_TOOLS_API_BASE',
 }}
@@ -429,6 +441,59 @@ def scrub_app_env_ai_routes(path, keys, prefixes):
             'removed_keys': [],
         }}
     backup_path = path.with_name(path.name + '.ai-route-cleanup.bak.' + time.strftime('%Y%m%d%H%M%S'))
+    backup_path.write_text(original_text, encoding='utf-8')
+    os.chmod(backup_path, 0o600)
+    path.write_text(chr(10).join(kept_lines).rstrip() + chr(10), encoding='utf-8')
+    return {{
+        'exists': True,
+        'backup': str(backup_path),
+        'removed_keys': removed_unique,
+    }}
+
+
+def scrub_legacy_phase3_env(path):
+    # This file belonged to the retired Phase 3 platform process.  It is not
+    # loaded by the split systemd services, but stale AI controls there can
+    # still be picked up by maintenance scripts or manual probes.
+    stale_keys = {{
+        'AI_LLM_CONCURRENCY',
+        'AI_LLM_MAX_CALLS_PER_ANALYSIS',
+        'AI_EXPERT_TIMEOUT_SECONDS',
+        'AI_DECISION_MAKER_TIMEOUT_SECONDS',
+        'AI_EXPERT_MAX_COMPLETION_TOKENS',
+        'AI_DECISION_MAKER_MAX_COMPLETION_TOKENS',
+        'AI_BATCH_EXPERTS_ENABLED',
+        'AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS',
+        'AI_BATCH_EXPERT_TIMEOUT_SECONDS',
+        'AI_BATCH_EXPERT_CIRCUIT_BREAKER_SECONDS',
+        'AI_BATCH_EXPERT_FORMAT_FAILURE_CIRCUIT_BREAKER_SECONDS',
+        'AI_TARGET_QWEN_TIMEOUT_SECONDS',
+        'AI_TARGET_QWEN_QUEUE_WAIT_SECONDS',
+        'HIGH_RISK_REVIEW_ENABLED',
+        'HIGH_RISK_REVIEW_API_BASE',
+        'HIGH_RISK_REVIEW_API_KEY',
+        'HIGH_RISK_REVIEW_MODEL',
+        'HIGH_RISK_REVIEW_MODEL_REVISION',
+    }}
+    if not path.exists():
+        return {{'exists': False, 'backup': '', 'removed_keys': []}}
+    original_text = path.read_text(encoding='utf-8')
+    removed = []
+    kept_lines = []
+    for raw_line in original_text.splitlines():
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0].strip().upper()
+            if key in stale_keys:
+                removed.append(key)
+                continue
+        kept_lines.append(raw_line)
+    removed_unique = sorted(set(removed))
+    if not removed_unique:
+        return {{'exists': True, 'backup': '', 'removed_keys': []}}
+    backup_path = path.with_name(
+        path.name + '.legacy-ai-cleanup.bak.' + time.strftime('%Y%m%d%H%M%S')
+    )
     backup_path.write_text(original_text, encoding='utf-8')
     os.chmod(backup_path, 0o600)
     path.write_text(chr(10).join(kept_lines).rstrip() + chr(10), encoding='utf-8')
@@ -545,11 +610,15 @@ app_env_cleanup = scrub_app_env_ai_routes(
     app_env_ai_route_keys,
     app_env_ai_route_prefixes,
 )
+legacy_phase3_env_cleanup = scrub_legacy_phase3_env(
+    Path('/data/bb/env/phase3.env')
+)
 if emit_summary:
     print(json.dumps({{
         'updated': True,
         'backup': backup_path,
         'app_env_ai_route_cleanup': app_env_cleanup,
+        'legacy_phase3_env_cleanup': legacy_phase3_env_cleanup,
         'ai_models': [(row.get('name'), row.get('api_base'), row.get('model')) for row in rows],
         'target_model_route_present': any(
             str(row.get('model') or '').strip() == 'qwen3.8-27b' for row in rows

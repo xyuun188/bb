@@ -172,6 +172,7 @@ async def run():
             )
         rows = [
             SimpleNamespace(
+                id=int(row.id),
                 analysis_type=row.analysis_type,
                 symbol=row.symbol,
                 action=row.action,
@@ -310,6 +311,76 @@ async def run():
         key=lambda item: item["min_gap_seconds"],
     )
     top_symbol, top_count = market_symbol_counts.most_common(1)[0] if market_symbol_counts else ("", 0)
+    analysis_failure_samples = []
+    for row in market_rows:
+        raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {{}}
+        status = classify_analysis_status(raw)
+        if status == "completed":
+            continue
+        quality = (
+            raw.get("analysis_quality_contract")
+            if isinstance(raw.get("analysis_quality_contract"), dict)
+            else {{}}
+        )
+        timeout = (
+            raw.get("market_model_timeout")
+            if isinstance(raw.get("market_model_timeout"), dict)
+            else {{}}
+        )
+        failures = raw.get("expert_failures")
+        failure_rows = []
+        if isinstance(failures, list):
+            for failure in failures[:8]:
+                if not isinstance(failure, dict):
+                    continue
+                failure_rows.append(
+                    {{
+                        "expert_name": str(failure.get("expert_name") or "")[:80],
+                        "status": str(failure.get("status") or "")[:80],
+                        "error_code": str(failure.get("error_code") or "")[:80],
+                        "reason": str(
+                            failure.get("reason")
+                            or failure.get("error")
+                            or failure.get("message")
+                            or ""
+                        )[:240],
+                    }}
+                )
+        timings = raw.get("_model_timings")
+        timing_rows = []
+        if isinstance(timings, list):
+            for timing in timings[:12]:
+                if not isinstance(timing, dict):
+                    continue
+                timing_rows.append(
+                    {{
+                        "expert_name": str(timing.get("expert_name") or "")[:80],
+                        "status": str(timing.get("status") or "")[:80],
+                        "error_code": str(timing.get("error_code") or "")[:80],
+                        "queue_wait_seconds": timing.get("queue_wait_seconds"),
+                        "timeout_seconds": timing.get("timeout_seconds"),
+                    }}
+                )
+        analysis_failure_samples.append(
+            {{
+                "id": getattr(row, "id", None),
+                "symbol": str(row.symbol or ""),
+                "created_at": as_utc(row.created_at).isoformat()
+                if as_utc(row.created_at)
+                else None,
+                "status": status,
+                "quality_status": str(quality.get("status") or "")[:80],
+                "quality_reason_code": str(quality.get("reason_code") or "")[:80],
+                "quality_reason": str(quality.get("reason") or "")[:240],
+                "timeout_reason": str(timeout.get("reason") or "")[:240],
+                "timeout_seconds": timeout.get("timeout_seconds"),
+                "failure_count": len(failure_rows),
+                "failures": failure_rows,
+                "timings": timing_rows,
+            }}
+        )
+        if len(analysis_failure_samples) >= 20:
+            break
     payload = {{
         "generated_at": now.isoformat(),
         "read_only": True,
@@ -344,6 +415,7 @@ async def run():
                 analysis_status_counts.get(status, 0)
                 for status in ("retryable_failure", "model_failure")
             ),
+            "model_failure_samples": analysis_failure_samples,
             "entry_funnel": {{
                 "signal_count": len(entry_rows),
                 "executed_count": sum(1 for row in entry_rows if bool(row.was_executed)),

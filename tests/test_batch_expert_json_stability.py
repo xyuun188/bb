@@ -1153,7 +1153,7 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
     monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 26.0)
-    assert PHASE3_TARGET_QUEUE_WAIT_SECONDS == 2.0
+    assert PHASE3_TARGET_QUEUE_WAIT_SECONDS == 8.0
     target_capacity = llm_agent_module._ScopedLLMCapacity(1)
     monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
     _BatchTimeoutExpert.batch_calls = 0
@@ -1186,7 +1186,10 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
         await holder.__aexit__(None, None, None)
 
     assert decisions == {}
-    assert asyncio.get_running_loop().time() - started < 2.5
+    assert (
+        asyncio.get_running_loop().time() - started
+        < PHASE3_TARGET_QUEUE_WAIT_SECONDS + 0.5
+    )
     assert _BatchTimeoutExpert.batch_calls == 0
     assert {row["status"] for row in context["_model_timings"]} == {"provider_queue_deferred"}
     assert not context.get("_attempted_models")

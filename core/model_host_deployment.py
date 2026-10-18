@@ -646,7 +646,7 @@ def target_start_script(
         # stale phase3.env overrides: the platform admission gate already
         # serializes Qwen calls, and the carrier must wait through normal
         # sub-second-to-second handoff without turning it into a fake outage.
-        + "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0\n"
+        + "export BB_TARGET_QUEUE_WAIT_SECONDS=8.0\n"
         + "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26\n"
         + "export BB_TARGET_MAX_NEW_TOKENS=96\n"
         + "export BB_TARGET_ATTN_IMPLEMENTATION=${BB_TARGET_ATTN_IMPLEMENTATION:-sdpa}\n"
