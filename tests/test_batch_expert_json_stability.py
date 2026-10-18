@@ -9,6 +9,7 @@ import openai
 import pytest
 
 import ai_brain.llm_agent as llm_agent_module
+import ai_brain.model_registry as model_registry_module
 from ai_brain.base_model import AbstractAIModel, Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
 from ai_brain.llm_agent import (
@@ -33,6 +34,10 @@ from core.phase3_model_contract import (
 )
 from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
+
+
+async def _ready_probe_immediately(_timeout_seconds: float) -> float:
+    return 0.0
 
 
 def test_openai_sdk_transient_errors_use_transport_recovery_contract() -> None:
@@ -152,6 +157,11 @@ async def test_target_qwen_retries_one_shared_batch_after_connection_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        model_registry_module,
+        "_wait_for_target_model_ready",
+        _ready_probe_immediately,
+    )
 
     class TransientConnectionExpert(AbstractAIModel):
         batch_calls = 0
@@ -227,6 +237,11 @@ async def test_target_qwen_transport_retry_uses_remaining_analysis_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        model_registry_module,
+        "_wait_for_target_model_ready",
+        _ready_probe_immediately,
+    )
     _RetryingTransportExpert.batch_calls = 0
     registry = ModelRegistry()
     names = (
@@ -254,6 +269,11 @@ async def test_target_qwen_retries_transient_busy_503_as_shared_transport_failur
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        model_registry_module,
+        "_wait_for_target_model_ready",
+        _ready_probe_immediately,
+    )
     _RetryingTransportExpert.batch_calls = 0
     _RetryingTransportExpert.first_error = "HTTP Error 503: Service Unavailable"
     registry = ModelRegistry()
@@ -285,6 +305,11 @@ async def test_target_qwen_transport_retry_defers_when_round_budget_is_exhausted
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        model_registry_module,
+        "_wait_for_target_model_ready",
+        _ready_probe_immediately,
+    )
     _RetryingTransportExpert.batch_calls = 0
     registry = ModelRegistry()
     names = (

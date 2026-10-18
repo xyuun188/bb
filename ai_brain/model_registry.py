@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import urllib.request
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -26,6 +27,7 @@ from ai_brain.llm_agent import (
 from config.settings import settings
 from core.phase3_model_contract import (
     PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
+    PHASE3_TARGET_MODEL_ENDPOINT,
     PHASE3_TARGET_QUEUE_WAIT_SECONDS,
 )
 from core.safe_output import safe_error_text
@@ -69,6 +71,45 @@ def _is_target_qwen_provider(model: object | None) -> bool:
     """Return whether a provider is the single-concurrency Qwen target."""
 
     return (_provider_model_name(model) or "").strip().lower() == "qwen3.8-27b"
+
+
+def _target_model_ready_url() -> str:
+    base = str(PHASE3_TARGET_MODEL_ENDPOINT or "").rstrip("/")
+    return f"{base.rsplit('/v1', 1)[0]}/health/ready"
+
+
+def _probe_target_model_ready() -> bool:
+    request = urllib.request.Request(  # noqa: S310
+        _target_model_ready_url(),
+        headers={"accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=1.5) as response:  # noqa: S310
+        if int(getattr(response, "status", 200) or 200) != 200:
+            return False
+        payload = response.read(4096).decode("utf-8", errors="replace").lower()
+    return '"status":"ready"' in payload or '"status": "ready"' in payload
+
+
+async def _wait_for_target_model_ready(timeout_seconds: float) -> float:
+    """Wait for the carrier's readiness contract before a transport retry."""
+
+    started = time.monotonic()
+    deadline = started + max(float(timeout_seconds or 0.0), 0.0)
+    while time.monotonic() < deadline:
+        try:
+            if await asyncio.to_thread(_probe_target_model_ready):
+                return round(max(time.monotonic() - started, 0.0), 3)
+        except Exception as exc:
+            logger.debug(
+                "target model readiness probe unavailable",
+                error=safe_error_text(exc, limit=120),
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.5, remaining))
+    return round(max(time.monotonic() - started, 0.0), 3)
 
 
 def _provider_group_key(model: object) -> tuple[str, str]:
@@ -768,6 +809,7 @@ class ModelRegistry:
 
         transport_retry_attempted = False
         transport_retry_error = ""
+        readiness_wait_seconds = 0.0
         provider_queue_deferred = False
         provider_queue_wait_seconds = 0.0
         try:
@@ -925,23 +967,65 @@ class ModelRegistry:
                 context["_batch_transport_retry_active"] = True
                 context["_batch_transport_retry_limit"] = 1
                 try:
-                    retry_delay = (
-                        min(2.0, max(0.25, retry_timeout * 0.1))
-                        if any(
-                            marker in first_error_text.lower()
-                            for marker in (
-                                "503",
-                                "service unavailable",
-                                "queue wait exceeded",
-                                "generation is still draining",
-                                "warming up",
-                            )
+                    retry_markers = (
+                        "503",
+                        "service unavailable",
+                        "queue wait exceeded",
+                        "generation is still draining",
+                        "warming up",
+                        "connection error",
+                        "connection reset",
+                    )
+                    readiness_budget = max(retry_timeout - 0.75, 0.0)
+                    readiness_wait_seconds = await _wait_for_target_model_ready(
+                        readiness_budget
+                    )
+                    if readiness_wait_seconds < 0.001 and not any(
+                        marker in first_error_text.lower() for marker in retry_markers
+                    ):
+                        await asyncio.sleep(min(0.1, max(retry_timeout - 0.05, 0.0)))
+                    retry_timeout, retry_budget = _bounded_analysis_timeout(
+                        context,
+                        batch_timeout,
+                    )
+                    if retry_timeout < 0.75:
+                        reason = _analysis_budget_reason(retry_budget)
+                        context.setdefault("_model_failures", []).append(
+                            {
+                                "expert_name": "batch_experts",
+                                "provider_model": _provider_model_name(batch_model),
+                                "experts": list(expert_names),
+                                "reason": reason,
+                                "status": "analysis_budget_deferred",
+                                "failure_scope": "shared_batch",
+                                "shared_batch_call": True,
+                                "readiness_wait_seconds": readiness_wait_seconds,
+                            }
                         )
-                        else min(0.1, retry_timeout / 10.0)
-                    )
-                    await asyncio.sleep(
-                        min(retry_delay, max(retry_timeout - 0.05, 0.0))
-                    )
+                        return {}, [
+                            _attach_analysis_budget_timing(
+                                {
+                                    "stage": "expert_initial",
+                                    "name": model.name,
+                                    "status": "analysis_budget_deferred",
+                                    "started_at": started_at.isoformat(),
+                                    "duration_sec": round(time.perf_counter() - perf_started, 3),
+                                    "batch_expert": True,
+                                    "shared_batch_call": True,
+                                    "batch_model_count": len(provider_group),
+                                    "batch_provider_group_count": provider_group_count,
+                                    "provider_model": _provider_model_name(batch_model),
+                                    "attempted": True,
+                                    "reason": reason,
+                                    "transport_retry_attempted": True,
+                                    "transport_retry_deferred": True,
+                                    "transport_retry_reason": first_error_text,
+                                    "readiness_wait_seconds": readiness_wait_seconds,
+                                },
+                                retry_budget,
+                            )
+                            for model in provider_group
+                        ]
                     retry_context = dict(context)
                     retry_context["_llm_capacity_preacquired"] = True
                     capacity_slot = _bounded_llm_capacity_slot(
@@ -1004,6 +1088,7 @@ class ModelRegistry:
                         "transport_retry_attempted": transport_retry_attempted,
                         "transport_retry_recovered": transport_retry_attempted,
                         "transport_retry_reason": transport_retry_error or None,
+                        "readiness_wait_seconds": readiness_wait_seconds,
                         "provider_queue_wait_seconds": provider_queue_wait_seconds,
                     }
                 )
@@ -1120,6 +1205,7 @@ class ModelRegistry:
                         "shared_batch_failure": True,
                         "transport_retry_attempted": transport_retry_attempted,
                         "transport_retry_reason": transport_retry_error or None,
+                        "readiness_wait_seconds": readiness_wait_seconds,
                     }
                     for model in provider_group
                 ]
