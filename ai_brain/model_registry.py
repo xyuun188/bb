@@ -24,6 +24,10 @@ from ai_brain.llm_agent import (
     ensure_llm_call_budget,
 )
 from config.settings import settings
+from core.phase3_model_contract import (
+    PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
+    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+)
 from core.safe_output import safe_error_text
 from data_feed.feature_vector import FeatureVector
 
@@ -33,9 +37,6 @@ BatchExpertDecider = Callable[
     [FeatureVector, dict[str, Any], list[str]],
     Awaitable[dict[str, DecisionOutput]],
 ]
-TARGET_QWEN_CALL_TIMEOUT_SECONDS = 30.0
-
-
 class BatchExpertModel(Protocol):
     """Protocol for a model that can answer all fixed experts in one LLM call."""
 
@@ -539,11 +540,20 @@ class ModelRegistry:
             started_at = datetime.now(UTC)
             perf_started = time.perf_counter()
             try:
-                base_timeout = max(float(settings.ai_expert_timeout_seconds or 30.0), 5.0)
-                active_count = max(len(active_models), 1)
-                concurrency = max(int(settings.ai_llm_concurrency or active_count), 1)
-                queue_batches = max((active_count + concurrency - 1) // concurrency, 1)
-                timeout_seconds = base_timeout * queue_batches
+                if _is_target_qwen_provider(model):
+                    timeout_seconds = PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
+                else:
+                    base_timeout = max(
+                        float(settings.ai_expert_timeout_seconds or 30.0),
+                        5.0,
+                    )
+                    active_count = max(len(active_models), 1)
+                    concurrency = max(int(settings.ai_llm_concurrency or active_count), 1)
+                    queue_batches = max(
+                        (active_count + concurrency - 1) // concurrency,
+                        1,
+                    )
+                    timeout_seconds = base_timeout * queue_batches
                 result = await asyncio.wait_for(
                     model.decide(features, context),
                     timeout=timeout_seconds,
@@ -764,13 +774,11 @@ class ModelRegistry:
             requested_batch_timeout = float(
                 settings.ai_batch_expert_timeout_seconds
                 or settings.ai_target_qwen_timeout_seconds
-                or TARGET_QWEN_CALL_TIMEOUT_SECONDS
+                or PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
             )
-            if _is_target_qwen_provider(batch_model):
-                # Include the target carrier's bounded queue wait and
-                # generation deadline in the caller budget.  Otherwise a
-                # queued but healthy request is recorded as a timeout.
-                requested_batch_timeout = TARGET_QWEN_CALL_TIMEOUT_SECONDS
+            target_qwen = _is_target_qwen_provider(batch_model)
+            if target_qwen:
+                requested_batch_timeout = PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
             requested_batch_timeout = max(requested_batch_timeout, 8.0)
             batch_timeout, budget_snapshot = _bounded_analysis_timeout(
                 context,
@@ -838,7 +846,7 @@ class ModelRegistry:
                 capacity_slot = _bounded_llm_capacity_slot(
                     context,
                     max_queue_wait_seconds=(
-                        settings.ai_target_qwen_queue_wait_seconds or 0.0
+                        PHASE3_TARGET_QUEUE_WAIT_SECONDS
                         if _is_target_qwen_provider(batch_model)
                         else 0.0
                     ),
@@ -939,7 +947,7 @@ class ModelRegistry:
                     capacity_slot = _bounded_llm_capacity_slot(
                         context,
                         max_queue_wait_seconds=(
-                            settings.ai_target_qwen_queue_wait_seconds or 0.0
+                            PHASE3_TARGET_QUEUE_WAIT_SECONDS
                             if _is_target_qwen_provider(batch_model)
                             else 0.0
                         ),

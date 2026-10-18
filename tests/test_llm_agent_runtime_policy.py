@@ -17,6 +17,7 @@ from ai_brain.llm_agent import (
     _ScopedLLMCapacity,
 )
 from core.exceptions import LLMResponseParseError, ModelInferenceError
+from core.phase3_model_contract import PHASE3_TARGET_HTTP_TIMEOUT_SECONDS
 from data_feed.feature_vector import FeatureVector
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import standardized_return_distribution
@@ -311,6 +312,7 @@ async def test_keyless_loopback_model_uses_process_local_client_placeholder(
     await agent.initialize()
 
     assert captured["api_key"] == "local"
+    assert captured["timeout"] == PHASE3_TARGET_HTTP_TIMEOUT_SECONDS
     assert captured["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
     assert agent._api_key == ""
 

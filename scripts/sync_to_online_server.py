@@ -368,6 +368,7 @@ app_env_ai_route_keys = {{
     'AI_MODELS',
     'AI_API_BASE',
     'AI_MODEL',
+    'AI_TARGET_QWEN_QUEUE_WAIT_SECONDS',
     'LOCAL_AI_TOOLS_ENABLED',
     'LOCAL_AI_TOOLS_API_BASE',
 }}
@@ -507,9 +508,8 @@ values['AI_DECISION_MAKER_TIMEOUT_SECONDS'] = '26'
 values['AI_BATCH_EXPERT_MAX_COMPLETION_TOKENS'] = '96'
 values['AI_BATCH_EXPERT_TIMEOUT_SECONDS'] = '26'
 values['AI_TARGET_QWEN_TIMEOUT_SECONDS'] = '26'
-# Let the process-wide provider gate use each analysis round's remaining
-# deadline instead of turning normal cross-loop queueing into a fixed 6s error.
-values['AI_TARGET_QWEN_QUEUE_WAIT_SECONDS'] = '0'
+# Queue wait is a code-owned Phase 3 contract, not a deployment override.
+values.pop('AI_TARGET_QWEN_QUEUE_WAIT_SECONDS', None)
 values['AI_DECISION_MAKER_MAX_COMPLETION_TOKENS'] = '96'
 # HIGH_RISK_REVIEW_* is edited atomically by the Dashboard and its secret is
 # stored in the encrypted settings service.  Keeping a second deployment-owned

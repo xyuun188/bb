@@ -644,9 +644,9 @@ def target_start_script(
         + "export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-8}\n"
         # These values are the single target-carrier contract.  Do not inherit
         # stale phase3.env overrides: the platform admission gate already
-        # serializes Qwen calls, and the carrier must fail fast when a prior
-        # generation is still draining.
-        + "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5\n"
+        # serializes Qwen calls, and the carrier must wait through normal
+        # sub-second-to-second handoff without turning it into a fake outage.
+        + "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0\n"
         + "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26\n"
         + "export BB_TARGET_MAX_NEW_TOKENS=96\n"
         + "export BB_TARGET_ATTN_IMPLEMENTATION=${BB_TARGET_ATTN_IMPLEMENTATION:-sdpa}\n"

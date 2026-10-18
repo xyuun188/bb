@@ -41,6 +41,10 @@ from core.model_runtime import (
     supports_provider_thinking_disable,
     uses_thinking_tags,
 )
+from core.phase3_model_contract import (
+    PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
+    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+)
 from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
     first_tool_payload,
@@ -51,8 +55,6 @@ from services.entry_signal_extraction import (
 )
 
 logger = structlog.get_logger(__name__)
-TARGET_QWEN_CALL_TIMEOUT_SECONDS = 30.0
-
 # Kept as a patchable module attribute for tests. The real LangChain/OpenAI
 # stack is imported only when an LLM call is actually constructed; importing
 # it during trading-service startup also imports transformers and torch.
@@ -360,8 +362,12 @@ async def _bounded_llm_capacity_slot(
                 deadline - asyncio.get_running_loop().time() - 0.1,
                 0.05,
             )
-            queue_limited = queue_budget > 0 and queue_budget < deadline_remaining
-            remaining = min(deadline_remaining, queue_budget) if queue_limited else deadline_remaining
+            queue_limited = queue_budget > 0
+            remaining = (
+                min(deadline_remaining, queue_budget)
+                if queue_limited
+                else deadline_remaining
+            )
         elif queue_budget > 0:
             remaining = queue_budget
             queue_limited = True
@@ -373,11 +379,12 @@ async def _bounded_llm_capacity_slot(
                 async with asyncio.timeout(remaining):
                     await slot.__aenter__()
             except TimeoutError as exc:
-                if queue_limited:
-                    raise LLMCapacityQueueDeferred(
-                        "shared LLM capacity admission queue is busy"
-                    ) from exc
-                raise
+                reason = (
+                    "shared LLM capacity admission queue exceeded its wait budget"
+                    if queue_limited
+                    else "analysis deadline expired before shared LLM capacity admission"
+                )
+                raise LLMCapacityQueueDeferred(reason) from exc
         else:
             await slot.__aenter__()
         if isinstance(context, dict) and provider_model:
@@ -1144,24 +1151,9 @@ class LLMAgent(AbstractAIModel):
             configured_timeout_value = 0.0
         target_qwen = str(model or "").strip().lower() == "qwen3.8-27b"
         if target_qwen:
-            # The production carrier is one A100 worker with a bounded queue
-            # in front of its generation deadline.  The caller timeout must
-            # cover both phases; otherwise a normal queued request is recorded
-            # as a model outage before the carrier can answer.
-            request_timeout = min(
-                max(
-                    float(
-                        getattr(
-                            settings,
-                            "ai_target_qwen_timeout_seconds",
-                            TARGET_QWEN_CALL_TIMEOUT_SECONDS,
-                        )
-                        or TARGET_QWEN_CALL_TIMEOUT_SECONDS
-                    ),
-                    TARGET_QWEN_CALL_TIMEOUT_SECONDS,
-                ),
-                TARGET_QWEN_CALL_TIMEOUT_SECONDS,
-            )
+            # The provider timeout must leave room for the carrier to return
+            # its own bounded-generation response before the caller cancels.
+            request_timeout = PHASE3_TARGET_HTTP_TIMEOUT_SECONDS
         elif fast_expert:
             request_timeout = min(max(configured_timeout_value or 14.0, 8.0), 18.0)
         elif max_completion_tokens_override is not None:
@@ -1415,7 +1407,7 @@ class LLMAgent(AbstractAIModel):
                 capacity_slot = _bounded_llm_capacity_slot(
                     context,
                     max_queue_wait_seconds=(
-                        settings.ai_target_qwen_queue_wait_seconds or 0.0
+                        PHASE3_TARGET_QUEUE_WAIT_SECONDS
                         if target_qwen
                         else 0.0
                     ),
@@ -1530,7 +1522,7 @@ class LLMAgent(AbstractAIModel):
             capacity_slot = _bounded_llm_capacity_slot(
                 context,
                 max_queue_wait_seconds=(
-                    settings.ai_target_qwen_queue_wait_seconds or 0.0
+                    PHASE3_TARGET_QUEUE_WAIT_SECONDS
                     if target_single_call
                     else 0.0
                 ),

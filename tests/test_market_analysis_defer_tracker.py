@@ -47,6 +47,20 @@ def test_market_analysis_defer_tracker_completes_and_prunes_ineligible_symbols()
     assert tracker.ordered_symbols() == ["SOL/USDT"]
 
 
+def test_market_analysis_defer_tracker_can_skip_capacity_only_entries() -> None:
+    tracker = _tracker()
+    tracker.defer_many(
+        ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        "shortlist_capacity",
+    )
+    tracker.defer("ETH/USDT", "model_timeout")
+
+    assert tracker.ordered_symbols(exclude_reasons={"shortlist_capacity"}) == [
+        "ETH/USDT"
+    ]
+    assert tracker.ordered_symbols() == ["BTC/USDT", "SOL/USDT", "ETH/USDT"]
+
+
 def test_market_analysis_defer_tracker_reports_current_reasons() -> None:
     tracker = _tracker(max_candidates=2)
     started_at = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)

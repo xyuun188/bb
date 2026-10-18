@@ -25,6 +25,12 @@ from ai_brain.model_registry import (
 from ai_brain.prompts import _compact_role_signal, build_batch_experts_user_prompt
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
+from core.phase3_model_contract import (
+    PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
+    PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
+    PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
+    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+)
 from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
 
@@ -370,6 +376,7 @@ def test_qwen_production_batch_prompt_uses_compact_wire_schema() -> None:
 
     assert '"a":["l|s|h|cl|cs",...]' in prompt
     assert "Production Qwen ultra-compact mode" in prompt
+    assert "QWEN_TARGET_BATCH_V3" in prompt
     assert "position_size_pct" not in prompt
     assert len(prompt) < 4_000
 
@@ -525,10 +532,9 @@ def test_compact_batch_prompt_includes_direction_rules() -> None:
         {"review_positions": False, "_compact_qwen_batch": True},
     )
 
-    assert "do not default every role to hold" in prompt
-    assert "RSI/MACD/EMA/ADX" in prompt
-    assert "returns、成交量和短期波动同向时报 l 或 s" in prompt
-    assert "无对应持仓必须报 h" in prompt
+    assert "Rules: trend=direction; momentum=payoff; sentiment=timing" in prompt
+    assert "rsi14=72" in prompt
+    assert "returns1=0.01" in prompt
 
 
 def test_batch_expert_prompt_can_scope_to_provider_group() -> None:
@@ -1147,7 +1153,7 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
     monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 26.0)
-    monkeypatch.setattr(settings, "ai_target_qwen_queue_wait_seconds", 0.01)
+    assert PHASE3_TARGET_QUEUE_WAIT_SECONDS == 2.0
     target_capacity = llm_agent_module._ScopedLLMCapacity(1)
     monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
     _BatchTimeoutExpert.batch_calls = 0
@@ -1162,7 +1168,14 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
 
     holder = target_capacity.slot({"_analysis_budget_scope": "market:holder"})
     await holder.__aenter__()
-    context: dict[str, Any] = {}
+    context: dict[str, Any] = {
+        "_analysis_deadline_monotonic": (
+            asyncio.get_running_loop().time()
+            + PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS
+        ),
+        "_analysis_budget_scope": "market_ai",
+        "_analysis_budget_seconds": PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
+    }
     started = asyncio.get_running_loop().time()
     try:
         decisions = await registry.decide_all(
@@ -1173,10 +1186,61 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
         await holder.__aexit__(None, None, None)
 
     assert decisions == {}
-    assert asyncio.get_running_loop().time() - started < 0.5
+    assert asyncio.get_running_loop().time() - started < 2.5
     assert _BatchTimeoutExpert.batch_calls == 0
     assert {row["status"] for row in context["_model_timings"]} == {"provider_queue_deferred"}
     assert not context.get("_attempted_models")
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_budget_does_not_cancel_before_http_response_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        llm_agent_module,
+        "_TARGET_QWEN_CAPACITY",
+        llm_agent_module._ScopedLLMCapacity(1),
+    )
+    monkeypatch.setattr(_ProviderBatchExpert, "batch_calls", [])
+    registry = ModelRegistry()
+    for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    ):
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3.8-27b",
+                batch_delay_seconds=0.05,
+            )
+        )
+
+    context: dict[str, Any] = {
+        "_analysis_deadline_monotonic": (
+            asyncio.get_running_loop().time()
+            + PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
+        ),
+        "_analysis_budget_scope": "market_symbol_ai",
+        "_analysis_budget_seconds": PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
+    }
+
+    decisions = await registry.decide_all(
+        FeatureVector(symbol="BTC/USDT"),
+        context,
+    )
+
+    assert set(decisions) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    }
+    assert {row["status"] for row in context["_model_timings"]} == {"completed"}
+    assert context["_model_timings"][0]["duration_sec"] < PHASE3_TARGET_HTTP_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -1184,7 +1248,6 @@ async def test_target_qwen_queue_is_shared_across_registries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
-    monkeypatch.setattr(settings, "ai_target_qwen_queue_wait_seconds", 1.0)
     target_capacity = llm_agent_module._ScopedLLMCapacity(1)
     monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
 

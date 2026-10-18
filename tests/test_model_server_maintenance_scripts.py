@@ -78,7 +78,7 @@ def test_target_runtime_contract_cannot_inherit_stale_carrier_limits() -> None:
         "export BB_TARGET_MAX_NEW_TOKENS=${BB_TARGET_MAX_NEW_TOKENS:-96}\n"
     )
     normalized = _normalize_script(stale)
-    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5" in normalized
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0" in normalized
     assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in normalized
     assert "export BB_TARGET_MAX_NEW_TOKENS=96" in normalized
     assert "${BB_TARGET_QUEUE_WAIT_SECONDS:-6}" not in normalized
@@ -95,7 +95,7 @@ def test_target_runtime_contract_cannot_inherit_stale_carrier_limits() -> None:
             "runtime": {"engine": "transformers"},
         }
     )
-    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=0.5" in script
+    assert "export BB_TARGET_QUEUE_WAIT_SECONDS=2.0" in script
     assert "export BB_TARGET_GENERATION_TIMEOUT_SECONDS=26" in script
 
 
@@ -373,7 +373,9 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     app_dir.mkdir()
     monkeypatch.setattr(sync, "REMOTE_RUNTIME_ENV_PATH", str(runtime_env))
     runtime_env.write_text(
-        "DATABASE_URL=postgresql+asyncpg://runtime\n" "BB_SECURE_SETTINGS_KEY=runtime-key\n",
+        "DATABASE_URL=postgresql+asyncpg://runtime\n"
+        "BB_SECURE_SETTINGS_KEY=runtime-key\n"
+        "AI_TARGET_QWEN_QUEUE_WAIT_SECONDS=0\n",
         encoding="utf-8",
     )
     app_env = app_dir / ".env"
@@ -421,6 +423,7 @@ def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(
     assert "qwen3.8-27b" in runtime_text
     assert "deepseek" not in runtime_text.lower()
     assert "HIGH_RISK_REVIEW_" not in runtime_text
+    assert "AI_TARGET_QWEN_QUEUE_WAIT_SECONDS" not in runtime_text
 
 
 def test_sync_to_online_server_runtime_env_preserves_online_decision_maker(

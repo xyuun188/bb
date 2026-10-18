@@ -125,14 +125,23 @@ class MarketAnalysisDeferTracker:
             if key not in eligible:
                 self.blocked_candidates.pop(key, None)
 
-    def ordered_symbols(self) -> list[str]:
+    def ordered_symbols(
+        self,
+        *,
+        exclude_reasons: Iterable[str] = (),
+    ) -> list[str]:
+        excluded = {str(reason or "").strip() for reason in exclude_reasons}
         now = datetime.now(UTC)
         for key, candidate in list(self.blocked_candidates.items()):
             if candidate.next_retry_at is None or now >= candidate.next_retry_at:
                 candidate.next_retry_at = None
                 self.candidates[key] = candidate
                 self.blocked_candidates.pop(key, None)
-        return [candidate.symbol for candidate in self.candidates.values()]
+        return [
+            candidate.symbol
+            for candidate in self.candidates.values()
+            if candidate.reason not in excluded
+        ]
 
     def snapshot(
         self,

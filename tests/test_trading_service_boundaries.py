@@ -16,6 +16,7 @@ import services.model_training_coordinator as model_training_coordinator
 import services.sync_service as sync_module
 import services.trading_service as trading_service
 from ai_brain.base_model import Action, DecisionOutput
+from core.phase3_model_contract import PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
 from core.symbols import normalize_trading_symbol
 from core.trading_mode import mode_manager
 from executor.base_executor import ExecutionResult, OrderStatus
@@ -4664,7 +4665,7 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
             target_count: int,
             concurrency: int,
         ) -> dict[str, Any]:
-            assert target_count == 2
+            assert target_count == 3
             assert concurrency == 4
             return {
                 "selected_symbols": [],
@@ -4705,14 +4706,15 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
             "PI/USDT": object(),
             "ETH/USDT": object(),
         },
-        2,
+        3,
         "paper",
     )
 
-    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
+    assert list(selected) == ["BTC/USDT"]
     diagnostics = service._last_auto_feature_rank_diagnostics
-    assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 2
+    assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 1
     assert diagnostics["execution_availability"]["execution_verified_selected_count"] == 0
+    assert diagnostics["execution_availability"]["analysis_only_fallback_truncated_count"] == 1
     ranked = {item["symbol"]: item for item in diagnostics["ranked_symbol_sample"]}
     assert ranked["BTC/USDT"]["analysis_only"] is True
     assert ranked["BTC/USDT"]["execution_candidate_state"] == (
@@ -4725,6 +4727,87 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
     assert "PI/USDT" in service._unavailable_entry_symbols_by_mode["paper"]
     assert "BTC/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
     assert "ETH/USDT" not in service._unavailable_entry_symbols_by_mode["paper"]
+
+
+@pytest.mark.asyncio
+async def test_market_shortlist_limits_unverified_tail_when_verified_candidates_exist() -> None:
+    service = TradingService.__new__(TradingService)
+    service._last_auto_feature_rank_diagnostics = {
+        "selected": 5,
+        "ranked_symbol_sample": [
+            {"symbol": symbol, "selected": True}
+            for symbol in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT")
+        ],
+    }
+    service._verified_entry_symbols_by_mode = {"paper": {"BTC/USDT", "ETH/USDT"}}
+    service._unavailable_entry_symbols_by_mode = {"paper": {}}
+    service._market_analysis_only_symbols = set()
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(
+            service,
+            "_schedule_market_instrument_availability_refresh",
+            lambda *_args, **_kwargs: None,
+        )
+        selected = await service._filter_entry_instrument_shortlist(
+            {
+                "BTC/USDT": object(),
+                "ETH/USDT": object(),
+                "SOL/USDT": object(),
+                "XRP/USDT": object(),
+                "ADA/USDT": object(),
+            },
+            5,
+            "paper",
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    diagnostics = service._last_auto_feature_rank_diagnostics["execution_availability"]
+    assert diagnostics["execution_verified_selected_count"] == 2
+    assert diagnostics["analysis_only_selected_count"] == 1
+    assert diagnostics["analysis_only_fallback_limit"] == 1
+    assert diagnostics["analysis_only_fallback_truncated_count"] == 2
+
+
+def test_hydration_rerank_does_not_restore_unverified_analysis_tail() -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_analysis_only_symbols = set()
+    features = {
+        symbol: object()
+        for symbol in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT")
+    }
+
+    class Ranker:
+        def rank(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                selected=dict(features),
+                diagnostics={
+                    "analysis_only_selected_symbols": list(features),
+                    "selected": len(features),
+                },
+            )
+
+    service.entry_feature_ranker = Ranker()
+    service._last_auto_feature_rank_diagnostics = {
+        "execution_availability": {
+            "unavailable": [],
+            "analysis_only_execution_unverified": [
+                {"symbol": "SOL/USDT"},
+                {"symbol": "XRP/USDT"},
+            ],
+        }
+    }
+
+    selected = service._rank_auto_feature_vectors(features, limit=4)
+
+    assert list(selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    diagnostics = service._last_auto_feature_rank_diagnostics
+    assert diagnostics["execution_verified_selected_count"] == 2
+    assert diagnostics["analysis_only_selected_symbols"] == ["SOL/USDT"]
+    assert diagnostics["analysis_only_fallback_truncated_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -8040,7 +8123,7 @@ def test_target_qwen_market_budget_has_no_unused_model_windows(
     assert service._target_qwen_single_call_route() is True
     assert service._independent_expert_window_seconds() == 0.0
     assert service.market_model_inference_timeout_seconds() == pytest.approx(
-        max(target_timeout, trading_service.TARGET_QWEN_CALL_TIMEOUT_SECONDS)
+        PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
         + trading_service.MARKET_MODEL_COMPLETION_RESERVE_SECONDS
     )
 

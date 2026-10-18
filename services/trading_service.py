@@ -28,16 +28,14 @@ from sqlalchemy import Float, cast, select
 from ai_brain.analysis_quality import build_expert_call_contract
 from ai_brain.base_model import Action, DecisionOutput
 from ai_brain.ensemble_coordinator import EnsembleCoordinator
-from ai_brain.model_registry import (
-    TARGET_QWEN_CALL_TIMEOUT_SECONDS,
-    ModelRegistry,
-)
+from ai_brain.model_registry import ModelRegistry
 from config.settings import (
     DECISION_MAKER_NAME,
     ENSEMBLE_TRADER_NAME,
     MARKET_ANALYSIS_EXPERT_NAMES,
     settings,
 )
+from core.phase3_model_contract import PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
 from core.safe_output import safe_error_tail, safe_error_text
 from core.trading_mode import mode_manager
 from db.repositories.decision_repo import DecisionRepository
@@ -345,6 +343,9 @@ MARKET_ROUND_FINALIZATION_RESERVE_SECONDS = 15.0
 # and remain eligible through the defer tracker.
 MARKET_ROUND_SCHEDULER_MAX_SECONDS = 120.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
+# Keep one unverified paper observation for learning without allowing a large
+# analysis-only tail to monopolize the single-worker model's request budget.
+MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT = 1
 # Keep the single-flight queue above the 75-second entry handoff deadline.
 # The final execution boundary refreshes market/account facts before submit.
 # Entry risk preparation and exchange submission are independent per-symbol
@@ -1458,9 +1459,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # generic 35-second batch setting is for cloud/multi-provider
             # callers and makes a stale response look like a healthy model
             # that is merely "slow". Keep the outer market budget aligned
-            # with the carrier's configured generation boundary.
+            # with the complete bounded target call, including queue and
+            # response delivery margin.
             if target_qwen_configured:
-                batch_window = TARGET_QWEN_CALL_TIMEOUT_SECONDS
+                batch_window = PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
         if batch_window > 0.0:
             independent_window = 0.0
         decision_timeout = max(
@@ -6727,7 +6729,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in verified_symbols
         ]
-        deferred_symbols = self._market_defer_tracker().ordered_symbols()
+        deferred_symbols = self._market_defer_tracker().ordered_symbols(
+            exclude_reasons={"shortlist_capacity"},
+        )
         deferred_keys = {
             self._normalize_position_symbol(symbol)
             for symbol in deferred_symbols
@@ -8385,6 +8389,75 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # _last_auto_feature_rank_diagnostics before its first ranking pass.
         if execution_availability:
             result.diagnostics["execution_availability"] = dict(execution_availability)
+            # Indicator hydration re-ranks the shortlist.  The ranker is
+            # intentionally allowed to fill observation slots, but it must
+            # not undo the capability boundary established immediately
+            # before hydration.  Without this second boundary, a verified
+            # candidate round could expand back into the whole
+            # ``analysis_only`` tail and monopolize the single-worker model.
+            unavailable_keys = {
+                self._normalize_position_symbol(item.get("symbol"))
+                for item in execution_availability.get("unavailable", [])
+                if isinstance(item, dict)
+                and self._normalize_position_symbol(item.get("symbol"))
+            }
+            unverified_keys = {
+                self._normalize_position_symbol(item.get("symbol"))
+                for item in execution_availability.get(
+                    "analysis_only_execution_unverified", []
+                )
+                if isinstance(item, dict)
+                and self._normalize_position_symbol(item.get("symbol"))
+            }
+            verified_keys = {
+                self._normalize_position_symbol(symbol)
+                for symbol in feature_vectors
+                if self._normalize_position_symbol(symbol)
+                not in unavailable_keys | unverified_keys
+            }
+            if verified_keys:
+                ranked_verified = [
+                    symbol
+                    for symbol in result.selected
+                    if self._normalize_position_symbol(symbol) in verified_keys
+                ]
+                ranked_unverified = [
+                    symbol
+                    for symbol in result.selected
+                    if self._normalize_position_symbol(symbol) in unverified_keys
+                ]
+                constrained_unverified = ranked_unverified[
+                    :MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT
+                ]
+                constrained_symbols = list(
+                    dict.fromkeys(ranked_verified + constrained_unverified)
+                )
+                constrained_selected = {
+                    symbol: feature_vectors[symbol]
+                    for symbol in constrained_symbols
+                    if symbol in feature_vectors
+                }
+                result.selected.clear()
+                result.selected.update(constrained_selected)
+                result.diagnostics["analysis_only_selected_symbols"] = [
+                    symbol for symbol in constrained_symbols if symbol in ranked_unverified
+                ]
+                result.diagnostics["analysis_only_selected_count"] = len(
+                    result.diagnostics["analysis_only_selected_symbols"]
+                )
+                result.diagnostics["analysis_only_fallback_limit"] = (
+                    MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT
+                    if ranked_unverified
+                    else 0
+                )
+                result.diagnostics["analysis_only_fallback_truncated_count"] = max(
+                    len(unverified_keys) - len(constrained_unverified),
+                    0,
+                )
+                result.diagnostics["execution_verified_selected_count"] = len(
+                    ranked_verified
+                )
+                result.diagnostics["selected"] = len(result.selected)
         logger.info(
             "auto opportunity shortlist",
             **result.diagnostics,
@@ -8765,13 +8838,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if str(symbol) in feature_vectors
             and candidate_state(str(symbol)) != "execution_unavailable"
         ]
-        selected_order = list(dict.fromkeys(availability_selected))
-        selected_order.extend(
+        selected_order = [
+            symbol
+            for symbol in dict.fromkeys(availability_selected)
+            if candidate_state(symbol) == "execution_verified"
+        ]
+        unverified_order = [
             str(symbol)
             for symbol in feature_vectors
             if str(symbol) not in selected_order
-            and candidate_state(str(symbol)) != "execution_unavailable"
-        )
+            and candidate_state(str(symbol)) == "analysis_only_execution_unverified"
+        ]
+        # Preserve one read-only exploration sample while prioritizing every
+        # currently executable symbol.  An unverified candidate cannot submit
+        # an order, so expanding this fallback to the whole shortlist only
+        # queues useless model calls behind the single-worker carrier and
+        # turns a capability probe delay into batch timeouts.
+        unverified_limit = MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT
+        selected_order.extend(unverified_order[:unverified_limit])
         selected_order = selected_order[:target]
         selected = {symbol: feature_vectors[symbol] for symbol in selected_order}
         selected_symbols = set(selected)
@@ -8832,6 +8916,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "analysis_only_selected_count": sum(
                 state == "analysis_only_execution_unverified"
                 for state in selected_states.values()
+            ),
+            "analysis_only_fallback_limit": unverified_limit if unverified_order else 0,
+            "analysis_only_fallback_truncated_count": max(
+                len(unverified_order) - unverified_limit,
+                0,
             ),
             "selected_count": len(selected),
             "target_count": target,

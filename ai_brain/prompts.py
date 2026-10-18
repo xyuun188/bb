@@ -142,8 +142,53 @@ _ROLE_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+_QWEN_COMPACT_ROLE_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "trend_expert": (
+        "rsi14",
+        "macd_diff",
+        "adx14",
+        "price_vs_sma20",
+        "price_vs_sma50",
+    ),
+    "momentum_expert": (
+        "returns1",
+        "returns5",
+        "returns20",
+        "volume_ratio",
+        "vol20",
+    ),
+    "sentiment_expert": (
+        "returns1",
+        "returns5",
+        "news_sent",
+        "social_sent",
+        "direct_news",
+        "market_background_news",
+    ),
+    "position_expert": (
+        "returns5",
+        "returns20",
+        "rsi14",
+        "vol20",
+    ),
+    "risk_expert": (
+        "abnormal_wick_count72h",
+        "abnormal_wick_max",
+        "vol20",
+        "atr14",
+        "funding",
+        "ob_imbalance",
+    ),
+}
 
-def _compact_role_signal(value: Any, expert_name: str, limit: int = 220) -> str:
+
+def _compact_role_signal(
+    value: Any,
+    expert_name: str,
+    limit: int = 220,
+    *,
+    selected_fields: tuple[str, ...] | None = None,
+) -> str:
     """Keep role-relevant key/value evidence inside the compact batch contract."""
 
     text = " ".join(str(value or "").split())
@@ -158,7 +203,7 @@ def _compact_role_signal(value: Any, expert_name: str, limit: int = 220) -> str:
     if not fields:
         return text[:limit]
 
-    selected = _ROLE_SIGNAL_FIELDS.get(expert_name, ())
+    selected = selected_fields or _ROLE_SIGNAL_FIELDS.get(expert_name, ())
     parts: list[str] = []
     for key in selected:
         item = fields.get(key)
@@ -702,20 +747,26 @@ def build_batch_experts_user_prompt(
             # bounded role-scoped context.  A prefix-only truncation used to
             # discard the role's RSI/ADX/return/news evidence, making every
             # expert see the same symbol/price header and default to hold.
-            name: _compact_role_signal(market_by_expert.get(name, ""), name)
+            name: _compact_role_signal(
+                market_by_expert.get(name, ""),
+                name,
+                limit=110,
+                selected_fields=_QWEN_COMPACT_ROLE_SIGNAL_FIELDS.get(name),
+            )
             for name in requested_experts
         }
         compact_order = ",".join(requested_experts)
-        compact_role_rules = "\n".join(
-            f"- {name}: {compact_role_contracts[name]}" for name in requested_experts
+        compact_role_rules = (
+            "trend=direction; momentum=payoff; sentiment=timing; "
+            "position=exit; risk=safety. Use h only for neutral, conflicting, "
+            "missing, or unsupported evidence."
         )
         return (
-            "QWEN_TARGET_BATCH_V2\n"
+            "QWEN_TARGET_BATCH_V3\n"
             "Production Qwen ultra-compact mode. JSON only; no markdown/thinking/reasoning. "
             f"Return exactly {{\"a\":[\"l|s|h|cl|cs\",...]}} in this order: {compact_order}. "
             "Use one action code per item only; never include expert names, confidence, or explanations.\n"
-            "Role rules (follow these; do not default every role to hold):\n"
-            f"{compact_role_rules}\n"
+            f"Rules: {compact_role_rules}\n"
             f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
             "Codes: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
             "No invented data; position_expert=hold without a position."
