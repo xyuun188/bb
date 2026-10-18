@@ -20,6 +20,7 @@ from services.normal_paper_trade import (
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
     normalize_normal_paper_contract,
+    reconcile_normal_paper_trade_contract,
     select_normal_paper_trade_side,
 )
 from tests.legacy_paper_contract_fixtures import (
@@ -113,6 +114,62 @@ def _decision(raw: dict, *, action: Action = Action.LONG) -> DecisionOutput:
         raw_response=raw,
         feature_snapshot={"current_price": 100.0},
     )
+
+
+def test_reconcile_normal_trade_uses_current_execution_return_and_blocks_stale_positive_edge() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=0.1),
+    )
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": -0.12,
+            "return_lcb_pct": -0.55,
+            "execution_cost": {"total_pct": 0.31},
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": 0.19}
+            },
+        },
+    )
+
+    assert reconciled["authorized"] is False
+    assert reconciled["expected_net_return_pct"] == pytest.approx(-0.12)
+    assert reconciled["current_raw_expected_return_pct"] == pytest.approx(0.19)
+    assert reconciled["reconciliation"]["status"] == (
+        "blocked_current_execution_return"
+    )
+    assert "normal_paper_trade_expected_net_not_positive" in (
+        normal_paper_trade_contract_reasons(reconciled)
+    )
+
+
+def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=0.1),
+    )
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+            "execution_cost": {"total_pct": 0.19},
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": 0.27}
+            },
+        },
+    )
+
+    assert reconciled["authorized"] is True
+    assert reconciled["current_edge_validated"] is True
+    assert reconciled["expected_net_return_pct"] == pytest.approx(0.08)
+    assert reconciled["current_raw_expected_return_pct"] == pytest.approx(0.27)
+    assert normal_paper_trade_contract_reasons(reconciled) == []
 
 
 def test_positive_net_direction_builds_normal_policy_trade() -> None:

@@ -754,6 +754,77 @@ def build_normal_paper_trade_contract(
     return contract
 
 
+def reconcile_normal_paper_trade_contract(
+    value: Any,
+    opportunity: Any,
+) -> dict[str, Any]:
+    """Bind entry permission to the final current execution return contract.
+
+    Direction support is calculated before the executable orderbook snapshot is
+    available. The opportunity scorer is the later, authoritative cost pass.
+    Keep the original direction evidence for audit, but make the persisted
+    normal-paper contract consume the same net return and downside values that
+    sizing and execution consume.
+    """
+
+    contract = dict(_dict(value))
+    if contract.get("version") != NORMAL_PAPER_TRADE_VERSION:
+        return contract
+    scored = _dict(opportunity)
+    expected_net = _float(scored.get("expected_net_return_pct"), None)
+    return_lcb = _float(scored.get("return_lcb_pct"), None)
+    if expected_net is None or return_lcb is None:
+        return contract
+
+    distribution = _dict(scored.get("return_distribution_contract"))
+    gross_distribution = _dict(distribution.get("gross_market_distribution"))
+    gross_expected = _float(gross_distribution.get("raw_expected_return_pct"), None)
+    previous = {
+        "expected_net_return_pct": contract.get("expected_net_return_pct"),
+        "objective_net_return_pct": contract.get("objective_net_return_pct"),
+        "current_raw_expected_return_pct": contract.get(
+            "current_raw_expected_return_pct"
+        ),
+    }
+    contract["expected_net_return_pct"] = round(expected_net, 8)
+    contract["objective_net_return_pct"] = round(return_lcb, 8)
+    if gross_expected is not None:
+        contract["current_raw_expected_return_pct"] = round(gross_expected, 8)
+    contract["current_edge_validated"] = bool(
+        expected_net > 0.0
+        and not contract.get("strong_expert_opposition")
+    )
+    contract["reconciliation"] = {
+        "version": "2026-10-18.normal-paper-current-execution-return.v1",
+        "source": "opportunity_score",
+        "status": (
+            "authorized"
+            if contract["current_edge_validated"]
+            and contract.get("authorized") is True
+            else "blocked_current_execution_return"
+        ),
+        "previous": previous,
+        "current": {
+            "expected_net_return_pct": round(expected_net, 8),
+            "return_lcb_pct": round(return_lcb, 8),
+            "gross_expected_return_pct": (
+                round(gross_expected, 8) if gross_expected is not None else None
+            ),
+            "execution_cost_pct": _float(
+                _dict(scored.get("execution_cost")).get("total_pct"),
+                None,
+            ),
+        },
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+    if not contract["current_edge_validated"]:
+        contract["authorized"] = False
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    return contract
+
+
 def ensure_normal_paper_trade_contract(
     decision: DecisionOutput,
     model_mode: str,

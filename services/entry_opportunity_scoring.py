@@ -32,6 +32,7 @@ from services.model_strategy_blueprint import (
     model_strategy_side_authorization,
     paper_strategy_authorization,
 )
+from services.normal_paper_trade import reconcile_normal_paper_trade_contract
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -992,6 +993,26 @@ class EntryOpportunityScoringPolicy:
             "policy_provenance": provenance,
             "strategy_context_observation_only": safe_dict(strategy),
         }
+        normal_trade = safe_dict(raw.get("normal_paper_trade"))
+        if normal_trade:
+            reconciled = reconcile_normal_paper_trade_contract(
+                normal_trade,
+                raw["opportunity_score"],
+            )
+            raw["normal_paper_trade"] = reconciled
+            if reconciled.get("authorized") is not True:
+                permission = safe_dict(raw.get("entry_permission"))
+                permission.update(
+                    {
+                        "granted": False,
+                        "reason": "current_execution_return_not_positive",
+                        "blocking_category": "profit_gate",
+                        "blocking_reasons": [
+                            "current_execution_return_not_positive"
+                        ],
+                    }
+                )
+                raw["entry_permission"] = permission
         decision.raw_response = raw
         self.annotate_decision_source(decision)
         return score
