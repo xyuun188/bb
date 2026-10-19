@@ -396,23 +396,6 @@ def assess_directional_entry_support(
                     "break_even_contract",
                 )
             }
-    quality_observation_reasons = sorted(
-        {
-            str(reason)
-            for permission in quant_quality_permissions.values()
-            if permission.get("paper_execution_permission") is not True
-            for reason in (
-                permission.get("paper_execution_blockers")
-                or [permission.get("paper_execution_reason")]
-            )
-            if str(reason).strip()
-        }
-    )
-    quality_permission_missing = bool(quant_quality_permissions) and any(
-        permission.get("paper_execution_permission") is not True
-        for permission in quant_quality_permissions.values()
-    )
-
     if paper_scope:
         opposite_rows = _dict(competition.get(opposite_side)).get("evidence")
         opposite_summaries = _quant_family_summaries(
@@ -502,6 +485,27 @@ def assess_directional_entry_support(
             for item in effective_families
             for source in item.get("sources") or []
         }
+    )
+    quant_quality_permissions = {
+        source: permission
+        for source, permission in quant_quality_permissions.items()
+        if source in quantitative_sources
+    }
+    quality_observation_reasons = sorted(
+        {
+            str(reason)
+            for permission in quant_quality_permissions.values()
+            if permission.get("paper_execution_permission") is not True
+            for reason in (
+                permission.get("paper_execution_blockers")
+                or [permission.get("paper_execution_reason")]
+            )
+            if str(reason).strip()
+        }
+    )
+    quality_permission_missing = any(
+        _dict(quant_quality_permissions.get(source)).get("paper_execution_permission") is not True
+        for source in quantitative_sources
     )
     quant_families = sorted(str(item["family"]) for item in effective_families)
     # When no family survives directional screening, retain the complete

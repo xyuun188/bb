@@ -5183,18 +5183,18 @@ async def _dashboard_pending_closed_position_rows_uncached(
     )
     from services.okx_position_ledger_view import build_okx_position_ledger_groups
     from services.position_settlement import (
-        final_settlement_status_values,
+        non_pending_settlement_status_values,
         settlement_display_state,
     )
 
-    final_statuses = final_settlement_status_values()
+    non_pending_statuses = non_pending_settlement_status_values()
     position_stmt = select(Position).where(
         Position.is_open.is_(False),
         Position.closed_at.is_not(None),
         or_(
             Position.settlement_status.is_(None),
             Position.settlement_status == "",
-            Position.settlement_status.not_in(final_statuses),
+            Position.settlement_status.not_in(non_pending_statuses),
         ),
     )
     if mode:
@@ -5217,8 +5217,11 @@ async def _dashboard_pending_closed_position_rows_uncached(
     pending_positions = [
         position
         for position in pending_positions
-        if str(getattr(position, "settlement_status", "") or "").strip()
-        != "superseded_position_residual"
+        if settlement_display_state(
+            getattr(position, "settlement_status", None),
+            getattr(position, "settlement_source", None),
+            getattr(position, "settlement_raw", None),
+        )["retryable"]
     ]
     if not pending_positions:
         return []
@@ -14044,7 +14047,8 @@ async def _get_expert_memories_uncached(
             "version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
             "loaded_count": len(outcomes),
             "complete_count": complete_outcome_count,
-            "pending_settlement_count": max(reflection_total - complete_outcome_count, 0),
+            "pending_settlement_count": len(outcomes) - complete_outcome_count,
+            "settlement_count_scope": "loaded_authoritative_outcomes",
             "orphan_reflection_count": orphan_reflection_count,
             "shadow_sample_count": shadow_sample_count,
             "production_evidence_eligible_count": production_evidence_eligible_count,

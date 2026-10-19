@@ -968,10 +968,6 @@ class EnsembleCoordinator:
             )
             if normal_contract.get("authorized") is True:
                 action = Action.LONG if selected_side == "long" else Action.SHORT
-                training_entry = (
-                    str(normal_contract.get("selection_reason") or "").strip()
-                    == "paper_training_entry"
-                )
                 loss_probability = self._finite_or_none(selected_support.get("loss_probability"))
                 confidence = (
                     min(
@@ -1012,7 +1008,7 @@ class EnsembleCoordinator:
                     "granted": True,
                     "scope": "paper_only",
                     "reason": normal_contract["selection_reason"],
-                    "training_only": training_entry,
+                    "training_only": False,
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(
@@ -1046,6 +1042,9 @@ class EnsembleCoordinator:
                 **paper_selection,
                 "decision_authority": "ensemble",
             }
+            if normal_contract:
+                hold_raw["normal_paper_trade"] = normal_contract
+                hold_raw["independent_direction_support"] = selected_support
             hold_raw["entry_permission"] = {
                 "granted": False,
                 "reason": str(paper_selection.get("selection_reason") or "no_direction"),
@@ -1065,7 +1064,9 @@ class EnsembleCoordinator:
             hold_raw["memory_feedback_observation"] = self._memory_feedback(context)
             selection_status = str(paper_selection.get("diagnostic_status") or "")
             reason_text = (
-                "模型已完成分析，但当前费后收益/质量门禁未通过，本轮保持观望"
+                "当前方向尚未通过费后质量验证，继续影子复盘训练"
+                if normal_contract.get("paper_training_only") is True
+                else "模型已完成分析，但当前费后收益/质量门禁未通过，本轮保持观望"
                 if selection_status == "profit_gate_blocked"
                 else "模型分析证据尚不完整，本轮保持观望"
                 if selection_status == "evidence_blocked"

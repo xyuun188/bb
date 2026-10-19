@@ -10,6 +10,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_VERSION,
     combine_paper_return_distribution,
     combine_production_return_distribution,
+    reprice_execution_opportunity,
     reprice_execution_return_distribution,
     risk_adjusted_expected_return,
     standardized_return_distribution,
@@ -108,6 +109,45 @@ def test_lower_quantile_above_raw_expected_is_blocked_not_clamped() -> None:
             tail_loss_probability=0.1,
             tail_loss_scale_pct=0.5,
         )
+
+
+def test_cost_refresh_rebuilds_from_gross_and_updates_every_net_alias() -> None:
+    distribution = combine_paper_return_distribution(
+        side="long",
+        model_contracts=[
+            _distribution(
+                raw_expected_return_pct=0.197,
+                median_return_pct=0.19,
+                lower_quantile_return_pct=-0.3,
+            )
+        ],
+        current_execution_cost_pct=0.1,
+        current_slippage_pct=0.02,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+        source_authority="test_paper",
+    )
+    distribution["raw_expected_return_pct"] = 0.5
+    opportunity = reprice_execution_opportunity(
+        {
+            "expected_net_return_pct": 0.5,
+            "expected_realized_net_return_pct": 0.5,
+            "return_distribution_contract": distribution,
+        },
+        execution_cost={"total_pct": 0.565, "slippage_pct": 0.465},
+    )
+    assert opportunity["expected_net_return_pct"] == pytest.approx(-0.368)
+    assert opportunity["expected_realized_net_return_pct"] == pytest.approx(-0.368)
+    assert opportunity["expected_net_breakdown"]["net_pct"] == pytest.approx(-0.368)
+    assert opportunity["return_lcb_pct"] == opportunity["realized_net_lcb_pct"]
+    repriced = opportunity["return_distribution_contract"]
+    assert repriced["median_return_pct"] == pytest.approx(-0.375)
+    assert repriced["lower_quantile_return_pct"] == pytest.approx(-0.865)
+    assert repriced["upper_quantile_return_pct"] == pytest.approx(0.535)
+    assert opportunity["return_lcb_pct"] == pytest.approx(-0.915)
+    repeated = reprice_execution_opportunity(
+        opportunity, execution_cost=opportunity["execution_cost"]
+    )
+    assert repeated == opportunity
 
 
 @pytest.mark.parametrize("expected", (-1.2, -0.1, 0.0, 0.4, 2.0))

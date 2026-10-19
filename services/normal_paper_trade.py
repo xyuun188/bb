@@ -11,10 +11,11 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-14.normal-paper-strategy-trade.v17"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-14.normal-paper-dynamic-risk.v9"
+NORMAL_PAPER_TRADE_VERSION = "2026-10-20.normal-paper-strategy-trade.v18"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-20.normal-paper-dynamic-risk.v10"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
+        "2026-10-14.normal-paper-dynamic-risk.v9",
         "2026-10-10.normal-paper-dynamic-risk.v8",
         "2026-08-25.normal-paper-dynamic-risk.v5",
         "2026-10-07.normal-paper-dynamic-risk.v6",
@@ -25,6 +26,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-14.normal-paper-strategy-trade.v17",
         "2026-10-10.normal-paper-strategy-trade.v16",
         "2026-10-09.normal-paper-strategy-trade.v15",
         "2026-09-26.normal-paper-strategy-trade.v14",
@@ -50,7 +52,7 @@ NORMAL_PAPER_TRADE_SELECTION_REASONS = {
 }
 # Observation envelopes are learning evidence, never order authorization.
 NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
-    {"strategy_edge_selected", "paper_training_entry"}
+    {"strategy_edge_selected"}
 )
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
@@ -367,14 +369,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def select_normal_paper_trade_side(
     support_by_side: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Select a validated edge or a bounded current-signal training entry.
-
-    Historical profitability permission governs promotion, not whether the
-    system may collect a new authoritative paper outcome.  A training entry
-    still requires a positive current expected return, complete execution
-    cost, directional evidence, and a bounded loss probability; it only
-    relaxes the historical positive-LCB/quality-permission requirement.
-    """
+    """Select an executable validated edge or a shadow training observation."""
 
     by_side = {
         side: dict(_dict(_dict(support_by_side).get(side)))
@@ -528,9 +523,6 @@ def select_normal_paper_trade_side(
             if str(reason).strip()
         )
     )
-    # Keep the old selection_reason for persisted-contract compatibility, but
-    # expose a single diagnostic vocabulary so callers do not have to infer a
-    # profit gate from the ambiguous ``no_direction`` value.
     quality_gate_reasons = {
         "direction_support_expected_net_not_positive",
         "direction_support_objective_net_not_positive",
@@ -668,7 +660,6 @@ def build_normal_paper_trade_contract(
         or not quality_permissions
         or (
             selection_reason == "strategy_edge_selected"
-            and not current_edge_validated
             and any(
                 permission.get("paper_execution_permission") is not True
                 for permission in quality_permissions.values()
@@ -728,8 +719,7 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        # Training eligibility controls whether the signal may enter; it does
-        # not silently turn an otherwise valid entry into a micro-order.
+        # Ordinary entries use one risk policy; shadow observations cannot submit orders.
         "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
@@ -794,12 +784,23 @@ def reconcile_normal_paper_trade_contract(
         expected_net > 0.0
         and not contract.get("strong_expert_opposition")
     )
+    quality_permissions = _dict(contract.get("quant_quality_permissions"))
+    ordinary_entry_eligible = bool(
+        contract.get("selection_reason") in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
+        and quality_permissions
+        and all(
+            isinstance(permission, dict)
+            and permission.get("paper_execution_permission") is True
+            for permission in quality_permissions.values()
+        )
+        and contract["current_edge_validated"]
+    )
     contract["reconciliation"] = {
         "version": "2026-10-18.normal-paper-current-execution-return.v1",
         "source": "opportunity_score",
         "status": (
             "authorized"
-            if contract["current_edge_validated"]
+            if ordinary_entry_eligible
             and contract.get("authorized") is True
             else "blocked_current_execution_return"
         ),
@@ -817,7 +818,7 @@ def reconcile_normal_paper_trade_contract(
         },
         "generated_at": datetime.now(UTC).isoformat(),
     }
-    if not contract["current_edge_validated"]:
+    if not ordinary_entry_eligible:
         contract["authorized"] = False
     contract["contract_fingerprint"] = _fingerprint(
         _contract_fingerprint_payload(contract)
@@ -914,13 +915,6 @@ def _normal_strategy_trade_contract_reasons(
     training_mode = selection_reason == "paper_training_entry"
     expected_net = _float(contract.get("expected_net_return_pct"), None)
     objective_net = _float(contract.get("objective_net_return_pct"), None)
-    current_edge_validated = bool(
-        contract.get("current_edge_validated") is True
-        or (
-            selection_reason == "strategy_edge_selected"
-            and normal_paper_current_return_ready(expected_net, objective_net)
-        )
-    )
     observation_only = bool(
         allow_unauthorized_observation and (observation_mode or training_mode)
     )
@@ -1005,14 +999,12 @@ def _normal_strategy_trade_contract_reasons(
                 continue
             if (
                 not observation_mode and not training_mode
-                and not current_edge_validated
                 and permission.get("paper_execution_permission") is not True
             ):
                 reasons.append("normal_paper_trade_quality_permission_denied")
             evidence = _dict(permission.get("paper_execution_evidence"))
             if (
                 not observation_mode and not training_mode
-                and not current_edge_validated
                 and int(_float(evidence.get("sample_count"), 0.0) or 0) <= 0
             ):
                 reasons.append("normal_paper_trade_quality_evidence_missing")

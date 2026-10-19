@@ -47,6 +47,18 @@ def final_settlement_status_values() -> tuple[str, ...]:
     return tuple(sorted(FINAL_SETTLEMENT_STATUSES))
 
 
+def non_pending_settlement_status_values() -> tuple[str, ...]:
+    """Exclude settled, terminal and duplicate rows from active settlement waits."""
+
+    return tuple(
+        sorted(
+            FINAL_SETTLEMENT_STATUSES
+            | TERMINAL_SETTLEMENT_STATUSES
+            | {"superseded_position_residual"}
+        )
+    )
+
+
 def is_final_settlement_status(value: Any) -> bool:
     return str(value or "").strip() in FINAL_SETTLEMENT_STATUSES
 

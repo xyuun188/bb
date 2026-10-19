@@ -648,7 +648,7 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 
 @pytest.mark.asyncio
-async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
+async def test_training_entry_cannot_authorize_normal_paper_sizing() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade["selection_reason"] = "paper_training_entry"
@@ -679,7 +679,9 @@ async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
 
     sizing = decision.raw_response["profit_risk_sizing"]
     dynamic = sizing["dynamic_leverage_decision"]
-    assert sizing["production_eligible"] is True
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0.0
+    assert decision.raw_response["entry_permission"]["granted"] is False
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
@@ -687,6 +689,42 @@ async def test_training_entry_uses_bounded_normal_paper_contract() -> None:
     )
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gross_return", [0.197, 1.2])
+async def test_normal_entry_refreshes_all_return_contracts_from_current_cost(gross_return: float) -> None:
+    decision = _decision()
+    decision.feature_snapshot.update(_size_aware_book_snapshot(5_000.0))
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["return_distribution_contract"].update(
+        {
+            "gross_market_distribution": {"raw_expected_return_pct": gross_return},
+            "transformations": {
+                "live_execution_cost_pct": 0.08,
+                "live_slippage_pct": 0.02,
+                "current_funding_cashflow_pct": 0.0,
+            },
+        }
+    )
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+    raw = decision.raw_response
+    sizing = raw["profit_risk_sizing"]
+    opportunity = raw["opportunity_score"]
+    distribution = opportunity["return_distribution_contract"]
+    normal = raw["normal_paper_trade"]
+    expected = gross_return - opportunity["execution_cost"]["total_pct"]
+    assert sizing["expected_net_return_pct"] == pytest.approx(expected)
+    assert normal["expected_net_return_pct"] == pytest.approx(expected)
+    assert opportunity["expected_realized_net_return_pct"] == pytest.approx(expected)
+    assert distribution["raw_expected_return_pct"] == pytest.approx(expected)
+    assert opportunity["expected_net_breakdown"]["net_pct"] == pytest.approx(expected)
+    assert normal["objective_net_return_pct"] == pytest.approx(sizing["return_lcb_pct"])
+    if expected <= 0.0:
+        assert sizing["production_eligible"] is False
+        assert normal["authorized"] is False
+        assert raw["entry_permission"]["granted"] is False
+        assert sizing["final_notional_usdt"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -721,7 +759,7 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is False
     assert sizing["final_notional_usdt"] == 0.0
-    assert sizing["paper_profitability_gate_applied"] is False
+    assert sizing["paper_profitability_gate_applied"] is True
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["paper_training_shadow_only"] is True
     assert "normal_paper_training_shadow_only" in sizing["reason"]
@@ -786,8 +824,8 @@ async def test_paper_training_reprices_against_distribution_slippage_floor_once(
         )
     )
 
-    assert sizing["production_eligible"] is True
-    assert sizing["paper_training_shadow_only"] is False
+    assert sizing["production_eligible"] is False
+    assert sizing["paper_training_shadow_only"] is True
     assert sizing["expected_net_return_pct"] > 0.0
     assert sizing["expected_net_return_pct"] == pytest.approx(
         expected_net_after_repricing
@@ -858,16 +896,16 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
     sizing = decision.raw_response["profit_risk_sizing"]
     solution = sizing["size_aware_profitability"]
     assert solution["production_eligible"] is entry_eligible
-    assert sizing["production_eligible"] is entry_eligible
-    assert sizing["paper_training_shadow_only"] is not entry_eligible
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0.0
+    assert sizing["paper_training_shadow_only"] is True
     assert sizing["expected_net_return_pct"] == pytest.approx(
         gross_return - sizing["execution_cost"]["total_pct"]
     )
     if entry_eligible:
         assert sizing["expected_net_return_pct"] > 0.0
-        assert sizing["final_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
-        assert sizing["final_notional_usdt"] <= solution["original_notional_usdt"]
-        assert "normal_paper_training_shadow_only" not in sizing["reason"]
+        assert solution["selected_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
+        assert "normal_paper_training_shadow_only" in sizing["reason"]
     else:
         assert sizing["expected_net_return_pct"] <= 0.0
         assert sizing["final_notional_usdt"] == 0.0

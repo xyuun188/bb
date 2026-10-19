@@ -31,12 +31,13 @@ from services.normal_paper_trade import (
     is_normal_paper_trade_decision,
     normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
+    reconcile_normal_paper_trade_contract,
 )
 from services.okx_native_facts import okx_minimum_order_notional_usdt
 from services.production_trade_gate import validate_production_trade_gate
 from services.return_objective import (
     execution_cost_with_slippage_floor,
-    reprice_execution_return_distribution,
+    reprice_execution_opportunity,
 )
 
 RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
@@ -1849,10 +1850,10 @@ class EntryProfitRiskSizingPolicy:
         drawdown_pressure = _clamp(
             _safe_float(strategy.get("drawdown_pressure"), 0.0)
         )
-        contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
         opportunity = _safe_dict(raw.get("opportunity_score"))
-        distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         execution_cost = _safe_dict(opportunity.get("execution_cost"))
+        opportunity = reprice_execution_opportunity(opportunity, execution_cost=execution_cost)
+        distribution = _safe_dict(opportunity.get("return_distribution_contract"))
         facts = (
             await self.exchange_risk_facts(model_mode, decision, open_positions)
             if self.exchange_risk_facts is not None
@@ -2164,21 +2165,23 @@ class EntryProfitRiskSizingPolicy:
                 return_lcb,
             )
             execution_cost = selected_size_cost
-            opportunity["execution_cost"] = execution_cost
-            opportunity["expected_net_return_pct"] = expected_net
-            opportunity["return_lcb_pct"] = return_lcb
-            distribution = reprice_execution_return_distribution(
-                distribution, execution_cost=execution_cost
+            # The solver consumes the current net distribution. Persist that
+            # same cost delta across the full distribution and all aliases.
+            transformations = dict(_safe_dict(distribution.get("transformations")))
+            transformations.setdefault(
+                "live_execution_cost_pct",
+                size_aware_solution["original_execution_cost_pct"],
             )
-            distribution["raw_expected_return_pct"] = expected_net
-            distribution["objective_expected_return_pct"] = return_lcb
+            transformations.setdefault(
+                "live_slippage_pct",
+                _safe_dict(opportunity.get("execution_cost")).get("slippage_pct"),
+            )
+            distribution["transformations"] = transformations
             opportunity["return_distribution_contract"] = distribution
-            breakdown = _safe_dict(opportunity.get("expected_net_breakdown"))
-            if breakdown:
-                breakdown.update(_safe_dict(distribution.get("transformations")))
-                breakdown["net_pct"] = expected_net
-                opportunity["expected_net_breakdown"] = breakdown
-            raw["opportunity_score"] = opportunity
+            opportunity = reprice_execution_opportunity(opportunity, execution_cost=execution_cost)
+            distribution = _safe_dict(opportunity.get("return_distribution_contract"))
+            expected_net = _safe_float(opportunity.get("expected_net_return_pct"), float("nan"))
+            return_lcb = _safe_float(opportunity.get("return_lcb_pct"), float("nan"))
             if size_aware_solution_eligible:
                 target_notional = max(
                     _safe_float(
@@ -2217,17 +2220,21 @@ class EntryProfitRiskSizingPolicy:
                     risk_and_liquidity_ceiling,
                     model_requested_notional_cap,
                 )
-        # Only the solved executable return determines shadow-only status.
-        # A negative full-size estimate can become profitable at a smaller
-        # native book boundary; do not carry its pre-sizing veto forward.
-        training_shadow_only = bool(
-            training_mode
-            and (
-                not isfinite(expected_net)
-                or expected_net <= 0.0
-                or not size_aware_solution_eligible
+        raw["opportunity_score"] = opportunity
+        normal_trade = reconcile_normal_paper_trade_contract(normal_trade, opportunity)
+        raw["normal_paper_trade"] = normal_trade
+        contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
+        if contract_reasons:
+            permission = dict(_safe_dict(raw.get("entry_permission")))
+            permission.update(
+                granted=False,
+                reason=contract_reasons[0],
+                blocking_category="profit_gate",
+                blocking_reasons=contract_reasons,
             )
-        )
+            raw["entry_permission"] = permission
+        decision.raw_response = raw
+        training_shadow_only = training_mode
         negative_lcb_stress_fraction = max(
             negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
         )
@@ -2377,7 +2384,6 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_leverage_tier_incomplete")
         if (
             leverage_decision.policy_provenance.get("production_eligible") is not True
-            and not training_mode
         ):
             reasons.extend(leverage_decision.reasons)
         if not size_aware_solution_eligible:
@@ -2562,7 +2568,7 @@ class EntryProfitRiskSizingPolicy:
                 8,
             ),
             "dynamic_take_profit_fraction": round(dynamic_take_profit, 8),
-            "paper_profitability_gate_applied": not training_mode,
+            "paper_profitability_gate_applied": True,
             "size_aware_profitability": size_aware_solution,
             "selection_reason": normal_trade.get("selection_reason"),
             "single_trade_risk_fraction_cap": round(single_trade_risk_fraction, 8),

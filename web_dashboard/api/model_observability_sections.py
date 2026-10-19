@@ -210,7 +210,7 @@ async def build_expert_memory_observability(
             int(position_id or 0) > 0 and int(position_id) not in outcome_positions
             for position_id in reflection_rows
         )
-        pending_count = max(reflection_count - len(complete_outcomes), 0)
+        pending_count = len(outcomes) - len(complete_outcomes)
         return {
             "status": (
                 "ok"
@@ -224,6 +224,7 @@ async def build_expert_memory_observability(
             "authoritative_outcome_count": len(outcomes),
             "complete_authoritative_outcome_count": len(complete_outcomes),
             "pending_settlement_count": pending_count,
+            "settlement_count_scope": "loaded_authoritative_outcomes",
             "orphan_position_count": orphan_reflection_count,
             "shadow_sample_count": shadow_count,
             "production_evidence_eligible_count": eligible_count,

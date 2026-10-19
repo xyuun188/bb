@@ -375,22 +375,22 @@ def test_live_entry_keeps_legacy_execution_values() -> None:
     assert "multidimensional_recommendation" not in decision.raw_response
 
 
-def test_positive_current_paper_mean_enters_training_when_promotion_quality_is_missing() -> None:
+def test_positive_current_paper_mean_stays_in_shadow_when_quality_is_missing() -> None:
     decision = _coordinator().combine(
         _features(),
         _paper_exploration_context("paper"),
         _strong_long_opinions(),
     )
 
-    assert decision.action == Action.LONG
+    assert decision.action == Action.HOLD
     contract = decision.raw_response["normal_paper_trade"]
-    assert contract["authorized"] is True
+    assert contract["authorized"] is False
     assert contract["selection_reason"] == "paper_training_entry"
     assert contract["expected_net_return_pct"] == pytest.approx(0.2)
     assert contract["objective_net_return_pct"] < 0
     assert contract["paper_training_only"] is True
     assert contract["production_permission"] is False
-    assert decision.raw_response["entry_permission"]["granted"] is True
+    assert decision.raw_response["entry_permission"]["granted"] is False
 
 
 def test_nonpositive_current_paper_net_return_cannot_open_for_training() -> None:

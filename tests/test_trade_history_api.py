@@ -764,9 +764,22 @@ async def test_dashboard_position_history_marks_same_open_group_slices_as_partia
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settlement_status", "settlement_source", "visible", "display_state"),
+    [
+        ("settlement_quarantined", "okx_position_history_identity_quarantine", True, "identity_unresolved"),
+        ("settlement_unresolved", "okx_position_history_identity_quarantine", False, "stopped_waiting"),
+        ("superseded_position_residual", "okx_current_position_deduplication", False, "stopped_waiting"),
+        ("settling", "okx_position_lifecycle_still_open", True, "lifecycle_open"),
+    ],
+)
 async def test_dashboard_position_history_shows_confirmed_close_awaiting_official_settlement(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    settlement_status: str,
+    settlement_source: str,
+    visible: bool,
+    display_state: str,
 ) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -797,8 +810,8 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
                     "close_fill_pnl": 0.05,
                     "entry_fee": 0.005,
                     "close_fee": 0.005,
-                    "settlement_status": "settlement_quarantined",
-                    "settlement_source": "okx_position_history_identity_quarantine",
+                    "settlement_status": settlement_status,
+                    "settlement_source": settlement_source,
                     "settlement_raw": {
                         "last_error_code": "positions_history_no_matching_row",
                         "quarantine_reason": "official_position_history_identity_unresolved",
@@ -855,6 +868,11 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
         await close_db()
 
     assert payload["settled_count"] == 0
+    if not visible:
+        assert payload["pending_settlement_count"] == 0
+        assert payload["total"] == 0
+        assert payload["positions"] == []
+        return
     assert payload["pending_settlement_count"] == 1
     assert payload["total"] == 1
     assert payload["ledger_source"] == (
@@ -864,7 +882,8 @@ async def test_dashboard_position_history_shows_confirmed_close_awaiting_officia
     assert row["symbol"] == "DOT/USDT"
     assert row["close_status"] == "full"
     assert row["linked_order_count"] == 2
-    assert row["settlement_status"] == "settlement_quarantined"
+    assert row["settlement_status"] == settlement_status
+    assert row["settlement_display_state"] == display_state
     assert row["settlement_state"] == "pending"
     assert row["settlement_complete"] is False
     assert row["realized_pnl"] is None

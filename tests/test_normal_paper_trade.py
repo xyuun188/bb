@@ -274,6 +274,17 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
     ) == {}
 
 
+def test_current_positive_mean_cannot_override_denied_quality_permission() -> None:
+    support = _support("long", expected_net=0.2)
+    support["quant_quality_permissions"]["local_ml"]["paper_execution_permission"] = False
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    ) == {}
+
+
 def test_unpromoted_quality_model_stays_shadow_only() -> None:
     support = _quality_observation_support("short")
 
@@ -283,7 +294,7 @@ def test_unpromoted_quality_model_stays_shadow_only() -> None:
     assert selection["selection_reason"] == "no_direction"
 
 
-def test_current_positive_signal_enters_bounded_training_route() -> None:
+def test_current_positive_signal_enters_shadow_training_route() -> None:
     support = _quality_observation_support(
         "short",
         expected_net=0.08,
@@ -304,9 +315,10 @@ def test_current_positive_signal_enters_bounded_training_route() -> None:
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is True
+    assert contract["authorized"] is False
     assert contract["paper_training_only"] is True
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert "normal_paper_trade_quality_observation_shadow_only" in normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
 def test_current_positive_signal_with_negative_lcb_enters_training_route() -> None:
@@ -351,9 +363,10 @@ def test_current_positive_signal_with_strong_expert_support_still_trains_before_
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is True
+    assert contract["authorized"] is False
     assert contract["paper_training_only"] is True
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert "normal_paper_trade_quality_observation_shadow_only" in normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
 def test_negative_lcb_quality_observation_cannot_authorize_a_paper_entry() -> None:

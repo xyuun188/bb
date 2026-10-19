@@ -752,9 +752,9 @@ def reprice_execution_return_distribution(
 
     result = dict(contract)
     transformations = dict(result.get("transformations") or {})
-    old_cost = safe_float(transformations.get("live_execution_cost_pct"), None)
     new_cost = safe_float(execution_cost.get("total_pct"), None)
-    if old_cost is None or new_cost is None:
+    old_cost = safe_float(transformations.get("live_execution_cost_pct"), None)
+    if new_cost is None or old_cost is None:
         return result
     reference_key = (
         "authoritative_slippage_upper_hinge_pct"
@@ -762,11 +762,18 @@ def reprice_execution_return_distribution(
         else "authoritative_slippage_expected_pct"
     )
     reference = transformations.get(reference_key)
-    cost_delta = execution_cost_with_slippage_floor(
+    effective_new_cost = execution_cost_with_slippage_floor(
         new_cost, execution_cost.get("slippage_pct"), reference
-    ) - execution_cost_with_slippage_floor(
+    )
+    cost_delta = effective_new_cost - execution_cost_with_slippage_floor(
         old_cost, transformations.get("live_slippage_pct"), reference
     )
+    gross_expected = safe_float(
+        dict(result.get("gross_market_distribution") or {}).get("raw_expected_return_pct"),
+        None,
+    )
+    funding_cashflow = safe_float(transformations.get("current_funding_cashflow_pct"), 0.0)
+    # Cost history owns the shift; a stale net alias must not move the quantiles.
     for key in (
         "raw_expected_return_pct",
         "median_return_pct",
@@ -777,6 +784,8 @@ def reprice_execution_return_distribution(
         value = safe_float(result.get(key), None)
         if value is not None:
             result[key] = value - cost_delta
+    if gross_expected is not None:
+        result["raw_expected_return_pct"] = gross_expected + funding_cashflow - effective_new_cost
     transformations.update(
         {
             "live_execution_cost_pct": new_cost,
@@ -789,6 +798,38 @@ def reprice_execution_return_distribution(
         }
     )
     result["transformations"] = transformations
+    return result
+
+
+def reprice_execution_opportunity(
+    opportunity: dict[str, Any], *, execution_cost: dict[str, Any]
+) -> dict[str, Any]:
+    """Refresh every projection from the same executable return distribution."""
+
+    result = dict(opportunity)
+    distribution = reprice_execution_return_distribution(
+        dict(result.get("return_distribution_contract") or {}),
+        execution_cost=execution_cost,
+    )
+    expected = safe_float(distribution.get("raw_expected_return_pct"), None)
+    downside = safe_float(distribution.get("objective_expected_return_pct"), None)
+    result.update(
+        {
+            "execution_cost": execution_cost,
+            "return_distribution_contract": distribution,
+            "expected_net_return_pct": expected,
+            "expected_realized_net_return_pct": expected,
+            "return_lcb_pct": downside,
+            "realized_net_lcb_pct": downside,
+        }
+    )
+    breakdown = dict(result.get("expected_net_breakdown") or {})
+    breakdown.update(dict(distribution.get("transformations") or {}))
+    breakdown["net_pct"] = expected
+    result["expected_net_breakdown"] = breakdown
+    dispersion = safe_float(distribution.get("dispersion_pct"), None)
+    if downside is not None and dispersion is not None and dispersion > 0.0:
+        result["score"] = downside / dispersion
     return result
 
 

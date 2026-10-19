@@ -8,6 +8,7 @@ import pytest
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
 from services.entry_direction_support import assess_directional_entry_support
 from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_VERSION,
     _contract_fingerprint_payload,
     _fingerprint,
     build_normal_paper_trade_contract,
@@ -1198,9 +1199,7 @@ def test_v13_micro_risk_history_is_normalized_and_remains_trainable() -> None:
     assert sample["normal_paper_trade_evidence"]["source_version"] == (
         "2026-09-26.normal-paper-strategy-trade.v13"
     )
-    assert sample["normal_paper_trade_evidence"]["version"] == (
-        "2026-10-14.normal-paper-strategy-trade.v17"
-    )
+    assert sample["normal_paper_trade_evidence"]["version"] == NORMAL_PAPER_TRADE_VERSION
     assert sample["strategy_entry_supervision_eligible"] is True
     assert sample["profit_training_contract"]["eligible"] is True
 
