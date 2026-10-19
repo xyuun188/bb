@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from executor.base_executor import ExecutionResult, OrderStatus
 from services.execution_result_classifier import ExecutionResultClassifier
 from web_dashboard.api.text_sanitize import sanitize_text
 
@@ -35,6 +36,26 @@ class DecisionReasonRecoveryPolicy:
         action = str(getattr(decision, "action", "") or "")
         if action in {"close_long", "close_short"}:
             return self._recover_exit_reason(decision, raw)
+        result = _safe_dict(raw.get("execution_result"))
+        response = _safe_dict(result.get("raw_response"))
+        if (
+            result.get("status") in {"rejected", "cancelled"}
+            and _safe_float(result.get("quantity")) <= 0
+            and not response.get("execution_transport_unknown")
+            and (response.get("error") or response.get("raw_error"))
+        ):
+            return self._classifier.reason_from_result(
+                ExecutionResult(
+                    order_id=str(result.get("order_id") or ""),
+                    symbol=str(getattr(decision, "symbol", "") or ""),
+                    side=action,
+                    order_type="market",
+                    quantity=0.0,
+                    price=_safe_float(result.get("price")),
+                    status=OrderStatus(result["status"]),
+                    raw_response=response,
+                )
+            )
         if fallback:
             return str(fallback)
         return None

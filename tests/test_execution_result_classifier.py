@@ -28,6 +28,17 @@ def test_execution_reason_handles_empty_result() -> None:
 
     assert policy.reason_from_result(None) == "交易接口未返回执行结果。"
 
+def test_execution_reason_preserves_authoritative_direction_capacity_diagnosis() -> None:
+    reason = "OKX 51008\uff1a\u8be5\u5408\u7ea6\u5f53\u524d\u65b9\u5411\u6700\u5927\u53ef\u5f00\u6570\u91cf\u4e3a 0 \u5f20"
+    result = _result(
+        OrderStatus.REJECTED, raw_response={
+            "error": reason,
+            "raw_error": "51008 Insufficient USDT margin",
+            "execution_blocker": "okx_account_direction_capacity_zero",
+        },
+    )
+    assert ExecutionResultClassifier().reason_from_result(result) == reason
+
 
 def test_execution_reason_describes_entry_tracking_partial_fill() -> None:
     policy = ExecutionResultClassifier()
@@ -72,7 +83,9 @@ def test_execution_reason_translates_known_okx_errors() -> None:
         exchange_order_id=None,
     )
 
-    assert "账户可用 USDT 保证金不足" in policy.reason_from_result(result)
+    reason = policy.reason_from_result(result)
+    assert "保证金或合约方向可开额度不足" in reason
+    assert "账户总可用余额不能代表每个合约方向" in reason
 
 
 def test_execution_reason_translates_okx_50001_as_transient_exchange_error() -> None:

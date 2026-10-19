@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 
 
@@ -105,3 +107,32 @@ def test_decision_reason_recovery_uses_fallback_for_non_exit() -> None:
 
     assert DecisionReasonRecoveryPolicy().recover(decision, "fallback") == "fallback"
     assert DecisionReasonRecoveryPolicy().recover(None, "fallback") is None
+
+
+@pytest.mark.parametrize("status", ["pending", "open", "partial", "filled"])
+def test_nonterminal_or_filled_entry_is_not_reclassified_as_rejected(status: str) -> None:
+    decision = SimpleNamespace(
+        action="long",
+        raw_llm_response={
+            "execution_result": {
+                "status": status, "quantity": 0.0,
+                "raw_response": {"error": "temporary warning"},
+            }
+        },
+    )
+    assert DecisionReasonRecoveryPolicy().recover(decision) is None
+
+
+def test_entry_transport_unknown_is_not_finalized_as_confirmed_rejection() -> None:
+    decision = SimpleNamespace(
+        action="long",
+        raw_llm_response={
+            "execution_result": {
+                "status": "rejected", "quantity": 0.0,
+                "raw_response": {
+                    "error": "connection lost", "execution_transport_unknown": True,
+                },
+            }
+        },
+    )
+    assert DecisionReasonRecoveryPolicy().recover(decision) is None

@@ -108,7 +108,8 @@ def _format_number(value: Any) -> str:
         decimal_value = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return str(value)
-    return format(decimal_value.normalize(), "f").rstrip("0").rstrip(".") or "0"
+    text = format(decimal_value.normalize(), "f")
+    return (text.rstrip("0").rstrip(".") if "." in text else text) or "0"
 
 
 def _timestamp_from_epoch_ms(epoch_ms: int) -> str:
@@ -997,6 +998,28 @@ class OkxPerpetualSdkExchange:
             ccy=str((params or {}).get("ccy") or ""),
         )
 
+    async def privateGetAccountMaxOrderSize(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return OKX's account- and direction-specific maximum order size."""
+
+        params = dict(params or {})
+        inst_id = normalize_swap_inst_id(params.get("instId"), required=True)
+        return await self._call_sdk(
+            lambda: self.account_api,
+            "get_max_order_size",
+            instId=inst_id,
+            tdMode=str(params.get("tdMode") or OKX_CROSS_MARGIN_MODE),
+            ccy=str(params.get("ccy") or ""),
+            px=str(params.get("px") or ""),
+            tradeQuoteCcy=(
+                str(params["tradeQuoteCcy"])
+                if params.get("tradeQuoteCcy") is not None
+                else None
+            ),
+        )
+
     async def privateGetAccountFeeRates(self, params: Mapping[str, Any]) -> dict[str, Any]:
         params = _swap_params(params)
         optional = _non_empty_params(params, "uly", "category", "instFamily", "instId")
@@ -1540,6 +1563,44 @@ class OkxPerpetualSdkExchange:
 
     async def fetch_balance(self) -> dict[str, Any]:
         return self._balance_response_to_ccxt_shape(await self.privateGetAccountBalance({}), "USDT")
+
+    async def fetch_max_order_size(
+        self,
+        symbol: str,
+        td_mode: str = OKX_CROSS_MARGIN_MODE,
+        price: float | None = None,
+    ) -> dict[str, Any]:
+        """Fetch native maxBuy/maxSell account capacity for one swap."""
+
+        response = await self.privateGetAccountMaxOrderSize(
+            {
+                "instId": normalize_swap_inst_id(symbol, required=True),
+                "tdMode": td_mode,
+                "px": _format_number(price) if price and price > 0 else "",
+            }
+        )
+        rows = response.get("data") if isinstance(response, Mapping) else []
+        row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], Mapping) else {}
+        inst_id = normalize_swap_inst_id(symbol, required=True)
+        if (
+            str(row.get("instId") or "").upper() != inst_id
+            or str(row.get("ccy") or "").upper() not in {"", "USDT"}
+        ):
+            raise ExchangeAPIError("OKX account max-size instrument/currency mismatch or missing")
+        values = {
+            field: _safe_float(row.get(field), -1.0) for field in ("maxBuy", "maxSell")
+        }
+        if any(value < 0 for value in values.values()):
+            raise ExchangeAPIError("OKX account max-size has missing or invalid direction limits")
+        return {
+            "inst_id": inst_id,
+            "td_mode": str(td_mode or OKX_CROSS_MARGIN_MODE),
+            "max_buy": values["maxBuy"],
+            "max_sell": values["maxSell"],
+            "unit": "contracts",
+            "raw": dict(row),
+            "source": "okx_account_max_order_size",
+        }
 
     async def fetch_leverage(self, symbol: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         params = dict(params or {})

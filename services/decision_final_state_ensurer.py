@@ -85,8 +85,16 @@ class DecisionFinalStateEnsurer:
 
         reason = str(getattr(row, "execution_reason", "") or "")
         if order_count > 0:
-            if is_pending_execution_reason(reason):
-                row.execution_reason = "本地订单记录已生成，但成交或拒单状态还没有最终确认。请以执行记录中的最新订单状态为准。"
+            if (
+                not reason
+                or is_pending_execution_reason(reason)
+                or reason.startswith("本地订单记录已生成")
+                or self.execution_reason_unusable_checker(reason)
+            ):
+                recovered = self.execution_reason_recoverer(row)
+                row.execution_reason = recovered or (
+                    "本地订单记录已生成，但成交或拒单状态还没有最终确认。请以执行记录中的最新订单状态为准。"
+                )
                 if flush_callback is not None:
                     await flush_callback()
             return

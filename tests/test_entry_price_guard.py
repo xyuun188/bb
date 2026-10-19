@@ -246,6 +246,35 @@ async def test_pre_order_execution_facts_replace_market_and_fee_snapshot() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocker", "expected"),
+    [
+        ("okx_pre_order_account_direction_capacity_zero", "最大可开数量为 0 张"),
+        ("okx_pre_order_account_order_capacity_unavailable", "可开额度暂时无法核验"),
+    ],
+)
+async def test_account_capacity_blocker_is_explained_before_submission(
+    blocker: str, expected: str,
+) -> None:
+    async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
+        return {
+            "production_eligible": False,
+            "reason": blocker,
+            "reasons": [blocker],
+        }
+
+    policy = EntryPriceGuardPolicy(
+        fresh_feature_provider=lambda _symbol: {"current_price": 100.0},
+        market_data_quality_reason_provider=lambda _snapshot, **_kwargs: None,
+        decision_age_seconds_provider=lambda _decision: 12.0,
+        pre_order_execution_facts_provider=execution_facts,
+    )
+    reason = await policy.guard_reason(_decision(), "paper")
+    assert expected in reason
+    assert "未提交订单" in reason
+
+
+@pytest.mark.asyncio
 async def test_analysis_only_execution_facts_cannot_submit_even_paper_entry() -> None:
     async def execution_facts(_mode: str, _decision: DecisionOutput) -> dict[str, Any]:
         return {

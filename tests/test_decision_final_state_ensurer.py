@@ -6,6 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
+from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.stale_entry_candidate_expirer import ENTRY_PENDING_EXECUTION_MAX_SECONDS
 
 
@@ -23,7 +24,9 @@ def _decision(action: Action = Action.LONG) -> DecisionOutput:
 def _ensurer() -> DecisionFinalStateEnsurer:
     return DecisionFinalStateEnsurer(
         execution_reason_unusable_checker=lambda reason: "unusable" in str(reason),
-        execution_reason_recoverer=lambda _row: "恢复出的平仓原因",
+        execution_reason_recoverer=lambda row: (
+            "恢复出的平仓原因" if row.action in {"close_long", "close_short"} else None
+        ),
         model_execution_mode_provider=lambda _model_name: "paper",
     )
 
@@ -80,6 +83,34 @@ async def test_decision_final_state_ensurer_keeps_pending_with_order_record() ->
     )
 
     assert "本地订单记录已生成" in row.execution_reason
+    assert results["decisions"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "previous_reason",
+    ["正在提交 OKX：已提交", "本地订单记录已生成，但成交或拒单状态还没有最终确认。", ""],
+)
+async def test_terminal_rejection_restores_actual_reason_with_local_order(
+    previous_reason: str,
+) -> None:
+    row = SimpleNamespace(
+        was_executed=False, execution_reason=previous_reason, action="long",
+        raw_llm_response={
+            "execution_result": {
+                "status": "rejected", "quantity": 0.0,
+                "raw_response": {"error": "OKX 杠杆设置失败，本次未开仓。"},
+            }
+        },
+    )
+    ensurer = _ensurer()
+    ensurer.execution_reason_recoverer = DecisionReasonRecoveryPolicy().recover
+    results = {"decisions": []}
+    await ensurer.ensure_row(
+        row, order_count=1, symbol="BTC/USDT", model_name="ensemble_trader",
+        decision=_decision(), results=results,
+    )
+    assert row.execution_reason == "OKX 杠杆设置失败，本次未开仓。"
     assert results["decisions"] == []
 
 

@@ -1045,6 +1045,36 @@ class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
         }
 
 
+class _AccountCapacityCcxt(_EntryMaxMarketSizeCcxt):
+    def __init__(self, max_buy: float = 1000.0, max_sell: float = 1000.0) -> None:
+        super().__init__()
+        self.max_buy = max_buy
+        self.max_sell = max_sell
+        self.capacity_calls: list[str] = []
+        self.capacity_error: Exception | None = None
+        self.submit_error: ExchangeAPIError | None = None
+
+    async def fetch_max_order_size(
+        self, symbol: str, td_mode: str = "cross",
+    ) -> dict[str, Any]:
+        assert td_mode == "cross"
+        self.capacity_calls.append(symbol)
+        if self.capacity_error:
+            raise self.capacity_error
+        return {
+            "inst_id": okx_inst_id_from_symbol(symbol),
+            "max_buy": self.max_buy,
+            "max_sell": self.max_sell,
+        }
+
+    async def create_order(self, *args: Any) -> dict[str, Any]:
+        if self.submit_error is not None:
+            self.max_buy = 0.0
+            self.create_calls.append(args)
+            raise self.submit_error
+        return await super().create_order(*args)
+
+
 class _MarketCacheMissingOnSubmitCcxt(_EntryMaxMarketSizeCcxt):
     def __init__(self) -> None:
         super().__init__()
@@ -1504,6 +1534,25 @@ def _executor(exchange: Any) -> OKXExecutor:
     executor = OKXExecutor(mode="paper")
     executor._connected = True
     executor._exchange = exchange
+    if not callable(getattr(exchange, "fetch_max_order_size", None)):
+        async def fixed_account_capacity(
+            _ccxt: Any,
+            symbol: str,
+            *,
+            side: str,
+            force: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "verified": True,
+                "inst_id": okx_inst_id_from_symbol(symbol),
+                "side": side,
+                "max_buy": 1_000_000.0,
+                "max_sell": 1_000_000.0,
+                "direction_max_contracts": 1_000_000.0,
+                "unit": "contracts",
+            }
+
+        executor._fetch_account_order_capacity = fixed_account_capacity  # type: ignore[method-assign]
     if not callable(getattr(exchange, "privateGetAccountBalance", None)) and not callable(
         getattr(exchange, "fetch_balance", None)
     ):
@@ -2762,7 +2811,10 @@ async def test_okx_59102_recovery_rejects_unverified_leverage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_okx_pre_order_execution_facts_share_native_instrument_and_units() -> None:
+@pytest.mark.parametrize("max_buy", [0.0, 10.0])
+async def test_okx_pre_order_execution_facts_share_native_instrument_and_units(
+    max_buy: float,
+) -> None:
     class _PreOrderFactsCcxt:
         urls = {"api": {"rest": "https://www.okx.com"}}
         hostname = "www.okx.com"
@@ -2895,12 +2947,23 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units()
             assert params == {"instType": "SWAP"}
             return {"data": [{"taker": "-0.0005", "ts": "1780000000002"}]}
 
+        async def fetch_max_order_size(
+            self, symbol: str, td_mode: str,
+        ) -> dict[str, Any]:
+            return {
+                "inst_id": okx_inst_id_from_symbol(symbol),
+                "max_buy": max_buy, "max_sell": 100.0,
+            }
+
     exchange = _PreOrderFactsCcxt()
     executor = _executor(exchange)
 
     facts = await executor.pre_order_execution_facts("BTC/USDT", "long")
 
-    assert facts["production_eligible"] is True
+    assert facts["production_eligible"] is (max_buy > 0)
+    assert facts["account_order_capacity"]["direction_max_contracts"] == max_buy
+    if max_buy == 0:
+        assert facts["reason"] == "okx_pre_order_account_direction_capacity_zero"
     assert facts["inst_id"] == "BTC-USDT-SWAP"
     snapshot = facts["feature_snapshot"]
     assert snapshot["market_fact"]["quality"]["status"] == "clean"
@@ -3168,6 +3231,141 @@ def test_okx_order_contracts_ceil_after_precision_rounds_below_minimum() -> None
     )
 
     assert contracts == 1.1
+
+
+@pytest.mark.parametrize(
+    ("target", "price", "fill_price", "contract_size", "expected"),
+    [
+        (9.71805, 0.05717, 0.05834, 10.0, 16.0),
+        (200.55, 0.07173, 0.07311, 100.0, 27.0),
+        (80.871, 0.19268, 0.19651, 10.0, 41.0),
+        (3.3321, 0.05571, 0.05684, 10.0, 5.0),
+    ],
+)
+def test_entry_contract_rounding_does_not_spend_fill_reserve_on_larger_quantity(
+    target: float, price: float, fill_price: float, contract_size: float, expected: float,
+) -> None:
+    executor = OKXExecutor(mode="paper")
+    market = {
+        "symbol": "CRO/USDT:USDT", "contractSize": contract_size,
+        "info": {"minSz": "1", "lotSz": "1"},
+    }
+    contracts, base_quantity = executor._entry_order_amount(
+        _FloorAmountPrecisionCcxt(), market, target, fill_price, 4000.0, 2.0,
+        reference_price=price, authorized_fill_ceiling_usdt=2500.0,
+    )
+    assert contracts == expected
+    assert base_quantity * price <= target + 1e-8
+
+
+@pytest.mark.asyncio
+async def test_account_capacity_zero_blocks_buy_without_blocking_sell_or_other_symbol() -> None:
+    exchange = _AccountCapacityCcxt(max_buy=0.0, max_sell=1000.0)
+    executor = _executor(exchange)
+    result = await executor.place_order(_entry_decision(), override_balance=100.0)
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["execution_blocker"] == (
+        "okx_pre_submit_account_direction_capacity_zero"
+    )
+    assert result.raw_response["system_pre_submit_rejection"] is True
+    assert result.raw_response["okx_rejection"] is False
+    assert exchange.create_calls == []
+    short = _entry_decision()
+    short.action = Action.SHORT
+    result = await executor.place_order(short, override_balance=100.0)
+    assert result.status == OrderStatus.FILLED
+    assert exchange.create_calls[0][2] == "sell"
+    exchange.max_buy = 200.0
+    other = await executor._fetch_account_order_capacity(
+        exchange, "ETH/USDT", side="buy",
+    )
+    assert other["direction_max_contracts"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_zero_capacity_cache_expires_and_final_submit_forces_current_probe() -> None:
+    exchange = _AccountCapacityCcxt(max_buy=0.0)
+    executor = _executor(exchange)
+    first = await executor._fetch_account_order_capacity(exchange, "BTC/USDT", side="buy")
+    second = await executor._fetch_account_order_capacity(exchange, "BTC/USDT", side="buy")
+    assert first["direction_max_contracts"] == 0.0
+    assert second["cache_hit"] is True
+    assert len(exchange.capacity_calls) == 1
+    key = ("BTC-USDT-SWAP", "buy")
+    row, observed = executor._entry_account_order_capacity_cache[key]
+    executor._entry_account_order_capacity_cache[key] = (row, observed - 61.0)
+    exchange.max_buy = 1000.0
+    recovered = await executor._fetch_account_order_capacity(exchange, "BTC/USDT", side="buy")
+    assert recovered["direction_max_contracts"] == 1000.0
+    assert key not in executor._entry_account_order_capacity_cache
+    exchange.max_buy = 0.0
+    await executor._fetch_account_order_capacity(exchange, "BTC/USDT", side="buy")
+    exchange.max_buy = 1000.0
+    result = await executor.place_order(_entry_decision(), override_balance=100.0)
+    assert result.status == OrderStatus.FILLED
+    assert key not in executor._entry_account_order_capacity_cache
+
+
+@pytest.mark.asyncio
+async def test_entry_caps_account_direction_size_to_native_lot_and_reconciles_risk() -> None:
+    exchange = _AccountCapacityCcxt(max_buy=17.8)
+    decision = _entry_decision()
+    result = await _executor(exchange).place_order(decision, override_balance=100.0)
+    assert result.status == OrderStatus.FILLED
+    assert exchange.create_calls[0][3] == 17.0
+    rules = result.raw_response["okx_order_rules"]
+    assert rules["account_order_within_max_size"] is True
+    assert rules["final_contracts"] == 17.0
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] == 17.0
+    assert result.raw_response["market_order_size_adjustment"]["reason"] == (
+        "okx_account_direction_max_size"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capacity_under_exchange_minimum_does_not_submit() -> None:
+    exchange = _AccountCapacityCcxt(max_buy=0.5)
+    result = await _executor(exchange).place_order(_entry_decision(), override_balance=100.0)
+    assert result.status == OrderStatus.REJECTED
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_capacity_probe_failure_is_not_misreported_as_zero_and_never_submits() -> None:
+    exchange = _AccountCapacityCcxt()
+    exchange.capacity_error = TimeoutError("account probe timed out")
+    result = await _executor(exchange).place_order(_entry_decision(), override_balance=100.0)
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["execution_blocker"] == (
+        "okx_pre_submit_account_order_capacity_unavailable"
+    )
+    assert result.raw_response["okx_order_rules"]["account_order_capacity"][
+        "direction_max_contracts"
+    ] is None
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_account_capacity_api_fails_closed() -> None:
+    executor = OKXExecutor(mode="paper")
+    result = await executor._fetch_account_order_capacity(object(), "BTC/USDT", side="buy")
+    assert result["verified"] is False
+    assert "API is unavailable" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_racing_margin_rejection_rechecks_capacity_and_does_not_resubmit() -> None:
+    exchange = _AccountCapacityCcxt()
+    exchange.submit_error = ExchangeAPIError(
+        "OKX API error [51008]: Insufficient USDT margin", code="51008",
+        payload={"subCode": "1001"},
+    )
+    result = await _executor(exchange).place_order(_entry_decision(), override_balance=100.0)
+    assert result.status == OrderStatus.REJECTED
+    assert len(exchange.create_calls) == 1
+    assert len(exchange.capacity_calls) == 2
+    assert result.raw_response["execution_blocker"] == "okx_account_direction_capacity_zero"
+    assert result.raw_response["okx_error_payload"] == {"subCode": "1001"}
 
 
 @pytest.mark.asyncio

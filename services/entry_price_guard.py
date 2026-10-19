@@ -71,6 +71,14 @@ class EntryPriceGuardPolicy:
             except Exception:
                 return "Authoritative pre-order execution facts are unavailable; entry fails closed."
             if execution_facts.get("production_eligible") is not True:
+                reasons = execution_facts.get("reasons") or [execution_facts.get("reason")]
+                if "okx_pre_order_account_direction_capacity_zero" in reasons:
+                    return (
+                        "OKX 账户当前该合约方向最大可开数量为 0 张，未提交订单；"
+                        "系统将自动复查额度，不影响其他合约或方向。"
+                    )
+                if "okx_pre_order_account_order_capacity_unavailable" in reasons:
+                    return "OKX 账户方向可开额度暂时无法核验，未提交订单，等待额度查询恢复。"
                 return (
                     "Authoritative pre-order execution facts are incomplete; entry fails closed: "
                     f"{execution_facts.get('reason') or 'unknown'}"

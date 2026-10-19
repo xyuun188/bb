@@ -130,6 +130,15 @@ class FakeCcxt:
     def amount_to_precision(self, _symbol, amount):
         return str(float(amount))
 
+    async def fetch_max_order_size(self, symbol, td_mode="cross"):
+        return {
+            "inst_id": okx_inst_id_from_symbol(symbol),
+            "td_mode": td_mode,
+            "max_buy": 100000.0,
+            "max_sell": 100000.0,
+            "unit": "contracts",
+        }
+
     async def fetch_ticker(self, _symbol):
         raise AssertionError("execution sizing must use OKX native ticker API")
 
@@ -674,7 +683,10 @@ async def test_okx_entry_exchange_rejection_is_structured_not_raised():
     assert result.raw_response is not None
     assert result.raw_response["okx_rejection"] is True
     assert result.raw_response["system_pre_submit_rejection"] is False
-    assert result.raw_response["execution_blocker"] == "okx_exchange_rejection"
+    assert (
+        result.raw_response["execution_blocker"]
+        == "okx_account_margin_or_capacity_rejection"
+    )
     assert "51008" in result.raw_response["raw_error"]
     assert result.raw_response["okx_error_code"] == "51008"
     assert result.raw_response["okx_error_payload"] == {

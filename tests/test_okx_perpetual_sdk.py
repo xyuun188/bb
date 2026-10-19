@@ -173,6 +173,63 @@ class _AccountApi:
         self.calls.append(("get_positions", dict(kwargs)))
         return {"code": "0", "data": []}
 
+    def get_max_order_size(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get_max_order_size", dict(kwargs)))
+        return {
+            "code": "0",
+            "data": [{"instId": kwargs["instId"], "maxBuy": "0", "maxSell": "3347"}],
+        }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(190, "190"), (10.0, "10"), (1000, "1000"), (1.23, "1.23"), (0.01, "0.01")],
+)
+def test_sdk_number_format_preserves_integer_trailing_zeroes(
+    value: float, expected: str,
+) -> None:
+    assert okx_perpetual_sdk._format_number(value) == expected
+
+
+@pytest.mark.asyncio
+async def test_sdk_native_capacity_preserves_zero_and_uses_account_swap_transport() -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    api = _AccountApi()
+    exchange._account_api = api
+
+    result = await exchange.fetch_max_order_size("CAP/USDT")
+
+    assert result["max_buy"] == 0.0
+    assert result["max_sell"] == 3347.0
+    assert result["unit"] == "contracts"
+    assert api.calls == [
+        ("get_max_order_size", {
+            "instId": "CAP-USDT-SWAP", "tdMode": "cross",
+            "ccy": "", "px": "", "tradeQuoteCcy": None,
+        })
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", [
+    {},
+    {"instId": "BTC-USDT-SWAP", "maxBuy": "1", "maxSell": "2"},
+    {"instId": "CAP-USDT-SWAP", "maxSell": "2"},
+    {"instId": "CAP-USDT-SWAP", "maxBuy": "NaN", "maxSell": "2"},
+    {"instId": "CAP-USDT-SWAP", "maxBuy": "-1", "maxSell": "2"},
+    {"instId": "CAP-USDT-SWAP", "maxBuy": "1", "maxSell": "inf"},
+])
+async def test_sdk_native_capacity_rejects_missing_invalid_or_wrong_instrument(
+    row: dict[str, Any],
+) -> None:
+    class Api:
+        def get_max_order_size(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"code": "0", "data": [row]}
+
+    exchange = OkxPerpetualSdkExchange("paper")
+    exchange._account_api = Api()
+    with pytest.raises(ExchangeAPIError):
+        await exchange.fetch_max_order_size("CAP/USDT")
 
 class _ConcurrentProbeApi:
     def __init__(self) -> None:
@@ -467,7 +524,8 @@ async def test_sdk_adapter_exposes_native_market_order_price_limits() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
+@pytest.mark.parametrize("amount", [2, 190, 1000])
+async def test_sdk_adapter_places_perpetual_order_through_sdk(amount: int) -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     trade_api = _TradeApi()
     exchange._trade_api = trade_api
@@ -476,7 +534,7 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
         "BTC/USDT:USDT",
         "market",
         "buy",
-        2,
+        amount,
         None,
         {"tdMode": "cross", "reduceOnly": False, "clOrdId": "BBPT104208"},
     )
@@ -490,7 +548,7 @@ async def test_sdk_adapter_places_perpetual_order_through_sdk() -> None:
                 "tdMode": "cross",
                 "side": "buy",
                 "ordType": "market",
-                "sz": "2",
+                "sz": str(amount),
                 "ccy": "",
                 "clOrdId": "BBPT104208",
                 "tag": "",

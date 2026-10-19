@@ -71,6 +71,7 @@ OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_EXIT_INSTRUMENT_REJECTION_COOLDOWN_SECONDS = 900.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
 OKX_ENTRY_INSTRUMENT_PROBE_FAILURE_CACHE_SECONDS = 30.0
+OKX_ENTRY_ACCOUNT_CAPACITY_RECHECK_SECONDS = 60.0
 OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS = 60.0
 OKX_STALE_PARTIAL_ENTRY_FORCE_CLOSE_SECONDS = 30.0
 OKX_ENTRY_FILL_PRICE_ANOMALY_RATIO = 100.0
@@ -145,6 +146,9 @@ class OKXExecutor(AbstractExecutor):
         self._exit_instrument_rejection_locks: dict[str, tuple[float, str]] = {}
         self._entry_instrument_availability_cache: dict[
             str, tuple[dict[str, Any], float, float]
+        ] = {}
+        self._entry_account_order_capacity_cache: dict[
+            tuple[str, str], tuple[dict[str, Any], float]
         ] = {}
         self._exit_submission_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._exit_submission_states: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -518,6 +522,7 @@ class OKXExecutor(AbstractExecutor):
         self._exchange = None
         self._connected = False
         self._markets_loaded = False
+        self._entry_account_order_capacity_cache.clear()
         await self.initialize()
 
     async def _with_retry(
@@ -705,6 +710,7 @@ class OKXExecutor(AbstractExecutor):
             "create_order",
             "fetch_balance",
             "fetch_leverage",
+            "fetch_max_order_size",
             "fetch_my_trades",
             "fetch_open_orders",
             "fetch_order",
@@ -1803,6 +1809,43 @@ class OKXExecutor(AbstractExecutor):
                             "okx_order_rules": okx_order_rules,
                         },
                     )
+                account_capacity = await self._fetch_account_order_capacity(
+                    ccxt,
+                    okx_symbol,
+                    side=side,
+                    force=True,
+                )
+                okx_order_rules["account_order_capacity"] = account_capacity
+                capacity_verified = account_capacity.get("verified") is True
+                account_max = self._safe_float(
+                    account_capacity.get("direction_max_contracts"), 0.0
+                )
+                if not capacity_verified or account_max <= 0:
+                    okx_order_rules["pre_submit_valid"] = False
+                    direction_label = "\u505a\u591a" if side == "buy" else "\u505a\u7a7a"
+                    return self._entry_market_order_size_rejection_result(
+                        decision=decision,
+                        side=side,
+                        price=price,
+                        okx_symbol=okx_symbol,
+                        contract_size=contract_size,
+                        order_quantity=order_quantity,
+                        base_quantity=base_quantity,
+                        okx_order_rules=okx_order_rules,
+                        blocker=(
+                            "okx_pre_submit_account_direction_capacity_zero"
+                            if capacity_verified
+                            else "okx_pre_submit_account_order_capacity_unavailable"
+                        ),
+                        error=(
+                            f"OKX \u8d26\u6237\u5f53\u524d {decision.symbol} {direction_label}"
+                            "\u6700\u5927\u53ef\u5f00\u6570\u91cf\u4e3a 0 \u5f20\uff0c"
+                            "\u672a\u63d0\u4ea4\u8ba2\u5355\uff1b\u7cfb\u7edf\u5c06\u81ea\u52a8\u590d\u67e5\u989d\u5ea6\u3002"
+                            if capacity_verified
+                            else "OKX \u8d26\u6237\u65b9\u5411\u53ef\u5f00\u989d\u5ea6\u6821\u9a8c\u5931\u8d25\uff0c"
+                            "\u672a\u63d0\u4ea4\u8ba2\u5355\uff0c\u7b49\u5f85\u6743\u5a01\u989d\u5ea6\u6062\u590d\u3002"
+                        ),
+                    )
                 market_size_adjustment = self._entry_market_order_size_adjustment(
                     decision=decision,
                     side=side,
@@ -1834,10 +1877,13 @@ class OKXExecutor(AbstractExecutor):
                     okx_order_rules["pre_submit_valid"] = True
                     okx_order_rules["market_order_size_adjustment"] = market_size_adjustment
                     order_resize_note = (
-                        f"OKX 单笔市价单上限为 {market_size_adjustment['amount_max_market_contracts']:g} 张，"
+                        f"OKX 当前方向可提交上限为 {market_size_adjustment['effective_max_contracts']:g} 张，"
                         f"系统已把原计划 {market_size_adjustment['original_planned_order_contracts']:g} 张"
                         f"缩到 {order_quantity:g} 张后提交。"
                     )
+                okx_order_rules["account_order_within_max_size"] = (
+                    order_quantity <= account_max
+                )
                 reconciled_contract = reconcile_profit_risk_sizing(
                     decision,
                     final_notional_usdt=order_quantity * contract_size * max(price, 0.0),
@@ -2054,6 +2100,12 @@ class OKXExecutor(AbstractExecutor):
             except ExchangeAPIError as e:
                 if decision.is_entry:
                     error_text = safe_error_text(e)
+                    if self._exchange_error_code(e, error_text) == "51008":
+                        okx_order_rules["account_order_capacity_after_rejection"] = (
+                            await self._fetch_account_order_capacity(
+                                ccxt, okx_symbol, side=side, force=True,
+                            )
+                        )
                     attached_rejection_code = self._retryable_attached_protection_rejection_code(
                         e,
                         decision=decision,
@@ -4917,6 +4969,15 @@ class OKXExecutor(AbstractExecutor):
             )
         contracts = self._normalize_order_contracts(ccxt, market, contracts, min_contracts)
 
+        # A fill-drift reserve covers execution price uncertainty; it does not
+        # authorize increasing the order's reference notional by one lot.
+        reference_notional = contracts * contract_size * minimum_price
+        if reference_notional > position_value + 1e-8:
+            contracts = self._floor_to_amount_step(
+                position_value / (contract_size * minimum_price), market,
+            )
+        if contracts <= 0 or (min_contracts > 0 and contracts + 1e-12 < min_contracts):
+            return 0.0, 0.0
         return contracts, contracts * contract_size
 
     def _entry_market_fill_risk_price(
@@ -5146,6 +5207,24 @@ class OKXExecutor(AbstractExecutor):
         error_text = safe_error_text(exchange_error, limit=500)
         error_code = str(getattr(exchange_error, "code", "") or "") or None
         error_payload = getattr(exchange_error, "payload", None)
+        margin_rejection = error_code == "51008"
+        capacity = (
+            okx_order_rules.get("account_order_capacity_after_rejection")
+            or okx_order_rules.get("account_order_capacity")
+            or {}
+        )
+        direction_unavailable = bool(
+            margin_rejection
+            and capacity.get("verified") is True
+            and capacity.get("direction_max_contracts") == 0
+        )
+        margin_message = (
+            "OKX 51008\uff1a\u8be5\u5408\u7ea6\u5f53\u524d\u65b9\u5411\u6700\u5927\u53ef\u5f00\u6570\u91cf\u4e3a 0 \u5f20\uff0c"
+            "\u4ea4\u6613\u6240\u5df2\u62d2\u5355\uff0c\u672a\u6210\u4ea4\uff1b\u7cfb\u7edf\u5c06\u81ea\u52a8\u590d\u67e5\u989d\u5ea6\u3002"
+            if direction_unavailable
+            else "OKX 51008\uff1a\u4ea4\u6613\u6240\u62d2\u7edd\u4e86\u672c\u6b21\u4fdd\u8bc1\u91d1/\u65b9\u5411\u989d\u5ea6\u7533\u8bf7\uff0c"
+            "\u8ba2\u5355\u672a\u6210\u4ea4\u3002\u8d26\u6237\u603b\u53ef\u7528\u4f59\u989d\u4e0d\u7b49\u4e8e\u8be5\u5408\u7ea6\u65b9\u5411\u7684\u53ef\u5f00\u989d\u5ea6\u3002"
+        )
 
         return ExecutionResult(
             order_id="okx_rejected",
@@ -5156,14 +5235,20 @@ class OKXExecutor(AbstractExecutor):
             price=price,
             status=OrderStatus.REJECTED,
             raw_response={
-                "error": (
+                "error": margin_message if margin_rejection else (
                     "OKX 拒绝了开仓订单；系统已记录提交前规则快照、计划张数、"
                     "最终张数和交易所返回原因，供执行详情定位。"
                 ),
                 "raw_error": error_text,
                 "okx_error_code": error_code,
                 "okx_error_payload": (error_payload if isinstance(error_payload, dict) else None),
-                "execution_blocker": "okx_exchange_rejection",
+                "execution_blocker": (
+                    "okx_account_direction_capacity_zero"
+                    if direction_unavailable
+                    else "okx_account_margin_or_capacity_rejection"
+                    if margin_rejection
+                    else "okx_exchange_rejection"
+                ),
                 "system_pre_submit_rejection": False,
                 "okx_rejection": True,
                 "okx_symbol": okx_symbol,
@@ -5191,9 +5276,23 @@ class OKXExecutor(AbstractExecutor):
         max_market_contracts = self._safe_float(
             okx_order_rules.get("amount_max_market_contracts"), 0.0
         ) or self._amount_market_max(okx_order_rules)
-        if max_market_contracts <= 0 or order_quantity <= max_market_contracts:
+        account_capacity = okx_order_rules.get("account_order_capacity") or {}
+        account_max = self._safe_float(
+            account_capacity.get("direction_max_contracts"), 0.0
+        )
+        limits = [value for value in (max_market_contracts, account_max) if value > 0]
+        max_contracts = min(limits) if limits else 0.0
+        if max_contracts <= 0 or order_quantity <= max_contracts:
             return None
-        adjusted_contracts = min(order_quantity, max_market_contracts)
+        amount_step = self._safe_float(okx_order_rules.get("amount_step_contracts"), 0.0)
+        adjusted_contracts = min(order_quantity, max_contracts)
+        if amount_step > 0:
+            step = Decimal(str(amount_step))
+            adjusted_contracts = float(
+                (Decimal(str(adjusted_contracts)) / step).to_integral_value(
+                    rounding=ROUND_FLOOR
+                ) * step
+            )
         adjusted_base_quantity = adjusted_contracts * contract_size
         adjusted_notional = adjusted_base_quantity * max(price, 0.0)
         amount_min = self._safe_float(okx_order_rules.get("amount_min_contracts"), 0.0)
@@ -5210,7 +5309,7 @@ class OKXExecutor(AbstractExecutor):
                 okx_order_rules=okx_order_rules,
                 blocker="system_pre_submit_market_order_max_too_small_after_cap",
                 error=(
-                    "计划市价单张数超过 OKX 单笔市价单上限，但按上限缩量后低于 OKX 最小下单张数，"
+                    "计划张数超过 OKX 单笔市价单或账户方向额度上限，按上限缩量后低于最小下单张数，"
                     "系统未提交无效订单。"
                 ),
             )
@@ -5226,7 +5325,7 @@ class OKXExecutor(AbstractExecutor):
                 okx_order_rules=okx_order_rules,
                 blocker="system_pre_submit_market_order_max_notional_below_min_after_cap",
                 error=(
-                    "计划市价单张数超过 OKX 单笔市价单上限，但按上限缩量后的名义金额低于 OKX 最小要求，"
+                    "计划张数超过 OKX 单笔市价单或账户方向额度上限，按上限缩量后的名义金额低于最小要求，"
                     "系统未提交无效订单。"
                 ),
             )
@@ -5238,7 +5337,11 @@ class OKXExecutor(AbstractExecutor):
         )
         return {
             "applied": True,
-            "reason": "okx_single_market_order_max_size",
+            "reason": (
+                "okx_account_direction_max_size"
+                if account_max > 0 and account_max == max_contracts
+                else "okx_single_market_order_max_size"
+            ),
             "original_planned_order_contracts": order_quantity,
             "original_planned_base_quantity": base_quantity,
             "original_planned_notional_usdt": round(original_notional, 8),
@@ -5246,6 +5349,8 @@ class OKXExecutor(AbstractExecutor):
             "adjusted_base_quantity": adjusted_base_quantity,
             "adjusted_notional_usdt": round(adjusted_notional, 8),
             "amount_max_market_contracts": max_market_contracts,
+            "account_max_contracts": account_max,
+            "effective_max_contracts": max_contracts,
             "risk_notional_reduction_ratio": round(reduction_ratio, 8),
             "okx_symbol": okx_symbol,
             "contract_size": contract_size,
@@ -7621,6 +7726,11 @@ class OKXExecutor(AbstractExecutor):
             self.fetch_account_fee_snapshot(),
             self.get_balance_snapshot(),
         )
+        account_order_capacity = await self._fetch_account_order_capacity(
+            ccxt,
+            okx_symbol,
+            side="buy" if str(side or "").lower() in {"long", "buy"} else "sell",
+        )
         mark_rows = mark_response.get("data") if isinstance(mark_response, dict) else []
         mark_row = mark_rows[0] if isinstance(mark_rows, list) and mark_rows else {}
         mark_row = mark_row if isinstance(mark_row, dict) else {}
@@ -7825,6 +7935,13 @@ class OKXExecutor(AbstractExecutor):
             reasons.append("okx_pre_order_account_equity_missing")
         if available_margin <= 0:
             reasons.append("okx_pre_order_available_margin_missing")
+        if account_order_capacity.get("verified") is not True:
+            reasons.append("okx_pre_order_account_order_capacity_unavailable")
+        elif (
+            self._safe_float(account_order_capacity.get("direction_max_contracts"), 0.0)
+            <= 0
+        ):
+            reasons.append("okx_pre_order_account_direction_capacity_zero")
         generated_at = datetime.now(UTC).isoformat()
         feature_snapshot = {
             "current_price": (bid + ask) / 2.0 if bid > 0 and ask >= bid else 0.0,
@@ -7857,6 +7974,7 @@ class OKXExecutor(AbstractExecutor):
             "market_source_consistency": market_source_consistency,
             "orderbook_fact": orderbook_fact,
             "mark_price_fact": mark_price_fact,
+            "account_order_capacity": account_order_capacity,
         }
         return {
             "production_eligible": not reasons,
@@ -7876,6 +7994,7 @@ class OKXExecutor(AbstractExecutor):
             "balance_snapshot": balance_snapshot,
             "account_equity_usdt": account_equity,
             "available_margin_usdt": available_margin,
+            "account_order_capacity": account_order_capacity,
             "feature_snapshot": feature_snapshot,
             "policy_provenance": {
                 "source": "okx_native_ticker_orderbook_mark_contract_fee_and_balance",
@@ -7892,6 +8011,68 @@ class OKXExecutor(AbstractExecutor):
                 "fallback_reason": "" if not reasons else ",".join(reasons),
             },
         }
+
+    async def _fetch_account_order_capacity(
+        self,
+        ccxt: Any,
+        okx_symbol: str,
+        *,
+        side: str,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Read OKX's current account-level maxBuy/maxSell contract limit."""
+
+        normalized_side = "buy" if str(side or "").lower() in {"buy", "long"} else "sell"
+        cache_key = (okx_inst_id_from_symbol(okx_symbol), normalized_side)
+        now = time.monotonic()
+        cached = self._entry_account_order_capacity_cache.get(cache_key)
+        if not force and cached and now - cached[1] < OKX_ENTRY_ACCOUNT_CAPACITY_RECHECK_SECONDS:
+            return {**cached[0], "cache_hit": True}
+        fetch = getattr(ccxt, "fetch_max_order_size", None)
+        try:
+            if not callable(fetch):
+                raise ExchangeAPIError("OKX account max-order-size API is unavailable")
+            payload = await self._with_retry(
+                fetch,
+                okx_symbol,
+                "cross",
+                _max_attempts=1,
+            )
+            if not isinstance(payload, Mapping) or payload.get("inst_id") != cache_key[0]:
+                raise ExchangeAPIError("OKX account max-order-size instrument mismatch")
+            max_buy = self._safe_float(payload.get("max_buy"), -1.0)
+            max_sell = self._safe_float(payload.get("max_sell"), -1.0)
+            if min(max_buy, max_sell) < 0:
+                raise ExchangeAPIError("OKX account max-order-size direction limits missing")
+            direction_max = max_buy if normalized_side == "buy" else max_sell
+            result = {
+                **dict(payload),
+                "verified": True,
+                "side": normalized_side,
+                "direction_max_contracts": direction_max,
+                "max_buy": max_buy,
+                "max_sell": max_sell,
+                "unit": "contracts",
+                "cache_hit": False,
+                "source": "okx_account_max_order_size",
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+            if direction_max <= 0:
+                self._entry_account_order_capacity_cache[cache_key] = (dict(result), now)
+            else:
+                self._entry_account_order_capacity_cache.pop(cache_key, None)
+            return result
+        except Exception as exc:
+            return {
+                "verified": False,
+                "side": normalized_side,
+                "direction_max_contracts": None,
+                "reason": "okx_account_max_order_size_probe_failed",
+                "error": safe_error_text(exc, limit=240),
+                "source": "okx_account_max_order_size",
+                "cache_hit": False,
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
 
     async def get_open_orders(self, symbol: str | None = None) -> list[dict]:
         okx_symbol = self._to_swap_symbol(symbol) if symbol else None

@@ -166,6 +166,11 @@ class ExecutionResultClassifier:
 
         error = raw.get("error") if isinstance(raw, dict) else None
         raw_error = raw.get("raw_error") if isinstance(raw, dict) else None
+        if error and raw.get("execution_blocker") in {
+            "okx_account_direction_capacity_zero",
+            "okx_account_margin_or_capacity_rejection",
+        }:
+            return str(sanitize_text(error) or error)
         error_text = f"{error or ''} {raw_error or ''}"
         translated_error = self.translate_execution_error_text(error_text)
         if translated_error:
@@ -206,9 +211,9 @@ class ExecutionResultClassifier:
             return okx_temporary_service_error_message(normalized)
         if "51008" in normalized or "Insufficient USDT margin" in normalized:
             return (
-                "OKX 返回错误码 51008：账户可用 USDT 保证金不足，订单没有提交成功。"
-                "通常是当前持仓/挂单占用保证金过高、可用余额不足，或本轮计划仓位过大；"
-                "系统应优先处理已有持仓的平仓/减仓，不再继续加仓。"
+                "OKX 返回错误码 51008：本次订单的保证金或合约方向可开额度不足，订单未成交。"
+                "账户总可用余额不能代表每个合约方向的可开额度；"
+                "应核对该合约的最大可开多/空张数及挂单占用。"
             )
         if "59670" in normalized or "more than 5 open orders" in normalized:
             return (
