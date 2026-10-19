@@ -28,7 +28,6 @@ from config.settings import settings
 from core.phase3_model_contract import (
     PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
     PHASE3_TARGET_MODEL_ENDPOINT,
-    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
 )
 from core.safe_output import safe_error_text
 from data_feed.feature_vector import FeatureVector
@@ -887,11 +886,11 @@ class ModelRegistry:
                 batch_context["_llm_capacity_preacquired"] = True
                 capacity_slot = _bounded_llm_capacity_slot(
                     context,
-                    max_queue_wait_seconds=(
-                        PHASE3_TARGET_QUEUE_WAIT_SECONDS
-                        if _is_target_qwen_provider(batch_model)
-                        else 0.0
-                    ),
+                    # A single process-wide gate serializes the target route.
+                    # Queue admission follows the current analysis deadline;
+                    # a fixed provider wait here created false outages whenever
+                    # a position review held the carrier for a normal window.
+                    max_queue_wait_seconds=0.0,
                     provider_model=_provider_model_name(batch_model),
                 )
                 async with capacity_slot:
@@ -1030,11 +1029,7 @@ class ModelRegistry:
                     retry_context["_llm_capacity_preacquired"] = True
                     capacity_slot = _bounded_llm_capacity_slot(
                         context,
-                        max_queue_wait_seconds=(
-                            PHASE3_TARGET_QUEUE_WAIT_SECONDS
-                            if _is_target_qwen_provider(batch_model)
-                            else 0.0
-                        ),
+                        max_queue_wait_seconds=0.0,
                         provider_model=_provider_model_name(batch_model),
                     )
                     async with capacity_slot:

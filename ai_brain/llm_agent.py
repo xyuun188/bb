@@ -43,7 +43,6 @@ from core.model_runtime import (
 )
 from core.phase3_model_contract import (
     PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
-    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
 )
 from core.safe_output import safe_error_text
 from services.entry_signal_extraction import (
@@ -1406,11 +1405,10 @@ class LLMAgent(AbstractAIModel):
                 _claim_llm_call(context, "expert" if expert_mode else "decision")
                 capacity_slot = _bounded_llm_capacity_slot(
                     context,
-                    max_queue_wait_seconds=(
-                        PHASE3_TARGET_QUEUE_WAIT_SECONDS
-                        if target_qwen
-                        else 0.0
-                    ),
+                    # The process-wide provider gate is the sole platform
+                    # admission contract.  Let the analysis deadline decide
+                    # how long a healthy cross-loop handoff may wait.
+                    max_queue_wait_seconds=0.0,
                     provider_model=model_name,
                 )
                 async with capacity_slot:
@@ -1521,11 +1519,10 @@ class LLMAgent(AbstractAIModel):
             )
             capacity_slot = _bounded_llm_capacity_slot(
                 context,
-                max_queue_wait_seconds=(
-                    PHASE3_TARGET_QUEUE_WAIT_SECONDS
-                    if target_single_call
-                    else 0.0
-                ),
+                # Batch registry admission already owns the same provider
+                # gate; the remaining analysis deadline is the only wait
+                # budget and the marker makes this call re-entrant.
+                max_queue_wait_seconds=0.0,
                 provider_model=self._model_name,
             )
             async with capacity_slot:

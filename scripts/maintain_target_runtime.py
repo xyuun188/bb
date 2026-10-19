@@ -14,9 +14,9 @@ if str(ROOT) not in sys.path:
 
 from core.model_server_bridge import load_model_server_info_from_platform  # noqa: E402
 from core.phase3_model_contract import (  # noqa: E402
+    PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS,
     PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
     PHASE3_TARGET_MAX_NEW_TOKENS,
-    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
 )
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 
@@ -63,7 +63,7 @@ def _normalize_script(text: str) -> str:
     patterns = {
         "BB_TARGET_MAX_NEW_TOKENS": PHASE3_TARGET_MAX_NEW_TOKENS,
         "BB_TARGET_GENERATION_TIMEOUT_SECONDS": PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
-        "BB_TARGET_QUEUE_WAIT_SECONDS": PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+        "BB_TARGET_QUEUE_WAIT_SECONDS": PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS,
     }
     updated = text
     for name, default in patterns.items():

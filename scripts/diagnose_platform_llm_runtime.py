@@ -21,9 +21,10 @@ import json
 from pathlib import Path
 from scripts.runtime_env_bootstrap import load_runtime_env_files
 from core.phase3_model_contract import (
+    PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS,
     PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
     PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
-    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+    PHASE3_TARGET_CALLER_QUEUE_WAIT_SECONDS,
 )
 
 # Match the systemd/dashboard environment before importing Settings.  A bare
@@ -52,7 +53,8 @@ print(json.dumps({
     "ai_batch_expert_timeout_seconds": settings.ai_batch_expert_timeout_seconds,
     "ai_target_qwen_max_completion_tokens": settings.ai_target_qwen_max_completion_tokens,
     "ai_target_qwen_timeout_seconds": settings.ai_target_qwen_timeout_seconds,
-    "phase3_target_queue_wait_seconds": PHASE3_TARGET_QUEUE_WAIT_SECONDS,
+    "phase3_target_caller_queue_wait_seconds": PHASE3_TARGET_CALLER_QUEUE_WAIT_SECONDS,
+    "phase3_target_carrier_queue_wait_seconds": PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS,
     "phase3_target_http_timeout_seconds": PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
     "phase3_target_caller_timeout_seconds": PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
     "ai_decision_maker_timeout_seconds": settings.ai_decision_maker_timeout_seconds,

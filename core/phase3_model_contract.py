@@ -14,15 +14,18 @@ PHASE3_QUANT_API_ID = "phase3_quant_api"
 # Canonical contract for the single-worker target carrier.
 PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS = 26.0
 PHASE3_TARGET_MAX_NEW_TOKENS = 96
-# The target carrier is a single-worker model.  Two seconds was shorter than
-# the observed handoff when market and position loops crossed, so healthy
-# requests were recorded as queue failures.  Keep one bounded queue contract
-# that covers normal inference bursts without allowing an unbounded stall.
-PHASE3_TARGET_QUEUE_WAIT_SECONDS = 8.0
+# Platform callers already serialize this provider through one process-wide
+# scheduler.  Their admission wait is therefore owned by each analysis
+# deadline, not by a second fixed timeout that can turn a healthy handoff into
+# a false model outage.
+PHASE3_TARGET_CALLER_QUEUE_WAIT_SECONDS = 0.0
+# Direct callers that bypass the platform scheduler still get a bounded carrier
+# lock wait.  This is a model-server boundary, not a platform analysis budget.
+PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS = 8.0
 PHASE3_TARGET_RESPONSE_MARGIN_SECONDS = 2.0
 PHASE3_TARGET_HTTP_TIMEOUT_SECONDS = (
     PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS
-    + PHASE3_TARGET_QUEUE_WAIT_SECONDS
+    + PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS
     + PHASE3_TARGET_RESPONSE_MARGIN_SECONDS
 )
 PHASE3_TARGET_CALLER_TIMEOUT_SECONDS = PHASE3_TARGET_HTTP_TIMEOUT_SECONDS + 1.0

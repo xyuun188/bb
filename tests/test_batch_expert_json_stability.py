@@ -27,10 +27,10 @@ from ai_brain.prompts import _compact_role_signal, build_batch_experts_user_prom
 from config.settings import settings
 from core.exceptions import LLMResponseParseError
 from core.phase3_model_contract import (
+    PHASE3_TARGET_CALLER_QUEUE_WAIT_SECONDS,
     PHASE3_TARGET_CALLER_TIMEOUT_SECONDS,
-    PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
+    PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS,
     PHASE3_TARGET_HTTP_TIMEOUT_SECONDS,
-    PHASE3_TARGET_QUEUE_WAIT_SECONDS,
 )
 from data_feed.feature_vector import FeatureVector
 from tests.model_endpoint_fixtures import LOCAL_QWEN_TEST_BASE
@@ -1178,7 +1178,8 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
 ) -> None:
     monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
     monkeypatch.setattr(settings, "ai_batch_expert_timeout_seconds", 26.0)
-    assert PHASE3_TARGET_QUEUE_WAIT_SECONDS == 8.0
+    assert PHASE3_TARGET_CALLER_QUEUE_WAIT_SECONDS == 0.0
+    assert PHASE3_TARGET_CARRIER_QUEUE_WAIT_SECONDS == 8.0
     target_capacity = llm_agent_module._ScopedLLMCapacity(1)
     monkeypatch.setattr(llm_agent_module, "_TARGET_QWEN_CAPACITY", target_capacity)
     _BatchTimeoutExpert.batch_calls = 0
@@ -1196,10 +1197,10 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
     context: dict[str, Any] = {
         "_analysis_deadline_monotonic": (
             asyncio.get_running_loop().time()
-            + PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS
+            + 1.25
         ),
         "_analysis_budget_scope": "market_ai",
-        "_analysis_budget_seconds": PHASE3_TARGET_GENERATION_TIMEOUT_SECONDS,
+        "_analysis_budget_seconds": 1.25,
     }
     started = asyncio.get_running_loop().time()
     try:
@@ -1213,7 +1214,7 @@ async def test_target_qwen_queue_wait_is_bounded_separately_from_generation(
     assert decisions == {}
     assert (
         asyncio.get_running_loop().time() - started
-        < PHASE3_TARGET_QUEUE_WAIT_SECONDS + 0.5
+        < 2.0
     )
     assert _BatchTimeoutExpert.batch_calls == 0
     assert {row["status"] for row in context["_model_timings"]} == {"provider_queue_deferred"}
