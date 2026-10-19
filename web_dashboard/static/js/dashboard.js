@@ -103,9 +103,26 @@ let systemSelfCheckWarmupTimer = null;
 let systemAuditRefreshInFlight = null;
 let systemAuditRefreshPollTimer = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
+const pageReadRetryTimers = new Map();
 
 function isPageActive(page) {
     return document.getElementById(`page-${page}`)?.classList.contains('active');
+}
+
+function schedulePageReadRetry(key, callback, delayMs = 3000) {
+    const existing = pageReadRetryTimers.get(key);
+    if (existing) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+        pageReadRetryTimers.delete(key);
+        if (!document.hidden && isPageActive(key)) callback();
+    }, delayMs);
+    pageReadRetryTimers.set(key, timer);
+}
+
+function clearPageReadRetry(key) {
+    const timer = pageReadRetryTimers.get(key);
+    if (timer) window.clearTimeout(timer);
+    pageReadRetryTimers.delete(key);
 }
 
 // Init on page load
@@ -624,28 +641,45 @@ async function fetchDailyPnlRecords({ silent = false } = {}) {
     }
     const days = Number(document.getElementById('daily-pnl-days')?.value || 30);
     const mode = state.mode || 'paper';
-    const data = await fetchJSON(`/api/dashboard/daily-pnl?mode=${mode}&days=${days}`);
-    if (!data || !Array.isArray(data.records)) {
-        if (tbody) {
-            tbody.innerHTML = '<tr><td colspan="8" style="color:var(--red);text-align:center;padding:24px;">每日盈亏加载失败，正在重试</td></tr>';
+    try {
+        const data = await fetchJSON(`/api/dashboard/daily-pnl?mode=${mode}&days=${days}`);
+        if (data?.status === 'warming') {
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);text-align:center;padding:24px;">每日盈亏快照正在后台生成，稍后自动更新...</td></tr>';
+            }
+            schedulePageReadRetry('daily-pnl', () => fetchDailyPnlRecords({ silent: true }));
+            return;
         }
-        return;
+        if (!data || !Array.isArray(data.records)) {
+            throw new Error('服务未返回有效的每日盈亏数据');
+        }
+        clearPageReadRetry('daily-pnl');
+        if (data.freshness?.is_stale) {
+            schedulePageReadRetry('daily-pnl', () => fetchDailyPnlRecords({ silent: true }), 15000);
+        }
+        state.dailyPnlRecords = data.records;
+        state.dailyPnlMeta = data;
+        const subtitle = document.getElementById('daily-pnl-subtitle');
+        if (subtitle) {
+            const equityStart = data.okx_equity_series_start_date || '';
+            const equityScope = data.okx_equity_series_complete
+                ? '\u4e09\u671f\u5b8c\u6574 OKX \u6743\u76ca\u5feb\u7167'
+                : (equityStart ? `OKX \u6743\u76ca\u5feb\u7167\u81ea ${equityStart} \u5f00\u59cb` : 'OKX \u6743\u76ca\u5feb\u7167\u672a\u7559\u5b58');
+            const tradeScope = data.trade_pnl_start_date
+                ? `结算账本自 ${data.trade_pnl_start_date}`
+                : '暂无已结算交易';
+            const updatedAt = data.trade_pnl_as_of ? ` · 更新 ${shortBeijingTime(data.trade_pnl_as_of)}` : '';
+            const freshness = data.freshness?.is_stale ? '数据略有延迟，正在后台刷新 · ' : '';
+            subtitle.textContent = `${freshness}${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''} · ${tradeScope} · ${equityScope}${updatedAt}`;
+        }
+        renderDailyPnlRecords(data.records);
+    } catch (error) {
+        if (tbody) {
+            const message = String(error?.message || '请求失败').slice(0, 180);
+            tbody.innerHTML = `<tr><td colspan="8" style="color:var(--red);text-align:center;padding:24px;">每日盈亏加载失败：${escHtml(message)}，稍后自动重试</td></tr>`;
+        }
+        schedulePageReadRetry('daily-pnl', () => fetchDailyPnlRecords({ silent: true }), 5000);
     }
-    state.dailyPnlRecords = data.records;
-    state.dailyPnlMeta = data;
-    const subtitle = document.getElementById('daily-pnl-subtitle');
-    if (subtitle) {
-        const equityStart = data.okx_equity_series_start_date || '';
-        const equityScope = data.okx_equity_series_complete
-            ? '\u4e09\u671f\u5b8c\u6574 OKX \u6743\u76ca\u5feb\u7167'
-            : (equityStart ? `OKX \u6743\u76ca\u5feb\u7167\u81ea ${equityStart} \u5f00\u59cb` : 'OKX \u6743\u76ca\u5feb\u7167\u672a\u7559\u5b58');
-        const tradeScope = data.trade_pnl_start_date
-            ? `结算账本自 ${data.trade_pnl_start_date}`
-            : '暂无已结算交易';
-        const updatedAt = data.trade_pnl_as_of ? ` · 更新 ${shortBeijingTime(data.trade_pnl_as_of)}` : '';
-        subtitle.textContent = `${mode === 'live' ? '实盘' : '模拟盘'} · 北京时间 ${data.start_date || ''} 至 ${data.end_date || ''} · ${tradeScope} · ${equityScope}${updatedAt}`;
-    }
-    renderDailyPnlRecords(data.records);
 }
 
 function updateDecisionBadge(total) {
@@ -9722,18 +9756,41 @@ function positionProtectionInventoryWarnings(inventory) {
 }
 
 async function fetchPositionHistory() {
-    const data = await fetchLatestPageJSON(
-        'position-history',
-        `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true`,
-    );
-    if (!data) return;
-    state.positionHistoryPage = data.page || state.positionHistoryPage;
-    state.positionHistoryTotal = data.total || 0;
-    const label = document.getElementById('position-history-mode-label');
-    if (label) {
-        label.textContent = `${state.mode === 'paper' ? '模拟盘' : '实盘'} · ${Number(data.settled_count || 0)} 已结算 / ${Number(data.pending_settlement_count || 0)} 待结算`;
+    try {
+        const data = await fetchLatestPageJSON(
+            'position-history',
+            `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true`,
+        );
+        if (!data) return;
+        const tbody = document.getElementById('position-history-tbody');
+        const pagination = document.getElementById('position-history-pagination');
+        if (String(data.ledger_source || '').includes('warming')) {
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">历史持仓账本正在后台生成，稍后自动更新...</td></tr>';
+            }
+            if (pagination) pagination.style.display = 'none';
+            schedulePageReadRetry('position-history', fetchPositionHistory);
+            return;
+        }
+        clearPageReadRetry('position-history');
+        state.positionHistoryPage = data.page || state.positionHistoryPage;
+        state.positionHistoryTotal = data.total || 0;
+        const label = document.getElementById('position-history-mode-label');
+        const stale = String(data.ledger_source || '').includes('_stale');
+        if (label) {
+            const freshness = stale ? ' · 历史数据正在后台刷新' : '';
+            label.textContent = `${state.mode === 'paper' ? '模拟盘' : '实盘'} · ${Number(data.settled_count || 0)} 已结算 / ${Number(data.pending_settlement_count || 0)} 待结算${freshness}`;
+        }
+        renderClosedPositionsTable(data.positions || [], state.positionHistoryPage, data.total_pages || 1, data.total || 0);
+        if (stale) schedulePageReadRetry('position-history', fetchPositionHistory, 15000);
+    } catch (error) {
+        const tbody = document.getElementById('position-history-tbody');
+        if (tbody && isPageActive('position-history')) {
+            const message = String(error?.message || '请求失败').slice(0, 180);
+            tbody.innerHTML = `<tr><td colspan="12" style="color:var(--red);text-align:center;padding:24px;">历史持仓加载失败：${escHtml(message)}，稍后自动重试</td></tr>`;
+        }
+        schedulePageReadRetry('position-history', fetchPositionHistory, 5000);
     }
-    renderClosedPositionsTable(data.positions || [], state.positionHistoryPage, data.total_pages || 1, data.total || 0);
 }
 
 function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItems = 0) {

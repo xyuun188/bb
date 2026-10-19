@@ -4597,61 +4597,114 @@ async def _dashboard_closed_position_ledger_rows(
     page: int = 1,
     page_size: int = 20,
     paginate: bool = True,
+    serve_stale: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int, str]:
     from services.okx_position_history_store import load_okx_position_history_watermark
 
     cache_key = _dashboard_closed_ledger_cache_key(mode, model_names)
     cached = _dashboard_heavy_cache.get(cache_key)
     history_watermark = load_okx_position_history_watermark(mode)
-    if cached is not None and history_watermark is not None and cached[0] < history_watermark:
+    stale_reason: str | None = None
+    force_sync_rebuild = False
+    watermark_advanced = bool(
+        cached is not None
+        and history_watermark is not None
+        and cached[0] < history_watermark
+    )
+    if watermark_advanced and not serve_stale:
         _dashboard_heavy_cache.pop(cache_key, None)
         cached = None
+
     if cached is not None:
         cached_at, payload = cached
-        age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
-        if age_seconds <= _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
-            ledger_payload = copy.deepcopy(payload)
-        elif age_seconds <= _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS:
-            _start_dashboard_closed_ledger_refresh(
-                cache_key,
-                mode=mode,
-                model_names=model_names,
-            )
-            ledger_payload = copy.deepcopy(payload)
-        else:
+        age_seconds = max((datetime.now(UTC) - cached_at).total_seconds(), 0.0)
+        if age_seconds > _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS:
             _dashboard_heavy_cache.pop(cache_key, None)
-            ledger_payload = await _rebuild_dashboard_closed_ledger_cache(
-                cache_key,
+            cached = None
+        else:
+            if watermark_advanced:
+                stale_reason = "okx_history_watermark_advanced"
+            elif age_seconds > _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
+                stale_reason = "refresh_in_background"
+            should_serve_cached = (
+                not stale_reason
+                or serve_stale
+                or (
+                    not watermark_advanced
+                    and age_seconds <= _DASHBOARD_CLOSED_LEDGER_STALE_TTL_SECONDS
+                )
+            )
+            if should_serve_cached:
+                if stale_reason:
+                    _start_dashboard_closed_ledger_refresh(
+                        cache_key,
+                        mode=mode,
+                        model_names=model_names,
+                    )
+                if serve_stale and stale_reason:
+                    source = f"{payload[4]}_stale"
+                    ledger_payload = (*copy.deepcopy(payload[:4]), source)
+                else:
+                    ledger_payload = copy.deepcopy(payload)
+            else:
+                _dashboard_heavy_cache.pop(cache_key, None)
+                cached = None
+                force_sync_rebuild = not serve_stale
+
+    if cached is None:
+        persisted = (
+            None
+            if force_sync_rebuild
+            else _load_dashboard_closed_ledger_snapshot(
                 mode=mode,
                 model_names=model_names,
-                session=session,
-                repo=repo,
+                allow_stale=serve_stale,
             )
-    else:
-        persisted = _load_dashboard_closed_ledger_snapshot(
-            mode=mode,
-            model_names=model_names,
         )
         if persisted is not None:
             persisted_at, persisted_payload = persisted
             _dashboard_heavy_cache[cache_key] = (persisted_at, persisted_payload)
-            if (
-                datetime.now(UTC) - persisted_at
-            ).total_seconds() > _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
+            age_seconds = max((datetime.now(UTC) - persisted_at).total_seconds(), 0.0)
+            watermark_advanced = (
+                history_watermark is not None and persisted_at < history_watermark
+            )
+            if watermark_advanced:
+                stale_reason = "okx_history_watermark_advanced"
+            elif age_seconds > _DASHBOARD_CLOSED_LEDGER_CACHE_TTL_SECONDS:
+                stale_reason = "refresh_in_background"
+            if stale_reason:
                 _start_dashboard_closed_ledger_refresh(
                     cache_key,
                     mode=mode,
                     model_names=model_names,
                 )
-            ledger_payload = copy.deepcopy(persisted_payload)
+            if serve_stale and stale_reason:
+                source = f"{persisted_payload[4]}_stale"
+                ledger_payload = (*copy.deepcopy(persisted_payload[:4]), source)
+            else:
+                ledger_payload = copy.deepcopy(persisted_payload)
         else:
-            ledger_payload = await _rebuild_dashboard_closed_ledger_cache(
-                cache_key,
-                mode=mode,
-                model_names=model_names,
-                session=session,
-                repo=repo,
-            )
+            if serve_stale:
+                _start_dashboard_closed_ledger_refresh(
+                    cache_key,
+                    mode=mode,
+                    model_names=model_names,
+                )
+                ledger_payload = (
+                    [],
+                    0,
+                    1,
+                    1,
+                    "dashboard_closed_ledger_warming",
+                )
+            else:
+                ledger_payload = await _rebuild_dashboard_closed_ledger_cache(
+                    cache_key,
+                    mode=mode,
+                    model_names=model_names,
+                    session=session,
+                    repo=repo,
+                )
 
     full_rows, total, _cached_page, _cached_pages, source = ledger_payload
     normalized_page_size = max(int(page_size or 20), 1)
@@ -4814,6 +4867,7 @@ def _load_dashboard_closed_ledger_snapshot(
     *,
     mode: str | None,
     model_names: tuple[str, ...] | None,
+    allow_stale: bool = False,
 ) -> tuple[datetime, tuple[list[dict[str, Any]], int, int, int, str]] | None:
     from services.okx_position_history_store import load_okx_position_history_watermark
 
@@ -4825,12 +4879,13 @@ def _load_dashboard_closed_ledger_snapshot(
         if int(document.get("version") or 0) != _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_VERSION:
             return None
         generated_at = _as_utc_datetime(document.get("generated_at"))
-        history_watermark = load_okx_position_history_watermark(mode)
         raw_payload = document.get("payload")
         if generated_at is None or not isinstance(raw_payload, list) or len(raw_payload) != 5:
             return None
-        if history_watermark is not None and generated_at < history_watermark:
-            return None
+        if not allow_stale:
+            history_watermark = load_okx_position_history_watermark(mode)
+            if history_watermark is not None and generated_at < history_watermark:
+                return None
         if (
             datetime.now(UTC) - generated_at
         ).total_seconds() > _DASHBOARD_CLOSED_LEDGER_SNAPSHOT_MAX_AGE_SECONDS:
@@ -5437,6 +5492,7 @@ async def _dashboard_position_history_rows(
     mode: str | None,
     page: int,
     page_size: int,
+    serve_stale: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int, str, int, int]:
     (
         settled_rows,
@@ -5451,6 +5507,7 @@ async def _dashboard_position_history_rows(
         page=1,
         page_size=5000,
         paginate=False,
+        serve_stale=serve_stale,
     )
     settled_rows = [
         {
@@ -5460,6 +5517,16 @@ async def _dashboard_position_history_rows(
         }
         for row in settled_rows
     ]
+    if "warming" in settled_source:
+        return (
+            [],
+            0,
+            1,
+            1,
+            settled_source,
+            0,
+            0,
+        )
     pending_rows = await _dashboard_pending_closed_position_rows(
         session,
         mode=mode,
@@ -10233,6 +10300,7 @@ async def get_positions(
                 mode=mode,
                 page=page,
                 page_size=page_size,
+                serve_stale=str(settings.database_url or "").startswith("postgresql"),
             )
             return {
                 "positions": positions,
@@ -14366,31 +14434,63 @@ async def get_daily_pnl_records(mode: str | None = None, days: int = 30):
         return await _build_daily_pnl_records(mode=selected_mode, days=capped_days)
     cache_key = ("daily-pnl", selected_mode, capped_days)
     cached = _dashboard_heavy_cache.get(cache_key)
-    if cached and _dashboard_daily_pnl_snapshot_obsolete(
-        cached[0], cached[1], mode=selected_mode
-    ):
-        _dashboard_heavy_cache.pop(cache_key, None)
     persisted = _load_dashboard_daily_pnl_snapshot(mode=selected_mode, days=capped_days)
-    if persisted is not None:
-        saved_at, payload = persisted
+    if persisted is not None and (
+        cached is None or persisted[0] > cached[0]
+    ):
+        cached = persisted
+        _dashboard_heavy_cache[cache_key] = persisted
+
+    if cached is not None:
+        saved_at, payload = cached
         age_seconds = max((datetime.now(UTC) - saved_at).total_seconds(), 0.0)
-        if age_seconds > 30.0:
-            _start_dashboard_daily_pnl_refresh(selected_mode, capped_days)
-        result = copy.deepcopy(payload)
-        result["status"] = "stale" if age_seconds > 30.0 else result.get("status", "ok")
-        result["freshness"] = {
-            "state": "stale" if age_seconds > 30.0 else "fresh",
-            "is_stale": age_seconds > 30.0,
-            "age_seconds": round(age_seconds, 3),
-            "stale_after_seconds": 30.0,
+        if age_seconds <= _DASHBOARD_DAILY_PNL_SNAPSHOT_MAX_AGE_SECONDS:
+            obsolete = _dashboard_daily_pnl_snapshot_obsolete(
+                saved_at,
+                payload,
+                mode=selected_mode,
+            )
+            is_stale = obsolete or age_seconds > 30.0
+            if is_stale:
+                _start_dashboard_daily_pnl_refresh(selected_mode, capped_days)
+            result = copy.deepcopy(payload)
+            result["status"] = "stale" if is_stale else result.get("status", "ok")
+            result["freshness"] = {
+                "state": "stale" if is_stale else "fresh",
+                "is_stale": is_stale,
+                "age_seconds": round(age_seconds, 3),
+                "stale_after_seconds": 30.0,
+                "reason": (
+                    "beijing_day_changed"
+                    if payload.get("end_date")
+                    and payload["end_date"] != datetime.now(BEIJING_TZ).date().isoformat()
+                    else "okx_history_watermark_advanced"
+                    if obsolete
+                    else "refresh_interval_elapsed"
+                    if is_stale
+                    else None
+                ),
+            }
+            result["source"] = "dashboard.daily_pnl_read_model"
+            result["snapshot_saved_at"] = saved_at.isoformat()
+            return sanitize_payload(result)
+        _dashboard_heavy_cache.pop(cache_key, None)
+
+    _start_dashboard_daily_pnl_refresh(selected_mode, capped_days)
+    return sanitize_payload(
+        {
+            "status": "warming",
+            "mode": selected_mode,
+            "days": capped_days,
+            "records": [],
+            "freshness": {
+                "state": "warming",
+                "is_stale": False,
+                "refresh_in_background": True,
+                "reason": "initial_snapshot_generation",
+            },
+            "source": "dashboard.daily_pnl_read_model",
         }
-        result["source"] = "dashboard.daily_pnl_read_model"
-        result["snapshot_saved_at"] = saved_at.isoformat()
-        return sanitize_payload(result)
-    return await _dashboard_heavy_cached(
-        cache_key,
-        lambda: _build_daily_pnl_records(mode=selected_mode, days=capped_days),
-        ttl_seconds=30.0,
     )
 
 
@@ -14426,8 +14526,6 @@ def _load_dashboard_daily_pnl_snapshot(
         saved_at = _as_utc_datetime(document.get("saved_at"))
         payload = document.get("payload")
         if saved_at is None or not isinstance(payload, dict):
-            return None
-        if _dashboard_daily_pnl_snapshot_obsolete(saved_at, payload, mode=mode):
             return None
         if (
             datetime.now(UTC) - saved_at
@@ -14475,6 +14573,7 @@ def _start_dashboard_daily_pnl_refresh(mode: str, days: int) -> None:
 
     async def refresh() -> None:
         try:
+            await _ensure_dashboard_daily_pnl_ledger_current(mode)
             payload = await _build_daily_pnl_records(mode=mode, days=days)
             _persist_dashboard_daily_pnl_snapshot(mode=mode, days=days, payload=payload)
             _dashboard_heavy_cache_set(("daily-pnl", mode, days), payload)
@@ -14484,6 +14583,38 @@ def _start_dashboard_daily_pnl_refresh(mode: str, days: int) -> None:
             _dashboard_daily_pnl_refresh_tasks.pop(key, None)
 
     _dashboard_daily_pnl_refresh_tasks[key] = asyncio.create_task(refresh())
+
+
+async def _ensure_dashboard_daily_pnl_ledger_current(mode: str) -> None:
+    """Refresh the execution ledger before rebuilding its dependent PnL snapshot."""
+
+    from services.okx_position_history_store import load_okx_position_history_watermark
+
+    cache_key = _dashboard_closed_ledger_cache_key(mode, EXECUTION_LEDGER_MODEL_NAMES)
+    cached = _dashboard_heavy_cache.get(cache_key)
+    if cached is None:
+        cached = _load_dashboard_closed_ledger_snapshot(
+            mode=mode,
+            model_names=EXECUTION_LEDGER_MODEL_NAMES,
+        )
+        if cached is not None:
+            _dashboard_heavy_cache[cache_key] = cached
+
+    watermark = load_okx_position_history_watermark(mode)
+    if cached is not None and (watermark is None or cached[0] >= watermark):
+        return
+
+    refresh_task = _dashboard_closed_ledger_refresh_tasks.get(cache_key)
+    if refresh_task is not None and not refresh_task.done():
+        await asyncio.shield(refresh_task)
+        return
+
+    await _rebuild_dashboard_closed_ledger_cache(
+        cache_key,
+        mode=mode,
+        model_names=EXECUTION_LEDGER_MODEL_NAMES,
+        force=True,
+    )
 
 
 def _daily_pnl_component_totals(

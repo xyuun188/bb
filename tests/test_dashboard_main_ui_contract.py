@@ -131,6 +131,22 @@ def test_pnl_views_use_shared_trading_totals_and_refresh_while_visible() -> None
     assert "pnl-ledger=20261016" in html
 
 
+def test_history_and_daily_pnl_pages_recover_from_slow_or_failed_reads() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
+
+    assert 'id="page-position-history"' in html
+    assert 'id="page-daily-pnl"' in html
+    assert "function schedulePageReadRetry(key, callback, delayMs = 3000)" in script
+    assert "data?.status === 'warming'" in script
+    assert "data.freshness?.is_stale" in script
+    assert "schedulePageReadRetry('daily-pnl'" in script
+    assert "schedulePageReadRetry('position-history'" in script
+    assert "每日盈亏加载失败：" in script
+    assert "历史持仓加载失败：" in script
+    assert "escHtml(message)" in script
+
+
 def test_daily_pnl_table_uses_plain_language_metrics() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")

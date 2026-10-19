@@ -35,6 +35,20 @@ async def test_closed_ledger_read_model_builds_once_across_pages(
 
     monkeypatch.setattr(dashboard, "_dashboard_closed_position_ledger_rows_uncached", fake_build)
 
+    warming = await dashboard._dashboard_closed_position_ledger_rows(
+        object(),
+        object(),
+        mode="paper",
+        page=1,
+        page_size=2,
+        serve_stale=True,
+    )
+    assert warming[4] == "dashboard_closed_ledger_warming"
+    task = dashboard._dashboard_closed_ledger_refresh_tasks[
+        dashboard._dashboard_closed_ledger_cache_key("paper", None)
+    ]
+    await task
+
     first = await dashboard._dashboard_closed_position_ledger_rows(
         object(),
         object(),
@@ -63,7 +77,83 @@ async def test_closed_ledger_read_model_builds_once_across_pages(
 
 
 @pytest.mark.asyncio
-async def test_closed_ledger_rebuilds_when_okx_history_watermark_is_newer(
+async def test_closed_ledger_default_cold_read_rebuilds_synchronously(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
+    payload = ([{"row": "fresh"}], 1, 1, 1, "okx_authoritative")
+    rebuilds: list[tuple[Any, ...]] = []
+
+    async def fake_rebuild(cache_key: tuple[Any, ...], **kwargs: Any):
+        rebuilds.append((cache_key, kwargs))
+        dashboard._dashboard_heavy_cache_set(cache_key, payload)
+        return payload
+
+    monkeypatch.setattr(dashboard, "_rebuild_dashboard_closed_ledger_cache", fake_rebuild)
+
+    result = await dashboard._dashboard_closed_position_ledger_rows(
+        object(),
+        object(),
+        mode="paper",
+    )
+
+    assert result == payload
+    assert len(rebuilds) == 1
+    assert rebuilds[0][1]["session"] is not None
+    assert rebuilds[0][1]["repo"] is not None
+    assert dashboard._dashboard_closed_ledger_cache_key("paper", None) not in (
+        dashboard._dashboard_closed_ledger_refresh_tasks
+    )
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
+
+
+@pytest.mark.asyncio
+async def test_closed_ledger_default_rebuilds_after_history_watermark_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
+    cache_key = dashboard._dashboard_closed_ledger_cache_key("paper", None)
+    stale_at = datetime.now(UTC) - timedelta(minutes=2)
+    dashboard._dashboard_heavy_cache[cache_key] = (
+        stale_at,
+        ([{"row": "stale"}], 1, 1, 1, "old"),
+    )
+    monkeypatch.setattr(
+        position_history_store,
+        "load_okx_position_history_watermark",
+        lambda _mode: stale_at + timedelta(minutes=1),
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_load_dashboard_closed_ledger_snapshot",
+        lambda **_kwargs: None,
+    )
+    fresh_payload = ([{"row": "fresh"}], 1, 1, 1, "new")
+    rebuilt = False
+
+    async def fake_rebuild(key: tuple[Any, ...], **kwargs: Any):
+        nonlocal rebuilt
+        assert key == cache_key
+        assert kwargs["session"] is not None
+        rebuilt = True
+        dashboard._dashboard_heavy_cache_set(key, fresh_payload)
+        return fresh_payload
+
+    monkeypatch.setattr(dashboard, "_rebuild_dashboard_closed_ledger_cache", fake_rebuild)
+
+    result = await dashboard._dashboard_closed_position_ledger_rows(
+        object(),
+        object(),
+        mode="paper",
+    )
+
+    assert result == fresh_payload
+    assert rebuilt
+    dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
+
+
+@pytest.mark.asyncio
+async def test_closed_ledger_serves_stale_snapshot_when_okx_history_watermark_is_newer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
@@ -84,18 +174,23 @@ async def test_closed_ledger_rebuilds_when_okx_history_watermark_is_newer(
         lambda **_kwargs: None,
     )
 
-    async def fake_build(*_args: Any, **_kwargs: Any):
-        return ([{"build": "fresh"}], 1, 1, 1, "okx_authoritative")
-
-    monkeypatch.setattr(dashboard, "_dashboard_closed_position_ledger_rows_uncached", fake_build)
+    started: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_closed_ledger_refresh",
+        lambda key, **_kwargs: started.append(key),
+    )
 
     result = await dashboard._dashboard_closed_position_ledger_rows(
         object(),
         object(),
         mode="paper",
+        serve_stale=True,
     )
 
-    assert result[0] == [{"build": "fresh"}]
+    assert result[0] == [{"build": "stale"}]
+    assert result[4] == "okx_authoritative_stale"
+    assert started == [cache_key]
     dashboard._clear_dashboard_heavy_cache("closed-position-ledger")
 
 
@@ -126,6 +221,7 @@ async def test_closed_ledger_stale_value_returns_while_background_refreshes(
         object(),
         object(),
         mode="paper",
+        serve_stale=True,
     )
     task = dashboard._dashboard_closed_ledger_refresh_tasks[cache_key]
     assert stale[0] == [{"build": 1}]
@@ -165,6 +261,7 @@ async def test_closed_ledger_cold_memory_uses_persisted_snapshot_before_refresh(
         object(),
         object(),
         mode="paper",
+        serve_stale=True,
     )
 
     assert result[0] == [{"build": "persisted"}]
@@ -635,24 +732,48 @@ async def test_profit_attribution_parameter_snapshot_short_circuits_watermark(
 
 @pytest.mark.asyncio
 async def test_daily_pnl_postgres_snapshot_is_single_flight(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dashboard._clear_dashboard_heavy_cache("daily-pnl")
     monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://runtime")
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_daily_pnl_snapshot_path",
+        lambda **_: tmp_path / "daily_pnl.json",
+    )
+
+    async def no_ledger_refresh(_mode: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        dashboard,
+        "_ensure_dashboard_daily_pnl_ledger_current",
+        no_ledger_refresh,
+    )
     calls = 0
+    release = asyncio.Event()
 
     async def build(*, mode: str, days: int) -> dict[str, Any]:
         nonlocal calls
         calls += 1
+        await release.wait()
         return {"mode": mode, "days": days, "records": []}
 
     monkeypatch.setattr(dashboard, "_build_daily_pnl_records", build)
 
     first = await dashboard.get_daily_pnl_records(mode="paper", days=7)
     second = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    await asyncio.sleep(0)
 
-    assert first == second == {"mode": "paper", "days": 7, "records": []}
+    assert first["status"] == second["status"] == "warming"
     assert calls == 1
+    task = dashboard._dashboard_daily_pnl_refresh_tasks[("paper", 7)]
+    release.set()
+    await task
+    ready = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    assert ready["records"] == []
+    assert ready["freshness"]["state"] == "fresh"
 
 
 @pytest.mark.asyncio
@@ -687,7 +808,7 @@ async def test_daily_pnl_rebuilds_persisted_and_memory_cache_after_accounting_ch
         assert dashboard._dashboard_daily_pnl_snapshot_obsolete(
             datetime.now(UTC) - timedelta(seconds=1), old_payload, mode="paper"
         )
-        assert dashboard._load_dashboard_daily_pnl_snapshot(mode="paper", days=7) is None
+        assert dashboard._load_dashboard_daily_pnl_snapshot(mode="paper", days=7) is not None
         cached_at, cached_payload = dashboard._dashboard_heavy_cache[
             ("daily-pnl", "paper", 7)
         ]
@@ -700,7 +821,17 @@ async def test_daily_pnl_rebuilds_persisted_and_memory_cache_after_accounting_ch
         return fresh_payload
 
     monkeypatch.setattr(dashboard, "_build_daily_pnl_records", build)
-    assert await dashboard.get_daily_pnl_records(mode="paper", days=7) == fresh_payload
+    started: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        dashboard,
+        "_start_dashboard_daily_pnl_refresh",
+        lambda mode, days: started.append((mode, days)),
+    )
+    result = await dashboard.get_daily_pnl_records(mode="paper", days=7)
+    assert result["revision"] == "old"
+    assert result["status"] == "stale"
+    assert result["freshness"]["is_stale"] is True
+    assert started == [("paper", 7)]
 
 
 @pytest.mark.asyncio
@@ -781,7 +912,7 @@ def test_closed_ledger_snapshot_round_trip(
     assert loaded_payload == payload
 
 
-def test_closed_ledger_snapshot_rejects_older_okx_history_watermark(
+def test_closed_ledger_snapshot_rejects_stale_by_default_but_page_can_serve_it(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -809,6 +940,11 @@ def test_closed_ledger_snapshot_rejects_older_okx_history_watermark(
         mode="paper",
         model_names=None,
     ) is None
+    assert dashboard._load_dashboard_closed_ledger_snapshot(
+        mode="paper",
+        model_names=None,
+        allow_stale=True,
+    ) is not None
 
 
 def test_official_history_matches_only_instrument_scoped_rows(
