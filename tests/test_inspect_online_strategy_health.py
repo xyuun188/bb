@@ -105,6 +105,11 @@ def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:
     assert "EnvironmentFile=/etc/bb/bb-runtime.env" in command
     assert "--property=User=bb" in command
     assert "chown bb:bb" in command
+    assert (
+        "find /data/bb/app/tmp/codex-strategy-health -maxdepth 1 -type f "
+        "\\( -name 'result_*.json' -o -name 'sample_*.py' \\) -mmin +1440 -delete"
+    ) in command
+    assert "trap 'rm -f --" in command
     assert 'detail=("summary" if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else "full")' in command
     assert "page_size=(5 if SUMMARY_ONLY or MARKET_SYMBOL_ONLY else 20)" in command
 

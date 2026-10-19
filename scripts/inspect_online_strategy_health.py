@@ -18,6 +18,7 @@ from services.profit_training_contract import PROFIT_TRAINING_TARGET  # noqa: E4
 
 REMOTE_RESULT_READ_TIMEOUT_SECONDS = 45.0
 REMOTE_RESULT_MAX_BYTES = 32 * 1024 * 1024
+REMOTE_TEMP_TTL_MINUTES = 24 * 60
 
 REMOTE_SCRIPT_TEMPLATE = r'''
 import asyncio
@@ -572,10 +573,17 @@ def _build_remote_command(
         .replace("__DECISION_ID__", str(max(int(decision_id or 0), 0)))
     )
     quoted_sample = shlex.quote(sample_path)
+    quoted_tmp_dir = shlex.quote(tmp_dir)
     command = [
         "set -eo pipefail",
         "cd /data/bb/app",
-        f"install -d -o bb -g bb -m 0750 {shlex.quote(tmp_dir)}",
+        f"install -d -o bb -g bb -m 0750 {quoted_tmp_dir}",
+        (
+            f"find {quoted_tmp_dir} -maxdepth 1 -type f "
+            "\\( -name 'result_*.json' -o -name 'sample_*.py' \\) "
+            f"-mmin +{REMOTE_TEMP_TTL_MINUTES} -delete"
+        ),
+        f"trap 'rm -f -- {quoted_sample}' EXIT",
         f"cat > {quoted_sample} <<'PY'",
         remote_script,
         "PY",
@@ -602,7 +610,6 @@ def _build_remote_command(
         )
     else:
         command.append(python_command)
-    command.append(f"rm -f {quoted_sample}")
     return "\n".join(command)
 
 
