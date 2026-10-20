@@ -21,6 +21,42 @@ def test_funnel_classifies_structured_funding_block() -> None:
     ) == "funding_cost_blocked"
 
 
+def test_funnel_distinguishes_selected_training_shadow_from_no_candidate() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "paper_trade_selection": {
+                "selected": True,
+                "selection_reason": "paper_training_entry",
+            },
+            "normal_paper_trade": {
+                "authorized": False,
+                "paper_training_only": True,
+            },
+        },
+        action="hold",
+        was_executed=False,
+        has_order=False,
+    ) == "shadow_training"
+
+
+def test_funnel_distinguishes_selected_quality_observation() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "paper_trade_selection": {
+                "selected": True,
+                "selection_reason": "paper_quality_observation",
+            },
+            "normal_paper_trade": {
+                "authorized": False,
+                "paper_quality_observation_only": True,
+            },
+        },
+        action="hold",
+        was_executed=False,
+        has_order=False,
+    ) == "quality_observation"
+
+
 def test_funnel_does_not_treat_normal_funding_diagnostics_as_a_block() -> None:
     assert classify_entry_funnel_reason(
         raw={

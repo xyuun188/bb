@@ -25,14 +25,31 @@ unexecuted exits, and seven officially settled lifecycles. The exit pipeline
 was active. This window is separate from the earlier 15:41 UTC snapshot and
 must not inherit its PnL.
 
-A separate bounded audit of 300 analyses from 15:18:07 to 17:33:33 UTC found
-300 complete, decision-eligible analyses and no service errors. All finished
-with `no_candidate`. None of 600 side evaluations were production eligible;
-42 long and 23 short mean-return estimates were positive, but their lower
-bounds were negative. Directional support, fee-after quality and economics
-remain the entry problem. Ordinary paper execution does not universally
-require model promotion or a positive per-trade lower bound, so those facts
-must not be described as a blanket paper-order prohibition.
+A bounded audit of 300 analyses from 15:18:07 to 17:33:33 UTC found 300
+complete, decision-eligible analyses and no service errors. Its then-current
+records all finished with `no_candidate`. A later read-only audit found that
+the funnel's hold classifier also mislabeled a selected `paper_training_entry`
+shadow as `no_candidate`; therefore the earlier result describes that earlier
+window only and is not a complete classification of later decisions.
+
+The later online example at 18:51:39 UTC on October 20 selected XRP short for
+shadow training, with modeled net return `+0.026606%`, gross return
+`+0.134172%`, execution cost `0.107566%`, objective net return `-0.862138%`
+and loss probability `0.524228`. Its historical local-ML quality evidence
+contained 265 samples with fee-after mean `-0.044642%`, lower bound
+`-0.174464%`, and profit factor `0.922553`. The contract correctly remained
+unauthorized because historical fee-after quality had not reached break-even.
+This is a selected shadow signal, not an executable entry, and its small
+positive current mean does not override the negative quality evidence.
+
+The latest sampled online window (100 rows, 17:59:05-18:54:35 UTC on October
+20) still contained only final `hold` actions. The audit exposed selected
+shadow examples in that window as well. No result here indicates that a paper
+order was opened. Ordinary paper execution does not universally require model
+promotion or a positive per-trade lower bound, but the existing historical
+quality contract can deliberately keep training candidates unauthorized.
+Do not describe all holds as either "no candidate" or a universal ban on
+ordinary paper orders.
 
 ## Repaired Causes
 
@@ -76,6 +93,17 @@ must not be described as a blanket paper-order prohibition.
    Three outer chronological folds evaluate the selected policies. Failed
    inner evidence selects no-trade. This research changes no runtime policy
    and cannot authorize promotion.
+9. A frozen, nested multi-horizon development diagnostic compared 5/15/60/240
+   minutes, existing/market-only features, Ridge strengths 1/10/100 and net
+   thresholds 0/0.05/0.1 percent. Two folds selected 240-minute research
+   policies; the third selected no policy. Aggregate all-opportunity evidence
+   was positive, but the single-global-position view selected only 15
+   observations and had a negative naive lower bound. This remains an
+   unqualified development result, not a deployable strategy.
+10. The entry-funnel diagnostics now distinguish selected
+    `paper_training_entry` and `paper_quality_observation` shadows from
+    `no_candidate`. This is display/classification only and does not change
+    authorization.
 
 ## Verified Historical Findings
 
@@ -160,6 +188,9 @@ Reducing an entry gate does not repair that economics.
 Both development diagnostics leave artifact pointers and production risk/
 execution rules unchanged. No fresh sealed exam has been consumed for this
 search, and no controlled paper round trip has been authorized by its results.
+The multi-horizon result also fails its own promotion guard: one outer fold
+selected no policy, and its nonoverlapping aggregate had only 15 selected
+observations with a nonpositive naive lower bound.
 
 ## Required Research Order
 

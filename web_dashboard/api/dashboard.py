@@ -11244,11 +11244,15 @@ async def get_opening_funnel(
                 "market_scans": 0,
                 "executable_entry_signals": 0,
                 "analysis_only_signals": 0,
+                "shadow_training_signals": 0,
+                "quality_observation_signals": 0,
                 "average_confidence": 0.0,
                 "stages": {
                     "market_scans": 0,
                     "ai_entry_signals": 0,
                     "analysis_only_signals": 0,
+                    "shadow_training_signals": 0,
+                    "quality_observation_signals": 0,
                     "orders_created": 0,
                     "executed_entries": 0,
                 },
@@ -11263,6 +11267,7 @@ async def get_opening_funnel(
                 "reason_buckets": {
                     "profit_expectancy": 0,
                     "evidence_gate": 0,
+                    "shadow_training": 0,
                     "risk_or_precheck": 0,
                     "pre_order_facts": 0,
                     "waiting_queue": 0,
@@ -11382,6 +11387,7 @@ async def _build_opening_funnel_payload(
     reason_buckets = {
         "profit_expectancy": 0,
         "evidence_gate": 0,
+        "shadow_training": 0,
         "risk_or_precheck": 0,
         "pre_order_facts": 0,
         "waiting_queue": 0,
@@ -11401,6 +11407,8 @@ async def _build_opening_funnel_payload(
     orders_created = 0
     executed_entries = 0
     no_order_after_signal = 0
+    shadow_training_signals = 0
+    quality_observation_signals = 0
     confidence_total = 0.0
     confidence_count = 0
 
@@ -11432,6 +11440,23 @@ async def _build_opening_funnel_payload(
                 hold_reason_buckets[funnel_reason] = (
                     hold_reason_buckets.get(funnel_reason, 0) + 1
                 )
+                reason_bucket = {
+                    "no_candidate": "waiting_queue",
+                    "insufficient_evidence": "evidence_gate",
+                    "direction_conflict": "evidence_gate",
+                    "shadow_training": "shadow_training",
+                    "quality_observation": "shadow_training",
+                    "risk_blocked": "risk_or_precheck",
+                    "funding_cost_blocked": "profit_expectancy",
+                    "pre_order_facts_blocked": "pre_order_facts",
+                    "execution_blocked": "execution_or_exchange",
+                    "account_reconciliation_blocked": "execution_or_exchange",
+                    "service_error": "execution_or_exchange",
+                }.get(funnel_reason, "unknown")
+                if funnel_reason == "shadow_training":
+                    shadow_training_signals += 1
+                elif funnel_reason == "quality_observation":
+                    quality_observation_signals += 1
                 if len(recent_blocked) < 20:
                     recent_blocked.append(
                         sanitize_payload(
@@ -11443,11 +11468,7 @@ async def _build_opening_funnel_payload(
                                 "symbol": symbol,
                                 "action": action or "hold",
                                 "confidence": row.confidence,
-                                "reason_bucket": (
-                                    "waiting_queue"
-                                    if funnel_reason == "no_candidate"
-                                    else "unknown"
-                                ),
+                                "reason_bucket": reason_bucket,
                                 "funnel_reason": funnel_reason,
                                 "reason": _display_execution_reason(row, None)
                                 or funnel_reason,
@@ -11550,6 +11571,9 @@ async def _build_opening_funnel_payload(
         if analysis_only_signals and not entry_signals:
             bottleneck = "analysis_only"
             bottleneck_label = "当前只有观察信号，暂无可执行开仓信号"
+        elif shadow_training_signals and not entry_signals:
+            bottleneck = "shadow_training"
+            bottleneck_label = "已有训练影子信号，但历史费后质量门禁禁止下单"
         elif signal_rate < 0.08:
             bottleneck = "ai_hold"
             bottleneck_label = "AI 主要选择观望"
@@ -11610,6 +11634,8 @@ async def _build_opening_funnel_payload(
             "market_scans": total_scans,
             "executable_entry_signals": entry_signals,
             "analysis_only_signals": analysis_only_signals,
+            "shadow_training_signals": shadow_training_signals,
+            "quality_observation_signals": quality_observation_signals,
             "average_confidence": (
                 (confidence_total / confidence_count) if confidence_count else 0.0
             ),
@@ -11617,6 +11643,8 @@ async def _build_opening_funnel_payload(
                 "market_scans": total_scans,
                 "ai_entry_signals": entry_signals,
                 "analysis_only_signals": analysis_only_signals,
+                "shadow_training_signals": shadow_training_signals,
+                "quality_observation_signals": quality_observation_signals,
                 "orders_created": orders_created,
                 "executed_entries": executed_entries,
             },

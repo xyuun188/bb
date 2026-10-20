@@ -12218,6 +12218,7 @@ function openingFunnelReasonLabel(key) {
     const labels = {
         profit_expectancy: '收益期望',
         evidence_gate: '证据评分',
+        shadow_training: '训练影子信号',
         risk_or_precheck: '风控/预检',
         pre_order_facts: '交易前事实',
         waiting_queue: '观望/等待',
@@ -12270,6 +12271,7 @@ function renderOpeningFunnelSummary(data) {
     const scans = Number(data.market_scans || 0);
     const signals = Number(data.stages?.ai_entry_signals ?? data.executable_entry_signals ?? 0);
     const observations = Number(data.stages?.analysis_only_signals ?? data.analysis_only_signals ?? 0);
+    const shadowTraining = Number(data.stages?.shadow_training_signals ?? data.shadow_training_signals ?? 0);
     const executed = Number(data.stages?.executed_entries || 0);
     const bottleneck = data.bottleneck_label || '暂无足够数据';
     const tone = data.bottleneck === 'healthy_selective' ? 'good' : scans ? 'warn' : 'muted';
@@ -12279,14 +12281,16 @@ function renderOpeningFunnelSummary(data) {
     const noEntryDetail = signals === 0 && scans > 0
         ? serviceErrorCount > 0
             ? `其中 ${serviceErrorCount} 次模型/服务异常已安全跳过，未拿异常结果下单。`
-            : noCandidateCount > 0 || Number(data.hold_count || 0) === scans
+            : shadowTraining > 0
+                ? `其中 ${shadowTraining} 次已选中训练影子信号，但历史费后质量门禁禁止下单，继续收集结算样本。`
+                : noCandidateCount > 0 || Number(data.hold_count || 0) === scans
                 ? '本窗口没有形成可执行的做多或做空信号；系统未提交新开仓订单，继续等待满足方向、费后收益和风险条件的候选。'
                 : '本窗口没有形成可执行的新开仓信号；系统未提交新开仓订单。'
         : '';
     el.innerHTML = `
         <div class="opening-funnel-verdict opening-funnel-${tone}">
             <strong>${escHtml(bottleneck)}</strong>
-            <span>扫描 ${scans} 次，可执行开仓信号 ${signals} 次，实际开仓 ${executed} 次。${observations ? `另有 ${observations} 次仅观察，不会下单。` : ''} 总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。${noEntryDetail ? ` ${noEntryDetail}` : ''}</span>
+            <span>扫描 ${scans} 次，可执行开仓信号 ${signals} 次，实际开仓 ${executed} 次。${observations ? `另有 ${observations} 次仅观察，不会下单。` : ''}${shadowTraining ? `另有 ${shadowTraining} 次训练影子信号。` : ''} 总开仓率 ${pctFmt(data.rates?.overall_open_rate)}。${noEntryDetail ? ` ${noEntryDetail}` : ''}</span>
         </div>
         <div class="opening-funnel-kpis">
             <div><span>可执行信号率</span><strong>${pctFmt(data.rates?.signal_rate)}</strong></div>
@@ -12327,8 +12331,21 @@ function renderOpeningFunnelReasons(data) {
     const el = document.getElementById('opening-funnel-reasons');
     if (!el) return;
     const buckets = { ...(data.reason_buckets || {}) };
+    const holdReasonBuckets = {
+        no_candidate: 'waiting_queue',
+        insufficient_evidence: 'evidence_gate',
+        direction_conflict: 'evidence_gate',
+        shadow_training: 'shadow_training',
+        quality_observation: 'shadow_training',
+        risk_blocked: 'risk_or_precheck',
+        funding_cost_blocked: 'profit_expectancy',
+        pre_order_facts_blocked: 'pre_order_facts',
+        execution_blocked: 'execution_or_exchange',
+        account_reconciliation_blocked: 'execution_or_exchange',
+        service_error: 'execution_or_exchange',
+    };
     Object.entries(data.hold_reason_buckets || {}).forEach(([key, count]) => {
-        const bucket = key === 'no_candidate' ? 'waiting_queue' : 'unknown';
+        const bucket = holdReasonBuckets[key] || 'unknown';
         buckets[bucket] = Number(buckets[bucket] || 0) + Number(count || 0);
     });
     const items = Object.entries(buckets).filter(([, count]) => Number(count || 0) > 0);

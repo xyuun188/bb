@@ -52,6 +52,8 @@ def test_opening_funnel_labels_observation_only_separately_from_executable_entri
     assert "仅观察信号" in script
     assert "不会下单" in script
     assert "pre_order_facts: '交易前事实'" in script
+    assert "shadow_training: '训练影子信号'" in script
+    assert "历史费后质量门禁禁止下单" in script
     assert "只统计可执行但未成交的信号" in html
 
 

@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 
+EARLIEST_EXAM_START = "2026-09-26T22:11:51.501105+00:00"
+
 REMOTE_CODE = """
 import asyncio
 import json
@@ -21,23 +23,58 @@ from config.settings import settings
 from db.session import close_db
 from services.ml_development_baselines import build_development_baseline_report
 from services.ml_nested_development import build_nested_development_report
+from services.ml_development_snapshot import (
+    load_development_snapshot, make_development_snapshot, save_development_snapshot,
+)
+from services.ml_horizon_development import build_horizon_development_report
 from services.ml_signal_service import build_training_frame
 from services.ml_training_dataset import load_shadow_training_rows
 from services.strategy_replay_governance import write_replay_governance
 
 NESTED = __NESTED__
+HORIZONS = __HORIZONS__
+CUTOFF = __CUTOFF__
 
 async def main():
     try:
-        rows = await load_shadow_training_rows()
-        builder = build_nested_development_report if NESTED else build_development_baseline_report
-        report = builder(build_training_frame(rows))
+        directory = settings.data_dir / "strategy_replay"
+        if HORIZONS:
+            snapshot_path = directory / "frozen_development_v1.json"
+            if snapshot_path.exists():
+                development, snapshot = load_development_snapshot(snapshot_path, cutoff=CUTOFF)
+            else:
+                rows = await load_shadow_training_rows()
+                snapshot = make_development_snapshot(build_training_frame(rows), cutoff=CUTOFF)
+                development, snapshot = save_development_snapshot(snapshot, path=snapshot_path)
+            report = build_horizon_development_report(development, snapshot=snapshot)
+        else:
+            rows = await load_shadow_training_rows()
+            builder = build_nested_development_report if NESTED else build_development_baseline_report
+            report = builder(build_training_frame(rows))
         report["generated_at"] = datetime.now(UTC).isoformat()
-        name = "nested_development.json" if NESTED else "development_baselines.json"
-        write_replay_governance(
-            report, path=settings.data_dir / "strategy_replay" / name
+        name = (
+            "horizon_development.json" if HORIZONS else
+            "nested_development.json" if NESTED else "development_baselines.json"
         )
-        if NESTED:
+        write_replay_governance(
+            report, path=directory / name
+        )
+        if HORIZONS:
+            folds = [
+                {
+                    **fold,
+                    "selection": {
+                        **fold["selection"],
+                        "candidate_count": len(fold["selection"]["candidates"]),
+                        "eligible_candidate_count": sum(
+                            candidate["inner_selection_eligible"]
+                            for candidate in fold["selection"]["candidates"]
+                        ),
+                        "candidates": [],
+                    },
+                } for fold in report["folds"]
+            ]
+        elif NESTED:
             folds = [
                 {
                     **fold,
@@ -74,7 +111,9 @@ asyncio.run(main())
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nested", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--nested", action="store_true")
+    mode.add_argument("--horizons", action="store_true")
     args = parser.parse_args()
     command = [
         "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
@@ -93,7 +132,9 @@ def main() -> int:
         "--setenv=DATABASE_POOL_SIZE=2",
         "--setenv=DATABASE_MAX_OVERFLOW=0",
         "/data/bb/app/.venv/bin/python", "-c",
-        REMOTE_CODE.replace("__NESTED__", str(args.nested)),
+        REMOTE_CODE.replace("__NESTED__", str(args.nested)).replace(
+            "__HORIZONS__", str(args.horizons)
+        ).replace("__CUTOFF__", repr(EARLIEST_EXAM_START)),
     ]
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:

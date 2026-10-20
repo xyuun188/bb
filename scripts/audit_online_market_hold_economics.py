@@ -213,6 +213,7 @@ async def main():
         "positive_production_examples": [],
         "positive_mean_non_positive_lcb_examples": [],
         "directional_decision_examples": [],
+        "shadow_training_count": 0,
         "symbol_counts": Counter(),
         "duplicate_idempotency_key_count": len(duplicate_rows),
     }
@@ -421,7 +422,13 @@ async def main():
             reason=row.execution_reason,
         )
         summary["funnel_reasons"][str(funnel_reason or "executed")] += 1
-        if action in {"long", "short"} and len(summary["directional_decision_examples"]) < 20:
+        paper_selection = _dict(raw.get("paper_trade_selection"))
+        if funnel_reason == "shadow_training":
+            summary["shadow_training_count"] += 1
+        if (
+            (action in {"long", "short"} or paper_selection.get("selected") is True)
+            and len(summary["directional_decision_examples"]) < 20
+        ):
             normal_trade = _dict(raw.get("normal_paper_trade"))
             sizing = _dict(raw.get("profit_risk_sizing"))
             high_risk_review = _dict(raw.get("high_risk_review"))

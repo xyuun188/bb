@@ -9,6 +9,8 @@ ENTRY_FUNNEL_REASONS = (
     "no_candidate",
     "insufficient_evidence",
     "direction_conflict",
+    "shadow_training",
+    "quality_observation",
     "risk_blocked",
     "funding_cost_blocked",
     "pre_order_facts_blocked",
@@ -157,6 +159,8 @@ def classify_entry_funnel_reason(
     funding = _dict(opportunity.get("funding_cost"))
     direction = _dict(payload.get("direction_competition"))
     high_risk_review = _dict(payload.get("high_risk_review"))
+    paper_selection = _dict(payload.get("paper_trade_selection"))
+    normal_paper_trade = _dict(payload.get("normal_paper_trade"))
     quality_complete = bool(
         quality.get("analysis_complete") is True
         and quality.get("decision_eligible") is True
@@ -166,6 +170,25 @@ def classify_entry_funnel_reason(
         or payload.get("expert_failures")
         or final_code in {"MODEL_UNAVAILABLE", "MODEL_TIMEOUT", "MODEL_INVALID_OUTPUT"}
     )
+
+    # Selected training/quality observations are deliberately unauthorized
+    # shadow envelopes, not missing candidates.
+    if (
+        paper_selection.get("selected") is True
+        and (
+            paper_selection.get("selection_reason") == "paper_training_entry"
+            or normal_paper_trade.get("paper_training_only") is True
+        )
+    ):
+        return "shadow_training"
+    if (
+        paper_selection.get("selected") is True
+        and (
+            paper_selection.get("selection_reason") == "paper_quality_observation"
+            or normal_paper_trade.get("paper_quality_observation_only") is True
+        )
+    ):
+        return "quality_observation"
 
     # A directional signal may be generated while the execution layer still
     # lacks a fresh, authoritative OKX fact snapshot. This is a deliberate
