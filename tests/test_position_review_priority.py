@@ -136,6 +136,43 @@ def test_profitable_priority_requires_cost_complete_dynamic_exit() -> None:
     scan = scans[("ensemble_trader", "BTC/USDT")]
     assert scan["priority_score"] == 0.0
     assert scan["dynamic_exit_eligible"] is False
+    assert scan["dynamic_exit_policy"]["eligible"] is False
+    assert scan["reason"] == scan["dynamic_exit_policy"]["reason"]
+    assert scan["reason"] != "dynamic_exit_pressure_zero"
+
+
+@pytest.mark.parametrize("eligible_side", [None, "short"])
+def test_blocked_assessment_preserves_reason_without_granting_exit(
+    monkeypatch: pytest.MonkeyPatch, eligible_side: str | None
+) -> None:
+    def assess(_policy, position, _feature):
+        eligible = position["side"] == eligible_side
+        return {
+            "eligible": eligible,
+            "close_fraction": 0.1 if eligible else 0.8,
+            "reason": "dynamic_exit_policy_passed" if eligible else "exit_execution_cost_incomplete",
+        }
+
+    monkeypatch.setattr(PositionReviewPriorityPolicy, "_assessment", assess)
+    key = ("ensemble_trader", "BTC/USDT")
+    scan = _policy().scan_groups(
+        [(key, [{"side": "long"}, {"side": "short"}])],
+        {},
+        {},
+        aggregate_position_group=_aggregate,
+    )[key]
+
+    if eligible_side:
+        assert scan["dynamic_exit_eligible"] is True
+        assert scan["priority_score"] == pytest.approx(10.0)
+        assert scan["reason"] == "dynamic_exit_policy_passed"
+        assert _policy().is_urgent_exit_scan(scan) is True
+    else:
+        assert scan["dynamic_exit_policy"]["close_fraction"] == 0.8
+        assert scan["reason"] == "exit_execution_cost_incomplete"
+        assert scan["dynamic_exit_eligible"] is False
+        assert scan["priority_score"] == scan["exit_score"] == 0.0
+        assert _policy().is_urgent_exit_scan(scan) is False
 
 
 def test_dynamic_exit_eligibility_is_the_only_urgent_signal() -> None:

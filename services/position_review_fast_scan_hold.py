@@ -77,6 +77,8 @@ class PositionReviewFastScanHoldPolicy:
                 "summary": agent_skill_summary,
             },
         }
+        if dynamic_exit:
+            raw_response["dynamic_exit_policy"] = dict(dynamic_exit)
         if portfolio_context:
             raw_response["portfolio_profit_observation"] = {
                 **portfolio_context,

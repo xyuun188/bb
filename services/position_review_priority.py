@@ -129,11 +129,14 @@ class PositionReviewPriorityPolicy:
 
             eligible = [item for item in assessments if item.get("eligible") is True]
             best = max(
-                eligible,
+                eligible or assessments,
                 key=lambda item: _safe_float(item.get("close_fraction"), 0.0),
                 default={},
             )
-            close_fraction = _safe_float(best.get("close_fraction"), 0.0)
+            exit_eligible = best.get("eligible") is True
+            close_fraction = (
+                _safe_float(best.get("close_fraction"), 0.0) if exit_eligible else 0.0
+            )
             hard_risk = bool(best.get("hard_risk"))
             scans[key] = {
                 "priority_score": close_fraction * 100.0,
@@ -146,7 +149,7 @@ class PositionReviewPriorityPolicy:
                 "release_reason": "",
                 "position_quality": {},
                 "dynamic_exit_policy": best,
-                "dynamic_exit_eligible": bool(best),
+                "dynamic_exit_eligible": exit_eligible,
                 "dynamic_exit_hard_risk": hard_risk,
             }
         return scans
