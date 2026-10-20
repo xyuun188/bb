@@ -44,6 +44,7 @@ from core.safe_output import safe_print  # noqa: E402
 from scripts.audit_online_secret_files import (
     _remote_script as secret_file_audit_script,
 )  # noqa: E402
+from scripts.install_strategy_replay_timer import install_command as install_strategy_replay_timer
 
 REMOTE_APP_DIR = "/data/bb/app"
 REMOTE_SERVICE_NAME = "bb-paper-trading.service"
@@ -716,7 +717,8 @@ TimeoutStopSec=30
         f"install -m 0644 /tmp/{model_tunnel_service} /etc/systemd/system/{model_tunnel_service}; "
         f"mkdir -p /etc/systemd/system/{trading_service}.d; "
         f"cat > /etc/systemd/system/{trading_service}.d/20-split-dashboard.conf <<'DROPIN'\n{trading_dropin}\nDROPIN\n"
-        f"systemctl daemon-reload; systemctl enable {dashboard_service} {model_tunnel_service} >/dev/null"
+        f"systemctl daemon-reload; systemctl enable {dashboard_service} {model_tunnel_service} >/dev/null\n"
+        + install_strategy_replay_timer(remote_app_dir, owner)
     )
 
 

@@ -852,6 +852,7 @@ def _ml_training_metadata(
             "training_run_mode": "persist" if artifact_persisted else "dry_run",
             "artifact_persisted": artifact_persisted,
             "feature_contract_version": ml_signal_module.FEATURE_CONTRACT_VERSION,
+            "shadow_selection_policy": ml_training_dataset.SHADOW_SELECTION_POLICY_VERSION,
             "multitask_prediction_contract_version": (
                 ml_signal_module.MULTITASK_PREDICTION_CONTRACT_VERSION
             ),
@@ -1955,7 +1956,7 @@ def test_cached_dry_run_candidate_is_persisted_without_refitting(
     assert id(metadata) not in ml_signal_module._TRAINING_CANDIDATE_CACHE
 
 
-@pytest.mark.parametrize("contract_kind", ("data_quality", "evaluation"))
+@pytest.mark.parametrize("contract_kind", ("data_quality", "evaluation", "selection_policy"))
 @pytest.mark.asyncio
 async def test_ml_signal_retrains_when_training_contract_changes(
     monkeypatch: pytest.MonkeyPatch,
@@ -1999,6 +2000,8 @@ async def test_ml_signal_retrains_when_training_contract_changes(
             **stale_metadata["quality_report"],
             "data_quality_version": "2026-07-14.separated-profit-supervision.v4",
         }
+    elif contract_kind == "selection_policy":
+        stale_metadata.pop("shadow_selection_policy")
     else:
         stale_metadata["horizons"] = [5, 15, 60, 240]
         stale_metadata.pop("primary_prediction_horizon_minutes", None)
@@ -2033,12 +2036,12 @@ async def test_ml_signal_retrains_when_training_contract_changes(
     assert result["trained"] is True
     expected_trigger = (
         "training_data_contract_changed"
-        if contract_kind == "data_quality"
+        if contract_kind in {"data_quality", "selection_policy"}
         else "training_evaluation_contract_changed"
     )
     assert result["training_policy"]["trigger"] == expected_trigger
     assert result["training_policy"]["training_data_contract_stale"] is (
-        contract_kind == "data_quality"
+        contract_kind in {"data_quality", "selection_policy"}
     )
     assert result["training_policy"]["training_evaluation_contract_stale"] is (
         contract_kind == "evaluation"
@@ -2544,12 +2547,12 @@ def test_shadow_training_selection_includes_clean_missed_trade_opportunities() -
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     missed_count = sum(bool(row.missed_opportunity) for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 18
+    assert len(selected) == 38
     assert len(set(selected_ids)) == len(selected_ids)
     assert non_hold_count == 8
     assert missed_count == 10
-    assert best_trade_count == len(selected)
-    assert not any(row.id in {item.id for item in recent_hold_rows} for row in selected)
+    assert best_trade_count == 18
+    assert all(row.id in selected_ids for row in recent_hold_rows)
 
 
 def test_ml_training_window_evaluator_bootstraps_runtime_before_db_import() -> None:
@@ -2583,7 +2586,7 @@ def test_ml_training_window_evaluator_exposes_extended_diagnostic_variants() -> 
     assert [row.id for row in matched_short] == [3]
 
 
-def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality_hold() -> None:
+def test_shadow_training_selection_keeps_clean_holds_independent_of_confidence() -> None:
     noisy_holds = [
         _shadow_row(20_000 - idx, action="hold", best_action="hold", confidence=0.01)
         for idx in range(30)
@@ -2615,10 +2618,10 @@ def test_shadow_training_selection_prioritizes_trainable_signal_over_low_quality
     noisy_selected = [row for row in selected if row.decision_confidence < 0.05]
     non_hold_count = sum(row.decision_action in {"long", "short"} for row in selected)
     best_trade_count = sum(row.best_action in {"long", "short"} for row in selected)
-    assert len(selected) == 24
-    assert len(noisy_selected) == 0
+    assert len(selected) == 54
+    assert len(noisy_selected) == 30
     assert non_hold_count == 12
-    assert best_trade_count == len(selected)
+    assert best_trade_count == 24
 
 
 def test_shadow_training_selection_includes_low_confidence_missed_hold_opportunities() -> None:
@@ -2655,7 +2658,7 @@ def test_shadow_training_selection_includes_low_confidence_missed_hold_opportuni
     assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
 
 
-def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds() -> None:
+def test_shadow_training_selection_includes_non_opportunity_holds() -> None:
     noisy_holds = [
         _shadow_row(40_000 - idx, action="hold", best_action="hold", confidence=0.01)
         for idx in range(40)
@@ -2673,9 +2676,22 @@ def test_shadow_training_selection_excludes_low_confidence_non_opportunity_holds
 
     selected = select_shadow_training_rows([*noisy_holds, *clean_missed_rows])
 
-    assert len(selected) == 12
-    assert all(row.missed_opportunity for row in selected)
-    assert not any(row.id in {item.id for item in noisy_holds} for row in selected)
+    assert len(selected) == 52
+    assert sum(row.missed_opportunity for row in selected) == 12
+    assert {row.id for row in noisy_holds} <= {row.id for row in selected}
+
+
+def test_shadow_training_membership_is_invariant_to_future_opportunity_labels() -> None:
+    rows = [
+        _shadow_row(1, action="hold", best_action="hold", missed=False),
+        _shadow_row(2, action="hold", best_action="long", missed=True),
+        _shadow_row(3, action="short", best_action="short"),
+    ]
+    selected_ids = {row.id for row in select_shadow_training_rows(rows)}
+    for row in rows:
+        row.best_action = "hold"
+        row.missed_opportunity = False
+    assert {row.id for row in select_shadow_training_rows(rows)} == selected_ids == {1, 2, 3}
 
 
 def test_shadow_training_selection_keeps_complete_clean_opportunity_history() -> None:
@@ -3159,14 +3175,14 @@ async def test_load_shadow_training_rows_combines_recent_trade_and_best_action_s
         await close_db()
 
     selected_ids = {row.id for row in selected}
-    assert len(selected) == 22
+    assert len(selected) == 62
     assert all(not isinstance(row, ShadowBacktest) for row in selected)
     assert 90 not in selected_ids
     assert 91 not in selected_ids
     assert sum(row.decision_action in {"long", "short"} for row in selected) == 8
     assert sum(row.decision_action == "hold" and row.missed_opportunity for row in selected) == 14
-    assert sum(row.best_action in {"long", "short"} for row in selected) == len(selected)
-    assert not any(row.id >= 10_000 for row in selected)
+    assert sum(row.best_action in {"long", "short"} for row in selected) == 22
+    assert sum(row.id >= 10_000 for row in selected) == 40
 
 
 @pytest.mark.asyncio
@@ -3196,10 +3212,9 @@ async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
     finally:
         await close_db()
 
-    assert len(selected) == 25
-    assert {row.decision_action for row in selected} <= {"long", "short"}
-    assert {row.best_action for row in selected} <= {"long", "short"}
-    assert not any(row.id >= 20_000 for row in selected)
+    assert len(selected) == 105
+    assert sum(row.decision_action in {"long", "short"} for row in selected) == 25
+    assert sum(row.id >= 20_000 for row in selected) == 80
 
 
 @pytest.mark.asyncio

@@ -258,15 +258,33 @@ class MemoryRepository(BaseRepository):
             return existing
 
     async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
+        """Drain old labels while reserving capacity for newly matured evidence."""
+
         now = datetime.now(UTC)
+        budget = max(int(limit or 200), 1)
+        filters = (
+            ShadowBacktest.status == "pending",
+            ShadowBacktest.due_at <= now,
+        )
+        oldest = (
+            select(ShadowBacktest.id)
+            .where(*filters)
+            .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
+            .limit((budget + 1) // 2)
+            .cte("oldest_due_shadow")
+        )
+        newest = (
+            select(ShadowBacktest.id)
+            .where(*filters, ShadowBacktest.id.not_in(select(oldest.c.id)))
+            .order_by(ShadowBacktest.due_at.desc(), ShadowBacktest.id.desc())
+            .limit(budget // 2)
+            .cte("newest_due_shadow")
+        )
+        selected = select(oldest.c.id).union_all(select(newest.c.id)).cte("due_shadow_ids")
         stmt = (
             select(ShadowBacktest)
-            .where(
-                ShadowBacktest.status == "pending",
-                ShadowBacktest.due_at <= now,
-            )
+            .join(selected, ShadowBacktest.id == selected.c.id)
             .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
-            .limit(max(int(limit or 200), 1))
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

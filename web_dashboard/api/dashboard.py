@@ -12491,6 +12491,7 @@ def _strategy_learning_dashboard_summary(payload: Any) -> dict[str, Any]:
             "production_permission",
             "current_production_strategy",
             "paper_strategy_champion",
+            "historical_replay_governance",
             "feedback",
         )
         if key in raw

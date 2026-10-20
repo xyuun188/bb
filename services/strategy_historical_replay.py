@@ -429,13 +429,9 @@ def _partition_observations(
     post_training = [
         row
         for row in eligible
-        if (
-            completed := _timestamp(
-                row.get("completed_at") or row.get("label_timestamp") or row.get("created_at")
-            )
-        )
+        if (decision := _timestamp(row.get("decision_timestamp") or row.get("created_at")))
         is not None
-        and completed > trained_at
+        and decision > trained_at
     ]
     historical_bounds = _group_bounds(historical)
     historical_groups = _ordered_groups(historical_bounds)
@@ -530,6 +526,7 @@ def _partition_observations(
         "status": status,
         "development": development,
         "exam": exam,
+        "forward_exam": post_training_additions,
         "diagnostics": {
             "eligible_observation_count": len(eligible),
             "historical_observation_count": len(historical),
@@ -567,6 +564,7 @@ def build_strategy_historical_replay(
         "model_version": strategy.get("model_version"),
         "development_samples": [],
         "exam_samples": [],
+        "forward_exam_samples": [],
         "selected_entry_count": 0,
         "excluded_reason_counts": {},
         "can_authorize_live": False,
@@ -629,6 +627,9 @@ def build_strategy_historical_replay(
         "strategy_exam": [],
     }
     replayed_source_ids: set[int] = set()
+    forward_source_ids = {
+        _int(row.get("source_id")) for row in partitions["forward_exam"]
+    }
     for partition_name, observations_for_partition in replay_observations.items():
         for observation in observations_for_partition:
             source_id = _int(observation.get("source_id"))
@@ -663,6 +664,7 @@ def build_strategy_historical_replay(
         }
     development = replayed["strategy_development"]
     exam = replayed["strategy_exam"]
+    forward_exam = [row for row in exam if row["source_id"] in forward_source_ids]
     return {
         **base,
         "status": "complete",
@@ -674,8 +676,10 @@ def build_strategy_historical_replay(
         },
         "development_samples": development,
         "exam_samples": exam,
+        "forward_exam_samples": forward_exam,
         "selected_entry_count": len(development) + len(exam),
         "development_selected_entry_count": len(development),
         "exam_selected_entry_count": len(exam),
+        "forward_exam_selected_entry_count": len(forward_exam),
         "excluded_reason_counts": dict(excluded),
     }

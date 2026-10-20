@@ -153,6 +153,11 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
     )
     monkeypatch.setattr(
         strategy_learning_module,
+        "load_training_data_start",
+        lambda: datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        strategy_learning_module,
         "get_read_session_ctx",
         lambda: FakeReadContext(session),
     )
@@ -172,6 +177,114 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
     replay_statement = session.statements[2]
     assert replay_statement._limit_clause.value == 7
     assert replay_row_ids == [1, 2]
+    parameters = replay_statement.compile().params
+    assert datetime(2026, 6, 1) in parameters.values()
+    assert "missed_opportunity IS true" not in str(replay_statement)
+    assert "decision_action IN" not in str(replay_statement)
+
+
+@pytest.mark.asyncio
+async def test_replay_reads_full_holdout_and_bounded_forward_exam(monkeypatch) -> None:
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def all(self):
+            return list(self.rows)
+
+        def scalars(self):
+            return self
+
+    class Session:
+        statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return Result()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            pass
+
+    async def outcomes(**_kwargs):
+        return []
+
+    session = Session()
+    monkeypatch.setattr(strategy_learning_module, "get_read_session_ctx", Context)
+    monkeypatch.setattr(strategy_learning_module, "load_authoritative_trade_outcomes", outcomes)
+    monkeypatch.setattr(
+        strategy_learning_module, "load_training_epoch_start",
+        lambda: datetime(2026, 9, 14, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        strategy_learning_module, "load_training_data_start",
+        lambda: datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    feedback = await StrategyLearningService()._feedback(
+        mode="paper", hours=168, limit=7, include_historical_replay=True,
+        replay_holdout_source_ids={1, 2},
+        replay_trained_at="2026-09-15T12:00:00+00:00",
+        replay_horizon_minutes=5,
+    )
+    holdout, forward = session.statements[2:4]
+    assert holdout._limit_clause is None
+    assert forward._limit_clause.value == 7
+    assert [1, 2] in holdout.compile().params.values()
+    assert [1, 2] in forward.compile().params.values()
+    assert "NOT IN" in str(forward)
+    assert "horizon_minutes =" in str(forward)
+    assert "decision_action IN" not in str(forward)
+    assert feedback.shadow_feedback["historical_replay_data_started_at"] == (
+        "2026-09-01T00:00:00+00:00"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replay_status", "current_version", "expected"),
+    [
+        ("complete", "v1", True),
+        ("artifact_holdout_rows_not_reconstructable", "v1", False),
+        ("complete", "v2", False),
+    ],
+)
+async def test_background_champion_reconciles_only_complete_current_model_evidence(
+    monkeypatch, replay_status, current_version, expected
+) -> None:
+    reconciliations = []
+
+    class Champion:
+        async def reconcile(self, **kwargs):
+            reconciliations.append(kwargs)
+            return {"active": True}
+
+    async def payload(**kwargs):
+        assert kwargs["include_historical_replay"] is True
+        return {
+            "schedule": {
+                "historical_model_replay": {"status": replay_status},
+                "candidates": [{"id": "candidate"}],
+            },
+            "model_strategy_blueprint": {"model_version": "v1"},
+        }
+
+    monkeypatch.setattr(
+        "services.ml_signal_service.MLSignalService",
+        lambda: SimpleNamespace(strategy_blueprint=lambda: {"model_version": current_version}),
+    )
+    service = StrategyLearningService(champion_service=Champion())
+    monkeypatch.setattr(service, "dashboard_payload", payload)
+    result = await service.evaluate_paper_champion()
+
+    assert result["champion_reconciled"] is expected
+    assert bool(reconciliations) is expected
+    if expected:
+        assert reconciliations[0]["mode"] == "paper"
+    else:
+        assert result["governance_blocker"]
 
 
 @pytest.mark.asyncio

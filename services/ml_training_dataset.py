@@ -25,6 +25,7 @@ LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = max(
     2,
 )
 LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
+SHADOW_SELECTION_POLICY_VERSION = "2026-10-21.outcome-independent-shadow-selection.v1"
 
 
 @dataclass(frozen=True)
@@ -144,16 +145,8 @@ def shadow_quality_sample(row: Any) -> dict[str, Any]:
 
 
 def shadow_is_trainable_trade_opportunity(row: Any) -> bool:
-    action = shadow_action(row, "decision_action")
-    best_action = shadow_action(row, "best_action")
-    if action in {"long", "short"}:
-        return not assess_shadow_sample(shadow_quality_sample(row)).exclude_from_training
-    missed = bool(getattr(row, "missed_opportunity", False)) and best_action in {
-        "long",
-        "short",
-    }
-    if not missed:
-        return False
+    """Keep quality-governed observations independently of their future outcome."""
+
     return not assess_shadow_sample(shadow_quality_sample(row)).exclude_from_training
 
 
@@ -173,13 +166,6 @@ def shadow_training_candidate_filters(epoch_start: datetime) -> tuple[Any, ...]:
         ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
-        or_(
-            ShadowBacktest.decision_action.in_(["long", "short"]),
-            and_(
-                ShadowBacktest.missed_opportunity.is_(True),
-                ShadowBacktest.best_action.in_(["long", "short"]),
-            ),
-        ),
     )
 
 

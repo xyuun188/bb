@@ -134,6 +134,7 @@ def _training_source_code_version() -> str:
         Path(__file__),
         Path(__file__).parents[1] / "core" / "training_contracts.py",
         Path(__file__).with_name("training_data_quality.py"),
+        Path(__file__).with_name("ml_training_dataset.py"),
         Path(__file__).with_name("ml_readiness.py"),
         Path(__file__).with_name("ml_training_contract.py"),
         Path(__file__).with_name("return_objective.py"),
@@ -2568,6 +2569,7 @@ def train_from_frame(
         ),
         "authoritative_trade_training_probe": authoritative_trade_training_probe or {},
         "training_window_composition": _training_window_composition(train),
+        "shadow_selection_policy": ml_training_dataset.SHADOW_SELECTION_POLICY_VERSION,
         "training_task_manifest": task_manifest,
         "training_sample_sources": {
             "shadow_market_label": int(len(frame)),
@@ -2771,23 +2773,42 @@ class MLSignalService:
         model_path: Path | None = None,
         *,
         artifact_registry: ModelArtifactRegistry | None = None,
+        resolved_artifact: ResolvedModelArtifact | None = None,
         training_state_store: ModelTrainingStateStore | None = None,
     ) -> None:
+        if model_path is not None and resolved_artifact is not None:
+            raise ValueError("model_path and resolved_artifact are mutually exclusive")
         self._explicit_model_path = model_path
         self.artifact_registry = artifact_registry or ML_SIGNAL_ARTIFACT_REGISTRY
+        if resolved_artifact is not None:
+            resolver = {
+                "current": self.artifact_registry.resolve_current,
+                "challenger": self.artifact_registry.resolve_challenger,
+            }.get(resolved_artifact.pointer_role)
+            verified = resolver() if resolver is not None else None
+            if verified is None or verified != resolved_artifact:
+                raise ValueError("replay artifact does not match its verified registry pointer")
+            resolved_artifact = verified
         self.training_state_store = training_state_store or MODEL_TRAINING_STATE_STORE
-        self.model_path = model_path or (
-            self.artifact_registry.model_root / "unregistered-model.joblib"
+        self._artifact_override = resolved_artifact
+        self.model_path = (
+            resolved_artifact.model_path
+            if resolved_artifact is not None
+            else model_path or (self.artifact_registry.model_root / "unregistered-model.joblib")
         )
         self.metadata_path = (
-            METADATA_PATH
-            if model_path is not None
-            else (self.artifact_registry.model_root / "unregistered-metadata.json")
+            resolved_artifact.metadata_path
+            if resolved_artifact is not None
+            else (
+                METADATA_PATH
+                if model_path is not None
+                else (self.artifact_registry.model_root / "unregistered-metadata.json")
+            )
         )
         self._bundle: dict[str, Any] | None = None
         self._loaded_mtime: float | None = None
         self._loaded_pointer_mtime_ns: int | None = None
-        self._resolved_artifact: ResolvedModelArtifact | None = None
+        self._resolved_artifact: ResolvedModelArtifact | None = resolved_artifact
         self._load_diagnostic: dict[str, Any] | None = None
         self._train_lock = asyncio.Lock()
         self._training = False
@@ -3053,6 +3074,8 @@ class MLSignalService:
     def rollback_to_strategy_model(self, target_version: str | None) -> dict[str, Any]:
         """Restore the registered predecessor only when it matches the strategy target."""
 
+        if self._artifact_override is not None:
+            raise RuntimeError("artifact-bound replay cannot change model pointers")
         target = str(target_version or "").strip()
         if not target:
             return {"rolled_back": False, "reason": "rollback_target_missing"}
@@ -3132,6 +3155,9 @@ class MLSignalService:
 
     async def maybe_auto_train(self, *, force: bool = False) -> dict[str, Any]:
         """Run one cross-process single-flight training check."""
+
+        if self._artifact_override is not None:
+            raise RuntimeError("artifact-bound replay cannot train or promote models")
 
         # A cooldown, lease contention, or resource circuit is still a live
         # scheduler check. Record the heartbeat before any early gate return so
@@ -3332,6 +3358,11 @@ class MLSignalService:
                         cursor_metadata
                         and cursor_metadata.get("multitask_prediction_contract_version")
                         != MULTITASK_PREDICTION_CONTRACT_VERSION
+                    )
+                    or (
+                        cursor_metadata
+                        and cursor_metadata.get("shadow_selection_policy")
+                        != ml_training_dataset.SHADOW_SELECTION_POLICY_VERSION
                     )
                 )
                 training_evaluation_contract_errors = _training_evaluation_contract_errors(
@@ -4743,7 +4774,12 @@ class MLSignalService:
         resolved_in_attempt: ResolvedModelArtifact | None = None
         try:
             trusted_root = MODEL_DIR
-            if self._explicit_model_path is None:
+            if self._artifact_override is not None:
+                resolved_in_attempt = self._artifact_override
+                self.model_path = resolved_in_attempt.model_path
+                self.metadata_path = resolved_in_attempt.metadata_path
+                trusted_root = resolved_in_attempt.model_path.parent
+            elif self._explicit_model_path is None:
                 pointer_mtime_ns = (
                     self.artifact_registry.current_path.stat().st_mtime_ns
                     if self.artifact_registry.current_path.exists()
@@ -4797,6 +4833,11 @@ class MLSignalService:
                 or _safe_dict(self._load_diagnostic).get("code") == "artifact_incompatible"
             ):
                 return
+            if self._artifact_override is not None:
+                with self.model_path.open("rb") as handle:
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                if digest != self._artifact_override.sha256:
+                    raise ValueError("replay artifact hash verification failed")
             self._bundle = load_trusted_joblib(
                 self.model_path,
                 trusted_root=trusted_root,

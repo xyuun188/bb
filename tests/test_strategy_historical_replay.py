@@ -288,6 +288,73 @@ def test_replay_reconstructs_explicit_holdout_crossing_training_timestamp() -> N
     assert report["partition"]["strategy_exam_post_training_added_count"] == 0
 
 
+def test_late_history_update_is_not_new_post_training_evidence() -> None:
+    observations = _observations()
+    late_row = _observation(
+        99,
+        decision_id=99,
+        created_at=datetime(2026, 7, 20, 18, 0, tzinfo=UTC),
+        horizon=10,
+    )
+    late_row["completed_at"] = "2026-07-21T00:00:00+00:00"
+    observations.append(late_row)
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert {row["source_id"] for row in report["forward_exam_samples"]} == {25}
+    assert report["forward_exam_selected_entry_count"] == 1
+
+
+def test_profitable_history_cannot_hide_a_losing_independent_forward_exam() -> None:
+    blueprint = _blueprint(holdout_sample_count=42)
+    blueprint["training_evidence"]["strategy_replay_holdout"] = {
+        "shadow_source_id_ranges": [[1, 42]], "sample_count": 42,
+    }
+    base = datetime(2026, 7, 20, tzinfo=UTC)
+    observations = [
+        _observation(
+            source_id, decision_id=source_id,
+            created_at=base + timedelta(minutes=source_id * 20),
+            horizon=10, realized_long=-0.01 if source_id % 5 == 0 else 0.5,
+        )
+        for source_id in range(1, 43)
+    ]
+    observations.extend(
+        _observation(
+            source_id, decision_id=source_id,
+            created_at=base + timedelta(hours=22, minutes=(source_id - 43) * 20),
+            horizon=10, realized_long=-0.1,
+        )
+        for source_id in (43, 44)
+    )
+    feedback = StrategyFeedback(
+        mode="paper", window_hours=168, generated_at="2026-07-21T00:00:00+00:00",
+        totals={}, side_performance={}, open_position_pressure={}, decision_quality={},
+        shadow_feedback={}, expert_memory={}, manual_intervention={}, trade_fact_quarantine={},
+        reflection_feedback={}, event_feedback={}, authoritative_return_observation={},
+        problems=[], root_causes=[], training_policy={},
+        shadow_replay_observations=observations,
+    )
+    schedule = StrategyLearningEngine().build_from_feedback(
+        feedback, model_strategy_blueprint=blueprint, model_predictor=_predictor,
+    )["schedule"]
+    candidate = next(
+        row for row in schedule["candidates"]
+        if row["params"]["selector"]["scope"] == "symbol_side"
+    )
+
+    assert candidate["backtest"]["metrics"]["return_lcb_pct"] > 0
+    assert candidate["shadow_validation"]["metrics"]["return_lcb_pct"] > 0
+    assert candidate["forward_validation"]["metrics"]["sample_count"] == 2
+    assert candidate["forward_validation"]["metrics"]["return_lcb_pct"] < 0
+    assert candidate["promotion"]["historical_prior_context_eligible"] is False
+    assert "forward_exam_fee_after_return_lcb_not_positive" in (
+        candidate["promotion"]["rejection_reasons"]
+    )
+
+
 def test_strategy_candidates_are_built_from_exact_replay_not_legacy_shadow_matching() -> None:
     feedback = StrategyFeedback(
         mode="paper",

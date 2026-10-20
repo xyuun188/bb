@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import load_only
 
 from config.settings import ENSEMBLE_TRADER_NAME
@@ -40,7 +40,7 @@ from services.strategy_historical_replay import (
     build_strategy_historical_replay,
 )
 from services.text_integrity import sanitize_runtime_text
-from services.training_epoch import load_training_epoch_start
+from services.training_epoch import load_training_data_start, load_training_epoch_start
 
 logger = structlog.get_logger(__name__)
 
@@ -959,6 +959,10 @@ class StrategyLearningEngine:
         exact_replay = bool(model_replay_required and replay.get("status") == "complete")
         replay_development = list(replay.get("development_samples") or [])
         replay_exam = list(replay.get("exam_samples") or [])
+        forward_exam_required = bool(
+            exact_replay
+            and _safe_dict(replay.get("partition")).get("strategy_exam_post_training_added_count")
+        )
         if model_replay_required:
             profiles = (
                 self.generator.generate_from_samples(
@@ -1021,6 +1025,30 @@ class StrategyLearningEngine:
                 shadow,
                 selector=selector,
             )
+            forward_validation = None
+            if exact_replay:
+                forward_samples = [
+                    sample
+                    for sample in replay.get("forward_exam_samples") or []
+                    if _selector_matches(selector, sample)
+                ]
+                forward_validation = _shadow_report(
+                    forward_samples, include_rows=include_evidence_rows
+                )
+                forward_validation["cross_symbol_generalization"] = (
+                    _cross_symbol_generalization(forward_samples)
+                )
+                forward_validation["evidence_partition"] = "post_training_forward_exam"
+                forward_validation["required"] = forward_exam_required
+                if forward_exam_required:
+                    forward_rejections = _candidate_rejections(
+                        backtest, forward_validation, selector=selector
+                    )
+                    rejection_reasons.extend(
+                        reason.replace("shadow", "forward_exam")
+                        for reason in forward_rejections
+                        if "shadow" in reason
+                    )
             if model_replay_required and not exact_replay:
                 rejection_reasons.append(
                     f"model_historical_replay_{replay.get('status') or 'incomplete'}"
@@ -1049,6 +1077,8 @@ class StrategyLearningEngine:
             }
             profile_payload["backtest"] = backtest
             profile_payload["shadow_validation"] = shadow
+            if forward_validation is not None:
+                profile_payload["forward_validation"] = forward_validation
             candidates.append(profile_payload)
             backtest_rows.append(
                 {"profile_id": profile.profile_id, "label": profile.label, **backtest}
@@ -1197,7 +1227,7 @@ class StrategyLearningEngine:
             "historical_model_replay": {
                 key: _json_safe(value)
                 for key, value in replay.items()
-                if key not in {"development_samples", "exam_samples"}
+                if key not in {"development_samples", "exam_samples", "forward_exam_samples"}
             },
             "continuous_strategy_routing": continuous_routing,
             "scheduler_mode": scheduler_mode,
@@ -1311,6 +1341,10 @@ class StrategyLearningService:
                 and predictor is not None
             ),
             replay_holdout_source_ids=_replay_holdout_source_ids(blueprint),
+            replay_trained_at=blueprint.get("trained_at"),
+            replay_horizon_minutes=_safe_int(
+                _safe_dict(blueprint.get("exit_policy")).get("historical_replay_horizon_minutes")
+            ),
         )
         payload = await asyncio.to_thread(
             self.engine.build_from_feedback,
@@ -1330,8 +1364,39 @@ class StrategyLearningService:
                 "optimization_target": "maximize_authoritative_fee_after_return_rate",
                 "production_permission": False,
                 "paper_strategy_champion": champion,
+                "model_strategy_blueprint": blueprint,
             }
         )
+        if not include_historical_replay:
+            from services.strategy_replay_governance import load_replay_governance
+
+            payload["historical_replay_governance"] = load_replay_governance()
+        return payload
+
+    async def evaluate_paper_champion(self) -> dict[str, Any]:
+        """Run exact replay outside trading and reconcile only complete evidence."""
+
+        payload = await self.dashboard_payload(mode="paper", include_historical_replay=True)
+        schedule = _safe_dict(payload.get("schedule"))
+        replay = _safe_dict(schedule.get("historical_model_replay"))
+        blueprint = _safe_dict(payload.get("model_strategy_blueprint"))
+        if replay.get("status") == "complete":
+            # An artifact may change while the isolated worker is replaying.
+            from services.ml_signal_service import MLSignalService
+
+            current_version = MLSignalService().strategy_blueprint().get("model_version")
+            if current_version and current_version == blueprint.get("model_version"):
+                payload["paper_strategy_champion"] = await self.champion_service.reconcile(
+                    mode="paper",
+                    blueprint=blueprint,
+                    candidates=list(schedule.get("candidates") or []),
+                )
+                payload["champion_reconciled"] = True
+                return payload
+            payload["governance_blocker"] = "model_version_changed_during_replay"
+        else:
+            payload["governance_blocker"] = replay.get("status") or "exact_replay_unavailable"
+        payload["champion_reconciled"] = False
         return payload
 
     async def apply_to_strategy_context(
@@ -1366,6 +1431,12 @@ class StrategyLearningService:
             include_historical_replay=replay_enabled,
             replay_holdout_source_ids=_replay_holdout_source_ids(
                 model_strategy_blueprint if replay_enabled else None
+            ),
+            replay_trained_at=_safe_dict(model_strategy_blueprint).get("trained_at"),
+            replay_horizon_minutes=_safe_int(
+                _safe_dict(_safe_dict(model_strategy_blueprint).get("exit_policy")).get(
+                    "historical_replay_horizon_minutes"
+                )
             ),
         )
         if open_positions is not None:
@@ -1419,6 +1490,8 @@ class StrategyLearningService:
         include_decision_evidence: bool = True,
         include_historical_replay: bool = False,
         replay_holdout_source_ids: set[int] | None = None,
+        replay_trained_at: str | None = None,
+        replay_horizon_minutes: int = 0,
     ) -> StrategyFeedback:
         selected_mode = "live" if str(mode).lower() == "live" else "paper"
         effective_hours = max(int(hours or 1), 1)
@@ -1429,7 +1502,8 @@ class StrategyLearningService:
         epoch_start = load_training_epoch_start()
         since = max(datetime.now(UTC) - timedelta(hours=effective_hours), epoch_start)
         since_naive = since.replace(tzinfo=None)
-        epoch_start_naive = epoch_start.replace(tzinfo=None)
+        replay_data_start = load_training_data_start() if include_historical_replay else epoch_start
+        replay_data_start_naive = replay_data_start.replace(tzinfo=None)
         # Real-time strategy context only needs the compact outcome projection.
         # Dashboard/replay callers can opt into decision evidence explicitly;
         # keep the two query shapes separate so a heavy report read cannot be
@@ -1563,16 +1637,9 @@ class StrategyLearningService:
                     .where(
                         ShadowBacktest.execution_mode == "paper",
                         ShadowBacktest.status == "completed",
-                        ShadowBacktest.created_at >= epoch_start_naive,
+                        ShadowBacktest.created_at >= replay_data_start_naive,
                         ShadowBacktest.long_return_pct.is_not(None),
                         ShadowBacktest.short_return_pct.is_not(None),
-                        or_(
-                            ShadowBacktest.decision_action.in_(["long", "short"]),
-                            and_(
-                                ShadowBacktest.missed_opportunity.is_(True),
-                                ShadowBacktest.best_action.in_(["long", "short"]),
-                            ),
-                        ),
                     )
                     .options(
                         load_only(
@@ -1598,11 +1665,45 @@ class StrategyLearningService:
                 )
                 holdout_ids = sorted(replay_holdout_source_ids or set())
                 if holdout_ids:
-                    replay_query = replay_query.where(ShadowBacktest.id.in_(holdout_ids))
+                    replay_shadows = list(
+                        (await session.execute(
+                            replay_query.where(ShadowBacktest.id.in_(holdout_ids))
+                        )).scalars().all()
+                    )
+                    if replay_trained_at:
+                        trained_at = datetime.fromisoformat(
+                            str(replay_trained_at).replace("Z", "+00:00")
+                        )
+                        if trained_at.tzinfo is None:
+                            trained_at = trained_at.replace(tzinfo=UTC)
+                        trained_at = trained_at.astimezone(UTC).replace(tzinfo=None)
+                        # Forward exam rows are selected by time and source identity,
+                        # never by future best_action or missed-opportunity labels.
+                        forward_query = replay_query.where(
+                            ShadowBacktest.created_at > max(since_naive, trained_at),
+                            ShadowBacktest.id.not_in(holdout_ids),
+                        )
+                        if replay_horizon_minutes > 0:
+                            forward_query = forward_query.where(
+                                ShadowBacktest.horizon_minutes == replay_horizon_minutes
+                            )
+                        replay_shadows.extend(
+                            (await session.execute(
+                                forward_query.limit(effective_limit)
+                            )).scalars().all()
+                        )
                 else:
-                    replay_query = replay_query.limit(effective_limit)
-                replay_shadows = list((await session.execute(replay_query)).scalars().all())
-            replay_shadows.reverse()
+                    replay_shadows = list(
+                        (await session.execute(
+                            replay_query.limit(effective_limit)
+                        )).scalars().all()
+                    )
+            replay_shadows.sort(
+                key=lambda row: (
+                    _timestamp_text(getattr(row, "created_at", None)),
+                    _safe_int(row.id),
+                )
+            )
             decisions = list(
                 (
                     await session.execute(
@@ -1722,7 +1823,7 @@ class StrategyLearningService:
         shadow_replay_observations, replay_excluded = await asyncio.to_thread(
             _build_historical_replay_observations,
             replay_shadows,
-            epoch_start=epoch_start,
+            epoch_start=replay_data_start,
         )
 
         side_performance = {
@@ -1769,6 +1870,8 @@ class StrategyLearningService:
                 "completed_row_count": len(shadows),
                 "cost_complete_direction_sample_count": len(shadow_samples),
                 "historical_replay_observation_count": len(shadow_replay_observations),
+                "historical_replay_evaluation_requested": include_historical_replay,
+                "historical_replay_data_started_at": replay_data_start.isoformat(),
                 "historical_replay_training_eligible_count": sum(
                     row.get("training_eligible") is True for row in shadow_replay_observations
                 ),

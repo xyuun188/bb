@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import shlex
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,11 +39,18 @@ for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
         )
 
 from services.strategy_learning import StrategyLearningService
+from services.strategy_learning import _replay_holdout_source_ids
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+from services.training_epoch import load_training_epoch_start
+from sqlalchemy import select
+from db.session import get_read_session_ctx
+from models.learning import ShadowBacktest
 from web_dashboard.api.dashboard import (
     _strategy_learning_watermark_for_request,
     get_strategy_learning,
 )
+
+EXACT_REPLAY = __EXACT_REPLAY__
 
 
 async def main():
@@ -90,7 +99,15 @@ async def main():
         }
     started = time.monotonic()
     try:
-        payload = await get_strategy_learning(mode="paper", detail="summary")
+        payload = (
+            await StrategyLearningService().dashboard_payload(
+                mode="paper", detail="summary", include_historical_replay=True
+            )
+            if EXACT_REPLAY
+            else await get_strategy_learning(mode="paper", detail="summary")
+        )
+        schedule = payload.get("schedule") or {}
+        candidates = schedule.get("candidates") or []
         strategy_result = {
             "elapsed": round(time.monotonic() - started, 3),
             "status": payload.get("status"),
@@ -111,7 +128,55 @@ async def main():
                 "trade_fact_quarantine"
             ),
             "problems": (payload.get("feedback") or {}).get("problems"),
+            "shadow_feedback": (payload.get("feedback") or {}).get("shadow_feedback"),
+            "historical_model_replay": schedule.get("historical_model_replay"),
+            "candidate_count": len(candidates),
+            "candidate_rejection_counts": dict(Counter(
+                reason
+                for candidate in candidates
+                for reason in (candidate.get("promotion") or {}).get("rejection_reasons", [])
+            )),
+            "leading_candidates": [
+                {
+                    "selector": (candidate.get("params") or {}).get("selector"),
+                    "backtest": (candidate.get("backtest") or {}).get("metrics"),
+                    "exam": (candidate.get("shadow_validation") or {}).get("metrics"),
+                    "rejections": (candidate.get("promotion") or {}).get("rejection_reasons"),
+                }
+                for candidate in candidates[:5]
+            ],
+            "historical_replay_governance": payload.get("historical_replay_governance"),
         }
+        if EXACT_REPLAY:
+            blueprint, _ = StrategyLearningService()._default_model_replay_context("paper")
+            holdout_ids = sorted(_replay_holdout_source_ids(blueprint))
+            async with get_read_session_ctx() as session:
+                rows = (await session.execute(
+                    select(
+                        ShadowBacktest.id, ShadowBacktest.created_at,
+                        ShadowBacktest.updated_at, ShadowBacktest.status,
+                        ShadowBacktest.decision_action, ShadowBacktest.best_action,
+                        ShadowBacktest.missed_opportunity, ShadowBacktest.execution_mode,
+                    ).where(ShadowBacktest.id.in_(holdout_ids))
+                )).all()
+            strategy_result["holdout_inventory"] = {
+                "expected_source_ids": len(holdout_ids),
+                "available_rows": len(rows),
+                "status_counts": dict(Counter(row.status for row in rows)),
+                "mode_counts": dict(Counter(row.execution_mode for row in rows)),
+                "decision_action_counts": dict(Counter(row.decision_action for row in rows)),
+                "created_min": str(min((row.created_at for row in rows), default=None)),
+                "created_max": str(max((row.created_at for row in rows), default=None)),
+                "epoch_start": load_training_epoch_start().isoformat(),
+                "trained_at": blueprint.get("trained_at"),
+                "holdout_contract": {
+                    key: value
+                    for key, value in ((blueprint.get("training_evidence") or {}).get(
+                        "strategy_replay_holdout"
+                    ) or {}).items()
+                    if key != "shadow_source_id_ranges"
+                },
+            }
     except Exception as exc:
         strategy_result = {
             "elapsed": round(time.monotonic() - started, 3),
@@ -134,6 +199,10 @@ asyncio.run(main())
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Diagnose strategy evidence without trading.")
+    parser.add_argument("--exact-replay", action="store_true")
+    args = parser.parse_args()
+    remote_code = REMOTE_CODE.replace("__EXACT_REPLAY__", str(bool(args.exact_replay)))
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
         command = (
@@ -142,10 +211,10 @@ def main() -> int:
             + shlex.quote(
                 "export DATABASE_URL='postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql'; "
                 + ".venv/bin/python -c "
-                + shlex.quote(REMOTE_CODE)
+                + shlex.quote(remote_code)
             )
         )
-        output = run_remote_text(ssh, command, timeout=120, check=False, max_output_chars=100000)
+        output = run_remote_text(ssh, command, timeout=600, check=False, max_output_chars=100000)
     finally:
         ssh.close()
     print(output)

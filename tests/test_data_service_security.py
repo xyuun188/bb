@@ -2733,6 +2733,142 @@ async def test_attach_native_market_fact_nonblocking_missing_depth_skips_rest() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("block_on_remote", [False, True])
+@pytest.mark.parametrize("has_snapshot_book", [False, True])
+async def test_stale_positive_depth_cannot_suppress_blocking_book_refresh(
+    block_on_remote: bool, has_snapshot_book: bool,
+) -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    stale_book = {
+        "inst_id": "DOGE-USDT-SWAP", "inst_type": "SWAP",
+        "source_timestamp_ms": timestamp - 600_000,
+        "bid": 0.1, "ask": 0.11,
+        "bid_depth_usdt": 10.0, "ask_depth_usdt": 20.0,
+    }
+    fresh_book = {
+        **stale_book, "source_timestamp_ms": timestamp,
+        "bid_depth_usdt": 300.0, "ask_depth_usdt": 400.0,
+        "source_endpoint": "okx_rest_market_books",
+    }
+    service.ws_client = SimpleNamespace(
+        latest_orderbooks={"DOGE/USDT": {
+            "orderbook_fact": stale_book,
+            "orderbook_bid_depth": 10.0, "orderbook_ask_depth": 20.0,
+        }},
+        latest_mark_prices={},
+    )
+    calls: list[str] = []
+
+    async def fetch(symbol: str, **_kwargs) -> dict:
+        calls.append(symbol)
+        return {
+            "orderbook_data_available": True,
+            "orderbook_bid_depth": 300.0, "orderbook_ask_depth": 400.0,
+            "orderbook_fact": fresh_book,
+        }
+
+    service.rest_client = SimpleNamespace(fetch_order_book_metrics=fetch)
+    service._get_instrument_spec = lambda *_a, **_kw: asyncio.sleep(0, result={})
+    snapshot = {"symbol": "DOGE/USDT", "timestamp": timestamp, "last_price": 0.105}
+    if has_snapshot_book:
+        snapshot.update({
+            "orderbook_fact": stale_book,
+            "orderbook_bid_depth": 10.0, "orderbook_ask_depth": 20.0,
+        })
+    result = await service._attach_native_market_fact(
+        "DOGE/USDT", snapshot, block_on_remote=block_on_remote,
+    )
+    assert calls == (["DOGE/USDT"] if block_on_remote else [])
+    if block_on_remote:
+        assert result["orderbook_fact"] == fresh_book
+        assert result["bid_depth_usdt"] == 300.0
+        assert result["ask_depth_usdt"] == 400.0
+    elif has_snapshot_book:
+        assert result["orderbook_fact"] == stale_book
+    else:
+        assert "orderbook_fact" not in result
+        assert result["market_fact"]["liquidity"]["bid_depth_usdt"] <= 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ws_offset_ms", [-600_000, -1_000, 1_000])
+async def test_native_cache_keeps_newest_current_book_and_mark(ws_offset_ms: int) -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000) - 2_000
+    book = {
+        "inst_id": "DOGE-USDT-SWAP", "inst_type": "SWAP",
+        "source_timestamp_ms": timestamp,
+        "bid": 0.1, "ask": 0.11,
+        "bid_depth_usdt": 300.0, "ask_depth_usdt": 400.0,
+    }
+    mark = {**book, "price": 0.105}
+    ws_book = {
+        **book, "source_timestamp_ms": timestamp + ws_offset_ms,
+        "bid_depth_usdt": 500.0, "ask_depth_usdt": 600.0,
+    }
+    ws_mark = {**mark, "source_timestamp_ms": timestamp + ws_offset_ms, "price": 0.106}
+    service.ws_client = SimpleNamespace(
+        latest_orderbooks={"DOGE/USDT": {
+            "orderbook_fact": ws_book,
+            "orderbook_bid_depth": 500.0, "orderbook_ask_depth": 600.0,
+        }},
+        latest_mark_prices={"DOGE/USDT": {
+            "mark_price": 0.106, "mark_price_fact": ws_mark,
+        }},
+    )
+
+    async def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("current native cache should not fetch a second book")
+
+    service.rest_client = SimpleNamespace(fetch_order_book_metrics=unexpected_fetch)
+    service._get_instrument_spec = lambda *_a, **_kw: asyncio.sleep(0, result={})
+    result = await service._attach_native_market_fact(
+        "DOGE/USDT", {
+            "timestamp": timestamp, "last_price": 0.105,
+            "orderbook_fact": book, "mark_price_fact": mark, "mark_price": 0.105,
+            "orderbook_bid_depth": 300.0, "orderbook_ask_depth": 400.0,
+        },
+        block_on_remote=True,
+    )
+    use_ws = ws_offset_ms > 0
+    assert result["orderbook_fact"] == (ws_book if use_ws else book)
+    assert result["mark_price_fact"] == (ws_mark if use_ws else mark)
+    assert result["mark_price"] == (0.106 if use_ws else 0.105)
+    assert result["bid_depth_usdt"] == (500.0 if use_ws else 300.0)
+    assert result["ask_depth_usdt"] == (600.0 if use_ws else 400.0)
+
+
+@pytest.mark.parametrize("fact_key", ["mark_price_fact", "index_price_fact"])
+@pytest.mark.parametrize("replacement", ["zero_price", "missing_time", "older", "newer"])
+def test_source_merge_preserves_newest_usable_reference_fact(fact_key, replacement) -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    snapshot_fact = {
+        "inst_id": "DOGE-USDT-SWAP", "inst_type": "SWAP",
+        "source_timestamp_ms": timestamp, "price": 0.105,
+    }
+    derivative_fact = {
+        **snapshot_fact, "source_timestamp_ms": timestamp + 1_000, "price": 0.106,
+    }
+    if replacement == "zero_price":
+        derivative_fact["price"] = 0
+    elif replacement == "missing_time":
+        derivative_fact["source_timestamp_ms"] = 0
+    elif replacement == "older":
+        derivative_fact["source_timestamp_ms"] = timestamp - 600_000
+    price_key = fact_key.removesuffix("_fact")
+    result = service._attach_market_source_consistency(
+        "DOGE/USDT",
+        {"timestamp": timestamp, "last_price": 0.105, fact_key: snapshot_fact, price_key: 0.105},
+        {fact_key: derivative_fact, price_key: derivative_fact["price"]},
+    )
+    selected = derivative_fact if replacement == "newer" else snapshot_fact
+    assert result[fact_key] == selected
+    assert result[price_key] == selected["price"]
+
+
+@pytest.mark.asyncio
 async def test_authoritative_instrument_spec_refresh_rejects_incomplete_cached_identity() -> None:
     service = _service()
     service._instrument_spec_cache = {

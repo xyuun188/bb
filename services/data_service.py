@@ -1558,12 +1558,15 @@ class DataService:
         )
         enriched = dict(snapshot)
         
-        # Merge WebSocket cached orderbook data if available
+        # Cached depth must have a current native timestamp before it can
+        # suppress the blocking REST fallback.
         normalized = self._normalize_symbols([symbol])[0]
         latest_orderbooks = getattr(self.ws_client, "latest_orderbooks", {})
         if not isinstance(latest_orderbooks, dict):
             latest_orderbooks = {}
         ws_orderbook = latest_orderbooks.get(symbol) or latest_orderbooks.get(normalized)
+        if not isinstance(ws_orderbook, dict):
+            ws_orderbook = {}
 
         # Ticker snapshots can already contain a valid REST order book. Reuse
         # it before consulting the websocket cache so a zero/empty cache cannot
@@ -1578,13 +1581,26 @@ class DataService:
             or enriched.get("ask_depth_usdt"),
             0.0,
         )
-        orderbook_available = bid_depth > 0 and ask_depth > 0
-        if orderbook_available:
+        snapshot_book = enriched.get("orderbook_fact")
+        orderbook_available = (
+            bid_depth > 0
+            and ask_depth > 0
+            and self._native_cached_fact_is_fresh(snapshot_book, snapshot=enriched)
+        )
+        if bid_depth > 0 and ask_depth > 0:
             enriched["orderbook_bid_depth"] = bid_depth
             enriched["orderbook_ask_depth"] = ask_depth
             enriched["bid_depth_usdt"] = bid_depth
             enriched["ask_depth_usdt"] = ask_depth
-        elif ws_orderbook:
+        ws_book = ws_orderbook.get("orderbook_fact")
+        if (
+            self._native_cached_fact_is_fresh(ws_book, snapshot=enriched)
+            and (
+                not orderbook_available
+                or self._ticker_timestamp_from_raw(ws_book)
+                > self._ticker_timestamp_from_raw(snapshot_book)
+            )
+        ):
             ws_bid_depth = self._safe_float(
                 ws_orderbook.get("orderbook_bid_depth")
                 or ws_orderbook.get("bid_depth_usdt"),
@@ -1595,18 +1611,16 @@ class DataService:
                 or ws_orderbook.get("ask_depth_usdt"),
                 0.0,
             )
-            enriched["bid_depth_native"] = ws_orderbook.get("bid_depth_native", 0)
-            enriched["ask_depth_native"] = ws_orderbook.get("ask_depth_native", 0)
-            enriched["bid_depth_usdt"] = ws_bid_depth
-            enriched["ask_depth_usdt"] = ws_ask_depth
-            # Keep the canonical market-fact fields in sync with the legacy
-            # websocket cache names consumed by downstream quality checks.
-            enriched["orderbook_bid_depth"] = ws_bid_depth
-            enriched["orderbook_ask_depth"] = ws_ask_depth
-            enriched["orderbook_imbalance"] = ws_orderbook.get("orderbook_imbalance", 0)
-            if isinstance(ws_orderbook.get("orderbook_fact"), dict):
-                enriched["orderbook_fact"] = dict(ws_orderbook["orderbook_fact"])
-            orderbook_available = ws_bid_depth > 0 and ws_ask_depth > 0
+            if ws_bid_depth > 0 and ws_ask_depth > 0:
+                enriched["bid_depth_native"] = ws_orderbook.get("bid_depth_native", 0)
+                enriched["ask_depth_native"] = ws_orderbook.get("ask_depth_native", 0)
+                enriched["bid_depth_usdt"] = ws_bid_depth
+                enriched["ask_depth_usdt"] = ws_ask_depth
+                enriched["orderbook_bid_depth"] = ws_bid_depth
+                enriched["orderbook_ask_depth"] = ws_ask_depth
+                enriched["orderbook_imbalance"] = ws_orderbook.get("orderbook_imbalance", 0)
+                enriched["orderbook_fact"] = dict(ws_book)
+                orderbook_available = True
         
         logger.debug(
             "orderbook check",
@@ -1658,14 +1672,22 @@ class DataService:
         if not isinstance(latest_mark_prices, dict):
             latest_mark_prices = {}
         ws_mark_price = latest_mark_prices.get(symbol) or latest_mark_prices.get(normalized)
-        if ws_mark_price:
+        if isinstance(ws_mark_price, dict):
             ws_mark_value = self._safe_float(ws_mark_price.get("mark_price"), 0.0)
-            if ws_mark_value > 0:
+            ws_mark_fact = ws_mark_price.get("mark_price_fact")
+            snapshot_mark_fact = enriched.get("mark_price_fact")
+            if (
+                ws_mark_value > 0
+                and self._native_cached_fact_is_fresh(ws_mark_fact, snapshot=enriched)
+                and (
+                    not isinstance(snapshot_mark_fact, dict)
+                    or self._safe_float(snapshot_mark_fact.get("price"), 0.0) <= 0
+                    or self._ticker_timestamp_from_raw(ws_mark_fact)
+                    > self._ticker_timestamp_from_raw(snapshot_mark_fact)
+                )
+            ):
                 enriched["mark_price"] = ws_mark_value
-                if isinstance(ws_mark_price.get("mark_price_fact"), dict):
-                    enriched["mark_price_fact"] = dict(
-                        ws_mark_price["mark_price_fact"]
-                    )
+                enriched["mark_price_fact"] = dict(ws_mark_fact)
         
         snapshot_spec = enriched.get("contract_spec")
         if (
@@ -1708,6 +1730,28 @@ class DataService:
             received_at=enriched["received_at"],
         )
         return enriched
+
+    def _native_cached_fact_is_fresh(
+        self,
+        fact: Any,
+        *,
+        snapshot: dict[str, Any],
+    ) -> bool:
+        """Bound cached native facts by both wall clock and ticker time."""
+
+        if not isinstance(fact, dict):
+            return False
+        timestamp = self._ticker_timestamp_from_raw(fact)
+        if timestamp <= 0:
+            return False
+        max_age_ms = TICKER_CACHE_MAX_AGE_SECONDS * 1000.0
+        if abs(datetime.now(UTC).timestamp() * 1000.0 - timestamp) > max_age_ms:
+            return False
+        ticker_timestamp = self._ticker_timestamp_from_raw(snapshot)
+        return (
+            ticker_timestamp <= 0
+            or abs(ticker_timestamp - timestamp) <= max_age_ms
+        )
 
     def _cached_native_consistency_bars(
         self,
@@ -2039,12 +2083,23 @@ class DataService:
                     if key in snapshot:
                         merged[key] = snapshot[key]
 
+            def usable_reference_fact(value: Any) -> bool:
+                return (
+                    isinstance(value, dict)
+                    and self._safe_float(value.get("price"), 0.0) > 0
+                    and self._ticker_timestamp_from_raw(value) > 0
+                )
+
             for key in ("mark_price_fact", "index_price_fact"):
                 snapshot_fact = snapshot.get(key)
                 derivative_fact = derivatives.get(key)
-                if isinstance(snapshot_fact, dict) and snapshot_fact:
-                    if not isinstance(derivative_fact, dict) or not derivative_fact:
-                        merged[key] = snapshot_fact
+                if usable_reference_fact(snapshot_fact) and (
+                    not usable_reference_fact(derivative_fact)
+                    or self._ticker_timestamp_from_raw(snapshot_fact)
+                    > self._ticker_timestamp_from_raw(derivative_fact)
+                ):
+                    merged[key] = snapshot_fact
+                    merged[key.removesuffix("_fact")] = snapshot_fact["price"]
             for key in ("mark_price", "index_price"):
                 if snapshot.get(key) and not derivatives.get(key):
                     merged[key] = snapshot[key]
