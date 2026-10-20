@@ -42,6 +42,7 @@ from scripts.run_okx_daily_reconciliation_report import (  # noqa: E402
     write_report,
 )
 from services.okx_order_fact_sync import (  # noqa: E402
+    DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC,
     PHASE3_DEFAULT_ORDER_SYNC_START,
     OkxOrderFactSyncService,
     _db_naive_since,
@@ -167,8 +168,12 @@ async def run(
                 "timeout_seconds": PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS,
             }
             if recovery_order_ids:
-                sync_kwargs["recovery_order_ids"] = recovery_order_ids
-            sync_result = await _sync_order_facts_with_lock_retry(sync_kwargs)
+                sync_result = await _sync_recovery_order_batches(
+                    sync_kwargs,
+                    recovery_order_ids,
+                )
+            else:
+                sync_result = await _sync_order_facts_with_lock_retry(sync_kwargs)
         except Exception as exc:  # pragma: no cover - defensive operator output
             sync_error = f"{type(exc).__name__}: {safe_error_text(exc, limit=240)}"
     after_report = await collect_report(allow_cache=False)
@@ -244,6 +249,112 @@ async def _sync_order_facts_with_lock_retry(
         and "single_writer_lock" in (result.get("deferred_stages") or [])
     )
     return result
+
+
+async def _sync_recovery_order_batches(
+    sync_kwargs: dict[str, Any],
+    recovery_order_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Run every explicitly requested recovery ID without silent batch truncation."""
+
+    batch_size = DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC
+    batches = [
+        tuple(recovery_order_ids[index : index + batch_size])
+        for index in range(0, len(recovery_order_ids), batch_size)
+    ]
+    results: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+    for batch in batches:
+        result = await _sync_order_facts_with_lock_retry(
+            {
+                **sync_kwargs,
+                "priority_only": True,
+                "recovery_order_ids": batch,
+            }
+        )
+        results.append((batch, result))
+
+    if not results:
+        return await _sync_order_facts_with_lock_retry(sync_kwargs)
+
+    count_fields = (
+        "local_checked",
+        "confirmed_count",
+        "unverified_count",
+        "backfilled_count",
+        "order_history_backfilled_count",
+        "contract_size_deferred_count",
+        "protection_execution_count",
+        "position_lifecycle_recovered_count",
+        "exit_lineage_recovered_count",
+        "missing_closed_position_recovered_count",
+        "skipped_old_count",
+        "retry_count",
+    )
+    completed_stages: list[str] = []
+    deferred_stages: list[str] = []
+    stage_errors: list[str] = []
+    pending_ids: set[str] = set()
+    samples: list[dict[str, Any]] = []
+    batch_summaries: list[dict[str, Any]] = []
+    for batch, result in results:
+        completed_stages.extend(
+            str(value) for value in result.get("completed_stages") or [] if value
+        )
+        deferred_stages.extend(
+            str(value) for value in result.get("deferred_stages") or [] if value
+        )
+        stage_errors.extend(str(value) for value in result.get("stage_errors") or [] if value)
+        result_pending = {
+            str(value).strip()
+            for value in result.get("recovery_order_ids_pending") or []
+            if str(value).strip()
+        }
+        if not result_pending and str(result.get("status") or "").lower() != "ok":
+            result_pending.update(batch)
+        pending_ids.update(result_pending)
+        samples.extend(result.get("samples") or [])
+        batch_summaries.append(
+            {
+                "order_ids": list(batch),
+                "status": result.get("status"),
+                "pending_order_ids": sorted(result_pending),
+                "completed_stages": result.get("completed_stages") or [],
+                "deferred_stages": result.get("deferred_stages") or [],
+            }
+        )
+
+    status_values = {str(result.get("status") or "").lower() for _, result in results}
+    if "degraded" in status_values:
+        status = "degraded"
+    elif "warning" in status_values or stage_errors:
+        status = "warning"
+    elif "deferred" in status_values or pending_ids:
+        status = "deferred"
+    else:
+        status = "ok"
+
+    aggregate = dict(results[-1][1])
+    aggregate.update(
+        {
+            "status": status,
+            "okx_pull_available": all(
+                result.get("okx_pull_available") is True for _, result in results
+            ),
+            "completed_stages": list(dict.fromkeys(completed_stages)),
+            "deferred_stages": list(dict.fromkeys(deferred_stages)),
+            "stage_errors": list(dict.fromkeys(stage_errors)),
+            "recovery_order_ids_pending": sorted(pending_ids),
+            "recovery_batch_count": len(results),
+            "recovery_batches": batch_summaries,
+            "samples": samples[:8],
+            "lock_retry_exhausted": any(
+                result.get("lock_retry_exhausted") is True for _, result in results
+            ),
+        }
+    )
+    for field in count_fields:
+        aggregate[field] = sum(int(result.get(field) or 0) for _, result in results)
+    return aggregate
 
 
 async def _cleanup_phase3_local_okx_cache(*, mode: str) -> dict[str, Any]:

@@ -29,6 +29,7 @@ from core.runtime_data_retention_contract import (  # noqa: E402
 )
 from core.safe_output import safe_error_text  # noqa: E402
 from db.session import close_db  # noqa: E402
+from scripts.cleanup_runtime_artifacts import cleanup_runtime_artifacts  # noqa: E402
 from services.runtime_data_retention import (  # noqa: E402
     RuntimeDataRetentionPolicy,
     RuntimeDataRetentionService,
@@ -101,10 +102,23 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         max_rows_per_table=args.max_rows_per_table,
         batch_pause_seconds=args.batch_pause_seconds,
     )
-    return await RuntimeDataRetentionService(policy).run(
+    report = await RuntimeDataRetentionService(policy).run(
         apply=bool(args.apply),
         measure_reclaimable_bytes=not bool(args.skip_byte_estimate),
     )
+    cleanup = await asyncio.to_thread(
+        cleanup_runtime_artifacts, settings.data_dir, apply=bool(args.apply),
+    )
+    report["file_cleanup"] = {
+        "dry_run": cleanup.dry_run,
+        "candidate_count": len(cleanup.candidates),
+        "candidate_bytes": sum(item.size_bytes for item in cleanup.candidates),
+        "deleted_count": cleanup.deleted_count,
+        "deleted_bytes": cleanup.deleted_bytes,
+        "report_retention_days": 30,
+        "minimum_reports_per_directory": 100,
+    }
+    return report
 
 
 async def async_main(argv: list[str] | None = None) -> int:

@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, tuple_
 
 from core.symbols import (
     normalize_trading_symbol,
@@ -519,7 +519,11 @@ class OkxPositionSettlementSyncService:
                     or_(
                         Position.settlement_status.is_(None),
                         Position.settlement_status.notin_(
-                            tuple(NON_RETRYABLE_SETTLEMENT_STATUSES)
+                            tuple(
+                                NON_RETRYABLE_SETTLEMENT_STATUSES
+                                - {SETTLEMENT_STATUS_UNRESOLVED}
+                                | frozenset(final_settlement_status_values())
+                            )
                         ),
                     ),
                 )
@@ -532,6 +536,45 @@ class OkxPositionSettlementSyncService:
                 for row in stale_result.scalars().all()
                 if int(getattr(row, "id", 0) or 0) not in seen_row_ids
             )
+            # A due close selects its entire entry lifecycle, including terminal
+            # fragments outside the recent window. Otherwise a multi-day close
+            # can never conserve contracts after its earliest fragment expires.
+            lifecycle_identities = {
+                (
+                    str(row.okx_inst_id),
+                    str(row.okx_pos_id),
+                    str(row.side),
+                    str(row.entry_exchange_order_id),
+                )
+                for row in rows
+                if row.okx_inst_id
+                and row.okx_pos_id
+                and row.entry_exchange_order_id
+                and not _has_superseded_position_metadata(row, _safe_dict(row.settlement_raw))
+                and (
+                    not is_final_settlement_status(row.settlement_status)
+                    or _final_fragment_requires_settlement_repair(row)
+                )
+            }
+            if lifecycle_identities:
+                sibling_result = await session.execute(
+                    select(Position).where(
+                        Position.execution_mode == self.mode,
+                        Position.is_open.is_(False),
+                        Position.closed_at >= _db_naive(stale_since),
+                        tuple_(
+                            Position.okx_inst_id,
+                            Position.okx_pos_id,
+                            Position.side,
+                            Position.entry_exchange_order_id,
+                        ).in_(sorted(lifecycle_identities)),
+                    )
+                )
+                seen_row_ids = {int(row.id) for row in rows}
+                rows.extend(
+                    row for row in sibling_result.scalars().all()
+                    if int(row.id) not in seen_row_ids
+                )
             rows, duplicate_rows = _deduplicate_closed_lifecycle_rows(rows, now=now)
             # Fill-level contract facts are the only acceptable basis for
             # splitting a shared official lifecycle.  Keep them on the
@@ -614,8 +657,7 @@ class OkxPositionSettlementSyncService:
                 )
             terminal_groups = [
                 (key, group) for key, group in evidence_groups.items()
-                if len(group) > 1
-                and any(member.settlement_status == SETTLEMENT_STATUS_UNRESOLVED for member in group)
+                if any(member.settlement_status == SETTLEMENT_STATUS_UNRESOLVED for member in group)
             ]
             if terminal_groups:
                 history_rows = await self._load_position_history_rows()
@@ -921,17 +963,21 @@ class OkxPositionSettlementSyncService:
             proven_terminal_repair = (
                 str(getattr(position, "settlement_status", "") or "")
                 == SETTLEMENT_STATUS_UNRESOLVED
-                and candidate.lifecycle_group_size > 1
                 and candidate.allocation_complete
                 and candidate.allocation_basis == "okx_close_fill_contracts_and_order_economics"
             )
             if _is_non_retryable_settlement_status(position) and not proven_terminal_repair:
                 return False, None
             apply_position_settlement_snapshot(position, success.snapshot)
-            if isinstance(raw.get("entry_identity_repair"), dict):
+            preserved_recovery = {
+                key: raw[key]
+                for key in ("entry_identity_repair", "close_time_repair", "lifecycle_recovery")
+                if isinstance(raw.get(key), dict)
+            }
+            if preserved_recovery:
                 position.settlement_raw = {
                     **_safe_dict(position.settlement_raw),
-                    "entry_identity_repair": raw["entry_identity_repair"],
+                    **preserved_recovery,
                 }
             authoritative_quantity = _authoritative_fragment_quantity(candidate, success.row)
             if authoritative_quantity > 0 and not _quantities_close(
@@ -1693,7 +1739,11 @@ def _prepare_lifecycle_allocations(
     for member in members:
         object.__setattr__(member, "lifecycle_group_size", len(members))
         object.__setattr__(member, "lifecycle_group_position_ids", ids)
-    if len(members) <= 1:
+    terminal_single = (
+        len(members) == 1
+        and members[0].settlement_status == SETTLEMENT_STATUS_UNRESOLVED
+    )
+    if len(members) <= 1 and not terminal_single:
         return
     first = members[-1]
     matched = _match_position_history_row(
@@ -1742,6 +1792,22 @@ def _prepare_lifecycle_allocations(
         and abs(total_close_contracts - official_contracts)
         <= max(official_contracts * 1e-6, 1e-9)
     )
+    if terminal_single:
+        # A lone retired projection needs exact lifecycle and entry evidence;
+        # the default single-fragment allocation is not proof of completeness.
+        row = matched[0] if not isinstance(matched, SettlementFailure) else {}
+        opened_delta = _time_delta_seconds(first.created_at, _position_history_opened_at(row))
+        contract_allocation_complete = bool(
+            contract_allocation_complete
+            and first.okx_pos_id
+            and _position_history_pos_id(row) == first.okx_pos_id
+            and _position_history_inst_id(row) == first.okx_inst_id
+            and _position_history_side(row) == first.side
+            and opened_delta is not None
+            and opened_delta <= POSITION_HISTORY_CLOSE_EARLY_TOLERANCE_SECONDS
+            and _quantities_close(first.entry_contracts, official_contracts)
+            and _history_row_position_ids(row) == {str(first.position_id)}
+        )
     entry_facts_complete = all(item.entry_fee_authoritative is not None for item in members)
     if contract_allocation_complete and entry_facts_complete:
         # Entry orders are often shared by all local partial-close fragments.

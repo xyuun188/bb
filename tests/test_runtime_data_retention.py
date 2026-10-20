@@ -273,6 +273,35 @@ def test_runtime_retention_runner_requires_explicit_apply_confirmation() -> None
     assert args.apply is True
 
 
+@pytest.mark.asyncio
+async def test_runtime_retention_runner_applies_shared_file_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def fake_run(self, *, apply, measure_reclaimable_bytes):
+        return {"summary": {"processed_rows": 0}}
+
+    def fake_cleanup(data_dir, *, apply):
+        calls.append((data_dir, apply))
+        return SimpleNamespace(
+            dry_run=not apply, candidates=[], deleted_count=2, deleted_bytes=300,
+        )
+
+    monkeypatch.setattr(runner_script, "settings", SimpleNamespace(data_dir=tmp_path))
+    monkeypatch.setattr(runner_script.RuntimeDataRetentionService, "run", fake_run)
+    monkeypatch.setattr(runner_script, "cleanup_runtime_artifacts", fake_cleanup)
+    args = runner_script.parse_args([
+        "--apply", "--confirm", runner_script.APPLY_CONFIRMATION, "--skip-byte-estimate",
+    ])
+    report = await runner_script.run(args)
+    assert calls == [(tmp_path, True)]
+    assert report["file_cleanup"]["deleted_bytes"] == 300
+    assert report["file_cleanup"]["dry_run"] is False
+
+
 def test_runtime_retention_timer_runs_as_bb_with_low_priority_runtime_env() -> None:
     service = timer_script.render_service()
     timer = timer_script.render_timer()

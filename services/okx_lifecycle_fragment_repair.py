@@ -11,18 +11,20 @@ proven.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from core.symbols import normalize_trading_symbol, symbol_from_okx_inst_id
+from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
 
 REPAIR_SOURCE = "okx_authoritative_lifecycle_fragment_recovery"
-REPAIR_VERSION = "2026-08-26.okx-lifecycle-fragment-repair.v1"
+REPAIR_VERSION = "2026-10-20.okx-lifecycle-recovery.v4"
 REPAIR_TRAINING_POLICY = "exclude_until_authoritative_settlement"
-REPAIR_REASON = "missing_local_position_fragment_for_authoritative_close_fill"
+REPAIR_REASON = "missing_local_position_for_authoritative_closed_lifecycle"
 ORDER_CONFIRMATION_STATES = {
     "okx_confirmed",
     "okx_order_detail_confirmed",
@@ -35,6 +37,25 @@ POSITION_SETTLEMENT_SUPERSEDED = {
 TIME_TOLERANCE_SECONDS = 120.0
 CONTRACT_TOLERANCE_RATIO = 1e-6
 MAX_LIFECYCLES_PER_PASS = 50
+
+
+@dataclass(frozen=True, slots=True)
+class MissingLifecyclePlan:
+    history_record: OkxPositionHistory
+    entry_order_ids: tuple[str, ...]
+    close_order_ids: tuple[str, ...]
+    decision_id: int
+    model_name: str
+    symbol: str
+    side: str
+    inst_id: str
+    pos_id: str
+    quantity: float
+    entry_price: float
+    close_price: float
+    leverage: float
+    opened_at: datetime
+    closed_at: datetime
 
 
 async def repair_missing_okx_lifecycle_fragments(
@@ -60,10 +81,23 @@ async def repair_missing_okx_lifecycle_fragments(
     if not history_rows:
         return _summary()
 
+    # Hold the same transaction lock through commit so concurrent workers read
+    # the previous repair's committed positions before planning another insert.
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"bb:okx_lifecycle_fragment_repair:{selected_mode}"},
+        )
     position_result = await session.execute(
-        select(Position).where(Position.execution_mode == selected_mode)
+        select(Position)
+        .where(Position.execution_mode == selected_mode)
+        .execution_options(populate_existing=True)
     )
-    positions = list(position_result.scalars().all())
+    all_positions = list(position_result.scalars().all())
+    positions = [
+        position for position in all_positions
+        if position.settlement_status not in POSITION_SETTLEMENT_SUPERSEDED
+    ]
     order_result = await session.execute(
         select(Order).where(
             Order.execution_mode == selected_mode,
@@ -75,33 +109,46 @@ async def repair_missing_okx_lifecycle_fragments(
         )
     )
     orders = list(order_result.scalars().all())
-    orders_by_id = {
-        _text(order.exchange_order_id): order
-        for order in orders
-        if _text(order.exchange_order_id)
-    }
+    orders_by_id: dict[str, Order] = {}
+    duplicate_order_ids: set[str] = set()
+    for order in orders:
+        order_id = _text(order.exchange_order_id)
+        if not order_id or order_id in duplicate_order_ids:
+            continue
+        if order_id in orders_by_id:
+            orders_by_id.pop(order_id, None)
+            duplicate_order_ids.add(order_id)
+            continue
+        orders_by_id[order_id] = order
     globally_linked_close_ids = {
         close_id
-        for position in positions
+        for position in all_positions
         for close_id in _split_ids(getattr(position, "close_exchange_order_id", None))
     }
     positions_by_close_id: dict[str, list[Position]] = {}
     for position in positions:
-        if bool(position.is_open) or position.settlement_status in POSITION_SETTLEMENT_SUPERSEDED:
+        if bool(position.is_open):
             continue
         for close_id in _split_ids(position.close_exchange_order_id):
             positions_by_close_id.setdefault(close_id, []).append(position)
     close_owners: dict[str, set[tuple[Any, ...]]] = {}
+    entry_owners: dict[str, set[tuple[Any, ...]]] = {}
+    lifecycle_row_counts: dict[tuple[Any, ...], int] = {}
     for row in history_rows:
-        identity = (
-            _text(row.get("instId")), _text(row.get("posId")),
-            _history_side(row), _history_opened_at(row),
-        )
+        lifecycle = _history_lifecycle(row, mode=selected_mode)
+        if lifecycle is None:
+            continue
+        _key, facts = lifecycle
+        identity = (facts["inst_id"], facts["pos_id"], facts["side"], facts["opened_at"])
+        lifecycle_row_counts[identity] = lifecycle_row_counts.get(identity, 0) + 1
+        for entry_id in _split_ids(row.get("_dashboard_entry_order_ids")):
+            entry_owners.setdefault(entry_id, set()).add(identity)
         for close_id in _split_ids(row.get("_dashboard_close_order_ids")):
             close_owners.setdefault(close_id, set()).add(identity)
 
     created = 0
     repaired_identity = 0
+    repaired_order_links = 0
     skipped = 0
     samples: list[dict[str, Any]] = []
     seen_lifecycles: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
@@ -111,10 +158,37 @@ async def repair_missing_okx_lifecycle_fragments(
         lifecycle = _history_lifecycle(row, mode=selected_mode)
         if lifecycle is None:
             continue
-        identity_samples = _repair_linked_lifecycle_identity(
-            lifecycle, positions_by_close_id=positions_by_close_id,
-            orders_by_id=orders_by_id, close_owners=close_owners, now=checked_at,
+        identity = (
+            lifecycle[1]["inst_id"],
+            lifecycle[1]["pos_id"],
+            lifecycle[1]["side"],
+            lifecycle[1]["opened_at"],
         )
+        if lifecycle_row_counts.get(identity, 0) == 1:
+            link_sample = await _repair_partial_lifecycle_order_links(
+                session,
+                lifecycle,
+                positions=positions,
+                orders=orders,
+                orders_by_id=orders_by_id,
+                entry_owners=entry_owners,
+                close_owners=close_owners,
+                now=checked_at,
+            )
+            if link_sample is not None:
+                repaired_order_links += 1
+                samples.append(link_sample)
+                for order_id in _split_ids(row.get("_dashboard_close_order_ids")):
+                    close_owners.setdefault(order_id, set()).add(identity)
+        identity_samples = []
+        if lifecycle_row_counts.get(identity, 0) == 1 and all(
+            len(entry_owners.get(order_id, set())) == 1
+            for order_id in _split_ids(row.get("_dashboard_entry_order_ids"))
+        ):
+            identity_samples = _repair_linked_lifecycle_identity(
+                lifecycle, positions_by_close_id=positions_by_close_id,
+                orders_by_id=orders_by_id, close_owners=close_owners, now=checked_at,
+            )
         repaired_identity += len(identity_samples)
         samples.extend(identity_samples)
         lifecycle_key, lifecycle_positions = _select_lifecycle_positions(
@@ -123,6 +197,91 @@ async def repair_missing_okx_lifecycle_fragments(
             orders_by_id=orders_by_id,
         )
         if lifecycle_key is None or not lifecycle_positions:
+            full_lifecycle_plan = await _plan_missing_full_lifecycle(
+                session,
+                lifecycle,
+                positions=all_positions,
+                orders_by_id=orders_by_id,
+                duplicate_order_ids=duplicate_order_ids,
+                entry_owners=entry_owners,
+                close_owners=close_owners,
+                lifecycle_row_count=lifecycle_row_counts.get(identity, 0),
+            )
+            if full_lifecycle_plan is None:
+                continue
+            position = Position(
+                model_name=full_lifecycle_plan.model_name,
+                execution_mode=selected_mode,
+                symbol=full_lifecycle_plan.symbol,
+                side=full_lifecycle_plan.side,
+                quantity=full_lifecycle_plan.quantity,
+                entry_price=full_lifecycle_plan.entry_price,
+                current_price=full_lifecycle_plan.close_price,
+                leverage=full_lifecycle_plan.leverage,
+                unrealized_pnl=0.0,
+                realized_pnl=0.0,
+                close_fill_pnl=0.0,
+                entry_fee=0.0,
+                close_fee=0.0,
+                funding_fee=0.0,
+                settlement_status="settling",
+                settlement_source=REPAIR_SOURCE,
+                settlement_synced_at=checked_at,
+                settlement_raw={
+                    "lifecycle_recovery": {
+                        "version": REPAIR_VERSION,
+                        "source": REPAIR_SOURCE,
+                        "reason": REPAIR_REASON,
+                        "repaired_at": checked_at.isoformat(),
+                        "training_policy": REPAIR_TRAINING_POLICY,
+                        "history_record_id": int(full_lifecycle_plan.history_record.id),
+                        "decision_id": full_lifecycle_plan.decision_id,
+                        "entry_order_ids": list(full_lifecycle_plan.entry_order_ids),
+                        "close_order_ids": list(full_lifecycle_plan.close_order_ids),
+                        "okx_inst_id": full_lifecycle_plan.inst_id,
+                        "okx_pos_id": full_lifecycle_plan.pos_id,
+                        "quantity": full_lifecycle_plan.quantity,
+                    }
+                },
+                is_open=False,
+                closed_at=full_lifecycle_plan.closed_at,
+                okx_inst_id=full_lifecycle_plan.inst_id,
+                okx_pos_id=full_lifecycle_plan.pos_id,
+                entry_exchange_order_id=",".join(full_lifecycle_plan.entry_order_ids),
+                close_exchange_order_id=",".join(full_lifecycle_plan.close_order_ids),
+                created_at=full_lifecycle_plan.opened_at,
+                updated_at=checked_at,
+            )
+            session.add(position)
+            await session.flush()
+            _merge_history_record_links(
+                full_lifecycle_plan.history_record,
+                position_id=position.id,
+                entry_ids=full_lifecycle_plan.entry_order_ids,
+                close_ids=full_lifecycle_plan.close_order_ids,
+                match_status="okx_full_lifecycle_recovery_pending_settlement",
+            )
+            row["_dashboard_position_ids"] = _merge_values(
+                row.get("_dashboard_position_ids"),
+                [str(position.id)],
+            )
+            positions.append(position)
+            all_positions.append(position)
+            globally_linked_close_ids.update(full_lifecycle_plan.close_order_ids)
+            created += 1
+            samples.append(
+                {
+                    "kind": "okx_missing_full_lifecycle_recovered",
+                    "position_id": int(position.id),
+                    "symbol": full_lifecycle_plan.symbol,
+                    "side": full_lifecycle_plan.side,
+                    "okx_pos_id": full_lifecycle_plan.pos_id,
+                    "entry_order_count": len(full_lifecycle_plan.entry_order_ids),
+                    "close_order_count": len(full_lifecycle_plan.close_order_ids),
+                    "quantity": full_lifecycle_plan.quantity,
+                    "settlement_status": "settling",
+                }
+            )
             continue
         if lifecycle_key in seen_lifecycles:
             continue
@@ -191,7 +350,7 @@ async def repair_missing_okx_lifecycle_fragments(
                 settlement_status="settling",
                 settlement_source=REPAIR_SOURCE,
                 settlement_synced_at=checked_at,
-                settlement_raw=evidence,
+                settlement_raw={"lifecycle_recovery": evidence},
                 is_open=False,
                 closed_at=filled_at,
                 okx_inst_id=inst_id,
@@ -204,6 +363,7 @@ async def repair_missing_okx_lifecycle_fragments(
             session.add(position)
             await session.flush()
             positions.append(position)
+            all_positions.append(position)
             globally_linked_close_ids.add(exchange_order_id)
             created += 1
             if history_record is not None:
@@ -239,13 +399,164 @@ async def repair_missing_okx_lifecycle_fragments(
     return {
         "created_count": created,
         "repaired_identity_count": repaired_identity,
+        "repaired_order_link_count": repaired_order_links,
         "skipped_count": skipped,
         "samples": samples[:10],
     }
 
 
 def _summary() -> dict[str, Any]:
-    return {"created_count": 0, "repaired_identity_count": 0, "skipped_count": 0, "samples": []}
+    return {
+        "created_count": 0,
+        "repaired_identity_count": 0,
+        "repaired_order_link_count": 0,
+        "skipped_count": 0,
+        "samples": [],
+    }
+
+
+async def _repair_partial_lifecycle_order_links(
+    session: Any,
+    lifecycle: tuple[tuple[str, str, str, str, tuple[str, ...]], dict[str, Any]],
+    *,
+    positions: list[Position],
+    orders: list[Order],
+    orders_by_id: dict[str, Order],
+    entry_owners: dict[str, set[tuple[Any, ...]]],
+    close_owners: dict[str, set[tuple[Any, ...]]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Refresh partial-history links only when fills conserve the live remainder."""
+    _key, facts = lifecycle
+    row = facts["row"]
+    entry_ids = _split_ids(row.get("_dashboard_entry_order_ids"))
+    if not entry_ids or facts["close_contracts"] >= facts["open_contracts"]:
+        return None
+    live_positions = [
+        position for position in positions
+        if position.is_open
+        and _text(position.okx_inst_id).upper() == facts["inst_id"]
+        and _text(position.okx_pos_id) == facts["pos_id"]
+        and _text(position.side).lower() == facts["side"]
+    ]
+    if (
+        len(live_positions) != 1
+        or normalize_trading_symbol(live_positions[0].symbol) != facts["symbol"]
+        or _split_ids(live_positions[0].entry_exchange_order_id) != entry_ids
+    ):
+        return None
+    record = await _history_record(session, row)
+    if (
+        record is None
+        or record.mode != facts["mode"]
+        or record.row_identity != _text(row.get("_dashboard_history_row_identity"))
+        or record.sync_status != "synced"
+        or record.close_status != "partial"
+        or _split_ids(record.entry_order_ids) != entry_ids
+    ):
+        return None
+    owner = (facts["inst_id"], facts["pos_id"], facts["side"], facts["opened_at"])
+    if any(entry_owners.get(order_id) != {owner} for order_id in entry_ids):
+        return None
+    entry_side = "sell" if facts["side"] == "short" else "buy"
+    close_side = "buy" if facts["side"] == "short" else "sell"
+    entry_orders = [orders_by_id.get(order_id) for order_id in sorted(entry_ids)]
+    close_orders = [
+        order for order in orders
+        if _text(order.okx_inst_id).upper() == facts["inst_id"]
+        and _text(order.side).lower() == close_side
+        and order.filled_at is not None
+        and facts["opened_at"] <= _aware_utc(order.filled_at)
+        <= facts["closed_at"] + timedelta(milliseconds=1)
+    ]
+    close_ids = {_text(order.exchange_order_id) for order in close_orders}
+    if (
+        not close_ids
+        or not _split_ids(record.close_order_ids).issubset(close_ids)
+        or any(
+            orders_by_id.get(_text(order.exchange_order_id)) is not order
+            or entry_owners.get(_text(order.exchange_order_id), set()) - {owner}
+            or close_owners.get(_text(order.exchange_order_id), set()) - {owner}
+            for order in close_orders
+        )
+    ):
+        return None
+    for position in positions:
+        if not _split_ids(position.close_exchange_order_id).intersection(close_ids):
+            continue
+        if (
+            normalize_trading_symbol(position.symbol) != facts["symbol"]
+            or _text(position.okx_inst_id).upper() != facts["inst_id"]
+            or (_text(position.okx_pos_id) and _text(position.okx_pos_id) != facts["pos_id"])
+            or _text(position.side).lower() != facts["side"]
+            or _split_ids(position.entry_exchange_order_id) != entry_ids
+        ):
+            return None
+    for group, side, target in (
+        (entry_orders, entry_side, facts["open_contracts"]),
+        (close_orders, close_side, facts["close_contracts"]),
+    ):
+        if any(
+            order is None
+            or _text(order.okx_inst_id).upper() != facts["inst_id"]
+            or not _order_is_authoritative(order, expected_side=side, position_side=facts["side"])
+            or _dict(order.okx_raw_fills).get("contract_size_verified") is not True
+            for order in group
+        ) or not _close_enough(sum(_order_contracts(order) for order in group), target):
+            return None
+    if any(order.filled_at is None for order in entry_orders):
+        return None
+    first_entry_at = min(_aware_utc(order.filled_at) for order in entry_orders)
+    last_entry_at = max(_aware_utc(order.filled_at) for order in entry_orders)
+    if (
+        abs((first_entry_at - facts["opened_at"]).total_seconds()) > TIME_TOLERANCE_SECONDS
+        or last_entry_at > min(_aware_utc(order.filled_at) for order in close_orders)
+    ):
+        return None
+    all_orders = [*entry_orders, *close_orders]
+    size = _order_contract_size(all_orders[0], row)
+    remaining = (facts["open_contracts"] - facts["close_contracts"]) * size
+    if (
+        size <= 0
+        or any(not _close_enough(_order_contract_size(order, row), size) for order in all_orders)
+        or not _close_enough(_safe_float(live_positions[0].quantity), remaining)
+        or not _price_close(_weighted_price(entry_orders), record.open_avg_px)
+        or not _price_close(_weighted_price(close_orders), record.close_avg_px)
+        or abs(sum(abs(_safe_float(order.fee)) for order in all_orders) - abs(record.fee))
+        > max(abs(record.fee) * 1e-6, 1e-8)
+    ):
+        return None
+    position_id = int(live_positions[0].id)
+    missing_close_ids = close_ids - _split_ids(record.close_order_ids)
+    if not missing_close_ids and str(position_id) in _split_ids(record.position_ids):
+        return None
+    raw = _dict(record.raw_row)
+    record.raw_row = {
+        **raw,
+        "_bb_partial_lifecycle_link_recovery": {
+            "source": REPAIR_SOURCE,
+            "version": REPAIR_VERSION,
+            "repaired_at": now.isoformat(),
+            "previous_close_order_ids": sorted(_split_ids(record.close_order_ids)),
+            "previous_position_ids": sorted(_split_ids(record.position_ids)),
+            "added_close_order_ids": sorted(missing_close_ids),
+        },
+    }
+    _merge_history_record_links(
+        record,
+        position_id=position_id,
+        entry_ids=sorted(entry_ids),
+        close_ids=sorted(close_ids),
+        match_status=record.match_status,
+    )
+    row["_dashboard_close_order_ids"] = list(record.close_order_ids)
+    row["_dashboard_position_ids"] = list(record.position_ids)
+    return {
+        "kind": "okx_partial_lifecycle_order_links_recovered",
+        "symbol": facts["symbol"],
+        "position_id": position_id,
+        "added_close_order_ids": sorted(missing_close_ids),
+    }
 
 
 def _repair_linked_lifecycle_identity(
@@ -256,7 +567,7 @@ def _repair_linked_lifecycle_identity(
     close_owners: dict[str, set[tuple[Any, ...]]],
     now: datetime,
 ) -> list[dict[str, Any]]:
-    """Restore entry identity only from a uniquely linked, fully proven lifecycle."""
+    """Restore identity and close time from a uniquely proven lifecycle."""
     _key, facts = lifecycle
     entry_ids = _split_ids(facts["row"].get("_dashboard_entry_order_ids"))
     close_ids = _split_ids(facts["row"].get("_dashboard_close_order_ids"))
@@ -302,34 +613,83 @@ def _repair_linked_lifecycle_identity(
     for position in selected.values():
         position_close_ids = _split_ids(position.close_exchange_order_id)
         if (
-            position.okx_pos_id != facts["pos_id"]
-            or _text(position.okx_inst_id).upper() != facts["inst_id"]
+            (_text(position.okx_pos_id) and _text(position.okx_pos_id) != facts["pos_id"])
+            or (
+                _text(position.okx_inst_id)
+                and _text(position.okx_inst_id).upper() != facts["inst_id"]
+            )
+            or normalize_trading_symbol(position.symbol) != facts["symbol"]
             or str(position.side or "").lower() != facts["side"]
             or not position_close_ids
             or not position_close_ids.issubset(close_ids)
-            or _split_ids(position.entry_exchange_order_id) == entry_ids
+            or any(len(positions_by_close_id.get(order_id, [])) != 1 for order_id in position_close_ids)
         ):
             continue
+        missing_identity = not _text(position.okx_pos_id) or not _text(position.okx_inst_id)
+        if missing_identity and (
+            _split_ids(position.entry_exchange_order_id) != entry_ids
+            or not _close_enough(
+                _safe_float(position.quantity),
+                sum(
+                    _order_base_quantity(
+                        orders_by_id[order_id],
+                        _order_contract_size(orders_by_id[order_id], facts["row"]),
+                    )
+                    for order_id in position_close_ids
+                ),
+            )
+        ):
+            continue
+        identity_requires_repair = (
+            missing_identity or _split_ids(position.entry_exchange_order_id) != entry_ids
+        )
+        authoritative_closed_at = max(
+            _aware_utc(orders_by_id[order_id].filled_at) for order_id in position_close_ids
+        )
+        previous_closed_at = _aware_utc(position.closed_at)
+        close_time_requires_repair = previous_closed_at != authoritative_closed_at
+        if not identity_requires_repair and not close_time_requires_repair:
+            continue
         raw = _dict(position.settlement_raw)
-        position.settlement_raw = {
-            **raw,
-            "entry_identity_repair": {
+        evidence: dict[str, Any] = {}
+        if identity_requires_repair:
+            evidence["entry_identity_repair"] = {
                 "source": REPAIR_SOURCE, "repaired_at": now.isoformat(),
                 "history_record_id": facts["row"].get("_dashboard_history_record_id"),
                 "previous_entry_order_ids": position.entry_exchange_order_id,
                 "previous_created_at": _aware_utc(position.created_at).isoformat(),
                 "previous_entry_price": position.entry_price,
+                "previous_okx_pos_id": position.okx_pos_id,
+                "previous_okx_inst_id": position.okx_inst_id,
                 "authoritative_entry_order_ids": sorted(entry_ids),
                 "authoritative_close_order_ids": sorted(position_close_ids),
-            },
+            }
+        if close_time_requires_repair:
+            evidence["close_time_repair"] = {
+                "source": REPAIR_SOURCE,
+                "repaired_at": now.isoformat(),
+                "history_record_id": facts["row"].get("_dashboard_history_record_id"),
+                "previous_closed_at": previous_closed_at.isoformat() if previous_closed_at else None,
+                "authoritative_closed_at": authoritative_closed_at.isoformat(),
+                "authoritative_close_order_ids": sorted(position_close_ids),
+            }
+            position.closed_at = authoritative_closed_at
+        position.settlement_raw = {
+            **raw,
+            **evidence,
             "next_settlement_retry_at": now.isoformat(),
         }
         position.entry_exchange_order_id = ",".join(sorted(entry_ids))
+        position.okx_pos_id = facts["pos_id"]
+        position.okx_inst_id = facts["inst_id"]
         position.created_at = facts["opened_at"]
         position.entry_price = facts["entry_price"]
         position.updated_at = now
         samples.append({
-            "kind": "okx_lifecycle_entry_identity_repaired",
+            "kind": (
+                "okx_lifecycle_entry_identity_repaired"
+                if identity_requires_repair else "okx_lifecycle_close_time_repaired"
+            ),
             "position_id": int(position.id), "symbol": facts["symbol"],
         })
     return samples
@@ -377,6 +737,9 @@ def _select_lifecycle_positions(
     orders_by_id: dict[str, Order],
 ) -> tuple[tuple[str, str, str, str, tuple[str, ...]] | None, list[Position]]:
     _base_key, facts = lifecycle
+    authoritative_entry_ids = tuple(
+        sorted(_split_ids(facts["row"].get("_dashboard_entry_order_ids")))
+    )
     candidates = [
         position
         for position in positions
@@ -391,7 +754,9 @@ def _select_lifecycle_positions(
     grouped: dict[tuple[str, ...], list[Position]] = {}
     for position in candidates:
         entry_ids = tuple(sorted(_split_ids(getattr(position, "entry_exchange_order_id", None))))
-        if entry_ids:
+        if entry_ids and (
+            not authoritative_entry_ids or entry_ids == authoritative_entry_ids
+        ):
             grouped.setdefault(entry_ids, []).append(position)
     if not grouped:
         return None, []
@@ -406,13 +771,15 @@ def _select_lifecycle_positions(
         if not entry_times:
             continue
         opened_delta = abs((min(entry_times) - facts["opened_at"]).total_seconds())
-        if opened_delta > 24 * 3600:
+        if opened_delta > TIME_TOLERANCE_SECONDS:
             continue
         entry_contracts = sum(
             _order_contracts(orders_by_id[order_id])
             for order_id in entry_ids
             if order_id in orders_by_id
         )
+        if not _close_enough(entry_contracts, facts["open_contracts"]):
+            continue
         contract_delta = abs(entry_contracts - facts["open_contracts"])
         score = opened_delta / 60.0 + contract_delta * 100.0
         scored.append((score, entry_ids, group))
@@ -422,8 +789,6 @@ def _select_lifecycle_positions(
     if len(scored) > 1 and abs(scored[0][0] - scored[1][0]) <= 1e-9:
         return None, []
     chosen_score, entry_ids, group = scored[0]
-    if chosen_score > 24 * 60.0 + 1e-6 and facts["open_contracts"] > 0:
-        return None, []
     return (*_base_key[:4], entry_ids), group
 
 
@@ -572,16 +937,236 @@ def _merge_history_record_links(
     *,
     position_id: int | None,
     entry_ids: Iterable[str],
-    close_id: str,
+    close_ids: Iterable[str] = (),
+    close_id: str = "",
+    match_status: str = "okx_lifecycle_fragment_repair_pending_settlement",
 ) -> None:
+    resolved_close_ids = _merge_values(close_ids, [close_id] if close_id else [])
     record.position_ids = _merge_values(record.position_ids, [str(position_id)] if position_id else [])
     record.entry_order_ids = _merge_values(record.entry_order_ids, entry_ids)
-    record.close_order_ids = _merge_values(record.close_order_ids, [close_id])
+    record.close_order_ids = _merge_values(record.close_order_ids, resolved_close_ids)
     record.linked_order_ids = _merge_values(
         record.linked_order_ids,
-        [*entry_ids, close_id],
+        [*entry_ids, *resolved_close_ids],
     )
-    record.match_status = "okx_lifecycle_fragment_repair_pending_settlement"
+    record.match_status = match_status
+
+
+async def _plan_missing_full_lifecycle(
+    session: Any,
+    lifecycle: tuple[tuple[str, str, str, str, tuple[str, ...]], dict[str, Any]],
+    *,
+    positions: list[Position],
+    orders_by_id: dict[str, Order],
+    duplicate_order_ids: set[str],
+    entry_owners: dict[str, set[tuple[Any, ...]]],
+    close_owners: dict[str, set[tuple[Any, ...]]],
+    lifecycle_row_count: int,
+) -> MissingLifecyclePlan | None:
+    lifecycle_key, facts = lifecycle
+    row = facts["row"]
+    history_record = await _history_record(session, row)
+    if (
+        lifecycle_row_count != 1
+        or history_record is None
+        or str(history_record.mode or "").lower() != facts["mode"]
+        or str(history_record.row_identity or "")
+        != _text(row.get("_dashboard_history_row_identity"))
+        or str(history_record.match_status or "") != "okx_account_position_history"
+        or str(history_record.sync_status or "").lower() != "synced"
+        or str(history_record.close_status or "").lower() != "full"
+        or history_record.evidence_gaps
+        or _split_ids(history_record.position_ids)
+    ):
+        return None
+
+    entry_ids = tuple(sorted(_split_ids(row.get("_dashboard_entry_order_ids"))))
+    close_ids = tuple(sorted(_split_ids(row.get("_dashboard_close_order_ids"))))
+    if not entry_ids or not close_ids or set(entry_ids).intersection(close_ids):
+        return None
+    if (
+        set(_split_ids(history_record.entry_order_ids)) != set(entry_ids)
+        or set(_split_ids(history_record.close_order_ids)) != set(close_ids)
+    ):
+        return None
+    owner_identity = (
+        facts["inst_id"],
+        facts["pos_id"],
+        facts["side"],
+        facts["opened_at"],
+    )
+    if any(
+        len(entry_owners.get(order_id, set())) != 1
+        or owner_identity not in entry_owners.get(order_id, set())
+        for order_id in entry_ids
+    ) or any(
+        len(close_owners.get(order_id, set())) != 1
+        or owner_identity not in close_owners.get(order_id, set())
+        for order_id in close_ids
+    ):
+        return None
+
+    open_contracts = _safe_float(facts["open_contracts"])
+    close_contracts = _safe_float(facts["close_contracts"])
+    if open_contracts <= 0 or not _close_enough(open_contracts, close_contracts):
+        return None
+    if (
+        not _close_enough(_safe_float(history_record.open_max_pos), open_contracts)
+        or not _close_enough(_safe_float(history_record.close_total_pos), close_contracts)
+        or _safe_float(history_record.open_avg_px) <= 0
+        or _safe_float(history_record.close_avg_px) <= 0
+    ):
+        return None
+
+    all_order_ids = set(entry_ids) | set(close_ids)
+    if all_order_ids.intersection(duplicate_order_ids):
+        return None
+    for position in positions:
+        position_order_ids = _split_ids(position.entry_exchange_order_id) | _split_ids(
+            position.close_exchange_order_id
+        )
+        if all_order_ids.intersection(position_order_ids):
+            return None
+        position_opened_at = getattr(position, "created_at", None)
+        if (
+            str(getattr(position, "okx_pos_id", "") or "").strip() == facts["pos_id"]
+            and str(getattr(position, "okx_inst_id", "") or "").strip().upper()
+            == facts["inst_id"]
+            and str(getattr(position, "side", "") or "").lower() == facts["side"]
+            and position_opened_at is not None
+            and abs((_aware_utc(position_opened_at) - facts["opened_at"]).total_seconds())
+            <= TIME_TOLERANCE_SECONDS
+        ):
+            return None
+
+    entry_orders = tuple(orders_by_id.get(order_id) for order_id in entry_ids)
+    close_orders = tuple(orders_by_id.get(order_id) for order_id in close_ids)
+    if any(order is None for order in (*entry_orders, *close_orders)):
+        return None
+    resolved_entry_orders = tuple(order for order in entry_orders if order is not None)
+    resolved_close_orders = tuple(order for order in close_orders if order is not None)
+    entry_side = "sell" if facts["side"] == "short" else "buy"
+    close_side = "buy" if facts["side"] == "short" else "sell"
+    for order_group, expected_side in (
+        (resolved_entry_orders, entry_side),
+        (resolved_close_orders, close_side),
+    ):
+        if any(
+            str(order.okx_inst_id or "").strip().upper() != facts["inst_id"]
+            or not _order_is_authoritative(
+                order,
+                expected_side=expected_side,
+                position_side=facts["side"],
+            )
+            or _dict(order.okx_raw_fills).get("contract_size_verified") is not True
+            or order.filled_at is None
+            or not (
+                facts["opened_at"] - timedelta(seconds=TIME_TOLERANCE_SECONDS)
+                <= _aware_utc(order.filled_at)
+                <= facts["closed_at"] + timedelta(seconds=TIME_TOLERANCE_SECONDS)
+            )
+            for order in order_group
+        ):
+            return None
+
+    decision_ids = {
+        int(order.decision_id)
+        for order in resolved_entry_orders
+        if int(getattr(order, "decision_id", 0) or 0) > 0
+    }
+    if len(decision_ids) != 1 or any(
+        not int(getattr(order, "decision_id", 0) or 0)
+        for order in resolved_entry_orders
+    ):
+        return None
+    decision_id = next(iter(decision_ids))
+    decision = await session.get(AIDecision, decision_id)
+    model_names = {str(order.model_name or "").strip() for order in resolved_entry_orders}
+    if (
+        decision is None
+        or bool(decision.is_paper) != (facts["mode"] != "live")
+        or not bool(decision.was_executed or decision.executed_at)
+        or str(decision.action or "").lower() != facts["side"]
+        or normalize_trading_symbol(decision.symbol) != facts["symbol"]
+        or not str(decision.model_name or "").strip()
+        or model_names != {str(decision.model_name).strip()}
+    ):
+        return None
+
+    contract_sizes = [
+        _order_contract_size(order, row)
+        for order in (*resolved_entry_orders, *resolved_close_orders)
+    ]
+    if not contract_sizes or any(size <= 0 for size in contract_sizes):
+        return None
+    contract_size = contract_sizes[0]
+    if any(not _close_enough(size, contract_size) for size in contract_sizes[1:]):
+        return None
+    quantity = open_contracts * contract_size
+    entry_contracts = sum(_order_contracts(order) for order in resolved_entry_orders)
+    close_contracts_from_orders = sum(_order_contracts(order) for order in resolved_close_orders)
+    entry_quantity = sum(
+        _order_base_quantity(order, contract_size) for order in resolved_entry_orders
+    )
+    close_quantity = sum(
+        _order_base_quantity(order, contract_size) for order in resolved_close_orders
+    )
+    if (
+        not _close_enough(entry_contracts, open_contracts)
+        or not _close_enough(close_contracts_from_orders, close_contracts)
+        or not _close_enough(entry_quantity, quantity)
+        or not _close_enough(close_quantity, quantity)
+    ):
+        return None
+
+    first_entry_at = min(
+        _aware_utc(order.filled_at or order.created_at) for order in resolved_entry_orders
+    )
+    last_close_at = max(
+        _aware_utc(order.filled_at or order.created_at) for order in resolved_close_orders
+    )
+    if (
+        abs((first_entry_at - facts["opened_at"]).total_seconds()) > TIME_TOLERANCE_SECONDS
+        or abs((last_close_at - facts["closed_at"]).total_seconds()) > TIME_TOLERANCE_SECONDS
+    ):
+        return None
+    entry_price = _weighted_price(resolved_entry_orders)
+    close_price = _weighted_price(resolved_close_orders)
+    official_entry_price = _safe_float(history_record.open_avg_px)
+    official_close_price = _safe_float(history_record.close_avg_px)
+    if (
+        entry_price <= 0
+        or close_price <= 0
+        or not _price_close(entry_price, official_entry_price)
+        or not _price_close(close_price, official_close_price)
+    ):
+        return None
+
+    return MissingLifecyclePlan(
+        history_record=history_record,
+        entry_order_ids=entry_ids,
+        close_order_ids=close_ids,
+        decision_id=decision_id,
+        model_name=str(decision.model_name).strip(),
+        symbol=facts["symbol"],
+        side=facts["side"],
+        inst_id=facts["inst_id"],
+        pos_id=facts["pos_id"],
+        quantity=quantity,
+        entry_price=official_entry_price,
+        close_price=official_close_price,
+        leverage=max(_safe_float(row.get("lever") or row.get("leverage"), 1.0), 1.0),
+        opened_at=facts["opened_at"],
+        closed_at=facts["closed_at"],
+    )
+
+
+def _close_enough(left: float, right: float) -> bool:
+    return abs(left - right) <= max(abs(left), abs(right), 1.0) * CONTRACT_TOLERANCE_RATIO
+
+
+def _price_close(left: float, right: float) -> bool:
+    return abs(left - right) <= max(abs(left), abs(right), 1e-8) * 0.002
 
 
 def _history_side(row: dict[str, Any]) -> str:

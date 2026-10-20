@@ -284,6 +284,7 @@ async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
             protection_order_id,
             quantity_mismatch_order_id,
         ),
+        "priority_only": True,
         "timeout_seconds": script.PHASE3_ORDER_FACT_SYNC_TIMEOUT_SECONDS,
     }
     assert result["recovery_order_ids"] == [
@@ -292,6 +293,68 @@ async def test_phase3_sync_passes_authoritative_missing_order_ids_to_recovery(
         quantity_mismatch_order_id,
     ]
     assert result["order_sync_result"]["backfilled_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_phase3_recovery_batches_all_ids_without_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order_ids = [str(3785286327831597056 + index) for index in range(9)]
+    issues = [
+        {"kind": "okx_fill_missing_local_order", "exchange_order_id": order_id}
+        for order_id in order_ids
+    ]
+    reports = [
+        {
+            **_report("warning"),
+            "cards": [
+                {
+                    "key": "okx_trade_fact_integrity",
+                    "details": {"okx_authoritative_sync": {"issues": issues}},
+                }
+            ],
+        },
+        _report(),
+    ]
+    calls: list[dict[str, object]] = []
+
+    async def fake_collect_report(*, allow_cache: bool = False) -> dict:
+        return reports.pop(0)
+
+    async def fake_equity_snapshot(*, mode: str) -> dict:
+        return {"status": "created", "mode": mode}
+
+    class FakeOrderSync:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        async def sync(self) -> dict:
+            batch = calls[-1]["recovery_order_ids"]
+            return {
+                "status": "ok",
+                "okx_pull_available": True,
+                "backfilled_count": len(batch),
+                "recovery_order_ids_pending": [],
+                "completed_stages": ["priority_queue_complete"],
+                "deferred_stages": [],
+                "stage_errors": [],
+                "samples": [],
+            }
+
+    monkeypatch.setattr(script, "collect_report", fake_collect_report)
+    monkeypatch.setattr(script, "_sync_okx_equity_snapshot", fake_equity_snapshot)
+    monkeypatch.setattr(script, "OkxOrderFactSyncService", FakeOrderSync)
+
+    result = await script.run(mode="paper", apply_order_sync=True, allow_cache=False)
+
+    batches = [call["recovery_order_ids"] for call in calls]
+    assert [len(batch) for batch in batches] == [4, 4, 1]
+    assert [order_id for batch in batches for order_id in batch] == order_ids
+    assert all(call["priority_only"] is True for call in calls)
+    assert result["order_sync_result"]["recovery_batch_count"] == 3
+    assert result["order_sync_result"]["backfilled_count"] == 9
+    assert result["order_sync_result"]["recovery_order_ids_pending"] == []
+    assert result["order_sync_result"]["status"] == "ok"
 
 
 @pytest.mark.asyncio

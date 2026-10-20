@@ -19,6 +19,17 @@ PROTECTED_FILENAMES = {
 }
 ROTATED_TRADING_LOG_RE = re.compile(r"^trading\.log\.\d+$")
 CODEX_RUN_LOG_RE = re.compile(r"^codex_run_(stdout|stderr)\.log$")
+REPORT_ARCHIVES = {
+    "phase3_paper_resume_observation_reports": "phase3-paper-resume-observation-*.json",
+    "phase3_paper_resume_preflight_reports": "phase3-paper-resume-preflight-*.json",
+    "phase3_stage_handoff_reports": "phase3-stage-handoff-*.json",
+    "phase3_model_server_readiness_reports": "phase3-model-server-readiness-*.json",
+    "phase3_rebuild_preflight_reports": "phase3-rebuild-preflight-*.json",
+    "okx_daily_reconciliation_reports": "okx-daily-reconciliation-*.json",
+    "runtime_data_retention_reports": "runtime-data-retention-*.json",
+}
+REPORT_RETENTION_HOURS = 30 * 24
+MINIMUM_REPORT_ARCHIVES = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +105,76 @@ def _candidate(
     )
 
 
+def _referenced_report_paths(data_dir: Path) -> set[Path] | None:
+    """Keep report evidence reachable from current manifests and latest cards."""
+    pending = [
+        *data_dir.glob("*.json"),
+        *(data_dir / name / "latest.json" for name in REPORT_ARCHIVES),
+    ]
+    visited: set[Path] = set()
+    protected: set[Path] = set()
+    while pending:
+        manifest = pending.pop()
+        if manifest in visited or not manifest.is_file():
+            continue
+        visited.add(manifest)
+        if manifest.is_symlink() or not _is_inside(manifest, data_dir):
+            return None
+        try:
+            if manifest.stat().st_size > 8 * 1024 * 1024:
+                return None
+            values = [json.loads(manifest.read_text(encoding="utf-8-sig"))]
+        except (OSError, ValueError):
+            return None
+        while values:
+            value = values.pop()
+            if isinstance(value, dict):
+                values.extend(value.values())
+            elif isinstance(value, list):
+                values.extend(value)
+            elif isinstance(value, str) and value.endswith(".json"):
+                path = Path(value)
+                if not path.is_absolute():
+                    path = data_dir.parent / path
+                if _is_inside(path, data_dir) and path.is_file():
+                    resolved = path.resolve()
+                    if resolved not in protected:
+                        protected.add(resolved)
+                        pending.append(resolved)
+    return protected
+
+
+def _report_archive_candidates(
+    data_dir: Path, *, now: datetime, min_age_hours: float,
+) -> list[CleanupCandidate]:
+    protected = _referenced_report_paths(data_dir)
+    if protected is None:
+        return []
+    candidates = []
+    for name, pattern in REPORT_ARCHIVES.items():
+        directory = data_dir / name
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        reports = sorted(
+            (path for path in directory.glob(pattern) if _is_safe_file(path, data_dir)),
+            key=lambda path: (path.stat().st_mtime, path.name),
+            reverse=True,
+        )
+        for path in reports[MINIMUM_REPORT_ARCHIVES:]:
+            if path.resolve() in protected:
+                continue
+            item = _candidate(
+                path,
+                data_dir=data_dir,
+                now=now,
+                min_age_hours=max(min_age_hours, REPORT_RETENTION_HOURS),
+                reason="expired_generated_report",
+            )
+            if item is not None:
+                candidates.append(item)
+    return candidates
+
+
 def plan_cleanup(
     data_dir: Path = DEFAULT_DATA_DIR,
     *,
@@ -151,6 +232,11 @@ def plan_cleanup(
         if item is not None:
             candidates.append(item)
 
+    candidates.extend(
+        _report_archive_candidates(
+            resolved_data_dir, now=current_time, min_age_hours=min_age_hours,
+        )
+    )
     return sorted(candidates, key=lambda item: item.size_bytes, reverse=True)
 
 
@@ -175,6 +261,13 @@ def cleanup_runtime_artifacts(
         for item in candidates:
             path = Path(item.path)
             if not _is_safe_file(path, resolved_data_dir):
+                continue
+            if path.stat().st_size != item.size_bytes or _age_hours(
+                path, (now or datetime.now(UTC)).astimezone(UTC),
+            ) < max(
+                min_age_hours,
+                REPORT_RETENTION_HOURS if item.reason == "expired_generated_report" else 0,
+            ):
                 continue
             os.remove(path)
             deleted_count += 1

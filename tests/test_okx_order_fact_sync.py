@@ -2023,12 +2023,28 @@ async def test_recovery_order_id_backfills_okx_only_fill_before_account_history(
         assert "fills_account" not in ccxt.calls
         assert "recovery_order_facts_persisted" in report["completed_stages"]
         assert report["backfilled_count"] == 1
+        assert report["status"] == "ok"
+        assert report["deferred_stages"] == []
+        assert report["recovery_order_ids_pending"] == []
+        assert "priority_queue_complete" in report["completed_stages"]
         assert order.exchange_order_id == recovery_order_id
         assert order.model_name == "okx_authoritative_sync"
         assert order.decision_id is None
         assert order.okx_raw_fills["contract_size_verified"] is True
     finally:
         await close_db()
+
+
+def test_order_fact_sync_keeps_all_explicit_recovery_ids() -> None:
+    order_ids = [f"recovery-{index}" for index in range(9)]
+
+    service = OkxOrderFactSyncService(
+        mode="paper",
+        priority_only=True,
+        recovery_order_ids=order_ids,
+    )
+
+    assert service.recovery_order_ids == tuple(order_ids)
 
 
 @pytest.mark.asyncio

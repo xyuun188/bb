@@ -1,8 +1,12 @@
+import base64
+import gzip
+import json
 from types import SimpleNamespace
 
 from scripts.audit_authoritative_trade_outcomes import (
     _compact_gap_summary,
     _gap_summary,
+    _online_report,
     _promotion_gate,
     _realized_pnl_sign_counts,
     _slippage_integrity_summary,
@@ -208,3 +212,48 @@ def test_authoritative_audit_gate_contract_requires_complete_trainable_outcomes(
         "authoritative_outcomes_all_incomplete",
         "authoritative_training_samples_missing",
     ]
+
+
+def test_online_audit_decodes_compressed_json_without_ssh_truncation(
+    monkeypatch,
+) -> None:
+    report = {"status": "ok", "summary_only": True}
+    envelope = {
+        "returncode": 0,
+        "stdout_gzip_b64": base64.b64encode(
+            gzip.compress(json.dumps(report).encode("utf-8"))
+        ).decode("ascii"),
+        "stderr": "",
+    }
+    calls = {}
+
+    class FakeSSH:
+        def close(self) -> None:
+            calls["closed"] = True
+
+    def fake_run_remote_text(_ssh, command, **kwargs):
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+        return json.dumps(envelope)
+
+    monkeypatch.setattr(
+        "scripts.audit_authoritative_trade_outcomes.connect_remote_ssh",
+        lambda *_args, **_kwargs: FakeSSH(),
+    )
+    monkeypatch.setattr(
+        "scripts.audit_authoritative_trade_outcomes.run_remote_text",
+        fake_run_remote_text,
+    )
+    monkeypatch.setattr(
+        "scripts.audit_authoritative_trade_outcomes.safe_print",
+        lambda value: calls.setdefault("printed", value),
+    )
+
+    result = _online_report(mode="paper", position_id=None, summary_only=False)
+
+    assert result == report
+    assert calls["printed"] == json.dumps(report)
+    assert calls["closed"] is True
+    assert calls["kwargs"]["max_output_chars"] == 200_000
+    assert "stdout_gzip_b64" in calls["command"]
+    assert "--summary-only" in calls["command"]

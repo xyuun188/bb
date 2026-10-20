@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import gzip
 import json
 import shlex
 import sys
@@ -15,8 +17,12 @@ from sqlalchemy import select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.remote_ssh import connect_remote_ssh, run_remote_text
-from core.safe_output import safe_print
+from core.remote_ssh import (
+    MAX_REMOTE_OUTPUT_TEXT_LIMIT,
+    connect_remote_ssh,
+    run_remote_text,
+)
+from core.safe_output import safe_error_text, safe_print
 from db.session import get_read_session_ctx
 from models.learning import ExpertMemory
 from models.trade import Order
@@ -496,13 +502,31 @@ def _online_report(
     ]
     if position_id is not None:
         remote_args.extend(("--position-id", str(position_id)))
-    if summary_only:
+    # A global online audit is a health check; its 500 full training records
+    # exceed the bounded SSH transport. Position-targeted online audits retain
+    # full evidence, while global online calls use the compact report.
+    if summary_only or position_id is None:
         remote_args.append("--summary-only")
+    remote_runner = "\n".join(
+        (
+            "import base64, gzip, json, subprocess, sys",
+            "result = subprocess.run(sys.argv[1:], capture_output=True)",
+            "payload = {",
+            '    "returncode": result.returncode,',
+            '    "stdout_gzip_b64": base64.b64encode(gzip.compress(result.stdout)).decode("ascii"),',
+            '    "stderr": result.stderr.decode("utf-8", errors="replace"),',
+            "}",
+            "print(json.dumps(payload, separators=(',', ':')))",
+        )
+    )
     app_script = "\n".join(
         (
             "cd /data/bb/app",
             "export DATABASE_URL='postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql'",
-            "exec " + " ".join(shlex.quote(value) for value in remote_args),
+            "exec .venv/bin/python -c "
+            + shlex.quote(remote_runner)
+            + " "
+            + " ".join(shlex.quote(value) for value in remote_args),
         )
     )
     ssh = connect_remote_ssh(root, timeout=20)
@@ -512,14 +536,27 @@ def _online_report(
             "runuser -u bb -- /bin/bash -lc " + shlex.quote(app_script),
             timeout=180,
             check=False,
+            max_output_chars=MAX_REMOTE_OUTPUT_TEXT_LIMIT,
         )
     finally:
         ssh.close()
-    safe_print(output)
+    if "truncated at " in output:
+        raise SystemExit(
+            "online outcome audit transport exceeded its output limit; "
+            "use --summary-only or --position-id"
+        )
     try:
-        report = json.loads(output)
-    except json.JSONDecodeError as exc:
-        raise SystemExit("online outcome audit did not return JSON") from exc
+        envelope = json.loads(output)
+        report_text = gzip.decompress(
+            base64.b64decode(envelope["stdout_gzip_b64"], validate=True)
+        ).decode("utf-8")
+        report = json.loads(report_text)
+    except (KeyError, TypeError, ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("online outcome audit response was invalid or incomplete") from exc
+    if int(envelope.get("returncode") or 0) != 0 and not report:
+        error = safe_error_text(envelope.get("stderr") or "remote audit failed", limit=240)
+        raise SystemExit(f"online outcome audit failed: {error}")
+    safe_print(report_text)
     return report
 
 

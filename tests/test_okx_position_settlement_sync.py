@@ -1077,6 +1077,86 @@ async def test_all_terminal_fragments_recover_when_official_evidence_is_complete
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_gap", ["", "entry_quantity", "close_pnl", "position_link"])
+async def test_single_old_terminal_recovers_only_with_complete_lifecycle_evidence(
+    tmp_path, monkeypatch, evidence_gap,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "single-terminal-recovery.db")
+    now = datetime.now(UTC)
+    closed_at = now - timedelta(days=5)
+    try:
+        position_id = await _seed_closed_position(
+            closed_at, settlement_status=SETTLEMENT_STATUS_UNRESOLVED,
+            settlement_raw={"lifecycle_recovery": {"source": "authoritative_history"}},
+        )
+        async with get_session_ctx() as session:
+            for order_id, contracts, fee, pnl in (
+                ("entry-1", 90.0 if evidence_gap == "entry_quantity" else 100.0, 0.05, 0.0),
+                ("close-1", 100.0, 0.05, None if evidence_gap == "close_pnl" else 4.1),
+            ):
+                session.add(Order(
+                    model_name="rule_strategy", execution_mode="paper",
+                    symbol="ADA/USDT", side="buy" if order_id == "entry-1" else "sell",
+                    order_type="market", quantity=contracts, price=0.6,
+                    status="filled", fee=fee, okx_fill_contracts=contracts,
+                    okx_fill_pnl=pnl, exchange_order_id=order_id,
+                    filled_at=closed_at - timedelta(minutes=20) if order_id == "entry-1" else closed_at,
+                ))
+            await upsert_okx_position_history_row(
+                session,
+                {
+                    "instId": "ADA-USDT-SWAP", "posId": "ada-pos-1", "posSide": "long",
+                    "type": "2", "cTime": _ms(closed_at - timedelta(minutes=20)),
+                    "uTime": _ms(closed_at), "openMaxPos": "100", "closeTotalPos": "100",
+                    "realizedPnl": "4.0", "pnl": "4.1", "fee": "-0.1", "fundingFee": "0",
+                },
+                mode="paper", source="okx_settlement_fact_mirror",
+                match_status="okx_account_position_history", synced_at=now,
+                position_ids=[] if evidence_gap == "position_link" else [position_id],
+            )
+        report = await OkxPositionSettlementSyncService(mode="paper").sync_once()
+        assert report["reconciled_count"] == (0 if evidence_gap else 1)
+        async with get_session_ctx() as session:
+            position = await session.get(Position, position_id)
+            assert position.settlement_status == (
+                SETTLEMENT_STATUS_UNRESOLVED if evidence_gap else "reconciled"
+            )
+            assert position.realized_pnl == pytest.approx(0.0 if evidence_gap else 4.0)
+            assert position.settlement_raw["lifecycle_recovery"]["source"] == "authoritative_history"
+        assert (await OkxPositionSettlementSyncService(mode="paper").sync_once())[
+            "reconciled_count"
+        ] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_due_lifecycle_loads_terminal_and_final_fragments_outside_recent_window(
+    tmp_path, monkeypatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "cross-window-fragments.db")
+    now = datetime.now(UTC)
+    try:
+        ids = [
+            await _seed_closed_position(
+                now - timedelta(days=days), settlement_status=status,
+            )
+            for days, status in (
+                (5, SETTLEMENT_STATUS_UNRESOLVED), (4, "reconciled"), (0, "settling"),
+            )
+        ]
+        async with get_session_ctx() as session:
+            for index, position_id in enumerate(ids):
+                position = await session.get(Position, position_id)
+                position.close_exchange_order_id = f"close-{index + 1}"
+                position.created_at = now - timedelta(days=6)
+        candidates = await OkxPositionSettlementSyncService(mode="paper")._load_candidates(now)
+        assert {candidate.position_id for candidate in candidates} == set(ids)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("official_contracts", [200.0, 250.0])
 async def test_terminal_fragment_recovers_only_after_official_conservation(
     tmp_path, monkeypatch, official_contracts,
@@ -1086,7 +1166,10 @@ async def test_terminal_fragment_recovers_only_after_official_conservation(
     try:
         terminal_id = await _seed_closed_position(
             now - timedelta(minutes=2), settlement_status=SETTLEMENT_STATUS_UNRESOLVED,
-            settlement_raw={"entry_identity_repair": {"previous_entry_order_ids": "prior-entry"}},
+            settlement_raw={
+                "entry_identity_repair": {"previous_entry_order_ids": "prior-entry"},
+                "lifecycle_recovery": {"source": "authoritative_history"},
+            },
         )
         sibling_id = await _seed_closed_position(now)
         async with get_session_ctx() as session:
@@ -1130,6 +1213,9 @@ async def test_terminal_fragment_recovers_only_after_official_conservation(
             assert terminal.realized_pnl == pytest.approx(2.0 if complete else 0.0)
             assert terminal.settlement_raw["entry_identity_repair"] == {
                 "previous_entry_order_ids": "prior-entry",
+            }
+            assert terminal.settlement_raw["lifecycle_recovery"] == {
+                "source": "authoritative_history",
             }
     finally:
         await close_db()

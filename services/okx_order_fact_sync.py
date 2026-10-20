@@ -136,6 +136,7 @@ class OkxOrderFactSyncSummary:
     completed_stages: tuple[str, ...] = ()
     deferred_stages: tuple[str, ...] = ()
     stage_errors: tuple[str, ...] = ()
+    recovery_order_ids_pending: tuple[str, ...] = ()
     skipped_old_count: int = 0
     error: str | None = None
     samples: tuple[dict[str, Any], ...] = ()
@@ -165,6 +166,7 @@ class OkxOrderFactSyncSummary:
             "completed_stages": list(self.completed_stages),
             "deferred_stages": list(self.deferred_stages),
             "stage_errors": list(self.stage_errors),
+            "recovery_order_ids_pending": list(self.recovery_order_ids_pending),
             "skipped_old_count": self.skipped_old_count,
             "error": self.error,
             "samples": list(self.samples),
@@ -237,7 +239,7 @@ class OkxOrderFactSyncService:
             dict.fromkeys(
                 token for value in recovery_values for token in _split_exchange_order_ids(value)
             )
-        )[:DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC]
+        )
         self.phase3_order_sync_start = _aware_utc(
             phase3_order_sync_start or PHASE3_DEFAULT_ORDER_SYNC_START
         )
@@ -571,6 +573,8 @@ class OkxOrderFactSyncService:
                 if incomplete_ids:
                     deferred_stages.append("target_order_fill_pagination_incomplete")
                 fills = [fill for fill in fills if fill.pagination_complete]
+                if not target_fills_complete:
+                    deferred_stages.append("target_order_fill_query_incomplete")
                 if target_fills_complete:
                     target_fill_order_ids.update(set(priority_target_order_ids) - incomplete_ids)
                 priority_contract_sizes, _ = await run_stage(
@@ -674,8 +678,34 @@ class OkxOrderFactSyncService:
                 missing_priority_ids = sorted(
                     urgent_target_order_ids - {fill.order_id for fill in fills if fill.order_id}
                 )
+                pending_recovery_ids = set(self.recovery_order_ids)
+                if priority_contract_size_deferred_count == 0:
+                    pending_recovery_ids.difference_update(recovery_targeted_fill_ids)
+                priority_deferred_stages: list[str] = []
+                if missing_priority_ids:
+                    priority_deferred_stages.append("priority_fill_not_yet_observed")
+                if priority_contract_size_deferred_count:
+                    priority_deferred_stages.append("order_facts_missing_public_contract_size")
+                if not target_fills_complete:
+                    priority_deferred_stages.append("target_order_fill_query_incomplete")
+                if incomplete_ids:
+                    priority_deferred_stages.append("target_order_fill_pagination_incomplete")
+                if pending_recovery_ids and not priority_contract_size_deferred_count:
+                    priority_deferred_stages.append("recovery_order_ids_remaining")
+                if (
+                    not priority_deferred_stages
+                    and not priority_unverified_count
+                    and not stage_errors
+                ):
+                    completed_stages.append("priority_queue_complete")
                 return OkxOrderFactSyncSummary(
-                    status=("warning" if priority_unverified_count else "deferred"),
+                    status=(
+                        "warning"
+                        if priority_unverified_count or stage_errors
+                        else "deferred"
+                        if priority_deferred_stages
+                        else "ok"
+                    ),
                     mode=self.mode,
                     source="okx_native_order_priority_sync",
                     phase3_order_sync_start=since,
@@ -691,17 +721,24 @@ class OkxOrderFactSyncService:
                         missing_closed_position_recovered_count
                     ),
                     completed_stages=tuple(completed_stages),
-                    deferred_stages=("priority_fill_not_yet_observed",),
+                    deferred_stages=tuple(priority_deferred_stages),
                     stage_errors=tuple(stage_errors),
+                    recovery_order_ids_pending=tuple(sorted(pending_recovery_ids)),
                     skipped_old_count=priority_skipped_old_count,
                     samples=tuple(
                         [
                             *priority_samples,
-                            {
-                                "kind": "priority_fill_not_yet_observed",
-                                "mode": self.mode,
-                                "exchange_order_ids": missing_priority_ids[:4],
-                            },
+                            *(
+                                [
+                                    {
+                                        "kind": "priority_fill_not_yet_observed",
+                                        "mode": self.mode,
+                                        "exchange_order_ids": missing_priority_ids[:4],
+                                    }
+                                ]
+                                if missing_priority_ids
+                                else []
+                            ),
                         ][:8]
                     ),
                 ).as_dict()
@@ -1108,6 +1145,18 @@ class OkxOrderFactSyncService:
             ):
                 await session.flush()
 
+        pending_recovery_order_ids = tuple(
+            sorted(
+                set(self.recovery_order_ids)
+                - {
+                    order_id
+                    for order_id, fill in fills_by_order_id.items()
+                    if _contract_size_for_fill(fill, contract_sizes) > 0
+                }
+            )
+        )
+        if pending_recovery_order_ids:
+            deferred_stages.append("recovery_order_ids_remaining")
         if not okx_pull_available:
             status = "degraded"
         elif unverified_count or stage_errors:
@@ -1137,6 +1186,7 @@ class OkxOrderFactSyncService:
             completed_stages=tuple(completed_stages),
             deferred_stages=tuple(dict.fromkeys(deferred_stages)),
             stage_errors=tuple(stage_errors),
+            recovery_order_ids_pending=pending_recovery_order_ids,
             skipped_old_count=skipped_old_count,
             error=pull_error,
             samples=_diagnostic_samples(samples),
@@ -1232,8 +1282,16 @@ class OkxOrderFactSyncService:
             exit_lineage_recovered_count=exit_lineage_recovered_count,
             missing_closed_position_recovered_count=missing_closed_position_recovered_count,
             completed_stages=tuple(completed_stages),
-            deferred_stages=tuple(dict.fromkeys(deferred_stages)),
+            deferred_stages=tuple(
+                dict.fromkeys(
+                    [
+                        *deferred_stages,
+                        *(["recovery_order_ids_remaining"] if self.recovery_order_ids else []),
+                    ]
+                )
+            ),
             stage_errors=tuple(stage_errors),
+            recovery_order_ids_pending=self.recovery_order_ids,
             error=pull_error,
             samples=_diagnostic_samples(samples),
         ).as_dict()
