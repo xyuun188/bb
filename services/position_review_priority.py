@@ -42,6 +42,8 @@ class PositionReviewPriorityPolicy:
         self,
         position: dict[str, Any],
         feature_vector: Any | None,
+        *,
+        position_fragments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         side = str(position.get("side") or "").lower()
         if side not in {"long", "short"}:
@@ -53,16 +55,30 @@ class PositionReviewPriorityPolicy:
         )
         if feature_price > 0.0:
             snapshot["current_price"] = feature_price
+        # The display aggregate omits fee, management, and confirmed-exit facts.
+        assessment_positions = [
+            dict(item)
+            for item in (position_fragments or [snapshot])
+            if isinstance(item, dict)
+        ]
+        if not assessment_positions:
+            assessment_positions = [snapshot]
+        for item in assessment_positions:
+            if not item.get("symbol"):
+                item["symbol"] = snapshot.get("symbol")
+            if feature_price > 0.0:
+                item["current_price"] = feature_price
         peak_key = self.position_peak_key(
             str(position.get("model_name") or ""),
             str(position.get("symbol") or ""),
             side,
         )
         peak_state = _safe_dict(self.position_peaks_provider().get(peak_key, {}))
-        snapshot["peak_unrealized_pnl"] = _safe_float(
+        peak_unrealized_pnl = _safe_float(
             peak_state.get("peak_unrealized_pnl"),
             _safe_float(position.get("peak_unrealized_pnl"), 0.0),
         )
+        assessment_positions[0]["peak_unrealized_pnl"] = peak_unrealized_pnl
         returns = [
             _safe_float(
                 getattr(feature_vector, name, 0.0) if feature_vector is not None else 0.0,
@@ -87,7 +103,7 @@ class PositionReviewPriorityPolicy:
             raw_response={
                 "close_evidence": {
                     "continuation_deteriorated": adverse,
-                    "peak_unrealized_pnl_usdt": snapshot["peak_unrealized_pnl"],
+                    "peak_unrealized_pnl_usdt": peak_unrealized_pnl,
                 }
             },
             feature_snapshot=(
@@ -97,7 +113,7 @@ class PositionReviewPriorityPolicy:
                 else {}
             ),
         )
-        return assess_dynamic_exit(decision, [snapshot]).to_dict()
+        return assess_dynamic_exit(decision, assessment_positions).to_dict()
 
     def scan_groups(
         self,
@@ -123,7 +139,11 @@ class PositionReviewPriorityPolicy:
             for side, side_positions in by_side.items():
                 aggregate = aggregate_position_group(side_positions, key[0], normalized or symbol, side)
                 if aggregate:
-                    assessment = self._assessment(aggregate, feature)
+                    assessment = self._assessment(
+                        aggregate,
+                        feature,
+                        position_fragments=side_positions,
+                    )
                     if assessment:
                         assessments.append(assessment)
 

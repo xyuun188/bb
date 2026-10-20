@@ -56,6 +56,7 @@ class PositionReviewBatchPolicy:
         cursor: int = 0,
     ) -> PositionReviewBatchSelection:
         del position_entry_pause_reason
+        defer_count_provider = defer_count_provider or (lambda _key: 0)
         sorted_items = sorted(
             grouped_items,
             key=lambda item: (-self._close_fraction(fast_scan.get(item[0], {})), item[0][1]),
@@ -65,6 +66,18 @@ class PositionReviewBatchPolicy:
         urgent_items = [
             item for item in sorted_items if self.urgent_exit_checker(fast_scan.get(item[0], {}))
         ]
+        # A hard capacity cap must not review the same alphabetical tie forever.
+        urgent_items.sort(
+            key=lambda item: (
+                not bool(
+                    fast_scan.get(item[0], {}).get("dynamic_exit_hard_risk")
+                    or self._dynamic(fast_scan.get(item[0], {})).get("hard_risk")
+                ),
+                -max(defer_count_provider(item[0]), 0),
+                -self._close_fraction(fast_scan.get(item[0], {})),
+                item[0][1],
+            )
+        )
         if urgent_items:
             max_groups = max(
                 max_groups,
@@ -86,7 +99,6 @@ class PositionReviewBatchPolicy:
             selected_keys = {item[0] for item in selected_items}
 
         skipped_items = [item for item in sorted_items if item[0] not in selected_keys]
-        defer_count_provider = defer_count_provider or (lambda _key: 0)
         deferred_exit_count = sum(1 for item in urgent_items if defer_count_provider(item[0]) > 0)
         loss_watch_count = sum(
             1 for item in urgent_items if self._fee_after_pnl(fast_scan.get(item[0], {})) < 0.0
