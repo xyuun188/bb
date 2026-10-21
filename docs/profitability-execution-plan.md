@@ -251,3 +251,104 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   then expand only if those fields can establish availability. Keep the
   original snapshot/cutoff immutable; do not rerun the completed audit
   unchanged or inspect a new exam. G2 remains blocked by timing evidence.
+
+## Original-Clock Audit Batch
+
+- Cost provenance repair and G1/G2 source audits committed/pushed as
+  `c8d42e8`; unrelated staged/unstaged paths preserved.
+- Deterministic 12-row discovery found original `raw_llm_response.timing`
+  and a matching compact timing copy. These clocks can be checked directly;
+  scheduling timestamps need not be substituted for original completion.
+  Some original feature payloads are missing and book reception clocks are
+  absent. Feature-vector construction time is not individual technical/news
+  input availability. Discovery did not read return labels or place orders.
+- New `scripts/audit_development_timing.py` selects only timing/identity JSON
+  projections for exact frozen IDs, checks original/compact conflicts,
+  feature and cost clock consistency, and reports missing component clocks.
+  It never accepts complete lineage merely because construction preceded
+  completion. Focused audits/provenance tests: 39 passed; Ruff passed.
+- Preregistered operation: original snapshot SHA256/cutoff unchanged;
+  `--max-rows 10000`, 200-row pages, one read-only DB connection,
+  15-second statements, one CPU, 1 GiB, 300-second systemd deadline.
+  No database return-value fields or new exam labels are selected.
+  Output: `data/profitability_remediation/development-timing-frozen-v1.json`.
+  Remote unit/report names include the audit dependency fingerprint;
+  cached complete reports are reused and active duplicate units rejected.
+- Before execution: targeted script/test upload, remote hash check and
+  focused tests, no service restart. Recovery: inspect named unit/report
+  before retrying. Then record full coverage and precise remaining lineage
+  gaps, and specify the bounded repair/collection required by those gaps.
+- Timing v1 completed `2026-10-21T18:45:37.773789Z`: all 9,191 IDs found,
+  all original recorded clocks recovered with consistent compact copies,
+  and all feature construction times precede recorded completion. Original
+  feature clocks are absent for 1,267 rows. The 789 historical rows retain
+  bar-close availability defects. This supersedes the blanket "all decision
+  clocks unresolved" observation, not the G2 component-lineage blocker.
+  v1 dependency identity:
+  `00b7f4dd6fec2e5c327b82853817880601d16cd6ccfca39f2783e9abc8354ad4`.
+  Timing evidence:
+  `3bc098b27c360d01256067959fc8caf153dbcad8ee1f76773e03a4364ebdd168`.
+- Follow-up found OKX funding clocks are numeric millisecond strings; v1's
+  parser incorrectly reported these as missing. v2 reuses the runtime
+  timestamp parser, checks overwritten fee values as well as clocks, and
+  reads compact contract observation windows when wide payloads are absent.
+  Do not use v1's funding-missing counts as evidence.
+- Confirmed code defect: shadow settlement overwrote decision-time fee facts
+  with the account fee observation obtained at settlement. Discovery showed
+  later clocks with equal numerical rates; this is a provenance failure,
+  not proof that every historical numerical fee was wrong.
+  Repair preserves decision-time fields and records a bounded separate
+  `shadow_settlement_cost_observation`, explicitly not a decision feature.
+  Missing original fees stay incomplete/quarantined instead of being filled.
+  Local expanded suite: 237 passed; owned-file Ruff passed.
+- v2 operation keeps the same immutable IDs/cutoff and resource budget,
+  output `data/profitability_remediation/development-timing-frozen-v2.json`.
+  Backups before staging:
+  `/data/bb/app/data/profitability_remediation/source_backups/20261022T030500-entry-cost-immutability`.
+  Remote shadow service matched the preexisting staged baseline after
+  newline normalization; no unrelated service changes need deployment.
+  New runtime hunk must be committed independently from those staged changes.
+- Timing v2 completed `2026-10-21T19:02:31.296684Z`. All 9,191 original
+  completion clocks are recovered and consistent; construction precedes
+  completion in every row. Original component clocks remain absent in 1,267
+  rows, all 9,191 lack individual technical/sentiment availability evidence,
+  and 789 historical rows remain ineligible for executable-cost training.
+  There are 9,143 shadow/original fee-clock mismatches, 8,346 shadow fee
+  observations after completion and 1,314 fee-value mismatches (including
+  missing original values); do not equate clock contamination with a changed
+  numeric fee in every row. Funding clocks are recovered for 7,924 rows.
+  The other 1,267 are missing; v1's millisecond-string counts are superseded.
+- In 1,699 of 8,402 compact contract windows, the recorded result observation
+  precedes the scheduled label time (maximum 108.964138 seconds). This is
+  a horizon-alignment blocker to investigate, not a causal claim about PnL.
+  No new exam labels or database return values were read.
+  v2 dependency identity:
+  `67a2bc26d83e10179431a143bb9e4c3869d2dc65d562a2e3c740d6db023dda32`.
+  Timing evidence identity:
+  `312c7b0c5eab8cfa6c8a0e58ace74126e19378b0412655f90e629324fe88a5a4`.
+  Remote report:
+  `/data/bb/app/data/profitability_remediation/frozen-timing-r10000-67a2bc26d83e.json`.
+  Local report:
+  `data/profitability_remediation/development-timing-frozen-v2.json`.
+- Targeted four-file upload passed integrity checks and 87 remote tests.
+  Only paper was restarted, at `2026-10-21T19:13:44Z`. Paper/dashboard remain
+  active/running with zero automatic restarts; `/health` returns HTTP 200.
+  Settings loaded from the actual paper-process environment and persisted
+  control both remain `paper`, with zero live-configured models.
+- Bounded rollout discovery read scalar projections for the newest 128
+  shadow IDs, finding 12 rows with separate settlement cost observations.
+  Eight displayed examples preserve both original fee values and clocks;
+  row 610666 preserves decision fee time `2026-10-21T19:10:47.795Z` while
+  settlement observation is `2026-10-21T19:16:28.811Z`. No return labels were
+  inspected. Final verification reselected the newest 128 IDs: all eight
+  new-format rows in that moving bounded window preserve original fee values
+  and clocks and mark settlement observations as nonfeatures, with zero
+  failures. IDs: 610631, 610635, 610639, 610643, 610647, 610651, 610666, 610691.
+  Verification evidence:
+  `a071b1b7117dfcb0f84e2d4d9e07d3cc2e5cd2478f901b198d9a4ff5ab2013ec`.
+  This is data integrity evidence, not profitability.
+- Next exact action: isolate this runtime/test hunk plus timing
+  audit/checkpoint in Git, preserving previous
+  staged queue/historical changes. Then investigate result-window alignment
+  and implement verifiable component-availability collection. G2 stays
+  incomplete, and no frozen candidate or independent profitable exam exists.

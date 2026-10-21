@@ -26,7 +26,7 @@ from core.training_contracts import (
 )
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
-from services.execution_cost_model import execution_cost_estimate
+from services.execution_cost_model import EXECUTION_COST_FACT_FIELDS, execution_cost_estimate
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
@@ -1100,8 +1100,16 @@ class ShadowBacktestService:
                         compact_market_fact_contract(market_contract)
                     )
                 current_cost_facts = execution_cost_facts.get(execution_mode, {})
-                if _safe_shadow_number(current_cost_facts.get("taker_fee_rate")):
-                    feature_snapshot.update(current_cost_facts)
+                if current_cost_facts:
+                    # Settlement observations must not become decision-time inputs.
+                    feature_snapshot["shadow_settlement_cost_observation"] = {
+                        key: current_cost_facts[key]
+                        for key in EXECUTION_COST_FACT_FIELDS
+                        if key in current_cost_facts
+                    } | {
+                        "version": "2026-10-22.immutable-shadow-entry-cost.v1",
+                        "used_as_decision_time_features": False,
+                    }
                 row.feature_snapshot = feature_snapshot
 
                 long_return = (actual_price - entry_price) / entry_price

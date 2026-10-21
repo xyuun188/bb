@@ -523,7 +523,9 @@ async def test_shadow_backtest_records_fee_after_training_label_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_due_shadow_fetches_current_account_fee_once_per_mode(
+@pytest.mark.parametrize("entry_fee", [None, 0.0004])
+async def test_due_shadow_observes_current_fee_without_replacing_decision_facts(
+    entry_fee: float | None,
 ) -> None:
     repo = _FakeRepo()
     repo.due_rows = [
@@ -549,6 +551,13 @@ async def test_due_shadow_fetches_current_account_fee_once_per_mode(
             },
         )
     ]
+    original_observed_at = "2026-07-13T07:50:00+00:00"
+    if entry_fee is not None:
+        repo.due_rows[0].feature_snapshot.update({
+            "taker_fee_rate": entry_fee,
+            "fee_rate_source": "original_account_trade_fee",
+            "fee_rate_observed_at": original_observed_at,
+        })
     calls: list[str] = []
 
     async def fee_facts(mode: str) -> dict[str, Any]:
@@ -568,13 +577,24 @@ async def test_due_shadow_fetches_current_account_fee_once_per_mode(
     ).update_due()
 
     assert calls == ["paper"]
-    assert repo.due_rows[0].feature_snapshot["taker_fee_rate"] == pytest.approx(0.0005)
-    assert repo.due_rows[0].feature_snapshot["fee_rate_source"] == (
-        "okx_account_trade_fee.takerU"
-    )
-    assert repo.due_rows[0].feature_snapshot["training_label_contract"][
-        "fee_after_complete"
-    ] is True
+    snapshot = repo.due_rows[0].feature_snapshot
+    settlement = snapshot["shadow_settlement_cost_observation"]
+    assert settlement["taker_fee_rate"] == pytest.approx(0.0005)
+    assert settlement["fee_rate_observed_at"] == "2026-07-13T08:00:00+00:00"
+    assert settlement["used_as_decision_time_features"] is False
+    if entry_fee is None:
+        assert "taker_fee_rate" not in snapshot
+        assert "fee_rate_observed_at" not in snapshot
+        assert snapshot["training_label_contract"].get("fee_after_complete") is not True
+        assert repo.due_rows[0].status == "quarantined"
+        assert "cost_incomplete:fee_rate_missing" in repo.due_rows[0].note
+    else:
+        assert snapshot["taker_fee_rate"] == pytest.approx(entry_fee)
+        assert snapshot["fee_rate_source"] == "original_account_trade_fee"
+        assert snapshot["fee_rate_observed_at"] == original_observed_at
+        assert "entry_fee_rate" not in snapshot
+        assert "exit_fee_rate" not in snapshot
+        assert snapshot["training_label_contract"]["fee_after_complete"] is True
 
 
 @pytest.mark.asyncio
