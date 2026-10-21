@@ -21,6 +21,23 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def execution_cost_provenance_blocker(snapshot: dict[str, Any]) -> str:
+    """Explicit market-only provenance overrides copied microstructure numbers."""
+
+    if snapshot.get("historical_market_path_only") is True:
+        return "historical_market_path_has_no_executable_cost_evidence"
+    for key in ("training_market_fact_contract", "market_fact_contract"):
+        contract = _safe_dict(snapshot.get(key))
+        assertions = _safe_dict(contract.get("assertions"))
+        if (
+            contract.get("status") == "historical_ohlcv_only"
+            or contract.get("executable_market_fact_verified") is False
+            or assertions.get("executable_market_fact_verified") is False
+        ):
+            return "market_fact_not_executable"
+    return ""
+
+
 def attach_execution_cost_facts(feature_vector: Any, facts: dict[str, Any] | None) -> Any:
     """Attach account fee facts to one live market snapshot without guessing values."""
 
@@ -281,11 +298,16 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
     order_notional = max(_safe_float(snapshot.get("planned_order_notional_usdt"), 0.0), 0.0)
     order_size_complete = order_notional > 0 and round_trip_impact_ready
     base_eligible = bool(spread_source != "missing" and spread_pct > 0 and fee_pct > 0)
+    provenance_blocker = execution_cost_provenance_blocker(snapshot)
     production_eligible = bool(
-        base_eligible and (order_notional <= 0 or order_size_complete)
+        not provenance_blocker
+        and base_eligible
+        and (order_notional <= 0 or order_size_complete)
     )
     failure_reason = (
-        "fee_rate_missing"
+        provenance_blocker
+        if provenance_blocker
+        else "fee_rate_missing"
         if fee_pct <= 0
         else "live_spread_missing"
         if spread_source == "missing" or spread_pct <= 0
@@ -332,6 +354,8 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
             if order_size_complete and production_eligible
             else "pre_sizing_live_spread_depth_imbalance"
             if production_eligible
+            else "observation_only_nonexecutable_market_fact"
+            if provenance_blocker
             else "observation_only_missing_live_spread"
         ),
         production_eligible=production_eligible,
@@ -351,7 +375,7 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
                 + max(int(_safe_float(impact.get("book_levels_consumed"), 0.0)), 0)
             ),
             "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-10-12.round-trip-order-size-execution-cost.v3",
+            "strategy_version": "2026-10-22.round-trip-executable-provenance.v4",
             "execution_mode": snapshot.get("execution_mode"),
             "entry_slippage_pct": (
                 impact.get("execution_slippage_pct") if round_trip_impact_ready else None
