@@ -39,6 +39,7 @@ def _support(
         "selected_side": side,
         "prediction_horizon_minutes": 30.0,
         "expected_net_return_pct": expected_net,
+        "raw_expected_return_pct": expected_net + 0.1,
         "objective_net_return_pct": (
             expected_net - 0.1 if objective_net is None else objective_net
         ),
@@ -172,6 +173,35 @@ def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized
     assert normal_paper_trade_contract_reasons(reconciled) == []
 
 
+def test_reconcile_cannot_restore_entry_after_historical_quality_permission_is_denied() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=0.1),
+    )
+    contract["quant_quality_permissions"]["local_ml"][
+        "paper_execution_permission"
+    ] = False
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+            "execution_cost": {"total_pct": 0.19},
+        },
+    )
+
+    assert reconciled["authorized"] is False
+    assert "normal_paper_trade_quality_permission_not_profit_validated" in (
+        normal_paper_trade_contract_reasons(reconciled)
+    )
+
+
 def test_positive_net_direction_builds_normal_policy_trade() -> None:
     selection = select_normal_paper_trade_side(
         {"long": _support("long", expected_net=0.2)}
@@ -274,7 +304,7 @@ def test_positive_direction_without_quality_permission_cannot_authorize_order() 
     ) == {}
 
 
-def test_current_positive_edge_can_override_historical_quality_permission() -> None:
+def test_current_positive_edge_with_denied_historical_quality_is_training_only() -> None:
     support = _support("long", expected_net=0.2)
     support["quant_quality_permissions"]["local_ml"]["paper_execution_permission"] = False
 
@@ -286,10 +316,112 @@ def test_current_positive_edge_can_override_historical_quality_permission() -> N
         direction_support=selection["selected_support"],
     )
 
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert contract["authorized"] is False
+    assert contract["paper_training_only"] is True
+    assert "normal_paper_trade_quality_observation_shadow_only" in (
+        normal_paper_trade_contract_reasons(contract)
+    )
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
+
+
+def test_strategy_entry_contract_cannot_bypass_denied_historical_quality() -> None:
+    support = _support("long", expected_net=0.2)
+    support["quant_quality_permissions"]["local_ml"]["paper_execution_permission"] = False
+
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sample_count", 0),
+        ("sample_count", float("nan")),
+        ("average_return", 0.0),
+        ("average_return", -0.01),
+        ("average_return", None),
+        ("return_lcb", 0.0),
+        ("return_lcb", -0.1),
+        ("return_lcb", None),
+        ("profit_factor", 1.0),
+        ("profit_factor", 0.9),
+        ("profit_factor", float("inf")),
+        ("profit_factor", "invalid"),
+        ("profit_factor_above_break_even", False),
+        ("profit_factor_above_break_even", None),
+    ],
+)
+def test_positive_permission_cannot_override_invalid_fee_after_evidence(
+    field: str,
+    value: object,
+) -> None:
+    support = _support("long", expected_net=0.2)
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    )
+    permission = support["quant_quality_permissions"]["local_ml"]
+    permission["paper_execution_evidence"][field] = value
+
+    selection = select_normal_paper_trade_side({"long": support})
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    ) == {}
+
+    contract["quant_quality_permissions"]["local_ml"] = permission
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    assert "normal_paper_trade_quality_permission_not_profit_validated" in (
+        normal_paper_trade_contract_reasons(contract)
+    )
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {"expected_net_return_pct": 0.2, "return_lcb_pct": -0.1},
+    )
+    assert reconciled["authorized"] is False
+
+
+def test_all_winning_historical_evidence_does_not_require_a_finite_profit_factor() -> None:
+    support = _support("long", expected_net=0.2)
+    permission = support["quant_quality_permissions"]["local_ml"]
+    permission["paper_execution_evidence"]["profit_factor"] = None
+    permission["break_even_contract"]["additional_diagnostic"] = True
+
+    selection = select_normal_paper_trade_side({"long": support})
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+
     assert selection["selection_reason"] == "strategy_edge_selected"
     assert contract["authorized"] is True
-    assert contract["paper_quality_observation_only"] is False
     assert normal_paper_trade_contract_reasons(contract) == []
+
+
+def test_malformed_quality_source_cannot_be_filtered_into_entry_permission() -> None:
+    support = _support("long", expected_net=0.2)
+    support["quant_quality_permissions"]["unverified_source"] = None
+
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    ) == {}
 
 
 def test_historical_quality_permission_cannot_replace_invalid_current_edge() -> None:
@@ -317,7 +449,7 @@ def test_unpromoted_quality_model_stays_shadow_only() -> None:
     assert selection["selection_reason"] == "no_direction"
 
 
-def test_current_positive_fee_after_mean_with_negative_downside_authorizes_entry() -> None:
+def test_current_positive_fee_after_mean_with_negative_downside_stays_training_only() -> None:
     support = _quality_observation_support(
         "short",
         expected_net=0.08,
@@ -329,7 +461,7 @@ def test_current_positive_fee_after_mean_with_negative_downside_authorizes_entry
     selection = select_normal_paper_trade_side({"short": support})
 
     assert selection["selected"] is True
-    assert selection["selection_reason"] == "strategy_edge_selected"
+    assert selection["selection_reason"] == "paper_training_entry"
 
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
@@ -337,13 +469,14 @@ def test_current_positive_fee_after_mean_with_negative_downside_authorizes_entry
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is True
+    assert contract["authorized"] is False
     assert contract["current_edge_validated"] is True
     assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
-def test_current_positive_signal_with_negative_lcb_and_denied_history_authorizes_entry() -> None:
+def test_current_positive_signal_with_negative_downside_and_denied_history_is_shadow_only() -> None:
     support = _support(
         "short",
         expected_net=0.08,
@@ -358,19 +491,20 @@ def test_current_positive_signal_with_negative_lcb_and_denied_history_authorizes
     selection = select_normal_paper_trade_side({"short": support})
 
     assert selection["selected"] is True
-    assert selection["selection_reason"] == "strategy_edge_selected"
+    assert selection["selection_reason"] == "paper_training_entry"
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side=selection["selected_side"],
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is True
+    assert contract["authorized"] is False
     assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
-def test_current_positive_edge_does_not_require_historical_expert_promotion() -> None:
+def test_current_positive_edge_does_not_override_denied_quality_permission() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.12,
@@ -384,7 +518,7 @@ def test_current_positive_edge_does_not_require_historical_expert_promotion() ->
     selection = select_normal_paper_trade_side({"long": support})
 
     assert selection["selected"] is True
-    assert selection["selection_reason"] == "strategy_edge_selected"
+    assert selection["selection_reason"] == "paper_training_entry"
 
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
@@ -392,8 +526,9 @@ def test_current_positive_edge_does_not_require_historical_expert_promotion() ->
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is True
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert contract["authorized"] is False
+    assert normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
 def test_negative_lcb_quality_observation_cannot_authorize_a_paper_entry() -> None:
@@ -609,6 +744,34 @@ def test_legacy_v4_contract_is_removed_before_new_entry_authorization() -> None:
         }
     )
 
+    assert ensure_normal_paper_trade_contract(decision, "paper") == {}
+    assert "normal_paper_trade" not in decision.raw_response
+
+
+def test_v19_entry_can_settle_but_cannot_be_retried_as_a_new_order() -> None:
+    support = _support("short", expected_net=0.2, objective_net=-0.3)
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="short",
+        selection_reason="strategy_edge_selected",
+        direction_support=support,
+    )
+    contract["version"] = "2026-10-21.normal-paper-strategy-trade.v19"
+    contract["quant_quality_permissions"]["local_ml"]["paper_execution_permission"] = False
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    decision = _decision(
+        {
+            "normal_paper_trade": contract,
+            "paper_trade_selection": {"selection_reason": "strategy_edge_selected"},
+            "independent_direction_support": support,
+        },
+        action=Action.SHORT,
+    )
+
+    assert normal_paper_settlement_contract_reasons(contract) == []
+    assert normal_paper_trade_contract_reasons(contract)
     assert ensure_normal_paper_trade_contract(decision, "paper") == {}
     assert "normal_paper_trade" not in decision.raw_response
 

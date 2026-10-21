@@ -1,7 +1,107 @@
 # Profitability Remediation And Acceptance
 
-Updated 2026-10-21. The account used for this investigation is paper trading.
+Updated 2026-10-22. The account used for this investigation is paper trading.
 No live trading is enabled, and no result below is a promise of profit.
+
+## Latest Remediation: October 22
+
+The ordinary-paper authorization defect is repaired and deployed, but a
+profitable replacement strategy is **not yet qualified**. Do not interpret
+fewer unauthorized entries, passing software tests or positive unrealized PnL
+as proof of profitability.
+
+### Verified Authorization Defect
+
+The deployed v19 policy allowed a positive current modeled net return to
+override a denied historical fee-after quality permission. Executed DOGE
+decision 680868 at October 21 16:02:56 UTC (October 22 00:02:56 Beijing time)
+had modeled net return `+0.05340004%`, but its local-ML historical permission
+was false. Its `authoritative_trade:ml_profit_model` evidence contained 230
+samples, mean `-0.294319 USDT`, lower bound `-0.440138 USDT`, and profit factor
+`0.592868`. These historical metrics use per-trade USDT, not percentages.
+CFX decision 680847 showed the same permission bypass.
+
+Contract `2026-10-21.normal-paper-strategy-trade.v20` now checks historical
+permissions at side selection, contract construction, current-cost
+reconciliation and final entry validation. Every supplied quality source
+must grant execution and contain positive historical fee-after mean and
+lower bound, a positive sample count, and profit-factor-above-break-even
+evidence. Malformed sources cannot be filtered away to manufacture permission.
+A missing profit-factor ratio is allowed for an all-winning history only
+with the producer's explicit above-break-even evidence.
+
+Failed historical quality remains eligible for shadow training where its
+current signal meets the existing training rules; it cannot submit an order.
+A per-trade downside quantile remains sizing stress, not a confidence bound
+on the historical mean. Recognized v19 envelopes can still support settlement
+and protection of existing positions, but cannot authorize new submissions.
+
+### Account And Model Evidence
+
+The read-only OKX account-bill audit at October 21 16:15:48 UTC (October 22
+00:15:48 Beijing time) covered the preceding 24 hours, reached the time
+boundary in two pages and deduplicated 170 bills. Trading bills contained
+realized price PnL `-14.3243872861 USDT` and fees `-6.5054990700 USDT`.
+Funding bills contributed `+0.1042119040 USDT`, giving trading/funding cash
+change `-20.7256744521 USDT`. This includes entry fees and is not a statistic
+of completed round trips or total marked-to-market account return.
+
+At that snapshot there were 18 positions, six long and twelve short. All
+had live exchange-confirmed OCO protection with matching closing direction,
+adequate quantity, and both stop-loss and take-profit triggers. Unrealized
+PnL was `+4.3620589898 USDT`; it was not treated as realized profit.
+Position-history rows include partial lifecycle updates and must not be
+summed as exact 24-hour trading PnL.
+
+The bounded same-window model comparison at October 21 16:19:29 UTC
+(October 22 00:19:29 Beijing time) evaluated 225 clean, mature, cost-complete
+five-minute decision groups shared by current and challenger. Three rows
+were excluded for missing executable order-book levels. The shared decision
+window was 11:12:52-16:11:14 UTC, strictly after the common artifact cutoff
+of 11:09:18 UTC.
+
+| Immutable Artifact | Mean Net Return | Profit Factor | Diagnostic Gate Passes |
+| --- | ---: | ---: | ---: |
+| Current `20260915T123923735471Z-a10583f2` | -0.19259738% | 0.33917223 | 0/225 |
+| Challenger `20261021T110918124657Z-9f094cf0` | -0.08713328% | 0.64132905 | 0/225 |
+
+The input fingerprint is
+`05e36086d8cc899fc113609457b3c2f70a536fa46a52fb00ea663a56e3db4ee0`.
+These are correlated shadow opportunities, not executed portfolio PnL or a
+fresh sealed strategy-selection exam. The diagnostic's distribution gate is
+not the ordinary-paper historical-quality gate. Neither artifact was promoted,
+trained, or used to submit orders by this comparison. A less-negative
+challenger is not a profitable replacement.
+
+### Deployment And Acceptance
+
+The three changed service files were backed up and uploaded individually.
+Remote source hashes match local files; imports and v20 policy flags passed.
+Only paper trading and Dashboard were restarted at October 21 16:21:27 UTC
+(October 22 00:21:27 Beijing time). Dashboard subsequently returned HTTP 200
+with `{"status":"ok"}`; both services were active with zero automatic restarts.
+Live trading remained inactive. No model tunnel, runtime environment, exchange
+account setting or manual order was changed.
+
+The final local worktree passed all 4,770 tests, Ruff on the nine changed
+Python files, and whitespace checks. A read-only remote replay of all 26
+executed entry decisions found in the preceding 24-hour bounded query changed
+each v19-authorized signal into an unauthorized `paper_training_entry`.
+A constructed positive-history/positive-current smoke case still authorized
+an entry without submitting one. This verifies entry gating, not profitability.
+
+At October 21 16:25:04 UTC (October 22 00:25:04 Beijing time), the first 40
+post-restart decisions contained five market decisions: XRP 681014 and ZRO
+681028 were v20 unauthorized training entries, while three had no direction.
+The position loop also executed ADA close-long decision 681005. A DOGE partial
+exit was separately blocked as below the exchange execution minimum. The
+quality fix therefore did not disable existing-position exits; it did not
+establish profitable exits either.
+
+The remaining acceptance criteria in Required Research Order still apply.
+Do not reopen historical-quality-denied execution to increase trade count,
+select a favorable side from this already-inspected comparison, or promote
+the challenger merely because it loses less in this window.
 
 ## Current Conclusion
 

@@ -515,6 +515,7 @@ def trade_execution_policy() -> dict[str, Any]:
     return {
         "optimization_target": PROFIT_TRAINING_TARGET,
         "paper_entry_requires_model_promotion": False,
+        "paper_entry_requires_historical_fee_after_quality_permission": True,
         "paper_normal_entry_requires_positive_return_lcb": False,
         "paper_validated_entry_requires_positive_return_lcb": False,
         "paper_downside_return_is_sizing_stress": True,
@@ -532,7 +533,7 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_training_entry_is_shadow_only": True,
         "paper_training_entry_authorizes_normal_entry": False,
         "paper_training_entry_production_permission": False,
-        "paper_entry_requires_profit_factor": False,
+        "paper_entry_requires_profit_factor": True,
         "paper_entry_requires_positive_expected_net_return": True,
         "paper_entry_requires_current_execution_cost": True,
         "paper_entry_requires_independent_quant_family_count": 1,

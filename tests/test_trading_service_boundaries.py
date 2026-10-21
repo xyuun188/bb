@@ -5659,6 +5659,12 @@ def test_entry_policy_strategy_context_recovers_valid_normal_paper_contract() ->
                             "average_return": 0.2,
                             "return_lcb": 0.1,
                             "profit_factor": 1.5,
+                            "profit_factor_above_break_even": True,
+                        },
+                        "break_even_contract": {
+                            "average_return_above_zero": True,
+                            "return_lcb_above_zero": True,
+                            "profit_factor_above_one": True,
                         },
                     }
                 },
@@ -6103,6 +6109,12 @@ async def test_dynamic_entry_contract_is_ready_before_hard_risk_engine() -> None
                     "average_return": 0.2,
                     "return_lcb": 0.1,
                     "profit_factor": 1.5,
+                    "profit_factor_above_break_even": True,
+                },
+                "break_even_contract": {
+                    "average_return_above_zero": True,
+                    "return_lcb_above_zero": True,
+                    "profit_factor_above_one": True,
                 },
             }
         },

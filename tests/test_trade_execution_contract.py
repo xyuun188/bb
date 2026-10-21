@@ -30,6 +30,7 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     policy = summarize_trade_execution_contract([])["policy"]
 
     assert policy["paper_entry_requires_model_promotion"] is False
+    assert policy["paper_entry_requires_historical_fee_after_quality_permission"] is True
     assert policy["paper_normal_entry_requires_positive_return_lcb"] is False
     assert policy["paper_validated_entry_requires_positive_return_lcb"] is False
     assert policy["paper_downside_return_is_sizing_stress"] is True
@@ -39,7 +40,7 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["paper_quality_observation_allows_non_positive_return_lcb"] is True
     assert policy["paper_quality_observation_authorizes_normal_entry"] is False
     assert policy["paper_quality_observation_is_shadow_only"] is True
-    assert policy["paper_entry_requires_profit_factor"] is False
+    assert policy["paper_entry_requires_profit_factor"] is True
     assert policy["paper_entry_requires_positive_expected_net_return"] is True
     assert policy["paper_entry_requires_independent_quant_family_count"] == 1
     assert policy["paper_direction_concentration_alert_threshold"] == pytest.approx(0.80)
@@ -432,7 +433,18 @@ def _normal_paper_historical_observation_raw() -> dict[str, object]:
             "quant_quality_permissions": {
                 "local_ml": {
                     "paper_execution_permission": True,
-                    "paper_execution_evidence": {"sample_count": 10},
+                    "paper_execution_evidence": {
+                        "sample_count": 10,
+                        "average_return": 0.2,
+                        "return_lcb": 0.1,
+                        "profit_factor": 1.5,
+                        "profit_factor_above_break_even": True,
+                    },
+                    "break_even_contract": {
+                        "average_return_above_zero": True,
+                        "return_lcb_above_zero": True,
+                        "profit_factor_above_one": True,
+                    },
                 }
             },
         },

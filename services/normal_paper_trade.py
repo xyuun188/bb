@@ -11,7 +11,7 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-21.normal-paper-strategy-trade.v19"
+NORMAL_PAPER_TRADE_VERSION = "2026-10-21.normal-paper-strategy-trade.v20"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-20.normal-paper-dynamic-risk.v10"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
@@ -26,6 +26,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-21.normal-paper-strategy-trade.v19",
         "2026-10-20.normal-paper-strategy-trade.v18",
         "2026-10-14.normal-paper-strategy-trade.v17",
         "2026-10-10.normal-paper-strategy-trade.v16",
@@ -79,6 +80,45 @@ def normal_paper_current_return_ready(expected_net: Any, downside_return: Any) -
     expected = _float(expected_net, None)
     downside = _float(downside_return, None)
     return expected is not None and expected > 0.0 and downside is not None
+
+
+def _quality_permissions_ready(value: Any) -> bool:
+    """Require historical fee-after evidence before ordinary paper execution."""
+
+    permissions = _dict(value)
+    if not permissions:
+        return False
+    for source, permission in permissions.items():
+        if not str(source).strip() or not isinstance(permission, dict):
+            return False
+        if permission.get("paper_execution_permission") is not True:
+            return False
+        evidence = _dict(permission.get("paper_execution_evidence"))
+        sample_count = _float(evidence.get("sample_count"), 0.0) or 0.0
+        average_return = _float(evidence.get("average_return"), None)
+        return_lcb = _float(evidence.get("return_lcb"), None)
+        profit_factor = _float(evidence.get("profit_factor"), None)
+        break_even = _dict(permission.get("break_even_contract"))
+        if (
+            sample_count <= 0.0
+            or average_return is None
+            or average_return <= 0.0
+            or return_lcb is None
+            or return_lcb <= 0.0
+            or any(
+                break_even.get(key) is not True
+                for key in (
+                    "average_return_above_zero",
+                    "return_lcb_above_zero",
+                    "profit_factor_above_one",
+                )
+            )
+            or evidence.get("profit_factor_above_break_even") is not True
+            or (evidence.get("profit_factor") is not None and profit_factor is None)
+            or (profit_factor is not None and profit_factor <= 1.0)
+        ):
+            return False
+    return True
 
 
 def _fingerprint(value: Any) -> str:
@@ -429,14 +469,11 @@ def select_normal_paper_trade_side(
         observation_only = support.get("paper_quality_observation_only") is True
         quality_permission_denied = bool(
             quality_permissions
-            and any(
-                permission.get("paper_execution_permission") is not True
-                for permission in quality_permissions.values()
-                if isinstance(permission, dict)
-            )
+            and not _quality_permissions_ready(quality_permissions)
         )
         training_candidate = bool(
             current_edge
+            and quality_permissions
             and expected_net is not None
             and expected_net > 0.0
             and raw_expected is not None
@@ -459,6 +496,9 @@ def select_normal_paper_trade_side(
             <= loss_probability
             <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
             and support.get("strong_expert_opposition") is not True
+            and not training_candidate
+            and not observation_only
+            and _quality_permissions_ready(quality_permissions)
         )
         training_edge = training_candidate and not validated_edge
         if validated_edge or training_edge:
@@ -597,11 +637,10 @@ def build_normal_paper_trade_contract(
     horizon = _float(support.get("prediction_horizon_minutes"), 0.0) or 0.0
     expected_net = _float(support.get("expected_net_return_pct"), None)
     objective_net = _float(support.get("objective_net_return_pct"), None)
+    source_quality_permissions = _dict(support.get("quant_quality_permissions"))
     quality_permissions = {
         str(source): deepcopy(permission)
-        for source, permission in _dict(
-            support.get("quant_quality_permissions")
-        ).items()
+        for source, permission in source_quality_permissions.items()
         if str(source).strip() and isinstance(permission, dict)
     }
     current_edge_signal = support.get("current_edge_validated")
@@ -663,7 +702,13 @@ def build_normal_paper_trade_contract(
         or loss_probability is None
         or not 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         or not quality_permissions
-        or (selection_reason == "strategy_edge_selected" and not current_edge_validated)
+        or (
+            selection_reason == "strategy_edge_selected"
+            and (
+                not current_edge_validated
+                or not _quality_permissions_ready(source_quality_permissions)
+            )
+        )
         or (
             selection_reason == "paper_quality_observation"
             and (
@@ -786,7 +831,7 @@ def reconcile_normal_paper_trade_contract(
     quality_permissions = _dict(contract.get("quant_quality_permissions"))
     ordinary_entry_eligible = bool(
         contract.get("selection_reason") in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
-        and quality_permissions
+        and _quality_permissions_ready(quality_permissions)
         and contract["current_edge_validated"]
         and normal_paper_current_return_ready(expected_net, return_lcb)
     )
@@ -999,6 +1044,14 @@ def _normal_strategy_trade_contract_reasons(
                 and permission.get("paper_execution_permission") is not False
             ):
                 reasons.append("normal_paper_trade_quality_permission_invalid")
+        if (
+            not observation_mode
+            and not training_mode
+            and not _quality_permissions_ready(quality_permissions)
+        ):
+            reasons.append(
+                "normal_paper_trade_quality_permission_not_profit_validated"
+            )
     horizon = _float(contract.get("prediction_horizon_minutes"), 0.0) or 0.0
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):

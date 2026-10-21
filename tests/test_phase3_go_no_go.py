@@ -16,6 +16,7 @@ def _cards() -> list[dict]:
                 "report_available": True,
                 "policy": {
                     "paper_entry_requires_model_promotion": False,
+                    "paper_entry_requires_historical_fee_after_quality_permission": True,
                     "paper_normal_entry_requires_positive_return_lcb": False,
                     "paper_validated_entry_requires_positive_return_lcb": False,
                     "paper_downside_return_is_sizing_stress": True,
@@ -24,7 +25,7 @@ def _cards() -> list[dict]:
                     "paper_quality_observation_allows_non_positive_return_lcb": True,
                     "paper_quality_observation_is_shadow_only": True,
                     "paper_quality_observation_authorizes_normal_entry": False,
-                    "paper_entry_requires_profit_factor": False,
+                    "paper_entry_requires_profit_factor": True,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,
                     "live_entry_requires_production_trade_gate": True,
