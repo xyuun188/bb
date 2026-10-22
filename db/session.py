@@ -25,6 +25,10 @@ from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
+from core.training_feature_snapshot import (
+    TRAINING_FEATURE_SNAPSHOT_VERSION,
+    postgres_training_feature_snapshot_functions,
+)
 from models.base import Base
 
 _engine = None
@@ -1666,36 +1670,20 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
                     "WHERE decision_id IS NOT NULL"
                 )
             )
+        for function_sql in postgres_training_feature_snapshot_functions():
+            await conn.execute(text(function_sql))
         await conn.execute(
             text(
-                """
+                f"""
                 CREATE OR REPLACE FUNCTION bb_sync_shadow_training_feature_snapshot()
                 RETURNS trigger
                 LANGUAGE plpgsql
                 AS $$
-                DECLARE
-                    raw JSONB := COALESCE(NEW.feature_snapshot::JSONB, '{}'::JSONB);
                 BEGIN
-                    NEW.training_feature_snapshot := COALESCE(
-                        (
-                            SELECT jsonb_object_agg(item.key, item.value)
-                            FROM jsonb_each(
-                                CASE WHEN jsonb_typeof(raw) = 'object'
-                                THEN raw ELSE '{}'::JSONB END
-                            ) AS item(key, value)
-                            WHERE jsonb_typeof(item.value) IN ('number', 'boolean', 'null')
-                               OR (
-                                   jsonb_typeof(item.value) = 'string'
-                                   AND length(item.value #>> '{}') <= 512
-                               )
-                               OR (
-                                   jsonb_typeof(item.value) = 'object'
-                                   AND pg_column_size(item.value) <= 2048
-                               )
-                        ),
-                        '{}'::JSONB
+                    NEW.training_feature_snapshot := bb_compact_training_feature_snapshot(
+                        NEW.feature_snapshot::JSONB
                     );
-                    NEW.training_feature_snapshot_version := 1;
+                    NEW.training_feature_snapshot_version := {TRAINING_FEATURE_SNAPSHOT_VERSION};
                     RETURN NEW;
                 END;
                 $$

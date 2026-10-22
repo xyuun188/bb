@@ -25,6 +25,10 @@ from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
+from core.training_feature_snapshot import (
+    FROZEN_TRAINING_FEATURE_KEYS,
+    compact_training_feature_snapshot,
+)
 from db.session import get_read_session_ctx
 from models.account import OkxAccountBill
 from models.decision import AIDecision
@@ -92,7 +96,8 @@ _COMPACT_DECISION_LEARNING_KEYS = (
 # Only these top-level feature facts are consumed by the canonical training
 # projection.  Selecting them as JSON paths avoids detoasting the full
 # feature_snapshot column for every authoritative lifecycle.
-_COMPACT_TRAINING_FEATURE_KEYS = (
+_COMPACT_TRAINING_FEATURE_KEYS = tuple(dict.fromkeys((
+    *FROZEN_TRAINING_FEATURE_KEYS,
     "adx_14",
     "atr_14",
     "atr_pct",
@@ -136,7 +141,7 @@ _COMPACT_TRAINING_FEATURE_KEYS = (
     "training_market_fact_contract",
     "training_label_contract",
     "local_ai_tools_shadow",
-)
+)))
 _compact_outcome_cache: tuple[float, list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_task: asyncio.Task[list[dict[str, Any]]] | None = None
 _compact_outcome_refresh_failed_until = 0.0
@@ -213,11 +218,13 @@ def _decision_feature_projection(row: Any) -> dict[str, Any]:
     """Rebuild the bounded training feature map from labeled JSON paths."""
 
     mapping = row._mapping if hasattr(row, "_mapping") else {}
-    return {
+    projected = {
         key: value
         for key in _COMPACT_TRAINING_FEATURE_KEYS
         if (value := mapping.get(f"feature_{key}")) is not None
+        or mapping.get(f"feature_present_{key}") is True
     }
+    return compact_training_feature_snapshot(projected)
 
 
 def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
@@ -860,6 +867,12 @@ async def load_authoritative_trade_outcomes(
                 decision_columns.extend(
                     AIDecision.feature_snapshot[key].label(f"feature_{key}")
                     for key in _COMPACT_TRAINING_FEATURE_KEYS
+                )
+                decision_columns.extend(
+                    AIDecision.feature_snapshot.op("->")(key).is_not(None).label(
+                        f"feature_present_{key}"
+                    )
+                    for key in FROZEN_TRAINING_FEATURE_KEYS
                 )
             # PostgreSQL can spend minutes detoasting a single large IN query
             # against ``ai_decisions``.  Keep each projection bounded so one

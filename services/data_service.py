@@ -10,6 +10,7 @@ import json
 import math
 import re
 from collections import deque
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -19,6 +20,13 @@ from sqlalchemy import select
 
 from config.settings import settings
 from core.exceptions import WebSocketConnectionError
+from core.feature_availability import (
+    COMPONENT_AVAILABILITY_VERSION,
+    ObservedKlines,
+    availability_fingerprint,
+    availability_timestamp,
+    sentiment_input_availability,
+)
 from core.market_facts import (
     build_market_fact,
     build_market_source_consistency,
@@ -137,6 +145,8 @@ KLINE_PERSIST_TIMEFRAME_LIMITS: dict[str, int] = {
     "1h": 100,
 }
 KLINE_FEATURE_SEQUENCE_LIMIT = 80
+OBSERVED_KLINE_CACHE_MAX_KEYS = 256
+OBSERVED_KLINE_CACHE_MAX_ROWS = 300
 # WebSocket quotes are authoritative in memory. Database ticker rows are a
 # low-priority recovery/history aid and must not receive one write per symbol
 # on every market tick.
@@ -252,6 +262,7 @@ class DataService:
         self._headlines_cache: dict[str, list[str]] = {}
         self._news_items_cache: dict[str, list[dict[str, Any]]] = {}
         self._kline_cache: dict[str, pd.DataFrame] = {}  # symbol:tf -> DataFrame
+        self._observed_klines_cache: dict[tuple[str, str], ObservedKlines] = {}
         self._indicator_snapshot_cache: dict[str, dict[str, Any]] = {}
         self._indicator_snapshot_tasks: dict[str, asyncio.Task] = {}
         self._indicator_cached_read_tasks: dict[str, asyncio.Task] = {}
@@ -600,8 +611,8 @@ class DataService:
             else:
                 social_posts = await self.sentiment_scraper.fetch_all_reddit()
 
-            self._last_articles = articles
-            self._last_social_posts = social_posts
+            self._last_articles = deepcopy(articles)
+            self._last_social_posts = deepcopy(social_posts)
             self._build_sentiment_cache(symbols_to_refresh, articles, social_posts)
             await self._persist_sentiment_samples(articles, social_posts)
 
@@ -639,6 +650,8 @@ class DataService:
         articles: list[dict],
         social_posts: list[dict],
     ) -> None:
+        articles = deepcopy(articles)
+        social_posts = deepcopy(social_posts)
         for symbol in self._normalize_symbols(symbols):
             base = self._symbol_base(symbol)
             symbol_articles = [
@@ -646,6 +659,7 @@ class DataService:
                 for a in articles
                 if self._mentions_symbol(a, base, fields=("symbols_mentioned", "title", "summary"))
             ]
+            contributing_articles = list(symbol_articles)
             symbol_posts = [
                 p
                 for p in social_posts
@@ -663,6 +677,12 @@ class DataService:
                 news_items = [
                     self._news_item_summary(a, base, direct_match=False) for a in articles[:5]
                 ]
+                contributing_articles.extend(
+                    item
+                    for item in articles[:5]
+                    if item.get("title")
+                    and not any(item is existing for existing in contributing_articles)
+                )
             news_scores = [self._weighted_news_score(a) for a in symbol_articles]
             social_scores = [
                 self._safe_score(
@@ -680,8 +700,8 @@ class DataService:
                 ),
                 reverse=True,
             )
-            self._headlines_cache[symbol] = headlines[:20]
-            self._news_items_cache[symbol] = news_items[:20]
+            self._headlines_cache[symbol] = list(headlines[:20])
+            self._news_items_cache[symbol] = deepcopy(news_items[:20])
             direct_items = [item for item in news_items if item.get("direct_match")]
             self._sentiment_cache[symbol] = {
                 "news_sentiment": sum(news_scores) / len(news_scores) if news_scores else 0.0,
@@ -711,6 +731,11 @@ class DataService:
                 ),
                 "direct_news_item_count": len(direct_items),
                 "news_items": news_items[:20],
+                "sentiment_availability": sentiment_input_availability(
+                    contributing_articles,
+                    symbol_posts,
+                    available_at=datetime.now(UTC),
+                ),
             }
 
     def _mentions_symbol(self, item: dict, base: str, fields: tuple[str, ...]) -> bool:
@@ -751,6 +776,7 @@ class DataService:
             "summary": summary[:360],
             "url": self._safe_external_url(item.get("url")),
             "published_at": str(item.get("published_at") or ""),
+            "received_at": deepcopy(item.get("received_at")),
             "symbols": [str(s).upper() for s in symbols if s][:12],
             "sentiment_score": round(self._weighted_news_score(item), 4),
             "event_type": str(item.get("event_type") or "market_news"),
@@ -1028,11 +1054,11 @@ class DataService:
         ticker = self._attach_market_source_consistency(symbol, ticker, derivatives)
 
         # Get sentiment
-        sentiment = self._sentiment_cache.get(symbol, {})
+        sentiment = deepcopy(self._sentiment_cache.get(symbol, {}))
 
         # Get headlines
-        headlines = self._headlines_cache.get(symbol, [])
-        news_items = self._news_items_cache.get(symbol, [])
+        headlines = list(self._headlines_cache.get(symbol, []))
+        news_items = deepcopy(self._news_items_cache.get(symbol, []))
         if news_items:
             sentiment = dict(sentiment)
             sentiment["news_items"] = news_items
@@ -1262,7 +1288,7 @@ class DataService:
                 "timestamp": self._ticker_timestamp_from_raw(raw_ticker),
                 "source_timestamp_ms": self._ticker_timestamp_from_raw(raw_ticker),
                 "source_sequence": ticker_info.get("seqId"),
-                "received_at": datetime.now(UTC).isoformat(),
+                "received_at": raw_ticker.get("received_at"),
                 "source": "rest",
                 "source_endpoint": "okx_rest_market_ticker",
                 "source_channel": "tickers",
@@ -1722,12 +1748,12 @@ class DataService:
             or info.get("instId")
             or spec.get("instId")
         )
-        enriched["received_at"] = enriched.get("received_at") or datetime.now(UTC).isoformat()
         enriched["market_fact"] = build_market_fact(
             symbol,
             enriched,
             contract_spec=spec,
-            received_at=enriched["received_at"],
+            received_at=enriched.get("received_at"),
+            require_observed_receipt=True,
         )
         return enriched
 
@@ -2004,6 +2030,7 @@ class DataService:
                 cached_ticker,
                 contract_spec=cached_ticker.get("contract_spec"),
                 received_at=cached_ticker.get("received_at"),
+                require_observed_receipt=True,
             )
             if isinstance(cached_fact.get("quality"), dict) and cached_fact["quality"].get(
                 "status"
@@ -2027,6 +2054,7 @@ class DataService:
             merged,
             contract_spec=merged.get("contract_spec"),
             received_at=merged.get("received_at"),
+            require_observed_receipt=True,
         )
 
     def _attach_market_source_consistency(
@@ -2113,6 +2141,7 @@ class DataService:
                 merge_snapshot(snapshot),
                 contract_spec=snapshot.get("contract_spec") or ticker.get("contract_spec"),
                 received_at=snapshot.get("received_at"),
+                require_observed_receipt=True,
             )
             for snapshot in source_snapshots
         ]
@@ -2966,10 +2995,24 @@ class DataService:
     ) -> dict[str, Any]:
         try:
             cached_features = await self._indicator_features_from_cached_klines(symbol)
-            if cached_features:
+            cached_availability = (
+                cached_features.get("technical_availability")
+                if isinstance(cached_features, dict)
+                else None
+            )
+            cached_delivery_observed = (
+                isinstance(cached_availability, dict)
+                and cached_availability.get("source_delivery_observed") is True
+            )
+            if cached_features and cached_delivery_observed:
                 self._store_indicator_snapshot_cache(symbol, cached_features)
                 self._schedule_kline_background_refresh(symbol)
                 return cached_features
+            if cached_features:
+                logger.debug(
+                    "cached indicator evidence unobserved; refreshing from exchange",
+                    symbol=symbol,
+                )
 
             gate = self._indicator_remote_refresh_gate()
             async with gate:
@@ -3129,7 +3172,72 @@ class DataService:
         features.update(self._kline_sequence_snapshot(sequence_df, sequence_timeframe))
         anomaly_df = trend_df if not trend_df.empty else short_df
         features.update(self._kline_anomaly_snapshot(anomaly_df))
+        used_timeframes = {
+            timeframe: frame
+            for timeframe, frame in (
+                (trend_timeframe, trend_df),
+                (short_timeframe, short_df),
+            )
+            if timeframe and not frame.empty
+        }
+        features["technical_availability"] = self._technical_input_availability(
+            klines_by_timeframe,
+            used_timeframes,
+        )
         return features
+
+    @staticmethod
+    def _technical_input_availability(
+        klines_by_timeframe: dict[str, list],
+        used_timeframes: dict[str, pd.DataFrame],
+    ) -> dict[str, Any]:
+        available_at = datetime.now(UTC)
+        evidence: dict[str, Any] = {
+            "version": COMPONENT_AVAILABILITY_VERSION,
+            "available_at": available_at.isoformat(),
+            "timeframes": ",".join(sorted(used_timeframes)),
+            "source_delivery_observed": bool(used_timeframes),
+        }
+        input_fingerprints = {}
+        for timeframe, frame in sorted(used_timeframes.items()):
+            rows = klines_by_timeframe.get(timeframe)
+            receipt = availability_timestamp(getattr(rows, "received_at", None))
+            seconds = TIMEFRAME_SECONDS.get(timeframe)
+            closed_at = (
+                (frame["timestamp"].iloc[-1] + pd.Timedelta(seconds=seconds)).to_pydatetime()
+                if seconds
+                else None
+            )
+            input_rows = [
+                [int(row[0].timestamp() * 1000), *[float(value) for value in row[1:]]]
+                for row in frame[
+                    ["timestamp", "open", "high", "low", "close", "volume"]
+                ].itertuples(index=False, name=None)
+            ]
+            try:
+                fingerprint = availability_fingerprint(input_rows)
+            except (TypeError, ValueError):
+                fingerprint = ""
+            input_fingerprints[timeframe] = fingerprint
+            evidence[f"{timeframe}_received_at"] = receipt.isoformat() if receipt else None
+            evidence[f"{timeframe}_closed_at"] = closed_at.isoformat() if closed_at else None
+            evidence[f"{timeframe}_input_fingerprint"] = fingerprint
+            evidence[f"{timeframe}_row_count"] = len(input_rows)
+            if (
+                not isinstance(rows, ObservedKlines)
+                or receipt is None
+                or closed_at is None
+                or closed_at > receipt
+                or receipt > available_at
+                or not fingerprint
+            ):
+                evidence["source_delivery_observed"] = False
+        evidence["input_fingerprint"] = (
+            availability_fingerprint(input_fingerprints)
+            if input_fingerprints and all(input_fingerprints.values())
+            else ""
+        )
+        return evidence
 
     def _kline_sequence_snapshot(self, df: pd.DataFrame, timeframe: str) -> dict[str, Any]:
         if df.empty:
@@ -3198,28 +3306,28 @@ class DataService:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df = df.dropna(subset=["timestamp", "close"]).drop_duplicates("timestamp")
         df = df.sort_values("timestamp").tail(max(len(klines), MIN_INDICATOR_ROWS))
-        df = self._drop_incomplete_latest_kline(df, timeframe)
+        df = self._drop_incomplete_latest_kline(
+            df,
+            timeframe,
+            observed_at=availability_timestamp(getattr(klines, "received_at", None)),
+        )
         if len(df) < MIN_INDICATOR_ROWS:
             return {}, df
         computed = compute_all_indicators(df)
         return extract_latest_features(computed), computed
 
     @staticmethod
-    def _drop_incomplete_latest_kline(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    def _drop_incomplete_latest_kline(
+        df: pd.DataFrame,
+        timeframe: str,
+        *,
+        observed_at: datetime | None = None,
+    ) -> pd.DataFrame:
         seconds = TIMEFRAME_SECONDS.get(str(timeframe or ""))
         if not seconds or df.empty:
             return df
-        latest = df.iloc[-1].get("timestamp")
-        if not isinstance(latest, pd.Timestamp):
-            return df
-        if latest.tzinfo is None:
-            latest = latest.tz_localize("UTC")
-        now = pd.Timestamp.now(tz="UTC")
-        if latest + pd.Timedelta(seconds=seconds) <= now:
-            return df
-        if len(df) <= 1:
-            return df.iloc[0:0].copy()
-        return df.iloc[:-1].copy()
+        cutoff = pd.Timestamp(observed_at or datetime.now(UTC))
+        return df[df["timestamp"] + pd.Timedelta(seconds=seconds) <= cutoff].copy()
 
     async def _fetch_and_persist_klines(
         self,
@@ -3309,6 +3417,7 @@ class DataService:
                 timeout=timeout,
             )
             if klines:
+                self._remember_observed_klines(symbol, timeframe, klines)
                 if persist_before_return:
                     await self._persist_klines(symbol, timeframe, klines)
                 else:
@@ -3336,23 +3445,89 @@ class DataService:
             symbol,
             {timeframe: limit},
         )
-        return list(grouped.get(timeframe) or [])
+        rows = grouped.get(timeframe) or []
+        return (
+            ObservedKlines(deepcopy(list(rows)), received_at=rows.received_at)
+            if isinstance(rows, ObservedKlines)
+            else list(rows)
+        )
+
+    def _remember_observed_klines(self, symbol: str, timeframe: str, rows: list) -> None:
+        if not isinstance(rows, ObservedKlines):
+            return
+        if availability_timestamp(rows.received_at) is None:
+            return
+        cache = getattr(self, "_observed_klines_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._observed_klines_cache = cache
+        key = (self._normalize_symbols([symbol])[0], timeframe)
+        cache.pop(key, None)
+        cache[key] = ObservedKlines(
+            deepcopy(list(rows)[-OBSERVED_KLINE_CACHE_MAX_ROWS:]),
+            received_at=deepcopy(rows.received_at),
+        )
+        while len(cache) > OBSERVED_KLINE_CACHE_MAX_KEYS:
+            cache.pop(next(iter(cache)))
+
+    def _recent_observed_klines(
+        self,
+        symbol: str,
+        timeframe_limits: dict[str, int],
+    ) -> dict[str, list]:
+        cache = getattr(self, "_observed_klines_cache", None)
+        if not isinstance(cache, dict):
+            return {}
+        now = datetime.now(UTC)
+        grouped = {}
+        for timeframe, limit in timeframe_limits.items():
+            key = (symbol, timeframe)
+            rows = cache.get(key)
+            if not isinstance(rows, ObservedKlines) or not rows:
+                continue
+            receipt = availability_timestamp(rows.received_at)
+            latest_open = availability_timestamp(rows[-1][0])
+            max_age_seconds = max(
+                TIMEFRAME_SECONDS.get(timeframe, 60) * KLINE_CACHE_MAX_AGE_MULTIPLIER,
+                KLINE_CACHE_MIN_MAX_AGE_SECONDS,
+            )
+            if (
+                receipt is None
+                or latest_open is None
+                or receipt > now
+                or (now - receipt).total_seconds() > max_age_seconds
+                or (now - latest_open).total_seconds() > max_age_seconds
+            ):
+                cache.pop(key, None)
+                continue
+            grouped[timeframe] = ObservedKlines(
+                deepcopy(list(rows)[-max(int(limit), 1):]),
+                received_at=deepcopy(rows.received_at),
+            )
+        return grouped
 
     async def _load_recent_cached_klines_for_timeframes(
         self,
         symbol: str,
         timeframe_limits: dict[str, int],
     ) -> dict[str, list[list[float]]]:
+        normalized = self._normalize_symbols([symbol])[0]
+        grouped = self._recent_observed_klines(normalized, timeframe_limits)
+        missing_limits = {
+            timeframe: limit
+            for timeframe, limit in timeframe_limits.items()
+            if timeframe not in grouped
+        }
+        if not missing_limits:
+            return grouped
         try:
-            normalized = self._normalize_symbols([symbol])[0]
             async with get_session_ctx() as session:
                 repo = MarketRepository(session)
                 grouped_rows = await repo.get_klines_for_timeframes(
                     normalized,
-                    timeframe_limits,
+                    missing_limits,
                 )
             now = datetime.now(UTC)
-            grouped: dict[str, list[list[float]]] = {}
             for timeframe, rows in grouped_rows.items():
                 if not rows:
                     continue
@@ -3384,7 +3559,7 @@ class DataService:
                 timeframes=list(timeframe_limits),
                 error=safe_error_text(exc),
             )
-            return {}
+            return grouped
 
     def _kline_anomaly_snapshot(self, df: pd.DataFrame) -> dict[str, float]:
         """Detect repeat extreme wicks that can make stop losses fill far away."""
@@ -3825,8 +4000,11 @@ class DataService:
                 "funding_time",
                 "next_funding_time",
                 "funding_rate_observed_at",
+                "funding_rate_received_at",
                 "open_interest_contracts",
                 "open_interest_value",
+                "open_interest_observed_at",
+                "open_interest_received_at",
             ):
                 if key not in data and key in cached_data:
                     data[key] = cached_data[key]

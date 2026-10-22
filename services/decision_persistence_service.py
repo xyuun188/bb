@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 
 from ai_brain.analysis_quality import analysis_quality_reason_code, analysis_quality_stage_status
 from ai_brain.base_model import DecisionOutput
+from core.feature_availability import availability_timestamp
 from core.safe_output import safe_error_text
 from db.repositories.decision_repo import DecisionRepository
 from db.session import get_session_ctx
@@ -59,6 +60,12 @@ class DecisionPersistenceService:
         """Insert one AI decision row and attach the initial AI-analysis stage."""
 
         try:
+            completed_at = availability_timestamp(decision.timestamp)
+            if isinstance(decision.feature_snapshot, dict) and completed_at is not None:
+                decision.feature_snapshot = {
+                    **decision.feature_snapshot,
+                    "original_decision_timestamp": completed_at.isoformat(),
+                }
             async with self._session_context_factory() as session:
                 repo = self._decision_repo_factory(session)
                 raw_response = (

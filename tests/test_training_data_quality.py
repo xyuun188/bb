@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from core.feature_availability import seal_feature_availability
 from core.market_facts import MARKET_FACT_CONTRACT_VERSION
 from core.training_contracts import (
     SHADOW_LABEL_VERSION,
@@ -87,6 +88,8 @@ def _shadow_sample(**overrides):
             )
         sample["features"] = features
     features = sample.get("features")
+    if isinstance(features, dict) and features:
+        _add_test_component_availability(features)
     if isinstance(features, dict) and features and "training_label_contract" not in features:
         features["training_label_contract"] = compact_shadow_label_contract(
             build_shadow_label_contract(
@@ -139,9 +142,89 @@ def _trade_sample(**overrides):
         "position_size_pct": 0.03,
         "holding_minutes": 35.0,
         "outcome": "profit",
+        "original_decision_timestamp": "2026-07-14T00:00:10+00:00",
+        "features": {
+            "symbol": "BTC/USDT",
+            "current_price": 100.0,
+            "bid": 99.99,
+            "ask": 100.01,
+            "spread_pct": 0.02,
+            "funding_rate": 0.0,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+            "taker_fee_rate": 0.0005,
+            "entry_fee_rate": 0.0005,
+            "exit_fee_rate": 0.0005,
+            "fee_rate_source": "okx_account_fee_snapshot",
+            "fee_rate_observed_at": "2026-07-14T00:00:01+00:00",
+            "account_fee_received_at": "2026-07-14T00:00:02+00:00",
+            "account_fee_source_observed_at": "2026-07-14T00:00:01+00:00",
+            "funding_rate_observed_at": "2026-07-14T00:00:01+00:00",
+            "funding_rate_received_at": "2026-07-14T00:00:02+00:00",
+            "original_decision_timestamp": "2026-07-14T00:00:10+00:00",
+        },
     }
     sample.update(overrides)
+    features = sample.get("features")
+    if isinstance(features, dict) and features:
+        _add_test_component_availability(features)
     return sample
+
+
+def _add_test_component_availability(features: dict) -> None:
+    """Give otherwise-valid unit fixtures explicit, deterministic source clocks."""
+    features.setdefault("original_decision_timestamp", "2026-07-14T00:00:10+00:00")
+    features.setdefault("funding_rate_observed_at", "2026-07-14T00:00:01+00:00")
+    features.setdefault("funding_rate_received_at", "2026-07-14T00:00:02+00:00")
+    features.setdefault("account_fee_source_observed_at", "2026-07-14T00:00:01+00:00")
+    features.setdefault("account_fee_received_at", "2026-07-14T00:00:02+00:00")
+    features.setdefault("funding_data_available", True)
+    features.setdefault("taker_fee_rate", 0.0005)
+    features.setdefault("entry_fee_rate", 0.0005)
+    features.setdefault("exit_fee_rate", 0.0005)
+    features.setdefault("fee_rate_source", "okx_account_fee_snapshot")
+    features.setdefault("fee_rate_observed_at", "2026-07-14T00:00:01+00:00")
+    features.setdefault(
+        "technical_availability",
+        {
+            "version": "2026-10-22.observed-component.v1",
+            "available_at": "2026-07-14T00:00:03+00:00",
+            "timeframes": "1m,15m",
+            "source_delivery_observed": True,
+            "1m_closed_at": "2026-07-14T00:00:01+00:00",
+            "1m_received_at": "2026-07-14T00:00:02+00:00",
+            "15m_closed_at": "2026-07-14T00:00:01+00:00",
+            "15m_received_at": "2026-07-14T00:00:02+00:00",
+            "input_fingerprint": "test-technical-inputs",
+        },
+    )
+    features.setdefault(
+        "sentiment_availability",
+        {
+            "version": "2026-10-22.observed-component.v1",
+            "available_at": "2026-07-14T00:00:03+00:00",
+            "news_input_count": 0,
+            "news_clock_errors": 0,
+            "news_input_fingerprint": "test-news-inputs",
+            "social_input_count": 0,
+            "social_clock_errors": 0,
+            "social_input_fingerprint": "test-social-inputs",
+        },
+    )
+    for key, offset in (
+        ("market_fact", 1),
+        ("orderbook_fact", 1),
+        ("mark_price_fact", 2),
+        ("index_price_fact", 3),
+    ):
+        features.setdefault(
+            key,
+            {
+                "timestamp": f"2026-07-14T00:00:0{offset}+00:00",
+                "received_at": "2026-07-14T00:00:04+00:00",
+            },
+        )
+    seal_feature_availability(features, frozen_at=datetime(2026, 7, 14, 0, 0, 5, tzinfo=UTC))
 
 
 def test_profit_learning_report_does_not_invent_profit_factor_without_losses() -> None:

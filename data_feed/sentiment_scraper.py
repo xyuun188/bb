@@ -92,6 +92,7 @@ class SentimentScraper:
                 return await self.fetch_reddit_rss_mentions(subreddit, limit=limit)
 
             data = resp.json()
+            received_at = datetime.now(UTC).isoformat()
             for child in data.get("data", {}).get("children", []):
                 post_data = child.get("data", {})
                 title = post_data.get("title", "")
@@ -119,9 +120,12 @@ class SentimentScraper:
                             "num_comments": post_data.get("num_comments", 0),
                             "engagement_count": post_data.get("score", 0)
                             + post_data.get("num_comments", 0),
-                            "posted_at": datetime.fromtimestamp(
-                                post_data.get("created_utc", 0), tz=UTC
+                            "posted_at": (
+                                datetime.fromtimestamp(post_data["created_utc"], tz=UTC)
+                                if post_data.get("created_utc") not in (None, "")
+                                else None
                             ),
+                            "received_at": received_at,
                             "url": f"https://reddit.com{permalink}",
                         }
                     )
@@ -144,7 +148,9 @@ class SentimentScraper:
                 )
                 return posts
 
-            root = ElementTree.fromstring(resp.text)
+            body = resp.text
+            received_at = datetime.now(UTC).isoformat()
+            root = ElementTree.fromstring(body)
             entries = [
                 item
                 for item in root.iter()
@@ -195,7 +201,8 @@ class SentimentScraper:
                         "sentiment_score": self._lexicon_sentiment(combined),
                         "num_comments": 0,
                         "engagement_count": 0,
-                        "posted_at": posted_at or datetime.now(UTC),
+                        "posted_at": posted_at,
+                        "received_at": received_at,
                         "url": link,
                     }
                 )
@@ -280,6 +287,7 @@ class SentimentScraper:
                     continue
 
                 data = resp.json()
+                received_at = datetime.now(UTC).isoformat()
                 for hit in data.get("hits", []):
                     title = str(hit.get("title") or hit.get("story_title") or "").strip()
                     url = str(hit.get("url") or hit.get("story_url") or "").strip()
@@ -318,7 +326,8 @@ class SentimentScraper:
                             "sentiment_score": self._lexicon_sentiment(combined),
                             "num_comments": comments,
                             "engagement_count": points + comments,
-                            "posted_at": created_at or datetime.now(UTC),
+                            "posted_at": created_at,
+                            "received_at": received_at,
                             "url": url or f"https://news.ycombinator.com/item?id={object_id}",
                         }
                     )

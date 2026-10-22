@@ -431,6 +431,7 @@ class OkxPerpetualSdkExchange:
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
         self._native_consistency_market_api: Any | None = None
+        self._historical_market_api: Any | None = None
         self._public_api: Any | None = None
         self._execution_market_api: Any | None = None
         self._execution_public_api: Any | None = None
@@ -480,6 +481,17 @@ class OkxPerpetualSdkExchange:
                 MarketAPI(**self._public_kwargs())
             )
         return self._native_consistency_market_api
+
+    @property
+    def historical_market_api(self) -> Any:
+        """Keep low-priority backfills off executable quote and native-path clients."""
+        if self._historical_market_api is None:
+            from okx.MarketData import MarketAPI
+
+            self._historical_market_api = self._configure_api_timeout(
+                MarketAPI(**self._public_kwargs())
+            )
+        return self._historical_market_api
 
     @property
     def public_api(self) -> Any:
@@ -691,6 +703,7 @@ class OkxPerpetualSdkExchange:
             "_trade_api",
             "_market_api",
             "_native_consistency_market_api",
+            "_historical_market_api",
             "_public_api",
             "_execution_market_api",
             "_execution_public_api",
@@ -756,6 +769,7 @@ class OkxPerpetualSdkExchange:
                 "_trade_api",
                 "_market_api",
                 "_native_consistency_market_api",
+                "_historical_market_api",
                 "_public_api",
                 "_execution_market_api",
                 "_execution_public_api",
@@ -778,6 +792,7 @@ class OkxPerpetualSdkExchange:
                         self._trade_api,
                         self._market_api,
                         self._native_consistency_market_api,
+                        self._historical_market_api,
                         self._public_api,
                         self._execution_market_api,
                         self._execution_public_api,
@@ -1479,6 +1494,30 @@ class OkxPerpetualSdkExchange:
             **request,
         )
         return self._parse_ohlcv_rows(response)
+
+    async def fetch_historical_ohlcv(
+        self,
+        symbol: str,
+        limit: int = 100,
+        *,
+        end_timestamp_ms: int,
+    ) -> list[list[float]]:
+        """Fetch closed 1m bars beyond the recent-candles endpoint's retention."""
+        inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)
+        response = await self._call_sdk(
+            lambda: self.historical_market_api,
+            "get_history_candlesticks",
+            instId=inst_id,
+            bar="1m",
+            limit=str(min(max(1, int(limit or 100)), 300)),
+            after=str(int(end_timestamp_ms) + 60_000),
+        )
+        closed_rows = [
+            row
+            for row in response.get("data", [])
+            if isinstance(row, (list, tuple)) and len(row) >= 9 and str(row[8]) == "1"
+        ]
+        return self._parse_ohlcv_rows({"data": closed_rows})
 
     async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:
         inst_id = normalize_swap_inst_id(symbol, field="symbol", required=True)

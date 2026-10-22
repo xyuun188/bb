@@ -572,6 +572,7 @@ class ShadowBacktestService:
                     feature_snapshot = {}
                 else:
                     feature_snapshot = dict(feature_snapshot)
+                feature_snapshot.setdefault("original_decision_timestamp", observed_at.isoformat())
                 raw_response = (
                     decision.raw_response
                     if isinstance(decision.raw_response, dict)

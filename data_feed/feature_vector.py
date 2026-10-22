@@ -7,10 +7,12 @@ into a unified FeatureVector dataclass consumed by all AI models.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from core.feature_availability import availability_fingerprint
 from core.market_facts import build_market_fact
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
 
@@ -90,6 +92,9 @@ class FeatureVector:
     indicator_snapshot_refresh_in_background: bool = False
     indicator_snapshot_quality: str = "unavailable"
     indicator_snapshot_reason: str = "indicator_snapshot_not_collected"
+    technical_availability: dict[str, Any] = field(default_factory=dict)
+    feature_snapshot_frozen_at: str | None = None
+    feature_availability_contract: dict[str, Any] = field(default_factory=dict)
 
     # --- Technical indicators (from latest candle) ---
     rsi_14: float = 50.0
@@ -130,14 +135,19 @@ class FeatureVector:
     funding_time: str | None = None
     next_funding_time: str | None = None
     funding_rate_observed_at: str | None = None
+    funding_rate_received_at: str | None = None
     taker_fee_rate: float | None = None
     entry_fee_rate: float | None = None
     exit_fee_rate: float | None = None
     fee_rate_source: str = ""
     fee_rate_observed_at: str | None = None
+    account_fee_received_at: str | None = None
+    account_fee_source_observed_at: str | None = None
     fee_policy_provenance: dict[str, Any] = field(default_factory=dict)
     open_interest_contracts: float = 0.0
     open_interest_value: float = 0.0
+    open_interest_observed_at: str | None = None
+    open_interest_received_at: str | None = None
     orderbook_bid_depth: float = 0.0
     orderbook_ask_depth: float = 0.0
     orderbook_imbalance: float = 0.0
@@ -159,6 +169,7 @@ class FeatureVector:
     news_sources: list[str] = field(default_factory=list)
     recent_headlines: list[str] = field(default_factory=list)
     recent_news_items: list[dict[str, Any]] = field(default_factory=list)
+    sentiment_availability: dict[str, Any] = field(default_factory=dict)
 
     # --- On-chain (future) ---
     exchange_inflow: float | None = None
@@ -175,7 +186,13 @@ class FeatureVector:
             if isinstance(f_value, dt):
                 d[f_name] = f_value.isoformat()
             else:
-                d[f_name] = f_value
+                d[f_name] = deepcopy(f_value)
+        d["model_text_fingerprint"] = availability_fingerprint(
+            {
+                "recent_headlines": self.recent_headlines,
+                "recent_news_items": self.recent_news_items,
+            }
+        )
         return d
 
     def to_llm_context(self) -> str:
@@ -311,7 +328,7 @@ def build_feature_vector(
         )
         for key, value in indicators.items():
             if hasattr(fv, key):
-                setattr(fv, key, value)
+                setattr(fv, key, deepcopy(value))
         fv.close_sequence = _safe_float_sequence(fv.close_sequence)
         fv.volume_sequence = _safe_float_sequence(fv.volume_sequence)
         if fv.close_sequence:
@@ -356,6 +373,7 @@ def build_feature_vector(
         fv.market_news_item_count = int(sentiment_data.get("market_news_item_count", 0) or 0)
         fv.news_sources = list(sentiment_data.get("news_sources") or [])
         fv.recent_news_items = list(sentiment_data.get("news_items") or [])[:20]
+        fv.sentiment_availability = deepcopy(sentiment_data.get("sentiment_availability") or {})
 
     # Headlines
     if headlines:
@@ -390,7 +408,7 @@ def build_feature_vector(
                         and (not isinstance(value, dict) or not value)
                     ):
                         continue
-                setattr(fv, key, value)
+                setattr(fv, key, deepcopy(value))
 
     ticker_fact_input = dict(ticker or {})
     ticker_fact_input.update(
@@ -424,6 +442,7 @@ def build_feature_vector(
         ticker_fact_input,
         contract_spec=ticker_fact_input.get("contract_spec"),
         received_at=ticker_fact_input.get("received_at"),
+        require_observed_receipt=True,
     )
 
     fv.liquidation_risk_score = _derive_liquidation_risk_score(fv)

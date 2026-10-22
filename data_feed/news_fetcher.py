@@ -262,6 +262,7 @@ class NewsFetcher:
             resp = await client.get(url, params=params, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
+                received_at = datetime.now(UTC).isoformat()
                 for post in data.get("results", [])[:20]:
                     title = post.get("title", "")
                     if not title:
@@ -281,6 +282,7 @@ class NewsFetcher:
                                 "url": post.get("url", ""),
                                 "symbols_mentioned": symbols or self._extract_symbols(title),
                                 "published_at": post.get("published_at"),
+                                "received_at": received_at,
                             },
                             "cryptopanic",
                         )
@@ -301,7 +303,9 @@ class NewsFetcher:
             if resp.status_code != 200:
                 return articles
 
-            root = ElementTree.fromstring(resp.text)
+            body = resp.text
+            received_at = datetime.now(UTC).isoformat()
+            root = ElementTree.fromstring(body)
             for item in root.iter("item"):
                 title = ""
                 link = ""
@@ -335,6 +339,7 @@ class NewsFetcher:
                             "url": link,
                             "symbols_mentioned": self._extract_symbols(f"{title} {description}"),
                             "published_at": pub_date,
+                            "received_at": received_at,
                         },
                         source_name,
                     )
@@ -368,6 +373,7 @@ class NewsFetcher:
                 logger.debug("coinmarketcal fetch failed", status=resp.status_code)
                 return articles
             data = resp.json()
+            received_at = datetime.now(UTC).isoformat()
             rows = data.get("body") if isinstance(data, dict) else data
             if not isinstance(rows, list):
                 return articles
@@ -398,7 +404,9 @@ class NewsFetcher:
                             "url": url,
                             "symbols_mentioned": symbols
                             or self._extract_symbols(f"{title} {summary}"),
-                            "published_at": item.get("date_event") or item.get("created_date"),
+                            "published_at": item.get("created_date"),
+                            "event_at": item.get("date_event"),
+                            "received_at": received_at,
                         },
                         "coinmarketcal",
                     )
@@ -429,6 +437,7 @@ class NewsFetcher:
                 logger.debug("newsapi fetch failed", status=resp.status_code)
                 return articles
             data = resp.json()
+            received_at = datetime.now(UTC).isoformat()
             for item in data.get("articles", [])[:50]:
                 title = str(item.get("title") or "").strip()
                 if not title:
@@ -449,6 +458,7 @@ class NewsFetcher:
                                 f"{title} {item.get('description') or ''}"
                             ),
                             "published_at": item.get("publishedAt"),
+                            "received_at": received_at,
                         },
                         f"newsapi:{source.get('name') or 'unknown'}",
                     )
@@ -477,7 +487,7 @@ class NewsFetcher:
             reverse=True,
         )
         logger.info("news fetched", count=len(all_articles), cached=len(self._articles))
-        return list(self._articles)
+        return [dict(article) for article in self._articles]
 
     def _article_sort_key(self, article: dict[str, Any]) -> tuple[float, float, float]:
         published = article.get("published_at")

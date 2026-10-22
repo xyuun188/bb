@@ -140,6 +140,7 @@ async def test_okx_ws_books_and_mark_price_include_native_source_facts() -> None
         "source_endpoint": "okx_ws_public",
         "source_channel": "books5",
         "source_timestamp_ms": 1_782_432_000_000,
+        "received_at": book["received_at"],
         "bid": pytest.approx(0.000002354),
         "ask": pytest.approx(0.000002356),
         "bid_depth_usdt": pytest.approx(11.77),
@@ -151,6 +152,7 @@ async def test_okx_ws_books_and_mark_price_include_native_source_facts() -> None
         "source_endpoint": "okx_ws_public",
         "source_channel": "mark-price",
         "source_timestamp_ms": 1_782_432_000_100,
+        "received_at": mark["received_at"],
         "price": pytest.approx(0.000002355),
     }
 

@@ -2979,6 +2979,10 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units(
     assert snapshot["orderbook_ask_depth"] == pytest.approx(100.2 * 2.0 * 0.01)
     assert snapshot["mark_price"] == pytest.approx(100.06)
     assert snapshot["taker_fee_rate"] == pytest.approx(0.0005)
+    assert snapshot["orderbook_fact"]["received_at"] == snapshot["market_fact"]["received_at"]
+    assert snapshot["mark_price_fact"]["received_at"]
+    assert snapshot["account_fee_received_at"] == facts["fee_snapshot"]["account_fee_received_at"]
+    assert snapshot["account_fee_source_observed_at"] == facts["fee_snapshot"]["account_fee_source_observed_at"]
     assert exchange.live_market_calls == [
         "ticker",
         "ticker",

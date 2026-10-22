@@ -137,6 +137,7 @@ class OKXWebSocketClient:
 
     async def _handle_message(self, raw: str) -> None:
         """Parse and route incoming WebSocket messages."""
+        received_at = datetime.now(UTC).isoformat()
         self._message_count += 1
         self._last_message_time = time.time()
 
@@ -201,7 +202,7 @@ class OKXWebSocketClient:
                     "timestamp": int(safe_float(ticker.get("ts"), 0.0)),
                     "source_timestamp_ms": int(safe_float(ticker.get("ts"), 0.0)),
                     "source_sequence": ticker.get("seqId"),
-                    "received_at": datetime.now(UTC).isoformat(),
+                    "received_at": received_at,
                     "source": "websocket",
                     "source_endpoint": "okx_ws_public",
                     "source_channel": channel,
@@ -239,6 +240,7 @@ class OKXWebSocketClient:
                     "source_endpoint": "okx_ws_public",
                     "source_channel": "books5",
                     "source_timestamp_ms": timestamp_ms,
+                    "received_at": received_at,
                     "bid": best_bid,
                     "ask": best_ask,
                     "bid_depth_usdt": bid_depth_usdt,
@@ -256,7 +258,7 @@ class OKXWebSocketClient:
                     "orderbook_ask_depth": ask_depth_usdt,
                     "timestamp": timestamp_ms,
                     "source_timestamp_ms": timestamp_ms,
-                    "received_at": datetime.now(UTC).isoformat(),
+                    "received_at": received_at,
                     "source": "websocket",
                     "source_endpoint": "okx_ws_public",
                     "source_channel": "books5",
@@ -278,7 +280,7 @@ class OKXWebSocketClient:
                     "mark_price": mark_price,
                     "timestamp": timestamp_ms,
                     "source_timestamp_ms": timestamp_ms,
-                    "received_at": datetime.now(UTC).isoformat(),
+                    "received_at": received_at,
                     "source": "websocket",
                     "source_endpoint": "okx_ws_public",
                     "source_channel": "mark-price",
@@ -288,6 +290,7 @@ class OKXWebSocketClient:
                         "source_endpoint": "okx_ws_public",
                         "source_channel": "mark-price",
                         "source_timestamp_ms": timestamp_ms,
+                        "received_at": received_at,
                         "price": mark_price,
                     },
                 }

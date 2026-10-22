@@ -35,6 +35,7 @@ from config.settings import (
     MARKET_ANALYSIS_EXPERT_NAMES,
     settings,
 )
+from core.feature_availability import seal_feature_availability
 from core.phase3_model_contract import PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
 from core.safe_output import safe_error_tail, safe_error_text
 from core.trading_mode import mode_manager
@@ -11326,6 +11327,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     fv,
                     market_execution_cost_facts.get(model_mode),
                 )
+                seal_feature_availability(fv)
                 feature_vectors[symbol] = fv
                 symbol_started_monotonic = asyncio.get_running_loop().time()
                 context_timeout_seconds = self.market_symbol_context_timeout_seconds()
@@ -12520,6 +12522,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             result["rejection_reason"] = f"Failed to get feature vector: {e}"
             return result
 
+        seal_feature_availability(fv)
         open_positions = await self.okx_sync_service.get_open_positions_context()
 
         # Manual trades also use the unified multi-model ensemble.

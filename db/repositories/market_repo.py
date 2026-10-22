@@ -62,6 +62,7 @@ class MarketRepository(BaseRepository):
             select(Kline).where(
                 Kline.symbol == symbol,
                 Kline.timeframe == timeframe,
+                Kline.open_time.in_(list(payload_by_open_time)),
             )
         )
         existing_by_open_time = {

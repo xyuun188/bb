@@ -21,6 +21,7 @@ from services.authoritative_trade_outcome import (
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.okx_position_history_store import load_okx_position_history_records
 from services.training_data_quality import annotate_training_payload
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 
 
 def test_compact_decision_projection_keeps_training_facts_without_large_payloads() -> None:
@@ -282,6 +283,11 @@ def _sample(**overrides):
         "training_evidence_gaps": [],
         "label_timestamp": "2026-07-14T04:33:27.688000+00:00",
     }
+    features = {"current_price": 2.167}
+    seal_synthetic_feature_availability(
+        features, decision_at=datetime(2026, 7, 14, 0, 0, 10, tzinfo=UTC),
+    )
+    sample["features"] = features
     sample.update(overrides)
     return sample
 

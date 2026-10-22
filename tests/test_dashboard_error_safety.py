@@ -1992,6 +1992,72 @@ async def test_opening_funnel_reports_selected_training_shadow_separately(
 
 
 @pytest.mark.asyncio
+async def test_opening_funnel_classifies_each_rows_own_raw_payload(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'opening-funnel-row-payloads.db').as_posix()}",
+    )
+    await init_db()
+
+    try:
+        now = datetime.now(UTC)
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    AIDecision(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        symbol="XRP/USDT",
+                        action="hold",
+                        confidence=0.61,
+                        analysis_type="market",
+                        is_paper=True,
+                        was_executed=False,
+                        raw_llm_response={
+                            "paper_trade_selection": {
+                                "selected": True,
+                                "selection_reason": "paper_training_entry",
+                            },
+                            "normal_paper_trade": {
+                                "authorized": False,
+                                "paper_training_only": True,
+                            },
+                        },
+                        created_at=now,
+                    ),
+                    AIDecision(
+                        model_name=ENSEMBLE_TRADER_NAME,
+                        symbol="BTC/USDT",
+                        action="hold",
+                        confidence=0.59,
+                        analysis_type="market",
+                        is_paper=True,
+                        was_executed=False,
+                        raw_llm_response={},
+                        created_at=now,
+                    ),
+                ]
+            )
+
+        payload = await dashboard._build_opening_funnel_payload(
+            mode="paper",
+            hours=24,
+            limit=500,
+        )
+
+        assert payload["market_scans"] == 2
+        assert payload["entry_funnel_reasons"]["shadow_training"] == 1
+        assert payload["entry_funnel_reasons"]["no_candidate"] == 1
+        assert payload["bottleneck"] == "shadow_training"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_daily_pnl_shows_linked_entry_and_close_activity_before_settlement(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

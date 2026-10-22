@@ -4392,6 +4392,7 @@ class OKXExecutor(AbstractExecutor):
         if not callable(fetch_ticker):
             raise ExchangeAPIError("OKX native market ticker API is unavailable")
         response = await self._with_retry(fetch_ticker, {"instId": inst_id})
+        received_at = datetime.now(UTC).isoformat()
         rows = response.get("data") if isinstance(response, dict) else None
         row = rows[0] if isinstance(rows, list) and rows else {}
         if not isinstance(row, dict):
@@ -4406,6 +4407,7 @@ class OKXExecutor(AbstractExecutor):
             "bid": self._safe_float(row.get("bidPx"), 0.0),
             "ask": self._safe_float(row.get("askPx"), 0.0),
             "timestamp": int(self._safe_float(row.get("ts"), 0.0)),
+            "received_at": received_at,
             "info": dict(row),
         }
 
@@ -7709,18 +7711,23 @@ class OKXExecutor(AbstractExecutor):
         fetch_mark_price = getattr(ccxt, "executionGetPublicMarkPrice", None)
         if not callable(fetch_mark_price):
             fetch_mark_price = ccxt.publicGetPublicMarkPrice
+
+        async def fetch_with_receipt(fetcher: Any, *args: Any) -> tuple[Any, str]:
+            response = await self._with_retry(fetcher, *args)
+            return response, datetime.now(UTC).isoformat()
+
         (
             ticker,
-            book,
-            mark_response,
+            (book, book_received_at),
+            (mark_response, mark_received_at),
             execution_specs,
             market_specs,
             fee,
             balance_snapshot,
         ) = await asyncio.gather(
             self._fetch_native_ticker(symbol),
-            self._with_retry(fetch_order_book, okx_symbol),
-            self._with_retry(fetch_mark_price, {"instId": inst_id}),
+            fetch_with_receipt(fetch_order_book, okx_symbol),
+            fetch_with_receipt(fetch_mark_price, {"instId": inst_id}),
             self._native_facts_client().fetch_contract_specs(symbols=[symbol]),
             self._native_facts_client().fetch_market_contract_specs(symbols=[symbol]),
             self.fetch_account_fee_snapshot(),
@@ -7821,6 +7828,7 @@ class OKXExecutor(AbstractExecutor):
             "source_endpoint": "okx_rest_market_books",
             "source_channel": "books",
             "source_timestamp_ms": orderbook_source_timestamp_ms,
+            "received_at": book_received_at,
             "bid": bid,
             "ask": ask,
             "bid_depth_usdt": bid_depth,
@@ -7836,6 +7844,7 @@ class OKXExecutor(AbstractExecutor):
             "source_endpoint": "okx_rest_public_mark_price",
             "source_channel": "mark-price",
             "source_timestamp_ms": mark_source_timestamp_ms,
+            "received_at": mark_received_at,
             "price": mark_price,
         }
         # The order book is the executable quote authority for the immediate
@@ -7850,6 +7859,7 @@ class OKXExecutor(AbstractExecutor):
             "source_endpoint": "okx_rest_market_books",
             "source_channel": "books",
             "timestamp": orderbook_source_timestamp_ms,
+            "received_at": book_received_at,
             "last_price": ticker_last or ((bid + ask) / 2.0),
             "notional_24h_usdt": notional_24h_usdt,
             "volume_24h_contracts": volume_24h_contracts,
@@ -7872,6 +7882,7 @@ class OKXExecutor(AbstractExecutor):
             "source_endpoint": "okx_rest_market_books",
             "source_channel": "books",
             "timestamp": orderbook_source_timestamp_ms,
+            "received_at": book_received_at,
             "last_price": ticker_last or ((bid + ask) / 2.0),
             "bid": bid,
             "ask": ask,
@@ -7891,7 +7902,7 @@ class OKXExecutor(AbstractExecutor):
             symbol,
             executable_quote_snapshot,
             contract_spec=market_spec,
-            received_at=datetime.now(UTC),
+            received_at=book_received_at,
         )
         market_source_consistency = build_market_source_consistency(
             base_market_fact,
@@ -7910,7 +7921,7 @@ class OKXExecutor(AbstractExecutor):
                 "market_source_consistency": market_source_consistency,
             },
             contract_spec=market_spec,
-            received_at=datetime.now(UTC),
+            received_at=book_received_at,
         )
         reasons: list[str] = []
         if not inst_id:
@@ -7969,6 +7980,8 @@ class OKXExecutor(AbstractExecutor):
             "exit_fee_rate": fee.get("exit_fee_rate"),
             "fee_rate_source": fee.get("fee_rate_source"),
             "fee_rate_observed_at": fee.get("fee_rate_observed_at"),
+            "account_fee_received_at": fee.get("account_fee_received_at"),
+            "account_fee_source_observed_at": fee.get("account_fee_source_observed_at"),
             "fee_policy_provenance": fee.get("policy_provenance"),
             "market_fact": primary_market_fact,
             "market_source_consistency": market_source_consistency,
@@ -8228,6 +8241,7 @@ class OKXExecutor(AbstractExecutor):
 
         exchange = await self._get_ccxt()
         response = await exchange.privateGetAccountFeeRates({"instType": "SWAP"})
+        received_at = datetime.now(UTC).isoformat()
         rows = response.get("data") if isinstance(response, dict) else []
         row = rows[0] if isinstance(rows, list) and rows else {}
         row = row if isinstance(row, dict) else {}
@@ -8240,10 +8254,10 @@ class OKXExecutor(AbstractExecutor):
                 taker_field = field_name
                 break
         observed_at_ms = self._safe_float(row.get("ts"), 0.0)
-        observed_at = (
+        source_observed_at = (
             datetime.fromtimestamp(observed_at_ms / 1000.0, tz=UTC).isoformat()
             if observed_at_ms > 0
-            else datetime.now(UTC).isoformat()
+            else None
         )
         fallback_reason = "" if taker_rate > 0 else "okx_swap_taker_fee_missing"
         return {
@@ -8255,12 +8269,15 @@ class OKXExecutor(AbstractExecutor):
                 if taker_field
                 else "okx_account_trade_fee.missing"
             ),
-            "fee_rate_observed_at": observed_at,
+            "fee_rate_observed_at": source_observed_at or received_at,
+            "account_fee_received_at": received_at,
+            "account_fee_source_observed_at": source_observed_at,
             "policy_provenance": {
                 "source": "okx_account_trade_fee_swap",
                 "observation_window": "current_account_fee_tier",
                 "sample_count": int(taker_rate > 0),
-                "generated_at": observed_at,
+                "generated_at": received_at,
+                "source_observed_at": source_observed_at,
                 "strategy_version": "2026-07-13.okx-account-fee-snapshot.v1",
                 "fallback_reason": fallback_reason,
             },

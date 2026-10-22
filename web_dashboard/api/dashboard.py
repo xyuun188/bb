@@ -11413,6 +11413,7 @@ async def _build_opening_funnel_payload(
     confidence_count = 0
 
     for row in market_rows:
+        raw = row.raw_llm_response if isinstance(row.raw_llm_response, dict) else {}
         action = str(row.action or "").lower()
         action_key = action if action in {"hold", "long", "short"} else "other"
         action_counts[action_key] += 1

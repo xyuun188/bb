@@ -25,6 +25,7 @@ from services.shadow_backtest_service import (
     shadow_path_labels,
     side_label,
 )
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 
 
 def test_market_label_horizons_match_the_versioned_training_contract() -> None:
@@ -793,7 +794,13 @@ async def test_shadow_backtest_service_does_not_apply_fixed_price_range_toleranc
             "round_trip_fee_pct": 0.08,
             "funding_rate": 0.0,
             "funding_interval_minutes": 480.0,
+            "market_fact": _market_fact("PROS/USDT", 0.3902, _ENTRY_TIMESTAMP_MS),
         },
+    )
+    seal_synthetic_feature_availability(
+        row.feature_snapshot,
+        decision_at=datetime.fromtimestamp(_ENTRY_TIMESTAMP_MS / 1000.0, tz=UTC)
+        + timedelta(seconds=5),
     )
     repo.due_rows = [row]
 

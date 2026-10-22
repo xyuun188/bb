@@ -14,6 +14,8 @@ EXECUTION_COST_FACT_FIELDS = (
     "round_trip_fee_pct",
     "fee_rate_source",
     "fee_rate_observed_at",
+    "account_fee_received_at",
+    "account_fee_source_observed_at",
 )
 
 

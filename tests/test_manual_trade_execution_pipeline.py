@@ -88,6 +88,9 @@ def _manual_service(
     class FakeEnsemble:
         async def decide(self, fv: Any, context: dict[str, Any]) -> tuple[Any, list[Any]]:
             calls.append(("ensemble_context", context))
+            calls.append(
+                ("ensemble_feature_sealed", bool(getattr(fv, "feature_availability_contract", None)))
+            )
             return decision, []
 
     class FakeRiskEngine:
@@ -193,6 +196,7 @@ async def test_manual_trade_uses_unified_execution_pipeline() -> None:
         "price": 100.0,
     }
     assert service._decision_count == 1
+    assert ("ensemble_feature_sealed", True) in calls
     assert (
         "execute_candidate",
         "BTC/USDT",

@@ -5043,7 +5043,9 @@ class MLSignalService:
             if not isinstance(last_result, dict):
                 continue
             candidate_at = last_result.get("full_training_probe_at")
-            if candidate_at and (not checkpoint["at"] or str(candidate_at) > str(checkpoint["at"])):
+            # The shared scheduler result is authoritative when timestamps
+            # tie: its probe fingerprint may be newer than the artifact copy.
+            if candidate_at and (not checkpoint["at"] or str(candidate_at) >= str(checkpoint["at"])):
                 checkpoint["at"] = candidate_at
                 checkpoint["raw_decision_group_count"] = last_result.get(
                     "completed_shadow_raw_decision_group_count"

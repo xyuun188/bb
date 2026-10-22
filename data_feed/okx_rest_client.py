@@ -9,11 +9,13 @@ import asyncio
 import math
 import time
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from config.settings import settings
+from core.feature_availability import ObservedKlines
 from core.market_facts import normalize_okx_contract_spec
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
@@ -91,6 +93,7 @@ PUBLIC_MARKET_METHODS = frozenset(
         "fetch_order_book",
         "fetch_ohlcv",
         "fetch_native_consistency_ohlcv",
+        "fetch_historical_ohlcv",
         "fetch_funding_rate",
         "fetch_open_interest",
     }
@@ -194,6 +197,7 @@ class OKXRestClient:
         self._public_market_request_gate: _PriorityRequestGate | None = None
         self._public_market_optional_request_gate: _PriorityRequestGate | None = None
         self._native_consistency_request_gate: _PriorityRequestGate | None = None
+        self._historical_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -281,6 +285,13 @@ class OKXRestClient:
         if not isinstance(gate, _PriorityRequestGate):
             gate = _PriorityRequestGate(PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY)
             self._native_consistency_request_gate = gate
+        return gate
+
+    def _historical_gate(self) -> _PriorityRequestGate:
+        gate = self._historical_request_gate
+        if not isinstance(gate, _PriorityRequestGate):
+            gate = _PriorityRequestGate(2)
+            self._historical_request_gate = gate
         return gate
 
     @staticmethod
@@ -453,10 +464,11 @@ class OKXRestClient:
 
     async def _fetch_ticker_uncached(self, inst_id: str) -> dict[str, Any]:
         response = await self._ccxt_call("publicGetMarketTicker", {"instId": inst_id})
+        received_at = datetime.now(UTC).isoformat()
         rows = response.get("data", []) if isinstance(response, dict) else []
         if not rows:
             return {}
-        return self._native_ticker_to_ccxt_shape(rows[0])
+        return {**self._native_ticker_to_ccxt_shape(rows[0]), "received_at": received_at}
 
     async def _fetch_authoritative_ticker_fallback(
         self,
@@ -639,6 +651,7 @@ class OKXRestClient:
             {"instType": "SWAP"},
             _request_priority=priority,
         )
+        received_at = datetime.now(UTC).isoformat()
         rows = response.get("data", []) if isinstance(response, dict) else []
         tickers: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -648,6 +661,7 @@ class OKXRestClient:
             if supported_inst_ids and inst_id not in supported_inst_ids:
                 continue
             ticker = self._native_ticker_to_ccxt_shape(row)
+            ticker["received_at"] = received_at
             symbol = str(ticker.get("symbol") or "").strip()
             if symbol:
                 tickers[symbol] = ticker
@@ -681,13 +695,14 @@ class OKXRestClient:
         kwargs: dict[str, Any] = {"limit": limit}
         if int(end_timestamp_ms or 0) > 0:
             kwargs["end_timestamp_ms"] = int(end_timestamp_ms or 0)
-        return await self._ccxt_call(
+        rows = await self._ccxt_call(
             "fetch_ohlcv",
             self._to_swap_symbol(symbol),
             timeframe,
             _request_priority=priority,
             **kwargs,
         )
+        return ObservedKlines(rows, received_at=datetime.now(UTC).isoformat())
 
     async def fetch_native_consistency_ohlcv(
         self,
@@ -710,10 +725,27 @@ class OKXRestClient:
             **kwargs,
         )
 
+    async def fetch_historical_ohlcv(
+        self,
+        symbol: str,
+        limit: int = 100,
+        *,
+        end_timestamp_ms: int,
+    ) -> list[list[float]]:
+        return await self._ccxt_call(
+            "fetch_historical_ohlcv",
+            self._to_swap_symbol(symbol),
+            limit=limit,
+            end_timestamp_ms=int(end_timestamp_ms),
+            _request_gate=self._historical_gate(),
+            _request_priority=False,
+        )
+
     async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:
         """Return OKX perpetual funding data, normalized for feature building."""
         try:
             data = await self._ccxt_call("fetch_funding_rate", self._to_swap_symbol(symbol))
+            received_at = datetime.now(UTC).isoformat()
         except Exception as exc:
             logger.debug("fetch funding rate failed", symbol=symbol, error=safe_error_text(exc))
             return {
@@ -749,12 +781,14 @@ class OKXRestClient:
             "funding_time": funding_time,
             "next_funding_time": next_funding_time,
             "funding_rate_observed_at": info.get("ts"),
+            "funding_rate_received_at": received_at,
         }
 
     async def fetch_open_interest(self, symbol: str) -> dict[str, Any]:
         """Return OKX perpetual open-interest data with safe defaults."""
         try:
             data = await self._ccxt_call("fetch_open_interest", self._to_swap_symbol(symbol))
+            received_at = datetime.now(UTC).isoformat()
         except Exception as exc:
             logger.debug("fetch open interest failed", symbol=symbol, error=safe_error_text(exc))
             return {"open_interest_contracts": 0.0, "open_interest_value": 0.0}
@@ -772,6 +806,8 @@ class OKXRestClient:
         return {
             "open_interest_contracts": contracts,
             "open_interest_value": value,
+            "open_interest_observed_at": data.get("timestamp") or info.get("ts"),
+            "open_interest_received_at": received_at,
         }
 
     async def _cached_derivatives_route(
@@ -941,6 +977,7 @@ class OKXRestClient:
                 self._to_swap_symbol(symbol),
                 limit=limit,
             )
+            received_at = datetime.now(UTC).isoformat()
             bids = book.get("bids") or []
             asks = book.get("asks") or []
             bid = self._safe_float(bids[0][0] if bids else 0.0)
@@ -989,6 +1026,7 @@ class OKXRestClient:
                     "source_endpoint": "okx_rest_market_books",
                     "source_channel": "books",
                     "source_timestamp_ms": source_timestamp_ms,
+                    "received_at": received_at,
                     "bid": bid,
                     "ask": ask,
                     "bid_depth_usdt": bid_depth_usdt,
@@ -1144,6 +1182,8 @@ class OKXRestClient:
         )
         mark_row = mark_rows[0] if mark_rows and isinstance(mark_rows[0], dict) else {}
         index_row = index_rows[0] if index_rows and isinstance(index_rows[0], dict) else {}
+        mark_received_at = mark_result.get("received_at") if isinstance(mark_result, dict) else None
+        index_received_at = index_result.get("received_at") if isinstance(index_result, dict) else None
         mark_price = self._safe_float(mark_row.get("markPx"))
         index_price = self._safe_float(index_row.get("idxPx"))
         fallback_used = False
@@ -1176,6 +1216,7 @@ class OKXRestClient:
                 if ticker_price > 0:
                     if mark_price <= 0:
                         mark_price = ticker_price
+                        mark_received_at = ticker_result.get("received_at")
                         mark_row = {
                             "instId": inst_id,
                             "instType": "SWAP",
@@ -1186,6 +1227,7 @@ class OKXRestClient:
                         fallback_used = True
                     if index_price <= 0:
                         index_price = ticker_price
+                        index_received_at = ticker_result.get("received_at")
                         index_row = {
                             "instId": uly,
                             "idxPx": ticker_result.get("last"),
@@ -1213,6 +1255,7 @@ class OKXRestClient:
                     "tickers-fallback" if mark_row.get("fallback") else "mark-price"
                 ),
                 "source_timestamp_ms": int(self._safe_float(mark_row.get("ts"))),
+                "received_at": mark_received_at,
                 "price": mark_price,
             },
             "index_price_fact": {
@@ -1229,6 +1272,7 @@ class OKXRestClient:
                     else "index-tickers"
                 ),
                 "source_timestamp_ms": int(self._safe_float(index_row.get("ts"))),
+                "received_at": index_received_at,
                 "price": index_price,
             },
         }
@@ -1248,7 +1292,13 @@ class OKXRestClient:
         existing = self._reference_route_tasks.get(key)
         if existing is not None and not existing.done():
             return existing
-        task = asyncio.create_task(fetcher())
+
+        async def fetch_with_receipt() -> Any:
+            result = await fetcher()
+            received_at = datetime.now(UTC).isoformat()
+            return {**result, "received_at": received_at} if isinstance(result, dict) else result
+
+        task = asyncio.create_task(fetch_with_receipt())
         self._reference_route_tasks[key] = task
 
         def cleanup(finished: asyncio.Task[Any]) -> None:

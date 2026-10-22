@@ -3,10 +3,41 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import event
 
 from config.settings import settings
 from db.repositories.market_repo import MarketRepository
 from db.session import close_db, get_session_ctx, init_db
+from models.market_data import Kline
+
+
+@pytest.mark.asyncio
+async def test_bulk_upsert_does_not_materialize_unrelated_history(monkeypatch, tmp_path) -> None:
+    await close_db()
+    db_path = tmp_path / "bounded-kline-upsert.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
+    timestamp = datetime(2026, 7, 10, 0, 0, tzinfo=UTC)
+    values = {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0}
+    loaded = []
+    try:
+        async with get_session_ctx() as session:
+            await MarketRepository(session).upsert_klines_bulk(
+                "BTC/USDT", "1m",
+                [(timestamp + timedelta(minutes=i), values) for i in range(200)],
+            )
+        async with get_session_ctx() as session:
+            event.listen(
+                session.sync_session, "loaded_as_persistent",
+                lambda _session, row: loaded.append(row) if isinstance(row, Kline) else None,
+            )
+            assert await MarketRepository(session).upsert_klines_bulk(
+                "BTC/USDT", "1m", [(timestamp, {**values, "close": 100.5})],
+            ) == 1
+            assert len(loaded) == 1
+            assert loaded[0].close == 100.5
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

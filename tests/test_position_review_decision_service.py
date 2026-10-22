@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,7 +30,7 @@ def _request(model_name: str = "ensemble_trader") -> PositionReviewDecisionReque
         model_name=model_name,
         symbol="BTC/USDT",
         normalized_symbol="BTC/USDT",
-        feature_vector=object(),
+        feature_vector=SimpleNamespace(),
         open_positions=[{"symbol": "BTC/USDT", "side": "long"}],
         trading_mode="paper",
         position_entry_pause_reason="",
@@ -55,6 +56,9 @@ async def test_position_review_decision_service_builds_ensemble_context_and_meta
         return {"expert_memory": {"symbol": symbol}}
 
     def ml_predictor(_feature_vector: Any) -> dict[str, Any]:
+        assert _feature_vector.feature_availability_contract["version"] == (
+            "2026-10-22.observed-feature-availability.v1"
+        )
         calls.append(("ml", None))
         return {"ready": True}
 

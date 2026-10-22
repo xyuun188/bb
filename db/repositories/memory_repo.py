@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import Float, cast, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import load_only
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
@@ -377,15 +378,22 @@ class MemoryRepository(BaseRepository):
             results.append(await self.create_shadow_backtest(row))
         return results
 
-    async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
-        """Drain old labels while reserving capacity for newly matured evidence."""
+    async def get_due_shadow_backtests(
+        self,
+        limit: int = 200,
+        *,
+        exclude_ids: list[int] | None = None,
+    ) -> list[ShadowBacktest]:
+        """Interleave old and recent labels so slow old rows cannot starve fresh work."""
 
         now = datetime.now(UTC)
         budget = max(int(limit or 200), 1)
-        filters = (
+        filters = [
             ShadowBacktest.status == "pending",
             ShadowBacktest.due_at <= now,
-        )
+        ]
+        if exclude_ids:
+            filters.append(ShadowBacktest.id.not_in(exclude_ids))
         oldest = (
             select(ShadowBacktest.id)
             .where(*filters)
@@ -404,10 +412,39 @@ class MemoryRepository(BaseRepository):
         stmt = (
             select(ShadowBacktest)
             .join(selected, ShadowBacktest.id == selected.c.id)
+            .options(
+                load_only(
+                    ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
+                    ShadowBacktest.model_name,
+                    ShadowBacktest.execution_mode,
+                    ShadowBacktest.symbol,
+                    ShadowBacktest.analysis_type,
+                    ShadowBacktest.decision_action,
+                    ShadowBacktest.decision_confidence,
+                    ShadowBacktest.entry_price,
+                    ShadowBacktest.feature_snapshot,
+                    ShadowBacktest.status,
+                    ShadowBacktest.due_at,
+                    ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.note,
+                    ShadowBacktest.created_at,
+                )
+            )
             .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
         )
         result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        chronological = list(result.scalars().all())
+        interleaved: list[ShadowBacktest] = []
+        left = 0
+        right = len(chronological) - 1
+        while left <= right:
+            interleaved.append(chronological[left])
+            if left != right:
+                interleaved.append(chronological[right])
+            left += 1
+            right -= 1
+        return interleaved
 
     async def get_market_decisions_missing_shadow_samples(
         self,
@@ -427,7 +464,10 @@ class MemoryRepository(BaseRepository):
         expected = max(int(horizon_count or 0), 1)
         shadow_count = (
             select(func.count(ShadowBacktest.id))
-            .where(ShadowBacktest.decision_id == AIDecision.id)
+            .where(
+                ShadowBacktest.decision_id == AIDecision.id,
+                ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
+            )
             .correlate(AIDecision)
             .scalar_subquery()
         )
@@ -436,21 +476,24 @@ class MemoryRepository(BaseRepository):
         # row; those wide JSON fields were the source of periodic 15s recovery
         # timeouts under normal trading load.
         stmt = (
-            select(
-                AIDecision.id,
-                AIDecision.model_name,
-                AIDecision.symbol,
-                AIDecision.action,
-                AIDecision.confidence,
-                AIDecision.reasoning,
-                AIDecision.position_size_pct,
-                AIDecision.suggested_leverage,
-                AIDecision.stop_loss_pct,
-                AIDecision.take_profit_pct,
-                AIDecision.is_paper,
-                AIDecision.created_at,
-                AIDecision.raw_llm_response,
-                AIDecision.feature_snapshot,
+            select(AIDecision)
+            .options(
+                load_only(
+                    AIDecision.id,
+                    AIDecision.model_name,
+                    AIDecision.symbol,
+                    AIDecision.action,
+                    AIDecision.confidence,
+                    AIDecision.reasoning,
+                    AIDecision.position_size_pct,
+                    AIDecision.suggested_leverage,
+                    AIDecision.stop_loss_pct,
+                    AIDecision.take_profit_pct,
+                    AIDecision.is_paper,
+                    AIDecision.created_at,
+                    AIDecision.raw_llm_response,
+                    AIDecision.feature_snapshot,
+                )
             )
             .where(
                 AIDecision.analysis_type == "market",
@@ -473,9 +516,31 @@ class MemoryRepository(BaseRepository):
         if not ids:
             return []
         result = await self.session.execute(
-            select(ShadowBacktest).where(
-                ShadowBacktest.id.in_(ids),
-                ShadowBacktest.status == "pending",
+            select(ShadowBacktest)
+            .where(
+                ShadowBacktest.id.in_(ids), ShadowBacktest.status == "pending",
+            )
+            .options(
+                load_only(
+                    ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
+                    ShadowBacktest.label_version,
+                    ShadowBacktest.symbol,
+                    ShadowBacktest.analysis_type,
+                    ShadowBacktest.decision_action,
+                    ShadowBacktest.decision_confidence,
+                    ShadowBacktest.feature_snapshot,
+                    ShadowBacktest.training_feature_snapshot,
+                    ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.due_at,
+                    ShadowBacktest.status,
+                    ShadowBacktest.long_return_pct,
+                    ShadowBacktest.short_return_pct,
+                    ShadowBacktest.best_action,
+                    ShadowBacktest.missed_opportunity,
+                    ShadowBacktest.note,
+                    ShadowBacktest.updated_at,
+                )
             )
         )
         return list(result.scalars().all())

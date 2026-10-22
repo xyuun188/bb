@@ -34,6 +34,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from config.settings import settings  # noqa: E402
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
+from core.training_feature_snapshot import compact_training_feature_snapshot  # noqa: E402
 from core.url_safety import normalize_http_base_url  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
@@ -132,13 +133,7 @@ _LOCAL_AI_TOOLS_SEQUENCE_KEYS = {
     "recent_closes",
     "recent_volumes",
 }
-_LOCAL_AI_TOOLS_TEXT_KEYS = {
-    "recent_headlines",
-    "headlines",
-}
 _LOCAL_AI_TOOLS_MAX_SEQUENCE_LENGTH = 80
-_LOCAL_AI_TOOLS_MAX_TEXT_ITEMS = 12
-_LOCAL_AI_TOOLS_MAX_TEXT_CHARS = 220
 _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE = 500
 _TRAINING_READ_STATEMENT_TIMEOUT_MS = 120_000
 _TRAINING_IDLE_TRANSACTION_TIMEOUT_MS = 180_000
@@ -290,18 +285,11 @@ def _compact_sequence(value: Any) -> list[float]:
     return out
 
 
-def _compact_text_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    out: list[str] = []
-    for item in value[-_LOCAL_AI_TOOLS_MAX_TEXT_ITEMS:]:
-        text = str(item or "").strip()
-        if text:
-            out.append(text[:_LOCAL_AI_TOOLS_MAX_TEXT_CHARS])
-    return out
-
-
 def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]:
+    if "feature_availability_contract" in features:
+        # Quality verification still needs the exact sealed inputs. Numerical
+        # projection belongs in _training_transport_features after that check.
+        return compact_training_feature_snapshot(features)
     compact: dict[str, Any] = {}
     for key in _LOCAL_AI_TOOLS_FEATURE_KEYS:
         if key not in features:
@@ -325,10 +313,6 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
         sequence = _compact_sequence(features.get(key))
         if sequence:
             compact[key] = sequence
-    for key in _LOCAL_AI_TOOLS_TEXT_KEYS:
-        texts = _compact_text_list(features.get(key))
-        if texts:
-            compact[key] = texts
     shadow = _compact_local_ai_tools_shadow(features.get("local_ai_tools_shadow"))
     if shadow:
         compact["local_ai_tools_shadow"] = shadow
@@ -805,11 +789,13 @@ def _compact_training_shadow_sample(row: Mapping[str, Any]) -> dict[str, Any] | 
     features = _snapshot(row.get("features"))
     if not features:
         return None
-    features.setdefault("symbol", row.get("symbol"))
+    sealed = "feature_availability_contract" in features
+    if not sealed:
+        features.setdefault("symbol", row.get("symbol"))
     features.setdefault("decision_confidence", _as_float(row.get("decision_confidence")))
     features.setdefault("horizon_minutes", int(row.get("horizon_minutes") or 10))
     fee_pct, _fee_source = round_trip_fee_pct(features)
-    if fee_pct > 0:
+    if fee_pct > 0 and not sealed:
         features["round_trip_fee_pct"] = fee_pct
     compact_features = _compact_local_ai_tools_features(features)
     if not compact_features:
@@ -929,7 +915,8 @@ async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
     for sample in samples:
         features = _compact_local_ai_tools_features(_snapshot(sample.get("features")))
         if features:
-            features.setdefault("symbol", sample.get("symbol"))
+            if "feature_availability_contract" not in features:
+                features.setdefault("symbol", sample.get("symbol"))
             sample["features"] = features
     return samples
 

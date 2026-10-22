@@ -25,7 +25,7 @@ from services.execution_cost_model import execution_cost_estimate
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
-PROFIT_SUPERVISION_VERSION = "2026-10-22.separated-profit-executable-provenance.v3"
+PROFIT_SUPERVISION_VERSION = "2026-10-22.separated-profit-component-availability.v4"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"

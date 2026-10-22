@@ -769,13 +769,48 @@ async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_ba
         for statement in fake_conn.statements
     )
     assert any(
+        "CREATE OR REPLACE FUNCTION bb_compact_training_feature_snapshot" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
+        "NEW.training_feature_snapshot_version := 3" in statement
+        and "bb_compact_training_feature_snapshot(" in statement
+        for statement in fake_conn.statements
+    )
+    assert any(
         "trg_shadow_backtests_training_feature_snapshot" in statement
         for statement in fake_conn.statements
     )
     assert any(
-        "UPDATE shadow_backtests" in statement and "training_feature_snapshot_version < 1" in statement
+        "UPDATE shadow_backtests" in statement
+        and "training_feature_snapshot_version < 1" in statement
         for statement in fake_conn.statements
     )
+
+
+def test_postgres_training_feature_snapshot_functions_are_single_ddl_statements() -> None:
+    from core.training_feature_snapshot import postgres_training_feature_snapshot_functions
+
+    statements = postgres_training_feature_snapshot_functions()
+
+    assert len(statements) == 4
+    assert [
+        statement.count("CREATE OR REPLACE FUNCTION")
+        for statement in statements
+    ] == [1, 1, 1, 1]
+    assert [
+        "bb_training_feature_storage_bytes",
+        "bb_training_feature_normalize_jsonb",
+        "bb_compact_market_fact",
+        "bb_compact_training_feature_snapshot",
+    ] == [
+        next(
+            line.split("FUNCTION ", 1)[1].split("(", 1)[0]
+            for line in statement.splitlines()
+            if "CREATE OR REPLACE FUNCTION " in line
+        )
+        for statement in statements
+    ]
 
 
 @pytest.mark.asyncio
@@ -810,6 +845,17 @@ async def test_postgres_shadow_snapshot_skips_steady_state_schema_ddl(
     )
 
     await session_module._ensure_shadow_backtest_training_snapshot_columns(fake_conn)
+
+    assert not any(statement.startswith("ALTER TABLE") for statement in fake_conn.statements)
+    assert any(
+        "CREATE OR REPLACE FUNCTION bb_compact_training_feature_snapshot" in statement
+        for statement in fake_conn.statements
+    )
+    assert not any(
+        "UPDATE shadow_backtests" in statement
+        and "training_feature_snapshot_version < 2" in statement
+        for statement in fake_conn.statements
+    )
 
 @pytest.mark.asyncio
 async def test_postgres_runtime_retention_columns_backfill_markers_and_add_indexes(

@@ -37,6 +37,28 @@ def test_native_consistency_route_uses_a_separate_gate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_history_backfill_cannot_occupy_native_fact_request_lane() -> None:
+    client = OKXRestClient()
+    calls = []
+
+    async def call(method, symbol, **kwargs):
+        calls.append((method, symbol, kwargs))
+        return []
+
+    client._ccxt_call = call
+    await client.fetch_historical_ohlcv(
+        "BTC/USDT", limit=62, end_timestamp_ms=1_780_000_120_000,
+    )
+    method, symbol, kwargs = calls[0]
+    assert method == "fetch_historical_ohlcv"
+    assert symbol == "BTC/USDT:USDT"
+    assert kwargs["_request_gate"] is client._historical_gate()
+    assert kwargs["_request_gate"] is not client._native_consistency_gate()
+    assert kwargs["_request_gate"] is not client._public_market_gate()
+    assert client._is_public_market_method(method)
+
+
+@pytest.mark.asyncio
 async def test_priority_market_gate_reserves_capacity_for_executable_routes() -> None:
     gate = _PriorityRequestGate(limit=4, normal_limit=2)
 

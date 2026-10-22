@@ -552,3 +552,171 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   for technical, news/sentiment, order-book and cost/funding components on
   newly collected samples, with component-level quarantine tests. Do not
   promote a candidate or reopen the inspected exam.
+
+## Point-In-Time Feature Availability Capture Batch
+
+- Local implementation is staged across 50 owned source/test paths on
+  `main` at `093f704`; three untracked audit helpers remain outside the index.
+  The only changes staged during this checkpoint were the two already-owned
+  test-file trailing-blank-line cleanups. No unrelated path was added.
+- The batch records an immutable pre-model feature fingerprint and freeze
+  time, and carries component-level clocks/fingerprints for the actual
+  technical K-line response, contributing news/social inputs, ticker,
+  order-book, mark/index prices, funding, account fee and open interest.
+  Training snapshots preserve frozen inputs without resealing or filling
+  missing facts; training quality excludes snapshots with missing,
+  contradictory, late, post-freeze, or changed component evidence. This
+  evidence gate does not weaken entry or risk controls and does not establish
+  profitability.
+- Local focused verification for feature capture, compaction, quality,
+  sentiment, shadow quarantine/settlement and queue paths:
+  `243 passed, 1 skipped`. Ruff across the owned Python paths passed;
+  staged and unstaged whitespace checks passed.
+- The targeted source/test sync completed without restarting either service.
+  Remote Python source integrity reported `source-integrity-ok:888`.
+  Remote focused suite with a unique, initially absent `/tmp/bb-g2-tests.*`
+  pytest base passed `243 passed, 1 skipped` in 17.24 seconds. The initial
+  sync used the complete tracked test set because the helper accepts
+  `--include-tests`; it uploaded 69 changed tracked paths and reported one
+  stale remote audit helper removed. Restore and hash-verify that helper from
+  the preserved local untracked copy before the next deployment. Future syncs
+  for this batch must use explicit `--only` filters to avoid pruning other
+  remote paths.
+- Read-only online check around `2026-10-22T14:00Z`: paper and Dashboard
+  active, `NRestarts=0`; paper process `TRADING_MODE=paper`; persisted runtime
+  state `mode=paper`, `running=true`, `paused=false`; Dashboard health HTTP
+  200. No matching profitability/frozen/G2 evaluation unit or system job was
+  active. This check preceded loading the new code into the running process.
+- A bounded 3-hour coverage projection found 92 recent market decisions,
+  three with incomplete shadow horizons and a minimum of zero horizons. The
+  recent 15-minute queue projection showed 1,868 due pending rows, with
+  horizon counts 347/379/477/665, and 40 shadow rows updated to completed in
+  the preceding five minutes. Queue work is progressing but coverage is not
+  yet complete. No G4 exam was opened.
+- G2 remains blocked on legacy samples without component availability,
+  verified post-deploy capture for newly collected decisions, historical
+  delivery latency, and unresolved fee/funding lineage. G3-G6 remain pending;
+  no profitability conclusion is supported.
+- The first post-restart projection (seven market decisions created after
+  `2026-10-22T14:12:38Z`) confirmed the sealed contract on all seven, but
+  only four had all selected scalar fields present and only four had observed
+  technical delivery. News clock errors were nonzero because RSS publication
+  dates use RFC-2822 strings that the original parser rejected; some rows also
+  reused database-only K-lines without an observed network receipt. These are
+  lineage defects, not profitability evidence.
+- Repair in the follow-up working tree: `availability_timestamp` now accepts
+  timezone-bearing RFC-2822 dates; an indicator snapshot built only from
+  cached K-lines is accepted as fresh only when its technical availability
+  contract proves observed delivery, otherwise the service performs a bounded
+  exchange refresh and fails closed if that refresh cannot provide receipts.
+  Existing cached rows remain available for diagnostics but cannot silently
+  authorize a model input.
+- New local regression status after the repair: `145 passed` across the
+  availability, sentiment/news and data-service security suites; Ruff and
+  whitespace checks passed. The broader prior local/remote batch remains
+  `243 passed, 1 skipped` before this follow-up repair.
+- Next exact action: stage only the repair, its tests and this checkpoint;
+  upload with explicit `--only` filters and no restart, run the same remote
+  focused suite in a unique initially-absent pytest base directory, then
+  restart only `bb-paper-trading.service` after read-only paper-mode checks.
+  Verify a fresh bounded decision sample has zero RFC-date clock errors and
+  no database-only technical snapshot is treated as observed. Keep all
+  incomplete samples quarantined; G2 remains pending until this evidence and
+  the historical/fee lineage gaps are resolved.
+
+### Compact Storage Fingerprint Parity Diagnostic (2026-10-23)
+
+- Recovery confirmed the point-in-time availability batch is still the first
+  incomplete gate; the active goal and 30-minute continuation remain intact.
+  Local `main` and `origin/main` are both `093f704`; unrelated staged and
+  unstaged paths remain present and were not reset or broadly staged.
+- Local focused regression group passed `174 passed, 1 skipped`; the skipped
+  test is the PostgreSQL temporary-transaction parity check because local
+  `BB_TEST_POSTGRES_URL` is unset. Ruff passed for the affected availability,
+  market-fact, snapshot, data-service and test modules; `git diff --check`
+  passed.
+- Read-only remote inventory found paper, Dashboard and model-tunnel services
+  active; no profitability/frozen-feature audit service was active. A
+  `bb-phase3-market-data-warmup.service` start job was present at the time of
+  inventory and must be checked before adding database work. No service was
+  restarted.
+- Remote hashes for `core/feature_availability.py`,
+  `core/market_facts.py`, `core/training_feature_snapshot.py` and
+  `models/learning.py` matched the working tree. The diagnostic test file was
+  stale. Two targeted SFTP uploads were reset during file close and left the
+  remote test path at zero bytes; that file was restored via an SSH-streamed
+  temporary file and atomic rename, then verified against local SHA-256
+  `18a8544908a1d5f15ff3f06344186b9bb63997a864f51bb511937a8bb58dbdf8`
+  (36,302 bytes). The targeted sync still skipped all service restarts.
+- The parity test now sets a 15-second transaction-local statement timeout
+  and a 5-second lock timeout before creating temporary objects. This limits
+  the remote check to one connection, temporary functions/table, scalar
+  fingerprint/size comparisons and transaction rollback. No outcome labels
+  or trading rows are selected or mutated.
+- Current result: the local behavior suite passes, but SQL/Python compact
+  fingerprint parity remains unverified online; do not activate a code
+  service or claim this repair is complete. Next: confirm the warm-up unit is
+  no longer running, then run only
+  `test_postgres_and_python_snapshot_compaction_match_in_temporary_functions`
+  under a unique transient unit with one CPU, 1 GiB, 300-second deadline,
+  transaction-local statement/lock timeouts and a unique temporary pytest
+  directory. Record the three diagnostic fingerprints and full comparison
+  result; repair the smallest source discrepancy and repeat focused tests
+  before considering any service restart.
+
+### Compact DDL Installation Recovery And Fresh Capture Check (2026-10-23)
+
+- Root cause was confirmed in the running paper service: the PostgreSQL
+  migration loop sent one prepared statement containing three `CREATE
+  FUNCTION` commands. `asyncpg` rejected it with
+  `cannot insert multiple commands into a prepared statement`, leaving
+  `bb-paper-trading.service` in an automatic restart loop (`NRestarts=26`
+  during the first diagnosis).
+- `postgres_training_feature_snapshot_functions()` now returns four
+  independent DDL statements in dependency order: storage bytes, JSONB
+  normalization, market-fact compaction, and training-snapshot compaction.
+  A regression asserts exactly one `CREATE OR REPLACE FUNCTION` per returned
+  statement. Local focused verification passed `43 passed, 1 skipped`;
+  Ruff, compilation, and whitespace checks passed.
+- The owned source/test paths were uploaded with explicit `--only` filters
+  and no broad worktree sync. The remote isolated PostgreSQL parity test
+  passed `1 passed`; the remote combined DDL/compaction suite passed
+  `44 passed`. The test used one connection, temporary functions, a
+  transaction-local 15-second statement timeout and 5-second lock timeout.
+- After the upload, the paper process recovered without a duplicate restart:
+  `bb-paper-trading.service` stayed `active/running` with the same main PID
+  and `NRestarts=72` across a 30-second bounded check. Runtime settings were
+  `mode=paper`, `paper=True`, `live=False`, and no new prepared-statement
+  error appeared after the 2026-10-22 19:01:38 UTC process start.
+- Fresh post-recovery capture from the immutable boundary
+  `[2026-10-22T19:01:38Z, current check]` contained 36 market decisions.
+  Python compaction had maximum frozen size `96,902 B` against the `98,304 B`
+  budget, with zero over-budget rows and zero seal errors. The 45-minute
+  diagnostic that included pre-recovery rows is not used as fresh evidence;
+  its legacy seal errors remain quarantined.
+- The same fresh boundary had 38 shadow decisions with the new availability
+  contract and storage contract. Twenty-two passed component-availability
+  checks; sixteen remained quarantined. The dominant reasons were missing or
+  unobserved index/mark receipt clocks and missing order-book facts. A
+  bounded source projection showed valid REST fallback facts on many rows,
+  while other rows had explicit zero/empty exchange responses; no defaults
+  were treated as observed data.
+- Full local repair/regression group passed `713 passed, 1 skipped`; no
+  profitability labels were opened by this batch. The exact same 23-file
+  remote focused group then passed `714 passed` in 99.05 seconds with one
+  CPU, 1 GiB memory and a 300-second deadline. The remote run used
+  `DATABASE_MAX_OVERFLOW=0` without forcing pool size to one, preserving the
+  pool-concurrency regression's intended precondition. Remote source
+  integrity passed for all 51 explicit paths; only
+  `tests/test_feature_availability_compaction.py` needed an upload.
+- Final read-only runtime check: paper and Dashboard are active; paper main
+  PID `2530425` and `NRestarts=72` were stable; runtime and persisted control
+  both report paper mode, live false, running true and unpaused. No prepared
+  statement error has appeared since the recovered process start, and no
+  profitability/frozen/G2 audit unit remains active. No order or protection
+  action was taken.
+- G2 remains `blocked_by_component_availability_evidence`; G3-G6 remain
+  pending. Next exact action: repair or instrument the remaining
+  index/mark/order-book receipt paths, then collect a fresh bounded post-fix
+  window and require zero contract errors plus complete component clocks
+  before any candidate research or exam is opened.

@@ -16,6 +16,7 @@ from core.training_contracts import (
     build_shadow_label_contract,
     compact_shadow_label_contract,
 )
+from core.training_feature_snapshot import TRAINING_FEATURE_SNAPSHOT_VERSION
 from db.repositories.memory_repo import MemoryRepository
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
@@ -78,6 +79,7 @@ from services.training_data_quality import (
     quality_report,
 )
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 
 
 def test_local_ml_training_retries_on_latest_window_after_memory_error(
@@ -456,8 +458,10 @@ def _with_return_objective(metadata: dict) -> dict:
     return metadata
 
 
-def _clean_training_market_fact_contract() -> dict[str, object]:
-    return {
+def _clean_training_market_fact_contract(
+    result_at: datetime | None = None,
+) -> dict[str, object]:
+    contract: dict[str, object] = {
         "version": MARKET_FACT_CONTRACT_VERSION,
         "status": "clean",
         "violation_count": 0,
@@ -467,6 +471,10 @@ def _clean_training_market_fact_contract() -> dict[str, object]:
         "executable_market_fact_verified": True,
         "data_fingerprint": "test-shadow-market-facts",
     }
+    if result_at is not None:
+        contract["result_source_timestamp_ms"] = int(result_at.timestamp() * 1000)
+        contract["result_received_at"] = result_at.isoformat()
+    return contract
 
 
 def _clean_training_label_contract(
@@ -497,7 +505,7 @@ def _clean_training_label_contract(
             short_take_profit_triggered=False,
             long_first_touch="none",
             short_first_touch="none",
-            market_fact_contract=_clean_training_market_fact_contract(),
+            market_fact_contract=_clean_training_market_fact_contract(due_at),
             cost_facts={"round_trip_fee_pct": 0.08},
             label_timestamp=due_at,
         )
@@ -614,6 +622,23 @@ def _db_shadow_row(
 ) -> ShadowBacktest:
     due_at = created_at + timedelta(minutes=30)
     decision_id = row_id + 10_000
+    feature_snapshot = {
+        "current_price": 100.0,
+        "spread_pct": 0.01,
+        "round_trip_fee_pct": 0.08,
+        "funding_rate": 0.0,
+        "funding_interval_minutes": 480.0,
+        "training_market_fact_contract": _clean_training_market_fact_contract(due_at),
+        "training_label_contract": _clean_training_label_contract(
+            row_id,
+            due_at,
+            decision_id=decision_id,
+            long_return_pct=float(long_return_pct or 0.0),
+            short_return_pct=float(short_return_pct or 0.0),
+            best_action=best_action,
+        ),
+    }
+    seal_synthetic_feature_availability(feature_snapshot, decision_at=created_at)
     return ShadowBacktest(
         id=row_id,
         decision_id=decision_id,
@@ -625,22 +650,7 @@ def _db_shadow_row(
         decision_action=action,
         decision_confidence=0.7,
         entry_price=100.0,
-        feature_snapshot={
-            "current_price": 100.0,
-            "spread_pct": 0.01,
-            "round_trip_fee_pct": 0.08,
-            "funding_rate": 0.0,
-            "funding_interval_minutes": 480.0,
-            "training_market_fact_contract": _clean_training_market_fact_contract(),
-            "training_label_contract": _clean_training_label_contract(
-                row_id,
-                due_at,
-                decision_id=decision_id,
-                long_return_pct=float(long_return_pct or 0.0),
-                short_return_pct=float(short_return_pct or 0.0),
-                best_action=best_action,
-            ),
-        },
+        feature_snapshot=feature_snapshot,
         status=status,
         due_at=due_at,
         horizon_minutes=30,
@@ -701,17 +711,17 @@ def _shadow_row(
     created_at: datetime | None = None,
 ) -> SimpleNamespace:
     row_created_at = created_at or datetime(2026, 6, 23, 3, row_id % 60, tzinfo=UTC)
+    due_at = row_created_at + timedelta(minutes=30)
+    decision_id = row_id + 10_000
     cost_complete_features: dict[str, object] = {
         "current_price": 100.0,
         "spread_pct": 0.01,
         "round_trip_fee_pct": 0.08,
         "funding_rate": 0.0,
         "funding_interval_minutes": 480.0,
-        "training_market_fact_contract": _clean_training_market_fact_contract(),
+        "training_market_fact_contract": _clean_training_market_fact_contract(due_at),
     }
     cost_complete_features.update(feature_snapshot or {})
-    due_at = row_created_at + timedelta(minutes=30)
-    decision_id = row_id + 10_000
     cost_complete_features.setdefault(
         "training_label_contract",
         _clean_training_label_contract(
@@ -722,6 +732,10 @@ def _shadow_row(
             short_return_pct=0.14 if best_action == "short" else -0.05,
             best_action=best_action,
         ),
+    )
+    seal_synthetic_feature_availability(
+        cost_complete_features,
+        decision_at=row_created_at,
     )
     return SimpleNamespace(
         id=row_id,
@@ -1499,7 +1513,7 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
             "liquidation_risk_score": 0.42,
             "direct_sentiment_data_available": True,
             "direct_news_item_count": 3,
-            "training_market_fact_contract": _clean_training_market_fact_contract(),
+            "training_market_fact_contract": _clean_training_market_fact_contract(due_at),
             "training_label_contract": _clean_training_label_contract(
                 7,
                 due_at,
@@ -1514,6 +1528,10 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
         best_action="short",
         missed_opportunity=False,
         due_at=due_at,
+    )
+    seal_synthetic_feature_availability(
+        row.feature_snapshot,
+        decision_at=due_at - timedelta(minutes=30),
     )
 
     frame = build_training_frame([row])
@@ -3238,7 +3256,7 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
         "funding_interval_minutes": 480.0,
         "feature_timestamp": created_at.isoformat(),
         "market_data_quality": {"code": ""},
-        "training_market_fact_contract": _clean_training_market_fact_contract(),
+        "training_market_fact_contract": _clean_training_market_fact_contract(row.due_at),
         "training_label_contract": _clean_training_label_contract(
             77,
             row.due_at,
@@ -3249,6 +3267,7 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
         ),
         "unused_llm_context": {"transcript": "x" * 100_000},
     }
+    seal_synthetic_feature_availability(row.feature_snapshot, decision_at=created_at)
     async with get_session_ctx() as session:
         session.add(row)
 
@@ -3257,7 +3276,7 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
         async with get_session_ctx() as session:
             compact = await session.get(ShadowBacktest, 77)
             assert compact is not None
-            assert compact.training_feature_snapshot_version == 1
+            assert compact.training_feature_snapshot_version == TRAINING_FEATURE_SNAPSHOT_VERSION
             assert compact.training_feature_snapshot["market_data_quality"] == {"code": ""}
             assert "unused_llm_context" not in compact.training_feature_snapshot
     finally:

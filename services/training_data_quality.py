@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from core.feature_availability import feature_availability_reasons
 from core.market_facts import (
     MARKET_FACT_CONTRACT_VERSION,
     compact_market_fact_contract,
@@ -42,7 +43,7 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-10-22.shadow-label-source-timing.v7"
+DATA_QUALITY_VERSION = "2026-10-22.component-feature-availability.v8"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
@@ -389,6 +390,17 @@ def _shadow_cost_completeness_reasons(features: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def _sample_feature_availability_reasons(sample: dict[str, Any]) -> list[str]:
+    features = _features(sample)
+    decision_at = sample.get("original_decision_timestamp") or features.get(
+        "original_decision_timestamp"
+    )
+    return [
+        f"feature_availability:{reason}"
+        for reason in feature_availability_reasons(features, decision_at=decision_at)
+    ]
+
+
 def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     features = _features(sample)
     reasons: list[str] = []
@@ -478,6 +490,10 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             0.0, [f"shadow_label_timing:{reason}" for reason in timing_reasons],
             exclude=True,
         )
+
+    availability_reasons = _sample_feature_availability_reasons(sample)
+    if availability_reasons:
+        return _final_assessment(0.0, availability_reasons, exclude=True)
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -681,6 +697,10 @@ def assess_trade_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             return _final_assessment(
                 0.0, ["unknown_losing_exit_attribution"], exclude=True
             )
+
+    availability_reasons = _sample_feature_availability_reasons(sample)
+    if availability_reasons:
+        return _final_assessment(0.0, availability_reasons, exclude=True)
 
     return _final_assessment(score, reasons, exclude=exclude)
 
@@ -1183,7 +1203,19 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
         "label_version": sample.get("label_version")
         or _safe_dict(features.get("training_label_contract")).get("version"),
         "feature_timestamp": sample.get("feature_timestamp") or features.get("timestamp"),
+        "feature_snapshot_frozen_at": features.get("feature_snapshot_frozen_at"),
+        "original_decision_timestamp": sample.get("original_decision_timestamp")
+        or features.get("original_decision_timestamp"),
         "label_timestamp": sample.get("label_timestamp"),
+    }
+    availability = {
+        key: features.get(key)
+        for key in (
+            "feature_availability_contract",
+            "technical_availability",
+            "sentiment_availability",
+        )
+        if key in features
     }
     label = {
         "gross_long_return_pct": _safe_float(sample.get("long_return_pct"), None),
@@ -1264,6 +1296,7 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
             else None
         ),
         "lineage": lineage,
+        "feature_availability": availability,
         "market_fact_data_fingerprint": _safe_dict(
             market_contract.get("provenance")
         ).get("data_fingerprint"),
@@ -1280,6 +1313,7 @@ def _training_sample_contract(sample: dict[str, Any], *, kind: SampleKind) -> di
         ),
         "required_label_version": SHADOW_LABEL_VERSION if kind == "shadow" else None,
         "lineage": lineage,
+        "feature_availability": availability,
         "market_fact_contract": market_contract,
         "shadow_label_contract": _safe_dict(features.get("training_label_contract")),
         "cost_facts": cost,

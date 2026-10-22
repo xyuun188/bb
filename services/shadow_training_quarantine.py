@@ -9,13 +9,15 @@ all consume the same clean training view.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import load_only
 
+from core.training_contracts import SHADOW_LABEL_VERSION
 from db.session import get_session_ctx
 from models.learning import ShadowBacktest
 from services.trading_params import DEFAULT_TRADING_PARAMS
@@ -25,6 +27,13 @@ from services.training_epoch import load_training_data_start
 QUARANTINE_STATUS = "quarantined"
 TRAINING_QUARANTINE_MARKER = "[training_quarantine]"
 _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+_HISTORICAL_REQUALIFICATION_REASONS = {
+    "market_data_quality:native_market_fact_invalid",
+    "market_data_quality:orderbook_depth_invalid",
+}
+_TRAINING_QUARANTINE_REASON_PATTERN = re.compile(
+    r"(?:^|\n)\[training_quarantine\][ \t]*([^\r\n]+)"
+)
 
 
 def _safe_feature_snapshot(value: Any) -> dict[str, Any]:
@@ -245,4 +254,145 @@ async def quarantine_dirty_shadow_samples(
         "top_reasons": [
             {"reason": reason, "count": count} for reason, count in reason_counts.most_common(20)
         ],
+    }
+
+
+async def requalify_verified_historical_shadow_samples(
+    *,
+    batch_size: int = 250,
+    max_batches: int = 20,
+    dry_run: bool = True,
+    only_newer_than_id: int | None = None,
+    only_up_to_id: int | None = None,
+) -> dict[str, Any]:
+    """Restore only historical rows quarantined solely by obsolete quote quality."""
+
+    size = max(int(batch_size or 250), 1)
+    batches = max(int(max_batches or 20), 1)
+    scanned = eligible = requalified = 0
+    cursor_id = int(only_newer_than_id) if only_newer_than_id is not None else None
+    candidate_ids: list[int] = []
+    skipped_reasons: Counter[str] = Counter()
+    coverage_complete = False
+    epoch_start = load_training_data_start()
+    quarantine_reason_filter = or_(
+        *(
+            ShadowBacktest.note.like(f"%{TRAINING_QUARANTINE_MARKER} {reason}%")
+            for reason in _HISTORICAL_REQUALIFICATION_REASONS
+        )
+    )
+
+    async with get_session_ctx() as session:
+        for _batch_index in range(batches):
+            stmt = (
+                select(ShadowBacktest)
+                .where(
+                    ShadowBacktest.status == QUARANTINE_STATUS,
+                    ShadowBacktest.created_at >= epoch_start,
+                    ShadowBacktest.execution_mode == "paper",
+                    ShadowBacktest.analysis_type == "market",
+                    ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
+                    ShadowBacktest.long_return_pct.is_not(None),
+                    ShadowBacktest.short_return_pct.is_not(None),
+                    ShadowBacktest.training_feature_snapshot_version >= 1,
+                    ShadowBacktest.training_feature_snapshot.is_not(None),
+                    ShadowBacktest.training_feature_snapshot[
+                        "historical_market_path_only"
+                    ].as_boolean().is_(True),
+                    quarantine_reason_filter,
+                )
+                .options(
+                    load_only(
+                        ShadowBacktest.id,
+                        ShadowBacktest.training_feature_snapshot,
+                        ShadowBacktest.training_feature_snapshot_version,
+                        ShadowBacktest.label_version,
+                        ShadowBacktest.decision_id,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.analysis_type,
+                        ShadowBacktest.decision_action,
+                        ShadowBacktest.decision_confidence,
+                        ShadowBacktest.horizon_minutes,
+                        ShadowBacktest.long_return_pct,
+                        ShadowBacktest.short_return_pct,
+                        ShadowBacktest.due_at,
+                        ShadowBacktest.best_action,
+                        ShadowBacktest.missed_opportunity,
+                        ShadowBacktest.note,
+                        ShadowBacktest.status,
+                        ShadowBacktest.updated_at,
+                    )
+                )
+                .order_by(ShadowBacktest.id.asc())
+            )
+            if cursor_id is not None:
+                stmt = stmt.where(ShadowBacktest.id > cursor_id)
+            if only_up_to_id is not None:
+                stmt = stmt.where(ShadowBacktest.id <= int(only_up_to_id))
+            stmt = stmt.limit(size)
+            rows = list((await session.execute(stmt)).scalars().all())
+            if not rows:
+                coverage_complete = True
+                break
+
+            for row in rows:
+                cursor_id = int(row.id)
+                scanned += 1
+                note = str(row.note or "")
+                reasons = _TRAINING_QUARANTINE_REASON_PATTERN.findall(note)
+                if (
+                    len(reasons) != 1
+                    or reasons[0].strip() not in _HISTORICAL_REQUALIFICATION_REASONS
+                ):
+                    skipped_reasons["quarantine_reason_not_solely_obsolete_quote_quality"] += 1
+                    continue
+                feature_snapshot = _safe_feature_snapshot(row.training_feature_snapshot)
+                if feature_snapshot.get("historical_market_path_only") is not True:
+                    skipped_reasons["not_historical_market_path_only"] += 1
+                    continue
+
+                assessment = assess_shadow_sample(
+                    {
+                        **shadow_quality_sample(row),
+                        "features": feature_snapshot,
+                    }
+                )
+                if (
+                    assessment.status != "downweighted"
+                    or assessment.reasons != ("historical_market_path_only",)
+                ):
+                    skipped_reasons.update(assessment.reasons or ("assessment_not_downweighted",))
+                    continue
+                eligible += 1
+                if len(candidate_ids) < 50:
+                    candidate_ids.append(int(row.id))
+                if not dry_run:
+                    row.status = "completed"
+                    row.note = (
+                        f"{note}\n[training_requalified] "
+                        "verified_historical_path_after_market_quality_fix"
+                    )
+                    row.updated_at = datetime.now(UTC)
+                    requalified += 1
+
+            if not dry_run:
+                await session.flush()
+            if len(rows) < size:
+                coverage_complete = True
+                break
+
+    return {
+        "dry_run": dry_run,
+        "batch_size": size,
+        "max_batches": batches,
+        "only_newer_than_id": only_newer_than_id,
+        "only_up_to_id": only_up_to_id,
+        "training_epoch_started_at": epoch_start.isoformat(),
+        "scanned": scanned,
+        "coverage_complete": coverage_complete,
+        "eligible": eligible,
+        "requalified": requalified,
+        "last_scanned_id": cursor_id,
+        "candidate_ids_sample": candidate_ids,
+        "skipped_reasons": dict(skipped_reasons),
     }

@@ -389,6 +389,43 @@ async def test_native_consistency_candles_can_anchor_to_fact_minute() -> None:
 
 
 @pytest.mark.asyncio
+async def test_historical_candles_use_history_endpoint_and_exclude_unclosed_bars() -> None:
+    class HistoryApi:
+        def __init__(self):
+            self.calls = []
+
+        def get_history_candlesticks(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "code": "0",
+                "data": [
+                    ["1780000120000", "1", "2", "0.9", "1.5", "10", "10", "15", "0"],
+                    ["1780000060000", "1", "2", "0.9", "1.1", "9", "9", "10", "1"],
+                ],
+            }
+
+    exchange = OkxPerpetualSdkExchange("paper")
+    primary_api = _MarketApi()
+    native_api = _MarketApi()
+    history_api = HistoryApi()
+    exchange._market_api = primary_api
+    exchange._native_consistency_market_api = native_api
+    exchange._historical_market_api = history_api
+
+    rows = await exchange.fetch_historical_ohlcv(
+        "BTC/USDT", limit=62, end_timestamp_ms=1_780_000_120_000,
+    )
+
+    assert len(rows) == 1
+    assert rows[0][0] == 1_780_000_060_000
+    assert primary_api.calls == native_api.calls == []
+    assert history_api.calls == [{
+        "instId": "BTC-USDT-SWAP", "bar": "1m", "limit": "62",
+        "after": "1780000180000",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_ohlcv_can_anchor_a_historical_shadow_window_at_result_time() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     market_api = _MarketApi()

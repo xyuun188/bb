@@ -600,8 +600,7 @@ def test_local_ai_tools_shadow_features_are_compacted_for_training_payload() -> 
     assert compact["current_price"] == 100.5
     assert compact["rsi_14"] == 55.0
     assert compact["close_sequence"] == list(range(40, 120))
-    assert len(compact["recent_headlines"]) == 12
-    assert all(len(text) == 220 for text in compact["recent_headlines"])
+    assert "recent_headlines" not in compact
     shadow = compact["local_ai_tools_shadow"]["time_series_prediction"]
     assert shadow["timesfm_shadow_expected_return_pct"] == 0.42
     assert shadow["timesfm_shadow_side"] == "long"

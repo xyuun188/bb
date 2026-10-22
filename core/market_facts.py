@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from core.feature_availability import availability_timestamp
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symbol_from_okx_inst_id
 
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
@@ -202,6 +203,7 @@ def build_market_fact(
     *,
     contract_spec: Mapping[str, Any] | None = None,
     received_at: Any = None,
+    require_observed_receipt: bool = False,
 ) -> dict[str, Any]:
     raw = _dict(snapshot)
     info = _dict(raw.get("info"))
@@ -221,6 +223,7 @@ def build_market_fact(
         else ""
     )
     default_channel = "tickers" if default_endpoint else ""
+    observed_receipt = availability_timestamp(received_at or raw.get("received_at"))
     fact = {
         "schema_version": MARKET_FACT_SCHEMA_VERSION,
         "symbol": normalized_symbol,
@@ -232,7 +235,11 @@ def build_market_fact(
         "source_channel": _text(raw.get("source_channel") or default_channel),
         "source_timestamp_ms": source_timestamp_ms,
         "source_sequence": raw.get("source_sequence") or info.get("seqId"),
-        "received_at": _iso(received_at or raw.get("received_at") or datetime.now(UTC)),
+        "received_at": (
+            observed_receipt.isoformat() if observed_receipt is not None else None
+        ) if require_observed_receipt else (
+            _iso(received_at or raw.get("received_at") or datetime.now(UTC))
+        ),
         "prices": {
             "last": _safe_float(
                 raw.get("last_price") or raw.get("last") or raw.get("current_price"), 0.0

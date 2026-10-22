@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ai_brain.base_model import DecisionOutput
+from core.feature_availability import seal_feature_availability
 
 ExpertMemoryContextProvider = Callable[[str], Awaitable[dict[str, Any]]]
 MLSignalPredictor = Callable[[Any], dict[str, Any] | Awaitable[dict[str, Any]]]
@@ -87,6 +88,7 @@ class PositionReviewDecisionService:
     ) -> PositionReviewDecisionResult | None:
         """Build context, call the model, and attach position-review metadata."""
 
+        seal_feature_availability(request.feature_vector)
         memory_context = await self.expert_memory_context_provider(
             request.normalized_symbol or request.symbol
         )

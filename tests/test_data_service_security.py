@@ -919,7 +919,7 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
 
 
 @pytest.mark.asyncio
-async def test_indicator_snapshot_uses_cached_klines_before_okx_fetch(
+async def test_indicator_snapshot_refreshes_when_cached_klines_lack_receipt_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _service()
@@ -969,7 +969,7 @@ async def test_indicator_snapshot_uses_cached_klines_before_okx_fetch(
     features = await service._get_indicator_snapshot("BTC/USDT")
 
     assert features["close"] == 100.5
-    assert fetch_calls == 0
+    assert fetch_calls == len(data_service_module.KLINE_PERSIST_TIMEFRAME_LIMITS)
 
 
 @pytest.mark.asyncio
