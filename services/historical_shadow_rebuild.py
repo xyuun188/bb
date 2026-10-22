@@ -68,6 +68,7 @@ def build_historical_shadow_sample(
     ordered = sorted((dict(row) for row in bars), key=lambda row: _as_utc(row["open_time"]))
     entry_at = _minute(created_at)
     result_at = entry_at + timedelta(minutes=int(horizon_minutes))
+    scheduled_label_at = _as_utc(created_at) + timedelta(minutes=int(horizon_minutes))
     window = [row for row in ordered if entry_at <= _as_utc(row["open_time"]) <= result_at]
     if not window or _as_utc(window[0]["open_time"]) != entry_at or _as_utc(window[-1]["open_time"]) != result_at:
         return None
@@ -75,17 +76,24 @@ def build_historical_shadow_sample(
     if len(window) != expected:
         return None
     features = dict(getattr(decision, "feature_snapshot", None) or {})
-    entry_price = _finite_float(features.get("current_price"), None) or _finite_float(window[0]["close"], None)
+    entry_price = _finite_float(features.get("current_price"), None)
     result_price = _finite_float(window[-1]["close"], None)
     if entry_price is None or result_price is None or entry_price <= 0 or result_price <= 0:
         return None
     entry_fact = build_historical_market_fact(symbol, window[0], role="entry")
     result_fact = build_historical_market_fact(symbol, window[-1], role="result")
+    source_available_at = datetime.fromisoformat(
+        str(result_fact["source_available_at"]).replace("Z", "+00:00")
+    )
+    maturity_lag_seconds = (source_available_at - scheduled_label_at).total_seconds()
+    if maturity_lag_seconds < 0 or maturity_lag_seconds > 60:
+        return None
     contract = build_historical_market_contract(
         symbol=symbol,
         entry_fact=entry_fact,
         result_fact=result_fact,
         bars=window,
+        scheduled_label_at=scheduled_label_at,
     )
     path_labels = shadow_path_labels(
         entry_price=entry_price,
@@ -102,7 +110,10 @@ def build_historical_shadow_sample(
         "current_price": entry_price,
         "historical_market_path_only": True,
         "historical_shadow_rebuild_version": HISTORICAL_SHADOW_REBUILD_VERSION,
-        "market_fact": entry_fact,
+        # This fact is retained only to reconstruct the historical price path.
+        # It is deliberately separate from decision-time features because the
+        # candle close is not observed until the bar closes.
+        "historical_market_path_entry_fact": entry_fact,
         "market_fact_contract": contract,
         "training_market_fact_contract": compact_historical_market_contract(contract),
     }
@@ -116,7 +127,8 @@ def build_historical_shadow_sample(
             best_action=best_action,
             market_fact_contract=feature_snapshot["training_market_fact_contract"],
             cost_facts={"cost_complete": False},
-            label_timestamp=result_at,
+            label_timestamp=source_available_at,
+            scheduled_label_at=scheduled_label_at,
             **path_labels,
         )
     )
@@ -135,7 +147,7 @@ def build_historical_shadow_sample(
         "status": "completed",
         "created_at": _as_utc(created_at),
         "updated_at": datetime.now(UTC),
-        "due_at": result_at,
+        "due_at": scheduled_label_at,
         "horizon_minutes": int(horizon_minutes),
         "label_version": SHADOW_LABEL_VERSION,
         "actual_price": result_price,

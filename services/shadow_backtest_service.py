@@ -23,6 +23,7 @@ from core.training_contracts import (
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
     compact_shadow_label_contract,
+    shadow_label_timing,
 )
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
@@ -51,6 +52,9 @@ SHADOW_RESULT_PATH_TIMEOUT_SECONDS = 30.0
 SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS = 60.0
 SHADOW_RESULT_PATH_RETRY_COUNT = 1
 SHADOW_RESULT_PATH_RETRY_DELAY_SECONDS = 0.05
+# Leave time for the write transaction before TradingService's 30s deadline.
+SHADOW_RESULT_COLLECTION_BUDGET_SECONDS = 20.0
+SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS = 300.0
 
 LatestPriceProvider = Callable[[str], Awaitable[float]]
 LatestMarketFactProvider = Callable[[str], Awaitable[dict[str, Any]]]
@@ -85,13 +89,18 @@ async def _bounded_task_gather(
     tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
     if not tasks:
         return [], False
-    done, pending = await asyncio.wait(
-        tasks,
-        timeout=max(float(budget_seconds or 0.0), 0.0),
-    )
-    for task in pending:
-        task.cancel()
-        task.add_done_callback(_consume_async_task)
+    try:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(float(budget_seconds or 0.0), 0.0),
+        )
+    finally:
+        # Parent cancellation must also stop queued and in-flight providers.
+        # Awaiting their cancellation here would break the bounded deadline.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+            task.add_done_callback(_consume_async_task)
     results: list[Any] = []
     for task in done:
         try:
@@ -514,6 +523,7 @@ class ShadowBacktestService:
     historical_market_path_provider: HistoricalMarketPathProvider | None = None
     horizons_minutes: tuple[int, ...] = SHADOW_BACKTEST_HORIZONS_MINUTES
     _market_fact_retry_after: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _historical_retry_after: dict[int, float] = field(default_factory=dict, init=False, repr=False)
 
     async def create(
         self,
@@ -536,7 +546,12 @@ class ShadowBacktestService:
         if entry_price <= 0:
             return False
 
-        now = datetime.now(UTC)
+        observed_at = decision.timestamp or datetime.now(UTC)
+        observed_at = (
+            observed_at.replace(tzinfo=UTC)
+            if observed_at.tzinfo is None
+            else observed_at.astimezone(UTC)
+        )
         try:
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
@@ -602,7 +617,8 @@ class ShadowBacktestService:
                             "feature_snapshot": feature_snapshot,
                             "raw_llm_response": raw_response,
                             "status": "pending",
-                            "due_at": now + timedelta(minutes=int(horizon)),
+                            "created_at": observed_at,
+                            "due_at": observed_at + timedelta(minutes=int(horizon)),
                             "horizon_minutes": int(horizon),
                             "label_version": SHADOW_LABEL_VERSION,
                         }
@@ -684,9 +700,32 @@ class ShadowBacktestService:
     async def update_due(self, limit: int = 200) -> int:
         """Complete due samples without holding a database session during OKX reads."""
         try:
+            deadline = (
+                asyncio.get_running_loop().time()
+                + SHADOW_RESULT_COLLECTION_BUDGET_SECONDS
+            )
+
+            def collection_budget(stage_budget: float) -> float:
+                return max(
+                    min(stage_budget, deadline - asyncio.get_running_loop().time()),
+                    0.0,
+                )
+
             async with self.session_factory() as session:
                 repo = self.repository_factory(session)
-                rows = await repo.get_due_shadow_backtests(limit=max(1, int(limit or 1)))
+                now = asyncio.get_running_loop().time()
+                self._historical_retry_after = {
+                    row_id: retry_at
+                    for row_id, retry_at in self._historical_retry_after.items()
+                    if retry_at > now
+                }
+                query_kwargs = (
+                    {"exclude_ids": list(self._historical_retry_after)}
+                    if self._historical_retry_after else {}
+                )
+                rows = await repo.get_due_shadow_backtests(
+                    limit=max(1, int(limit or 1)), **query_kwargs
+                )
             if not rows:
                 return 0
 
@@ -720,7 +759,9 @@ class ShadowBacktestService:
 
                 cost_results, cost_timed_out = await _bounded_task_gather(
                     (fetch_execution_cost_facts(mode) for mode in execution_modes),
-                    budget_seconds=SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS,
+                    budget_seconds=collection_budget(
+                        SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS
+                    ),
                 )
                 if cost_timed_out:
                     logger.warning(
@@ -746,13 +787,17 @@ class ShadowBacktestService:
             historical_path_semaphore = asyncio.Semaphore(
                 max(1, SHADOW_RESULT_PATH_CONCURRENCY)
             )
+            historical_attempted: set[int] = set()
 
             async def fetch_historical_outcome(row: Any) -> tuple[int, dict[str, Any]]:
                 row_id = int(getattr(row, "id", 0) or 0)
                 due_at = getattr(row, "due_at", None)
                 snapshot = getattr(row, "feature_snapshot", None)
                 snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
-                entry_fact = snapshot.get("market_fact")
+                entry_fact = (
+                    snapshot.get("market_fact")
+                    or snapshot.get("historical_market_path_entry_fact")
+                )
                 if not isinstance(entry_fact, dict):
                     entry_fact = build_market_fact(
                         str(getattr(row, "symbol", "") or ""),
@@ -769,6 +814,7 @@ class ShadowBacktestService:
                     return row_id, {}
                 try:
                     async with historical_path_semaphore:
+                        historical_attempted.add(row_id)
                         outcome = await asyncio.wait_for(
                             self.historical_market_path_provider(
                                 self.symbol_normalizer(getattr(row, "symbol", ""))
@@ -791,21 +837,41 @@ class ShadowBacktestService:
                 return row_id, dict(outcome) if isinstance(outcome, dict) else {}
 
             if historical_rows:
+                historical_started = asyncio.get_running_loop().time()
+                path_budget = collection_budget(SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS)
                 historical_results, historical_timed_out = await _bounded_task_gather(
                     (fetch_historical_outcome(row) for row in historical_rows),
-                    budget_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                    budget_seconds=path_budget,
                 )
                 if historical_timed_out:
                     logger.warning(
                         "historical shadow market path batch timed out",
                         row_count=len(historical_rows),
-                        timeout_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                        timeout_seconds=round(path_budget, 3),
+                        attempted_count=len(historical_attempted),
                     )
                 for item in historical_results:
                     if isinstance(item, tuple) and len(item) == 2:
                         row_id, outcome = item
                         if row_id > 0 and isinstance(outcome, dict) and outcome:
                             historical_outcome_cache[row_id] = outcome
+                retry_at = (
+                    asyncio.get_running_loop().time()
+                    + SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS
+                )
+                for row_id in historical_attempted - historical_outcome_cache.keys():
+                    self._historical_retry_after[row_id] = retry_at
+                logger.info(
+                    "shadow historical collection finished",
+                    selected_count=len(historical_rows),
+                    attempted_count=len(historical_attempted),
+                    collected_count=len(historical_outcome_cache),
+                    retry_cooldown_count=len(self._historical_retry_after),
+                    elapsed_seconds=round(
+                        asyncio.get_running_loop().time() - historical_started, 3
+                    ),
+                    budget_seconds=round(path_budget, 3),
+                )
 
             market_fact_cache: dict[str, dict[str, Any]] = {}
             symbols = {
@@ -922,7 +988,9 @@ class ShadowBacktestService:
             if symbols:
                 fact_results, facts_timed_out = await _bounded_task_gather(
                     (fetch_market_fact(symbol) for symbol in sorted(symbols)),
-                    budget_seconds=SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS,
+                    budget_seconds=collection_budget(
+                        SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS
+                    ),
                 )
                 if facts_timed_out:
                     logger.warning(
@@ -999,6 +1067,18 @@ class ShadowBacktestService:
                         )
                     continue
                 result_fact = market_fact_cache.get(symbol, {})
+                timing = shadow_label_timing(
+                    {"result_fact": result_fact}, getattr(row, "due_at", None)
+                )
+                if any(reason in timing["reasons"] for reason in (
+                    "scheduled_label_time_missing",
+                    "result_source_time_missing",
+                    "result_availability_time_missing",
+                    "result_source_before_schedule",
+                    "result_received_before_schedule",
+                    "result_received_before_source",
+                )):
+                    continue
                 result_prices = (
                     result_fact.get("prices")
                     if isinstance(result_fact.get("prices"), dict)
@@ -1034,7 +1114,9 @@ class ShadowBacktestService:
             if path_tasks:
                 path_results, paths_timed_out = await _bounded_task_gather(
                     path_tasks,
-                    budget_seconds=SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS,
+                    budget_seconds=collection_budget(
+                        SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS
+                    ),
                 )
                 if paths_timed_out:
                     logger.warning(
@@ -1095,6 +1177,12 @@ class ShadowBacktestService:
                         price_path,
                     )
                 feature_snapshot["market_fact_contract"] = market_contract
+                timing = shadow_label_timing(
+                    market_contract, getattr(row, "due_at", None)
+                )
+                if any(reason != "result_source_lag_exceeds_one_minute"
+                       for reason in timing["reasons"]):
+                    continue
                 if not historical_outcome:
                     feature_snapshot["training_market_fact_contract"] = (
                         compact_market_fact_contract(market_contract)
@@ -1157,7 +1245,8 @@ class ShadowBacktestService:
                             "training_market_fact_contract"
                         ),
                         cost_facts=fee_after_outcome,
-                        label_timestamp=getattr(row, "due_at", None),
+                        label_timestamp=timing["label_available_at"],
+                        scheduled_label_at=getattr(row, "due_at", None),
                         **path_labels,
                     )
                 )

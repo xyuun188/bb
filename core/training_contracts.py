@@ -9,8 +9,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from core.market_facts import _datetime
+
 SHADOW_LABEL_VERSION = "2026-07-27.market-opportunity-multitask.v2"
-HISTORICAL_SHADOW_REBUILD_VERSION = "2026-09-14.preserved-ohlcv-shadow.v1"
+HISTORICAL_SHADOW_REBUILD_VERSION = "2026-10-22.preserved-ohlcv-close-availability.v2"
 HISTORICAL_SHADOW_SOURCE = "preserved_market_klines_historical_path"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-24.authoritative-trade-outcome.v3"
@@ -83,6 +85,64 @@ def is_authoritative_expert_memory_extra(value: Any) -> bool:
     )
 
 
+def shadow_label_timing(
+    market_fact_contract: Mapping[str, Any] | None,
+    scheduled_label_at: Any,
+) -> dict[str, Any]:
+    """Keep source-event time, availability and the requested horizon distinct."""
+    market = _dict(market_fact_contract)
+    provenance = _dict(market.get("provenance"))
+    result = _dict(market.get("result_fact"))
+    historical = market.get("status") == "historical_ohlcv_only"
+    scheduled = _datetime(scheduled_label_at)
+    source = _datetime(
+        result.get("source_available_at") or market.get("result_source_available_at")
+        if historical else
+        result.get("source_timestamp_ms") or market.get("result_source_timestamp_ms")
+    )
+    window = provenance.get("observation_window") or market.get("observation_window")
+    if isinstance(window, str):
+        try:
+            window = json.loads(window)
+        except ValueError:
+            window = {}
+    window = _dict(window)
+    available = source if historical else _datetime(
+        result.get("received_at") or market.get("result_received_at") or window.get("end")
+    )
+    reasons = []
+    if scheduled is None:
+        reasons.append("scheduled_label_time_missing")
+    if source is None:
+        reasons.append("result_source_time_missing")
+    if available is None:
+        reasons.append("result_availability_time_missing")
+    source_lag = (source - scheduled).total_seconds() if source and scheduled else None
+    if source_lag is not None:
+        if source_lag < 0:
+            reasons.append("result_source_before_schedule")
+        elif source_lag > 60:
+            reasons.append("result_source_lag_exceeds_one_minute")
+    if available and scheduled and available < scheduled:
+        reasons.append("result_received_before_schedule")
+    if source and available and available < source:
+        reasons.append("result_received_before_source")
+    return {
+        "scheduled_label_at": _iso(scheduled),
+        "result_source_at": _iso(source),
+        "label_available_at": _iso(available),
+        "source_horizon_lag_seconds": source_lag,
+        "label_maturity_lag_seconds": (
+            (available - scheduled).total_seconds() if available and scheduled else None
+        ),
+        "availability_basis": (
+            "one_minute_candle_close_lower_bound" if historical else "native_result_received_at"
+        ),
+        "delivery_latency_observed": not historical and available is not None,
+        "reasons": reasons,
+    }
+
+
 def build_shadow_label_contract(
     *,
     shadow_backtest_id: int,
@@ -94,6 +154,7 @@ def build_shadow_label_contract(
     market_fact_contract: Mapping[str, Any] | None,
     cost_facts: Mapping[str, Any] | None,
     label_timestamp: Any,
+    scheduled_label_at: Any = None,
     long_mfe_pct: float | None = None,
     long_mae_pct: float | None = None,
     short_mfe_pct: float | None = None,
@@ -133,6 +194,8 @@ def build_shadow_label_contract(
         "long_first_touch": _text(long_first_touch).lower(),
         "short_first_touch": _text(short_first_touch).lower(),
     }
+    if scheduled_label_at is not None:
+        labels["scheduled_label_at"] = _iso(scheduled_label_at)
     if fee_after_complete:
         labels.update(
             {
@@ -223,6 +286,8 @@ def compact_shadow_label_contract(
         "strategy_version": provenance.get("strategy_version"),
         "fallback_reason": provenance.get("fallback_reason"),
     }
+    if "scheduled_label_at" in labels:
+        compact["scheduled_label_at"] = labels["scheduled_label_at"]
     if labels.get("fee_after_complete") is True:
         compact.update(
             {

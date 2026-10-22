@@ -923,6 +923,8 @@ def compact_market_fact_contract(contract: Mapping[str, Any] | None) -> dict[str
         "data_fingerprint": provenance.get("data_fingerprint"),
         "entry_fact_id": entry.get("fact_id"),
         "result_fact_id": result.get("fact_id"),
+        "result_source_timestamp_ms": result.get("source_timestamp_ms"),
+        "result_received_at": result.get("received_at"),
         "entry_inst_id": entry_identity.get("inst_id"),
         "result_inst_id": result_identity.get("inst_id"),
         "entry_contract_spec_version": entry_identity.get("contract_spec_version"),

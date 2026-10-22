@@ -117,10 +117,43 @@ def test_historical_rows_and_replaced_cost_clocks_remain_explicit(row):
     row["shadow_fee_observed"] = row["feature_at"]
     row["result_source"] = int((row["due_at"] - timedelta(seconds=30)).timestamp() * 1000)
     result = audit.inspect_timing(row)
-    assert "historical_bar_close_availability_unverified" in result["issues"]
+    assert "historical_bar_delivery_latency_unobserved" in result["issues"]
     assert "shadow_original_cost_clock_mismatch:fee_observed" in result["issues"]
-    assert "result_source_precedes_scheduled_label" in result["issues"]
+    assert "result_source_precedes_scheduled_label" not in result["issues"]
+    assert result["offset_seconds"][
+        "historical_result_close_availability_lower_bound_minus_exact_schedule_seconds"
+    ] == pytest.approx(30 + 0.99)
+    assert result["offset_seconds"][
+        "historical_result_bar_open_minus_exact_schedule_seconds"
+    ] == pytest.approx(-30 + 0.99)
     assert result["g2_row_accepted"] is False
+
+
+def test_historical_close_availability_before_schedule_stays_rejected(row):
+    row["historical"] = True
+    row["result_source"] = int(
+        (
+            row["original_created_at"]
+            + timedelta(minutes=5, seconds=-61)
+        ).timestamp() * 1000
+    )
+    result = audit.inspect_timing(row)
+    assert "historical_result_close_available_before_scheduled_label" in result["issues"]
+    assert result["offset_seconds"][
+        "historical_result_close_availability_lower_bound_minus_exact_schedule_seconds"
+    ] == pytest.approx(-1)
+
+
+def test_old_historical_result_open_clock_can_be_derived_but_not_observed(row):
+    row["historical"] = True
+    row["result_source"] = None
+    row["due_at"] = row["original_created_at"] + timedelta(minutes=5)
+    row["historical_label_timestamp"] = row["due_at"].isoformat()
+    result = audit.inspect_timing(row)
+    assert "historical_close_availability_lower_bound_derived" in result["issues"]
+    assert result["offset_seconds"][
+        "historical_result_close_availability_lower_bound_minus_exact_schedule_seconds"
+    ] == pytest.approx(60)
 
 
 def test_projection_omits_raw_payloads_and_label_values():

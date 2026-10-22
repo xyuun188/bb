@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +18,7 @@ from core.training_contracts import (
 from services.shadow_backtest_service import (
     SHADOW_BACKTEST_HORIZONS_MINUTES,
     ShadowBacktestService,
+    _bounded_task_gather,
     shadow_fee_after_outcome,
     shadow_path_labels,
     side_label,
@@ -89,9 +90,11 @@ class _FakeRepo:
     async def create_shadow_backtest(self, data: dict[str, Any]) -> None:
         self.created.append(data)
 
-    async def get_due_shadow_backtests(self, limit: int = 200) -> list[Any]:
+    async def get_due_shadow_backtests(
+        self, limit: int = 200, *, exclude_ids: list[int] | None = None,
+    ) -> list[Any]:
         assert limit == 200
-        return self.due_rows
+        return [row for row in self.due_rows if row.id not in (exclude_ids or [])]
 
     async def complete_shadow_backtest(self, row: Any, **data: Any) -> None:
         for key, value in data.items():
@@ -145,6 +148,7 @@ def _market_fact(
             "tickSz": "0.0001",
             "state": "live",
         },
+        received_at=datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC),
     )
 
 
@@ -613,6 +617,7 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
             status="pending",
             note="",
             feature_snapshot={},
+            due_at=datetime.now(UTC) - timedelta(seconds=1),
         )
     ]
 
@@ -642,6 +647,37 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
 
     assert await service.update_due() == 1
     assert TrackingSessionCtx.entries == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_lag", [-1, 0, 61])
+async def test_shadow_source_clock_gates_maturity_and_late_labels(source_lag) -> None:
+    repo = _FakeRepo()
+    result_at = datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
+    row = SimpleNamespace(
+        id=71, decision_id=123, symbol="BTC/USDT", decision_action="hold",
+        entry_price=100.0, horizon_minutes=10, status="pending", note="",
+        due_at=result_at - timedelta(seconds=source_lag),
+        feature_snapshot={
+            "bid": 99.99, "ask": 100.01, "taker_fee_rate": 0.0005,
+            "funding_rate": 0.0, "funding_interval_minutes": 480,
+            "orderbook_bid_depth": 100_000, "orderbook_ask_depth": 100_000,
+        },
+    )
+    repo.due_rows = [row]
+    completed = await _service(repo).update_due()
+    if source_lag < 0:
+        assert completed == 0
+        assert row.status == "pending"
+        assert repo.completed == []
+    else:
+        assert completed == 1
+        label = row.feature_snapshot["training_label_contract"]
+        assert label["scheduled_label_at"] == row.due_at.isoformat()
+        assert label["label_timestamp"] == result_at.isoformat()
+        if source_lag > 60:
+            assert row.status == "quarantined"
+            assert "result_source_lag_exceeds_one_minute" in row.note
 
 
 @pytest.mark.asyncio
@@ -879,6 +915,9 @@ async def test_shadow_backtest_uses_historical_due_at_path_without_current_quote
         historical_calls.append((symbol, due_at, horizon))
         entry_fact = _market_fact(symbol, 100.0, _ENTRY_TIMESTAMP_MS)
         result_fact = _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS)
+        result_fact["source_available_at"] = (
+            due_at + timedelta(minutes=1)
+        ).isoformat()
         return {
             "result_fact": result_fact,
             "price_path": {
@@ -923,6 +962,46 @@ async def test_shadow_backtest_uses_historical_due_at_path_without_current_quote
 
 async def _completed_float(value: float) -> float:
     return value
+
+
+@pytest.mark.asyncio
+async def test_unavailable_historical_rows_yield_queue_capacity_until_cooldown_expires():
+    class QueueRepo(_FakeRepo):
+        async def get_due_shadow_backtests(self, limit=1, *, exclude_ids=None):
+            return [
+                row for row in self.due_rows if row.id not in (exclude_ids or [])
+            ][:limit]
+
+    repo = QueueRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=row_id, symbol="BTC/USDT", execution_mode="paper",
+            due_at=datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000, tz=UTC),
+            horizon_minutes=5, entry_price=100.0, status="pending", feature_snapshot={},
+        )
+        for row_id in (101, 102)
+    ]
+    calls = []
+
+    async def unavailable(_symbol, _entry, _due, _horizon):
+        calls.append(len(calls))
+        return {}
+
+    service = _service(repo)
+    service.historical_market_path_provider = unavailable
+    assert await service.update_due(limit=1) == 0
+    assert set(service._historical_retry_after) == {101}
+    assert await service.update_due(limit=1) == 0
+    assert set(service._historical_retry_after) == {101, 102}
+    assert len(calls) == 2
+    assert await service.update_due(limit=1) == 0
+    assert len(calls) == 2
+
+    service._historical_retry_after[101] = 0
+    assert await service.update_due(limit=1) == 0
+    assert len(calls) == 3
+    assert all(row.status == "pending" for row in repo.due_rows)
+    assert repo.completed == []
 
 
 @pytest.mark.asyncio
@@ -1042,6 +1121,99 @@ async def test_shadow_backtest_batch_timeout_does_not_wait_for_stubborn_provider
     await asyncio.wait_for(cancelled.wait(), timeout=1.0)
     assert repo.completed == []
     assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_bounded_gather_cancels_provider_when_parent_is_cancelled() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def provider() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(30.0)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = asyncio.create_task(
+        _bounded_task_gather((provider(),), budget_seconds=30.0)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_shadow_collection_stages_share_deadline_and_preserve_completed_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    repo.due_rows = [
+        SimpleNamespace(
+            id=row_id,
+            decision_id=1000 + row_id,
+            model_name="ensemble_trader",
+            symbol=symbol,
+            decision_action="hold",
+            entry_price=100.0,
+            horizon_minutes=10,
+            status="pending",
+            note="",
+            feature_snapshot={},
+        )
+        for row_id, symbol in ((101, "BTC/USDT"), (102, "ETH/USDT"))
+    ]
+    cost_finished = asyncio.Event()
+    fact_finished = asyncio.Event()
+    path_cancelled = asyncio.Event()
+
+    async def cost_facts(_mode: str) -> dict[str, Any]:
+        await asyncio.sleep(0.04)
+        cost_finished.set()
+        return {}
+
+    service = _service(repo, execution_cost_facts_provider=cost_facts)
+    original_path = service.price_path_provider
+    assert original_path is not None
+
+    async def market_fact(symbol: str) -> dict[str, Any]:
+        assert cost_finished.is_set()
+        await asyncio.sleep(0.04)
+        fact_finished.set()
+        return _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS)
+
+    async def path(
+        entry: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert fact_finished.is_set()
+        if entry["symbol"] == "ETH/USDT":
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                path_cancelled.set()
+                raise
+        return await original_path(entry, result)
+
+    monkeypatch.setattr(
+        "services.shadow_backtest_service.SHADOW_RESULT_COLLECTION_BUDGET_SECONDS",
+        0.15,
+    )
+    service.latest_market_fact_provider = market_fact
+    service.price_path_provider = path
+    started = asyncio.get_running_loop().time()
+
+    assert await asyncio.wait_for(service.update_due(), timeout=0.6) == 2
+    assert asyncio.get_running_loop().time() - started < 0.6
+    await asyncio.wait_for(path_cancelled.wait(), timeout=1.0)
+    assert len(repo.completed) == 2
+    assert repo.due_rows[0].feature_snapshot["market_fact_contract"]["assertions"][
+        "same_contract_price_path_verified"
+    ] is True
 
 
 def test_shadow_backtest_side_label() -> None:

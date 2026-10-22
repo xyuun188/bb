@@ -2199,6 +2199,12 @@ class DataService:
             else result_open - timedelta(minutes=max(int(horizon_minutes or 0), 1))
         )
         expected = max(int((result_open - entry_open).total_seconds() // 60) + 1, 1)
+        if (
+            entry_open > result_open
+            or expected > 300
+            or result_open + timedelta(minutes=1) > datetime.now(UTC)
+        ):
+            return {}
 
         async def load_cached() -> list[dict[str, Any]]:
             async with get_session_ctx() as session:
@@ -2230,26 +2236,16 @@ class DataService:
             ]
 
         bars = await load_cached()
+        fetched_bars: list[dict[str, Any]] = []
         if len(bars) != expected:
             limit = min(expected + 2, 300)
             rows: list[Any] = []
             try:
-                native_fetcher = getattr(
-                    self.rest_client, "fetch_native_consistency_ohlcv", None
+                rows = await self.rest_client.fetch_historical_ohlcv(
+                    normalized,
+                    limit=limit,
+                    end_timestamp_ms=int(result_open.timestamp() * 1000),
                 )
-                if callable(native_fetcher):
-                    rows = await native_fetcher(
-                        normalized,
-                        limit=limit,
-                        end_timestamp_ms=int(result_open.timestamp() * 1000),
-                    )
-                else:
-                    rows = await self.rest_client.fetch_ohlcv(
-                        normalized,
-                        timeframe="1m",
-                        limit=limit,
-                        end_timestamp_ms=int(result_open.timestamp() * 1000) + 60_000,
-                    )
             except Exception as exc:
                 logger.warning(
                     "historical shadow kline refresh failed",
@@ -2258,8 +2254,35 @@ class DataService:
                 )
                 rows = []
             if rows:
-                await self._persist_klines(normalized, "1m", rows)
-                bars = await load_cached()
+                # Old windows can be outside the rolling cache's retention.
+                # Validate the exchange facts directly before any cache eviction.
+                for row in rows:
+                    try:
+                        ts, open_, high, low, close, volume = row[:6]
+                        values = [float(value) for value in (open_, high, low, close, volume)]
+                        opened = datetime.fromtimestamp(float(ts) / 1000.0, tz=UTC)
+                        if (
+                            not entry_open <= opened <= result_open
+                            or opened.second != 0
+                            or opened.microsecond != 0
+                            or not all(math.isfinite(value) for value in values)
+                            or min(values[:4]) <= 0
+                            or values[2] > min(values[0], values[3])
+                            or values[1] < max(values[0], values[3])
+                            or values[4] < 0
+                        ):
+                            continue
+                        fetched_bars.append({
+                            "open_time": opened,
+                            "open": values[0],
+                            "high": values[1],
+                            "low": values[2],
+                            "close": values[3],
+                            "volume": values[4],
+                        })
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                bars.extend(fetched_bars)
 
         by_minute = {
             item["open_time"].replace(second=0, microsecond=0): item
@@ -2273,6 +2296,24 @@ class DataService:
         if any(item is None for item in window):
             return {}
         complete_window = [dict(item) for item in window if item is not None]
+        if fetched_bars:
+            # Preserve fetched evidence without the rolling cache deleting this
+            # old window before its canonical market_klines contract is built.
+            async with self._kline_persist_gate():
+                async with get_session_ctx() as session:
+                    await MarketRepository(session).upsert_klines_bulk(
+                        normalized,
+                        "1m",
+                        [
+                            (
+                                bar["open_time"],
+                                {key: bar[key] for key in (
+                                    "open", "high", "low", "close", "volume",
+                                )},
+                            )
+                            for bar in complete_window
+                        ],
+                    )
         historical_entry = build_historical_market_fact(
             normalized,
             complete_window[0],
@@ -2288,6 +2329,7 @@ class DataService:
             entry_fact=historical_entry,
             result_fact=historical_result,
             bars=complete_window,
+            scheduled_label_at=due_at,
         )
         return {
             "result_fact": historical_result,

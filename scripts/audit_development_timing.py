@@ -9,7 +9,7 @@ import json
 import shlex
 import sys
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +39,13 @@ DEPENDENCIES = (
     "models/decision.py",
     "models/learning.py",
     "core/market_facts.py",
+    "core/training_contracts.py",
     "core/runtime_data_retention_contract.py",
     "services/execution_cost_model.py",
+    "services/data_service.py",
+    "services/historical_shadow_contract.py",
+    "services/historical_shadow_rebuild.py",
+    "services/training_data_quality.py",
 )
 COMPONENTS = (
     "market_source", "market_received", "book_source", "book_received",
@@ -86,6 +91,9 @@ def timing_columns() -> tuple[Any, ...]:
         original["taker_fee_rate"].label("original_taker_fee"),
         shadow["training_market_fact_contract"]["observation_window"].label(
             "contract_observation_window"
+        ),
+        shadow["training_label_contract"]["label_timestamp"].label(
+            "historical_label_timestamp"
         ),
         contract["entry_fact"]["source_timestamp_ms"].label("entry_source"),
         contract["entry_fact"]["received_at"].label("entry_received"),
@@ -136,7 +144,7 @@ def inspect_timing(row: dict[str, Any]) -> dict[str, Any]:
     if observed is not None and completed is not None and observed > completed:
         issues.append("feature_constructed_after_decision_completed")
     if row.get("historical") is True:
-        issues.append("historical_bar_close_availability_unverified")
+        issues.append("historical_bar_delivery_latency_unobserved")
     components = {}
     offsets = {}
     for key in COMPONENTS:
@@ -168,15 +176,55 @@ def inspect_timing(row: dict[str, Any]) -> dict[str, Any]:
             ("contract_entry_observed", "start"), ("contract_result_observed", "end"),
         ):
             value = _clock(window.get(boundary))
+            if row.get("historical") is True and boundary == "end":
+                result_source = (
+                    _clock(row.get("result_source"))
+                    or _clock(row.get("historical_label_timestamp"))
+                )
+                value = (
+                    result_source + timedelta(minutes=1)
+                    if result_source is not None else None
+                )
+                key = "historical_result_close_availability_lower_bound"
             if value is not None and clock_recovered:
                 offsets[f"{key}_minus_completion_seconds"] = (
                     value - completed
                 ).total_seconds()
     due = _clock(row.get("due_at"))
     created = _clock(row.get("created_at"))
-    if isinstance(window, dict) and due is not None:
-        result_observed = _clock(window.get("end"))
-        if result_observed is not None:
+    result_source = _clock(row.get("result_source"))
+    historical_label = _clock(row.get("historical_label_timestamp"))
+    if due is not None:
+        result_observed = _clock(window.get("end")) if isinstance(window, dict) else None
+        if row.get("historical") is True:
+            result_bar_open = result_source or historical_label
+            exact_schedule = (
+                original_created + timedelta(minutes=int(row.get("horizon_minutes") or 0))
+                if original_created is not None
+                else due
+            )
+            if result_bar_open is not None:
+                offsets["historical_result_bar_open_minus_exact_schedule_seconds"] = (
+                    result_bar_open - exact_schedule
+                ).total_seconds()
+            close_available = (
+                result_bar_open + timedelta(minutes=1)
+                if result_bar_open is not None else None
+            )
+            if close_available is None:
+                issues.append("historical_result_bar_source_clock_missing")
+            else:
+                if result_source is None and historical_label is not None:
+                    issues.append("historical_close_availability_lower_bound_derived")
+                lag = (close_available - exact_schedule).total_seconds()
+                offsets[
+                    "historical_result_close_availability_lower_bound_minus_exact_schedule_seconds"
+                ] = lag
+                if lag < 0:
+                    issues.append("historical_result_close_available_before_scheduled_label")
+                elif lag > 60:
+                    issues.append("historical_result_close_availability_exceeds_one_bar")
+        elif result_observed is not None:
             offsets["contract_result_observed_minus_due_seconds"] = (
                 result_observed - due
             ).total_seconds()
@@ -198,10 +246,12 @@ def inspect_timing(row: dict[str, Any]) -> dict[str, Any]:
             offsets["feature_construction_age_at_completion_seconds"] = (
                 completed - observed
             ).total_seconds()
-    result_source = _clock(row.get("result_source"))
     if result_source is not None and due is not None:
-        offsets["result_source_minus_due_seconds"] = (result_source - due).total_seconds()
-        if result_source < due:
+        offsets[
+            "historical_result_bar_open_minus_due_seconds"
+            if row.get("historical") is True else "result_source_minus_due_seconds"
+        ] = (result_source - due).total_seconds()
+        if result_source < due and row.get("historical") is not True:
             issues.append("result_source_precedes_scheduled_label")
     # FeatureVector records construction time, not individual indicator/news input clocks.
     components["technical_and_sentiment_inputs"] = "individual_availability_not_recorded"
@@ -248,6 +298,10 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
                 evidence.append((row["id"], row["decision_id"], _fingerprint(row)))
                 counts["rows_checked"] += 1
                 counts["historical_rows"] += row.get("historical") is True
+                counts["historical_availability_lower_bound_derived"] += (
+                    "historical_close_availability_lower_bound_derived"
+                    in inspected["issues"]
+                )
                 counts["recorded_original_clock_recovered"] += inspected[
                     "recorded_original_clock_recovered"
                 ]
@@ -262,7 +316,7 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
                 if len(examples) < 4:
                     examples.append({"id": row["id"], **inspected})
     return {
-        "audit_version": "development-timing.v2", "audit_code_identity": code_identity(),
+        "audit_version": "development-timing.v4", "audit_code_identity": code_identity(),
         "generated_at": datetime.now(UTC).isoformat(), "read_only": True,
         "exam_labels_read": False, "database_label_values_selected": False,
         "production_permission": False, "source_row_budget": max_rows,
@@ -282,6 +336,7 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
         },
         "bounded_examples": examples,
         "g2_acceptance": "blocked_by_component_availability_evidence",
+        "historical_close_lower_bound_is_derived_not_delivery_observed": True,
         "clock_recovery_is_not_complete_component_lineage": True,
         "profitability_acceptance": "not_evaluated",
     }

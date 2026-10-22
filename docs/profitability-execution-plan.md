@@ -352,3 +352,162 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   staged queue/historical changes. Then investigate result-window alignment
   and implement verifiable component-availability collection. G2 stays
   incomplete, and no frozen candidate or independent profitable exam exists.
+
+## Historical Label Clock Repair Batch
+
+- The prior timing report treated historical candle `open_time`/`received_at`
+  as when its close price was available. That is not the candle's availability
+  time. For one-minute OHLCV, the close availability lower bound is
+  `open_time + 60 seconds`; actual delivery latency is not in historical data.
+- Historical sample rebuild also stored `floor(decision_time, minute) +
+  horizon` as `due_at`, shifting the planned horizon earlier by up to one
+  minute. The intended scheduled label time is now the exact original decision
+  time plus horizon. The existing minute close is accepted only when its
+  availability lower bound is at/after schedule and no more than 60 seconds
+  late; the label contract records the close-availability lower bound
+  separately from scheduled time and effective horizon.
+- Historical contract version is now
+  `2026-10-22.preserved-ohlcv-close-availability.v2`. Prior v1 historical
+  samples fail closed as stale until rebuilt. Training-quality validation
+  requires the source availability metadata and rejects early or over-one-bar
+  late labels. This does not create executable historical costs or upgrade
+  historical-only data into trading evidence.
+- Timing audit v3 distinguishes candle open from theoretical close
+  availability; it records the close-time lower bound without claiming
+  actual retrieval latency. It still reads no outcome fields. Frozen sample,
+  cutoff and IDs remain unchanged.
+- Initial local verification: 117 focused tests passed across historical
+  rebuild, timing, training quality/quarantine and shadow collection; Ruff and
+  whitespace checks passed. Online targeted upload/tests and the v3 frozen
+  timing run are pending; do not use the old v2 early-result count after this
+  timestamp reinterpretation.
+- Commit `bfba943` (decision-time fee immutability plus timing v2 audit) is
+  pushed to `origin/main`. Other staged changes remain untouched.
+- Next exact action: finish staged deployment and remote focused tests for the
+  historical availability contract, run timing v3 against the same immutable
+  development IDs under the prior 1-CPU/1-GiB/300-second budget, record its
+  corrected offsets, then commit only owned hunks. Keep G2 blocked on missing
+  individual feature availability; G3-G6 remain pending and no profitability
+  claim is made.
+
+## Current Continuation Checkpoint: Label Timing And Historical Entry Isolation
+
+- Local repair now separates scheduled label time, result source time and
+  result availability time through `shadow_label_timing`. Native result facts
+  carry bounded source/receipt projections in their compact contract.
+  Historical OHLCV labels carry the one-minute close-availability lower bound;
+  the field is named `label_maturity_lag_seconds`, not an effective horizon.
+- Shadow labels now record `scheduled_label_at` separately from
+  `label_timestamp`. Quality assessment rejects missing, early, contradictory,
+  or over-one-minute-late result timing and rejects labels whose timestamp is
+  not the recorded result availability. A late native result may remain an
+  audit row, but cannot enter training.
+- Historical rebuild no longer falls back to a future candle close when the
+  original decision price is missing. Such a row is skipped. Its OHLCV entry
+  fact is retained only as `historical_market_path_entry_fact` for bounded
+  path reconstruction; it is not a decision-time `market_fact` feature.
+- Focused local regression status: 104 passed across historical rebuild/path,
+  shadow settlement, label timing, quality and quarantine tests; changed-file
+  Ruff and `git diff --check` passed. This is lineage evidence, not profit
+  evidence.
+- Remote deployment and the v3 frozen timing audit are still pending for this
+  exact source state. No service restart has been performed for this batch.
+  Paper/live safety remains unchanged: live is off, no manual order action,
+  no protection changes, and no candidate or exam promotion.
+- Next action: upload only the owned timing/historical/quality files and their
+  focused tests with `--skip-restart`, run the bounded remote suite, then
+  activate only the required paper/dashboard services after hash and mode
+  checks. Run the immutable v3 audit once, record its evidence and remaining
+  component-lineage blocker, then isolate-commit/push this batch.
+
+### Frozen Timing Audit v3 Result And Follow-Up
+
+- v3 completed online at `2026-10-22T04:32:03.596732Z`, unit
+  `bb-frozen-timing-r10000-6fce600ab3f8`, with 1 CPU, 1 GiB, a 300-second
+  deadline, 15-second read statements and 200-row pages.
+- The exact frozen development snapshot remains 9,191 rows / 2,434 groups,
+  cutoff `2026-09-26T22:11:51.501105Z`, SHA256
+  `afced19c8876ec2fc8237b298f22248d326160e6bdc83a754df1bc431cc9cec3`.
+  All 9,191 IDs were found; original recorded clocks were consistent and
+  feature construction preceded completion in all rows. The source-clock
+  evidence SHA256 exactly matched v2:
+  `312c7b0c5eab8cfa6c8a0e58ace74126e19378b0412655f90e629324fe88a5a4`.
+  No outcome fields or exam labels were selected.
+- v3 found 789 historical rows with missing result source clocks and
+  unobserved delivery latency. It also found 1,699 of 8,402 nonhistorical
+  compact result receipt clocks before `due_at` (minimum `-108.964138s`).
+  Their native source timestamps did not precede schedule, so the issue is
+  specifically receipt-clock/schedule inconsistency; it is not evidence that
+  those labels are early from source-event time alone. They remain blocked
+  until the contract requires both source-event and receipt availability to
+  be no earlier than schedule.
+- The historical rebuild's verified rule floors decision creation to the
+  minute for the result bar and labels at that bar's open time. v4 now reads
+  only the compact label timestamp clock and derives the one-minute close
+  availability lower bound from that result-bar open, compared against
+  original decision creation plus horizon. The derived bound is explicitly
+  not an observed exchange delivery clock; missing source/feature-component
+  and actual historical latency evidence remain G2 blockers.
+- New local regression suite: 130 passed across audit, timing, historical
+  path/rebuild, quality, quarantine and settlement; Ruff and whitespace
+  checks passed. The prior deployed-source remote run passed 95 tests, but
+  did not include the new untracked timing test and predates the v4 follow-up.
+- v4 remote report and remote focused tests for this exact source state are
+  now complete. Remote suite before adding the standalone timing test:
+  120 passed in 5.02 seconds. The v4 report completed at
+  `2026-10-22T04:43:17.228052Z`, unit
+  `bb-frozen-timing-r10000-3acd743a722f`; dependency identity
+  `3acd743a722ff9f9ac154983c324e99a29dc298351c5eaf816cbbbf3822db920`;
+  source-clock evidence SHA256
+  `06d492f72bfb619d7921507c8300dc6d28baf32679468a90eb4bccc1ab879edd`.
+- v4 found all 9,191 frozen IDs with unchanged snapshot SHA/cutoff and zero
+  missing source rows. All 789 historical label bar-open timestamps yielded
+  a derived one-minute close-availability lower bound from original decision
+  creation plus horizon: `0.372065s` minimum, `59.603941s` maximum,
+  `30.963838s` median. None is early or more than one bar late. All 789 remain
+  explicitly marked as delivery-latency-unobserved and are not G2-accepted.
+- The 1,699 native receipt-before-schedule rows remain unchanged; these are
+  distinct from source-event times, and the runtime/quality gate now also
+  rejects receipt clocks before schedule. Overall G2 remains
+  `blocked_by_component_availability_evidence`: 9,191 technical/sentiment
+  component availability clocks are absent; 1,267 original feature payloads
+  are missing; 9,191 book receipt clocks are missing; historical actual
+  delivery latency is unobserved; and fee/funding lineage mismatches remain.
+- Read-only platform diagnosis at `2026-10-22T04:43Z` showed settings mode
+  `paper`, the paper executor log reported `mode=paper,demo=true`, all six
+  configured models use the local paper route, paper/dashboard were active,
+  and both had zero automatic restarts. This diagnosis output is not a
+  profitability claim.
+
+### Final v4 Deployment Verification
+
+- On 2026-10-22, the exact six-file focused suite
+  (`test_audit_development_timing`, historical path/rebuild,
+  shadow backtest/label timing, and training quality) passed locally and
+  remotely: 122 passed in each environment. No exam labels were read.
+- A targeted 15-path sync with `--skip-restart --skip-secret-file-purge`
+  found the 14 source/test files already identical online; only this
+  checkpoint document required upload. Remote source integrity reported
+  `source-integrity-ok:14`. The completed v4 unit
+  `bb-frozen-timing-r10000-3acd743a722f` was inactive; its report was not
+  rerun or modified.
+- Read-only verification after sync: paper and Dashboard were active with
+  `NRestarts=0`, both last started at `2026-10-22 04:48:30 UTC`; paper
+  executor journal says `mode=paper,demo=true`; runtime settings say
+  `trading_mode=paper` and `live_trading_enabled=false`. Persisted control is
+  `mode=paper, paused=false`. All six configured model slots route locally.
+  Dashboard `/health` returned HTTP 200. Since the exact code was already
+  deployed and both services had started after that deployment, no duplicate
+  restart was needed.
+- The bounded recent journal projection contained a
+  `shadow sample recovery scan failed` `TimeoutError` at
+  `2026-10-22T05:00:00.834979Z`; nearby shadow maintenance still completed
+  25 rows. Recurrence/count and cause were not established. Investigate this
+  bounded recovery path before relying on its maintenance coverage.
+- G2 remains blocked: per-component technical/news and book availability
+  clocks are still absent in the frozen rows; historical delivery latency is
+  unobserved; and prior fee/funding lineage gaps remain. G3-G6 remain pending.
+  The next action is to bound and diagnose the recovery-scan timeout, then
+  design and test point-in-time availability capture for each newly collected
+  feature component. Do not rerun the frozen audit unchanged, and do not open
+  or tune against a new exam.

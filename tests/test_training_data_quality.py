@@ -31,7 +31,10 @@ from services.training_data_quality import (
 )
 
 
-def _clean_market_fact_contract() -> dict:
+def _clean_market_fact_contract(result_at=None) -> dict:
+    result_at = result_at or datetime(2026, 7, 14, 0, 30, tzinfo=UTC)
+    if isinstance(result_at, str):
+        result_at = datetime.fromisoformat(result_at.replace("Z", "+00:00"))
     return {
         "version": MARKET_FACT_CONTRACT_VERSION,
         "status": "clean",
@@ -41,6 +44,8 @@ def _clean_market_fact_contract() -> dict:
         "same_contract_price_path_verified": True,
         "executable_market_fact_verified": True,
         "data_fingerprint": "test-shadow-market-facts",
+        "result_source_timestamp_ms": int(result_at.timestamp() * 1000),
+        "result_received_at": result_at.isoformat(),
     }
 
 
@@ -70,12 +75,15 @@ def _shadow_sample(**overrides):
     }
     override_features = overrides.pop("features", None) if "features" in overrides else None
     sample.update(overrides)
+    sample["features"]["training_market_fact_contract"] = _clean_market_fact_contract(
+        sample["label_timestamp"],
+    )
     if override_features is not None:
         features = dict(override_features)
         if features:
             features.setdefault(
                 "training_market_fact_contract",
-                _clean_market_fact_contract(),
+                _clean_market_fact_contract(sample["label_timestamp"]),
             )
         sample["features"] = features
     features = sample.get("features")

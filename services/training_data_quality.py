@@ -19,6 +19,7 @@ from core.training_contracts import (
     HISTORICAL_SHADOW_SOURCE,
     SHADOW_LABEL_VERSION,
     shadow_label_contract_reasons,
+    shadow_label_timing,
 )
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
@@ -41,7 +42,7 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-09-15.authoritative-trade-integrity.v6"
+DATA_QUALITY_VERSION = "2026-10-22.shadow-label-source-timing.v7"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
@@ -176,6 +177,16 @@ def _historical_market_path_reasons(features: dict[str, Any]) -> list[str]:
         reasons.append("historical_market_path_fingerprint_missing")
     if not _safe_str(contract.get("data_fingerprint")):
         reasons.append("historical_market_data_fingerprint_missing")
+    scheduled = _parse_datetime(contract.get("scheduled_label_at"))
+    available = _parse_datetime(contract.get("result_source_available_at"))
+    if scheduled is None or available is None:
+        reasons.append("historical_label_availability_missing")
+    elif available < scheduled:
+        reasons.append("historical_label_available_before_schedule")
+    elif (available - scheduled).total_seconds() > 60:
+        reasons.append("historical_label_availability_lag_exceeds_one_bar")
+    if contract.get("availability_basis") != "one_minute_candle_close_lower_bound":
+        reasons.append("historical_label_availability_basis_unverified")
     return reasons
 
 
@@ -388,16 +399,19 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
     if guard_reasons:
         return _final_assessment(0.0, guard_reasons, exclude=True)
 
+    if not features:
+        return _final_assessment(0.0, ["missing_features"], exclude=True)
+
+    historical_market_only = features.get("historical_market_path_only") is True
     quality_issue = _market_data_quality_issue(sample, features)
-    if quality_issue:
+    # Verified historical OHLCV labels do not assert executable orderbook quality.
+    # Their separate path and label contracts below must still pass in full.
+    if quality_issue and not historical_market_only:
         return _final_assessment(
             0.0,
             [f"market_data_quality:{quality_issue}"],
             exclude=True,
         )
-
-    if not features:
-        return _final_assessment(0.0, ["missing_features"], exclude=True)
 
     price_warning = _safe_str(features.get("price_reconciliation_warning"))
     if price_warning:
@@ -431,7 +445,6 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             exclude=True,
         )
 
-    historical_market_only = features.get("historical_market_path_only") is True
     if historical_market_only:
         reasons.append("historical_market_path_only")
         score = min(score, 0.7)
@@ -445,6 +458,24 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
         return _final_assessment(
             0.0,
             [f"market_fact_contract:{reason}" for reason in fact_contract_reasons],
+            exclude=True,
+        )
+
+    label = _safe_dict(features.get("training_label_contract"))
+    label = _safe_dict(label.get("labels")) or label
+    scheduled = label.get("scheduled_label_at") or sample.get("label_timestamp")
+    timing = shadow_label_timing(_shadow_market_fact_contract(features), scheduled)
+    timing_reasons = list(timing["reasons"])
+    if _parse_datetime(label.get("label_timestamp")) != _parse_datetime(
+        timing["label_available_at"]
+    ):
+        timing_reasons.append("label_timestamp_not_result_availability")
+    row_schedule = _parse_datetime(sample.get("label_timestamp"))
+    if row_schedule and row_schedule != _parse_datetime(scheduled):
+        timing_reasons.append("scheduled_label_row_mismatch")
+    if timing_reasons:
+        return _final_assessment(
+            0.0, [f"shadow_label_timing:{reason}" for reason in timing_reasons],
             exclude=True,
         )
 

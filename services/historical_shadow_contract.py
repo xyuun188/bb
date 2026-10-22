@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.market_facts import MARKET_FACT_CONTRACT_VERSION
@@ -28,6 +28,7 @@ def build_historical_market_fact(
     role: str,
 ) -> dict[str, Any]:
     close = float(bar["close"])
+    opened = _as_utc(bar["open_time"])
     return {
         "schema_version": "historical_ohlcv_fact.v1",
         "symbol": symbol,
@@ -40,7 +41,10 @@ def build_historical_market_fact(
         "source_endpoint": "market_klines",
         "source_channel": "1m",
         "source_timestamp_ms": _timestamp_ms(bar["open_time"]),
-        "received_at": _as_utc(bar["open_time"]).isoformat(),
+        "received_at": opened.isoformat(),
+        "source_available_at": (opened + timedelta(minutes=1)).isoformat(),
+        "availability_basis": "one_minute_candle_close_lower_bound",
+        "delivery_latency_observed": False,
         "prices": {
             "last": close,
             "open": float(bar["open"]),
@@ -63,6 +67,7 @@ def build_historical_market_contract(
     entry_fact: dict[str, Any],
     result_fact: dict[str, Any],
     bars: list[dict[str, Any]],
+    scheduled_label_at: Any = None,
 ) -> dict[str, Any]:
     path = {
         "version": "historical_ohlcv_path.v1",
@@ -112,6 +117,18 @@ def build_historical_market_contract(
         ).encode("utf-8")
     ).hexdigest()
     path["path_fingerprint"] = data_fingerprint
+    # Keep the exact fingerprint inputs even after rolling candle-cache eviction.
+    path["ohlcv_evidence"] = fingerprint_payload
+    source_available_at = result_fact.get("source_available_at")
+    scheduled = _as_utc(scheduled_label_at) if isinstance(
+        scheduled_label_at, datetime
+    ) else scheduled_label_at
+    label_maturity_lag_seconds = None
+    if isinstance(scheduled, datetime) and source_available_at:
+        label_maturity_lag_seconds = (
+            datetime.fromisoformat(str(source_available_at).replace("Z", "+00:00"))
+            - _as_utc(scheduled)
+        ).total_seconds()
     return {
         "version": MARKET_FACT_CONTRACT_VERSION,
         "status": "historical_ohlcv_only",
@@ -128,9 +145,16 @@ def build_historical_market_contract(
         "provenance": {
             "source": HISTORICAL_SHADOW_SOURCE,
             "observation_window": {
-                "start": entry_fact["received_at"],
-                "end": result_fact["received_at"],
+                "start": entry_fact.get("source_available_at", entry_fact["received_at"]),
+                "end": source_available_at or result_fact["received_at"],
             },
+            "scheduled_label_at": (
+                _as_utc(scheduled).isoformat() if isinstance(scheduled, datetime) else str(scheduled or "")
+            ),
+            "result_source_available_at": source_available_at or "",
+            "label_maturity_lag_seconds": label_maturity_lag_seconds,
+            "availability_basis": "one_minute_candle_close_lower_bound",
+            "delivery_latency_observed": False,
             "sample_count": len(bars),
             "effective_sample_size": 1.0,
             "generated_at": datetime.now(UTC).isoformat(),
@@ -153,4 +177,10 @@ def compact_historical_market_contract(contract: dict[str, Any]) -> dict[str, An
         "path_status": "clean",
         "path_fingerprint": provenance["data_fingerprint"],
         "data_fingerprint": provenance["data_fingerprint"],
+        "observation_window": provenance["observation_window"],
+        "scheduled_label_at": provenance["scheduled_label_at"],
+        "result_source_available_at": provenance["result_source_available_at"],
+        "label_maturity_lag_seconds": provenance["label_maturity_lag_seconds"],
+        "availability_basis": provenance["availability_basis"],
+        "delivery_latency_observed": provenance["delivery_latency_observed"],
     }
