@@ -154,6 +154,14 @@ class FeatureVector:
     liquidation_risk_score: float = 0.0
     derivatives_snapshot_stale: bool = False
     derivatives_refresh_in_background: bool = False
+    # Keep the required-route outcome beside the feature snapshot so a
+    # quarantined observation can be diagnosed without inferring it from zero
+    # values. These fields never grant entry permission.
+    derivatives_route_status: dict[str, Any] = field(default_factory=dict)
+    derivatives_required_routes: list[str] = field(default_factory=list)
+    derivatives_required_data_available: bool = False
+    derivatives_snapshot_partial: bool = False
+    derivatives_unavailable_reason: str = ""
     sector_relative_strength: float = 0.0
 
     # --- Sentiment data ---

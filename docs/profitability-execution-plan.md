@@ -1,6 +1,6 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-22, Asia/Shanghai.
+Updated: 2026-10-23, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
@@ -720,3 +720,90 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   index/mark/order-book receipt paths, then collect a fresh bounded post-fix
   window and require zero contract errors plus complete component clocks
   before any candidate research or exam is opened.
+
+### Reference-Route Follow-Up (2026-10-23)
+
+- After the second paper-only restart at `2026-10-22T20:46:45Z`, the first
+  seven fresh market decisions had order-book receipts `7/7` and frozen
+  payloads between `91702` and `96642` bytes (`0/7` over the 96 KiB budget).
+  However, mark receipts were `5/7` and index receipts `4/7`; three rows had
+  empty reference responses under burst contention. The rows stayed
+  quarantined and no order was opened.
+- An isolated bounded public-route probe for `PEPE/USDT`, `OP/USDT` and
+  `IRYS/USDT` completed with positive mark/index prices and independent
+  receipt clocks for all three. This distinguishes route contention/latency
+  from exchange endpoint unavailability.
+- Repair: increase the bounded reference-route join window from `1.5s` to
+  `3.0s` while retaining single-flight requests and fail-closed facts. The
+  earlier fallback repair also retries the authoritative ticker batch when
+  the short ticker route returns only a background marker. Local focused
+  verification after these changes passed `146` tests; Ruff and whitespace
+  checks passed. The next step is targeted upload, remote focused verification,
+  paper-only restart, and a fresh sample requiring mark/index/order-book
+  receipt coverage before considering this sub-gate complete.
+
+### Recovery Continuation: Receipt Diagnostics And Budget Recheck (2026-10-23)
+
+- Local focused verification for the current working tree passed
+  `202 passed, 1 skipped`; the skipped case is the PostgreSQL temporary
+  transaction parity check because `BB_TEST_POSTGRES_URL` is not configured
+  locally. Ruff, compilation and `git diff --check` passed.
+- A bounded online entry/recovery audit at
+  `2026-10-22T20:28:05Z` covered the preceding three hours. All 40 recent
+  market decisions were `insufficient_evidence`/HOLD; no order or protection
+  action was taken. Paper mode and `live=false` remained in force. The
+  execution gate remains disabled because the authoritative local-ML evidence
+  is fee-after-return negative (`average_return=-0.311071%`,
+  `return_lcb=-0.441736%`, `profit_factor=0.549345`), while other sources
+  have no accepted fee-after-return sample.
+- The same bounded report found quarantines dominated by missing or
+  unobserved `orderbook`, `mark_price` and `index_price` facts. Pending
+  shadow rows remain disclosed and are not treated as valid labels. This is
+  the current G2 blocker, not a reason to relax gates or force trades.
+- A 60-minute frozen-payload projection at `2026-10-22T20:27:10Z` found
+  `23/64` raw decision snapshots over the 96 KiB frozen budget
+  (maximum `100708` bytes). The largest contributor was the full
+  `market_fact.source_consistency` projection. This is a storage/eligibility
+  defect to resolve before training; it is not profitability evidence.
+- Added a bounded-cache regression for the 256-symbol native 1m evidence
+  cache. The next action is explicit-path online verification of the current
+  availability/market-fact/data-service batch, followed by a fresh
+  post-deploy projection. G2 remains blocked until newly captured rows have
+  complete component receipts and the payload budget is clean; G3-G6 remain
+  pending.
+
+### Order-Book Receipt Follow-Up (2026-10-23)
+
+- The current availability/compaction/reference batch was uploaded with
+  explicit paths and verified remotely. The local focused group passed
+  `150 passed, 1 skipped`; the same remote group passed `150 passed,
+  1 skipped`. The PostgreSQL skip is expected because the local dedicated
+  `BB_TEST_POSTGRES_URL` is unset.
+- Only `bb-paper-trading.service` was restarted after the targeted upload.
+  At `2026-10-22T21:14:03Z` it was `active/running` with `NRestarts=0`;
+  runtime mode remained `paper` and live execution stayed disabled.
+- A new bounded budget audit distinguishes the raw decision snapshot from the
+  actual training snapshot. In the post-deploy window ending
+  `2026-10-22T21:16:05Z`, the training column had 64 rows, maximum frozen
+  payload `96,636 B`, and `0/64` over the `98,304 B` limit. The raw
+  `AIDecision.feature_snapshot` column still had `13/37` rows over the limit
+  (maximum `100,014 B`); this is retained for audit/execution context and is
+  not accepted as training evidence. The training payload budget therefore
+  passes, while raw decision storage remains disclosed.
+- The fresh availability projection after the first restart contained 8
+  market decisions from `2026-10-22T21:16:51Z` through `21:20:11Z`: all 8
+  were sealed, 6 were clean, and 2 were quarantined for missing order-book,
+  mark, and index facts. A later 11-row slice had 9 clean and 2 with
+  `orderbook:fact_missing`; no row was authorized for entry. These are
+  component-lineage results, not profitability evidence.
+- The remaining order-book route was allowed a bounded `4.0 s` single-flight
+  join window (below the existing six-second derivatives deadline), and
+  timeout results now carry an explicit `orderbook_timeout` marker. Local
+  regressions passed `204 passed, 1 skipped`; the remote order-book/reference
+  group passed `51 passed`. A second paper-only restart completed at
+  `2026-10-22T21:30:31Z` with `active/running` and `NRestarts=0`.
+- G2 is still blocked. The next evidence boundary is the fresh sample after
+  `2026-10-22T21:30:31Z`; require zero order-book/mark/index availability
+  errors, complete receipts, and a clean training payload before considering
+  this sub-gate passed. Negative fee-after-return evidence remains a separate
+  execution blocker; G3-G6 stay pending.

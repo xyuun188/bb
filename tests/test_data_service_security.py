@@ -9,6 +9,10 @@ from typing import Any
 
 import pytest
 
+from core.feature_availability import (
+    COMPONENT_AVAILABILITY_VERSION,
+    ObservedKlines,
+)
 from data_feed.feature_vector import build_feature_vector
 from services import data_service as data_service_module
 from services.data_service import DataService
@@ -59,6 +63,24 @@ def _service() -> DataService:
     service._available_symbols_refresh_task = None
     service._stopping = False
     return service
+
+
+def _observed(rows: list[list[float]]) -> ObservedKlines:
+    return ObservedKlines(rows, received_at=datetime.now(UTC).isoformat())
+
+
+def _observed_technical_contract() -> dict[str, Any]:
+    received = datetime.now(UTC)
+    return {
+        "version": COMPONENT_AVAILABILITY_VERSION,
+        "available_at": received.isoformat(),
+        "timeframes": "1m",
+        "source_delivery_observed": True,
+        "1m_closed_at": (received - timedelta(seconds=1)).isoformat(),
+        "1m_received_at": received.isoformat(),
+        "1m_input_fingerprint": "1" * 64,
+        "input_fingerprint": "2" * 64,
+    }
 
 
 @pytest.mark.asyncio
@@ -447,10 +469,10 @@ async def test_indicator_snapshot_persists_all_training_timeframes(
             limit: int = 100,
         ) -> list[list[float]]:
             fetch_calls.append((timeframe, limit))
-            return [
+            return _observed([
                 [1_700_000_000_000 + index * 60_000, 100.0, 101.0, 99.0, 100.5, 10.0]
                 for index in range(limit)
-            ]
+            ])
 
     async def fake_persist(symbol: str, timeframe: str, klines: list[Any]) -> None:
         persisted.append((symbol, timeframe, len(klines)))
@@ -751,6 +773,7 @@ async def test_normal_feature_vector_can_build_indicators_from_cached_klines() -
             "technical_indicator_timeframe": "1h",
             "close": 100.0,
             "volume_ratio": 1.2,
+            "technical_availability": _observed_technical_contract(),
         }
 
     service.refresh_sentiment = noop_sentiment  # type: ignore[method-assign]
@@ -845,7 +868,7 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
                 "15m": 30.0,
                 "1h": 100.0,
             }[timeframe]
-            return [
+            return _observed([
                 [
                     1_700_000_000_000 + index * 60_000,
                     base_price + index * 0.01,
@@ -855,7 +878,7 @@ async def test_indicator_snapshot_uses_minute_returns_and_hourly_trend(
                     10.0,
                 ]
                 for index in range(limit)
-            ]
+            ])
 
     async def fake_persist(symbol: str, timeframe: str, klines: list[Any]) -> None:
         return None
@@ -968,7 +991,8 @@ async def test_indicator_snapshot_refreshes_when_cached_klines_lack_receipt_prov
 
     features = await service._get_indicator_snapshot("BTC/USDT")
 
-    assert features["close"] == 100.5
+    assert features["indicator_snapshot_available"] is False
+    assert features["indicator_snapshot_reason"] == "indicator_source_delivery_unobserved"
     assert fetch_calls == len(data_service_module.KLINE_PERSIST_TIMEFRAME_LIMITS)
 
 
@@ -987,7 +1011,7 @@ async def test_indicator_snapshot_does_not_wait_for_kline_persistence(
             timeframe: str = "1h",
             limit: int = 100,
         ) -> list[list[float]]:
-            return [
+            return _observed([
                 [
                     1_700_000_000_000 + index * 60_000,
                     100.0,
@@ -997,7 +1021,7 @@ async def test_indicator_snapshot_does_not_wait_for_kline_persistence(
                     10.0,
                 ]
                 for index in range(limit)
-            ]
+            ])
 
     async def no_cache(symbol: str, timeframe: str, limit: int) -> list[list[float]]:
         return []
@@ -1290,9 +1314,11 @@ async def test_indicator_snapshot_nonblocking_returns_stale_cache_and_refreshes(
 
     features = await service._get_indicator_snapshot("BTC/USDT", block_on_remote=False)
 
-    assert features["close"] == pytest.approx(100.5)
-    assert features["indicator_snapshot_stale"] is True
-    assert features["indicator_snapshot_refresh_in_background"] is True
+    assert features["indicator_snapshot_available"] is False
+    assert "close" not in features
+    assert features["indicator_snapshot_reason"] == (
+        "indicator_cached_source_delivery_unobserved"
+    )
     assert scheduled == ["BTC/USDT"]
 
 
@@ -1817,6 +1843,39 @@ async def test_native_consistency_bars_do_not_join_an_older_inflight_window() ->
     assert requested_windows == [previous_minute, current_minute]
     cached_rows = service._native_consistency_bars_cache["BTC/USDT"][1]
     assert {int(row[0]) for row in cached_rows} == {previous_minute, current_minute}
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_bar_cache_evicts_oldest_symbols_at_bound() -> None:
+    service = _service()
+    current_timestamp = int(time.time() * 1000)
+    current_minute = (current_timestamp // 60_000) * 60_000
+    calls: list[str] = []
+
+    class FakeRestClient:
+        async def fetch_ohlcv(
+            self, symbol: str, *, timeframe: str, limit: int
+        ) -> list[list[float]]:
+            assert timeframe == "1m"
+            assert limit >= 1
+            calls.append(symbol)
+            return [[float(current_minute), 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    for index in range(data_service_module.NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS + 1):
+        await service._fetch_native_consistency_bars(
+            f"ASSET{index}/USDT",
+            [{"timestamp": current_timestamp}],
+        )
+
+    cache = service._native_consistency_bars_cache
+    assert len(cache) == data_service_module.NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS
+    assert "ASSET0/USDT" not in cache
+    assert (
+        f"ASSET{data_service_module.NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS}/USDT"
+        in cache
+    )
+    assert len(calls) == data_service_module.NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS + 1
 
 
 @pytest.mark.asyncio
@@ -2733,6 +2792,50 @@ async def test_attach_native_market_fact_nonblocking_missing_depth_skips_rest() 
 
 
 @pytest.mark.asyncio
+async def test_nonblocking_native_fact_starts_one_minute_path_refresh_after_service_start() -> None:
+    service = _service()
+    service._started = True
+    timestamp = int(time.time() * 1000)
+    calls: list[tuple[str, int]] = []
+
+    class FakeWsClient:
+        latest_orderbooks: dict[str, dict[str, Any]] = {}
+        latest_mark_prices: dict[str, dict[str, Any]] = {}
+
+    class FakeRestClient:
+        async def fetch_native_consistency_ohlcv(
+            self,
+            symbol: str,
+            *,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+        ) -> list[list[float]]:
+            calls.append((symbol, limit))
+            return [[timestamp - 60_000, 99.0, 101.0, 98.0, 100.0, 10.0]]
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    service._get_instrument_spec = (  # type: ignore[method-assign]
+        lambda _symbol, **_kwargs: asyncio.sleep(0, result={})
+    )
+
+    await service._attach_native_market_fact(
+        "BTC/USDT",
+        {
+            "symbol": "BTC/USDT",
+            "source": "websocket",
+            "timestamp": timestamp,
+            "source_timestamp_ms": timestamp,
+            "received_at": datetime.now(UTC).isoformat(),
+        },
+        block_on_remote=False,
+    )
+    await asyncio.sleep(0.05)
+
+    assert calls == [("BTC/USDT", 3)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("block_on_remote", [False, True])
 @pytest.mark.parametrize("has_snapshot_book", [False, True])
 async def test_stale_positive_depth_cannot_suppress_blocking_book_refresh(
@@ -3124,7 +3227,10 @@ async def test_candidate_indicator_build_marks_all_remote_klines_as_priority() -
         return timeframe, [[1_780_000_000_000.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
 
     async def compute_features(_klines: dict[str, list]) -> dict[str, Any]:
-        return {"indicator_snapshot_available": True}
+        return {
+            "indicator_snapshot_available": True,
+            "technical_availability": _observed_technical_contract(),
+        }
 
     service._indicator_features_from_cached_klines = no_cached_features  # type: ignore[method-assign]
     service._fetch_indicator_klines = fetch_indicator  # type: ignore[method-assign]

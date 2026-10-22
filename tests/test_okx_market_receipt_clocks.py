@@ -194,6 +194,46 @@ async def test_reference_fallback_retains_original_ticker_delivery_clock(
 
 
 @pytest.mark.asyncio
+async def test_reference_fallback_retries_authoritative_ticker_when_short_route_is_backgrounded(
+    monkeypatch, receipt_clock,
+) -> None:
+    client = OKXRestClient()
+    authoritative_received_at = (receipt_clock.current + timedelta(seconds=7)).isoformat()
+    fallback_calls: list[str] = []
+
+    async def fetch(*args, **kwargs):
+        return {"data": []}
+
+    async def short_ticker(*args, **kwargs):
+        assert kwargs.get("wait_for_completion") is False
+        return {"ticker_refresh_in_background": True}
+
+    async def authoritative(inst_id: str) -> dict:
+        fallback_calls.append(inst_id)
+        return {
+            "id": inst_id,
+            "last": 100.0,
+            "bid": 99.9,
+            "ask": 100.1,
+            "timestamp": SOURCE_TIMESTAMP_MS,
+            "received_at": authoritative_received_at,
+            "info": {"instId": inst_id},
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+    monkeypatch.setattr(client, "fetch_ticker", short_ticker)
+    monkeypatch.setattr(client, "_fetch_authoritative_ticker_fallback", authoritative)
+
+    result = await client.fetch_reference_prices("BTC/USDT", contract_spec=CONTRACT_SPEC)
+
+    assert result["reference_prices_fallback"] == "ticker_last"
+    assert fallback_calls == ["BTC-USDT-SWAP"]
+    for key in ("mark_price_fact", "index_price_fact"):
+        assert result[key]["received_at"] == authoritative_received_at
+        assert result[key]["source_timestamp_ms"] == SOURCE_TIMESTAMP_MS
+
+
+@pytest.mark.asyncio
 async def test_ticker_routes_capture_local_completion_not_exchange_ts(
     monkeypatch, receipt_clock,
 ) -> None:

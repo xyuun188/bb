@@ -163,6 +163,7 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
 # actual quote route.  Keep a short single-flight cache; the market-fact
 # validator still rejects missing or stale paths.
 NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS = 30.0
+NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS = 256
 LATEST_MARKET_FACT_CACHE_TTL_SECONDS = 15.0
 AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
 CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
@@ -1545,6 +1546,8 @@ class DataService:
                 if remaining:
                     merged_rows.extend(unkeyed_rows[-remaining:])
                 cache[normalized] = (asyncio.get_running_loop().time(), merged_rows)
+                while len(cache) > NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS:
+                    cache.pop(next(iter(cache)))
             return result
 
         task = asyncio.create_task(fetch())
@@ -1755,6 +1758,18 @@ class DataService:
             received_at=enriched.get("received_at"),
             require_observed_receipt=True,
         )
+        # Cache-only market scans must stay bounded, but they should still
+        # start the isolated native 1m evidence request when the service is
+        # running. A later scan can then attach a verified path instead of
+        # repeatedly persisting an observation with no path at all. Tests and
+        # direct callers remain read-only until ``start()`` marks the service
+        # as active.
+        if not block_on_remote and bool(getattr(self, "_started", False)):
+            await self._fetch_native_consistency_bars(
+                normalized,
+                [enriched],
+                wait_for_completion=False,
+            )
         return enriched
 
     def _native_cached_fact_is_fresh(
@@ -2596,14 +2611,24 @@ class DataService:
         normalized = self._normalize_symbols([symbol])[0]
         cache = self._indicator_snapshot_cache_map()
         cached = cache.get(normalized)
-        if self._is_fresh_indicator_cache(cached):
+        cached_data = cached.get("data") if isinstance(cached, dict) else None
+        cached_delivery_observed = self._has_observed_technical_inputs(cached_data)
+        if self._is_fresh_indicator_cache(cached) and cached_delivery_observed:
             if allow_background_refresh:
                 self._schedule_kline_background_refresh(normalized)
-            return dict(cached.get("data") or {})
-        if isinstance(cached, dict) and not block_on_remote:
+            return deepcopy(cached_data)
+        if isinstance(cached, dict) and not block_on_remote and not cached_delivery_observed:
             if allow_background_refresh:
                 self._schedule_indicator_snapshot_refresh(normalized)
-            data = dict(cached.get("data") or {})
+            return self._unavailable_indicator_snapshot(
+                "indicator_cached_source_delivery_unobserved",
+                refresh_in_background=bool(allow_background_refresh),
+                background_refresh_deferred=not allow_background_refresh,
+            )
+        if isinstance(cached, dict) and not block_on_remote and cached_delivery_observed:
+            if allow_background_refresh:
+                self._schedule_indicator_snapshot_refresh(normalized)
+            data = deepcopy(cached_data or {})
             if data:
                 data["indicator_snapshot_stale"] = True
                 data["indicator_snapshot_refresh_in_background"] = bool(
@@ -2652,10 +2677,18 @@ class DataService:
                     )
                 cached_features = next(iter(done)).result()
                 if cached_features:
-                    self._store_indicator_snapshot_cache(normalized, cached_features)
+                    if self._has_observed_technical_inputs(cached_features):
+                        self._store_indicator_snapshot_cache(normalized, cached_features)
+                        if allow_background_refresh:
+                            self._schedule_kline_background_refresh(normalized)
+                        return cached_features
                     if allow_background_refresh:
-                        self._schedule_kline_background_refresh(normalized)
-                    return cached_features
+                        self._schedule_indicator_snapshot_refresh(normalized)
+                    return self._unavailable_indicator_snapshot(
+                        "indicator_cached_source_delivery_unobserved",
+                        refresh_in_background=bool(allow_background_refresh),
+                        background_refresh_deferred=not allow_background_refresh,
+                    )
             if allow_background_refresh:
                 self._schedule_indicator_snapshot_refresh(normalized)
             return self._unavailable_indicator_snapshot(
@@ -2894,13 +2927,46 @@ class DataService:
             datetime.now(UTC) - updated_at
         ).total_seconds() <= INDICATOR_SNAPSHOT_CACHE_TTL_SECONDS
 
+    @staticmethod
+    def _has_observed_technical_inputs(features: Any) -> bool:
+        if not isinstance(features, dict):
+            return False
+        evidence = features.get("technical_availability")
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("version") != COMPONENT_AVAILABILITY_VERSION
+            or evidence.get("source_delivery_observed") is not True
+            or not evidence.get("input_fingerprint")
+        ):
+            return False
+        available_at = availability_timestamp(evidence.get("available_at"))
+        timeframes = [
+            value for value in str(evidence.get("timeframes") or "").split(",") if value
+        ]
+        if available_at is None or not timeframes:
+            return False
+        for timeframe in timeframes:
+            receipt = availability_timestamp(evidence.get(f"{timeframe}_received_at"))
+            closed = availability_timestamp(evidence.get(f"{timeframe}_closed_at"))
+            fingerprint = evidence.get(f"{timeframe}_input_fingerprint")
+            if (
+                receipt is None
+                or closed is None
+                or closed > receipt
+                or receipt > available_at
+                or not isinstance(fingerprint, str)
+                or not fingerprint
+            ):
+                return False
+        return True
+
     def _store_indicator_snapshot_cache(self, symbol: str, data: dict[str, Any]) -> None:
         if not data:
             return
         normalized = self._normalize_symbols([symbol])[0]
         self._indicator_snapshot_cache_map()[normalized] = {
             "updated_at": datetime.now(UTC),
-            "data": dict(data),
+            "data": deepcopy(data),
         }
 
     def _schedule_kline_background_refresh(self, symbol: str) -> None:
@@ -2995,15 +3061,7 @@ class DataService:
     ) -> dict[str, Any]:
         try:
             cached_features = await self._indicator_features_from_cached_klines(symbol)
-            cached_availability = (
-                cached_features.get("technical_availability")
-                if isinstance(cached_features, dict)
-                else None
-            )
-            cached_delivery_observed = (
-                isinstance(cached_availability, dict)
-                and cached_availability.get("source_delivery_observed") is True
-            )
+            cached_delivery_observed = self._has_observed_technical_inputs(cached_features)
             if cached_features and cached_delivery_observed:
                 self._store_indicator_snapshot_cache(symbol, cached_features)
                 self._schedule_kline_background_refresh(symbol)
@@ -3038,8 +3096,13 @@ class DataService:
             features = await self._compute_indicator_features_off_loop(
                 klines_by_timeframe
             )
-            if features:
-                self._store_indicator_snapshot_cache(symbol, features)
+            if not features:
+                return {}
+            if not self._has_observed_technical_inputs(features):
+                return self._unavailable_indicator_snapshot(
+                    "indicator_source_delivery_unobserved"
+                )
+            self._store_indicator_snapshot_cache(symbol, features)
             return features
         except Exception as e:
             logger.debug("failed to compute indicators", symbol=symbol, error=safe_error_text(e))

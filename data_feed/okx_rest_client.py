@@ -44,10 +44,17 @@ DERIVATIVES_ROUTE_CACHE_TTL_SECONDS = 20.0
 # before it can populate the cache and every new symbol becomes ineligible.
 DERIVATIVES_ROUTE_STALE_CACHE_TTL_SECONDS = 10 * 60
 DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
-REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 1.5
+# Reference routes share the public request gate with executable quotes. A
+# short 1.5s deadline caused bursty rounds to persist empty mark/index facts
+# even though the shared single-flight request completed moments later.
+REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 3.0
 REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
 REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
-ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 2.5
+# The order-book route shares the public request gate with ticker and
+# reference-price calls. Keep the wait bounded below the six-second
+# derivatives deadline, but allow a queued single-flight request to finish
+# before persisting a missing fact under burst load.
+ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 4.0
 ORDERBOOK_CACHE_TTL_SECONDS = 10.0
 TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # A caller joining an already-running ticker refresh gets a normal bounded
@@ -1067,6 +1074,7 @@ class OKXRestClient:
                 "orderbook_imbalance": 0.0,
                 "orderbook_data_available": False,
                 "orderbook_refresh_in_background": True,
+                "orderbook_timeout": True,
             }
         except Exception as exc:
             logger.debug("fetch order book failed", symbol=symbol, error=safe_error_text(exc))
@@ -1205,6 +1213,21 @@ class OKXRestClient:
                     asyncio.shield(ticker_task),
                     timeout=REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS,
                 )
+                ticker_info = (
+                    ticker_result.get("info")
+                    if isinstance(ticker_result, dict)
+                    and isinstance(ticker_result.get("info"), dict)
+                    else {}
+                )
+                if self._safe_float(
+                    ticker_result.get("last") if isinstance(ticker_result, dict) else None
+                ) <= 0 and self._safe_float(ticker_info.get("last")) <= 0:
+                    # The short per-symbol request can legitimately return a
+                    # background marker when the shared SDK lane is busy.
+                    # Retry through the authoritative batch route so an empty
+                    # mark/index response never becomes a completed-looking
+                    # zero-valued fact without a receipt clock.
+                    ticker_result = await self._fetch_authoritative_ticker_fallback(inst_id)
                 ticker_info = ticker_result.get("info") or {}
                 ticker_price = self._safe_float(ticker_result.get("last"))
                 ticker_timestamp_ms = int(

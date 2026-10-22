@@ -13,6 +13,7 @@ from core.feature_availability import (
     sentiment_input_availability,
 )
 from data_feed import okx_rest_client
+from data_feed.feature_vector import build_feature_vector
 from data_feed.okx_rest_client import OKXRestClient
 from services import data_service as data_service_module
 from services.data_service import DataService
@@ -49,6 +50,20 @@ def _service() -> DataService:
     return service
 
 
+def _observed_technical_contract() -> dict:
+    received = RECEIVED_AT
+    return {
+        "version": COMPONENT_AVAILABILITY_VERSION,
+        "available_at": received.isoformat(),
+        "timeframes": "1m",
+        "source_delivery_observed": True,
+        "1m_closed_at": (received - timedelta(seconds=1)).isoformat(),
+        "1m_received_at": received.isoformat(),
+        "1m_input_fingerprint": "1" * 64,
+        "input_fingerprint": "2" * 64,
+    }
+
+
 @pytest.fixture
 def receipt_clock(monkeypatch: pytest.MonkeyPatch):
     class Clock(datetime):
@@ -61,6 +76,79 @@ def receipt_clock(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(data_service_module, "datetime", Clock)
     monkeypatch.setattr(okx_rest_client, "datetime", Clock)
     return Clock
+
+
+@pytest.mark.asyncio
+async def test_fresh_indicator_cache_without_observed_receipt_is_bypassed() -> None:
+    service = _service()
+    service._indicator_snapshot_cache["BTC/USDT"] = {
+        "updated_at": RECEIVED_AT,
+        "data": {"close": 99.0, "indicator_snapshot_available": True},
+    }
+    rebuilt = {
+        "close": 101.0,
+        "indicator_snapshot_available": True,
+        "technical_availability": _observed_technical_contract(),
+    }
+    build_calls = []
+
+    async def rebuild(symbol: str) -> dict:
+        build_calls.append(symbol)
+        return rebuilt
+
+    service._build_indicator_snapshot = rebuild  # type: ignore[method-assign]
+
+    result = await service._get_indicator_snapshot("BTC/USDT")
+
+    assert result["close"] == 101.0
+    assert result["technical_availability"]["source_delivery_observed"] is True
+    assert build_calls == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_indicator_cache_without_receipt_fails_closed() -> None:
+    service = _service()
+    service._indicator_snapshot_cache["BTC/USDT"] = {
+        "updated_at": RECEIVED_AT,
+        "data": {"close": 99.0, "indicator_snapshot_available": True},
+    }
+    scheduled = []
+    service._schedule_indicator_snapshot_refresh = scheduled.append  # type: ignore[method-assign]
+
+    result = await service._get_indicator_snapshot(
+        "BTC/USDT", block_on_remote=False,
+    )
+
+    assert result["indicator_snapshot_available"] is False
+    assert "close" not in result
+    assert result["indicator_snapshot_reason"] == (
+        "indicator_cached_source_delivery_unobserved"
+    )
+    assert scheduled == ["BTC/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_database_indicator_build_is_not_cached_or_returned() -> None:
+    service = _service()
+    scheduled = []
+    service._schedule_indicator_snapshot_refresh = scheduled.append  # type: ignore[method-assign]
+
+    async def build_from_cached_rows(_symbol: str) -> dict:
+        return {"close": 99.0, "indicator_snapshot_available": True}
+
+    service._indicator_features_from_cached_klines = build_from_cached_rows  # type: ignore[method-assign]
+
+    result = await service._get_indicator_snapshot(
+        "BTC/USDT", block_on_remote=False,
+    )
+
+    assert result["indicator_snapshot_available"] is False
+    assert "close" not in result
+    assert result["indicator_snapshot_reason"] == (
+        "indicator_cached_source_delivery_unobserved"
+    )
+    assert "BTC/USDT" not in service._indicator_snapshot_cache
+    assert scheduled == ["BTC/USDT"]
 
 
 def _rows(timeframe: str, *, count: int = 40) -> list[list[float]]:
@@ -303,6 +391,30 @@ async def test_feature_vector_retains_detached_component_availability(
         "available_at"
     ] == RECEIVED_AT.isoformat()
     assert service._news_items_cache["BTC/USDT"][0]["received_at"] == RECEIVED_AT.isoformat()
+
+
+def test_feature_vector_preserves_derivatives_route_diagnostics() -> None:
+    vector = build_feature_vector(
+        "BTC/USDT",
+        ticker={"last_price": 100.0, "bid": 99.9, "ask": 100.1},
+        derivatives={
+            "derivatives_route_status": {
+                "completed": ["orderbook"],
+                "failed": [],
+                "timed_out": ["reference_prices"],
+            },
+            "derivatives_required_routes": ["orderbook", "reference_prices"],
+            "derivatives_required_data_available": False,
+            "derivatives_snapshot_partial": True,
+            "derivatives_unavailable_reason": "reference_prices_timeout",
+        },
+    )
+
+    assert vector.derivatives_route_status["timed_out"] == ["reference_prices"]
+    assert vector.derivatives_required_routes == ["orderbook", "reference_prices"]
+    assert vector.derivatives_required_data_available is False
+    assert vector.derivatives_snapshot_partial is True
+    assert vector.derivatives_unavailable_reason == "reference_prices_timeout"
 
 
 @pytest.mark.parametrize(

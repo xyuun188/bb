@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -16,6 +17,7 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symb
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
 MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
 MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-17.okx-source-consistency.v4"
+MARKET_FACT_STORAGE_COMPACTION_VERSION = "2026-10-22.compact-market-fact.v1"
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -273,6 +275,222 @@ def build_market_fact(
     }
     fact["fact_id"] = f"sha256:{_fingerprint(fact)}"
     return fact
+
+
+def _compact_source_consistency(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Retain quality decisions and fingerprints without duplicating raw facts."""
+
+    source = _dict(value)
+    if not source:
+        return {}
+    compact: dict[str, Any] = {
+        key: source.get(key)
+        for key in (
+            "version",
+            "status",
+            "quotes_overlap",
+            "quotes_temporally_reconciled",
+        )
+        if key in source
+    }
+    compact["reasons"] = [
+        _text(item)[:160] for item in source.get("reasons") or [] if _text(item)
+    ]
+    compact["reference_warnings"] = [
+        _text(item)[:160] for item in source.get("reference_warnings") or [] if _text(item)
+    ]
+    nested_fields = {
+        "assertions": (
+            "native_identity_verified",
+            "executable_quotes_verified",
+            "tick_alignment_verified",
+            "reference_prices_verified",
+            "one_minute_path_verified",
+            "market_continuity_verified",
+        ),
+        "native_identity": ("inst_id", "inst_type", "uly", "contract_spec_version", "tick_size"),
+        "quote_reconciliation": (
+            "time_span_ms",
+            "gap",
+            "tolerance",
+            "max_interval_spread",
+            "source_skew_tolerance",
+            "relative_tolerance_cap",
+        ),
+        "reference_observations": ("mark_price_available", "index_price_available"),
+    }
+    for key, fields in nested_fields.items():
+        nested = _dict(source.get(key))
+        projected = {field: nested[field] for field in fields if field in nested}
+        if projected:
+            compact[key] = projected
+    path = _dict(source.get("path"))
+    if path:
+        missing_times = path.get("missing_open_times_ms")
+        compact["path"] = {
+            field: path[field]
+            for field in (
+                "source",
+                "bar_count",
+                "path_low",
+                "path_high",
+                "observed_prices_within_path",
+                "continuity_accepted_via",
+            )
+            if field in path
+        }
+        if isinstance(missing_times, list):
+            from core.training_feature_snapshot import storage_feature_fingerprint
+
+            compact["path"]["missing_open_times_count"] = len(missing_times)
+            compact["path"]["missing_open_times_fingerprint"] = (
+                storage_feature_fingerprint(missing_times)
+            )
+    compact["ticker_sources"] = [
+        {
+            field: item.get(field)
+            for field in ("fact_id", "source_interface", "source_timestamp_ms")
+            if field in item
+        }
+        for item in source.get("ticker_sources") or []
+        if isinstance(item, Mapping)
+    ]
+    compact["executable_intervals"] = [
+        {
+            field: item.get(field)
+            for field in ("source", "bid", "ask", "source_timestamp_ms")
+            if field in item
+        }
+        for item in source.get("executable_intervals") or []
+        if isinstance(item, Mapping)
+    ]
+    provenance = _dict(source.get("provenance"))
+    if provenance:
+        compact["provenance"] = {
+            field: deepcopy(provenance.get(field))
+            for field in (
+                "source",
+                "observation_window",
+                "sample_count",
+                "effective_sample_size",
+                "generated_at",
+                "strategy_version",
+                "data_fingerprint",
+            )
+            if field in provenance
+        }
+        if provenance.get("fallback_reason"):
+            compact["provenance"]["fallback_reason"] = _text(
+                provenance.get("fallback_reason")
+            )[:512]
+    return compact
+
+
+def _strip_json_null_object_values(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_json_null_object_values(child)
+            for key, child in value.items()
+            if child is not None
+        }
+    if isinstance(value, list):
+        return [_strip_json_null_object_values(child) for child in value]
+    return deepcopy(value)
+
+
+def compact_market_fact(fact: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project a native fact for training storage while retaining audit identity.
+
+    The full fact remains in ``ShadowBacktest.feature_snapshot`` and the
+    decision record. This projection is only used for the bounded training
+    snapshot; it keeps the execution fields and fingerprints while removing
+    duplicated nested raw contracts.
+    """
+
+    source = _dict(fact)
+    if not source or source.get("schema_version") != MARKET_FACT_SCHEMA_VERSION:
+        return deepcopy(source)
+    storage_contract = _dict(source.get("storage_contract"))
+    if (
+        storage_contract.get("version") == MARKET_FACT_STORAGE_COMPACTION_VERSION
+        and storage_contract.get("full_fact_fingerprint") == source.get("fact_id")
+    ):
+        return deepcopy(source)
+    identity = _dict(source.get("native_identity"))
+    spec = _dict(identity.get("contract_spec"))
+    compact_identity = {
+        key: identity.get(key)
+        for key in ("inst_id", "inst_type", "uly", "contract_spec_version")
+        if key in identity
+    }
+    compact_identity["contract_spec"] = {
+        key: spec.get(key)
+        for key in (
+            "inst_id",
+            "inst_type",
+            "uly",
+            "contract_type",
+            "contract_value",
+            "contract_multiplier",
+            "contract_value_currency",
+            "settle_currency",
+            "lot_size",
+            "minimum_size",
+            "tick_size",
+            "state",
+            "source",
+            "spec_version",
+        )
+        if key in spec
+    }
+    compact: dict[str, Any] = {
+        key: source.get(key)
+        for key in (
+            "schema_version",
+            "symbol",
+            "source_interface",
+            "source_endpoint",
+            "source_channel",
+            "source_timestamp_ms",
+            "source_sequence",
+            "received_at",
+            "stale",
+            "source_quality_issue",
+            "fact_id",
+        )
+        if key in source
+    }
+    compact["native_identity"] = compact_identity
+    for key in ("prices", "liquidity"):
+        nested = _dict(source.get(key))
+        if nested:
+            compact[key] = deepcopy(nested)
+    consistency = _compact_source_consistency(source.get("source_consistency"))
+    if consistency:
+        compact["source_consistency"] = consistency
+    quality = _dict(source.get("quality"))
+    if quality:
+        compact["quality"] = {
+            "status": quality.get("status"),
+            "violation_count": quality.get("violation_count"),
+            "reasons": [
+                _text(item)[:160] for item in quality.get("reasons") or [] if _text(item)
+            ],
+        }
+    source_provenance = _dict(source.get("source_consistency"))
+    source_provenance = _dict(source_provenance.get("provenance"))
+    compact["storage_contract"] = {
+        key: value
+        for key, value in {
+            "version": MARKET_FACT_STORAGE_COMPACTION_VERSION,
+            "full_fact_fingerprint": source.get("fact_id"),
+            "full_source_consistency_fingerprint": source_provenance.get(
+                "data_fingerprint"
+            ),
+        }.items()
+        if value is not None
+    }
+    return _strip_json_null_object_values(compact)
 
 
 def _bar_payload(row: Any) -> dict[str, Any] | None:

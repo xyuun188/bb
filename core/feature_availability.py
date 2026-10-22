@@ -191,12 +191,38 @@ def feature_availability_reasons(features: dict[str, Any], *, decision_at: Any =
     elif frozen > completed:
         reasons.append("feature_freeze_after_original_decision")
     try:
-        fingerprint = availability_fingerprint(
-            {key: features[key] for key in FROZEN_FEATURE_FIELDS if key in features}
-        )
+        storage_contract = features.get("feature_storage_compaction")
+        if (
+            isinstance(storage_contract, dict)
+            and storage_contract.get("version")
+            == "2026-10-22.compact-feature-storage.v1"
+        ):
+            from core.training_feature_snapshot import storage_feature_fingerprint
+
+            fingerprint = storage_feature_fingerprint(
+                {key: features[key] for key in FROZEN_FEATURE_FIELDS if key in features}
+            )
+            compact_fingerprint = storage_contract.get("compact_input_fingerprint")
+            if compact_fingerprint != fingerprint:
+                reasons.append("feature_inputs_changed_after_freeze")
+            if storage_contract.get("full_input_fingerprint") != contract.get(
+                "input_fingerprint"
+            ):
+                reasons.append("feature_storage_contract_input_mismatch")
+            fingerprint = contract.get("input_fingerprint")
+        else:
+            fingerprint = availability_fingerprint(
+                {key: features[key] for key in FROZEN_FEATURE_FIELDS if key in features}
+            )
     except (TypeError, ValueError):
         fingerprint = None
-    if not fingerprint or contract.get("input_fingerprint") != fingerprint:
+    if (
+        not fingerprint
+        or (
+            not isinstance(features.get("feature_storage_compaction"), dict)
+            and contract.get("input_fingerprint") != fingerprint
+        )
+    ):
         reasons.append("feature_inputs_changed_after_freeze")
 
     technical = features.get("technical_availability")

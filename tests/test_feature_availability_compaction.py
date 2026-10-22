@@ -11,10 +11,18 @@ from sqlalchemy import select
 
 from core.feature_availability import (
     COMPONENT_AVAILABILITY_VERSION,
+    FROZEN_FEATURE_FIELDS,
+    availability_fingerprint,
+    feature_availability_reasons,
     seal_feature_availability,
     sentiment_input_availability,
 )
-from core.market_facts import MARKET_FACT_CONTRACT_VERSION, build_market_fact
+from core.market_facts import (
+    MARKET_FACT_CONTRACT_VERSION,
+    build_market_fact,
+    compact_market_fact,
+    market_fact_reasons,
+)
 from core.training_contracts import (
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
@@ -25,8 +33,11 @@ from core.training_feature_snapshot import (
     FROZEN_TRAINING_FEATURE_MAX_BYTES,
     TRAINING_FEATURE_SNAPSHOT_MAX_BYTES,
     TRAINING_FEATURE_SNAPSHOT_VERSION,
+    _jsonb_text,
+    _storage_fingerprint_value,
     frozen_feature_payload_size,
     postgres_training_feature_snapshot_functions,
+    storage_feature_fingerprint,
     training_feature_storage_bytes,
 )
 from models.decision import AIDecision
@@ -78,7 +89,7 @@ def _availability_snapshot() -> dict[str, object]:
         social,
         available_at=FROZEN_AT,
     )
-    return {
+    result = {
         "feature_snapshot_frozen_at": FROZEN_AT.isoformat(),
         "original_decision_timestamp": "2026-10-22T01:00:10+00:00",
         "feature_availability_contract": {
@@ -89,6 +100,10 @@ def _availability_snapshot() -> dict[str, object]:
         "technical_availability": technical,
         "sentiment_availability": sentiment,
     }
+    result["feature_availability_contract"]["input_fingerprint"] = availability_fingerprint(
+        {key: result[key] for key in FROZEN_FEATURE_FIELDS if key in result}
+    )
+    return result
 
 
 def _conservative_jsonb_size_bound(value: dict[str, object]) -> int:
@@ -98,6 +113,35 @@ def _conservative_jsonb_size_bound(value: dict[str, object]) -> int:
         json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     )
     return encoded_bytes + 32 * len(value) + 16
+
+
+def _json_differences(left: object, right: object, path: str = "$") -> list[str]:
+    if isinstance(left, dict) and isinstance(right, dict):
+        differences = []
+        for key in sorted(set(left) | set(right)):
+            child_path = f"{path}.{key}"
+            if key not in left or key not in right:
+                differences.append(
+                    f"{child_path}: key presence differs "
+                    f"(left={key in left}, right={key in right})"
+                )
+            else:
+                differences.extend(_json_differences(left[key], right[key], child_path))
+            if len(differences) >= 20:
+                break
+        return differences
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return [f"{path}: array lengths differ ({len(left)} != {len(right)})"]
+        differences = []
+        for index, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
+            differences.extend(_json_differences(left_item, right_item, f"{path}[{index}]"))
+            if len(differences) >= 20:
+                break
+        return differences
+    if type(left) is not type(right) or left != right:
+        return [f"{path}: {left!r} != {right!r}"]
+    return []
 
 
 def test_availability_contracts_survive_training_snapshot_compaction() -> None:
@@ -119,12 +163,29 @@ def test_availability_contracts_survive_training_snapshot_compaction() -> None:
         "2026-10-22.observed-feature-availability.v1"
     )
     assert compacted["feature_availability_contract"]["frozen_at"] == FROZEN_AT.isoformat()
-    assert compacted["feature_availability_contract"]["input_fingerprint"] == "b" * 64
+    assert compacted["feature_availability_contract"]["input_fingerprint"] == (
+        source["feature_availability_contract"]["input_fingerprint"]
+    )
     assert compacted["technical_availability"]["input_fingerprint"] == "a" * 64
     assert compacted["sentiment_availability"]["news_input_count"] == 20
     assert compacted["sentiment_availability"]["social_input_count"] == 20
     assert compacted["sentiment_availability"]["news_clock_errors"] == 0
     assert compacted["sentiment_availability"]["social_clock_errors"] == 0
+
+
+def test_storage_fingerprint_normalizes_json_number_scale() -> None:
+    assert storage_feature_fingerprint({"value": 1}) == storage_feature_fingerprint(
+        {"value": 1.0}
+    )
+    assert storage_feature_fingerprint({"value": 0.0}) == storage_feature_fingerprint(
+        {"value": 0}
+    )
+    assert storage_feature_fingerprint({"nested": {"value": None}}) == (
+        storage_feature_fingerprint({"nested": {}})
+    )
+    assert storage_feature_fingerprint({"values": [None]}) != storage_feature_fingerprint(
+        {"values": []}
+    )
 
 
 def test_availability_contracts_fit_compaction_strings_and_postgres_jsonb_budget() -> None:
@@ -311,7 +372,16 @@ def test_full_feature_vector_with_eighty_bar_sequences_fits_and_remains_eligible
 
     assert features["close_sequence"] == original["close_sequence"]
     assert features["volume_sequence"] == original["volume_sequence"]
-    assert features["market_fact"] == original["market_fact"]
+    assert features["market_fact"]["prices"] == {
+        key: value
+        for key, value in original["market_fact"]["prices"].items()
+        if value is not None
+    }
+    assert features["market_fact"]["liquidity"] == original["market_fact"]["liquidity"]
+    assert features["market_fact"]["fact_id"] == original["market_fact"]["fact_id"]
+    assert features["market_fact"]["storage_contract"]["full_fact_fingerprint"] == (
+        original["market_fact"]["fact_id"]
+    )
     assert features["model_text_fingerprint"] == original["model_text_fingerprint"]
     assert frozen_feature_payload_size(features) <= FROZEN_TRAINING_FEATURE_MAX_BYTES
     assert training_feature_storage_bytes(features) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
@@ -364,13 +434,145 @@ def test_compacted_sealed_inputs_remain_trainable_without_text_or_resealing() ->
     assert assess_shadow_sample(compacted_sample).exclude_from_training is False
     for key in FROZEN_TRAINING_FEATURE_KEYS:
         if key in original:
-            assert features[key] == original[key]
+            if key == "market_fact":
+                assert features[key] == compact_market_fact(original[key])
+            else:
+                assert features[key] == original[key]
     assert "mark_price" in features and features["mark_price"] is None
     assert not {"news_articles", "social_posts", "recent_headlines"} & features.keys()
     transport = _training_transport_features(features)
     assert "feature_availability_contract" not in transport
     assert transport["current_price"] == original["current_price"]
     assert training_feature_storage_bytes(features) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+
+
+def test_market_fact_storage_projection_preserves_quality_and_native_inputs() -> None:
+    fact = _full_feature_vector_sample()["features"]["market_fact"]
+    fact["source_consistency"] = {
+        "version": "2026-07-17.okx-source-consistency.v4",
+        "status": "clean",
+        "reasons": [],
+        "assertions": {
+            "native_identity_verified": True,
+            "executable_quotes_verified": True,
+            "tick_alignment_verified": True,
+            "reference_prices_verified": True,
+            "market_continuity_verified": True,
+        },
+        "orderbook_fact": {"raw_depth": [100.0] * 200},
+        "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
+        "provenance": {
+            "data_fingerprint": "source-consistency-digest",
+            "fallback_reason": "",
+        },
+    }
+    fact["quality"] = {"status": "clean", "violation_count": 0, "reasons": []}
+
+    compact = compact_market_fact(fact)
+
+    assert compact["prices"] == {
+        key: value for key, value in fact["prices"].items() if value is not None
+    }
+    assert compact["liquidity"] == fact["liquidity"]
+    assert compact["native_identity"]["contract_spec_version"] == (
+        fact["native_identity"]["contract_spec_version"]
+    )
+    assert compact["source_consistency"]["assertions"] == (
+        fact["source_consistency"]["assertions"]
+    )
+    assert compact["storage_contract"]["full_fact_fingerprint"] == fact["fact_id"]
+    assert compact["storage_contract"]["full_source_consistency_fingerprint"] == (
+        "source-consistency-digest"
+    )
+    assert "orderbook_fact" not in compact["source_consistency"]
+    assert "reference_prices" not in compact["source_consistency"]
+    assert market_fact_reasons(compact) == market_fact_reasons(fact)
+
+
+def test_verbose_market_consistency_fits_frozen_budget_without_losing_quality_gate() -> None:
+    sample = _full_feature_vector_sample()
+    features = sample["features"]
+    fact = features["market_fact"]
+    fact["source_consistency"] = {
+        "version": "2026-07-17.okx-source-consistency.v4",
+        "status": "clean",
+        "reasons": [],
+        "reference_warnings": ["optional_index_path_not_collected"],
+        "assertions": {
+            "native_identity_verified": True,
+            "executable_quotes_verified": True,
+            "tick_alignment_verified": True,
+            "reference_prices_verified": True,
+            "market_continuity_verified": True,
+        },
+        "native_identity": {"specification": ["x" * 400] * 20},
+        "quote_reconciliation": {"diagnostic_samples": ["x" * 400] * 20},
+        "path": {"missing_open_times_ms": list(range(2_000))},
+        "reference_observations": {"details": ["x" * 400] * 20},
+        "orderbook_fact": {"raw_depth": [100.0] * 200},
+        "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
+        "ticker_sources": [
+            {
+                "fact_id": f"sha256:{index:064d}",
+                "source_interface": "rest",
+                "source_timestamp_ms": 1_798_000_000_000 + index,
+            }
+            for index in range(8)
+        ],
+        "executable_intervals": [
+            {"source": "rest", "bid": 99.9, "ask": 100.1}
+        ],
+        "provenance": {
+            "data_fingerprint": "source-consistency-digest",
+            "fallback_reason": "",
+        },
+    }
+    features.pop("feature_availability_contract")
+    seal_feature_availability(features, frozen_at=FROZEN_AT)
+
+    assert frozen_feature_payload_size(features) <= FROZEN_TRAINING_FEATURE_MAX_BYTES
+    compacted = _compact_training_feature_snapshot(features)
+    sample["features"] = compacted
+
+    assert "training_feature_compaction_error" not in compacted
+    assert compacted["market_fact"]["prices"] == {
+        key: value for key, value in fact["prices"].items() if value is not None
+    }
+    assert compacted["market_fact"]["liquidity"] == fact["liquidity"]
+    assert compacted["market_fact"]["source_consistency"]["assertions"] == (
+        fact["source_consistency"]["assertions"]
+    )
+    assert "orderbook_fact" not in compacted["market_fact"]["source_consistency"]
+
+
+def test_compacted_market_fact_input_tampering_breaks_storage_fingerprint() -> None:
+    features = _full_feature_vector_sample()["features"]
+    compacted = _compact_training_feature_snapshot(features)
+    compacted["market_fact"]["prices"]["last"] += 1
+
+    assert "feature_inputs_changed_after_freeze" in feature_availability_reasons(
+        compacted,
+        decision_at=compacted["original_decision_timestamp"],
+    )
+
+
+def test_verbose_market_fact_recompaction_keeps_storage_fingerprint() -> None:
+    features = _full_feature_vector_sample()["features"]
+    features["market_fact"]["source_consistency"] = {
+        "version": "2026-07-17.okx-source-consistency.v4",
+        "status": "clean",
+        "assertions": {"executable_quotes_verified": True},
+        "path": {"missing_open_times_ms": list(range(2000))},
+        "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
+        "provenance": {"data_fingerprint": "source-consistency-digest"},
+    }
+    features.pop("feature_availability_contract")
+    features.pop("feature_snapshot_frozen_at")
+    seal_feature_availability(features, frozen_at=FROZEN_AT)
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert "training_feature_compaction_error" not in compacted
+    assert _compact_training_feature_snapshot(compacted) == compacted
 
 
 @pytest.mark.parametrize("mutation", ["sequence", "nested_receipt"])
@@ -385,7 +587,9 @@ def test_compaction_keeps_frozen_input_tampering_visible_to_quality(mutation: st
     assessment = assess_shadow_sample(sample)
 
     assert assessment.exclude_from_training is True
-    assert "feature_availability:feature_inputs_changed_after_freeze" in assessment.reasons
+    assert sample["features"] == {
+        "training_feature_compaction_error": "frozen_input_storage_mismatch"
+    }
 
 
 def test_oversized_frozen_inputs_fail_closed_without_partial_sealed_payload() -> None:
@@ -485,18 +689,193 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
     transaction = connection.transaction()
     await transaction.start()
     try:
+        await connection.execute("SET LOCAL statement_timeout = '15s'")
+        await connection.execute("SET LOCAL lock_timeout = '5s'")
         await connection.execute("CREATE TEMP TABLE bb_compaction_test_scope (id INTEGER)")
+        await connection.execute("SET LOCAL search_path TO pg_temp, public")
+        function_names = (
+            "bb_training_feature_storage_bytes",
+            "bb_training_feature_normalize_jsonb",
+            "bb_compact_market_fact",
+            "bb_compact_training_feature_snapshot",
+        )
         for sql in postgres_training_feature_snapshot_functions():
-            await connection.execute(sql.replace("bb_", "pg_temp.bb_"))
+            for function_name in function_names:
+                sql = sql.replace(f"{function_name}(", f"pg_temp.{function_name}(")
+            await connection.execute(sql)
         original = _full_feature_vector_sample()["features"]
         oversized = deepcopy(original)
         oversized["close_sequence"] = [100.0] * 1000
+        oversized["feature_availability_contract"]["input_fingerprint"] = (
+            availability_fingerprint({
+                key: oversized[key]
+                for key in FROZEN_FEATURE_FIELDS
+                if key in oversized
+            })
+        )
         for features in (original, oversized, {"empty": {}, "array": [], "text": "x" * 513}):
             encoded = json.dumps(features, ensure_ascii=False)
             pg_compacted = json.loads(await connection.fetchval(
                 "SELECT pg_temp.bb_compact_training_feature_snapshot($1::JSONB)", encoded,
             ))
-            assert pg_compacted == _compact_training_feature_snapshot(features)
+            server_recomputed_fingerprint = await connection.fetchval(
+                """
+                WITH compacted AS (
+                    SELECT pg_temp.bb_compact_training_feature_snapshot($1::JSONB) AS snapshot
+                ),
+                projection AS (
+                    SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB) AS value
+                    FROM compacted
+                    CROSS JOIN LATERAL jsonb_each(compacted.snapshot) AS item(key, value)
+                    WHERE item.key = ANY($2::TEXT[])
+                )
+                SELECT md5(
+                    pg_temp.bb_training_feature_normalize_jsonb(
+                        jsonb_strip_nulls(projection.value)
+                    )::TEXT
+                )
+                FROM projection
+                """,
+                encoded,
+                list(FROZEN_FEATURE_FIELDS),
+            )
+            manually_rebuilt_fingerprint = await connection.fetchval(
+                """
+                WITH raw AS (
+                    SELECT $1::JSONB AS value
+                ),
+                frozen AS (
+                    SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB) AS value
+                    FROM raw
+                    CROSS JOIN LATERAL jsonb_each(raw.value) AS item(key, value)
+                    WHERE item.key = ANY($2::TEXT[])
+                      AND item.key <> 'feature_storage_compaction'
+                ),
+                compacted AS (
+                    SELECT CASE
+                        WHEN frozen.value ? 'market_fact' THEN jsonb_set(
+                            frozen.value,
+                            '{market_fact}',
+                            pg_temp.bb_compact_market_fact(frozen.value->'market_fact'),
+                            true
+                        )
+                        ELSE frozen.value
+                    END AS value
+                    FROM frozen
+                ),
+                projection AS (
+                    SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB) AS value
+                    FROM compacted
+                    CROSS JOIN LATERAL jsonb_each(compacted.value) AS item(key, value)
+                    WHERE item.key = ANY($3::TEXT[])
+                )
+                SELECT md5(
+                    pg_temp.bb_training_feature_normalize_jsonb(
+                        jsonb_strip_nulls(projection.value)
+                    )::TEXT
+                )
+                FROM projection
+                """,
+                encoded,
+                list(FROZEN_TRAINING_FEATURE_KEYS),
+                list(FROZEN_FEATURE_FIELDS),
+            )
+            raw_market_fingerprint = await connection.fetchval(
+                """
+                WITH raw AS (
+                    SELECT $1::JSONB AS value
+                ),
+                frozen AS (
+                    SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB) AS value
+                    FROM raw
+                    CROSS JOIN LATERAL jsonb_each(raw.value) AS item(key, value)
+                    WHERE item.key = ANY($2::TEXT[])
+                      AND item.key <> 'feature_storage_compaction'
+                ),
+                projection AS (
+                    SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB) AS value
+                    FROM frozen
+                    CROSS JOIN LATERAL jsonb_each(frozen.value) AS item(key, value)
+                    WHERE item.key = ANY($3::TEXT[])
+                )
+                SELECT md5(
+                    pg_temp.bb_training_feature_normalize_jsonb(
+                        jsonb_strip_nulls(projection.value)
+                    )::TEXT
+                )
+                FROM projection
+                """,
+                encoded,
+                list(FROZEN_TRAINING_FEATURE_KEYS),
+                list(FROZEN_FEATURE_FIELDS),
+            )
+            expected_compacted = _compact_training_feature_snapshot(features)
+            differences = _json_differences(pg_compacted, expected_compacted)
+            if "training_feature_compaction_error" in expected_compacted:
+                assert pg_compacted == expected_compacted, differences
+                assert await connection.fetchval(
+                    "SELECT pg_temp.bb_training_feature_storage_bytes($1::JSONB)", encoded,
+                ) == training_feature_storage_bytes(features)
+                continue
+            storage_contract = pg_compacted.get("feature_storage_compaction")
+            if "feature_availability_contract" in features:
+                assert isinstance(storage_contract, dict), pg_compacted
+                assert (
+                    manually_rebuilt_fingerprint
+                    == storage_contract.get("compact_input_fingerprint")
+                ), (
+                    manually_rebuilt_fingerprint,
+                    raw_market_fingerprint,
+                    storage_contract.get("compact_input_fingerprint"),
+                )
+            else:
+                assert storage_contract is None
+            assert (
+                server_recomputed_fingerprint
+                == manually_rebuilt_fingerprint
+                ), (server_recomputed_fingerprint, manually_rebuilt_fingerprint)
+            pg_input = {
+                key: pg_compacted[key]
+                for key in FROZEN_FEATURE_FIELDS
+                if key in pg_compacted
+            }
+            py_input = {
+                key: expected_compacted[key]
+                for key in FROZEN_FEATURE_FIELDS
+                if key in expected_compacted
+            }
+            pg_input_text = await connection.fetchval(
+                "SELECT pg_temp.bb_training_feature_normalize_jsonb("
+                "jsonb_strip_nulls($1::JSONB))::TEXT",
+                json.dumps(pg_input, ensure_ascii=False),
+            )
+            py_input_text = _jsonb_text(_storage_fingerprint_value(py_input))
+            if pg_input_text != py_input_text:
+                mismatch_at = next(
+                    (
+                        index
+                        for index, (pg_char, py_char) in enumerate(
+                            zip(pg_input_text, py_input_text, strict=False)
+                        )
+                        if pg_char != py_char
+                    ),
+                    min(len(pg_input_text), len(py_input_text)),
+                )
+                text_difference = (
+                    "jsonb text differs at "
+                    f"{mismatch_at}: postgres={pg_input_text[max(0, mismatch_at - 40):mismatch_at + 80]!r}, "
+                    f"python={py_input_text[max(0, mismatch_at - 40):mismatch_at + 80]!r}"
+                )
+                assert pg_input_text == py_input_text, text_difference
+            pg_input_fingerprint = await connection.fetchval(
+                "SELECT md5(pg_temp.bb_training_feature_normalize_jsonb("
+                "jsonb_strip_nulls($1::JSONB))::TEXT)",
+                json.dumps(pg_input, ensure_ascii=False),
+            )
+            assert pg_input_fingerprint == storage_feature_fingerprint(py_input)
+            if isinstance(storage_contract, dict):
+                assert storage_contract.get("compact_input_fingerprint") == pg_input_fingerprint
+            assert not differences, differences
             assert await connection.fetchval(
                 "SELECT pg_temp.bb_training_feature_storage_bytes($1::JSONB)", encoded,
             ) == training_feature_storage_bytes(features)
