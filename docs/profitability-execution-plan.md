@@ -914,7 +914,7 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - Owned source/tests and this checkpoint were committed locally as
   `fef731f`. The targeted sync confirmed all four remote hashes and uploaded
   zero changed files, with restart skipped. `git push origin main` then
-  failed twice with a GitHub HTTPS connection timeout; local `main` is one
-  commit ahead of `origin/main`. The unrelated pre-existing `db/session.py`
-  modification remains unstaged and untouched. Retry the push when GitHub
-  connectivity is available.
+  failed three times with a GitHub HTTPS connection timeout; local `main` is
+  three commits ahead of `origin/main`. The unrelated pre-existing
+  `db/session.py` modification remains unstaged and untouched. Retry the push
+  when GitHub connectivity is available.
