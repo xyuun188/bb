@@ -85,7 +85,9 @@ class AutoScanParams:
     feature_fetch_pool_min: int = 48
     feature_fetch_pool_max: int = 64
     feature_fetch_timeout_seconds: float = 8.0
-    feature_fetch_concurrency: int = 8
+    # A full feature vector fans out to several OKX routes; bound active
+    # symbols to keep executable quote requests ahead of the scan backlog.
+    feature_fetch_concurrency: int = 4
     major_symbols: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")
 
 

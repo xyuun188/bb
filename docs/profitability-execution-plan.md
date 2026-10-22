@@ -69,7 +69,7 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | IN PROGRESS | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
+| G2 Data and label validity | BLOCKED | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
 | G3 Cost-aware candidate development | PENDING | Preregistered bounded experiment ledger and purged chronological comparisons | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | PENDING | Policy/code/data fingerprints, untouched exam and acceptance report | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | PENDING | Controlled paper fills, protection, exits and official lifecycle settlements | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
@@ -858,3 +858,49 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   defect is demonstrated. Continue fresh component projections; require zero
   availability errors and the existing payload budget before G2 can pass.
   Keep historical labels quarantined and do not open/tune an exam.
+
+### Latency Evidence And Fresh Boundary (2026-10-23)
+
+- The owned latency diagnostics are present online byte-for-byte for
+  `data_feed/okx_rest_client.py`, `services/trading_params.py` and their two
+  focused test files. The paper process entered `active/running` at
+  `2026-10-22T22:15:18Z` and remained at `NRestarts=0`; persisted control is
+  still `mode=paper`, `paused=false`.
+- A bounded journal projection from that restart boundary through
+  `2026-10-22T22:26:59Z` contained 620 route events. The route summaries were:
+  `fetch_order_book` 167 calls (queue p50/p95/max
+  `0.0/3389.8/10536.0 ms`, provider p50/p95/max
+  `1616.0/8241.5/12628.6 ms`, 10 timeouts);
+  `publicGetMarketIndexTickers` 212 calls (queue
+  `134.0/4836.5/8354.3 ms`, provider
+  `1409.8/7604.0/13121.9 ms`, 9 timeouts);
+  `publicGetMarketTicker` 67 calls (queue
+  `606.4/4165.3/5514.9 ms`, provider
+  `2401.4/8016.2/11262.9 ms`, 3 timeouts); and
+  `publicGetPublicMarkPrice` 174 calls (queue
+  `0.0/4803.8/8014.8 ms`, provider
+  `998.4/5441.7/12480.1 ms`, 2 timeouts). This establishes both provider
+  latency and public-route contention; it does not justify increasing
+  concurrency or route deadlines without a controlled comparison.
+- The immutable fresh availability boundary
+  `[2026-10-22T22:15:18Z, 2026-10-22T22:27:58Z)` contained 21 market
+  decisions, all HOLD/not executed. Fourteen were availability-clean and
+  seven were quarantined: four each for missing order-book, mark and index
+  facts, with two additional index receipt/clock ambiguity cases. No row was
+  authorized for entry.
+- In the same boundary, the training snapshot audit covered 64 rows with
+  zero seal errors and zero rows above the `98,304 B` training budget
+  (p50 `93,882 B`, p95/max `96,482 B`). The raw decision snapshot remained
+  over budget for 6/21 rows (maximum `99,872 B`); raw context is not accepted
+  as training evidence and remains disclosed.
+- The authoritative fee-after quality gate is unchanged and negative:
+  `n=261`, mean `-0.311071%`, lower bound `-0.441736%`, profit factor
+  `0.549345`; model influence remains disabled. Historical requalification was
+  not rerun; the prior bounded `110,709`-row scan with zero eligible rows is
+  still the current evidence. G2 therefore remains
+  `blocked_by_component_availability_evidence`; G3-G6 remain pending.
+- Local targeted tests passed `44/44`, Ruff and whitespace checks passed, and
+  remote source hashes match the owned working-tree files. The next exact
+  action is to keep collecting a sufficiently large post-restart sample and
+  remeasure after any demonstrated bottleneck repair; do not promote a
+  candidate, open a fresh exam, or relax quality/risk gates.

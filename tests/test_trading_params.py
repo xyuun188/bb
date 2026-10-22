@@ -27,7 +27,7 @@ def test_training_data_quality_uses_the_current_snapshot() -> None:
     assert training_data_quality._QUALITY_PARAMS == DEFAULT_TRADING_PARAMS.training_data_quality
     assert (
         training_data_quality.DATA_QUALITY_VERSION
-        == "2026-09-15.authoritative-trade-integrity.v6"
+        == "2026-10-22.component-feature-availability.v8"
     )
 
 
@@ -39,6 +39,8 @@ def test_auto_scan_snapshot_is_operational_not_entry_permission() -> None:
     assert trading_service.AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS == (
         params.feature_fetch_timeout_seconds
     )
+    assert params.feature_fetch_concurrency == 4
+    assert trading_service.AUTO_SCAN_FEATURE_FETCH_CONCURRENCY == 4
     assert "BTC/USDT" in params.major_symbols
     selection = DEFAULT_TRADING_PARAMS.market_analysis_selection
     assert selection.candidate_pool_multiplier >= 2

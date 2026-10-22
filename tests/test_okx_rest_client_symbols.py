@@ -6,8 +6,10 @@ from typing import Any
 
 import pytest
 
+import data_feed.okx_rest_client as okx_rest_client_module
 from data_feed.feature_vector import build_feature_vector
 from data_feed.okx_rest_client import (
+    PUBLIC_MARKET_DIAGNOSTIC_METHODS,
     PUBLIC_MARKET_OPTIONAL_METHODS,
     PUBLIC_MARKET_PRIORITY_METHODS,
     OKXRestClient,
@@ -34,6 +36,57 @@ def test_native_consistency_route_uses_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._native_consistency_gate() is not client._public_market_gate()
     assert client._native_consistency_gate() is not client._public_market_optional_gate()
+
+
+def test_latency_diagnostics_only_cover_executable_quote_routes() -> None:
+    assert PUBLIC_MARKET_DIAGNOSTIC_METHODS == {
+        "fetch_order_book",
+        "fetch_ticker",
+        "publicGetMarketIndexTickers",
+        "publicGetMarketTicker",
+        "publicGetPublicMarkPrice",
+    }
+
+
+@pytest.mark.asyncio
+async def test_public_market_latency_logs_bounded_queue_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    events: list[dict[str, Any]] = []
+
+    class SlowGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is True
+            await asyncio.sleep(0.26)
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is True
+
+    class Exchange:
+        async def publicGetMarketTicker(self, _params: dict[str, str]) -> dict[str, Any]:
+            return {"data": [{"instId": "BTC-USDT-SWAP", "last": "1"}]}
+
+    monkeypatch.setattr(client, "_public_market_gate", lambda: SlowGate())
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    monkeypatch.setattr(
+        okx_rest_client_module.logger,
+        "info",
+        lambda _event, **kwargs: events.append(kwargs),
+    )
+
+    result = await client._ccxt_call(
+        "publicGetMarketTicker",
+        {"instId": "BTC-USDT-SWAP"},
+    )
+
+    assert result["data"][0]["last"] == "1"
+    assert len(events) == 1
+    assert events[0]["method"] == "publicGetMarketTicker"
+    assert events[0]["queue_wait_ms"] >= 250.0
+    assert events[0]["provider_duration_ms"] >= 0.0
+    assert events[0]["outcome"] == "ok"
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,17 @@ PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 2
 # a dead exchange connection must not occupy a shared request slot for a full
 # minute and starve executable quotes.
 PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
+PUBLIC_MARKET_SLOW_WAIT_LOG_MS = 250.0
+PUBLIC_MARKET_SLOW_PROVIDER_LOG_MS = 750.0
+PUBLIC_MARKET_DIAGNOSTIC_METHODS = frozenset(
+    {
+        "fetch_order_book",
+        "fetch_ticker",
+        "publicGetMarketIndexTickers",
+        "publicGetMarketTicker",
+        "publicGetPublicMarkPrice",
+    }
+)
 
 PUBLIC_MARKET_METHODS = frozenset(
     {
@@ -328,11 +339,15 @@ class OKXRestClient:
                 if request_priority is not None
                 else str(method_name or "") in PUBLIC_MARKET_PRIORITY_METHODS
             )
-            if gate is not None:
-                await gate.acquire(
-                    priority=is_priority,
-                )
+            wait_started = time.monotonic()
+            gate_acquired_at: float | None = None
+            acquired = False
+            request_error: Exception | None = None
             try:
+                if gate is not None:
+                    await gate.acquire(priority=is_priority)
+                    acquired = True
+                gate_acquired_at = time.monotonic()
                 call = method(*args, **kwargs)
                 if gate is not None:
                     # Keep the shared single-flight task alive after a caller's
@@ -344,6 +359,7 @@ class OKXRestClient:
                     )
                 return await call
             except Exception as exc:
+                request_error = exc
                 if attempt == 0 and self._is_broken_rest_url_error(exc):
                     logger.warning(
                         "OKX REST URL state invalid; reinitializing SDK client",
@@ -354,7 +370,42 @@ class OKXRestClient:
                     continue
                 raise
             finally:
-                if gate is not None:
+                completed_at = time.monotonic()
+                queue_wait_ms = 0.0
+                provider_duration_ms = 0.0
+                if gate_acquired_at is not None:
+                    queue_wait_ms = max(gate_acquired_at - wait_started, 0.0) * 1000.0
+                    provider_duration_ms = max(
+                        completed_at - gate_acquired_at,
+                        0.0,
+                    ) * 1000.0
+                else:
+                    queue_wait_ms = max(completed_at - wait_started, 0.0) * 1000.0
+                if (
+                    gate is not None
+                    and method_name in PUBLIC_MARKET_DIAGNOSTIC_METHODS
+                    and (
+                        queue_wait_ms >= PUBLIC_MARKET_SLOW_WAIT_LOG_MS
+                        or provider_duration_ms >= PUBLIC_MARKET_SLOW_PROVIDER_LOG_MS
+                        or request_error is not None
+                    )
+                ):
+                    logger.info(
+                        "OKX public market request latency",
+                        method=method_name,
+                        queue_wait_ms=round(queue_wait_ms, 1),
+                        provider_duration_ms=round(provider_duration_ms, 1),
+                        priority=is_priority,
+                        outcome=(
+                            "error" if request_error is not None else "ok"
+                        ),
+                        error_type=(
+                            type(request_error).__name__
+                            if request_error is not None
+                            else None
+                        ),
+                    )
+                if gate is not None and acquired:
                     gate.release(priority=is_priority)
 
     async def _load_usdt_swap_markets(self) -> None:
