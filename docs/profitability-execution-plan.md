@@ -882,6 +882,12 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `998.4/5441.7/12480.1 ms`, 2 timeouts). This establishes both provider
   latency and public-route contention; it does not justify increasing
   concurrency or route deadlines without a controlled comparison.
+- A 10-second cgroup sample during the same active paper process measured
+  approximately `1.02` CPU cores used against a two-core quota,
+  `2,235,359,232` bytes current memory, and zero `avg10` CPU/memory PSI
+  pressure. This short sample does not rule out earlier contention, but it
+  does not show current host saturation as the primary explanation for the
+  route delays.
 - The immutable fresh availability boundary
   `[2026-10-22T22:15:18Z, 2026-10-22T22:27:58Z)` contained 21 market
   decisions, all HOLD/not executed. Fourteen were availability-clean and
@@ -902,5 +908,13 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - Local targeted tests passed `44/44`, Ruff and whitespace checks passed, and
   remote source hashes match the owned working-tree files. The next exact
   action is to keep collecting a sufficiently large post-restart sample and
-  remeasure after any demonstrated bottleneck repair; do not promote a
-  candidate, open a fresh exam, or relax quality/risk gates.
+  isolate endpoint latency from gate queueing before changing concurrency or
+  timeouts; do not promote a candidate, open a fresh exam, or relax
+  quality/risk gates.
+- Owned source/tests and this checkpoint were committed locally as
+  `fef731f`. The targeted sync confirmed all four remote hashes and uploaded
+  zero changed files, with restart skipped. `git push origin main` then
+  failed twice with a GitHub HTTPS connection timeout; local `main` is one
+  commit ahead of `origin/main`. The unrelated pre-existing `db/session.py`
+  modification remains unstaged and untouched. Retry the push when GitHub
+  connectivity is available.
