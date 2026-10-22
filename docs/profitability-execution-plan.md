@@ -511,3 +511,44 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   design and test point-in-time availability capture for each newly collected
   feature component. Do not rerun the frozen audit unchanged, and do not open
   or tune against a new exam.
+
+### Shadow Recovery Batch Repair
+
+- The bounded online diagnosis on 2026-10-22 found that the recovery query
+  itself took about `0.10-0.27s`, while four separate horizon inserts took
+  about `2.4-4.5s` under PostgreSQL contention. The old per-decision timeout
+  (`2.5s`) therefore produced false recovery failures even without a lock
+  wait. The inspected rows had raw payloads around `162-166 KiB`; no outcome
+  labels or orders were read by this diagnosis.
+- Repair: `MemoryRepository.create_shadow_backtests` now performs one bounded
+  existing-row read and one savepoint/flush for all horizons, retaining the
+  established uniqueness/idempotency fallback for concurrent writers.
+  `ShadowBacktestService.create` uses that batch contract, while the legacy
+  single-row method remains the fallback for small repository fakes.
+  Recovery records per-decision elapsed time and defers a candidate when the
+  remaining pass budget cannot accommodate a full decision batch, avoiding
+  cancellation during a database flush. The per-decision budget is `6s` and
+  the whole pass remains `12s`; this maintenance path is read-only with
+  respect to trading and cannot place orders.
+- Local focused verification after the repair: `401 passed`, Ruff clean, and
+  scoped whitespace check clean. Remote focused verification of the uploaded
+  shadow queue/service sources: `38 passed`; the unrelated full boundary run
+  still has one pre-existing source/test mismatch in the unuploaded trading
+  timeout test and is not used as repair evidence.
+- Targeted upload completed with source integrity checks; only
+  `bb-paper-trading.service` was restarted at `2026-10-22 07:12:42 UTC`.
+  `bb-dashboard.service` remained active, both services reported
+  `NRestarts=0`, runtime mode remained `paper`, and no live orders or
+  protection actions were performed.
+- Post-restart bounded online evidence at `2026-10-22T07:27:27Z`:
+  406 recent paper market decisions had `incomplete_decisions=0` and
+  `minimum_horizons=4`; shadow maintenance had `success_count=20`,
+  `failure_count=0`, `last_error=null`, and the latest recovery log was
+  `scanned=1,recovered=1,failed=0` in `2.811s`. This proves recovery
+  coverage, not profitability. The remaining G2 blockers are unchanged:
+  missing per-component availability clocks, unobserved historical delivery
+  latency, and unresolved fee/funding lineage gaps.
+- Next exact action: design and implement point-in-time availability capture
+  for technical, news/sentiment, order-book and cost/funding components on
+  newly collected samples, with component-level quarantine tests. Do not
+  promote a candidate or reopen the inspected exam.

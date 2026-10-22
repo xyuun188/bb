@@ -233,7 +233,12 @@ from services.production_trade_gate import evaluate_production_trade_gate
 from services.profit_supervision import authoritative_execution_cost_calibration
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.same_symbol_reentry import SameSymbolReentryGuard
-from services.shadow_backtest_service import ShadowBacktestService
+from services.shadow_backtest_service import (
+    SHADOW_SAMPLE_RECOVERY_MAX_BATCH as SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
+)
+from services.shadow_backtest_service import (
+    ShadowBacktestService,
+)
 from services.stale_entry_candidate_expirer import StaleEntryCandidateExpirer
 from services.strategy_context_performance import StrategyContextPerformanceService
 from services.strategy_learning import StrategyLearningService
@@ -475,7 +480,8 @@ SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 25
 SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
 SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS = 300.0
 SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES = 240
-SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT = 25
+# Each recovery item opens a bounded transaction and creates four horizons.
+# A small batch keeps the 15s outer deadline available for normal settlement.
 SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS = 30.0
 SHADOW_BACKTEST_RECOVERY_TIMEOUT_SECONDS = 15.0
 SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS = 30.0

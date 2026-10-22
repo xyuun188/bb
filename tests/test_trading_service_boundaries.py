@@ -1983,6 +1983,34 @@ async def test_shadow_backtest_maintenance_reuses_running_background_task() -> N
 
 
 @pytest.mark.asyncio
+async def test_shadow_sample_recovery_uses_bounded_small_batch() -> None:
+    service = TradingService.__new__(TradingService)
+    recovery_calls: list[dict[str, Any]] = []
+
+    class ShadowBacktestService:
+        async def recover_missing_market_samples(self, **kwargs: Any) -> dict[str, int]:
+            recovery_calls.append(kwargs)
+            return {"scanned": 0, "recovered": 0, "failed": 0}
+
+        async def update_due(self, limit: int = 200) -> int:
+            return 0
+
+    service.shadow_backtest_service = ShadowBacktestService()
+    service._market_shadow_sample_recovery_next_allowed_at = None
+    service._market_shadow_sample_recovery_last_result = None
+    service._market_shadow_sample_recovery_last_started_at = None
+    service._market_shadow_sample_recovery_throttled_count = 0
+
+    assert await service._run_shadow_backtest_update(limit=1) == 0
+
+    assert recovery_calls == [{
+        "lookback_minutes": trading_service.SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES,
+        "limit": 4,
+    }]
+    assert service._market_shadow_sample_recovery_last_result["scan_limit"] == 4
+
+
+@pytest.mark.asyncio
 async def test_market_shadow_sample_write_is_queued_without_blocking_round() -> None:
     service = TradingService.__new__(TradingService)
     started = asyncio.Event()

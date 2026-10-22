@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 import structlog
@@ -52,6 +53,15 @@ SHADOW_RESULT_PATH_TIMEOUT_SECONDS = 30.0
 SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS = 60.0
 SHADOW_RESULT_PATH_RETRY_COUNT = 1
 SHADOW_RESULT_PATH_RETRY_DELAY_SECONDS = 0.05
+# Recovery opens a separate governed transaction for each durable decision.
+# Keep each item and the whole pass bounded so a partial write cannot consume
+# the trading loop's maintenance deadline.
+SHADOW_SAMPLE_RECOVERY_MAX_BATCH = 4
+# A four-horizon batch writes several hundred KiB of JSON through the
+# PostgreSQL trigger path; online measurements range from 2.4s to 4.5s under
+# contention. Keep headroom while the outer recovery pass remains bounded.
+SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS = 6.0
+SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS = 12.0
 # Leave time for the write transaction before TradingService's 30s deadline.
 SHADOW_RESULT_COLLECTION_BUDGET_SECONDS = 20.0
 SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS = 300.0
@@ -603,26 +613,32 @@ class ShadowBacktestService:
                 feature_snapshot["training_market_fact_contract"] = (
                     compact_market_fact_contract(market_contract)
                 )
-                for horizon in self.horizons_minutes:
-                    await repo.create_shadow_backtest(
-                        {
-                            "decision_id": decision_id,
-                            "model_name": decision.model_name,
-                            "execution_mode": execution_mode,
-                            "symbol": decision.symbol,
-                            "analysis_type": analysis_type,
-                            "decision_action": decision.action.value,
-                            "decision_confidence": float(decision.confidence or 0.0),
-                            "entry_price": entry_price,
-                            "feature_snapshot": feature_snapshot,
-                            "raw_llm_response": raw_response,
-                            "status": "pending",
-                            "created_at": observed_at,
-                            "due_at": observed_at + timedelta(minutes=int(horizon)),
-                            "horizon_minutes": int(horizon),
-                            "label_version": SHADOW_LABEL_VERSION,
-                        }
-                    )
+                rows = [
+                    {
+                        "decision_id": decision_id,
+                        "model_name": decision.model_name,
+                        "execution_mode": execution_mode,
+                        "symbol": decision.symbol,
+                        "analysis_type": analysis_type,
+                        "decision_action": decision.action.value,
+                        "decision_confidence": float(decision.confidence or 0.0),
+                        "entry_price": entry_price,
+                        "feature_snapshot": feature_snapshot,
+                        "raw_llm_response": raw_response,
+                        "status": "pending",
+                        "created_at": observed_at,
+                        "due_at": observed_at + timedelta(minutes=int(horizon)),
+                        "horizon_minutes": int(horizon),
+                        "label_version": SHADOW_LABEL_VERSION,
+                    }
+                    for horizon in self.horizons_minutes
+                ]
+                batch_create = getattr(repo, "create_shadow_backtests", None)
+                if callable(batch_create):
+                    await batch_create(rows)
+                else:
+                    for row in rows:
+                        await repo.create_shadow_backtest(row)
             return True
         except Exception as exc:
             logger.warning(
@@ -638,15 +654,22 @@ class ShadowBacktestService:
         *,
         lookback_minutes: int = 180,
         limit: int = 200,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Rebuild missing/partial samples from durable AI decisions.
 
         Market decisions are persisted before this method is called.  A fresh
         session reads only decisions with fewer than the configured horizons and
-        then reuses ``create`` so duplicate recovery is harmless.
+        then reuses ``create`` so duplicate recovery is harmless. Each decision
+        uses its own transaction, so both the selected batch and the work per
+        item have explicit limits.
         """
 
         since = datetime.now(UTC) - timedelta(minutes=max(int(lookback_minutes or 1), 1))
+        query_started_at = monotonic()
+        batch_limit = min(
+            max(int(limit or 1), 1),
+            SHADOW_SAMPLE_RECOVERY_MAX_BATCH,
+        )
         async with self.session_factory() as session:
             repo = self.repository_factory(session)
             finder = getattr(repo, "get_market_decisions_missing_shadow_samples", None)
@@ -655,12 +678,29 @@ class ShadowBacktestService:
             rows = await finder(
                 since=since,
                 horizon_count=len(self.horizons_minutes),
-                limit=max(int(limit or 1), 1),
+                limit=batch_limit,
             )
+        query_seconds = monotonic() - query_started_at
 
         recovered = 0
         failed = 0
-        for row in rows:
+        scanned = 0
+        deferred = 0
+        started_at = monotonic()
+        deadline = started_at + SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS
+        for index, row in enumerate(rows):
+            remaining = deadline - monotonic()
+            if remaining < SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS:
+                deferred = len(rows) - index
+                logger.warning(
+                    "shadow sample recovery budget deferred remaining candidates",
+                    scanned=len(rows),
+                    recovered=recovered,
+                    failed=failed,
+                    deferred=deferred,
+                )
+                break
+            scanned += 1
             raw_action = str(getattr(row, "action", "hold") or "hold")
             decision = DecisionOutput(
                 model_name=str(getattr(row, "model_name", "") or "ensemble_trader"),
@@ -684,18 +724,63 @@ class ShadowBacktestService:
                     else {}
                 ),
             )
+            decision_started_at = monotonic()
             try:
-                created = await self.create(
-                    int(getattr(row, "id", 0) or 0),
-                    decision,
-                    decision.feature_snapshot or {},
-                    "paper" if bool(getattr(row, "is_paper", True)) else "live",
-                    analysis_type="market",
+                created = await asyncio.wait_for(
+                    self.create(
+                        int(getattr(row, "id", 0) or 0),
+                        decision,
+                        decision.feature_snapshot or {},
+                        "paper" if bool(getattr(row, "is_paper", True)) else "live",
+                        analysis_type="market",
+                    ),
+                    timeout=min(
+                        SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS,
+                        remaining,
+                    ),
                 )
                 recovered += 1 if created else 0
-            except Exception:
+            except TimeoutError:
                 failed += 1
-        return {"scanned": len(rows), "recovered": recovered, "failed": failed}
+                deferred = len(rows) - index - 1
+                logger.warning(
+                    "shadow sample recovery decision timed out",
+                    decision_id=getattr(row, "id", None),
+                    recovered=recovered,
+                    failed=failed,
+                    elapsed_seconds=round(monotonic() - decision_started_at, 3),
+                )
+                break
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "shadow sample recovery decision failed",
+                    decision_id=getattr(row, "id", None),
+                    error=safe_error_text(exc, limit=180),
+                    elapsed_seconds=round(monotonic() - decision_started_at, 3),
+                )
+            else:
+                logger.info(
+                    "shadow sample recovery decision finished",
+                    decision_id=getattr(row, "id", None),
+                    created=created,
+                    elapsed_seconds=round(monotonic() - decision_started_at, 3),
+                )
+        else:
+            deferred = 0
+        if scanned >= len(rows):
+            deferred = 0
+        logger.info(
+            "shadow sample recovery batch finished",
+            candidates=len(rows),
+            scanned=scanned,
+            recovered=recovered,
+            failed=failed,
+            deferred=deferred,
+            query_seconds=round(query_seconds, 3),
+            processing_seconds=round(monotonic() - started_at, 3),
+        )
+        return {"scanned": scanned, "recovered": recovered, "failed": failed}
 
     async def update_due(self, limit: int = 200) -> int:
         """Complete due samples without holding a database session during OKX reads."""

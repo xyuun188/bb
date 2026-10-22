@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import services.shadow_backtest_service as shadow_backtest_module
 from ai_brain.base_model import Action, DecisionOutput
 from core.market_facts import build_market_fact, verify_market_fact_path
 from core.training_contracts import (
@@ -17,6 +18,7 @@ from core.training_contracts import (
 )
 from services.shadow_backtest_service import (
     SHADOW_BACKTEST_HORIZONS_MINUTES,
+    SHADOW_SAMPLE_RECOVERY_MAX_BATCH,
     ShadowBacktestService,
     _bounded_task_gather,
     shadow_fee_after_outcome,
@@ -292,6 +294,7 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
 @pytest.mark.asyncio
 async def test_shadow_backtest_service_recovers_missing_horizons_from_persisted_decision() -> None:
     repo = _FakeRepo()
+    finder_kwargs: dict[str, Any] = {}
     row = SimpleNamespace(
         id=456,
         model_name="ensemble_trader",
@@ -310,14 +313,102 @@ async def test_shadow_backtest_service_recovers_missing_horizons_from_persisted_
     )
 
     async def finder(**_kwargs: Any) -> list[Any]:
+        finder_kwargs.update(_kwargs)
         return [row]
 
     repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
     result = await _service(repo).recover_missing_market_samples(limit=10)
 
     assert result == {"scanned": 1, "recovered": 1, "failed": 0}
+    assert finder_kwargs["limit"] == SHADOW_SAMPLE_RECOVERY_MAX_BATCH
     assert [item["horizon_minutes"] for item in repo.created] == [10, 30]
     assert all(item["decision_id"] == 456 for item in repo.created)
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_recovery_defers_a_timed_out_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=457,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action="hold",
+        confidence=0.8,
+        reasoning="slow recovery",
+        position_size_pct=0.05,
+        suggested_leverage=1.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        is_paper=True,
+        created_at=datetime.now(UTC),
+        raw_llm_response={},
+        feature_snapshot={"current_price": 100.0},
+    )
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        return [row]
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    service = _service(repo)
+
+    async def hanging_create(*_args: Any, **_kwargs: Any) -> bool:
+        await asyncio.sleep(1.0)
+        return True
+
+    monkeypatch.setattr(ShadowBacktestService, "create", hanging_create)
+    monkeypatch.setattr(
+        shadow_backtest_module,
+        "SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS",
+        0.01,
+    )
+
+    result = await service.recover_missing_market_samples(limit=10)
+
+    assert result == {"scanned": 1, "recovered": 0, "failed": 1}
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_recovery_defers_when_remaining_budget_is_too_small(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=458,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action="hold",
+        confidence=0.8,
+        reasoning="deferred recovery",
+        position_size_pct=0.05,
+        suggested_leverage=1.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        is_paper=True,
+        created_at=datetime.now(UTC),
+        raw_llm_response={},
+        feature_snapshot={"current_price": 100.0},
+    )
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        return [row]
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        shadow_backtest_module,
+        "SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        shadow_backtest_module,
+        "SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS",
+        0.01,
+    )
+
+    result = await _service(repo).recover_missing_market_samples(limit=10)
+
+    assert result == {"scanned": 0, "recovered": 0, "failed": 0}
 
 
 @pytest.mark.asyncio

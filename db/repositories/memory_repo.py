@@ -257,6 +257,126 @@ class MemoryRepository(BaseRepository):
                 raise
             return existing
 
+    async def create_shadow_backtests(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[ShadowBacktest]:
+        """Insert a decision's shadow horizons with one read and one flush.
+
+        Recovery normally creates all horizons for one decision at once.  The
+        per-row idempotency path above is intentionally conservative, but its
+        repeated savepoints make a four-horizon recovery exceed the maintenance
+        budget on a busy PostgreSQL instance.  Keep the batch fast while
+        retaining the row-level method as a race-condition fallback.
+        """
+
+        normalized = [
+            _normalize_shadow_backtest_payload(dict(row or {}))
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        if not normalized:
+            return []
+        for row in normalized:
+            row["label_version"] = str(row.get("label_version") or SHADOW_LABEL_VERSION)
+
+        keyed_rows: dict[tuple[int, int, str], dict[str, Any]] = {}
+        unkeyed_rows: list[dict[str, Any]] = []
+        for row in normalized:
+            decision_id = int(row.get("decision_id") or 0)
+            horizon_minutes = int(row.get("horizon_minutes") or 0)
+            label_version = str(row["label_version"])
+            if decision_id > 0 and horizon_minutes > 0:
+                keyed_rows[(decision_id, horizon_minutes, label_version)] = row
+            else:
+                unkeyed_rows.append(row)
+
+        existing_by_key: dict[tuple[int, int, str], ShadowBacktest] = {}
+        if keyed_rows:
+            decision_ids = {key[0] for key in keyed_rows}
+            label_versions = {key[2] for key in keyed_rows}
+            horizons = {key[1] for key in keyed_rows}
+            result = await self.session.execute(
+                select(ShadowBacktest).where(
+                    ShadowBacktest.decision_id.in_(decision_ids),
+                    ShadowBacktest.horizon_minutes.in_(horizons),
+                    ShadowBacktest.label_version.in_(label_versions),
+                )
+            )
+            for existing in result.scalars().all():
+                key = (
+                    int(existing.decision_id or 0),
+                    int(existing.horizon_minutes or 0),
+                    str(existing.label_version or ""),
+                )
+                if key in keyed_rows:
+                    existing_by_key[key] = existing
+
+        missing = [
+            row
+            for key, row in keyed_rows.items()
+            if key not in existing_by_key
+        ]
+        results: list[ShadowBacktest] = [
+            existing_by_key[key] for key in keyed_rows if key in existing_by_key
+        ]
+        if not missing:
+            for row in unkeyed_rows:
+                results.append(await self.create_shadow_backtest(row))
+            return results
+
+        new_rows = [ShadowBacktest(**row) for row in missing]
+        try:
+            begin_nested = getattr(self.session, "begin_nested", None)
+            if callable(begin_nested):
+                async with begin_nested():
+                    self.session.add_all(new_rows)
+                    await self.session.flush()
+            else:
+                self.session.add_all(new_rows)
+                await self.session.flush()
+            for key, row in zip(
+                (key for key in keyed_rows if key not in existing_by_key),
+                new_rows,
+                strict=True,
+            ):
+                existing_by_key[key] = row
+        except IntegrityError:
+            # Another writer may have created one or more horizons between the
+            # pre-read and flush.  The savepoint is rolled back; re-read the
+            # canonical rows and use the established single-row path only for
+            # any key still absent.
+            if callable(getattr(self.session, "begin_nested", None)):
+                refreshed = await self.session.execute(
+                    select(ShadowBacktest).where(
+                        ShadowBacktest.decision_id.in_(
+                            {key[0] for key in keyed_rows}
+                        ),
+                        ShadowBacktest.horizon_minutes.in_(
+                            {key[1] for key in keyed_rows}
+                        ),
+                        ShadowBacktest.label_version.in_(
+                            {key[2] for key in keyed_rows}
+                        ),
+                    )
+                )
+                for existing in refreshed.scalars().all():
+                    key = (
+                        int(existing.decision_id or 0),
+                        int(existing.horizon_minutes or 0),
+                        str(existing.label_version or ""),
+                    )
+                    if key in keyed_rows:
+                        existing_by_key[key] = existing
+            for key, row in keyed_rows.items():
+                if key not in existing_by_key:
+                    existing_by_key[key] = await self.create_shadow_backtest(row)
+
+        results.extend(existing_by_key[key] for key in keyed_rows)
+        for row in unkeyed_rows:
+            results.append(await self.create_shadow_backtest(row))
+        return results
+
     async def get_due_shadow_backtests(self, limit: int = 200) -> list[ShadowBacktest]:
         """Drain old labels while reserving capacity for newly matured evidence."""
 
