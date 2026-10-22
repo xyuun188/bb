@@ -807,3 +807,54 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   errors, complete receipts, and a clean training payload before considering
   this sub-gate passed. Negative fee-after-return evidence remains a separate
   execution blocker; G3-G6 stay pending.
+
+### Post-Restart Receipt Audit (2026-10-23)
+
+- The paper unit entered `active/running` at
+  `2026-10-22T21:30:31Z`; a read-only check at `21:48:52Z` found the same
+  active process, `NRestarts=0`, no matching profitability/frozen/G2 audit
+  unit, and no running market-data warm-up. No order or protection operation
+  was performed. The runtime audit continued to report paper-only decisions
+  and disabled model execution permission.
+- A bounded projection over `[2026-10-22T21:30:31Z, 21:53:29Z)` returned
+  56 market decisions, all `hold` and not executed. Forty-five passed the
+  component-availability check; eleven were quarantined. Reasons included
+  nine missing order-book facts, seven missing mark facts, seven missing
+  index facts (the mark/index gaps overlap), one zero index-price receipt/
+  clock contradiction, and one stale sentiment availability contract.
+  These are input-integrity findings, not strategy outcomes.
+- The earlier 42-row route projection showed six order-book timeouts and
+  four reference-price timeouts, with three rows timing out on both routes;
+  one additional row returned an empty index fact while the wrapper route
+  appeared completed. This confirms that route completion alone is not proof
+  of usable facts. Existing per-instrument order-book single-flight means
+  ticker and derivatives callers may join the same task; duplicated network
+  requests are not established as the cause.
+- A fresh 15-minute training-snapshot budget projection (64 rows, after the
+  restart) had no seal errors and no rows above the `98,304 B` limit.
+  Frozen payload sizes were `89,980-96,872 B`, with p50 `96,018 B` and p95
+  `96,872 B`. This passes storage budget only, not component validity or
+  profitability.
+- The bounded execution audit still found `120/120` recent market decisions
+  blocked as `insufficient_evidence`. Authoritative local-ML fee-after-return
+  evidence remains negative: 261 samples, mean `-0.311071%`, LCB
+  `-0.441736%`, and PF `0.549345`; model influence and execution remain
+  disabled. A read-only historical requalification dry-run scanned 110,709
+  rows and found zero eligible rows because the historical rebuild/label
+  availability contract is stale or missing.
+- A one-time host sample showed the paper process at 100% of one CPU and
+  `2,292,172 KiB` RSS, with CPU-pressure `some avg10=2.72`; this is a
+  contention lead, not proof that CPU caused the route misses. Filtered
+  privileged journal queries returned no matching route-timeout diagnostics,
+  so request queue-wait/provider-duration evidence is still missing. Do not
+  increase route deadlines or concurrency from this snapshot alone.
+- Current local `HEAD` is `92f8f4a`, one commit ahead of `origin/main`;
+  unrelated `db/session.py` remains modified and untouched. No code change was
+  made in this checkpoint. G2 remains blocked, and G3-G6 remain pending.
+- Next exact action: instrument or otherwise obtain bounded request queue-wait
+  and provider-duration measurements for ticker, order-book and reference
+  routes without logging credentials/raw responses. Then correct the measured
+  bottleneck with focused regressions and a paper-only deployment if a code
+  defect is demonstrated. Continue fresh component projections; require zero
+  availability errors and the existing payload budget before G2 can pass.
+  Keep historical labels quarantined and do not open/tune an exam.
