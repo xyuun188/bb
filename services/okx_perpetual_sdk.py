@@ -185,6 +185,10 @@ class OkxPublicWebSocketSdkStream:
         self._market_ready: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._market_queued: set[tuple[str, str]] = set()
         self._coalesced_market_messages = 0
+        # When ticker and derivative messages are ready together, alternate
+        # between the coalesced queues so high-volume tickers cannot starve
+        # executable books/reference facts.
+        self._last_ready_kind: str | None = None
 
     async def connect(self) -> None:
         from okx.websocket.WsPublicAsync import WsPublicAsync
@@ -308,25 +312,62 @@ class OkxPublicWebSocketSdkStream:
             if consume_task in done:
                 consume_task.result()
                 raise ExchangeAPIError("OKX WebSocket SDK consumer stopped unexpectedly")
-            if ticker_waiter in done:
+
+            selected_waiter: asyncio.Task[Any] | None = None
+            ready_kind: str | None = None
+            if queue_waiter in done:
+                selected_waiter = queue_waiter
+            elif ticker_waiter in done and market_waiter in done:
+                ready_kind = (
+                    "market"
+                    if self._last_ready_kind == "ticker"
+                    else "ticker"
+                )
+                selected_waiter = (
+                    market_waiter if ready_kind == "market" else ticker_waiter
+                )
+            elif market_waiter in done:
+                ready_kind = "market"
+                selected_waiter = market_waiter
+            elif ticker_waiter in done:
+                ready_kind = "ticker"
+                selected_waiter = ticker_waiter
+
+            # asyncio.wait() lets multiple Queue.get() tasks complete at
+            # once. Each completed waiter has already removed its item from
+            # the queue, so restore every unselected item instead of silently
+            # dropping it when the other stream wins arbitration.
+            for waiter, target_queue in (
+                (queue_waiter, self._queue),
+                (ticker_waiter, self._ticker_ready),
+                (market_waiter, self._market_ready),
+            ):
+                if waiter is selected_waiter or waiter not in done:
+                    continue
+                target_queue.put_nowait(waiter.result())
+
+            if selected_waiter is queue_waiter:
+                return queue_waiter.result()
+
+            if ready_kind == "ticker":
                 inst_id = ticker_waiter.result()
                 self._ticker_queued.discard(inst_id)
                 message = self._ticker_messages.pop(inst_id, None)
                 if message is not None:
+                    self._last_ready_kind = "ticker"
                     self._ticker_next_emit_at[inst_id] = (
                         asyncio.get_running_loop().time()
                         + OKX_WS_TICKER_EMIT_INTERVAL_SECONDS
                     )
                     return message
-                return await self.recv()
-            if market_waiter in done:
+            elif ready_kind == "market":
                 key = market_waiter.result()
                 self._market_queued.discard(key)
                 message = self._market_messages.pop(key, None)
                 if message is not None:
+                    self._last_ready_kind = "market"
                     return message
-                return await self.recv()
-            return queue_waiter.result()
+            return await self.recv()
         finally:
             if not queue_waiter.done():
                 queue_waiter.cancel()
@@ -351,6 +392,7 @@ class OkxPublicWebSocketSdkStream:
         self._ticker_next_emit_at.clear()
         self._market_messages.clear()
         self._market_queued.clear()
+        self._last_ready_kind = None
         for handle in self._ticker_emit_handles.values():
             handle.cancel()
         self._ticker_emit_handles.clear()
