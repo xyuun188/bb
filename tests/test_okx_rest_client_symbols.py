@@ -27,6 +27,22 @@ def test_required_market_fact_routes_use_priority_lane() -> None:
     )
 
 
+def test_required_route_waits_fit_under_outer_snapshot_cap() -> None:
+    assert (
+        okx_rest_client_module.REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS
+        == 5.5
+    )
+    assert okx_rest_client_module.ORDERBOOK_ROUTE_TIMEOUT_SECONDS == 5.5
+    assert (
+        okx_rest_client_module.REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS
+        < okx_rest_client_module.DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS
+    )
+    assert (
+        okx_rest_client_module.ORDERBOOK_ROUTE_TIMEOUT_SECONDS
+        < okx_rest_client_module.DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS
+    )
+
+
 def test_optional_derivatives_routes_use_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._public_market_gate() is not client._public_market_optional_gate()

@@ -1075,3 +1075,95 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   error-free, in-budget training snapshots; then retrain/re-evaluate only
   within the governed development protocol and preserve a new independent
   exam.
+
+### Preregistered Route-Wait Intervention (2026-10-23)
+
+- Read-only evidence boundary: paper process start
+  `2026-10-23T02:19:31Z` through `02:54:09Z`; 33 recent market decisions
+  were all HOLD/unexecuted, with 16 availability-clean and 17 invalid.
+  A separate 15-minute training audit covered 64 rows with zero seal or
+  compaction errors and maximum frozen size `97,582 B` (budget `98,304 B`).
+- A bounded privileged-journal projection selected at most 1,000 request
+  latency events and 143 partial-snapshot events. It showed order-book route
+  p95 queue wait/provider duration of `3,847/4,574 ms`; mark-price p95
+  `5,617/3,606 ms`; index-price p95 `5,534/3,724 ms`. Partial snapshots
+  recorded 130 order-book and 32 reference-price caller timeouts. The request
+  SDK still has an 8-second hard timeout, while the inner reference/order-book
+  waits are 3.0/4.0 seconds and the outer required-derivatives snapshot cap is
+  6 seconds. The latency-event query hit its 1,000-row cap; report these
+  percentiles as a capped sample, not a full population.
+- Preregistered intervention: change only the reference-price and order-book
+  single-flight join waits to `5.5 s`, preserving the existing `6.0 s` outer
+  snapshot cap, `8.0 s` provider timeout, concurrency, fail-closed fact and
+  timestamp checks, execution authorization, and risk limits. Add a regression
+  proving both inner waits remain below the outer cap. This tests whether
+  callers were persisting incomplete facts before already-queued requests
+  finished; it is an availability experiment, not profitability tuning.
+- Post-deploy acceptance boundary begins at the exact paper-service restart
+  time. Require at least 30 consecutive market decisions across at least 20
+  symbols, every row sealed with zero order-book/mark/index receipt or clock
+  errors, plus zero training seal/compaction errors and all same-boundary
+  snapshots at or below `98,304 B`. Keep G2 blocked on any failure. Compare
+  request/partial-route aggregates against the capped baseline; do not treat
+  this as a strategy exam or read return labels.
+
+### Live Recheck And Route-Wait Patch (2026-10-23)
+
+- Read-only coverage check at `2026-10-23T03:04:01Z` covered
+  `[02:49:01Z,03:04:01Z)`. The paper, dashboard, and model-tunnel services
+  were active with zero restarts; persisted control was unpaused `paper`.
+  Thirty-five market decisions across 31 symbols were incomplete with
+  `funding_evidence_unavailable`; the entry funnel had zero signals and zero
+  executions. The coverage window was not ready. This is a current direct
+  blocker to entries, distinct from route timeouts.
+- A same-time bounded training-snapshot check covered 64 rows. All had zero
+  seal/compaction errors; frozen payloads were `94,362-97,582 B` with zero
+  above the `98,304 B` budget. This passes storage budget only.
+- Implemented the preregistered local route-wait intervention:
+  reference-price and order-book waits are now `5.5 s`, each strictly below
+  the unchanged `6.0 s` outer snapshot cap. Concurrency, provider timeout,
+  fact/timestamp validation, execution permissions, and risk limits are
+  unchanged. Regression asserts the exact wait values and both inequalities.
+  Focused local suite passed `42` tests; Ruff and `git diff --check` passed.
+- Local source/test SHA256 values are
+  `7e408f7ad3d585869a6d7a8f47d183ff7706e0f3bee345ecbfad7ef2dc659e33` and
+  `719523ef3ba895be9ad388f9e3fecb80934a3b2bc9e7d12ee152d32f4ca49ac6`.
+- Staged targeted upload completed for only the source and test paths; remote
+  integrity validation passed and the focused remote suite passed `42` tests.
+  The split-service deployment restarted the paper, dashboard, and model
+  tunnels at `2026-10-23T03:10:41Z` (tunnels at `03:10:30Z`). The first
+  post-restart read-only check at `03:11:21Z` confirmed paper/unpaused state,
+  active services, no automatic service restarts, and zero open paper positions.
+  Its one market decision was incomplete with
+  `funding_evidence_unavailable`; there were zero signals/executions. The
+  one-minute training query had zero rows, so there is not yet any post-restart
+  training-budget evidence. This sample is explicitly too small to evaluate
+  the preregistered route intervention.
+- Baseline HEAD for this batch was `9d5b903`. The pre-existing
+  `db/session.py` modification remains unrelated, unstaged, and untouched.
+  The targeted source/test deployment did not include unrelated working-tree
+  files.
+- Next: collect only rows at or after the exact trading restart time above.
+  Require 30 consecutive market decisions across at least 20 symbols with
+  zero order-book/mark/index receipt or clock errors, and same-boundary
+  training snapshots with no seal/compaction errors and maximum frozen size
+  `98,304 B`. Separately trace `funding_evidence_unavailable`, stale
+  return-distribution supervision contracts, missing authorized paper
+  horizons, and missing independent fee-after evidence. Keep G2 blocked unless
+  the component sample passes; do not treat the route adjustment as evidence
+  of profitability or relax the model permission gate.
+- Code-path trace confirms the current funding blocker is not repaired by the
+  route-wait change: `services/entry_direction_competition.py` can derive a
+  paper funding horizon only from a selected eligible prediction cohort, an
+  authorized horizon, or an eligible paper-training cohort. If all are
+  absent, it requires a funding projection without inventing a horizon;
+  `ai_brain/ensemble_coordinator.py` then marks the analysis incomplete when
+  funding evidence is not complete. The last per-source audit at
+  `2026-10-23T02:44:56Z` found server-profit/timeseries contracts on stale v2
+  supervision and local-ML contracts without paper permission. The immediate
+  post-restart row still has `funding_evidence_unavailable`. Do not whitelist
+  stale contracts or grant local-ML permission; resolve those upstream only
+  with a current-contract artifact and separate fee-after evidence.
+- Profitability remains unqualified: fee-after-return evidence is still
+  `n=261`, mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`. G3-G6 remain
+  pending; this route change is not a profitability fix or trade authorization.

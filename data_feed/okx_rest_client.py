@@ -47,14 +47,14 @@ DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # Reference routes share the public request gate with executable quotes. A
 # short 1.5s deadline caused bursty rounds to persist empty mark/index facts
 # even though the shared single-flight request completed moments later.
-REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 3.0
+REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 5.5
 REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
 REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
 # The order-book route shares the public request gate with ticker and
 # reference-price calls. Keep the wait bounded below the six-second
 # derivatives deadline, but allow a queued single-flight request to finish
 # before persisting a missing fact under burst load.
-ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 4.0
+ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 5.5
 ORDERBOOK_CACHE_TTL_SECONDS = 10.0
 TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # A caller joining an already-running ticker refresh gets a normal bounded
