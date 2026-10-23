@@ -15,7 +15,7 @@ from typing import Any
 import structlog
 
 from config.settings import settings
-from core.feature_availability import ObservedKlines
+from core.feature_availability import ObservedKlines, availability_timestamp
 from core.market_facts import normalize_okx_contract_spec
 from core.okx_instrument_filter import supported_usdt_swap_instruments
 from core.safe_output import safe_error_text
@@ -61,7 +61,6 @@ TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # wait.  This is deliberately independent from the first caller's short
 # route budget so a completed shared request is not lost as a timeout stub.
 TICKER_ROUTE_JOIN_TIMEOUT_SECONDS = 2.5
-REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS = TICKER_ROUTE_JOIN_TIMEOUT_SECONDS
 # Final entry validation may wait longer for the same single-flight request,
 # but remains bounded so a slow exchange route cannot stall the trading loop.
 TICKER_ROUTE_AUTHORITATIVE_TIMEOUT_SECONDS = max(
@@ -71,11 +70,10 @@ TICKER_ROUTE_AUTHORITATIVE_TIMEOUT_SECONDS = max(
 TICKER_ROUTE_AUTHORITATIVE_FALLBACK_TIMEOUT_SECONDS = 5.0
 TICKER_ROUTE_AUTHORITATIVE_BATCH_CACHE_SECONDS = 1.0
 TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
-# All public market routes share one SDK session.  Without a client-level
-# gate, a market round can create several requests per symbol (ticker,
-# orderbook, mark/index and the native 1m path) and overwhelm that session
-# even though the service-level feature gate is bounded.
-PUBLIC_MARKET_REQUEST_CONCURRENCY = 8
+# All public market routes share one SDK session. Four priority slots match
+# one feature-fetch wave, preventing the 240-symbol scan from creating an
+# eight-request burst against the public exchange routes.
+PUBLIC_MARKET_REQUEST_CONCURRENCY = 4
 # Funding and open-interest are useful enrichments, but they must never be
 # able to consume every public-request slot while executable quotes are being
 # refreshed. Keep a fixed reserve for ticker/orderbook/mark/index routes.
@@ -83,7 +81,7 @@ PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
     1,
     PUBLIC_MARKET_REQUEST_CONCURRENCY // 2,
 )
-PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 2
+PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 1
 # Native one-minute candles are part of the executable-market-fact proof. They
 # must not queue behind the larger indicator K-line fan-out, while still being
 # bounded so a provider outage cannot consume all public-request capacity.
@@ -138,6 +136,84 @@ def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
         task.result()
     except (asyncio.CancelledError, Exception):
         return
+
+
+def _reference_fact_clock_is_valid(
+    *,
+    price: Any,
+    source_timestamp_ms: Any,
+    received_at: Any,
+) -> bool:
+    """Require a positive observed fact whose source predates its receipt."""
+
+    try:
+        price_value = float(price)
+        source_ms = int(float(source_timestamp_ms))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(price_value) or price_value <= 0 or source_ms <= 0:
+        return False
+    received = availability_timestamp(received_at)
+    if received is None:
+        return False
+    source = availability_timestamp(source_ms)
+    return source is not None and source <= received
+
+
+def _positive_timestamp_ms(value: Any) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(number) if math.isfinite(number) and number > 0 else 0
+
+
+def _orderbook_snapshot_is_complete(result: dict[str, Any]) -> bool:
+    fact = result.get("orderbook_fact")
+    if not isinstance(fact, dict):
+        return False
+    try:
+        bid_depth = float(fact.get("bid_depth_usdt") or 0.0)
+        ask_depth = float(fact.get("ask_depth_usdt") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        result.get("orderbook_data_available") is True
+        and _reference_fact_clock_is_valid(
+            price=fact.get("bid"),
+            source_timestamp_ms=fact.get("source_timestamp_ms"),
+            received_at=fact.get("received_at"),
+        )
+        and _reference_fact_clock_is_valid(
+            price=fact.get("ask"),
+            source_timestamp_ms=fact.get("source_timestamp_ms"),
+            received_at=fact.get("received_at"),
+        )
+        and math.isfinite(bid_depth)
+        and math.isfinite(ask_depth)
+        and bid_depth > 0
+        and ask_depth > 0
+    )
+
+
+def _reference_snapshot_is_complete(result: dict[str, Any]) -> bool:
+    mark = result.get("mark_price_fact")
+    index = result.get("index_price_fact")
+    return (
+        result.get("reference_prices_data_available") is True
+        and isinstance(mark, dict)
+        and isinstance(index, dict)
+        and _reference_fact_clock_is_valid(
+            price=mark.get("price"),
+            source_timestamp_ms=mark.get("source_timestamp_ms"),
+            received_at=mark.get("received_at"),
+        )
+        and _reference_fact_clock_is_valid(
+            price=index.get("price"),
+            source_timestamp_ms=index.get("source_timestamp_ms"),
+            received_at=index.get("received_at"),
+        )
+    )
 
 
 class _PriorityRequestGate:
@@ -1179,7 +1255,7 @@ class OKXRestClient:
                         time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
                     )
                     return
-                if not result.get("mark_price") and not result.get("index_price"):
+                if result.get("reference_prices_data_available") is not True:
                     self._reference_price_failure_cache[inst_id] = (
                         time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
                     )
@@ -1245,74 +1321,10 @@ class OKXRestClient:
         index_received_at = index_result.get("received_at") if isinstance(index_result, dict) else None
         mark_price = self._safe_float(mark_row.get("markPx"))
         index_price = self._safe_float(index_row.get("idxPx"))
-        fallback_used = False
-        if mark_price <= 0 or index_price <= 0:
-            # A slow public mark/index endpoint must not block an analysis
-            # round.  The ticker is an exchange-native, current price fallback
-            # and is explicitly labelled so downstream training can distinguish
-            # it from a verified mark/index pair.
-            ticker_task: asyncio.Task[Any] | None = None
-            try:
-                # Reference prices only need a current last price for a
-                # mark/index fallback.  Do not require executable bid/ask
-                # fields here; the strict bid/ask contract remains enforced by
-                # the authoritative data-service path.
-                ticker_task = asyncio.create_task(
-                    self.fetch_ticker(symbol, wait_for_completion=False)
-                )
-                ticker_result = await asyncio.wait_for(
-                    asyncio.shield(ticker_task),
-                    timeout=REFERENCE_PRICES_FALLBACK_TIMEOUT_SECONDS,
-                )
-                ticker_info = (
-                    ticker_result.get("info")
-                    if isinstance(ticker_result, dict)
-                    and isinstance(ticker_result.get("info"), dict)
-                    else {}
-                )
-                if self._safe_float(
-                    ticker_result.get("last") if isinstance(ticker_result, dict) else None
-                ) <= 0 and self._safe_float(ticker_info.get("last")) <= 0:
-                    # The short per-symbol request can legitimately return a
-                    # background marker when the shared SDK lane is busy.
-                    # Retry through the authoritative batch route so an empty
-                    # mark/index response never becomes a completed-looking
-                    # zero-valued fact without a receipt clock.
-                    ticker_result = await self._fetch_authoritative_ticker_fallback(inst_id)
-                ticker_info = ticker_result.get("info") or {}
-                ticker_price = self._safe_float(ticker_result.get("last"))
-                ticker_timestamp_ms = int(
-                    self._safe_float(
-                        ticker_result.get("timestamp")
-                        or ticker_info.get("ts")
-                    )
-                )
-                if ticker_price > 0:
-                    if mark_price <= 0:
-                        mark_price = ticker_price
-                        mark_received_at = ticker_result.get("received_at")
-                        mark_row = {
-                            "instId": inst_id,
-                            "instType": "SWAP",
-                            "markPx": ticker_result.get("last"),
-                            "ts": ticker_timestamp_ms,
-                            "fallback": True,
-                        }
-                        fallback_used = True
-                    if index_price <= 0:
-                        index_price = ticker_price
-                        index_received_at = ticker_result.get("received_at")
-                        index_row = {
-                            "instId": uly,
-                            "idxPx": ticker_result.get("last"),
-                            "ts": ticker_timestamp_ms,
-                            "fallback": True,
-                        }
-                        fallback_used = True
-            except Exception:
-                if ticker_task is not None and not ticker_task.done():
-                    ticker_task.cancel()
-                    ticker_task.add_done_callback(_consume_cancelled_task)
+        # A ticker last price is not a mark price or an index price.  Never
+        # synthesize either required reference fact from it: missing or
+        # clock-invalid routes must remain unavailable and retry with bounded
+        # backoff instead of entering the model/training contract as a lie.
 
         payload = {
             "mark_price": mark_price,
@@ -1328,7 +1340,7 @@ class OKXRestClient:
                 "source_channel": (
                     "tickers-fallback" if mark_row.get("fallback") else "mark-price"
                 ),
-                "source_timestamp_ms": int(self._safe_float(mark_row.get("ts"))),
+                "source_timestamp_ms": _positive_timestamp_ms(mark_row.get("ts")),
                 "received_at": mark_received_at,
                 "price": mark_price,
             },
@@ -1345,14 +1357,41 @@ class OKXRestClient:
                     if index_row.get("fallback")
                     else "index-tickers"
                 ),
-                "source_timestamp_ms": int(self._safe_float(index_row.get("ts"))),
+                "source_timestamp_ms": _positive_timestamp_ms(index_row.get("ts")),
                 "received_at": index_received_at,
                 "price": index_price,
             },
         }
-        if fallback_used:
-            payload["reference_prices_fallback"] = "ticker_last"
-        if mark_price > 0 or index_price > 0:
+        reference_reasons: list[str] = []
+        mark_price_fact = payload["mark_price_fact"]
+        index_price_fact = payload["index_price_fact"]
+        if (
+            str(mark_price_fact["inst_id"]).upper() != inst_id
+            or str(mark_price_fact["inst_type"]).upper() != "SWAP"
+            or not _reference_fact_clock_is_valid(
+                price=mark_price_fact["price"],
+                source_timestamp_ms=mark_price_fact["source_timestamp_ms"],
+                received_at=mark_price_fact["received_at"],
+            )
+        ):
+            reference_reasons.append("mark_price_fact_incomplete")
+        if (
+            str(index_price_fact["inst_id"]).upper() != uly
+            or str(index_price_fact["inst_type"]).upper() != "INDEX"
+            or not _reference_fact_clock_is_valid(
+                price=index_price_fact["price"],
+                source_timestamp_ms=index_price_fact["source_timestamp_ms"],
+                received_at=index_price_fact["received_at"],
+            )
+        ):
+            reference_reasons.append("index_price_fact_incomplete")
+        payload["reference_prices_data_available"] = not reference_reasons
+        if reference_reasons:
+            payload["reference_prices_unavailable_reasons"] = reference_reasons
+        # Never cache a half-built pair.  A later caller must retry the
+        # authoritative routes instead of reusing one positive price with a
+        # missing, rewritten, or future-dated receipt clock.
+        if payload["reference_prices_data_available"] is True:
             self._reference_price_cache[inst_id] = (time.monotonic(), payload)
         return payload
 
@@ -1464,6 +1503,21 @@ class OKXRestClient:
                 merged.update(result)
                 if result.get(f"{route_name}_timeout"):
                     timed_out_routes.append(route_name)
+                elif route_name in required_routes and not (
+                    (
+                        route_name == "orderbook"
+                        and _orderbook_snapshot_is_complete(result)
+                    )
+                    or (
+                        route_name == "reference_prices"
+                        and _reference_snapshot_is_complete(result)
+                    )
+                    or (
+                        route_name == "funding"
+                        and result.get("funding_data_available") is True
+                    )
+                ):
+                    failed_routes.append(route_name)
                 else:
                     completed_routes.append(route_name)
             else:

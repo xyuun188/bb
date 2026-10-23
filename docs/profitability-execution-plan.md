@@ -918,3 +918,48 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   three commits ahead of `origin/main`. The unrelated pre-existing
   `db/session.py` modification remains unstaged and untouched. Retry the push
   when GitHub connectivity is available.
+
+### Compact Budget Repair And Fresh Post-Restart Boundary (2026-10-23)
+
+- The next incomplete G2 sub-gate was the training-snapshot compaction
+  contract. `compact_market_fact()` previously returned an already-contracted
+  object unchanged, so a verbose old storage contract could remain above the
+  frozen budget. Recompaction also dropped
+  `missing_open_times_count`/`missing_open_times_fingerprint` when the raw
+  millisecond list had already been removed. Both Python and PostgreSQL
+  compaction now always re-project the native fact and preserve those bounded
+  metadata fields. The provenance fallback reason is capped at 160 characters
+  in both implementations to prevent duplicated diagnostic text from
+  consuming the model-input budget; full source identity remains in the
+  existing fact and source-consistency fingerprints.
+- The online frozen-budget audit now reports
+  `training_feature_compaction_error` in addition to availability seal errors.
+  This prevents a failed training snapshot from being misreported as a
+  budget-clean row with a 32-byte error object.
+- Local focused tests passed `58 passed, 1 skipped`; the skip is the local
+  PostgreSQL temporary-function check because `BB_TEST_POSTGRES_URL` is unset.
+  The targeted remote group passed `45 passed`, including the PostgreSQL
+  Python/SQL parity test with the runtime database URL translated to an
+  `asyncpg`-compatible scheme. Ruff, compilation and whitespace checks passed.
+  Only the four owned source/test paths were uploaded; no broad worktree sync
+  or service restart occurred during verification.
+- `bb-paper-trading.service` was then restarted once at
+  `2026-10-23T00:17:47Z` UTC and remained active with `NRestarts=0`; paper
+  mode and live execution remained disabled. The strict boundary
+  `[2026-10-23T00:17:47Z, 2026-10-23T00:23:46Z)` contained three market
+  decisions, all sealed and availability-clean, with zero executions. Twelve
+  training snapshots in the same boundary had no compaction errors and frozen
+  sizes `65,490-66,812 B`, all below `98,304 B`. This is a positive repair
+  result but not a completed G2 acceptance sample.
+- A wider eight-minute diagnostic after deployment covered 64 training rows:
+  all 64 had no seal or compaction errors, with frozen sizes
+  `95,606-97,250 B` and zero over-budget rows. The wider market projection
+  still mixed pre-restart rows and showed 19 market decisions with 11 clean
+  and 8 quarantined; the strict post-restart boundary above is the evidence
+  for the repaired code.
+- The remaining G2 requirement is a larger independent post-restart market
+  sample with zero order-book/mark/index receipt errors and no training
+  compaction errors. Continue collecting it before any candidate research or
+  exam. The fee-after quality gate remains negative (`n=261`, mean
+  `-0.311071%`, LCB `-0.441736%`, PF `0.549345`), so model influence and
+  order-capable paper execution remain disabled; G3-G6 stay pending.

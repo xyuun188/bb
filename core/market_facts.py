@@ -336,6 +336,8 @@ def _compact_source_consistency(value: Mapping[str, Any] | None) -> dict[str, An
                 "path_high",
                 "observed_prices_within_path",
                 "continuity_accepted_via",
+                "missing_open_times_count",
+                "missing_open_times_fingerprint",
             )
             if field in path
         }
@@ -382,7 +384,7 @@ def _compact_source_consistency(value: Mapping[str, Any] | None) -> dict[str, An
         if provenance.get("fallback_reason"):
             compact["provenance"]["fallback_reason"] = _text(
                 provenance.get("fallback_reason")
-            )[:512]
+            )[:160]
     return compact
 
 
@@ -409,12 +411,6 @@ def compact_market_fact(fact: Mapping[str, Any] | None) -> dict[str, Any]:
 
     source = _dict(fact)
     if not source or source.get("schema_version") != MARKET_FACT_SCHEMA_VERSION:
-        return deepcopy(source)
-    storage_contract = _dict(source.get("storage_contract"))
-    if (
-        storage_contract.get("version") == MARKET_FACT_STORAGE_COMPACTION_VERSION
-        and storage_contract.get("full_fact_fingerprint") == source.get("fact_id")
-    ):
         return deepcopy(source)
     identity = _dict(source.get("native_identity"))
     spec = _dict(identity.get("contract_spec"))

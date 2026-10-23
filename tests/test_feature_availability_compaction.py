@@ -463,7 +463,7 @@ def test_market_fact_storage_projection_preserves_quality_and_native_inputs() ->
         "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
         "provenance": {
             "data_fingerprint": "source-consistency-digest",
-            "fallback_reason": "",
+            "fallback_reason": "x" * 512,
         },
     }
     fact["quality"] = {"status": "clean", "violation_count": 0, "reasons": []}
@@ -486,6 +486,7 @@ def test_market_fact_storage_projection_preserves_quality_and_native_inputs() ->
     )
     assert "orderbook_fact" not in compact["source_consistency"]
     assert "reference_prices" not in compact["source_consistency"]
+    assert len(compact["source_consistency"]["provenance"]["fallback_reason"]) == 160
     assert market_fact_reasons(compact) == market_fact_reasons(fact)
 
 
@@ -543,6 +544,31 @@ def test_verbose_market_consistency_fits_frozen_budget_without_losing_quality_ga
         fact["source_consistency"]["assertions"]
     )
     assert "orderbook_fact" not in compacted["market_fact"]["source_consistency"]
+
+
+def test_market_fact_with_old_storage_contract_is_recompacted() -> None:
+    sample = _full_feature_vector_sample()
+    fact = sample["features"]["market_fact"]
+    fact["source_consistency"].setdefault("path", {})
+    fact["source_consistency"]["path"]["missing_open_times_ms"] = list(range(2_000))
+    fact["storage_contract"] = {
+        "version": "2026-10-22.compact-market-fact.v1",
+        "full_fact_fingerprint": fact["fact_id"],
+        "full_source_consistency_fingerprint": "old-source-consistency",
+    }
+
+    compact = compact_market_fact(fact)
+
+    assert compact["storage_contract"]["full_fact_fingerprint"] == fact["fact_id"]
+    assert "missing_open_times_ms" not in compact["source_consistency"]["path"]
+    assert "missing_open_times_count" in compact["source_consistency"]["path"]
+    assert training_feature_storage_bytes(compact) < training_feature_storage_bytes(fact)
+    assert training_feature_storage_bytes({"market_fact": fact}) > (
+        FROZEN_TRAINING_FEATURE_MAX_BYTES
+    )
+    assert frozen_feature_payload_size({"market_fact": compact}) < (
+        FROZEN_TRAINING_FEATURE_MAX_BYTES
+    )
 
 
 def test_compacted_market_fact_input_tampering_breaks_storage_fingerprint() -> None:

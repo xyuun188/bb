@@ -666,7 +666,7 @@ async def test_reference_prices_keep_swap_and_index_native_identities(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
+async def test_reference_prices_fail_closed_when_one_route_is_slow(
     monkeypatch,
 ) -> None:
     client = OKXRestClient()
@@ -699,15 +699,12 @@ async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
     )
 
     # A slow route is kept alive as a shared single-flight request so a later
-    # round can reuse it; the current caller receives the ticker fallback.
+    # round can reuse it; the current caller cannot synthesize a reference fact.
     assert cancelled.is_set() is False
-    assert prices["mark_price"] == pytest.approx(0.01291)
-    assert prices["index_price"] == pytest.approx(0.01291)
-    assert prices["reference_prices_fallback"] == "ticker_last"
-    assert prices["mark_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
-    assert prices["index_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
-    assert prices["mark_price_fact"]["source_endpoint"] == "okx_rest_market_ticker_fallback"
-    assert prices["index_price_fact"]["source_endpoint"] == "okx_rest_market_ticker_fallback"
+    assert prices["mark_price"] == 0.0
+    assert prices["index_price"] == 0.0
+    assert prices["reference_prices_data_available"] is False
+    assert "reference_prices_fallback" not in prices
     mark_task = client._reference_route_tasks.get(("ROBO-USDT-SWAP", "mark"))
     assert mark_task is not None and not mark_task.done()
     mark_task.cancel()
@@ -715,7 +712,7 @@ async def test_reference_prices_fall_back_to_ticker_when_one_route_is_slow(
 
 
 @pytest.mark.asyncio
-async def test_reference_prices_wait_for_shared_ticker_beyond_old_short_deadline(
+async def test_reference_prices_do_not_wait_for_ticker_fallback_beyond_route_deadline(
     monkeypatch,
 ) -> None:
     client = OKXRestClient()
@@ -749,9 +746,9 @@ async def test_reference_prices_wait_for_shared_ticker_beyond_old_short_deadline
         contract_spec={"instId": "ROBO-USDT-SWAP", "uly": "ROBO-USDT"},
     )
 
-    assert prices["mark_price"] == pytest.approx(0.01291)
-    assert prices["index_price"] == pytest.approx(0.01291)
-    assert prices["mark_price_fact"]["source_timestamp_ms"] == 1_783_990_800_000
+    assert prices["mark_price"] == 0.0
+    assert prices["index_price"] == 0.0
+    assert prices["reference_prices_data_available"] is False
     route_tasks = list(client._reference_route_tasks.values())
     for task in route_tasks:
         task.cancel()
@@ -859,7 +856,7 @@ async def test_public_market_requests_share_client_concurrency_gate(monkeypatch)
         )
     )
 
-    assert max_active <= 8
+    assert max_active <= 4
 
 
 @pytest.mark.asyncio
@@ -1008,7 +1005,19 @@ async def test_derivatives_snapshot_returns_completed_routes_before_deadline(
         return {"open_interest": 123.0}
 
     async def orderbook(_symbol: str, *, contract_spec=None) -> dict:
-        return {"orderbook_bid_depth": 10.0, "orderbook_ask_depth": 11.0}
+        return {
+            "orderbook_bid_depth": 10.0,
+            "orderbook_ask_depth": 11.0,
+            "orderbook_data_available": True,
+            "orderbook_fact": {
+                "bid": 100.0,
+                "ask": 100.1,
+                "bid_depth_usdt": 10.0,
+                "ask_depth_usdt": 11.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
+        }
 
     async def slow_reference(_symbol: str, *, contract_spec=None) -> dict:
         try:
@@ -1066,10 +1075,36 @@ async def test_derivatives_snapshot_does_not_wait_for_optional_routes(
             "orderbook_bid_depth": 10.0,
             "orderbook_ask_depth": 11.0,
             "orderbook_data_available": True,
+            "orderbook_fact": {
+                "bid": 100.0,
+                "ask": 100.1,
+                "bid_depth_usdt": 10.0,
+                "ask_depth_usdt": 11.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
         }
 
     async def reference_prices(_symbol: str, *, contract_spec=None) -> dict:
-        return {"mark_price": 100.0, "index_price": 100.0}
+        return {
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "reference_prices_data_available": True,
+            "mark_price_fact": {
+                "inst_id": "BTC-USDT-SWAP",
+                "inst_type": "SWAP",
+                "price": 100.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
+            "index_price_fact": {
+                "inst_id": "BTC-USDT",
+                "inst_type": "INDEX",
+                "price": 100.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
+        }
 
     monkeypatch.setattr(client, "fetch_funding_rate", slow_funding)
     monkeypatch.setattr(client, "fetch_open_interest", open_interest)
@@ -1117,10 +1152,36 @@ async def test_derivatives_snapshot_can_require_funding_for_final_analysis(
             "orderbook_bid_depth": 10.0,
             "orderbook_ask_depth": 11.0,
             "orderbook_data_available": True,
+            "orderbook_fact": {
+                "bid": 100.0,
+                "ask": 100.1,
+                "bid_depth_usdt": 10.0,
+                "ask_depth_usdt": 11.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
         }
 
     async def reference_prices(_symbol: str, *, contract_spec=None) -> dict:
-        return {"mark_price": 100.0, "index_price": 100.0}
+        return {
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "reference_prices_data_available": True,
+            "mark_price_fact": {
+                "inst_id": "BTC-USDT-SWAP",
+                "inst_type": "SWAP",
+                "price": 100.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
+            "index_price_fact": {
+                "inst_id": "BTC-USDT",
+                "inst_type": "INDEX",
+                "price": 100.0,
+                "source_timestamp_ms": 1_783_990_800_000,
+                "received_at": "2026-10-22T12:00:04+00:00",
+            },
+        }
 
     monkeypatch.setattr(client, "fetch_funding_rate", funding)
     monkeypatch.setattr(client, "fetch_open_interest", open_interest)

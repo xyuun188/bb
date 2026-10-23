@@ -3894,7 +3894,7 @@ class DataService:
 
         if not isinstance(data, dict) or not data:
             return False
-        if data.get("derivatives_required_data_available") is False:
+        if data.get("derivatives_required_data_available") is not True:
             return False
         if not bool(data.get("orderbook_data_available")):
             return False
@@ -3902,18 +3902,34 @@ class DataService:
             return False
         if self._safe_float(data.get("orderbook_ask_depth"), 0.0) <= 0:
             return False
-        if self._safe_float(data.get("mark_price"), 0.0) <= 0:
+        if data.get("reference_prices_data_available") is not True:
             return False
-        mark_fact = data.get("mark_price_fact")
-        if not isinstance(mark_fact, dict):
-            return False
-        if self._safe_float(mark_fact.get("price"), 0.0) <= 0:
-            return False
-        try:
-            if int(mark_fact.get("source_timestamp_ms") or 0) <= 0:
+
+        def observed_fact_is_complete(fact: Any, *, expected_kind: str) -> bool:
+            if not isinstance(fact, dict):
                 return False
-        except (TypeError, ValueError):
+            if self._safe_float(fact.get("price"), 0.0) <= 0 and expected_kind != "orderbook":
+                return False
+            if expected_kind == "orderbook" and (
+                self._safe_float(fact.get("bid"), 0.0) <= 0
+                or self._safe_float(fact.get("ask"), 0.0) <= 0
+            ):
+                return False
+            try:
+                source_ms = int(fact.get("source_timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                return False
+            if source_ms <= 0:
+                return False
+            received = availability_timestamp(fact.get("received_at"))
+            source = availability_timestamp(source_ms)
+            return received is not None and source is not None and source <= received
+
+        if not observed_fact_is_complete(data.get("orderbook_fact"), expected_kind="orderbook"):
             return False
+        for fact_key in ("mark_price_fact", "index_price_fact"):
+            if not observed_fact_is_complete(data.get(fact_key), expected_kind="reference"):
+                return False
         return True
 
     def _schedule_derivatives_background_refresh(self, symbol: str) -> None:

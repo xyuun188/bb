@@ -163,18 +163,21 @@ async def test_reference_route_clocks_are_independent_and_unchanged_on_cache_hit
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("has_receipt", [True, False])
-async def test_reference_fallback_retains_original_ticker_delivery_clock(
+async def test_reference_prices_require_ticker_receipt_when_routes_are_empty(
     monkeypatch, receipt_clock, has_receipt,
 ) -> None:
     client = OKXRestClient()
     ticker_received_at = (
         (receipt_clock.current - timedelta(seconds=10)).isoformat() if has_receipt else None
     )
+    ticker_calls = 0
 
     async def fetch(*args, **kwargs):
         return {"data": []}
 
     async def ticker(*args, **kwargs):
+        nonlocal ticker_calls
+        ticker_calls += 1
         payload = {
             "last": 100.0,
             "timestamp": SOURCE_TIMESTAMP_MS,
@@ -187,14 +190,15 @@ async def test_reference_fallback_retains_original_ticker_delivery_clock(
     monkeypatch.setattr(client, "fetch_ticker", ticker)
     result = await client.fetch_reference_prices("BTC/USDT", contract_spec=CONTRACT_SPEC)
 
-    assert result["reference_prices_fallback"] == "ticker_last"
-    for key in ("mark_price_fact", "index_price_fact"):
-        assert result[key]["received_at"] == ticker_received_at
-        assert result[key]["source_timestamp_ms"] == SOURCE_TIMESTAMP_MS
+    assert result["reference_prices_data_available"] is False
+    assert "reference_prices_fallback" not in result
+    assert result["mark_price"] == 0.0
+    assert result["index_price"] == 0.0
+    assert ticker_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_reference_fallback_retries_authoritative_ticker_when_short_route_is_backgrounded(
+async def test_reference_prices_do_not_promote_authoritative_ticker_to_reference_facts(
     monkeypatch, receipt_clock,
 ) -> None:
     client = OKXRestClient()
@@ -226,11 +230,11 @@ async def test_reference_fallback_retries_authoritative_ticker_when_short_route_
 
     result = await client.fetch_reference_prices("BTC/USDT", contract_spec=CONTRACT_SPEC)
 
-    assert result["reference_prices_fallback"] == "ticker_last"
-    assert fallback_calls == ["BTC-USDT-SWAP"]
-    for key in ("mark_price_fact", "index_price_fact"):
-        assert result[key]["received_at"] == authoritative_received_at
-        assert result[key]["source_timestamp_ms"] == SOURCE_TIMESTAMP_MS
+    assert result["reference_prices_data_available"] is False
+    assert "reference_prices_fallback" not in result
+    assert fallback_calls == []
+    assert result["mark_price"] == 0.0
+    assert result["index_price"] == 0.0
 
 
 @pytest.mark.asyncio

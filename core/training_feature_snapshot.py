@@ -348,10 +348,6 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
             IF source->>'schema_version' IS DISTINCT FROM '2026-07-14.okx-native-market-fact.v1' THEN
                 RETURN source;
             END IF;
-            IF storage->>'version' = '2026-10-22.compact-market-fact.v1'
-               AND storage->>'full_fact_fingerprint' = source->>'fact_id' THEN
-                RETURN source;
-            END IF;
             SELECT COALESCE(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                 'fact_id', item.value->'fact_id',
                 'source_interface', item.value->'source_interface',
@@ -462,13 +458,13 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                                     consistency_path->'missing_open_times_ms'
                                 ) = 'array' THEN to_jsonb(jsonb_array_length(
                                     consistency_path->'missing_open_times_ms'
-                                )) END,
+                                )) ELSE consistency_path->'missing_open_times_count' END,
                             'missing_open_times_fingerprint',
                                 CASE WHEN jsonb_typeof(
                                     consistency_path->'missing_open_times_ms'
                                 ) = 'array' THEN to_jsonb(md5(
                                     (consistency_path->'missing_open_times_ms')::TEXT
-                                )) END
+                                )) ELSE consistency_path->'missing_open_times_fingerprint' END
                         )),
                         'reference_observations', jsonb_strip_nulls(jsonb_build_object(
                             'mark_price_available',
@@ -488,7 +484,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                             'fallback_reason', CASE WHEN COALESCE(
                                 provenance->>'fallback_reason', ''
                             ) <> '' THEN to_jsonb(left(
-                                provenance->>'fallback_reason', 512
+                                provenance->>'fallback_reason', 160
                             )) END,
                             'data_fingerprint', provenance->'data_fingerprint'
                         ))

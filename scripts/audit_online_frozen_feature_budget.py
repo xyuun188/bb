@@ -71,7 +71,9 @@ def main_summary(rows, checked_at, source):
         size = training_feature_storage_bytes(frozen)
         sizes.append(size)
         contract = features.get("feature_availability_contract")
-        error = contract.get("seal_error") if isinstance(contract, dict) else None
+        seal_error = contract.get("seal_error") if isinstance(contract, dict) else None
+        compaction_error = features.get("training_feature_compaction_error")
+        error = compaction_error or seal_error
         errors[str(error or "none")] += 1
         contributions = {}
         for key, value in frozen.items():
@@ -89,7 +91,8 @@ def main_summary(rows, checked_at, source):
                 "symbol": row.symbol,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "frozen_bytes": size,
-                "seal_error": error,
+                "seal_error": seal_error,
+                "training_feature_compaction_error": compaction_error,
                 "largest_fields": sorted(
                     (
                         {"field": name, "bytes": amount}
