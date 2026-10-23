@@ -340,17 +340,64 @@ async def test_okx_ws_subscription_coverage_tracks_argument_level_acknowledgemen
             "acknowledged": 1,
             "rejected": 0,
             "missing_ack": 0,
+            "message_seen": 0,
+            "message_missing": 1,
+            "message_missing_sample": [
+                {"channel": "books5", "inst_id": "ETH-USDT-SWAP"}
+            ],
         },
         "mark-price": {
             "expected": 1,
             "acknowledged": 0,
             "rejected": 1,
             "missing_ack": 0,
+            "message_seen": 0,
+            "message_missing": 1,
+            "message_missing_sample": [
+                {"channel": "mark-price", "inst_id": "XRP-USDT-SWAP"}
+            ],
         },
         "tickers": {
             "expected": 1,
             "acknowledged": 1,
             "rejected": 0,
             "missing_ack": 0,
+            "message_seen": 0,
+            "message_missing": 1,
+            "message_missing_sample": [
+                {"channel": "tickers", "inst_id": "BTC-USDT-SWAP"}
+            ],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_okx_ws_subscription_coverage_tracks_per_instrument_messages() -> None:
+    client = OKXWebSocketClient()
+    client._subscription_expected_args = {
+        ("books5", "BTC-USDT-SWAP"),
+        ("index-tickers", "BTC-USDT"),
+    }
+
+    await client._handle_message(
+        json.dumps(
+            {
+                "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+                "data": [
+                    {
+                        "bids": [["100", "1", "0", "1"]],
+                        "asks": [["101", "1", "0", "1"]],
+                        "ts": "1782432000000",
+                    }
+                ],
+            }
+        )
+    )
+
+    coverage = client.get_stats()["subscription_coverage"]["by_channel"]
+    assert coverage["books5"]["message_seen"] == 1
+    assert coverage["books5"]["message_missing"] == 0
+    assert coverage["index-tickers"]["message_seen"] == 0
+    assert coverage["index-tickers"]["message_missing_sample"] == [
+        {"channel": "index-tickers", "inst_id": "BTC-USDT"}
+    ]

@@ -81,6 +81,7 @@ class OKXWebSocketClient:
         self._subscription_acknowledged_args: set[tuple[str, str]] = set()
         self._subscription_rejected_args: set[tuple[str, str]] = set()
         self._channel_message_counts: dict[str, int] = {}
+        self._channel_last_message_at: dict[tuple[str, str], float] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -147,6 +148,7 @@ class OKXWebSocketClient:
         self._subscription_acknowledged_args.clear()
         self._subscription_rejected_args.clear()
         self._subscription_unattributed_error_count = 0
+        self._channel_last_message_at.clear()
 
     async def connect(self) -> None:
         """Establish WebSocket connection and subscribe to channels."""
@@ -287,6 +289,9 @@ class OKXWebSocketClient:
             self._channel_message_counts[channel] = (
                 self._channel_message_counts.get(channel, 0) + 1
             )
+            argument_key = (str(channel), str(inst_id))
+            if argument_key in self._subscription_expected_args:
+                self._channel_last_message_at[argument_key] = time.time()
         
         # Debug: log non-ticker channels
         if channel != "tickers":
@@ -616,6 +621,12 @@ class OKXWebSocketClient:
             self.latest_orderbooks.pop(normalized, None)
             self.latest_mark_prices.pop(normalized, None)
             self.latest_index_prices.pop(normalized, None)
+            for key in list(self._channel_last_message_at):
+                if key[1] in {
+                    self._to_ws_inst_id(sym),
+                    self._to_ws_index_id(sym),
+                }:
+                    self._channel_last_message_at.pop(key, None)
         # Subscribe to new
         if new_ids:
             await self._send_subscription_operation("subscribe", new_ids)
@@ -633,6 +644,12 @@ class OKXWebSocketClient:
         self.latest_orderbooks.pop(normalized, None)
         self.latest_mark_prices.pop(normalized, None)
         self.latest_index_prices.pop(normalized, None)
+        for key in list(self._channel_last_message_at):
+            if key[1] in {
+                self._to_ws_inst_id(symbol),
+                self._to_ws_index_id(symbol),
+            }:
+                self._channel_last_message_at.pop(key, None)
         self._subscribe_symbols = [
             item
             for item in getattr(self, "_subscribe_symbols", [])
@@ -704,6 +721,19 @@ class OKXWebSocketClient:
                 "missing_ack": len(
                     expected_args - acknowledged_args - rejected_args
                 ),
+                "message_seen": sum(
+                    1 for key in expected_args if key in self._channel_last_message_at
+                ),
+                "message_missing": sum(
+                    1
+                    for key in expected_args
+                    if key not in self._channel_last_message_at
+                ),
+                "message_missing_sample": [
+                    {"channel": key[0], "inst_id": key[1]}
+                    for key in sorted(expected_args)
+                    if key not in self._channel_last_message_at
+                ][:20],
             }
         return {
             "expected_argument_count": len(self._subscription_expected_args),

@@ -2245,3 +2245,49 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   executable, fee-after shadow decision groups and inspect their fingerprint
   failures without using already inspected labels to choose a candidate.
   Keep all model/entry permissions unchanged until G2 and later gates pass.
+
+### Per-Instrument WebSocket Coverage Deployment (2026-10-24 06:56 Asia/Shanghai)
+
+- Added bounded per-instrument last-message timestamps to the existing
+  WebSocket subscription summary. The diagnostic is keyed by exact
+  `(channel, inst_id)` arguments and is outside frozen model inputs. It reports
+  message coverage separately from ACK coverage, so an ACK omission cannot be
+  mistaken for an absent stream.
+- Added the bounded native-derivatives cache diagnostic to the persisted
+  trading runtime summary. The diagnostic retains only recent route status,
+  source identity, receipt age and source age; it does not alter entry,
+  quality, model, risk, order or protection decisions.
+- Local verification passed `10` WebSocket tests and `468` trading-service
+  boundary tests; Ruff and `git diff --check` passed. Targeted upload of
+  `data_feed/okx_ws_client.py`, `services/trading_service.py` and
+  `tests/test_okx_ticker_volume.py` completed with remote
+  `source-integrity-ok:3` and no service restart during upload. The remote
+  WebSocket regression passed `10`; the broader remote trading-boundary run
+  was not accepted because the online pytest environment contains
+  root-owned temporary directories that cause permission failures during
+  teardown, so it is not evidence of a code failure or a pass.
+- Paper and Dashboard were restarted at `2026-10-23T22:53:56Z`; both are
+  active with zero automatic restarts. Runtime remains `paper`, unpaused,
+  and live trading is inactive.
+- The first post-restart runtime projection at
+  `2026-10-23T22:56:15Z` showed 498/498 ticker instruments with messages.
+  Books5, mark-price and index-tickers had messages for 153/498, 184/498 and
+  165/498 instruments respectively. Native cache diagnostics showed books and
+  mark facts available for several sampled symbols while many index facts were
+  `source_stale`; two sampled symbols had all three facts missing. The
+  connection was healthy (`reconnect_count=0`, ticker stream not stale), so
+  missing ACKs are not by themselves a sufficient root-cause explanation.
+  The entry model remains unauthorized (`model_strategy_blueprint_paper_permission`
+  absent; no positive cost-complete quality evidence), and no new entry was
+  authorized or executed.
+- G1 remains passed only as negative-economics attribution; G2 remains
+  blocked; G3-G6 remain pending. This deployment is diagnostic only and does
+  not establish a profitable candidate.
+- Next exact action: collect a full bounded post-restart window after the
+  process has produced mature decisions; compare route diagnostics for the
+  confirmed failure symbols against per-instrument WebSocket coverage and
+  REST fallback status. Then fix only the demonstrated route/availability
+  defect, retest and redeploy in a targeted batch. Separately continue
+  counting mature native executable fee-after decision groups without
+  inspecting labels for candidate selection. Keep all entry/model permissions
+  unchanged and live trading inactive.

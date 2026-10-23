@@ -5892,6 +5892,20 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 data_service_runtime["ticker_persist_dropped_count"] = int(
                     getattr(data_service, "_ticker_persist_dropped_count", 0) or 0
                 )
+                diagnostics_reader = getattr(
+                    data_service,
+                    "_native_derivatives_cache_diagnostics_snapshot",
+                    None,
+                )
+                if callable(diagnostics_reader):
+                    try:
+                        data_service_runtime["native_derivatives_cache_diagnostics"] = (
+                            diagnostics_reader(limit=32)
+                        )
+                    except Exception:
+                        data_service_runtime[
+                            "native_derivatives_cache_diagnostics"
+                        ] = []
             process_memory = {}
             try:
                 with Path("/proc/self/status").open(encoding="utf-8") as status_file:
