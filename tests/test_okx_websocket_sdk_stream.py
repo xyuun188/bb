@@ -112,6 +112,42 @@ async def test_sdk_stream_coalesces_ticker_backlog_to_latest_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sdk_stream_coalesces_derivative_market_backlog_to_latest_payload() -> None:
+    stream = OkxPublicWebSocketSdkStream()
+    consumer_released = asyncio.Event()
+    consume_task = asyncio.create_task(consumer_released.wait())
+    stream._consume_task = consume_task
+
+    def book(timestamp: str, bid: str) -> str:
+        return json.dumps(
+            {
+                "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+                "data": [
+                    {
+                        "bids": [[bid, "1", "0", "1"]],
+                        "asks": [["64001", "1", "0", "1"]],
+                        "ts": timestamp,
+                    }
+                ],
+            }
+        )
+
+    stream._on_message(book("1000", "63999"))
+    stream._on_message(book("1100", "64000"))
+    stream._on_message(book("1200", "64001"))
+
+    received = json.loads(await asyncio.wait_for(stream.recv(), timeout=0.2))
+
+    assert received["data"][0]["bids"][0][0] == "64001"
+    assert stream._market_ready.empty()
+    assert stream._market_messages == {}
+    assert stream._coalesced_market_messages == 2
+
+    await stream.close()
+    assert consume_task.done()
+
+
+@pytest.mark.asyncio
 async def test_sdk_stream_rate_limits_each_ticker_instrument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

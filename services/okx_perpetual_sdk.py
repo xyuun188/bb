@@ -42,7 +42,9 @@ OKX_SDK_HTTP_TIMEOUT_SECONDS = 8.0
 OKX_WS_PUBLIC_URL = "wss://ws.okx.com/ws/v5/public"
 OKX_WS_TICKER_EMIT_INTERVAL_SECONDS = 5.0
 OKX_WS_TICKER_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"tickers"')
+OKX_WS_DATA_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"([^"]+)"')
 OKX_WS_TICKER_INST_ID_RE = re.compile(r'"instId"\s*:\s*"([^"]+)"')
+OKX_WS_COALESCED_CHANNELS = frozenset({"books5", "mark-price", "index-tickers"})
 OKX_WS_BUSINESS_URL = "wss://ws.okx.com/ws/v5/business"
 OKX_WS_DEMO_URL = "wss://wspap.okx.com/ws/v5/public?brokerId=9999"
 
@@ -179,6 +181,10 @@ class OkxPublicWebSocketSdkStream:
         self._ticker_next_emit_at: dict[str, float] = {}
         self._ticker_emit_handles: dict[str, asyncio.TimerHandle] = {}
         self._coalesced_ticker_messages = 0
+        self._market_messages: dict[tuple[str, str], str] = {}
+        self._market_ready: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._market_queued: set[tuple[str, str]] = set()
+        self._coalesced_market_messages = 0
 
     async def connect(self) -> None:
         from okx.websocket.WsPublicAsync import WsPublicAsync
@@ -212,17 +218,31 @@ class OkxPublicWebSocketSdkStream:
 
     def _on_message(self, message: str) -> None:
         text = message.decode() if isinstance(message, bytes) else str(message)
-        if OKX_WS_TICKER_CHANNEL_RE.search(text) and '"data"' in text:
+        channel_match = (
+            OKX_WS_DATA_CHANNEL_RE.search(text) if '"data"' in text else None
+        )
+        channel = channel_match.group(1) if channel_match is not None else ""
+        if channel == "tickers":
             inst_match = OKX_WS_TICKER_INST_ID_RE.search(text)
             inst_id = inst_match.group(1) if inst_match is not None else ""
-        else:
-            inst_id = ""
-        if inst_id:
-            if inst_id in self._ticker_messages:
-                self._coalesced_ticker_messages += 1
-            self._ticker_messages[inst_id] = text
-            self._schedule_ticker(inst_id)
-            return
+            if inst_id:
+                if inst_id in self._ticker_messages:
+                    self._coalesced_ticker_messages += 1
+                self._ticker_messages[inst_id] = text
+                self._schedule_ticker(inst_id)
+                return
+        elif channel in OKX_WS_COALESCED_CHANNELS:
+            inst_match = OKX_WS_TICKER_INST_ID_RE.search(text)
+            inst_id = inst_match.group(1) if inst_match is not None else ""
+            key = (channel, inst_id)
+            if inst_id:
+                if key in self._market_messages:
+                    self._coalesced_market_messages += 1
+                self._market_messages[key] = text
+                if key not in self._market_queued:
+                    self._market_queued.add(key)
+                    self._market_ready.put_nowait(key)
+                return
         self._queue.put_nowait(text)
 
     def _schedule_ticker(self, inst_id: str) -> None:
@@ -279,9 +299,10 @@ class OkxPublicWebSocketSdkStream:
 
         queue_waiter = asyncio.create_task(self._queue.get())
         ticker_waiter = asyncio.create_task(self._ticker_ready.get())
+        market_waiter = asyncio.create_task(self._market_ready.get())
         try:
             done, _ = await asyncio.wait(
-                (queue_waiter, ticker_waiter, consume_task),
+                (queue_waiter, ticker_waiter, market_waiter, consume_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if consume_task in done:
@@ -298,13 +319,27 @@ class OkxPublicWebSocketSdkStream:
                     )
                     return message
                 return await self.recv()
+            if market_waiter in done:
+                key = market_waiter.result()
+                self._market_queued.discard(key)
+                message = self._market_messages.pop(key, None)
+                if message is not None:
+                    return message
+                return await self.recv()
             return queue_waiter.result()
         finally:
             if not queue_waiter.done():
                 queue_waiter.cancel()
             if not ticker_waiter.done():
                 ticker_waiter.cancel()
-            await asyncio.gather(queue_waiter, ticker_waiter, return_exceptions=True)
+            if not market_waiter.done():
+                market_waiter.cancel()
+            await asyncio.gather(
+                queue_waiter,
+                ticker_waiter,
+                market_waiter,
+                return_exceptions=True,
+            )
 
     async def close(self) -> None:
         client = self._client
@@ -314,11 +349,15 @@ class OkxPublicWebSocketSdkStream:
         self._ticker_messages.clear()
         self._ticker_queued.clear()
         self._ticker_next_emit_at.clear()
+        self._market_messages.clear()
+        self._market_queued.clear()
         for handle in self._ticker_emit_handles.values():
             handle.cancel()
         self._ticker_emit_handles.clear()
         while not self._ticker_ready.empty():
             self._ticker_ready.get_nowait()
+        while not self._market_ready.empty():
+            self._market_ready.get_nowait()
         try:
             if client is not None:
                 await client.stop()

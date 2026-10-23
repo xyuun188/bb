@@ -2291,3 +2291,33 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   counting mature native executable fee-after decision groups without
   inspecting labels for candidate selection. Keep all entry/model permissions
   unchanged and live trading inactive.
+
+### Derivatives Stream Backlog Repair (2026-10-24 07:07 Asia/Shanghai)
+
+- Root-cause evidence: after the diagnostic-only deployment, the connection
+  received 172,453 messages in roughly six minutes, while books5, mark-price
+  and index-tickers facts were received with source clocks about 249--251
+  seconds old and were therefore classified as
+  `stale_or_ticker_misaligned`/`source_stale`. Tickers were current. The
+  underlying SDK coalesced only tickers; every derivative update was queued
+  individually, allowing a historical-message backlog to delay current
+  executable facts.
+- Repair: `OkxPublicWebSocketSdkStream` now coalesces only the latest payload
+  per `(channel, inst_id)` for `books5`, `mark-price` and `index-tickers`,
+  while preserving subscribe/error/control events and the existing ticker
+  rate limit. This is a transport freshness repair; it does not alter
+  quality thresholds, model permissions, sizing, exits, risk or live mode.
+- Local focused verification passed `20` tests (SDK stream plus OKX WS client),
+  Ruff, compileall and diff checks. Targeted upload of the SDK and its test
+  passed `source-integrity-ok:2`; the same 20 tests passed remotely. Paper and
+  Dashboard were restarted at `2026-10-23T23:06:56Z`; both are active with
+  zero automatic restarts and paper mode remains unpaused.
+- This repair is not yet accepted as G2 evidence until a fresh mature window
+  confirms source-clock freshness and complete route contracts for the
+  previously failing symbols. No entry was authorized or manually created.
+- Exact next action: after the new bounded window completes, compare
+  per-instrument message coverage and source/receipt ages before and after the
+  repair, then run the frozen-feature and entry-gate audits. If freshness
+  recovers, keep G2 blocked until independent native fee-after samples meet
+  the preregistered evidence gate; if it does not, trace the remaining REST
+  fallback or instrument-contract path without weakening the gate.
