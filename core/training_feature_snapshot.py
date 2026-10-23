@@ -13,9 +13,9 @@ from decimal import Decimal
 from typing import Any
 
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
-from core.market_facts import compact_market_fact
+from core.market_facts import compact_market_fact, compact_market_fact_contract
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 4
+TRAINING_FEATURE_SNAPSHOT_VERSION = 5
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
@@ -45,6 +45,37 @@ TRAINING_FEATURE_RAW_TEXT_KEYS = (
     "transcript",
     "opinions",
     "experts",
+)
+TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS = (
+    "training_label_contract",
+    "training_market_fact_contract",
+)
+_TRAINING_MARKET_FACT_CONTRACT_KEYS = (
+    "version",
+    "status",
+    "violation_count",
+    "violation_reason_codes",
+    "native_instrument_identity_verified",
+    "same_contract_price_path_verified",
+    "executable_market_fact_verified",
+    "source",
+    "observation_window",
+    "sample_count",
+    "effective_sample_size",
+    "generated_at",
+    "strategy_version",
+    "fallback_reason",
+    "data_fingerprint",
+    "entry_fact_id",
+    "result_fact_id",
+    "result_source_timestamp_ms",
+    "result_received_at",
+    "entry_inst_id",
+    "result_inst_id",
+    "entry_contract_spec_version",
+    "result_contract_spec_version",
+    "path_status",
+    "path_fingerprint",
 )
 _INVALID_SIZE = TRAINING_FEATURE_SNAPSHOT_MAX_BYTES + 1
 
@@ -152,6 +183,44 @@ def _compact_frozen_value(key: str, value: Any) -> Any:
     return deepcopy(value)
 
 
+def _compact_training_market_fact_contract(value: object) -> dict[str, Any]:
+    """Retain label provenance without treating it as a frozen model input."""
+
+    if not isinstance(value, dict):
+        return {}
+    if any(
+        key in value
+        for key in ("assertions", "entry_fact", "result_fact", "price_path", "provenance")
+    ):
+        compact = compact_market_fact_contract(value)
+        compact["observation_window"] = _parse_compact_observation_window(
+            compact["observation_window"]
+        )
+        return compact
+    compact: dict[str, Any] = {}
+    for key in _TRAINING_MARKET_FACT_CONTRACT_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if key == "observation_window" and isinstance(item, str):
+            item = _parse_compact_observation_window(item)
+        elif key == "fallback_reason":
+            item = str(item or "")[:512]
+        elif key == "violation_reason_codes":
+            item = str(item or "")
+        compact[key] = deepcopy(item)
+    return compact
+
+
+def _parse_compact_observation_window(value: Any) -> Any:
+    if not isinstance(value, str):
+        return deepcopy(value)
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
 def compact_frozen_feature_payload(features: dict[str, Any]) -> dict[str, Any]:
     """Return the exact immutable projection used by frozen snapshot storage."""
 
@@ -228,6 +297,21 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
     compact = frozen_training_feature_snapshot(value)
     if "training_feature_compaction_error" in compact:
         return compact
+    for key in TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS:
+        raw_contract = value.get(key)
+        if not isinstance(raw_contract, dict) or not raw_contract:
+            continue
+        contract = (
+            raw_contract
+            if key == "training_label_contract"
+            else _compact_training_market_fact_contract(raw_contract)
+        )
+        if training_feature_storage_bytes(contract) > TRAINING_FEATURE_OBJECT_MAX_BYTES:
+            return {"training_feature_compaction_error": "required_contract_budget_exceeded"}
+        candidate = {**compact, key: contract}
+        if training_feature_storage_bytes(candidate) > TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
+            return {"training_feature_compaction_error": "required_contract_snapshot_budget_exceeded"}
+        compact = candidate
     # Optional diagnostics are useful only when they fit beside the sealed
     # training inputs.  Keep a deterministic prefix and drop the rest rather
     # than rejecting an otherwise valid frozen sample.
@@ -529,6 +613,102 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         $compact_market_fact$;
     """
 
+    market_fact_contract_sql = """
+        CREATE OR REPLACE FUNCTION bb_compact_training_market_fact_contract(input_value JSONB)
+        RETURNS JSONB
+        LANGUAGE plpgsql IMMUTABLE
+        AS $compact_training_market_fact_contract$
+        DECLARE
+            source JSONB := CASE WHEN jsonb_typeof(input_value) = 'object'
+                                 THEN input_value ELSE '{}'::JSONB END;
+            assertions JSONB := CASE WHEN jsonb_typeof(source->'assertions') = 'object'
+                                     THEN source->'assertions' ELSE source END;
+            provenance JSONB := CASE
+                WHEN jsonb_typeof(source->'provenance') = 'object'
+                THEN source->'provenance' ELSE source
+            END;
+            entry JSONB := CASE WHEN jsonb_typeof(source->'entry_fact') = 'object'
+                                THEN source->'entry_fact' ELSE source END;
+            result JSONB := CASE WHEN jsonb_typeof(source->'result_fact') = 'object'
+                                 THEN source->'result_fact' ELSE source END;
+            entry_identity JSONB := COALESCE(entry->'native_identity', '{}'::JSONB);
+            result_identity JSONB := COALESCE(result->'native_identity', '{}'::JSONB);
+            path JSONB := CASE WHEN jsonb_typeof(source->'price_path') = 'object'
+                               THEN source->'price_path' ELSE source END;
+            reason_codes TEXT;
+            observation_window JSONB;
+        BEGIN
+            IF source ? 'provenance' THEN
+                observation_window := COALESCE(
+                    provenance->'observation_window',
+                    'null'::JSONB
+                );
+            ELSIF source ? 'observation_window' THEN
+                IF jsonb_typeof(source->'observation_window') = 'string' THEN
+                    BEGIN
+                        observation_window := (source->>'observation_window')::JSONB;
+                    EXCEPTION WHEN invalid_text_representation THEN
+                        observation_window := source->'observation_window';
+                    END;
+                ELSE
+                    observation_window := source->'observation_window';
+                END IF;
+            END IF;
+            SELECT COALESCE(string_agg(left(item.value, 160), ';' ORDER BY item.ordinality), '')
+                INTO reason_codes
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof(source->'violation_reasons') = 'array'
+                         THEN source->'violation_reasons' ELSE '[]'::JSONB END
+                ) WITH ORDINALITY AS item(value, ordinality);
+            IF reason_codes = '' THEN
+                reason_codes := COALESCE(source->>'violation_reason_codes', '');
+            END IF;
+            RETURN jsonb_build_object(
+                'version', source->'version',
+                'status', source->'status',
+                'violation_count', source->'violation_count',
+                'violation_reason_codes', reason_codes,
+                'native_instrument_identity_verified',
+                    COALESCE(assertions->'native_instrument_identity_verified', source->'native_instrument_identity_verified'),
+                'same_contract_price_path_verified',
+                    COALESCE(assertions->'same_contract_price_path_verified', source->'same_contract_price_path_verified'),
+                'executable_market_fact_verified',
+                    COALESCE(assertions->'executable_market_fact_verified', source->'executable_market_fact_verified'),
+                'source', COALESCE(provenance->'source', source->'source'),
+                'observation_window', observation_window,
+                'sample_count', COALESCE(provenance->'sample_count', source->'sample_count'),
+                'effective_sample_size',
+                    COALESCE(provenance->'effective_sample_size', source->'effective_sample_size'),
+                'generated_at', COALESCE(provenance->'generated_at', source->'generated_at'),
+                'strategy_version',
+                    COALESCE(provenance->'strategy_version', source->'strategy_version'),
+                'fallback_reason', left(COALESCE(
+                    provenance->>'fallback_reason', source->>'fallback_reason', ''
+                ), 512),
+                'data_fingerprint',
+                    COALESCE(provenance->'data_fingerprint', source->'data_fingerprint'),
+                'entry_fact_id', COALESCE(entry->'fact_id', source->'entry_fact_id'),
+                'result_fact_id', COALESCE(result->'fact_id', source->'result_fact_id'),
+                'result_source_timestamp_ms',
+                    COALESCE(result->'source_timestamp_ms', source->'result_source_timestamp_ms'),
+                'result_received_at',
+                    COALESCE(result->'received_at', source->'result_received_at'),
+                'entry_inst_id',
+                    COALESCE(entry_identity->'inst_id', source->'entry_inst_id'),
+                'result_inst_id',
+                    COALESCE(result_identity->'inst_id', source->'result_inst_id'),
+                'entry_contract_spec_version',
+                    COALESCE(entry_identity->'contract_spec_version', source->'entry_contract_spec_version'),
+                'result_contract_spec_version',
+                    COALESCE(result_identity->'contract_spec_version', source->'result_contract_spec_version'),
+                'path_status', COALESCE(path->'status', source->'path_status'),
+                'path_fingerprint',
+                    COALESCE(path->'path_fingerprint', source->'path_fingerprint')
+            );
+        END;
+        $compact_training_market_fact_contract$;
+    """
+
     compact_sql = f"""
         CREATE OR REPLACE FUNCTION bb_compact_training_feature_snapshot(input_value JSONB)
         RETURNS JSONB
@@ -541,6 +721,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
             input_projection JSONB;
             compact JSONB;
             candidate JSONB;
+            required_contract JSONB;
             optional_item RECORD;
             frozen_keys TEXT[] := ARRAY[{frozen_keys}]::TEXT[];
             input_keys TEXT[] := ARRAY[{input_keys}]::TEXT[];
@@ -585,11 +766,53 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 );
             END IF;
             compact := frozen;
+            IF jsonb_typeof(raw->'training_label_contract') = 'object'
+               AND raw->'training_label_contract' <> '{{}}'::JSONB THEN
+                candidate := compact || jsonb_build_object(
+                    'training_label_contract', raw->'training_label_contract'
+                );
+                IF bb_training_feature_storage_bytes(raw->'training_label_contract')
+                    > {TRAINING_FEATURE_OBJECT_MAX_BYTES}
+                    OR bb_training_feature_storage_bytes(candidate)
+                        > {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                    RETURN jsonb_build_object(
+                        'training_feature_compaction_error', 'required_contract_budget_exceeded'
+                    );
+                END IF;
+                compact := candidate;
+            END IF;
+            IF jsonb_typeof(raw->'training_market_fact_contract') = 'object'
+               AND raw->'training_market_fact_contract' <> '{{}}'::JSONB THEN
+                required_contract := bb_compact_training_market_fact_contract(
+                    raw->'training_market_fact_contract'
+                );
+                IF bb_training_feature_storage_bytes(required_contract)
+                    > {TRAINING_FEATURE_OBJECT_MAX_BYTES} THEN
+                    RETURN jsonb_build_object(
+                        'training_feature_compaction_error', 'required_contract_budget_exceeded'
+                    );
+                END IF;
+                candidate := compact || jsonb_build_object(
+                    'training_market_fact_contract', required_contract
+                );
+                IF bb_training_feature_storage_bytes(candidate)
+                    > {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                    RETURN jsonb_build_object(
+                        'training_feature_compaction_error',
+                        'required_contract_snapshot_budget_exceeded'
+                    );
+                END IF;
+                compact := candidate;
+            END IF;
             FOR optional_item IN
                 SELECT entry.key, entry.value
                 FROM jsonb_each(raw) AS entry(key, value)
                 WHERE length(entry.key) <= 120
                   AND NOT (entry.key = ANY(frozen_keys))
+                  AND NOT (entry.key = ANY(ARRAY[
+                      'training_label_contract',
+                      'training_market_fact_contract'
+                  ]::TEXT[]))
                   AND NOT (entry.key = ANY(raw_keys))
                   AND (
                       jsonb_typeof(entry.value) IN ('number', 'boolean', 'null')
@@ -617,4 +840,4 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         END;
         $compact_features$;
     """
-    return storage_sql, normalize_sql, market_fact_sql, compact_sql
+    return storage_sql, normalize_sql, market_fact_sql, market_fact_contract_sql, compact_sql

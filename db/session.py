@@ -1720,6 +1720,41 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
                 """
             )
         )
+        # Recompact a bounded batch whose source retains required label
+        # provenance but whose old training view lost it to optional diagnostics.
+        await conn.execute(
+            text(
+                """
+                WITH candidates AS (
+                    SELECT id
+                    FROM shadow_backtests
+                    WHERE feature_snapshot IS NOT NULL
+                      AND (
+                          (
+                              (feature_snapshot::JSONB) ? 'training_market_fact_contract'
+                              AND NOT (
+                                  COALESCE(training_feature_snapshot, '{}'::JSONB)
+                                  ? 'training_market_fact_contract'
+                              )
+                          )
+                          OR (
+                              (feature_snapshot::JSONB) ? 'training_label_contract'
+                              AND NOT (
+                                  COALESCE(training_feature_snapshot, '{}'::JSONB)
+                                  ? 'training_label_contract'
+                              )
+                          )
+                      )
+                    ORDER BY id DESC
+                    LIMIT 500
+                )
+                UPDATE shadow_backtests AS shadow
+                SET feature_snapshot = shadow.feature_snapshot
+                FROM candidates
+                WHERE shadow.id = candidates.id
+                """
+            )
+        )
         return
 
     if "sqlite" not in settings.database_url:

@@ -21,6 +21,8 @@ from core.market_facts import (
     MARKET_FACT_CONTRACT_VERSION,
     build_market_fact,
     compact_market_fact,
+    compact_market_fact_contract,
+    market_fact_contract_reasons,
     market_fact_reasons,
 )
 from core.training_contracts import (
@@ -317,6 +319,59 @@ def _trainable_shadow_sample() -> dict:
     }
 
 
+def _large_native_market_fact_contract() -> dict:
+    native_identity = {
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "uly": "BTC-USDT",
+        "contract_spec_version": "okx-contract-spec-v1",
+    }
+    return {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "clean",
+        "violation_count": 0,
+        "violation_reasons": [],
+        "assertions": {
+            "native_instrument_identity_verified": True,
+            "same_contract_price_path_verified": True,
+            "executable_market_fact_verified": True,
+        },
+        "entry_fact": {
+            "fact_id": "entry-fact",
+            "native_identity": native_identity,
+            "raw_provider_payload": [{"book": [100.0] * 300} for _ in range(8)],
+        },
+        "result_fact": {
+            "fact_id": "result-fact",
+            "source_timestamp_ms": 1792632600000,
+            "received_at": "2026-10-22T01:30:00+00:00",
+            "native_identity": native_identity,
+            "raw_provider_payload": [{"book": [101.0] * 300} for _ in range(8)],
+        },
+        "price_path": {
+            "status": "clean",
+            "path_fingerprint": "sha256:" + "a" * 64,
+            "_ordered_bar_ranges": [
+                {"open_time_ms": index * 60_000, "high": 101.0, "low": 99.0}
+                for index in range(500)
+            ],
+        },
+        "provenance": {
+            "source": "shadow_entry_result_and_okx_native_1m_path",
+            "observation_window": {
+                "start": "2026-10-22T01:00:00+00:00",
+                "end": "2026-10-22T01:30:00+00:00",
+            },
+            "sample_count": 1,
+            "effective_sample_size": 1.0,
+            "generated_at": "2026-10-22T01:30:01+00:00",
+            "strategy_version": MARKET_FACT_CONTRACT_VERSION,
+            "fallback_reason": "",
+            "data_fingerprint": "b" * 64,
+        },
+    }
+
+
 def _full_feature_vector_sample() -> dict:
     from data_feed.feature_vector import FeatureVector
 
@@ -449,6 +504,73 @@ def test_compacted_sealed_inputs_remain_trainable_without_text_or_resealing() ->
     assert "feature_availability_contract" not in transport
     assert transport["current_price"] == original["current_price"]
     assert training_feature_storage_bytes(features) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+
+
+def test_required_market_contract_is_compacted_and_survives_optional_budget() -> None:
+    sample = _trainable_shadow_sample()
+    features = sample["features"]
+    contract = _large_native_market_fact_contract()
+    features["training_market_fact_contract"] = contract
+    features.update(
+        {
+            f"optional_diagnostic_{index:03d}": "x" * 512
+            for index in range(80)
+        }
+    )
+
+    assert training_feature_storage_bytes(contract) > 16 * 1024
+    compacted = _compact_training_feature_snapshot(features)
+    compact_contract = compacted["training_market_fact_contract"]
+    expected_contract = compact_market_fact_contract(contract)
+    expected_contract["observation_window"] = json.loads(
+        expected_contract["observation_window"]
+    )
+
+    assert compacted.get("training_feature_compaction_error") is None
+    assert compact_contract == expected_contract
+    assert training_feature_storage_bytes(compact_contract) <= 16 * 1024
+    assert _compact_training_feature_snapshot(compacted) == compacted
+    assert market_fact_contract_reasons(compact_contract) == []
+    assert compacted["feature_availability_contract"]["input_fingerprint"] == (
+        features["feature_availability_contract"]["input_fingerprint"]
+    )
+    assert "training_market_fact_contract" not in FROZEN_TRAINING_FEATURE_KEYS
+    assert "optional_diagnostic_079" not in compacted
+    sample["features"] = compacted
+    assert assess_shadow_sample(sample).status == "included"
+
+
+def test_required_market_contract_does_not_change_frozen_input_fingerprint() -> None:
+    features = _trainable_shadow_sample()["features"]
+    original_fingerprint = features["feature_availability_contract"]["input_fingerprint"]
+    first_contract = _large_native_market_fact_contract()
+    changed_contract = deepcopy(first_contract)
+    changed_contract["provenance"]["data_fingerprint"] = "c" * 64
+
+    first = {
+        **features,
+        "training_market_fact_contract": first_contract,
+    }
+    second = {
+        **features,
+        "training_market_fact_contract": changed_contract,
+    }
+
+    assert compact_input_fingerprint(first, original_fingerprint) == compact_input_fingerprint(
+        second,
+        original_fingerprint,
+    )
+
+
+def test_missing_market_contract_still_fails_closed_after_compaction() -> None:
+    sample = _trainable_shadow_sample()
+    sample["features"].pop("training_market_fact_contract")
+    sample["features"] = _compact_training_feature_snapshot(sample["features"])
+
+    assessment = assess_shadow_sample(sample)
+
+    assert assessment.exclude_from_training is True
+    assert "market_fact_contract:market_fact_contract_missing_or_stale" in assessment.reasons
 
 
 def test_market_fact_storage_projection_preserves_quality_and_native_inputs() -> None:
@@ -766,6 +888,8 @@ def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None
     assert "optional_item RECORD" in compact_sql
     assert "FOR optional_item IN" in compact_sql
     assert "jsonb_build_object(\n                    optional_item.key" in compact_sql
+    assert "bb_compact_training_market_fact_contract(" in compact_sql
+    assert "'training_market_fact_contract', required_contract" in compact_sql
     assert "FOR item IN" not in compact_sql
 
 
@@ -891,6 +1015,7 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             "bb_training_feature_storage_bytes",
             "bb_training_feature_normalize_jsonb",
             "bb_compact_market_fact",
+            "bb_compact_training_market_fact_contract",
             "bb_compact_training_feature_snapshot",
         )
         for sql in postgres_training_feature_snapshot_functions():
@@ -907,7 +1032,22 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                 if key in oversized
             })
         )
-        for features in (original, oversized, {"empty": {}, "array": [], "text": "x" * 513}):
+        with_contract = deepcopy(original)
+        with_contract["training_market_fact_contract"] = (
+            _large_native_market_fact_contract()
+        )
+        with_contract.update(
+            {
+                f"optional_diagnostic_{index:03d}": "x" * 512
+                for index in range(80)
+            }
+        )
+        for features in (
+            original,
+            oversized,
+            with_contract,
+            {"empty": {}, "array": [], "text": "x" * 513},
+        ):
             encoded = json.dumps(features, ensure_ascii=False)
             pg_compacted = json.loads(await connection.fetchval(
                 "SELECT pg_temp.bb_compact_training_feature_snapshot($1::JSONB)", encoded,

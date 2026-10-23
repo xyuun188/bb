@@ -43,7 +43,7 @@ from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_epoch import CURRENT_TRAINING_EPOCH_POLICY
 
 _QUALITY_PARAMS = DEFAULT_TRADING_PARAMS.training_data_quality
-DATA_QUALITY_VERSION = "2026-10-22.component-feature-availability.v8"
+DATA_QUALITY_VERSION = "2026-10-24.component-feature-availability.v9"
 PROFIT_LEARNING_VERSION = "separated-profit-supervision-v4"
 MAX_WORST_SAMPLE_COUNT = 8
 _SHADOW_BENIGN_DOWNWEIGHT_REASONS = {
