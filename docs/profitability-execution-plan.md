@@ -958,8 +958,11 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   and 8 quarantined; the strict post-restart boundary above is the evidence
   for the repaired code.
 - The remaining G2 requirement is a larger independent post-restart market
-  sample with zero order-book/mark/index receipt errors and no training
-  compaction errors. Continue collecting it before any candidate research or
-  exam. The fee-after quality gate remains negative (`n=261`, mean
-  `-0.311071%`, LCB `-0.441736%`, PF `0.549345`), so model influence and
+  sample. Preregistered for this repair boundary: at least 30 consecutive
+  market decisions spanning at least 20 distinct symbols, every row sealed
+  and with zero order-book/mark/index receipt or clock errors; every training
+  snapshot in the same boundary must have zero compaction/seal errors and
+  remain at or below `98,304 B`. Continue collecting it before any candidate
+  research or exam. The fee-after quality gate remains negative (`n=261`,
+  mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`), so model influence and
   order-capable paper execution remain disabled; G3-G6 stay pending.
