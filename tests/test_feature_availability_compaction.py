@@ -29,12 +29,17 @@ from core.training_contracts import (
     compact_shadow_label_contract,
 )
 from core.training_feature_snapshot import (
+    FEATURE_STORAGE_COMPACTION_VERSION,
     FROZEN_TRAINING_FEATURE_KEYS,
     FROZEN_TRAINING_FEATURE_MAX_BYTES,
+    LEGACY_FEATURE_STORAGE_COMPACTION_VERSION,
     TRAINING_FEATURE_SNAPSHOT_MAX_BYTES,
     TRAINING_FEATURE_SNAPSHOT_VERSION,
     _jsonb_text,
     _storage_fingerprint_value,
+    compact_frozen_feature_payload,
+    compact_input_fingerprint,
+    compact_training_feature_snapshot,
     frozen_feature_payload_size,
     postgres_training_feature_snapshot_functions,
     storage_feature_fingerprint,
@@ -576,6 +581,136 @@ def test_market_fact_with_old_storage_contract_is_recompacted() -> None:
     )
 
 
+def test_frozen_budget_audit_uses_production_compacted_projection() -> None:
+    from scripts.audit_online_frozen_feature_budget import REMOTE_SCRIPT
+
+    features = _full_feature_vector_sample()["features"]
+    features["market_fact"]["source_consistency"] = {
+        "version": "2026-07-17.okx-source-consistency.v4",
+        "status": "clean",
+        "assertions": {"executable_quotes_verified": True},
+        "path": {"missing_open_times_ms": list(range(2_000))},
+        "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
+    }
+
+    compacted = compact_frozen_feature_payload(features)
+
+    assert "training_feature_storage_bytes(frozen)" not in REMOTE_SCRIPT
+    assert "frozen_feature_payload_size(features)" in REMOTE_SCRIPT
+    assert (
+        training_feature_storage_bytes(features["market_fact"])
+        > FROZEN_TRAINING_FEATURE_MAX_BYTES
+    )
+    assert frozen_feature_payload_size(features) <= FROZEN_TRAINING_FEATURE_MAX_BYTES
+    assert compacted["market_fact"]["source_consistency"]["assertions"] == {
+        "executable_quotes_verified": True
+    }
+    assert (
+        "missing_open_times_ms"
+        not in compacted["market_fact"]["source_consistency"]["path"]
+    )
+
+
+def test_compaction_metadata_binds_original_fingerprint_without_storing_it_twice() -> None:
+    features = _full_feature_vector_sample()["features"]
+
+    compacted = compact_frozen_feature_payload(features)
+    storage_contract = compacted["feature_storage_compaction"]
+
+    assert storage_contract["version"] == FEATURE_STORAGE_COMPACTION_VERSION
+    assert "full_input_fingerprint" not in storage_contract
+    assert storage_contract["compact_input_fingerprint"] == compact_input_fingerprint(
+        compacted,
+        features["feature_availability_contract"]["input_fingerprint"],
+    )
+
+
+def test_v2_compaction_fits_payload_that_legacy_metadata_put_over_budget() -> None:
+    template = _full_feature_vector_sample()["features"]
+    template.pop("feature_availability_contract")
+    template.pop("feature_snapshot_frozen_at")
+    selected = None
+    for length in range(4_400, 4_700):
+        features = deepcopy(template)
+        features["sequence_quality_warning"] = "x" * length
+        seal_feature_availability(features, frozen_at=FROZEN_AT)
+        compacted = compact_frozen_feature_payload(features)
+        legacy = deepcopy(compacted)
+        compact_input = {
+            key: compacted[key]
+            for key in FROZEN_FEATURE_FIELDS
+            if key in compacted
+        }
+        legacy["feature_storage_compaction"] = {
+            "version": LEGACY_FEATURE_STORAGE_COMPACTION_VERSION,
+            "full_input_fingerprint": (
+                features["feature_availability_contract"]["input_fingerprint"]
+            ),
+            "compact_input_fingerprint": storage_feature_fingerprint(compact_input),
+        }
+        legacy_size = training_feature_storage_bytes(legacy)
+        compacted_size = training_feature_storage_bytes(compacted)
+        if (
+            legacy_size > FROZEN_TRAINING_FEATURE_MAX_BYTES
+            and compacted_size <= FROZEN_TRAINING_FEATURE_MAX_BYTES
+        ):
+            selected = features
+            break
+
+    assert selected is not None
+    assert selected["feature_availability_contract"].get("seal_error") is None
+
+    oversized = deepcopy(selected)
+    oversized["sequence_quality_warning"] += "x" * 512
+    oversized["feature_availability_contract"]["input_fingerprint"] = (
+        availability_fingerprint(
+            {
+                key: oversized[key]
+                for key in FROZEN_FEATURE_FIELDS
+                if key in oversized
+            }
+        )
+    )
+    oversized = compact_frozen_feature_payload(oversized)
+    assert frozen_feature_payload_size(oversized) > FROZEN_TRAINING_FEATURE_MAX_BYTES
+    reasons = feature_availability_reasons(
+        oversized,
+        decision_at=oversized["original_decision_timestamp"],
+    )
+    assert "feature_availability_frozen_input_budget_exceeded" in reasons
+
+
+def test_legacy_v1_training_compaction_is_read_and_upgraded() -> None:
+    features = _full_feature_vector_sample()["features"]
+    legacy = compact_frozen_feature_payload(features)
+    compact_input = {
+        key: legacy[key]
+        for key in FROZEN_FEATURE_FIELDS
+        if key in legacy
+    }
+    legacy["feature_storage_compaction"] = {
+        "version": LEGACY_FEATURE_STORAGE_COMPACTION_VERSION,
+        "full_input_fingerprint": (
+            features["feature_availability_contract"]["input_fingerprint"]
+        ),
+        "compact_input_fingerprint": storage_feature_fingerprint(compact_input),
+    }
+
+    upgraded = compact_training_feature_snapshot(legacy)
+
+    assert upgraded["feature_storage_compaction"]["version"] == (
+        FEATURE_STORAGE_COMPACTION_VERSION
+    )
+    assert "full_input_fingerprint" not in upgraded["feature_storage_compaction"]
+    assert feature_availability_reasons(
+        legacy,
+        decision_at=legacy["original_decision_timestamp"],
+    ) == feature_availability_reasons(
+        compact_frozen_feature_payload(features),
+        decision_at=features["original_decision_timestamp"],
+    )
+
+
 def test_compacted_market_fact_input_tampering_breaks_storage_fingerprint() -> None:
     features = _full_feature_vector_sample()["features"]
     compacted = _compact_training_feature_snapshot(features)
@@ -830,10 +965,17 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                 )
                 SELECT md5(
                     pg_temp.bb_training_feature_normalize_jsonb(
-                        jsonb_strip_nulls(projection.value)
+                        jsonb_strip_nulls(
+                            projection.value || jsonb_build_object(
+                                '__feature_availability_input_fingerprint__',
+                                raw.value->'feature_availability_contract'
+                                    ->>'input_fingerprint'
+                            )
+                        )
                     )::TEXT
                 )
                 FROM projection
+                CROSS JOIN raw
                 """,
                 encoded,
                 list(FROZEN_TRAINING_FEATURE_KEYS),
@@ -889,10 +1031,6 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                 )
             else:
                 assert storage_contract is None
-            assert (
-                server_recomputed_fingerprint
-                == manually_rebuilt_fingerprint
-                ), (server_recomputed_fingerprint, manually_rebuilt_fingerprint)
             pg_input = {
                 key: pg_compacted[key]
                 for key in FROZEN_FEATURE_FIELDS
@@ -933,7 +1071,11 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             )
             assert pg_input_fingerprint == storage_feature_fingerprint(py_input)
             if isinstance(storage_contract, dict):
-                assert storage_contract.get("compact_input_fingerprint") == pg_input_fingerprint
+                assert server_recomputed_fingerprint == pg_input_fingerprint
+                assert (
+                    storage_contract.get("compact_input_fingerprint")
+                    == manually_rebuilt_fingerprint
+                )
             assert not differences, differences
             assert await connection.fetchval(
                 "SELECT pg_temp.bb_training_feature_storage_bytes($1::JSONB)", encoded,

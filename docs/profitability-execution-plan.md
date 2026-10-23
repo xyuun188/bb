@@ -1167,3 +1167,442 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - Profitability remains unqualified: fee-after-return evidence is still
   `n=261`, mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`. G3-G6 remain
   pending; this route change is not a profitability fix or trade authorization.
+
+### Fresh Read-Only Check (2026-10-23)
+
+- A bounded eight-minute coverage audit completed at
+  `2026-10-23T03:30:42Z`, after the route-wait deployment restart at
+  `03:10:41Z`. Paper remains unpaused, trading/dashboard/model-tunnel services
+  are active with zero automatic restarts, and there are zero open paper
+  positions. The audit observed 18 market decisions across 18 symbols; all 18
+  were incomplete with `funding_evidence_unavailable`, with zero signals and
+  zero executions. The decision-count/symbol preregistration (30/20) is not
+  yet met, so this is not route-intervention acceptance.
+- The same coverage check found 35 deferred candidates (33
+  `feature_unavailable`, two `shortlist_capacity`) and marked the observation
+  assessment not ready. This is additional current evidence that the entry
+  funnel is blocked upstream of order execution, not evidence that entries
+  would be profitable if forced through.
+- A same-window training-snapshot audit completed at
+  `2026-10-23T03:30:57Z`: 64 rows, zero seal errors, maximum frozen payload
+  `97,590 B`, and zero rows above the `98,304 B` budget. The storage-budget
+  sub-gate passes; it does not offset the market/funding blockers.
+- The last authoritative fee-after quality evidence remains negative
+  (`n=261`, mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`). No strategy
+  profitability or paper-entry readiness is established. G2 remains blocked;
+  G3-G6 remain pending. Next: resolve the funding-evidence/horizon and current
+  supervision-contract path without granting unauthorized model influence,
+  then collect the preregistered post-restart market sample. Keep live
+  execution disabled and do not submit orders.
+
+### Fresh Status Verification (2026-10-23)
+
+- Read-only 30-minute online coverage audit completed at
+  `2026-10-23T03:55:37Z`, covering
+  `[2026-10-23T03:25:37Z,2026-10-23T03:55:37Z)`. Paper, dashboard and model
+  tunnel services were active/running with zero automatic restarts; persisted
+  mode was `paper`, `paused=false`, and there were zero open paper positions.
+- The window contained 82 market decisions across 43 symbols. All 82 were
+  incomplete; the audit's bounded first 20 incomplete-analysis samples
+  reported `funding_evidence_unavailable`. The entry funnel had zero
+  directional signals and zero executions. Sixty-two candidates were
+  deferred (60 `feature_unavailable`, two `shortlist_capacity`), with no
+  overdue symbols. The coverage monitor assessment was `ready=true` for
+  monitoring continuity only; it is not the G2 component-availability,
+  entry-authorization, or profitability acceptance gate.
+- A same-window frozen training-snapshot projection inspected 32 rows: zero
+  seal/compaction errors, maximum frozen payload `94,160 B` against the
+  `98,304 B` limit. This storage-budget subgate passes for the inspected
+  rows only.
+- Read-only `GET /models/status` on the Phase 3 model host found no
+  `training_process.json` runtime marker, a current artifact pointer at
+  `20260919T201515268231Z-7dab2e19` with lifecycle `canary`, no candidate
+  pointer, and challenger `20261021T130459127095Z-79a46eb5`.
+  `live_ml_ready=false`. The API reports
+  `2026-07-24.separated-profit-supervision.v2`, while the repository's
+  authoritative contract is
+  `2026-10-22.separated-profit-component-availability.v4`. The API's latest
+  recorded training time is `2026-10-21T13:04:59Z`; no new qualifying or
+  promoted artifact is visible in the current pointer state.
+- G1 remains passed as an attribution audit with negative net outcomes; G2
+  remains blocked and G3-G6 remain pending. The fee-after quality evidence
+  remains `n=261`, mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`.
+  The local repository is at `2397e0c`, equal to `origin/main`; unrelated
+  `db/session.py` and this checkpoint's existing uncommitted documentation
+  change are preserved.
+- Next: align the Phase 3 API's supervision contract to v4 with focused
+  regressions that continue to reject old v2 artifacts; keep any new v4
+  artifacts shadow-only until independently qualified. Separately resolve
+  the missing authorized prediction horizon and collect a fresh
+  component-clean G2 boundary. Do not treat monitoring readiness, storage
+  budget, a successful training process exit, or a canary pointer as evidence
+  of profitability or order authorization.
+
+### Status And Remote Regression Update (2026-10-23)
+
+- The Phase 3 API source now has the v4 supervision contract and keeps
+  candidate promotion shadow-only until independent-exam promotion is
+  explicitly enabled. Local source SHA256
+  `a3a1423441c4c2fdd2a2c76b23fcda18de95c397c1da4e7d1e6b21079340e072`
+  matched `/data/bb/app/scripts/phase3_quant_api_service.py`. The online test
+  file was initially empty after a failed transfer; only
+  `tests/test_local_ai_tools_deploy_service.py` was then uploaded with
+  `--skip-restart`, and remote integrity verification passed. The focused
+  remote regressions for shadow-only promotion and v4/legacy-v2 rejection
+  passed `3 passed` in `3.74s`; the complete local test file passed
+  `99 passed`. No trading service was restarted for this test-file repair.
+- Read-only online coverage audit at `2026-10-23T04:42:58Z` covered
+  `[04:12:58Z,04:42:58Z)`. Persisted mode remained `paper`, unpaused; trading,
+  dashboard and model tunnels were active with zero restarts since
+  `03:10:41Z`/`03:10:30Z`. There were 29 market decisions across 24 symbols;
+  all 29 analyses were incomplete, the bounded first 20 incomplete samples
+  reported `funding_evidence_unavailable`, and the funnel had zero directional
+  signals and zero executions. There were 124 deferred candidates, including
+  110 `feature_unavailable`; five symbols were overdue and the coverage window
+  was not met. No paper positions were open.
+- A bounded feature-budget audit at `2026-10-23T04:44:23Z` inspected six
+  decision snapshots: all were sealed, but one exceeded the `98,304 B` frozen
+  budget; maximum size was `102,774 B`. A separate training-snapshot audit at
+  `2026-10-23T04:46:58Z` covered 16 rows with zero seal errors and a maximum
+  frozen size of `90,978 B`; this passes only the training-snapshot budget
+  sub-gate and does not cancel the decision-snapshot failure.
+- G1 remains passed as an attribution audit with negative economics. The
+  latest authoritative fee-after quality evidence remains `n=261`, mean
+  `-0.311071%`, LCB `-0.441736%`, PF `0.549345`; no profitability or paper
+  entry readiness is established. G2 remains blocked on funding/horizon and
+  feature-availability evidence, including the decision-snapshot budget
+  breach. G3-G6 remain pending. Local HEAD and `origin/main` remain
+  `2397e0c`; the Phase 3 source, test and this plan have uncommitted changes,
+  while the unrelated `db/session.py` modification remains untouched.
+- Next: identify and correct the decision-snapshot over-budget component
+  without altering frozen inputs; trace why eligible current-contract
+  prediction evidence still does not provide a paper funding horizon; then
+  collect a fresh preregistered component-clean sample. Keep model influence
+  and order-capable paper execution gated until independent fee-after
+  profitability acceptance passes. Do not submit orders or claim the current
+  candidate is profitable.
+
+### Budget Audit Correction And Live Blocker Trace (2026-10-23)
+
+- Corrected the frozen-payload audit to call the production
+  `compact_frozen_feature_payload()` and `frozen_feature_payload_size()`
+  functions. The old audit counted verbose pre-compaction `market_fact`
+  diagnostics and therefore reported a false frozen-input budget breach; the
+  frozen inputs themselves were not modified or truncated. A regression now
+  uses a large source-consistency diagnostic payload that compacts below the
+  budget and asserts the online audit calls the production projection.
+- Focused local verification passed `29 passed, 1 skipped`; Ruff and
+  `git diff --check` passed. The core projection, corrected audit script, and
+  focused test were uploaded with `--skip-restart`; source integrity passed
+  for all three files. No service was restarted for this audit-only change.
+- Corrected read-only online budget audit at
+  `2026-10-23T05:10:23Z`, last 30 minutes, limit 30 per source:
+  decision snapshots `30/30` sealed, `0` seal/compaction errors, maximum
+  compact frozen payload `95,726 B`; training snapshots `30/30`, zero errors,
+  maximum `93,202 B`; both are below `98,304 B`. This supersedes the
+  `2026-10-23T04:44:23Z` decision-budget breach. The storage-budget subgate
+  passes for this bounded sample only.
+- Read-only coverage at `2026-10-23T05:11:28Z` covered 48 market decisions
+  across 37 symbols. All 48 were incomplete with
+  `funding_evidence_unavailable`; there were zero directional signals, zero
+  executions, zero open paper positions, and zero model failures. The
+  candidate monitor still had 8 overdue symbols and the coverage window was
+  not met; 10 candidates were deferred for `feature_unavailable` and 11 for
+  `shortlist_capacity`.
+- Source-level horizon audit covered 50 market decisions, IDs `689131-689180`,
+  from `2026-10-23T04:59:08Z` through `05:19:34Z`. All were HOLD with
+  `funding_evidence_unavailable`; no authorized, selected, or training horizon
+  existed. Both funding sides failed with `prediction_horizon_missing`.
+  Across side/source evidence rows: `local_ml` had no horizon or supervision
+  version and was blocked by
+  `model_strategy_blueprint_paper_permission_missing` (100 rows);
+  `server_profit` and `timeseries` had 10-minute display horizons but were
+  `signal_unavailable`, ineligible, and had no current supervision version
+  (100 rows each). Do not treat display horizons as eligible forecasts or
+  substitute them into funding estimates.
+- Read-only strategy/training status at `2026-10-23T05:22:37Z` confirms the
+  paper/dashboard/model-tunnel services are operating and the OKX
+  reconciliation gate allows new entries, but no strategy currently authorizes
+  one: local ML readiness is disabled, the blueprint is `unversioned` /
+  `unregistered` with no eligible paper sides, the paper champion is
+  unavailable, and all 73 scheduled strategy candidates are rejected (zero
+  governed). The local profit-quality artifact is `promotion_blocked` with
+  negative/stability, incomplete market-fact, and tail-evidence blockers.
+  Six local AI models remain canary with non-positive empirical lower-hinge
+  blockers. These are qualification failures, not exchange/order-routing
+  failures.
+- The training schedulers have fresh heartbeats and are not stuck, but the
+  latest profitability/return-distribution training attempts were skipped:
+  `local_ml_profit_quality` reported
+  `authoritative_execution_cost_distribution_unavailable`; local AI
+  distribution training reported
+  `cost_complete_training_distribution_unavailable`. The current artifact
+  therefore cannot supply an authorized horizon, while the models cannot
+  produce a replacement from the currently eligible cost-complete rows. The
+  last accepted fee-after evidence remains negative (`n=261`, mean
+  `-0.311071%`, LCB `-0.441736%`, PF `0.549345`).
+- The same read-only strategy check found one orphan paper protection order
+  for `TRX/USDT` short with no corresponding open position. It was not
+  modified. Keep this under operator review; do not cancel it as part of this
+  remediation.
+- G1 remains an attribution audit with negative economics; G2 remains blocked
+  on current component availability and a usable, authorized current-contract
+  prediction horizon; G3-G6 remain pending. The branch remains at `2397e0c`,
+  equal to `origin/main`; unrelated `db/session.py` remains untouched.
+- Next exact action: trace the bounded current-epoch training rows and
+  authoritative cost-distribution builder to identify which required fill,
+  fee, funding, slippage, entry-feature, or component-receipt fields are absent
+  and why the training probe counts zero new eligible decision groups. Repair
+  only a demonstrated producer/join/eligibility defect, add regressions, and
+  rerun the preregistered fresh component sample. Do not authorize local ML,
+  promote canary artifacts, substitute the display-only 10-minute horizon,
+  or open orders to create training data.
+
+### Fresh Online Status And Training Blocker (2026-10-23 18:35 Asia/Shanghai)
+
+- A bounded read-only coverage check completed at
+  `2026-10-23T10:34:59Z` (`18:34:59` Asia/Shanghai), covering the preceding
+  30 minutes. The persisted mode remains `paper`, `paused=false`; trading,
+  dashboard, and model-tunnel services are active with zero automatic restarts.
+  There are zero open paper positions.
+- The window contains 96 market decisions across 61 symbols. All 96 analyses
+  are incomplete with `funding_evidence_unavailable`; the entry funnel has
+  `signal_count=0` and `executed_count=0`. The coverage monitor itself is
+  healthy (`coverage_window_met=true`); this confirms the no-entry condition is
+  an authorization/data condition, not a scheduler stall.
+- The bounded horizon audit at `2026-10-23T10:35:04Z` reports no authorized,
+  selected, or training horizon for all 96 rows. Both funding sides fail with
+  `prediction_horizon_missing`. `local_ml` is blocked by
+  `model_strategy_blueprint_paper_permission_missing`; `server_profit` and
+  `timeseries` expose only a display horizon of 10 minutes but are
+  `signal_unavailable`, have no current supervision version, and are ineligible.
+  A display interval is not a usable forecast and must not be substituted into
+  the funding projection.
+- The current Phase 3 model status remains `artifact_unavailable` /
+  `live_ml_ready=false`: no candidate, current, or rollback local-AI artifact
+  is registered under the v4 contract; the API reports incompatible legacy
+  artifact contracts and no trained local-AI model bundle. Specialist model
+  files being present on disk is not evidence that the governed return
+  distribution is available.
+- A bounded authoritative-training audit at `2026-10-23T10:29:39Z` inspected
+  300 recent paper outcomes. All 300 are complete as trade lifecycles and have
+  OKX fee/slippage/funding sources plus supervision version
+  `2026-10-22.separated-profit-component-availability.v4`, but all 300 are
+  excluded because their linked decision feature snapshot lacks
+  `feature_availability_contract`; `trainable_count=0`. The wider summary
+  over 500 rows reports the same 500/500 exclusion. This is insufficient
+  evidence to rewrite or impute historical feature contracts; the rows must
+  remain quarantined unless a verified original sealed snapshot can be joined.
+- The corrected frozen-feature audit at `2026-10-23T10:28:57Z` found 32/32
+  decision snapshots and 32/32 training snapshots within the `98,304 B` frozen
+  budget, with no seal/compaction errors. Decision snapshots were only 25/32
+  availability-valid (seven had missing/ambiguous order-book or mark/index
+  facts); training snapshots were 32/32 valid. The storage sub-gate passes,
+  while the current component-validity gate remains blocked.
+- G1 remains passed as attribution only, with negative fee-after quality
+  evidence (`n=261`, mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`).
+  G2 remains blocked; G3-G6 remain pending. No profitability or paper-entry
+  readiness is established, and no order was submitted.
+- Exact next action: determine whether the 500 excluded outcomes are
+  irrecoverably pre-contract lifecycles or whether a bounded, provenance-safe
+  join to an original sealed `AIDecision.feature_snapshot` exists. In parallel,
+  keep collecting the post-restart component-validity sample and resolve the
+  missing current v4 cost-complete training artifact. Do not grant model
+  permission, use the 10-minute display horizon, or open orders to manufacture
+  training data.
+
+### Entry Funnel And Training Recheck (2026-10-23 18:35 Asia/Shanghai)
+
+- A second bounded entry-recovery audit completed at
+  `2026-10-23T10:35:01Z`. It found 97 market decisions in the last 30 minutes,
+  all `hold` and unexecuted; all had `insufficient_evidence`. The latest
+  97-row availability projection had 47 clean and 50 invalid snapshots, with
+  the invalid rows dominated by missing/ambiguous order-book and mark/index
+  facts. This is an additional G2 blocker even though the coverage scheduler is
+  healthy.
+- Direction selection explicitly rejected the recent candidates for
+  `direction_support_expected_net_not_positive`,
+  `direction_support_objective_net_missing`,
+  `direction_support_quality_observation_loss_probability_too_high`,
+  `direction_support_quant_evidence_missing`, and
+  `direction_support_prediction_horizon_missing`. No entry permission was
+  granted.
+- Current online model-quality evidence in this audit was `n=267`,
+  average fee-after return `-0.303832%`, LCB `-0.431590%`, and profit factor
+  `0.549713`; local-ML paper permission is false. Specialist profit/time-series
+  sources each have zero fee-after shadow samples and no paper permission.
+  Six local-AI training schedulers are alive but their most recent runs were
+  skipped for `authoritative_execution_cost_distribution_unavailable`;
+  local-ML profit-quality training was skipped for
+  `cost_complete_training_distribution_unavailable` despite reporting 1,769
+  newly observed samples. These are data/label readiness failures, not stuck
+  scheduler processes.
+- The online historical-requalification dry run inspected 110,709 rows,
+  reported complete scan coverage but zero eligible or requalified rows.
+  Its dominant blockers are missing/stale historical rebuild contracts and
+  unverified historical label-availability provenance. Therefore these
+  already-inspected rows cannot be reused as a fresh exam or retroactively
+  sealed to make them trainable.
+- Current conclusion: paper services and candidate monitoring are operational,
+  but the system is not presently entry-ready or profitability-qualified. It
+  has opened no current paper position; no profitable strategy is established.
+  The next work is to verify whether any exact linked trade decision has a
+  genuinely original sealed feature snapshot, then repair only a proven
+  snapshot producer/join defect. If the old rows predate the contract, retain
+  them as quarantined and rely only on newly observed, valid data for later
+  development; keep the current unprofitable model and all unauthorized
+  sources out of the entry path.
+
+### Executable Quote Cache Repair (2026-10-23 19:40 Asia/Shanghai)
+
+- The no-entry path was repaired at the producer/consumer boundary instead of
+  loosening the entry gate. The OKX WebSocket client now subscribes to and
+  stores the distinct `index-tickers` channel, and dynamic subscribe,
+  resubscribe, unsubscribe and reconnect cleanup cover tickers, books5,
+  mark-price and index-tickers together.
+- WebSocket books now preserve price-weighted contract depth as raw
+  `*_depth_quote_contracts`; `DataService` converts it to executable USDT
+  depth only after a complete native instrument specification is available.
+  This removes the prior unit error that treated swap contracts as USDT
+  quantities.
+- `DataService` projects only fresh, source/identity-bound WebSocket
+  orderbook/mark/index facts into `fetch_derivatives_snapshot`. The REST
+  adapter accepts that projection only when all required facts have valid
+  receipt clocks, are no older than 10 seconds, match the expected SWAP/index
+  identities and channels, and pass the existing completeness contract.
+  Missing, stale, misbound or ticker-derived facts still fall back to the
+  existing REST path and remain fail-closed on timeout.
+- Verification: the focused market/data suite passed `189` tests; changed
+  Python files passed Ruff and `git diff --check`. No online deployment or
+  profitability claim has been made yet. The local worktree still contains
+  unrelated pre-existing modifications, including `db/session.py`, which
+  remains untouched.
+- Next exact action: upload only the two OKX data-feed files, the data service,
+  and their focused tests; restart only paper/dashboard through the governed
+  split-service deploy; then run a bounded read-only check for fresh
+  component-valid decisions. Keep model permission, live execution and
+  profitability acceptance blocked until the independent fee-after gates pass.
+
+### Targeted Quote-Cache Deployment And Fresh Evidence (2026-10-23 20:58 Asia/Shanghai)
+
+- The pre-deployment bounded check found paper mode, `paused=false`, zero open
+  positions, all three existing services active, and no remaining instances of
+  the two previously tracked diagnostic PIDs. Local focused verification for
+  the quote-cache patch passed `169 passed, 1 skipped`; Ruff and
+  `git diff --check` passed.
+- Only the three owned runtime files and their three focused test files were
+  uploaded. Remote source integrity passed for all six files. The bounded
+  remote regression unit ran with one CPU, 1 GiB memory and a 180-second
+  deadline; it passed `150 passed` in 43.94 seconds. No stale remote source
+  was removed.
+- Paper trading and Dashboard were restarted at
+  `2026-10-23T12:45:35Z` / `12:45:34Z`. The model tunnel was not restarted.
+  Both services were active afterward, the Dashboard returned HTTP 302, the
+  persisted mode remained `paper` and unpaused, and there were zero open paper
+  positions. This was a deployment check, not an entry or profitability pass.
+- The post-restart decision-snapshot audit at `12:57:46Z` covered 23 rows in
+  the preceding 15 minutes. All 23 had sealed availability contracts and
+  stayed below the 98,304-byte budget; 20 were component-valid and three
+  invalid. The one pre-restart invalid row was decision `690155`. The two
+  post-restart invalid rows were `690176` (reference-price route timed out)
+  and `690177` (orderbook and reference-price routes timed out). The first 20
+  post-restart decisions, IDs `690156-690175`, had valid native orderbook,
+  mark and index facts. Bounded inspection of decisions `690171-690177`
+  showed all four required derivatives routes completed for five rows; the
+  last two rows still require fallback/timeout investigation.
+- Despite the data improvement, all 15 post-restart market decisions through
+  `12:50:41Z` remained HOLD with zero directional signals or executions:
+  their actual funding facts were present, but both sides' funding projections
+  were ineligible solely because no authorized prediction horizon was
+  available (`prediction_horizon_missing`). This repair therefore reduces
+  missing component evidence; it does not authorize a model, signal or order.
+- A bounded authoritative training-eligibility audit at `12:58:03Z` inspected
+  120 recent paper outcomes. All 120 have official OKX fills, fees, slippage
+  and funding plus supervision v4, but all are excluded because their linked
+  original feature snapshots lack `feature_availability_contract`. A
+  three-row exact decision-ID projection dated October 15-16 confirmed those
+  original snapshots have zero/absent mark/index source clocks and no sealed
+  availability contract. Do not reconstruct or backfill those historical
+  contracts from current code or current market data.
+- The same-window snapshot audit inspected 23 decision and 40 training rows.
+  All were sealed and within the storage budget. The training rows were
+  32/40 component-valid; those rows predate this deployment and do not qualify
+  as fresh post-restart entry evidence.
+- G2 remains blocked; G3-G6 remain pending. The latest accepted fee-after
+  evidence remains negative (`n=267`, mean `-0.303832%`, LCB `-0.431590%`,
+  PF `0.549713`). The deployed code has not established profitable trading.
+  Next: investigate the two new derivative-route timeouts and continue the
+  preregistered post-restart component-valid sample; separately obtain a
+  v4-compatible, provenance-complete return-distribution artifact without
+  importing quarantined pre-contract outcomes or substituting a display-only
+  horizon. Live trading remains disabled; no manual orders or protection
+  changes were made.
+
+### Compact Contract v2 Repair And Current Entry Blocker (2026-10-23)
+
+- Recovered the in-progress compact-contract repair and preserved all other
+  staged/unstaged paths. The prior regression had added only 60 characters
+  after selecting a payload near the legacy/v2 boundary, so it did not
+  reliably cross the frozen-input budget. It now adds a larger deterministic
+  payload, compacts it through the production projection, asserts the measured
+  size exceeds `98,304 B`, then verifies fail-closed availability rejection.
+  Ruff import ordering is fixed.
+- Focused local regression group passed `124 passed, 1 skipped`; Ruff and
+  `git diff --check` passed. The skipped case is the PostgreSQL parity test:
+  `BB_TEST_POSTGRES_URL` is not configured in this environment. The compact
+  contract v2 core and its one regression file were uploaded using explicit
+  `--only` paths and `--skip-restart`; remote source integrity passed and the
+  remote focused regression passed `22 passed, 1 skipped`. No service restart
+  was needed for this storage-contract-only change.
+- A subsequent targeted restart of paper trading and Dashboard found both
+  active with zero automatic restarts and Dashboard HTTP 302. Runtime remains
+  `paper`, running and unpaused; database projection reports zero open
+  positions in either mode. The service timestamps advanced to
+  `2026-10-23T14:10:37Z` / `14:10:36Z` for paper/Dashboard; model tunnels were
+  not restarted. This restart validates startup, not entry or profit.
+- Latest bounded market-hold audit at `2026-10-23T14:12:38Z` covered 31
+  decisions in the preceding 15 minutes; all 31 were HOLD, with no authorized,
+  selected or training horizon. Each lacked a valid local-ML paper permission;
+  `server_profit` and `timeseries` exposed only unavailable 10-minute display
+  output with no current supervision version. Both funding sides therefore
+  failed `prediction_horizon_missing`; there were no signals, executions, or
+  open positions. This independently confirms the current entry blocker is
+  model-artifact/readiness and authorization, not exchange order routing.
+- The same decision audit found 23/31 availability-valid snapshots and 8/31
+  invalid. All 31 fit below the frozen `98,304 B` budget (maximum `97,438 B`).
+  Invalid reasons were missing mark/index facts (seven each), missing account
+  fee receipt/availability clocks (four each), and missing orderbook facts
+  (three). A bounded projection of the latest 12 decisions shows recent rows
+  with complete orderbook/mark/index and fee clocks mixed with recent route
+  timeouts, so component availability is still variable and needs a clean
+  post-restart sample.
+- A separate 32-row recent training-snapshot audit found no seal errors or
+  frozen-budget breaches (maximum `97,438 B`) but only 28/32 availability-valid.
+  In a separate authoritative sample, 120/120 recent paper outcomes have
+  official OKX fills, fees, funding and slippage plus supervision v4, but
+  0/120 are trainable because each linked original decision snapshot lacks
+  `feature_availability_contract`. The existing negative historical quality
+  sample remains `n=267`, mean `-0.303832%`, LCB `-0.431590%`, PF `0.549713`.
+- Shadow data collection and settlement are operating, not wedged: recent
+  read-only queue counts showed completed and pending 5/15/60/240-minute
+  observations, zero overdue pending rows, and 343/343 market decisions with
+  the expected four shadow horizons. However, newly completed historical
+  OHLCV labels are explicitly `historical_ohlcv_only`; they are research path
+  labels, not executable quote evidence and cannot repair missing authorized
+  model predictions or be passed off as fills.
+- Current acceptance remains G1 passed as negative-economics attribution, G2
+  blocked by component availability, quarantined pre-contract trade features,
+  and absent authorized current-contract prediction horizon; G3-G6 pending.
+  No profitable model, paper-entry readiness or fee-after acceptance exists.
+  Do not promote/authorize legacy or canary artifacts, substitute display-only
+  horizons, requalify the 120 pre-contract snapshots, or place orders to create
+  evidence.
+- Next: (1) diagnose why each model endpoint returns unavailable/legacy
+  supervision and find the v4 cost-complete model-data path without persisting
+  an unqualified artifact; (2) verify the interval from new sealed market
+  features through shadow settlement and immutable label availability, while
+  keeping historical OHLCV in research-only scope; (3) collect a preregistered
+  fresh post-restart component-valid window. Run the dedicated PostgreSQL
+  Python/SQL compaction-parity test against a dedicated test database when
+  `BB_TEST_POSTGRES_URL` is available. Keep live trading disabled and existing
+  exchange protections unchanged.

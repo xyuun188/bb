@@ -15,13 +15,15 @@ from typing import Any
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
 from core.market_facts import compact_market_fact
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 3
+TRAINING_FEATURE_SNAPSHOT_VERSION = 4
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
 TRAINING_FEATURE_MAX_STRING_CHARS = 512
 TRAINING_FEATURE_MAX_DEPTH = 16
-FEATURE_STORAGE_COMPACTION_VERSION = "2026-10-22.compact-feature-storage.v1"
+FEATURE_STORAGE_COMPACTION_VERSION = "2026-10-23.compact-feature-storage.v2"
+LEGACY_FEATURE_STORAGE_COMPACTION_VERSION = "2026-10-22.compact-feature-storage.v1"
+_AVAILABILITY_FINGERPRINT_KEY = "__feature_availability_input_fingerprint__"
 TRAINING_FEATURE_METADATA_KEYS = (
     "feature_availability_contract",
     "feature_snapshot_frozen_at",
@@ -128,8 +130,20 @@ def storage_feature_fingerprint(value: Any) -> str:
     ).hexdigest()
 
 
+def compact_input_fingerprint(features: dict[str, Any], input_fingerprint: Any) -> str:
+    """Bind compact inputs to the original seal without storing its hash twice."""
+
+    projection = {
+        key: _compact_frozen_value(key, features[key])
+        for key in FROZEN_FEATURE_FIELDS
+        if key in features
+    }
+    projection[_AVAILABILITY_FINGERPRINT_KEY] = input_fingerprint
+    return storage_feature_fingerprint(projection)
+
+
 def frozen_feature_payload_size(features: dict[str, Any]) -> int:
-    return training_feature_storage_bytes(_compact_frozen_features(features))
+    return training_feature_storage_bytes(compact_frozen_feature_payload(features))
 
 
 def _compact_frozen_value(key: str, value: Any) -> Any:
@@ -138,7 +152,9 @@ def _compact_frozen_value(key: str, value: Any) -> Any:
     return deepcopy(value)
 
 
-def _compact_frozen_features(features: dict[str, Any]) -> dict[str, Any]:
+def compact_frozen_feature_payload(features: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact immutable projection used by frozen snapshot storage."""
+
     compact = {
         key: _compact_frozen_value(key, features[key])
         for key in FROZEN_TRAINING_FEATURE_KEYS
@@ -148,13 +164,9 @@ def _compact_frozen_features(features: dict[str, Any]) -> dict[str, Any]:
     if isinstance(original_contract, dict):
         compact["feature_storage_compaction"] = {
             "version": FEATURE_STORAGE_COMPACTION_VERSION,
-            "full_input_fingerprint": original_contract.get("input_fingerprint"),
-            "compact_input_fingerprint": storage_feature_fingerprint(
-                {
-                    key: compact[key]
-                    for key in FROZEN_FEATURE_FIELDS
-                    if key in compact
-                }
+            "compact_input_fingerprint": compact_input_fingerprint(
+                compact,
+                original_contract.get("input_fingerprint"),
             ),
         }
     elif "feature_storage_compaction" in features:
@@ -167,7 +179,7 @@ def _compact_frozen_features(features: dict[str, Any]) -> dict[str, Any]:
 def frozen_training_feature_snapshot(features: dict[str, Any]) -> dict[str, Any]:
     """Preserve every present frozen value, including explicit JSON null."""
 
-    frozen = _compact_frozen_features(features)
+    frozen = compact_frozen_feature_payload(features)
     if training_feature_storage_bytes(frozen) > FROZEN_TRAINING_FEATURE_MAX_BYTES:
         return {"training_feature_compaction_error": "frozen_input_budget_exceeded"}
     return deepcopy(frozen)
@@ -182,20 +194,30 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
     storage_contract = value.get("feature_storage_compaction")
     if isinstance(original_contract, dict):
         if isinstance(storage_contract, dict):
-            compact_input = {
-                key: _compact_frozen_value(key, value[key])
-                for key in FROZEN_FEATURE_FIELDS
-                if key in value
-            }
-            current_fingerprint = storage_feature_fingerprint(
-                compact_input
-            )
-            if (
-                storage_contract.get("version") != FEATURE_STORAGE_COMPACTION_VERSION
-                or storage_contract.get("full_input_fingerprint")
-                != original_contract.get("input_fingerprint")
-                or storage_contract.get("compact_input_fingerprint") != current_fingerprint
-            ):
+            version = storage_contract.get("version")
+            if version == LEGACY_FEATURE_STORAGE_COMPACTION_VERSION:
+                current_fingerprint = storage_feature_fingerprint(
+                    {
+                        key: _compact_frozen_value(key, value[key])
+                        for key in FROZEN_FEATURE_FIELDS
+                        if key in value
+                    }
+                )
+                contract_matches = (
+                    storage_contract.get("full_input_fingerprint")
+                    == original_contract.get("input_fingerprint")
+                )
+            elif version == FEATURE_STORAGE_COMPACTION_VERSION:
+                current_fingerprint = compact_input_fingerprint(
+                    value,
+                    original_contract.get("input_fingerprint"),
+                )
+                contract_matches = True
+            else:
+                return {"training_feature_compaction_error": "frozen_input_storage_mismatch"}
+            if not contract_matches or storage_contract.get(
+                "compact_input_fingerprint"
+            ) != current_fingerprint:
                 return {"training_feature_compaction_error": "frozen_input_storage_mismatch"}
         else:
             original_fingerprint = availability_fingerprint(
@@ -546,11 +568,14 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 frozen := frozen || jsonb_build_object(
                     'feature_storage_compaction',
                     jsonb_build_object(
-                        'version', '2026-10-22.compact-feature-storage.v1',
-                        'full_input_fingerprint',
-                            raw->'feature_availability_contract'->>'input_fingerprint',
+                        'version', '{FEATURE_STORAGE_COMPACTION_VERSION}',
                         'compact_input_fingerprint',
-                            md5(bb_training_feature_normalize_jsonb(input_projection)::TEXT)
+                            md5(bb_training_feature_normalize_jsonb(
+                                jsonb_strip_nulls(input_projection || jsonb_build_object(
+                                    '{_AVAILABILITY_FINGERPRINT_KEY}',
+                                    raw->'feature_availability_contract'->>'input_fingerprint'
+                                ))
+                            )::TEXT)
                     )
                 );
             END IF;

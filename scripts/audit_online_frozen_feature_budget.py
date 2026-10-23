@@ -27,10 +27,12 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 
 from core.training_feature_snapshot import (
-    FROZEN_TRAINING_FEATURE_KEYS,
     FROZEN_TRAINING_FEATURE_MAX_BYTES,
+    compact_frozen_feature_payload,
+    frozen_feature_payload_size,
     training_feature_storage_bytes,
 )
+from core.feature_availability import feature_availability_reasons
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
@@ -42,11 +44,7 @@ SINCE_MINUTES = __SINCE_MINUTES__
 def frozen_payload(features):
     if not isinstance(features, dict):
         return {}
-    return {
-        key: features[key]
-        for key in FROZEN_TRAINING_FEATURE_KEYS
-        if key in features
-    }
+    return compact_frozen_feature_payload(features)
 
 
 def nested_sizes(value, path):
@@ -63,15 +61,45 @@ def nested_sizes(value, path):
 def main_summary(rows, checked_at, source):
     sizes = []
     errors = Counter()
+    contract_versions = Counter()
+    frozen_timestamp_count = 0
+    original_decision_timestamp_count = 0
+    contract_present_count = 0
+    availability_reason_counts = Counter()
+    availability_valid_count = 0
+    availability_invalid_examples = []
     key_sizes = {}
     oversized_examples = []
     for row in rows:
         features = row.feature_snapshot if isinstance(row.feature_snapshot, dict) else {}
         frozen = frozen_payload(features)
-        size = training_feature_storage_bytes(frozen)
+        size = frozen_feature_payload_size(features)
         sizes.append(size)
         contract = features.get("feature_availability_contract")
         seal_error = contract.get("seal_error") if isinstance(contract, dict) else None
+        if isinstance(contract, dict) and contract:
+            contract_present_count += 1
+            contract_versions[str(contract.get("version") or "missing")] += 1
+        if features.get("feature_snapshot_frozen_at") is not None:
+            frozen_timestamp_count += 1
+        if features.get("original_decision_timestamp") is not None:
+            original_decision_timestamp_count += 1
+        availability_reasons = feature_availability_reasons(
+            features,
+            decision_at=features.get("original_decision_timestamp"),
+        )
+        if availability_reasons:
+            availability_reason_counts.update(availability_reasons)
+            if len(availability_invalid_examples) < 12:
+                availability_invalid_examples.append(
+                    {
+                        "id": row.id,
+                        "symbol": row.symbol,
+                        "reasons": availability_reasons[:12],
+                    }
+                )
+        else:
+            availability_valid_count += 1
         compaction_error = features.get("training_feature_compaction_error")
         error = compaction_error or seal_error
         errors[str(error or "none")] += 1
@@ -137,6 +165,17 @@ def main_summary(rows, checked_at, source):
             ),
         },
         "seal_error_counts": dict(errors),
+        "availability_contract": {
+            "present_count": contract_present_count,
+            "missing_count": len(rows) - contract_present_count,
+            "version_counts": dict(contract_versions),
+            "frozen_timestamp_count": frozen_timestamp_count,
+            "original_decision_timestamp_count": original_decision_timestamp_count,
+            "valid_count": availability_valid_count,
+            "invalid_count": len(rows) - availability_valid_count,
+            "reason_counts": dict(availability_reason_counts.most_common(20)),
+            "invalid_examples": availability_invalid_examples,
+        },
         "largest_field_contributions": field_summary[:60],
         "oversized_examples": oversized_examples[:12],
     }
