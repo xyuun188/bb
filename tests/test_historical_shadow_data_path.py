@@ -164,7 +164,8 @@ async def test_projected_queue_rows_settle_through_real_repository(monkeypatch):
         assert await service.update_due(limit=1) == 1
         async with session_ctx() as session:
             row = (await session.execute(select(ShadowBacktest))).scalar_one()
-            assert row.status == "completed"
+            assert row.status == "quarantined"
+            assert "feature_availability_contract_missing" in row.note
             assert row.actual_price == 101
             label = row.training_feature_snapshot["training_label_contract"]
             assert label["scheduled_label_at"] == row.due_at.replace(tzinfo=UTC).isoformat()

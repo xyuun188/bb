@@ -1606,3 +1606,79 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   Python/SQL compaction-parity test against a dedicated test database when
   `BB_TEST_POSTGRES_URL` is available. Keep live trading disabled and existing
   exchange protections unchanged.
+
+### Fresh Shadow-Settlement Routing Repair (2026-10-23 22:48 Asia/Shanghai)
+
+- A bounded read-only online audit completed at `2026-10-23T14:48:38Z`.
+  Paper mode was running and unpaused; the trading heartbeat and market/
+  position error fields were current and clear. No non-HOLD paper decisions
+  were recorded in the preceding six hours. The shadow queue had pending rows
+  across all four horizons; one recent maintenance run reported `TimeoutError`
+  and another was still running when the audit sampled status.
+- Both completed shadow rows in the preceding 15 minutes were tagged
+  `historical_ohlcv_only`: XRP/USDT 15-minute (scheduled result at
+  `14:37:53Z`, updated `14:43:33Z`) and RESOLV/USDT 240-minute (scheduled at
+  `14:34:59Z`, updated `14:35:31Z`). Their preserved-candle fingerprints
+  verified, but `executable_market_fact_verified=false`; they are market-path
+  research evidence, not fee-after executable observations.
+- Root cause confirmed in `ShadowBacktestService.update_due`: when the
+  historical provider was configured, every matured row entered historical
+  OHLCV collection before the native current-fact branch, so even a freshly
+  matured row with a usable native observation could not create a native
+  result contract. The repository queue already interleaves oldest and newest
+  due rows, so old history work does not exclude fresh rows, but it was
+  consuming the collection budget before the fresh-row path.
+- Local repair: rows whose `due_at` is within the shared 60-second source-lag
+  contract now use native current market facts and native price-path
+  verification first. Early or late native facts remain pending/quarantined
+  under the existing timing contract and are never relabeled as valid. Older
+  rows continue through the explicitly non-executable historical OHLCV path,
+  after fresh work has used its bounded collection budget. Historical rows
+  remain excluded from execution-cost labels; no old feature contract or
+  outcome was backfilled.
+- Verification: 117 focused tests passed across native/historical settlement,
+  label timing, quarantine, training quality and queue behavior. Changed
+  Python files passed Ruff and `git diff --check`. A historical-rebuild
+  test fixture now seals valid synthetic decision-time inputs for its
+  downweighted market-opportunity case and separately asserts that a missing
+  original availability contract stays excluded.
+- This is a label-production repair, not entry authorization or profit
+  evidence. G1 remains passed only as a negative-economics attribution audit;
+  G2 remains blocked, and G3-G6 remain pending. No strategy was promoted and
+  no order was submitted.
+- Targeted deployment completed at 2026-10-23 23:08 Asia/Shanghai. Only the
+  two runtime files and four regression/fixture files were selected; five
+  changed files uploaded, no stale files removed, and six selected source
+  files passed remote integrity checks. The bounded remote regression passed
+  `117` tests in `5.87s`. Paper trading and Dashboard were restarted directly;
+  both are active, paper remains unpaused, and Dashboard returned HTTP 302.
+  Model tunnels were not restarted.
+- Fresh post-deploy verification at `2026-10-23T15:10:28Z` showed shadow
+  maintenance processing a 25-row batch with no current error. A subsequent
+  bounded exact-ID projection found native result facts were collected for
+  recent rows, proving fresh rows no longer automatically take the historical
+  provider. However, representative new labels remain quarantined because the
+  original decision-time snapshots themselves are invalid: SAND/DOT/ARB had
+  zero bid/ask depth and missing native orderbook/mark facts; TRX/SUI had
+  unreconciled quote sources, no recent one-minute path, and observed prices
+  outside that path. Their result facts were clean, but executable label
+  eligibility is false. Old historical rebuild rows also remained explicitly
+  non-executable and some were quarantined for their pre-contract provenance;
+  they were not rewritten.
+- Independent entry audit at `2026-10-23T15:12:37Z` covered 33 market
+  decisions in the preceding 15 minutes. All 33 were HOLD with
+  `prediction_horizon_missing`; local ML lacks governed paper permission,
+  while server-profit and time-series outputs are unavailable display-only
+  10-minute results with no current supervision version. The zero-entry cause
+  therefore remains model/artifact authorization as well as inconsistent
+  decision-time market components, not exchange order routing. No positions
+  were opened and no profitability result was established.
+- Exact next action: trace the two demonstrated producer failures separately:
+  (1) missing/zero orderbook and mark facts in the decision feature assembly,
+  including the cache-only market screening path and required-route receipts;
+  (2) native quote/path temporal reconciliation failures. Repair only proven
+  source/merge defects without relaxing completeness, identity, or freshness
+  checks. In parallel, identify why the v4 fee-after distribution trainer has
+  no eligible rows/artifact without reusing quarantined pre-contract trade
+  features. Keep all model permissions blocked until fresh independent
+  profitability evidence passes; keep live trading disabled.

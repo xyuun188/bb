@@ -15,6 +15,7 @@ SHADOW_LABEL_VERSION = "2026-07-27.market-opportunity-multitask.v2"
 HISTORICAL_SHADOW_REBUILD_VERSION = "2026-10-22.preserved-ohlcv-close-availability.v2"
 HISTORICAL_SHADOW_SOURCE = "preserved_market_klines_historical_path"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"
+SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS = 60.0
 AUTHORITATIVE_TRADE_OUTCOME_VERSION = "2026-07-24.authoritative-trade-outcome.v3"
 AUTHORITATIVE_TRADE_LABEL_VERSION = "2026-08-17.net-return-funding-audit.v3"
 AUTHORITATIVE_TRADE_OUTCOME_AUTHORITY = "okx_settlement_and_execution"
@@ -121,7 +122,7 @@ def shadow_label_timing(
     if source_lag is not None:
         if source_lag < 0:
             reasons.append("result_source_before_schedule")
-        elif source_lag > 60:
+        elif source_lag > SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS:
             reasons.append("result_source_lag_exceeds_one_minute")
     if available and scheduled and available < scheduled:
         reasons.append("result_received_before_schedule")

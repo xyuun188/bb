@@ -21,6 +21,7 @@ from core.market_facts import (
 )
 from core.safe_output import safe_error_text
 from core.training_contracts import (
+    SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS,
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
     compact_shadow_label_contract,
@@ -78,6 +79,15 @@ FloatParser = Callable[[Any, float], float]
 SessionFactory = Callable[[], Any]
 RepositoryFactory = Callable[[Any], Any]
 ExecutionCostFactsProvider = Callable[[str], Awaitable[dict[str, Any]]]
+
+
+def _shadow_due_age_seconds(row: Any, now: datetime) -> float | None:
+    due_at = getattr(row, "due_at", None)
+    if not isinstance(due_at, datetime):
+        return None
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=UTC)
+    return (now - due_at.astimezone(UTC)).total_seconds()
 
 
 def _consume_async_task(task: asyncio.Task[Any]) -> None:
@@ -862,14 +872,34 @@ class ShadowBacktestService:
                             dict(facts) if isinstance(facts, dict) else {}
                         )
 
+            native_rows = rows
+            historical_rows: list[Any] = []
+            if self.historical_market_path_provider is not None:
+                native_rows = []
+                checked_at = datetime.now(UTC)
+                for row in rows:
+                    due_age = _shadow_due_age_seconds(row, checked_at)
+                    if (
+                        due_age is not None
+                        and 0.0 <= due_age <= SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS
+                    ):
+                        native_rows.append(row)
+                    elif (
+                        due_age is not None
+                        and due_age > SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS
+                    ):
+                        historical_rows.append(row)
+            native_row_ids = {
+                int(getattr(row, "id", 0) or 0)
+                for row in native_rows
+                if int(getattr(row, "id", 0) or 0) > 0
+            }
+
             # Price collection can wait on an exchange request. Keep it outside the
             # ORM context so low-priority shadow maintenance cannot exhaust the pool.
             # Fetch each symbol once and in parallel; the old row-by-row loop made a
             # 25-row batch exceed the 30-second trading-service maintenance budget.
             historical_outcome_cache: dict[int, dict[str, Any]] = {}
-            historical_rows = (
-                rows if self.historical_market_path_provider is not None else []
-            )
             historical_path_semaphore = asyncio.Semaphore(
                 max(1, SHADOW_RESULT_PATH_CONCURRENCY)
             )
@@ -922,49 +952,11 @@ class ShadowBacktestService:
                     return row_id, {}
                 return row_id, dict(outcome) if isinstance(outcome, dict) else {}
 
-            if historical_rows:
-                historical_started = asyncio.get_running_loop().time()
-                path_budget = collection_budget(SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS)
-                historical_results, historical_timed_out = await _bounded_task_gather(
-                    (fetch_historical_outcome(row) for row in historical_rows),
-                    budget_seconds=path_budget,
-                )
-                if historical_timed_out:
-                    logger.warning(
-                        "historical shadow market path batch timed out",
-                        row_count=len(historical_rows),
-                        timeout_seconds=round(path_budget, 3),
-                        attempted_count=len(historical_attempted),
-                    )
-                for item in historical_results:
-                    if isinstance(item, tuple) and len(item) == 2:
-                        row_id, outcome = item
-                        if row_id > 0 and isinstance(outcome, dict) and outcome:
-                            historical_outcome_cache[row_id] = outcome
-                retry_at = (
-                    asyncio.get_running_loop().time()
-                    + SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS
-                )
-                for row_id in historical_attempted - historical_outcome_cache.keys():
-                    self._historical_retry_after[row_id] = retry_at
-                logger.info(
-                    "shadow historical collection finished",
-                    selected_count=len(historical_rows),
-                    attempted_count=len(historical_attempted),
-                    collected_count=len(historical_outcome_cache),
-                    retry_cooldown_count=len(self._historical_retry_after),
-                    elapsed_seconds=round(
-                        asyncio.get_running_loop().time() - historical_started, 3
-                    ),
-                    budget_seconds=round(path_budget, 3),
-                )
-
             market_fact_cache: dict[str, dict[str, Any]] = {}
             symbols = {
                 self.symbol_normalizer(getattr(row, "symbol", ""))
                 or str(getattr(row, "symbol", "") or "")
-                for row in rows
-                if self.historical_market_path_provider is None
+                for row in native_rows
             }
             symbols.discard("")
             fact_semaphore = asyncio.Semaphore(max(1, SHADOW_RESULT_FACT_CONCURRENCY))
@@ -1139,7 +1131,10 @@ class ShadowBacktestService:
                 row_id = int(getattr(row, "id", 0) or 0)
                 symbol = self.symbol_normalizer(row.symbol) or row.symbol
                 historical_outcome = historical_outcome_cache.get(row_id)
-                if self.historical_market_path_provider is not None and not historical_outcome:
+                if (
+                    self.historical_market_path_provider is not None
+                    and row_id not in native_row_ids
+                ):
                     continue
                 if historical_outcome:
                     result_fact = historical_outcome.get("result_fact")
@@ -1214,6 +1209,53 @@ class ShadowBacktestService:
                     if isinstance(item, tuple) and len(item) == 2:
                         cache_key, path = item
                         path_cache[cache_key] = dict(path) if isinstance(path, dict) else {}
+
+            if historical_rows:
+                historical_started = asyncio.get_running_loop().time()
+                path_budget = collection_budget(SHADOW_RESULT_PATH_BATCH_TIMEOUT_SECONDS)
+                historical_results, historical_timed_out = await _bounded_task_gather(
+                    (fetch_historical_outcome(row) for row in historical_rows),
+                    budget_seconds=path_budget,
+                )
+                if historical_timed_out:
+                    logger.warning(
+                        "historical shadow market path batch timed out",
+                        row_count=len(historical_rows),
+                        timeout_seconds=round(path_budget, 3),
+                        attempted_count=len(historical_attempted),
+                    )
+                for item in historical_results:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        row_id, outcome = item
+                        if row_id > 0 and isinstance(outcome, dict) and outcome:
+                            historical_outcome_cache[row_id] = outcome
+                retry_at = (
+                    asyncio.get_running_loop().time()
+                    + SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS
+                )
+                for row_id in historical_attempted - historical_outcome_cache.keys():
+                    self._historical_retry_after[row_id] = retry_at
+                for row in historical_rows:
+                    row_id = int(getattr(row, "id", 0) or 0)
+                    outcome = historical_outcome_cache.get(row_id)
+                    result_fact = outcome.get("result_fact") if outcome else None
+                    price_path = outcome.get("price_path") if outcome else None
+                    if isinstance(result_fact, dict) and isinstance(price_path, dict):
+                        symbol = self.symbol_normalizer(row.symbol) or row.symbol
+                        path_task_rows.append(
+                            (row, symbol, {}, result_fact, ("historical", row_id, 0))
+                        )
+                logger.info(
+                    "shadow historical collection finished",
+                    selected_count=len(historical_rows),
+                    attempted_count=len(historical_attempted),
+                    collected_count=len(historical_outcome_cache),
+                    retry_cooldown_count=len(self._historical_retry_after),
+                    elapsed_seconds=round(
+                        asyncio.get_running_loop().time() - historical_started, 3
+                    ),
+                    budget_seconds=round(path_budget, 3),
+                )
 
             completions: dict[int, dict[str, Any]] = {}
             for row, _symbol, entry_fact, result_fact, cache_key in path_task_rows:

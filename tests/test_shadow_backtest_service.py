@@ -868,15 +868,23 @@ async def test_shadow_backtest_market_fact_error_keeps_authoritative_sample_pend
     )
     repo.due_rows = [row]
     service = _service(repo, latest_price=101.5)
+    row.due_at = datetime.now(UTC) - timedelta(seconds=1)
+    historical_calls: list[int] = []
 
     async def broken_market_fact(_symbol: str) -> dict[str, Any]:
         raise TimeoutError("market fact timeout")
 
+    async def historical_path(*_args: Any) -> dict[str, Any]:
+        historical_calls.append(1)
+        return {}
+
     service.latest_market_fact_provider = broken_market_fact
+    service.historical_market_path_provider = historical_path
 
     assert await service.update_due() == 0
     assert repo.completed == []
     assert row.status == "pending"
+    assert historical_calls == []
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1064,141 @@ async def test_shadow_backtest_uses_historical_due_at_path_without_current_quote
     ]
     assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
     assert row.feature_snapshot["historical_market_path_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_fresh_due_shadow_backtest_prefers_native_facts_over_history() -> None:
+    now = datetime.now(UTC)
+    due_at = now - timedelta(seconds=10)
+    entry_at = due_at - timedelta(minutes=2)
+    result_at = due_at + timedelta(seconds=2)
+    entry_fact = _market_fact(
+        "BTC/USDT", 100.0, int(entry_at.timestamp() * 1000),
+    )
+    result_fact = _market_fact(
+        "BTC/USDT", 101.0, int(result_at.timestamp() * 1000),
+    )
+    row = SimpleNamespace(
+        id=98,
+        decision_id=998,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        due_at=due_at,
+        feature_snapshot={"market_fact": entry_fact},
+    )
+    repo = _FakeRepo()
+    repo.due_rows = [row]
+    native_calls: list[str] = []
+    historical_calls: list[int] = []
+
+    async def current_fact(symbol: str) -> dict[str, Any]:
+        native_calls.append(symbol)
+        return result_fact
+
+    async def historical_path(*_args: Any) -> dict[str, Any]:
+        historical_calls.append(1)
+        return {}
+
+    async def price_path(
+        entry: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry_ms = int(entry["source_timestamp_ms"])
+        result_ms = int(result["source_timestamp_ms"])
+        first_open = entry_ms - entry_ms % 60_000
+        last_open = result_ms - result_ms % 60_000
+        bars = [
+            [stamp, 100.0, 102.0, 99.0, 101.0, 1.0]
+            for stamp in range(first_open, last_open + 60_000, 60_000)
+        ]
+        return verify_market_fact_path(entry, result, bars)
+
+    service = ShadowBacktestService(
+        latest_price_provider=lambda _symbol: _completed_float(999.0),
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=_SessionCtx,
+        repository_factory=lambda _session: repo,
+        latest_market_fact_provider=current_fact,
+        price_path_provider=price_path,
+        historical_market_path_provider=historical_path,
+        horizons_minutes=(10,),
+    )
+
+    assert await service.update_due() == 1
+    assert native_calls == ["BTC/USDT"]
+    assert historical_calls == []
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
+    assert row.feature_snapshot["market_fact_contract"]["status"] == "clean"
+    assert row.feature_snapshot.get("historical_market_path_only") is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_lag", [-1, 61])
+async def test_fresh_due_shadow_backtest_rejects_mistimed_native_fact_without_history(
+    source_lag: int,
+) -> None:
+    due_at = datetime.now(UTC) - timedelta(seconds=10)
+    result_at = due_at + timedelta(seconds=source_lag)
+    entry_at = due_at - timedelta(minutes=2)
+    row = SimpleNamespace(
+        id=99 + source_lag,
+        decision_id=999,
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        symbol="BTC/USDT",
+        decision_action="hold",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        due_at=due_at,
+        feature_snapshot={
+            "market_fact": _market_fact(
+                "BTC/USDT", 100.0, int(entry_at.timestamp() * 1000),
+            ),
+        },
+    )
+    repo = _FakeRepo()
+    repo.due_rows = [row]
+    historical_calls: list[int] = []
+
+    async def current_fact(_symbol: str) -> dict[str, Any]:
+        return _market_fact(
+            "BTC/USDT", 101.0, int(result_at.timestamp() * 1000),
+        )
+
+    async def historical_path(*_args: Any) -> dict[str, Any]:
+        historical_calls.append(1)
+        return {}
+
+    service = ShadowBacktestService(
+        latest_price_provider=lambda _symbol: _completed_float(999.0),
+        symbol_normalizer=lambda symbol: str(symbol or "").upper(),
+        float_parser=_float,
+        session_factory=_SessionCtx,
+        repository_factory=lambda _session: repo,
+        latest_market_fact_provider=current_fact,
+        historical_market_path_provider=historical_path,
+        horizons_minutes=(10,),
+    )
+
+    completed = await service.update_due()
+    assert historical_calls == []
+    if source_lag < 0:
+        assert completed == 0
+        assert row.status == "pending"
+        assert repo.completed == []
+    else:
+        assert completed == 1
+        assert row.status == "quarantined"
+        assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
 
 
 async def _completed_float(value: float) -> float:

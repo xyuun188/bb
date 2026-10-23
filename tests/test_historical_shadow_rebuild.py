@@ -10,10 +10,11 @@ from services.historical_shadow_rebuild import (
     build_historical_shadow_sample,
 )
 from services.training_data_quality import annotate_sample
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 
 
 def _decision() -> SimpleNamespace:
-    return SimpleNamespace(
+    decision = SimpleNamespace(
         id=17,
         model_name="ensemble_trader",
         symbol="BTC/USDT",
@@ -25,6 +26,7 @@ def _decision() -> SimpleNamespace:
         created_at=datetime(2026, 9, 1, 0, 0, 25, tzinfo=UTC),
         raw_llm_response={"large": "not copied"},
         feature_snapshot={
+            "symbol": "BTC/USDT",
             "current_price": 100.0,
             "rsi_14": 55.0,
             "market_data_quality": {
@@ -36,6 +38,11 @@ def _decision() -> SimpleNamespace:
             ),
         },
     )
+    seal_synthetic_feature_availability(
+        decision.feature_snapshot,
+        decision_at=decision.created_at,
+    )
+    return decision
 
 
 def _bars(count: int) -> list[dict[str, object]]:
@@ -76,7 +83,7 @@ def test_historical_shadow_sample_is_market_only_and_has_real_identity() -> None
         HISTORICAL_SHADOW_REBUILD_VERSION
     )
     assert features["historical_market_path_entry_fact"]["role"] == "entry"
-    assert "market_fact" not in features
+    assert features["market_fact"]["received_at"] == "2026-09-01T00:00:17+00:00"
     assert features["training_market_fact_contract"]["source"] == (
         HISTORICAL_SHADOW_SOURCE
     )
@@ -121,6 +128,41 @@ def test_historical_shadow_sample_is_market_only_and_has_real_identity() -> None
     tasks = annotated["profit_supervision"]["tasks"]
     assert tasks["market_opportunity_distribution"]["eligible"] is True
     assert tasks["execution_cost_and_slippage_distribution"]["eligible"] is False
+
+
+def test_historical_shadow_sample_does_not_invent_missing_feature_contract() -> None:
+    decision = _decision()
+    decision.feature_snapshot.pop("feature_availability_contract")
+    sample = build_historical_shadow_sample(
+        decision,
+        horizon_minutes=5,
+        bars=_bars(6),
+        shadow_backtest_id=95,
+    )
+
+    assert sample is not None
+    annotated = annotate_sample(
+        {
+            "id": 95,
+            "decision_id": sample["decision_id"],
+            "label_version": sample["label_version"],
+            "symbol": sample["symbol"],
+            "decision_action": sample["decision_action"],
+            "decision_confidence": sample["decision_confidence"],
+            "horizon_minutes": sample["horizon_minutes"],
+            "features": sample["feature_snapshot"],
+            "long_return_pct": sample["long_return_pct"],
+            "short_return_pct": sample["short_return_pct"],
+            "best_action": sample["best_action"],
+            "label_timestamp": sample["due_at"].isoformat(),
+        },
+        "shadow",
+    )
+
+    assert annotated["exclude_from_training"] is True
+    assert "feature_availability:feature_availability_contract_missing" in (
+        annotated["quality_reasons"]
+    )
 
 
 def test_historical_shadow_invalid_path_contract_remains_excluded() -> None:
