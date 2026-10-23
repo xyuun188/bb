@@ -462,6 +462,8 @@ def test_market_fact_storage_projection_preserves_quality_and_native_inputs() ->
         "orderbook_fact": {"raw_depth": [100.0] * 200},
         "reference_prices": {"raw_mark": {"book": [101.0] * 200}},
         "provenance": {
+            "source": "okx_native_rest_ws_book_mark_index_1m",
+            "strategy_version": "2026-07-17.okx-source-consistency.v4",
             "data_fingerprint": "source-consistency-digest",
             "fallback_reason": "x" * 512,
         },
@@ -484,6 +486,9 @@ def test_market_fact_storage_projection_preserves_quality_and_native_inputs() ->
     assert compact["storage_contract"]["full_source_consistency_fingerprint"] == (
         "source-consistency-digest"
     )
+    assert set(compact["source_consistency"]["provenance"]) == {
+        "source", "strategy_version", "data_fingerprint", "fallback_reason",
+    }
     assert "orderbook_fact" not in compact["source_consistency"]
     assert "reference_prices" not in compact["source_consistency"]
     assert len(compact["source_consistency"]["provenance"]["fallback_reason"]) == 160
@@ -599,6 +604,34 @@ def test_verbose_market_fact_recompaction_keeps_storage_fingerprint() -> None:
 
     assert "training_feature_compaction_error" not in compacted
     assert _compact_training_feature_snapshot(compacted) == compacted
+
+
+def test_optional_diagnostics_are_dropped_when_they_exceed_snapshot_budget() -> None:
+    features = _trainable_shadow_sample()["features"]
+    features.update(
+        {
+            f"optional_diagnostic_{index:03d}": "x" * 512
+            for index in range(220)
+        }
+    )
+
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert "training_feature_compaction_error" not in compacted
+    assert frozen_feature_payload_size(compacted) <= FROZEN_TRAINING_FEATURE_MAX_BYTES
+    assert training_feature_storage_bytes(compacted) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+    assert "optional_diagnostic_000" in compacted
+    assert "optional_diagnostic_219" not in compacted
+    assert _compact_training_feature_snapshot(features) == compacted
+
+
+def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None:
+    compact_sql = postgres_training_feature_snapshot_functions()[-1]
+
+    assert "optional_item RECORD" in compact_sql
+    assert "FOR optional_item IN" in compact_sql
+    assert "jsonb_build_object(\n                    optional_item.key" in compact_sql
+    assert "FOR item IN" not in compact_sql
 
 
 @pytest.mark.parametrize("mutation", ["sequence", "nested_receipt"])

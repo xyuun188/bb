@@ -455,6 +455,7 @@ class DataService:
         """Start all data feed connections."""
         self._stopping = False
         self._started = True
+        sentiment_warmup = asyncio.create_task(self.refresh_sentiment())
         # Fetch all available USDT pairs for auto mode WS subscription
         try:
             available = await self._refresh_available_symbols_cache()
@@ -497,6 +498,24 @@ class DataService:
                 "external event scraper isolated from trading process",
                 reason="EXTERNAL_EVENT_SCRAPER_TRADING_PROCESS_ENABLED=false",
             )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(sentiment_warmup),
+                timeout=max(
+                    float(settings.sentiment_blocking_timeout_seconds or 0.0),
+                    15.0,
+                ),
+            )
+        except TimeoutError:
+            logger.warning(
+                "sentiment startup warmup still running; first incomplete snapshot will stay quarantined"
+            )
+            sentiment_warmup.add_done_callback(_consume_task_result)
+        except asyncio.CancelledError:
+            if not sentiment_warmup.done():
+                sentiment_warmup.cancel()
+                sentiment_warmup.add_done_callback(_consume_task_result)
+            raise
         logger.info("data service started")
 
 

@@ -372,10 +372,6 @@ def _compact_source_consistency(value: Mapping[str, Any] | None) -> dict[str, An
             field: deepcopy(provenance.get(field))
             for field in (
                 "source",
-                "observation_window",
-                "sample_count",
-                "effective_sample_size",
-                "generated_at",
                 "strategy_version",
                 "data_fingerprint",
             )

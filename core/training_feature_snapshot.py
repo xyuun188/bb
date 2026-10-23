@@ -206,7 +206,11 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
     compact = frozen_training_feature_snapshot(value)
     if "training_feature_compaction_error" in compact:
         return compact
-    for key, raw in value.items():
+    # Optional diagnostics are useful only when they fit beside the sealed
+    # training inputs.  Keep a deterministic prefix and drop the rest rather
+    # than rejecting an otherwise valid frozen sample.
+    for key in sorted(value, key=lambda item: str(item)):
+        raw = value[key]
         if (
             not isinstance(key, str)
             or len(key) > 120
@@ -223,10 +227,11 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
                 isinstance(raw, dict)
                 and training_feature_storage_bytes(raw) <= TRAINING_FEATURE_OBJECT_MAX_BYTES
             )
-        if keep:
-            compact[key] = deepcopy(raw)
-    if training_feature_storage_bytes(compact) > TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
-        return {"training_feature_compaction_error": "snapshot_budget_exceeded"}
+        if not keep:
+            continue
+        candidate = {**compact, key: deepcopy(raw)}
+        if training_feature_storage_bytes(candidate) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
+            compact = candidate
     return compact
 
 
@@ -476,10 +481,6 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                         'executable_intervals', executable_intervals,
                         'provenance', jsonb_strip_nulls(jsonb_build_object(
                             'source', provenance->'source',
-                            'observation_window', provenance->'observation_window',
-                            'sample_count', provenance->'sample_count',
-                            'effective_sample_size', provenance->'effective_sample_size',
-                            'generated_at', provenance->'generated_at',
                             'strategy_version', provenance->'strategy_version',
                             'fallback_reason', CASE WHEN COALESCE(
                                 provenance->>'fallback_reason', ''
@@ -517,6 +518,8 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
             frozen JSONB;
             input_projection JSONB;
             compact JSONB;
+            candidate JSONB;
+            optional_item RECORD;
             frozen_keys TEXT[] := ARRAY[{frozen_keys}]::TEXT[];
             input_keys TEXT[] := ARRAY[{input_keys}]::TEXT[];
             raw_keys TEXT[] := ARRAY[{raw_keys}]::TEXT[];
@@ -556,29 +559,35 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     'training_feature_compaction_error', 'frozen_input_budget_exceeded'
                 );
             END IF;
-            SELECT frozen || COALESCE(jsonb_object_agg(item.key, item.value), '{{}}'::JSONB)
-                INTO compact
-                FROM jsonb_each(raw) AS item(key, value)
-                WHERE length(item.key) <= 120
-                  AND NOT (item.key = ANY(frozen_keys))
-                  AND NOT (item.key = ANY(raw_keys))
+            compact := frozen;
+            FOR optional_item IN
+                SELECT entry.key, entry.value
+                FROM jsonb_each(raw) AS entry(key, value)
+                WHERE length(entry.key) <= 120
+                  AND NOT (entry.key = ANY(frozen_keys))
+                  AND NOT (entry.key = ANY(raw_keys))
                   AND (
-                      jsonb_typeof(item.value) IN ('number', 'boolean', 'null')
+                      jsonb_typeof(entry.value) IN ('number', 'boolean', 'null')
                       OR (
-                          jsonb_typeof(item.value) = 'string'
-                          AND length(item.value #>> '{{}}') <= {TRAINING_FEATURE_MAX_STRING_CHARS}
+                          jsonb_typeof(entry.value) = 'string'
+                          AND length(entry.value #>> '{{}}') <= {TRAINING_FEATURE_MAX_STRING_CHARS}
                       )
                       OR (
-                          jsonb_typeof(item.value) = 'object'
-                          AND bb_training_feature_storage_bytes(item.value)
+                          jsonb_typeof(entry.value) = 'object'
+                          AND bb_training_feature_storage_bytes(entry.value)
                               <= {TRAINING_FEATURE_OBJECT_MAX_BYTES}
                       )
-                  );
-            IF bb_training_feature_storage_bytes(compact) > {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
-                RETURN jsonb_build_object(
-                    'training_feature_compaction_error', 'snapshot_budget_exceeded'
+                  )
+                ORDER BY entry.key
+            LOOP
+                candidate := compact || jsonb_build_object(
+                    optional_item.key, optional_item.value
                 );
-            END IF;
+                IF bb_training_feature_storage_bytes(candidate)
+                    <= {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                    compact := candidate;
+                END IF;
+            END LOOP;
             RETURN compact;
         END;
         $compact_features$;

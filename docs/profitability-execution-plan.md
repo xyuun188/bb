@@ -966,3 +966,112 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   research or exam. The fee-after quality gate remains negative (`n=261`,
   mean `-0.311071%`, LCB `-0.441736%`, PF `0.549345`), so model influence and
   order-capable paper execution remain disabled; G3-G6 stay pending.
+
+### Optional Diagnostic Budget Repair And New Boundary (2026-10-23)
+
+- The first post-deploy budget audit exposed a real distinction: four
+  `IRYS/USDT` rows had frozen inputs below the 96 KiB model-input budget
+  (`97,010 B`) but their non-frozen diagnostic fields pushed the wider
+  128 KiB snapshot budget over the limit. The old implementation rejected the
+  entire training snapshot as `snapshot_budget_exceeded`, even though the
+  sealed training inputs were valid.
+- Repair: `compact_training_feature_snapshot()` and the PostgreSQL
+  `bb_compact_training_feature_snapshot()` function now iterate optional
+  diagnostic keys in stable lexical order and retain only candidates that fit
+  the remaining 128 KiB budget. Frozen fields still fail closed on a genuine
+  frozen-input overflow or storage-fingerprint mismatch; no frozen value is
+  truncated or rewritten. A regression covers a large optional-diagnostic
+  payload and requires deterministic Python output.
+- Local focused verification passed `183 passed, 1 skipped`; remote Python/
+  PostgreSQL parity and availability group passed `197 passed, 1 skipped`.
+  Targeted source upload and remote integrity verification passed. The paper
+  service restarted at `2026-10-23T01:43:58Z` UTC with `NRestarts=0`,
+  `active/running`, paper mode and live execution disabled.
+- The 10-minute audit ending `2026-10-23T01:45:00Z` still included two
+  pre-restart rows (`01:35:47` and `01:37:31`) marked with the old
+  `snapshot_budget_exceeded`; those rows are explicitly excluded from the
+  fresh boundary. No post-restart market row had yet accumulated by the
+  check time. A strict fresh audit must start at
+  `2026-10-23T01:43:58Z` UTC and require the existing preregistered
+  30-row/20-symbol market sample plus zero training seal or compaction errors.
+- Current execution evidence remains negative and unchanged:
+  local-ML fee-after-return `n=261`, mean `-0.311071%`, LCB `-0.441736%`,
+  PF `0.549345`; model influence and order-capable paper execution remain
+  disabled. G2 is still blocked pending the fresh component-availability
+  boundary; G3-G6 remain pending.
+- Next exact action: collect only rows created after
+  `2026-10-23T01:43:58Z` UTC, audit the post-restart training and market
+  projections, and retain the gate as pending unless all component receipts,
+  clocks and budgets pass. Do not open a candidate exam or manually trade.
+
+### Receipt And Funding-Horizon Recheck (2026-10-23)
+
+- The follow-up repair batch fixed the PostgreSQL optional-field compaction
+  loop's `item` record-name collision by using `optional_item`, removed
+  nonessential source-consistency diagnostics from the frozen projection, and
+  added a bounded sentiment startup warm-up. The targeted online verification
+  reported 46 passed and 1 skipped; the paper service restarted at
+  `2026-10-23T02:19:31Z`. Local focused retest of compaction, market-fact and
+  data-service security regressions passed `128 passed, 1 skipped`.
+- A read-only 10-minute online coverage audit at `2026-10-23T02:30:34Z`
+  found paper and dashboard services active with zero restarts, persisted
+  `mode=paper`, and `paused=false`. It covered 23 market decisions across 23
+  symbols; all were incomplete with `funding_evidence_unavailable`, and none
+  produced a directional signal or execution. Another 25 candidates were
+  deferred for `feature_unavailable`. The observation window was too short
+  for the broader coverage-readiness assessment.
+- A bounded projection at `2026-10-23T02:37:58Z` covered 37 post-restart
+  market HOLD decisions, all unexecuted and sealed. Twenty-five passed
+  component availability; twelve remained quarantined: five missing
+  order-book facts, three missing mark facts, three missing index facts, six
+  ambiguous mark receipts/clocks, eight ambiguous index receipts/clocks, and
+  one stale technical availability contract. Counts overlap by row.
+- The same 37-row projection found every direction-aware funding projection
+  incomplete because no prediction horizon was selected. All 37 reported
+  `paper_prediction_horizon_unavailable`; the inspected source-evidence
+  counters included 74 `model_strategy_blueprint_paper_permission_missing`
+  and 148 `return_distribution_profit_supervision_version_mismatch`
+  observations. These counts are evidence-row counts, not unique models or
+  decisions. The permission blocker must not be bypassed; the supervision
+  version mismatch and source/horizon lineage need investigation before
+  another candidate study.
+- A read-only 15-minute training-snapshot audit covered 64 rows: zero seal or
+  compaction errors, maximum frozen payload `97,582 B`, and zero rows over the
+  `98,304 B` limit. The storage-budget sub-gate passes for this sample, but
+  does not offset component-availability failures or establish profitability.
+- G2 remains blocked; G3-G6 remain pending. Authoritative local-ML
+  fee-after-return evidence remains negative (`n=261`, mean `-0.311071%`,
+  LCB `-0.441736%`, PF `0.549345`). No order was submitted and no execution
+  permission was enabled. Next action: trace the return-distribution
+  supervision-version mismatch to its producer/artifact contract and inspect
+  why otherwise observed model output lacks an authorized paper prediction
+  horizon; preserve all quality and risk gates, then collect a fresh
+  post-fix component-clean boundary before G3.
+- The owned source/test/plan paths are committed locally and deployed with
+  targeted online tests already recorded above. Push to `origin/main` failed
+  because the local host could not connect to `github.com:443`; retry when
+  network connectivity returns. The unrelated `db/session.py` modification
+  remains unstaged and excluded.
+
+### Return-Distribution Source Follow-Up (2026-10-23)
+
+- A further bounded read-only projection at `2026-10-23T02:44:56Z` covered
+  32 recent market decisions. Every decision still lacked an eligible
+  prediction horizon. Across source/side evidence rows, `server_profit` and
+  `timeseries` each supplied 64 contracts tagged
+  `2026-07-24.separated-profit-supervision.v2`; the current code requires
+  `2026-10-22.separated-profit-component-availability.v4`. The 64 `local_ml`
+  source/side rows had no return-distribution supervision version and were
+  blocked by `model_strategy_blueprint_paper_permission_missing`.
+- This confirms the no-horizon finding is downstream of stale or
+  unauthorized return-distribution evidence; it is not a missing-cost
+  permission that can be repaired by accepting the old version. Keep these
+  sources observation-only. They need valid current-contract artifacts and
+  independent fee-after evidence before they can provide an eligible horizon.
+- G2 remains the first incomplete gate because 12 of the 37 audited decisions
+  still had component-receipt/clock or technical-availability errors.
+  Do not start or tune G3 using the currently blocked data/artifacts. First
+  obtain the preregistered consecutive clean availability sample and
+  error-free, in-budget training snapshots; then retrain/re-evaluate only
+  within the governed development protocol and preserve a new independent
+  exam.
