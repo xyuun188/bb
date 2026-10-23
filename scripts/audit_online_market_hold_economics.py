@@ -65,6 +65,62 @@ def _metric_summary(values):
     }
 
 
+def _horizon_diagnostic(raw):
+    competition = _dict(raw.get("direction_competition"))
+    funding = _dict(competition.get("funding_projection"))
+    sources = []
+    for side in ("long", "short"):
+        side_evidence = _list(_dict(competition.get(side)).get("evidence"))
+        for item in side_evidence:
+            if not isinstance(item, dict):
+                continue
+            contract = _dict(item.get("return_distribution_contract"))
+            sources.append({
+                "source": str(item.get("source") or "unavailable"),
+                "side": side,
+                "horizon_minutes": item.get("horizon_minutes"),
+                "profit_supervision_version": (
+                    item.get("profit_supervision_version")
+                    or contract.get("profit_supervision_version")
+                ),
+                "decision_eligible": item.get("decision_eligible") is True,
+                "paper_eligible": item.get("paper_eligible") is True,
+                "production_eligible": item.get("production_eligible") is True,
+                "eligibility_reason": str(item.get("eligibility_reason") or ""),
+            })
+    return {
+        "authorized_prediction_horizon_minutes": competition.get(
+            "authorized_prediction_horizon_minutes"
+        ),
+        "authorized_prediction_horizon_source": str(
+            competition.get("authorized_prediction_horizon_source") or "unavailable"
+        ),
+        "selected_horizon_minutes": competition.get("selected_horizon_minutes"),
+        "training_horizon_minutes": _dict(
+            competition.get("training_horizon_cohort_selection")
+        ).get("selected_horizon_minutes"),
+        "aggregate_blockers": _list(competition.get("aggregate_blockers")),
+        "funding_projection": {
+            "evidence_complete": funding.get("evidence_complete") is True,
+            "selected_horizon_minutes": funding.get("selected_horizon_minutes"),
+            "horizon_source": str(funding.get("horizon_source") or "unavailable"),
+            "sides": {
+                side: {
+                    key: _dict(funding.get(side)).get(key)
+                    for key in (
+                        "production_eligible",
+                        "reason",
+                        "horizon_minutes",
+                        "estimated_settlement_count",
+                    )
+                }
+                for side in ("long", "short")
+            },
+        },
+        "source_contracts": sources,
+    }
+
+
 def _normalize(value):
     if isinstance(value, Counter):
         return dict(value)
@@ -200,6 +256,14 @@ async def main():
             },
         },
         "quality_permission_blockers": Counter(),
+        "authorized_horizon_source_counts": Counter(),
+        "authorized_horizon_counts": Counter(),
+        "selected_horizon_counts": Counter(),
+        "training_horizon_counts": Counter(),
+        "funding_projection_status_counts": Counter(),
+        "funding_projection_reason_counts": Counter(),
+        "source_contract_status_counts": Counter(),
+        "aggregate_blocker_counts": Counter(),
         "authoritative_candidate": Counter(),
         "cross_validation_count_distribution": Counter(),
         "consultation": Counter(),
@@ -293,6 +357,40 @@ async def main():
         summary["preferred_paper_observation_side"][preferred_observation] += 1
 
         competition = _dict(raw.get("direction_competition"))
+        horizon = _horizon_diagnostic(raw)
+        summary["authorized_horizon_source_counts"][
+            horizon["authorized_prediction_horizon_source"]
+        ] += 1
+        summary["authorized_horizon_counts"][
+            str(horizon["authorized_prediction_horizon_minutes"] or "missing")
+        ] += 1
+        summary["selected_horizon_counts"][
+            str(horizon["selected_horizon_minutes"] or "missing")
+        ] += 1
+        summary["training_horizon_counts"][
+            str(horizon["training_horizon_minutes"] or "missing")
+        ] += 1
+        summary["funding_projection_status_counts"][
+            "complete"
+            if horizon["funding_projection"]["evidence_complete"]
+            else "incomplete"
+        ] += 1
+        for side, funding_side in horizon["funding_projection"]["sides"].items():
+            reason = str(funding_side.get("reason") or "none")
+            summary["funding_projection_reason_counts"][f"{side}:{reason}"] += 1
+        for blocker in horizon["aggregate_blockers"]:
+            summary["aggregate_blocker_counts"][str(blocker)] += 1
+        for source in horizon["source_contracts"]:
+            identity = "|".join(
+                (
+                    source["source"],
+                    str(source["profit_supervision_version"] or "missing_version"),
+                    str(source["horizon_minutes"] or "missing_horizon"),
+                    str(source["eligibility_reason"] or "no_reason"),
+                    "eligible" if source["decision_eligible"] else "ineligible",
+                )
+            )
+            summary["source_contract_status_counts"][identity] += 1
         for competition_side in ("long", "short"):
             competition_evidence = _list(
                 _dict(competition.get(competition_side)).get("evidence")
@@ -507,6 +605,7 @@ async def main():
                     ),
                     "model_timings": _list(raw.get("model_timings"))
                     or _list(row.model_health_timings),
+                    "horizon_diagnostic": horizon,
                 }
             )
         if (
@@ -678,6 +777,40 @@ def _build_remote_command(limit: int, since_minutes: int) -> str:
     )
 
 
+def _horizon_summary(report: dict) -> dict:
+    keys = (
+        "row_count",
+        "id_range",
+        "time_range",
+        "final_actions",
+        "quality_reason_codes",
+        "authorized_horizon_source_counts",
+        "authorized_horizon_counts",
+        "selected_horizon_counts",
+        "training_horizon_counts",
+        "funding_projection_status_counts",
+        "funding_projection_reason_counts",
+        "source_contract_status_counts",
+        "aggregate_blocker_counts",
+    )
+    samples = report.get("incomplete_examples")
+    return {
+        key: report.get(key)
+        for key in keys
+    } | {
+        "incomplete_horizon_samples": [
+            {
+                "id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "created_at": row.get("created_at"),
+                "horizon_diagnostic": row.get("horizon_diagnostic"),
+            }
+            for row in samples[:8]
+            if isinstance(row, dict)
+        ] if isinstance(samples, list) else [],
+    }
+
+
 def _read_remote_report(ssh, limit: int, since_minutes: int) -> dict:
     directory = "/data/bb/app/tmp/codex-market-hold-economics"
     result_path = f"{directory}/result_{secrets.token_hex(12)}.json"
@@ -707,6 +840,11 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--minutes", type=int, default=0)
+    parser.add_argument(
+        "--horizon-summary",
+        action="store_true",
+        help="Print only bounded funding-horizon and source-contract diagnostics.",
+    )
     args = parser.parse_args()
     limit = max(1, min(int(args.limit or 500), 5000))
     since_minutes = max(0, min(int(args.minutes or 0), 7 * 24 * 60))
@@ -715,6 +853,8 @@ def main() -> None:
         payload = _read_remote_report(ssh, limit, since_minutes)
     finally:
         ssh.close()
+    if args.horizon_summary:
+        payload = _horizon_summary(payload)
     safe_print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

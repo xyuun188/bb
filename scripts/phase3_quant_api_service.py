@@ -65,6 +65,8 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
 CURRENT_TRAINING_EPOCH_POLICY = "current_epoch_plus_approved_historical_rebuild"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
+# No frozen independent exam has passed for the active profitability plan.
+INDEPENDENT_EXAM_PROMOTION_ENABLED = False
 TRAIN_REQUEST_TIMEOUT_SECONDS = min(
     max(
         float(
@@ -100,7 +102,7 @@ PRIMARY_PREDICTION_HORIZON_MINUTES = 5
 RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
 COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
-PROFIT_SUPERVISION_VERSION = "2026-07-24.separated-profit-supervision.v2"
+PROFIT_SUPERVISION_VERSION = "2026-10-22.separated-profit-component-availability.v4"
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
@@ -1899,6 +1901,8 @@ def _governed_candidate_activation_stage(
     promotion_recommendation: dict[str, Any],
     evidence_blockers: list[str],
 ) -> str:
+    if not INDEPENDENT_EXAM_PROMOTION_ENABLED:
+        return "shadow"
     recommended = str(promotion_recommendation.get("recommended_stage") or "shadow").lower()
     if (
         recommended == "active"

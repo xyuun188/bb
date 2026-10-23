@@ -19,6 +19,7 @@ import structlog
 from config.settings import settings
 from core.exceptions import WebSocketConnectionError
 from core.safe_output import safe_error_text
+from core.symbols import normalize_trading_symbol
 from data_feed.okx_ticker_volume import okx_swap_volume_fields, safe_float
 from services.okx_perpetual_sdk import (
     OKX_WS_BUSINESS_URL,
@@ -41,6 +42,8 @@ WS_MAX_CONSECUTIVE_RECEIVE_TIMEOUTS = 2
 WS_TICKER_STALE_RECONNECT_SECONDS = 90.0
 WS_RECONNECT_DELAY_SECONDS = 5.0
 WS_TICKER_MIN_PROCESS_INTERVAL_SECONDS = 0.5
+WS_SUBSCRIPTION_BATCH_SIZE = 100
+WS_SUBSCRIPTION_MIN_INTERVAL_SECONDS = 0.5
 
 
 class OKXWebSocketClient:
@@ -55,6 +58,7 @@ class OKXWebSocketClient:
         self._ws: Any = None
         self.latest_orderbooks: dict[str, dict] = {}
         self.latest_mark_prices: dict[str, dict] = {}
+        self.latest_index_prices: dict[str, dict] = {}
         self._running = False
         self._ticker_callbacks: list[Callable[..., Any]] = []
         self._kline_callbacks: list[Callable[..., Any]] = []
@@ -67,6 +71,16 @@ class OKXWebSocketClient:
         self._reconnect_count = 0
         self._last_processed_ticker_time: dict[str, float] = {}
         self._throttled_ticker_updates = 0
+        self._subscription_request_lock = asyncio.Lock()
+        self._last_subscription_request_at: float | None = None
+        self._subscription_request_count = 0
+        self._subscription_acknowledged_count = 0
+        self._subscription_error_count = 0
+        self._subscription_unattributed_error_count = 0
+        self._subscription_expected_args: set[tuple[str, str]] = set()
+        self._subscription_acknowledged_args: set[tuple[str, str]] = set()
+        self._subscription_rejected_args: set[tuple[str, str]] = set()
+        self._channel_message_counts: dict[str, int] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -90,6 +104,49 @@ class OKXWebSocketClient:
         """
         base = symbol.split("/")[0].split(":")[0].split("-")[0]
         return f"{base}-USDT-SWAP"
+
+    def _to_ws_index_id(self, symbol: str) -> str:
+        """Convert a trading symbol to its OKX index instrument ID."""
+        base = symbol.split("/")[0].split(":")[0].split("-")[0]
+        return f"{base}-USDT"
+
+    def _subscription_args(self, symbols: list[str]) -> list[dict[str, str]]:
+        channels: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for symbol in symbols:
+            swap_id = self._to_ws_inst_id(symbol)
+            for channel, inst_id in (
+                ("tickers", swap_id),
+                ("books5", swap_id),
+                ("mark-price", swap_id),
+                ("index-tickers", self._to_ws_index_id(symbol)),
+            ):
+                key = (channel, inst_id)
+                if key not in seen:
+                    channels.append({"channel": channel, "instId": inst_id})
+                    seen.add(key)
+        return channels
+
+    @staticmethod
+    def _subscription_argument_key(argument: Any) -> tuple[str, str] | None:
+        if not isinstance(argument, dict):
+            return None
+        channel = str(argument.get("channel") or "").strip()
+        inst_id = str(argument.get("instId") or "").strip()
+        return (channel, inst_id) if channel and inst_id else None
+
+    def _reset_subscription_coverage(
+        self,
+        channels: list[dict[str, str]],
+    ) -> None:
+        self._subscription_expected_args = {
+            key
+            for channel in channels
+            if (key := self._subscription_argument_key(channel)) is not None
+        }
+        self._subscription_acknowledged_args.clear()
+        self._subscription_rejected_args.clear()
+        self._subscription_unattributed_error_count = 0
 
     async def connect(self) -> None:
         """Establish WebSocket connection and subscribe to channels."""
@@ -115,25 +172,66 @@ class OKXWebSocketClient:
         symbols = getattr(self, "_subscribe_symbols", settings.symbols)
         
         # Build all channels
-        all_channels = []
-        for symbol in symbols:
-            inst_id = self._to_ws_inst_id(symbol)
-            all_channels.append({"channel": "tickers", "instId": inst_id})
-            all_channels.append({"channel": "books5", "instId": inst_id})
-            all_channels.append({"channel": "mark-price", "instId": inst_id})
+        all_channels = self._subscription_args(symbols)
+        self._reset_subscription_coverage(all_channels)
 
-        # Subscribe in batches (max 100 channels per batch to avoid "message too big")
-        batch_size = 100
-        for i in range(0, len(all_channels), batch_size):
-            batch = all_channels[i:i+batch_size]
-            sub_msg = {"op": "subscribe", "args": batch}
-            await self._ws.send(json.dumps(sub_msg))
-            logger.info("subscribed to batch", batch_num=i//batch_size+1, channels=len(batch))
-            # Small delay between batches to avoid overwhelming the server
-            if i + batch_size < len(all_channels):
-                await asyncio.sleep(0.1)
-        
-        logger.info("all subscriptions complete", symbols=len(symbols), total_channels=len(all_channels))
+        request_count = await self._send_subscription_operation("subscribe", all_channels)
+        logger.info(
+            "all subscriptions sent",
+            symbols=len(symbols),
+            total_channels=len(all_channels),
+            request_count=request_count,
+        )
+
+    async def _send_subscription_request(
+        self,
+        operation: str,
+        channels: list[dict[str, str]],
+    ) -> None:
+        async with self._subscription_request_lock:
+            if self._last_subscription_request_at is not None:
+                delay = (
+                    self._last_subscription_request_at
+                    + WS_SUBSCRIPTION_MIN_INTERVAL_SECONDS
+                    - time.monotonic()
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            if self._ws is None or not self._running:
+                raise WebSocketConnectionError(
+                    "Cannot send a subscription request while WebSocket is disconnected."
+                )
+            await self._ws.send(
+                json.dumps({"op": operation, "args": channels})
+            )
+            self._last_subscription_request_at = time.monotonic()
+            self._subscription_request_count += 1
+
+    async def _send_subscription_operation(
+        self,
+        operation: str,
+        channels: list[dict[str, str]],
+    ) -> int:
+        keys = {
+            key
+            for channel in channels
+            if (key := self._subscription_argument_key(channel)) is not None
+        }
+        if operation == "subscribe":
+            self._subscription_expected_args.update(keys)
+            self._subscription_acknowledged_args.difference_update(keys)
+            self._subscription_rejected_args.difference_update(keys)
+        elif operation == "unsubscribe":
+            self._subscription_expected_args.difference_update(keys)
+            self._subscription_acknowledged_args.difference_update(keys)
+            self._subscription_rejected_args.difference_update(keys)
+
+        requests = 0
+        for offset in range(0, len(channels), WS_SUBSCRIPTION_BATCH_SIZE):
+            batch = channels[offset : offset + WS_SUBSCRIPTION_BATCH_SIZE]
+            await self._send_subscription_request(operation, batch)
+            requests += 1
+        return requests
 
     async def _handle_message(self, raw: str) -> None:
         """Parse and route incoming WebSocket messages."""
@@ -147,8 +245,37 @@ class OKXWebSocketClient:
             return
 
         if "event" in data:
-            # Subscription confirmation or error
-            logger.debug("ws event", ws_event=data.get("event"), msg=data.get("msg", ""))
+            event = str(data.get("event") or "")
+            code = str(data.get("code") or "")
+            argument_key = self._subscription_argument_key(data.get("arg"))
+            if event == "error" or (code and code != "0"):
+                self._subscription_error_count += 1
+                if argument_key in self._subscription_expected_args:
+                    self._subscription_rejected_args.add(argument_key)
+                    self._subscription_acknowledged_args.discard(argument_key)
+                else:
+                    self._subscription_unattributed_error_count += 1
+                logger.error(
+                    "OKX WebSocket operation rejected",
+                    operation=event or "unknown",
+                    code=code or "missing",
+                    message=str(data.get("msg") or "")[:240],
+                    arg=data.get("arg"),
+                )
+            elif event in {"subscribe", "unsubscribe"}:
+                self._subscription_acknowledged_count += 1
+                if (
+                    event == "subscribe"
+                    and argument_key in self._subscription_expected_args
+                ):
+                    self._subscription_acknowledged_args.add(argument_key)
+                logger.debug(
+                    "OKX WebSocket operation acknowledged",
+                    operation=event,
+                    arg=data.get("arg"),
+                )
+            else:
+                logger.debug("ws event", ws_event=event, msg=data.get("msg", ""))
             return
 
         if "arg" not in data or "data" not in data:
@@ -156,6 +283,10 @@ class OKXWebSocketClient:
 
         channel = data["arg"].get("channel", "")
         inst_id = data["arg"].get("instId", "")
+        if channel:
+            self._channel_message_counts[channel] = (
+                self._channel_message_counts.get(channel, 0) + 1
+            )
         
         # Debug: log non-ticker channels
         if channel != "tickers":
@@ -225,12 +356,16 @@ class OKXWebSocketClient:
                 symbol = inst_id.replace("-SWAP", "").replace("-", "/")
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
-                # Calculate depths in native currency (contracts) and USDT
+                # OKX swap quantities are contracts. Keep price-weighted
+                # contract depth until the instrument spec converts it to USDT.
                 bid_depth_native = sum(safe_float(q, 0.0) for p, q, *_ in bids)
                 ask_depth_native = sum(safe_float(q, 0.0) for p, q, *_ in asks)
-                # For USDT depth, multiply by price
-                bid_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in bids)
-                ask_depth_usdt = sum(safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in asks)
+                bid_depth_quote_contracts = sum(
+                    safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in bids
+                )
+                ask_depth_quote_contracts = sum(
+                    safe_float(p, 0.0) * safe_float(q, 0.0) for p, q, *_ in asks
+                )
                 timestamp_ms = int(safe_float(book.get("ts"), 0.0))
                 best_bid = safe_float(bids[0][0], 0.0) if bids else 0.0
                 best_ask = safe_float(asks[0][0], 0.0) if asks else 0.0
@@ -243,8 +378,8 @@ class OKXWebSocketClient:
                     "received_at": received_at,
                     "bid": best_bid,
                     "ask": best_ask,
-                    "bid_depth_usdt": bid_depth_usdt,
-                    "ask_depth_usdt": ask_depth_usdt,
+                    "bid_depth_quote_contracts": bid_depth_quote_contracts,
+                    "ask_depth_quote_contracts": ask_depth_quote_contracts,
                 }
                 orderbook_data = {
                     "symbol": symbol,
@@ -252,10 +387,12 @@ class OKXWebSocketClient:
                     "inst_type": "SWAP",
                     "bid_depth_native": bid_depth_native,
                     "ask_depth_native": ask_depth_native,
-                    "bid_depth_usdt": bid_depth_usdt,
-                    "ask_depth_usdt": ask_depth_usdt,
-                    "orderbook_bid_depth": bid_depth_usdt,
-                    "orderbook_ask_depth": ask_depth_usdt,
+                    "bid_depth_usdt": 0.0,
+                    "ask_depth_usdt": 0.0,
+                    "bid_depth_quote_contracts": bid_depth_quote_contracts,
+                    "ask_depth_quote_contracts": ask_depth_quote_contracts,
+                    "orderbook_bid_depth": 0.0,
+                    "orderbook_ask_depth": 0.0,
                     "timestamp": timestamp_ms,
                     "source_timestamp_ms": timestamp_ms,
                     "received_at": received_at,
@@ -296,6 +433,36 @@ class OKXWebSocketClient:
                 }
                 # Store in cache for data service to pick up
                 self.latest_mark_prices[symbol] = mark_price_data
+
+        elif channel == "index-tickers":
+            # Keep index prices as their own observed fact; never derive them
+            # from a swap ticker or mark price.
+            for index in data["data"]:
+                index_id = str(index.get("instId") or inst_id).upper()
+                index_symbol = normalize_trading_symbol(index_id)
+                index_price = safe_float(index.get("idxPx"), 0.0)
+                timestamp_ms = int(safe_float(index.get("ts"), 0.0))
+                self.latest_index_prices[index_symbol] = {
+                    "symbol": index_symbol,
+                    "inst_id": index_id,
+                    "inst_type": "INDEX",
+                    "index_price": index_price,
+                    "timestamp": timestamp_ms,
+                    "source_timestamp_ms": timestamp_ms,
+                    "received_at": received_at,
+                    "source": "websocket",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "index-tickers",
+                    "index_price_fact": {
+                        "inst_id": index_id,
+                        "inst_type": "INDEX",
+                        "source_endpoint": "okx_ws_public",
+                        "source_channel": "index-tickers",
+                        "source_timestamp_ms": timestamp_ms,
+                        "received_at": received_at,
+                        "price": index_price,
+                    },
+                }
 
         elif channel and channel.startswith("candle"):
             timeframe = channel.replace("candle", "")
@@ -420,32 +587,38 @@ class OKXWebSocketClient:
         if not self._ws or not self._running:
             logger.warning("cannot subscribe, ws not connected", symbol=symbol)
             return
-        inst_id = self._to_ws_inst_id(symbol)
-        channels = [{"channel": "tickers", "instId": inst_id}]
-        sub_msg = {"op": "subscribe", "args": channels}
-        await self._ws.send(json.dumps(sub_msg))
-        logger.info("subscribed to symbol", symbol=symbol, inst_id=inst_id)
+        channels = self._subscription_args([symbol])
+        await self._send_subscription_operation("subscribe", channels)
+        current = list(getattr(self, "_subscribe_symbols", settings.symbols))
+        normalized = normalize_trading_symbol(symbol)
+        if normalized not in {normalize_trading_symbol(item) for item in current}:
+            current.append(normalized)
+        self._subscribe_symbols = current
+        logger.info("subscribed to symbol", symbol=symbol, channels=len(channels))
 
     async def resubscribe_all(self, symbols: list[str]) -> None:
         """Resubscribe to a new list of symbols (unsub old, sub new)."""
-        old_ids = [
-            {"channel": "tickers", "instId": self._to_ws_inst_id(s)}
-            for s in getattr(self, "_subscribe_symbols", settings.symbols)
-        ]
-        new_ids = [{"channel": "tickers", "instId": self._to_ws_inst_id(s)} for s in symbols]
+        old_symbols = getattr(self, "_subscribe_symbols", settings.symbols)
+        old_ids = self._subscription_args(old_symbols)
+        new_ids = self._subscription_args(symbols)
         if not self._ws or not self._running:
             self._subscribe_symbols = symbols
             return
-        # Unsubscribe from old
+        # Unsubscribe old channels and subscribe replacements within the same
+        # per-connection operation budget used during initial startup.
         if old_ids:
-            await self._ws.send(json.dumps({"op": "unsubscribe", "args": old_ids}))
+            await self._send_subscription_operation("unsubscribe", old_ids)
         # Clear old tickers
         old_symbols = set(getattr(self, "_subscribe_symbols", []))
         for sym in old_symbols:
             self._latest_tickers.pop(sym, None)
+            normalized = normalize_trading_symbol(sym)
+            self.latest_orderbooks.pop(normalized, None)
+            self.latest_mark_prices.pop(normalized, None)
+            self.latest_index_prices.pop(normalized, None)
         # Subscribe to new
         if new_ids:
-            await self._ws.send(json.dumps({"op": "subscribe", "args": new_ids}))
+            await self._send_subscription_operation("subscribe", new_ids)
         self._subscribe_symbols = symbols
         logger.info("resubscribed", old_count=len(old_ids), new_count=len(new_ids))
 
@@ -453,11 +626,18 @@ class OKXWebSocketClient:
         """Dynamically unsubscribe from a symbol's channels."""
         if not self._ws or not self._running:
             return
-        inst_id = self._to_ws_inst_id(symbol)
-        channels = [{"channel": "tickers", "instId": inst_id}]
-        sub_msg = {"op": "unsubscribe", "args": channels}
-        await self._ws.send(json.dumps(sub_msg))
+        channels = self._subscription_args([symbol])
+        await self._send_subscription_operation("unsubscribe", channels)
         self._latest_tickers.pop(symbol, None)
+        normalized = normalize_trading_symbol(symbol)
+        self.latest_orderbooks.pop(normalized, None)
+        self.latest_mark_prices.pop(normalized, None)
+        self.latest_index_prices.pop(normalized, None)
+        self._subscribe_symbols = [
+            item
+            for item in getattr(self, "_subscribe_symbols", [])
+            if normalize_trading_symbol(item) != normalized
+        ]
         logger.info("unsubscribed from symbol", symbol=symbol)
 
     async def close(self) -> None:
@@ -491,4 +671,49 @@ class OKXWebSocketClient:
             "reconnect_count": self._reconnect_count,
             "throttled_ticker_updates": self._throttled_ticker_updates,
             "ticker_process_interval_seconds": WS_TICKER_MIN_PROCESS_INTERVAL_SECONDS,
+            "subscription_request_count": self._subscription_request_count,
+            "subscription_acknowledged_count": self._subscription_acknowledged_count,
+            "subscription_error_count": self._subscription_error_count,
+            "subscription_coverage": self._subscription_coverage_snapshot(),
+            "channel_message_counts": dict(self._channel_message_counts),
+        }
+
+    def _subscription_coverage_snapshot(self) -> dict[str, Any]:
+        acknowledged = self._subscription_acknowledged_args & self._subscription_expected_args
+        rejected = self._subscription_rejected_args & self._subscription_expected_args
+        missing = self._subscription_expected_args - acknowledged - rejected
+        channels = sorted(
+            {
+                channel
+                for channel, _inst_id in self._subscription_expected_args
+            }
+        )
+        by_channel = {}
+        for channel in channels:
+            expected_args = {
+                key
+                for key in self._subscription_expected_args
+                if key[0] == channel
+            }
+            acknowledged_args = expected_args & acknowledged
+            rejected_args = expected_args & rejected
+            by_channel[channel] = {
+                "expected": len(expected_args),
+                "acknowledged": len(acknowledged_args),
+                "rejected": len(rejected_args),
+                "missing_ack": len(
+                    expected_args - acknowledged_args - rejected_args
+                ),
+            }
+        return {
+            "expected_argument_count": len(self._subscription_expected_args),
+            "acknowledged_argument_count": len(acknowledged),
+            "rejected_argument_count": len(rejected),
+            "missing_ack_count": len(missing),
+            "unattributed_error_count": self._subscription_unattributed_error_count,
+            "by_channel": by_channel,
+            "missing_ack_sample": [
+                {"channel": channel, "inst_id": inst_id}
+                for channel, inst_id in sorted(missing)[:20]
+            ],
         }

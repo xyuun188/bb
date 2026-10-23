@@ -314,6 +314,9 @@ class DataService:
         self._native_consistency_bars_tasks: dict[
             tuple[str, int, int], asyncio.Task[list[Any]]
         ] = {}
+        self._native_derivatives_cache_diagnostics: deque[dict[str, Any]] = deque(
+            maxlen=64
+        )
         self._latest_market_fact_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._latest_market_fact_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._started = False
@@ -1605,10 +1608,27 @@ class DataService:
             block_on_remote=block_on_remote,
         )
         enriched = dict(snapshot)
-        
-        # Cached depth must have a current native timestamp before it can
-        # suppress the blocking REST fallback.
         normalized = self._normalize_symbols([symbol])[0]
+        snapshot_spec = enriched.get("contract_spec")
+        if (
+            not require_authoritative_snapshot
+            and self._instrument_spec_is_complete(normalized, snapshot_spec)
+        ):
+            spec = dict(snapshot_spec)
+        else:
+            spec = await self._get_instrument_spec(
+                symbol,
+                block_on_remote=block_on_remote,
+                force_refresh=require_authoritative_snapshot,
+            )
+        normalized_spec = normalize_okx_contract_spec(spec)
+        contract_base_size = (
+            self._safe_float(normalized_spec.get("contract_value"), 0.0)
+            * self._safe_float(normalized_spec.get("contract_multiplier"), 0.0)
+        )
+
+        # Cached depth must have a current native timestamp and a known
+        # contract multiplier before it can suppress the blocking REST fallback.
         latest_orderbooks = getattr(self.ws_client, "latest_orderbooks", {})
         if not isinstance(latest_orderbooks, dict):
             latest_orderbooks = {}
@@ -1641,6 +1661,47 @@ class DataService:
             enriched["bid_depth_usdt"] = bid_depth
             enriched["ask_depth_usdt"] = ask_depth
         ws_book = ws_orderbook.get("orderbook_fact")
+        ws_bid_depth = self._safe_float(
+            ws_orderbook.get("orderbook_bid_depth")
+            or ws_orderbook.get("bid_depth_usdt"),
+            0.0,
+        )
+        ws_ask_depth = self._safe_float(
+            ws_orderbook.get("orderbook_ask_depth")
+            or ws_orderbook.get("ask_depth_usdt"),
+            0.0,
+        )
+        if isinstance(ws_book, dict) and ws_book.get("source_endpoint") == "okx_ws_public":
+            expected_inst_id = str(normalized_spec.get("inst_id") or "").upper()
+            raw_bid_depth = self._safe_float(
+                ws_orderbook.get("bid_depth_quote_contracts"), 0.0
+            )
+            raw_ask_depth = self._safe_float(
+                ws_orderbook.get("ask_depth_quote_contracts"), 0.0
+            )
+            if (
+                expected_inst_id
+                and str(ws_book.get("inst_id") or "").upper() == expected_inst_id
+                and str(ws_book.get("inst_type") or "").upper() == "SWAP"
+                and str(ws_book.get("source_channel") or "") == "books5"
+                and contract_base_size > 0
+                and raw_bid_depth > 0
+                and raw_ask_depth > 0
+            ):
+                ws_bid_depth = raw_bid_depth * contract_base_size
+                ws_ask_depth = raw_ask_depth * contract_base_size
+                ws_book = {
+                    **ws_book,
+                    "bid_depth_usdt": ws_bid_depth,
+                    "ask_depth_usdt": ws_ask_depth,
+                    "contract_spec_version": normalized_spec.get("spec_version"),
+                }
+            elif (
+                ws_book.get("contract_spec_version")
+                != normalized_spec.get("spec_version")
+            ):
+                ws_bid_depth = 0.0
+                ws_ask_depth = 0.0
         if (
             self._native_cached_fact_is_fresh(ws_book, snapshot=enriched)
             and (
@@ -1649,16 +1710,6 @@ class DataService:
                 > self._ticker_timestamp_from_raw(snapshot_book)
             )
         ):
-            ws_bid_depth = self._safe_float(
-                ws_orderbook.get("orderbook_bid_depth")
-                or ws_orderbook.get("bid_depth_usdt"),
-                0.0,
-            )
-            ws_ask_depth = self._safe_float(
-                ws_orderbook.get("orderbook_ask_depth")
-                or ws_orderbook.get("ask_depth_usdt"),
-                0.0,
-            )
             if ws_bid_depth > 0 and ws_ask_depth > 0:
                 enriched["bid_depth_native"] = ws_orderbook.get("bid_depth_native", 0)
                 enriched["ask_depth_native"] = ws_orderbook.get("ask_depth_native", 0)
@@ -1737,18 +1788,6 @@ class DataService:
                 enriched["mark_price"] = ws_mark_value
                 enriched["mark_price_fact"] = dict(ws_mark_fact)
         
-        snapshot_spec = enriched.get("contract_spec")
-        if (
-            not require_authoritative_snapshot
-            and self._instrument_spec_is_complete(normalized, snapshot_spec)
-        ):
-            spec = dict(snapshot_spec)
-        else:
-            spec = await self._get_instrument_spec(
-                symbol,
-                block_on_remote=block_on_remote,
-                force_refresh=require_authoritative_snapshot,
-            )
         if spec:
             enriched["contract_spec"] = spec
             enriched["uly"] = spec.get("uly")
@@ -1812,6 +1851,309 @@ class DataService:
             ticker_timestamp <= 0
             or abs(ticker_timestamp - timestamp) <= max_age_ms
         )
+
+    def _cached_native_derivatives_facts(
+        self,
+        symbol: str,
+        contract_spec: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Project only fresh, identity-bound WebSocket facts for REST reuse."""
+
+        normalized_symbol = self._normalize_symbols([symbol])[0]
+        if not self._instrument_spec_is_complete(normalized_symbol, contract_spec):
+            not_checked = {"status": "not_checked"}
+            self._record_native_derivatives_cache_diagnostic(
+                normalized_symbol,
+                contract_spec_status="incomplete",
+                orderbook=not_checked,
+                mark_price=not_checked,
+                index_price=not_checked,
+            )
+            return {}
+        spec = normalize_okx_contract_spec(contract_spec)
+        inst_id = str(spec.get("inst_id") or "").upper()
+        uly = str(spec.get("uly") or "").upper()
+        if (
+            spec.get("contract_type") != "linear"
+            or spec.get("settle_currency") != "USDT"
+        ):
+            not_checked = {"status": "not_checked"}
+            self._record_native_derivatives_cache_diagnostic(
+                normalized_symbol,
+                contract_spec_status="unsupported_contract",
+                orderbook=not_checked,
+                mark_price=not_checked,
+                index_price=not_checked,
+            )
+            return {}
+        contract_base_size = (
+            self._safe_float(spec.get("contract_value"), 0.0)
+            * self._safe_float(spec.get("contract_multiplier"), 0.0)
+        )
+        if not inst_id or not uly or contract_base_size <= 0:
+            not_checked = {"status": "not_checked"}
+            self._record_native_derivatives_cache_diagnostic(
+                normalized_symbol,
+                contract_spec_status="incomplete",
+                orderbook=not_checked,
+                mark_price=not_checked,
+                index_price=not_checked,
+            )
+            return {}
+
+        ticker_cache = getattr(self.ws_client, "latest_tickers", {})
+        ticker = (
+            ticker_cache.get(normalized_symbol, {})
+            if isinstance(ticker_cache, dict)
+            else {}
+        )
+        ticker = ticker if isinstance(ticker, dict) else {}
+        facts: dict[str, dict[str, Any]] = {}
+
+        orderbooks = getattr(self.ws_client, "latest_orderbooks", {})
+        book_cache = (
+            orderbooks.get(normalized_symbol, {})
+            if isinstance(orderbooks, dict)
+            else {}
+        )
+        book_cache = book_cache if isinstance(book_cache, dict) else {}
+        book_fact = book_cache.get("orderbook_fact")
+        if not isinstance(book_fact, dict):
+            book_status_code = "missing"
+        elif str(book_fact.get("source_endpoint") or "") != "okx_ws_public":
+            book_status_code = "source_mismatch"
+        elif (
+            str(book_fact.get("source_channel") or "") != "books5"
+            or str(book_fact.get("inst_id") or "").upper() != inst_id
+            or str(book_fact.get("inst_type") or "").upper() != "SWAP"
+        ):
+            book_status_code = "identity_mismatch"
+        elif not self._native_cached_fact_is_fresh(book_fact, snapshot=ticker):
+            book_status_code = "stale_or_ticker_misaligned"
+        elif availability_timestamp(book_fact.get("received_at")) is None:
+            book_status_code = "receipt_missing"
+        else:
+            book_status_code = "available"
+        if (
+            isinstance(book_fact, dict)
+            and str(book_fact.get("source_endpoint") or "") == "okx_ws_public"
+            and str(book_fact.get("source_channel") or "") == "books5"
+            and str(book_fact.get("inst_id") or "").upper() == inst_id
+            and str(book_fact.get("inst_type") or "").upper() == "SWAP"
+            and self._native_cached_fact_is_fresh(book_fact, snapshot=ticker)
+            and availability_timestamp(book_fact.get("received_at")) is not None
+        ):
+            bid_quote_contracts = self._safe_float(
+                book_cache.get("bid_depth_quote_contracts"), 0.0
+            )
+            ask_quote_contracts = self._safe_float(
+                book_cache.get("ask_depth_quote_contracts"), 0.0
+            )
+            bid_depth = bid_quote_contracts * contract_base_size
+            ask_depth = ask_quote_contracts * contract_base_size
+            bid = self._safe_float(book_fact.get("bid"), 0.0)
+            ask = self._safe_float(book_fact.get("ask"), 0.0)
+            if bid_depth > 0 and ask_depth > 0 and bid > 0 and ask >= bid:
+                book_status_code = "available"
+                normalized_book_fact = {
+                    **book_fact,
+                    "bid_depth_usdt": bid_depth,
+                    "ask_depth_usdt": ask_depth,
+                    "contract_spec_version": spec.get("spec_version"),
+                }
+                facts["orderbook"] = {
+                    "spread_pct": (ask - bid) / ((ask + bid) / 2) * 100,
+                    "orderbook_bid_depth": bid_depth,
+                    "orderbook_ask_depth": ask_depth,
+                    "orderbook_imbalance": (bid_depth - ask_depth)
+                    / (bid_depth + ask_depth),
+                    "orderbook_data_available": True,
+                    "orderbook_fact": normalized_book_fact,
+                    "orderbook_cached": True,
+                }
+            else:
+                book_status_code = "invalid_depth_or_quote"
+
+        reference_statuses: dict[str, str] = {}
+        def fresh_reference(
+            fact: Any,
+            *,
+            expected_id: str,
+            expected_type: str,
+            expected_channel: str,
+            max_age_seconds: float,
+        ) -> bool:
+            if not isinstance(fact, dict):
+                reference_statuses[expected_channel] = "missing"
+                return False
+            received = availability_timestamp(fact.get("received_at"))
+            if (
+                str(fact.get("source_endpoint") or "") != "okx_ws_public"
+            ):
+                reference_statuses[expected_channel] = "source_mismatch"
+                return False
+            if (
+                str(fact.get("source_channel") or "") != expected_channel
+                or str(fact.get("inst_id") or "").upper() != expected_id
+                or str(fact.get("inst_type") or "").upper() != expected_type
+            ):
+                reference_statuses[expected_channel] = "identity_mismatch"
+                return False
+            if self._safe_float(fact.get("price"), 0.0) <= 0:
+                reference_statuses[expected_channel] = "invalid_price"
+                return False
+            if received is None:
+                reference_statuses[expected_channel] = (
+                    "receipt_missing_or_ambiguous"
+                )
+                return False
+            if received.timestamp() > datetime.now(UTC).timestamp() + 1.0:
+                reference_statuses[expected_channel] = "receipt_in_future"
+                return False
+            if (datetime.now(UTC) - received).total_seconds() > max_age_seconds:
+                reference_statuses[expected_channel] = "receipt_stale"
+                return False
+            source_ms = self._ticker_timestamp_from_raw(fact)
+            if source_ms <= 0:
+                reference_statuses[expected_channel] = "source_clock_missing"
+                return False
+            if source_ms > int(received.timestamp() * 1000):
+                reference_statuses[expected_channel] = "source_after_receipt"
+                return False
+            if (
+                abs(datetime.now(UTC).timestamp() * 1000 - source_ms)
+                > max_age_seconds * 1000
+            ):
+                reference_statuses[expected_channel] = "source_stale"
+                return False
+            ticker_timestamp = self._ticker_timestamp_from_raw(ticker)
+            if ticker_timestamp <= 0:
+                reference_statuses[expected_channel] = "ticker_clock_missing"
+                return False
+            if abs(ticker_timestamp - source_ms) > max_age_seconds * 1000:
+                reference_statuses[expected_channel] = "ticker_misaligned"
+                return False
+            reference_statuses[expected_channel] = "available"
+            return True
+
+        mark_cache = getattr(self.ws_client, "latest_mark_prices", {})
+        mark_row = (
+            mark_cache.get(normalized_symbol, {})
+            if isinstance(mark_cache, dict)
+            else {}
+        )
+        mark_row = mark_row if isinstance(mark_row, dict) else {}
+        mark_fact = mark_row.get("mark_price_fact")
+
+        index_cache = getattr(self.ws_client, "latest_index_prices", {})
+        index_row = (
+            index_cache.get(normalized_symbol, {})
+            if isinstance(index_cache, dict)
+            else {}
+        )
+        index_row = index_row if isinstance(index_row, dict) else {}
+        index_fact = index_row.get("index_price_fact")
+        mark_fresh = fresh_reference(
+            mark_fact,
+            expected_id=inst_id,
+            expected_type="SWAP",
+            expected_channel="mark-price",
+            max_age_seconds=TICKER_CACHE_MAX_AGE_SECONDS,
+        )
+        index_fresh = fresh_reference(
+            index_fact,
+            expected_id=uly,
+            expected_type="INDEX",
+            expected_channel="index-tickers",
+            max_age_seconds=65.0,
+        )
+        if mark_fresh and index_fresh:
+            facts["reference_prices"] = {
+                "mark_price": self._safe_float(mark_fact.get("price"), 0.0),
+                "index_price": self._safe_float(index_fact.get("price"), 0.0),
+                "mark_price_fact": dict(mark_fact),
+                "index_price_fact": dict(index_fact),
+                "reference_prices_data_available": True,
+                "reference_prices_cached": True,
+            }
+        self._record_native_derivatives_cache_diagnostic(
+            normalized_symbol,
+            contract_spec_status="complete",
+            orderbook=self._native_fact_diagnostic(
+                book_fact,
+                book_status_code,
+            ),
+            mark_price=self._native_fact_diagnostic(
+                mark_fact,
+                reference_statuses.get("mark-price", "not_checked"),
+            ),
+            index_price=self._native_fact_diagnostic(
+                index_fact,
+                reference_statuses.get("index-tickers", "not_checked"),
+            ),
+        )
+        return facts
+
+    @staticmethod
+    def _native_fact_diagnostic(fact: Any, status: str) -> dict[str, Any]:
+        """Keep bounded source/clock details outside frozen model features."""
+
+        result: dict[str, Any] = {"status": str(status)[:64]}
+        if not isinstance(fact, dict):
+            return result
+        for key in ("source_endpoint", "source_channel", "inst_id", "inst_type"):
+            value = fact.get(key)
+            if value is not None:
+                result[key] = str(value)[:80]
+        received = availability_timestamp(fact.get("received_at"))
+        source_ms = DataService._ticker_timestamp_from_raw(fact)
+        now = datetime.now(UTC)
+        if received is not None:
+            result["receipt_age_seconds"] = round(
+                (now - received).total_seconds(), 3
+            )
+        if source_ms > 0:
+            result["source_age_seconds"] = round(
+                now.timestamp() - source_ms / 1000.0, 3
+            )
+        return result
+
+    def _record_native_derivatives_cache_diagnostic(
+        self,
+        symbol: str,
+        *,
+        contract_spec_status: str,
+        orderbook: dict[str, Any],
+        mark_price: dict[str, Any],
+        index_price: dict[str, Any],
+    ) -> None:
+        diagnostics = getattr(self, "_native_derivatives_cache_diagnostics", None)
+        if not isinstance(diagnostics, deque):
+            diagnostics = deque(maxlen=64)
+            self._native_derivatives_cache_diagnostics = diagnostics
+        diagnostics.append(
+            {
+                "observed_at": datetime.now(UTC).isoformat(),
+                "symbol": str(symbol)[:40],
+                "contract_spec_status": str(contract_spec_status)[:64],
+                "orderbook": dict(orderbook),
+                "mark_price": dict(mark_price),
+                "index_price": dict(index_price),
+            }
+        )
+
+    def _native_derivatives_cache_diagnostics_snapshot(
+        self,
+        *,
+        limit: int = 32,
+    ) -> list[dict[str, Any]]:
+        diagnostics = getattr(self, "_native_derivatives_cache_diagnostics", None)
+        if not isinstance(diagnostics, deque):
+            return []
+        bounded_limit = max(0, min(int(limit), 64))
+        if not bounded_limit:
+            return []
+        return deepcopy(list(diagnostics)[-bounded_limit:])
 
     def _cached_native_consistency_bars(
         self,
@@ -3764,16 +4106,39 @@ class DataService:
         cached_funding_ready = self._derivatives_funding_ready(cached_data)
         if cached:
             updated_at = cached.get("updated_at")
+            cache_age_seconds = (
+                (now - updated_at).total_seconds()
+                if isinstance(updated_at, datetime)
+                else None
+            )
             if (
                 isinstance(updated_at, datetime)
-                and (now - updated_at).total_seconds() < self._derivatives_update_interval
+                and cache_age_seconds is not None
+                and cache_age_seconds < self._derivatives_update_interval
                 and cached_has_required_facts
                 and (not require_funding or cached_funding_ready)
             ):
                 return cached_data
             if (
+                not block_on_remote
+                and not cached_has_required_facts
+                and cache_age_seconds is not None
+                and -1.0 <= cache_age_seconds < DERIVATIVES_FAILURE_CACHE_SECONDS
+            ):
+                data = cached_data
+                if data:
+                    data["derivatives_snapshot_stale"] = True
+                    data["derivatives_required_data_available"] = False
+                    data["derivatives_refresh_suppressed"] = True
+                    data["derivatives_refresh_retry_after_seconds"] = round(
+                        max(DERIVATIVES_FAILURE_CACHE_SECONDS - cache_age_seconds, 0.0),
+                        3,
+                    )
+                return data
+            if (
                 isinstance(updated_at, datetime)
-                and (now - updated_at).total_seconds() <= DERIVATIVES_STALE_MAX_AGE_SECONDS
+                and cache_age_seconds is not None
+                and cache_age_seconds <= DERIVATIVES_STALE_MAX_AGE_SECONDS
                 and not block_on_remote
             ):
                 if allow_background_refresh:
@@ -4048,30 +4413,38 @@ class DataService:
                 failed_cache[normalized] = datetime.now(UTC)
                 return data
             fetcher = self.rest_client.fetch_derivatives_snapshot
-            try:
-                fetch_call = fetcher(
+            fetch_kwargs: dict[str, Any] = {
+                "contract_spec": contract_spec,
+                "required_only": required_only,
+                "require_funding": require_funding,
+                "native_market_facts": self._cached_native_derivatives_facts(
                     normalized,
-                    contract_spec=contract_spec,
-                    required_only=required_only,
-                    require_funding=require_funding,
-                )
-            except TypeError as exc:
-                error_text = safe_error_text(exc)
-                if "require_funding" in error_text:
-                    try:
-                        fetch_call = fetcher(
-                            normalized,
-                            contract_spec=contract_spec,
-                            required_only=required_only,
-                        )
-                    except TypeError as nested_exc:
-                        if "required_only" not in safe_error_text(nested_exc):
-                            raise
-                        fetch_call = fetcher(normalized, contract_spec=contract_spec)
-                elif "required_only" in error_text:
-                    fetch_call = fetcher(normalized, contract_spec=contract_spec)
-                else:
-                    raise
+                    contract_spec,
+                ),
+            }
+            for _attempt in range(4):
+                try:
+                    fetch_call = fetcher(normalized, **fetch_kwargs)
+                    break
+                except TypeError as exc:
+                    error_text = safe_error_text(exc)
+                    unsupported = next(
+                        (
+                            key
+                            for key in (
+                                "native_market_facts",
+                                "require_funding",
+                                "required_only",
+                            )
+                            if key in error_text
+                        ),
+                        None,
+                    )
+                    if unsupported is None:
+                        raise
+                    fetch_kwargs.pop(unsupported, None)
+            else:
+                fetch_call = fetcher(normalized, contract_spec=contract_spec)
             data = await asyncio.wait_for(
                 fetch_call,
                 timeout=max(float(DERIVATIVES_PROVIDER_TIMEOUT_SECONDS), 0.5),
@@ -4236,4 +4609,7 @@ class DataService:
                 for sym, d in self.ws_client.latest_tickers.items()
             },
             "ws_stats": self.ws_client.get_stats(),
+            "native_derivatives_cache_diagnostics": (
+                self._native_derivatives_cache_diagnostics_snapshot()
+            ),
         }

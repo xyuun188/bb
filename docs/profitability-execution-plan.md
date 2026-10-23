@@ -2059,3 +2059,189 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   supervision; (3) only then resume preregistered G3 nested chronological
   cost-aware research. The independent PostgreSQL parity check remains
   outstanding and must run only against a dedicated test database.
+
+### Partial-Snapshot Refresh Backoff And Queue Recheck (2026-10-24 04:56 Asia/Shanghai)
+
+- Read-only route projection at `2026-10-23T20:38:57Z` covered 45 recent
+  decisions. Order-book timed out for 11, reference prices timed out for 9,
+  and reference prices failed for 5. The bounded 15-minute request-log
+  aggregate had 585 latency events: order-book queue-wait p95 `7,606.7 ms`,
+  mark-price p95 `8,719.0 ms`, and index-price p95 `8,438.3 ms`, all beyond
+  the existing `5,500 ms` quote-route deadline. Provider-duration p95 was
+  `3,820.5 ms`, `2,369.6 ms`, and `3,117.9 ms`, respectively; do not respond
+  by merely increasing the caller timeout.
+- The route and cache code showed that cache-only market scans rescheduled a
+  background derivatives refresh whenever a recent cached snapshot lacked
+  required book/reference facts. The incomplete snapshot correctly remained
+  unusable, but there was no cooldown between completed partial refreshes.
+  This could repeatedly add REST quote work while the public route queue was
+  already saturated.
+- Repair: cache-only reads now suppress another refresh for 15 seconds after
+  a recent incomplete snapshot, expose `derivatives_refresh_suppressed` and a
+  bounded retry delay, and explicitly keep
+  `derivatives_required_data_available=false`. Fresh/complete snapshots retain
+  the existing update interval, and a partial snapshot becomes retryable
+  after the backoff. No quote deadline, quality threshold, funding rule,
+  model permission, entry gate, risk budget, or live setting was loosened.
+- Local regression suite for data-service, market-fact and trading boundaries:
+  `480 passed`; changed-file Ruff, `compileall`, and `git diff --check` passed.
+  The remote focused `tests/test_data_service_security.py` run passed
+  `102` tests with one CPU, 1 GiB memory and a 300-second transient-unit
+  deadline.
+- Targeted upload included only `services/data_service.py` and
+  `tests/test_data_service_security.py`; remote integrity verification passed
+  for both. Before restart, paper state was unpaused with zero open paper
+  positions and zero nonterminal paper orders. The market round completed
+  without error. Restarted only `bb-paper-trading.service` at
+  `2026-10-23T20:55:58Z`; it is active/running with zero automatic restarts,
+  paper mode unpaused, a fresh heartbeat, and no round error. No order or
+  protective order was modified.
+- The current post-restart sample is not yet mature. Do not count it as G2
+  evidence until a full new 15-minute window has elapsed. At this checkpoint
+  G1 remains attribution-only with negative economics; G2 remains blocked;
+  G3-G6 remain pending. This repair only bounds repeated quote requests and
+  does not establish an executable profitable strategy.
+- Exact next action: after `2026-10-23T21:11:00Z`, collect one bounded
+  post-restart 15-minute decision/training sample and the same bounded
+  per-route queue-latency aggregate. Check whether retry suppression is
+  present in incomplete rows, whether quote-route p95 is within the existing
+  deadline, and whether component availability improves without weakening
+  any contract. Continue the frozen G2 sample until its preregistered size,
+  coverage and zero-core-error boundary passes; then resume G3 only if
+  eligible native fee-after training evidence is sufficient. Keep the model
+  disabled for entries and live trading inactive.
+
+### Fresh G2, Entry-Gate, And Label Recheck (2026-10-24 05:46 Asia/Shanghai)
+
+- Recovered the live state before further work. `bb-paper-trading.service`
+  and `bb-dashboard.service` are active with zero automatic restarts; the
+  paper service started at `2026-10-23T20:55:58Z`. Runtime mode is paper,
+  unpaused, with a current heartbeat and no round/market/position error.
+  SHA-256 hashes for the live data-service, REST, WebSocket, SDK, and
+  quant-service files match the local working tree exactly. No order or
+  protection was changed.
+- The live WebSocket is connected for 498 symbols. Its bounded persisted
+  counters show 20 subscription requests for 1,992 expected channel
+  arguments, 1,685 acknowledged, zero rejected, and 307 without ACK. Per
+  channel, missing ACKs are books5 75/498, index-tickers 77/498,
+  mark-price 75/498, and tickers 80/498. Aggregate message counts are
+  nonzero on all four channels, but the current snapshot has no
+  per-instrument message timestamps; do not assume the missing ACKs caused
+  particular quote failures.
+- Fresh post-restart, read-only G2 audit at `2026-10-23T21:34:10Z` covered
+  the newest 64 decisions in a 30-minute window. All 64 sealed snapshots fit
+  the 98,304-byte frozen budget (maximum 96,984 B) with no seal errors.
+  Only 52/64 decisions passed component availability; 12/64 remained invalid:
+  nine order-book fact misses, seven mark and seven index fact misses,
+  three ambiguous mark/index receipts and source clocks, and two decisions
+  with no account-fee observation clock. The matching 64 training snapshots
+  had 44 valid and 20 invalid; repeated horizon rows are not independent
+  decision groups.
+- A bounded projection of the invalid decisions confirmed actual
+  `orderbook`/`reference_prices` route timeouts for XPL, PEPE, SHIB, XRP,
+  MAGIC and ZRO, and order-book timeouts plus zero-clock/zero-price
+  reference failures for WLD, DOT and INJ. ENA and DOGE had usable market
+  facts but no account-fee source or receipt clock. Recent snapshots mark
+  cached derivatives data stale and background refresh active. The optional
+  `derivatives_refresh_suppressed` diagnostic is not retained in the frozen
+  decision snapshot, so this projection cannot prove whether its cooldown
+  fired.
+- A separate 30-minute decision audit at `2026-10-23T21:41Z` covered 64
+  decisions from `21:18:13Z` through `21:40:18Z`. All 64 were `HOLD` for
+  `insufficient_evidence`; all lacked authorized, selected, and training
+  prediction horizons, and all funding projections were incomplete with
+  `prediction_horizon_missing`. The local model has no available version and
+  lacks `model_strategy_blueprint_paper_permission`; server-profit and
+  time-series outputs were unavailable/display-only. Existing local-model
+  governance blockers remain negative average fee-after return, negative
+  lower bound, profit factor below break-even, and missing fee-after quality
+  evidence. This is the direct current entry blocker; market-data fixes alone
+  cannot authorize a trade.
+- Read-only authoritative training-eligibility audit of 200 recent paper
+  outcomes at `2026-10-24T05:41:38+08:00` found `0/200` trainable. Every
+  outcome has authoritative OKX fill/fee/funding sources, but all 200 linked
+  pre-contract decision snapshots lack `feature_availability_contract` and
+  are correctly excluded. These historical inputs cannot be repaired by
+  copying current features or relabeled for training.
+- The 45-minute shadow-pipeline projection at `2026-10-24T05:42:17+08:00`
+  counted 27 completed rows and 112 quarantined rows across the four
+  horizons. The latest five-minute settlement pass completed 13 and
+  quarantined 40. The shadow worker is active, read-only, and reports no
+  failures or dropped queued samples. The bounded recent sample contained
+  historical-OHLCV-only rows and three native executable-price-path examples
+  whose evidence-fingerprint verifier returned false; none of those examples
+  is counted as accepted training evidence. No executed entry evidence was
+  found in the audit window.
+- Focused local verification of the current changed audit/data/market tests:
+  `279 passed`; Ruff, `compileall`, and `git diff --check` passed. The earlier
+  remote `test_data_service_security.py` regression remains `102 passed`.
+  The 15-minute request-latency aggregate could not be read: the `bb` SSH
+  account lacks journal access and `sudo -n journalctl` is denied. No API
+  refresh, service restart, order, or protection mutation was attempted in
+  this audit.
+- Gates remain G1 passed for negative-economics attribution only, G2 blocked,
+  and G3-G6 pending. No profitability acceptance or independent positive
+  net-return evidence exists.
+- Exact next action: add bounded per-instrument WebSocket last-message
+  coverage to the existing runtime summary so missing-ACK instruments can
+  be distinguished from ACK omissions with actual stream traffic; add a
+  bounded route-cooldown diagnostic that survives into audit-only status
+  rather than the frozen model inputs. Verify against the nine confirmed
+  route-failure symbols after a fresh, post-restart window. In parallel,
+  determine why three otherwise native shadow examples fail their evidence
+  fingerprint verifier and count eligible native, fee-after decision groups
+  without inspecting labels for candidate selection. Keep G2 blocked, all
+  entry/model permissions unchanged, and live trading inactive until these
+  provenance and profitability gates pass.
+
+### Fresh Route And Entry Blocker Check (2026-10-24 06:09 Asia/Shanghai)
+
+- Re-ran the local focused source/audit suite after recovering the workspace:
+  `275 passed`; the new bounded route-diagnostic audit tests add `25 passed`.
+  Changed-file Ruff, compileall, and `git diff --check` pass. The first
+  attempted `rtk pytest` invocation could not find a global pytest executable;
+  tests were run through the repository's `.venv\Scripts\python.exe -m pytest`.
+- Read-only online decision audit at `2026-10-24T06:04:15+08:00` queried
+  64 market decisions from the preceding 30-minute window. All 64 were HOLD;
+  all lacked authorized/selected/training prediction horizon and had
+  `paper_prediction_horizon_unavailable`. Local ML had no paper permission;
+  server-profit and time-series artifacts/signals were unavailable. The
+  sampled decision still passed all four expert calls, but analysis was
+  blocked by `funding_evidence_unavailable`; direction evidence and net
+  return estimates were absent. This is not an exchange order-placement
+  failure.
+- The matching 30-minute frozen-feature projection covered 64 decisions:
+  all contracts present, all frozen sizes below the 98,304-byte limit
+  (maximum 97,562 B), but only 36/64 component-valid. A fresh 15-minute,
+  32-row projection was worse: 13/32 component-valid and 19/32 invalid.
+  The latter still had zero over-budget rows and zero seal/compaction errors.
+  Invalid rows showed 17 orderbook fact misses, 12 each for mark and index,
+  plus seven ambiguous mark/index source clocks/receipts.
+- Extended `scripts/audit_online_frozen_feature_budget.py` to retain, for at
+  most 12 invalid examples, bounded `derivatives_route_status`, unavailable
+  reason, and source identity/clock fields for orderbook/mark/index. It does
+  not read outcome labels or add diagnostics to frozen model inputs. Its
+  focused regressions passed (`25` tests across this and neighboring audit
+  modules), Ruff and compileall passed. The 15-minute online projection
+  confirmed recurring orderbook/reference timeouts; several REST fallback
+  reference facts carried zero source timestamps and correctly failed
+  availability. The new diagnostics need to be committed and pushed before
+  they are durable.
+- A bounded authoritative training-eligibility audit at
+  `2026-10-24T06:06:06+08:00` examined 100 most recent paper trade outcomes:
+  `0/100` trainable. All have official OKX fill/fee/funding sources and v4
+  supervision, but every linked old decision lacks
+  `feature_availability_contract`; do not reconstruct these old inputs from
+  current values. No candidate or profitability acceptance exists.
+- G1 remains passed only for negative-economics attribution; G2 is blocked;
+  G3-G6 remain pending. Entry-model permissions, risk settings, and live
+  trading were not changed. No order or protective order was touched.
+- Exact next action: collect route-cache diagnostic evidence keyed to the
+  recent failure symbols, with a strict bounded runtime summary outside the
+  frozen feature input; distinguish absent/stale/misbound WebSocket facts from
+  public REST route timeout before changing market code. Then fix the
+  demonstrated cause, run focused tests, stage targeted deployment, and
+  verify a fresh decision/training window. Separately count matured native,
+  executable, fee-after shadow decision groups and inspect their fingerprint
+  failures without using already inspected labels to choose a candidate.
+  Keep all model/entry permissions unchanged until G2 and later gates pass.

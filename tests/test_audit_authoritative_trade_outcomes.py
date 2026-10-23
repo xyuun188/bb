@@ -1,6 +1,7 @@
 import base64
 import gzip
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from scripts.audit_authoritative_trade_outcomes import (
@@ -12,6 +13,8 @@ from scripts.audit_authoritative_trade_outcomes import (
     _slippage_integrity_summary,
     _slippage_storage_summary,
     _strategy_entry_kind_counts,
+    _training_exclusion_summary,
+    _training_outcome_query_kwargs,
 )
 from services.okx_execution_slippage import OKX_FILL_MARK_SLIPPAGE_VERSION
 
@@ -212,6 +215,55 @@ def test_authoritative_audit_gate_contract_requires_complete_trainable_outcomes(
         "authoritative_outcomes_all_incomplete",
         "authoritative_training_samples_missing",
     ]
+
+
+def test_training_exclusion_summary_counts_each_reason_once_per_outcome() -> None:
+    summary = _training_exclusion_summary(
+        {
+            "record_count": 2,
+            "included_count": 1,
+            "excluded_count": 1,
+            "records": [
+                {
+                    "exclusion_reasons": [
+                        "missing_feature_availability",
+                        "missing_feature_availability",
+                    ]
+                },
+                {"exclusion_reasons": ["missing_authoritative_fee"]},
+                "invalid-record",
+            ],
+        }
+    )
+
+    assert summary == {
+        "record_count": 3,
+        "included_count": 1,
+        "excluded_count": 1,
+        "excluded_reason_counts": {
+            "missing_authoritative_fee": 1,
+            "missing_feature_availability": 1,
+        },
+    }
+
+
+def test_training_outcome_audit_matches_current_training_projection(monkeypatch) -> None:
+    start = datetime(2026, 10, 1, tzinfo=UTC)
+    monkeypatch.setattr(
+        "scripts.audit_authoritative_trade_outcomes.load_training_data_start",
+        lambda: start,
+    )
+
+    kwargs = _training_outcome_query_kwargs(mode="paper", limit=500)
+
+    assert kwargs == {
+        "mode": "paper",
+        "since": start,
+        "limit": 500,
+        "compact": True,
+        "include_training_features": True,
+        "include_decision_evidence": True,
+    }
 
 
 def test_online_audit_decodes_compressed_json_without_ssh_truncation(

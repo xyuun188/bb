@@ -39,12 +39,12 @@ OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
 # caller.  Without this, cancelling an outer wait leaves a requests worker
 # blocked on the OS socket timeout and every balance refresh piles up behind it.
 OKX_SDK_HTTP_TIMEOUT_SECONDS = 8.0
-OKX_WS_PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_WS_PUBLIC_URL = "wss://ws.okx.com/ws/v5/public"
 OKX_WS_TICKER_EMIT_INTERVAL_SECONDS = 5.0
 OKX_WS_TICKER_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"tickers"')
 OKX_WS_TICKER_INST_ID_RE = re.compile(r'"instId"\s*:\s*"([^"]+)"')
-OKX_WS_BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
-OKX_WS_DEMO_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+OKX_WS_BUSINESS_URL = "wss://ws.okx.com/ws/v5/business"
+OKX_WS_DEMO_URL = "wss://wspap.okx.com/ws/v5/public?brokerId=9999"
 
 
 def okx_sdk_flag_for_mode(mode: str) -> str:

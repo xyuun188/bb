@@ -2255,6 +2255,56 @@ async def test_incomplete_derivatives_cache_is_not_reused_as_fresh() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recent_incomplete_derivatives_cache_suppresses_retry_storm() -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    service._derivatives_cache["PROS/USDT"] = {
+        "updated_at": datetime.now(UTC),
+        "data": {
+            "derivatives_required_data_available": False,
+            "orderbook_data_available": False,
+        },
+    }
+    scheduled: list[str] = []
+    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot(
+        "PROS/USDT",
+        block_on_remote=False,
+    )
+
+    assert scheduled == []
+    assert result["derivatives_snapshot_stale"] is True
+    assert result["derivatives_required_data_available"] is False
+    assert result["derivatives_refresh_suppressed"] is True
+    assert result["derivatives_refresh_retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_derivatives_cache_retries_after_backoff() -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    service._derivatives_cache["PROS/USDT"] = {
+        "updated_at": datetime.now(UTC) - timedelta(seconds=16),
+        "data": {
+            "derivatives_required_data_available": False,
+            "orderbook_data_available": False,
+        },
+    }
+    scheduled: list[str] = []
+    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+
+    result = await service._get_derivatives_snapshot(
+        "PROS/USDT",
+        block_on_remote=False,
+    )
+
+    assert scheduled == ["PROS/USDT"]
+    assert result["derivatives_refresh_in_background"] is True
+    assert result["derivatives_required_data_available"] is False
+
+
+@pytest.mark.asyncio
 async def test_derivatives_refresh_timeout_keeps_shared_task_alive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2940,6 +2990,324 @@ async def test_native_cache_keeps_newest_current_book_and_mark(ws_offset_ms: int
     assert result["mark_price"] == (0.106 if use_ws else 0.105)
     assert result["bid_depth_usdt"] == (500.0 if use_ws else 300.0)
     assert result["ask_depth_usdt"] == (600.0 if use_ws else 400.0)
+
+
+def test_cached_native_derivatives_facts_scale_contract_depth_and_bind_identity() -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    received_at = datetime.now(UTC).isoformat()
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "2",
+        "settleCcy": "USDT",
+    }
+    base_fact = {
+        "source_timestamp_ms": timestamp,
+        "received_at": received_at,
+        "price": 100.0,
+    }
+    service.ws_client = SimpleNamespace(
+        latest_tickers={
+            "BTC/USDT": {
+                "timestamp": timestamp,
+                "source_timestamp_ms": timestamp,
+            }
+        },
+        latest_orderbooks={
+            "BTC/USDT": {
+                "bid_depth_quote_contracts": 1000.0,
+                "ask_depth_quote_contracts": 1200.0,
+                "orderbook_fact": {
+                    **base_fact,
+                    "inst_id": "BTC-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "books5",
+                    "bid": 99.9,
+                    "ask": 100.1,
+                },
+            }
+        },
+        latest_mark_prices={
+            "BTC/USDT": {
+                "mark_price_fact": {
+                    **base_fact,
+                    "inst_id": "BTC-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "mark-price",
+                }
+            }
+        },
+        latest_index_prices={
+            "BTC/USDT": {
+                "index_price_fact": {
+                    **base_fact,
+                    "inst_id": "BTC-USDT",
+                    "inst_type": "INDEX",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "index-tickers",
+                }
+            }
+        },
+    )
+
+    result = service._cached_native_derivatives_facts("BTC/USDT", spec)
+
+    assert result["orderbook"]["orderbook_bid_depth"] == pytest.approx(20.0)
+    assert result["orderbook"]["orderbook_ask_depth"] == pytest.approx(24.0)
+    assert result["orderbook"]["orderbook_fact"]["contract_spec_version"]
+    assert result["reference_prices"]["mark_price"] == pytest.approx(100.0)
+    assert result["reference_prices"]["index_price"] == pytest.approx(100.0)
+
+
+def test_native_derivatives_cache_diagnostic_explains_rejected_sources() -> None:
+    service = _service()
+    now = datetime.now(UTC)
+    timestamp = int(now.timestamp() * 1000)
+    old_timestamp = timestamp - 120_000
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "1",
+        "settleCcy": "USDT",
+    }
+    service._instrument_spec_cache = {"BTC/USDT": spec}
+    service.ws_client = SimpleNamespace(
+        latest_tickers={
+            "BTC/USDT": {
+                "source_endpoint": "okx_ws_public",
+                "source_timestamp_ms": timestamp,
+                "timestamp": timestamp,
+                "received_at": now.isoformat(),
+            }
+        },
+        latest_orderbooks={
+            "BTC/USDT": {
+                "bid_depth_quote_contracts": 1000,
+                "ask_depth_quote_contracts": 1200,
+                "orderbook_fact": {
+                    "inst_id": "BTC-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_ws_public",
+                    "source_channel": "books5",
+                    "source_timestamp_ms": old_timestamp,
+                    "received_at": (
+                        now - timedelta(seconds=120)
+                    ).isoformat(),
+                    "bid": 99.9,
+                    "ask": 100.1,
+                },
+            }
+        },
+        latest_mark_prices={
+            "BTC/USDT": {
+                "mark_price_fact": {
+                    "inst_id": "BTC-USDT-SWAP",
+                    "inst_type": "SWAP",
+                    "source_endpoint": "okx_rest_public_mark_price",
+                    "source_channel": "mark-price",
+                    "source_timestamp_ms": 0,
+                    "received_at": now.isoformat(),
+                    "price": 100.0,
+                }
+            }
+        },
+        latest_index_prices={"BTC/USDT": {}},
+    )
+
+    facts = service._cached_native_derivatives_facts("BTC/USDT", spec)
+    diagnostic = service._native_derivatives_cache_diagnostics_snapshot()
+
+    assert facts == {}
+    assert len(diagnostic) == 1
+    assert diagnostic[0]["contract_spec_status"] == "complete"
+    assert diagnostic[0]["orderbook"]["status"] == "stale_or_ticker_misaligned"
+    assert diagnostic[0]["mark_price"]["status"] == "source_mismatch"
+    assert diagnostic[0]["index_price"]["status"] == "missing"
+    assert diagnostic[0]["orderbook"]["source_channel"] == "books5"
+
+
+def test_native_derivatives_cache_diagnostics_are_bounded_and_copied() -> None:
+    service = _service()
+
+    for index in range(80):
+        service._record_native_derivatives_cache_diagnostic(
+            f"COIN{index}/USDT",
+            contract_spec_status="complete",
+            orderbook={"status": "missing"},
+            mark_price={"status": "missing"},
+            index_price={"status": "missing"},
+        )
+
+    snapshot = service._native_derivatives_cache_diagnostics_snapshot(limit=100)
+    snapshot[-1]["symbol"] = "mutated"
+
+    assert len(snapshot) == 64
+    assert snapshot[0]["symbol"] == "COIN16/USDT"
+    assert service._native_derivatives_cache_diagnostics_snapshot()[-1][
+        "symbol"
+    ] == "COIN79/USDT"
+
+
+def test_market_state_exposes_only_bounded_native_cache_diagnostics() -> None:
+    service = _service()
+    service.ws_client = SimpleNamespace(
+        latest_tickers={},
+        get_stats=lambda: {"connected": True},
+    )
+    service._record_native_derivatives_cache_diagnostic(
+        "BTC/USDT",
+        contract_spec_status="complete",
+        orderbook={"status": "source_mismatch"},
+        mark_price={"status": "source_clock_missing"},
+        index_price={"status": "missing"},
+    )
+
+    market_state = service.get_market_state()
+    market_state["native_derivatives_cache_diagnostics"][0]["symbol"] = "changed"
+
+    assert market_state["ws_stats"] == {"connected": True}
+    assert len(market_state["native_derivatives_cache_diagnostics"]) == 1
+    assert service._native_derivatives_cache_diagnostics_snapshot()[0][
+        "symbol"
+    ] == "BTC/USDT"
+
+
+@pytest.mark.parametrize(
+    ("fact_key", "replacement"),
+    [
+        ("orderbook_fact", {"source_timestamp_ms": 1}),
+        ("index_price_fact", {"source_channel": "tickers"}),
+        ("index_price_fact", {"inst_id": "ETH-USDT"}),
+    ],
+)
+def test_cached_native_derivatives_facts_reject_stale_or_misbound_facts(
+    fact_key: str,
+    replacement: dict[str, Any],
+) -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    received_at = datetime.now(UTC).isoformat()
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "2",
+        "settleCcy": "USDT",
+    }
+    book_fact = {
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "books5",
+        "source_timestamp_ms": timestamp,
+        "received_at": received_at,
+        "bid": 99.9,
+        "ask": 100.1,
+    }
+    mark_fact = {
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "mark-price",
+        "source_timestamp_ms": timestamp,
+        "received_at": received_at,
+        "price": 100.0,
+    }
+    index_fact = {
+        "inst_id": "BTC-USDT",
+        "inst_type": "INDEX",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "index-tickers",
+        "source_timestamp_ms": timestamp,
+        "received_at": received_at,
+        "price": 100.0,
+    }
+    target = {
+        "orderbook_fact": book_fact,
+        "mark_price_fact": mark_fact,
+        "index_price_fact": index_fact,
+    }[fact_key]
+    target.update(replacement)
+    service.ws_client = SimpleNamespace(
+        latest_tickers={"BTC/USDT": {"timestamp": timestamp}},
+        latest_orderbooks={
+            "BTC/USDT": {
+                "bid_depth_quote_contracts": 1000.0,
+                "ask_depth_quote_contracts": 1200.0,
+                "orderbook_fact": book_fact,
+            }
+        },
+        latest_mark_prices={"BTC/USDT": {"mark_price_fact": mark_fact}},
+        latest_index_prices={"BTC/USDT": {"index_price_fact": index_fact}},
+    )
+
+    result = service._cached_native_derivatives_facts("BTC/USDT", spec)
+
+    if fact_key == "orderbook_fact":
+        assert "orderbook" not in result
+    else:
+        assert "reference_prices" not in result
+
+
+def test_cached_native_derivatives_facts_accepts_current_slow_index_channel() -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    now = datetime.fromtimestamp(timestamp / 1000, UTC)
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctType": "linear",
+        "ctVal": "0.01",
+        "ctMult": "2",
+        "settleCcy": "USDT",
+    }
+    mark_fact = {
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "mark-price",
+        "source_timestamp_ms": timestamp,
+        "received_at": now.isoformat(),
+        "price": 100.0,
+    }
+    index_time = now - timedelta(seconds=55)
+    index_timestamp = int(index_time.timestamp() * 1000)
+    index_fact = {
+        "inst_id": "BTC-USDT",
+        "inst_type": "INDEX",
+        "source_endpoint": "okx_ws_public",
+        "source_channel": "index-tickers",
+        "source_timestamp_ms": index_timestamp,
+        "received_at": index_time.isoformat(),
+        "price": 100.0,
+    }
+    service.ws_client = SimpleNamespace(
+        latest_tickers={
+            "BTC/USDT": {
+                "timestamp": timestamp,
+                "source_timestamp_ms": timestamp,
+            }
+        },
+        latest_orderbooks={},
+        latest_mark_prices={"BTC/USDT": {"mark_price_fact": mark_fact}},
+        latest_index_prices={"BTC/USDT": {"index_price_fact": index_fact}},
+    )
+
+    result = service._cached_native_derivatives_facts("BTC/USDT", spec)
+
+    assert result["reference_prices"]["index_price"] == pytest.approx(100.0)
 
 
 @pytest.mark.parametrize("fact_key", ["mark_price_fact", "index_price_fact"])

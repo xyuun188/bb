@@ -33,6 +33,7 @@ from services.authoritative_trade_outcome import (
 from services.okx_execution_slippage import OKX_FILL_MARK_SLIPPAGE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
+from services.training_epoch import load_training_data_start
 
 LINKAGE_RECOVERY_GAPS = {
     "missing_position_history_entry_orders",
@@ -169,6 +170,43 @@ def _compact_gap_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "recovery_class_counts": dict(
             summary.get("recovery_class_counts") or {}
         ),
+    }
+
+
+def _training_exclusion_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    records = manifest.get("records")
+    if not isinstance(records, list):
+        records = []
+    reason_counts: Counter[str] = Counter()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        reasons = record.get("exclusion_reasons")
+        if not isinstance(reasons, list):
+            continue
+        reason_counts.update(
+            {
+                str(reason).strip()[:160]
+                for reason in reasons
+                if str(reason).strip()
+            }
+        )
+    return {
+        "record_count": len(records),
+        "included_count": int(manifest.get("included_count") or 0),
+        "excluded_count": int(manifest.get("excluded_count") or 0),
+        "excluded_reason_counts": dict(reason_counts.most_common(20)),
+    }
+
+
+def _training_outcome_query_kwargs(*, mode: str, limit: int) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "since": load_training_data_start(),
+        "limit": limit,
+        "compact": True,
+        "include_training_features": True,
+        "include_decision_evidence": True,
     }
 
 
@@ -332,15 +370,11 @@ async def audit(
     # compact loader keeps the authoritative label contract while avoiding
     # detoasting large decision/evidence JSON payloads.
     outcome_limit = 500
-    outcomes = await load_authoritative_trade_outcomes(
+    training_query = _training_outcome_query_kwargs(
         mode=mode,
-        compact=True,
-        # Promotion/training auditing needs the exact entry decision payload;
-        # the compact projection remains bounded but must not omit authority
-        # and strategy-contract fields from the decision learning snapshot.
-        include_decision_evidence=True,
         limit=outcome_limit,
     )
+    outcomes = await load_authoritative_trade_outcomes(**training_query)
     exchange_order_ids = {
         str(order_id).strip()
         for outcome in outcomes
@@ -433,6 +467,10 @@ async def audit(
     return {
         "status": "ok" if not violations else "blocked",
         "mode": mode,
+        "training_data_started_at": training_query["since"].isoformat(),
+        "training_feature_projection_enabled": training_query[
+            "include_training_features"
+        ],
         "contract_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
         "outcome_count": len(outcomes),
         "outcome_limit": outcome_limit,
@@ -442,6 +480,7 @@ async def audit(
         "promotion_gate": promotion_gate,
         "training_integrity": {
             "trainable_count": len(trainable),
+            "eligibility": _training_exclusion_summary(manifest),
             "trainable_realized_pnl_sign_counts": _realized_pnl_sign_counts(trainable),
             "all_outcome_entry_kind_counts": _strategy_entry_kind_counts(outcomes),
             "trainable_entry_kind_counts": _strategy_entry_kind_counts(trainable),

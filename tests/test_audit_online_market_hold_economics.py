@@ -9,6 +9,31 @@ import pytest
 from scripts import audit_online_market_hold_economics as audit
 
 
+def test_horizon_summary_keeps_only_bounded_contract_evidence() -> None:
+    report = {
+        "row_count": 2,
+        "quality_reason_codes": {"funding_evidence_unavailable": 2},
+        "authorized_horizon_source_counts": {"unavailable": 2},
+        "source_contract_status_counts": {"server_profit|v2|5|stale|ineligible": 4},
+        "incomplete_examples": [
+            {
+                "id": index,
+                "symbol": "BTC/USDT",
+                "created_at": "2026-10-23T00:00:00Z",
+                "horizon_diagnostic": {"source_contracts": []},
+                "quality": {"large": "omitted"},
+            }
+            for index in range(12)
+        ],
+    }
+
+    summary = audit._horizon_summary(report)
+
+    assert summary["row_count"] == 2
+    assert len(summary["incomplete_horizon_samples"]) == 8
+    assert "quality" not in summary["incomplete_horizon_samples"][0]
+
+
 def test_remote_audit_compiles_and_reads_current_consultation_contract() -> None:
     compile(audit.REMOTE_SCRIPT, "<online-market-hold-economics>", "exec")
 
@@ -52,6 +77,17 @@ def test_remote_audit_reports_observation_starvation_economics() -> None:
     assert "hard_review_required" in audit.REMOTE_SCRIPT
     assert "execution_result" in audit.REMOTE_SCRIPT
     assert "exchange_order_id" in audit.REMOTE_SCRIPT
+
+
+def test_remote_audit_reports_authorized_horizons_and_funding_blockers() -> None:
+    compile(audit.REMOTE_SCRIPT, "<online-market-hold-economics>", "exec")
+
+    assert "def _horizon_diagnostic(raw):" in audit.REMOTE_SCRIPT
+    assert "authorized_horizon_source_counts" in audit.REMOTE_SCRIPT
+    assert "funding_projection_reason_counts" in audit.REMOTE_SCRIPT
+    assert "source_contract_status_counts" in audit.REMOTE_SCRIPT
+    assert "profit_supervision_version" in audit.REMOTE_SCRIPT
+    assert '"horizon_diagnostic": horizon' in audit.REMOTE_SCRIPT
 
 
 def test_remote_audit_reads_large_json_without_log_truncation(monkeypatch) -> None:

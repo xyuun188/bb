@@ -1492,9 +1492,13 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
         )
 
 
-def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> None:
+def test_local_ai_registry_activates_governed_paper_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = ModuleType("local_ai_tools_api_registry_canary_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(module, "INDEPENDENT_EXAM_PROMOTION_ENABLED", True)
     _configure_local_ai_registry(module, tmp_path)
     metadata = _test_artifact_metadata(module)
     metadata["oos_return_evaluation"]["long"]["return_lcb_pct"] = -0.5
@@ -1530,9 +1534,11 @@ def test_local_ai_registry_activates_governed_paper_canary(tmp_path: Path) -> No
 
 def test_local_ai_registry_activates_active_only_with_complete_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = ModuleType("local_ai_tools_api_registry_governed_live_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(module, "INDEPENDENT_EXAM_PROMOTION_ENABLED", True)
     _configure_local_ai_registry(module, tmp_path)
     metadata = _test_artifact_metadata(module)
     assert module._production_return_evidence_blockers(metadata) == []
@@ -1566,9 +1572,11 @@ def test_local_ai_registry_activates_active_only_with_complete_evidence(
 
 def test_local_ai_registry_rejects_regressive_active_challenger(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = ModuleType("local_ai_tools_api_registry_challenger_rejection_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(module, "INDEPENDENT_EXAM_PROMOTION_ENABLED", True)
     champion = _persist_test_shadow_artifact(module, tmp_path)
     recommendation = {
         "recommended_stage": "active",
@@ -1623,9 +1631,11 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
 
 def test_local_ai_registry_accepts_strictly_improved_active_challenger(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = ModuleType("local_ai_tools_api_registry_challenger_acceptance_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    monkeypatch.setattr(module, "INDEPENDENT_EXAM_PROMOTION_ENABLED", True)
     champion = _persist_test_shadow_artifact(module, tmp_path)
     recommendation = {
         "recommended_stage": "active",
@@ -2988,6 +2998,68 @@ def test_local_ai_tools_training_does_not_require_shadow_execution_cost(
     assert market_rows
     assert all("long_execution_cost" not in row for row in market_rows)
     assert all(row["best_side"] == "long" for row in market_rows)
+
+
+@pytest.mark.parametrize("recommended_stage", ["canary", "active"])
+def test_candidate_promotion_stays_shadow_until_independent_exam_passes(
+    tmp_path: Path,
+    recommended_stage: str,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    recommendation = {
+        "recommended_stage": recommended_stage,
+        "canary_ready": True,
+        "canary_execution_scope": "paper_only",
+        "canary_production_permission": False,
+        "live_ml_ready": True,
+    }
+
+    assert module.INDEPENDENT_EXAM_PROMOTION_ENABLED is False
+    assert (
+        module._governed_candidate_activation_stage(recommendation, [])
+        == "shadow"
+    )
+
+
+def test_phase3_service_uses_current_supervision_and_rejects_legacy_v2(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    assert module.PROFIT_SUPERVISION_VERSION == PROFIT_SUPERVISION_VERSION
+
+    current_samples = _training_shadow_samples(count=2)
+    assert len(module._market_training_rows(current_samples)) == 2
+
+    legacy_samples = deepcopy(current_samples)
+    for sample in legacy_samples:
+        sample["profit_supervision"]["version"] = (
+            "2026-07-24.separated-profit-supervision.v2"
+        )
+    assert module._market_training_rows(legacy_samples) == []
+
+    legacy_metadata = _test_artifact_metadata(
+        module,
+        profit_supervision_version="2026-07-24.separated-profit-supervision.v2",
+    )
+    with pytest.raises(
+        module.IncompatibleArtifactContractError,
+        match="profit_supervision_version",
+    ):
+        module.persist_candidate_bundle(_test_artifact_bundle(), legacy_metadata)
+
+    legacy_source = SERVICE_CODE.replace(
+        f'PROFIT_SUPERVISION_VERSION = "{module.PROFIT_SUPERVISION_VERSION}"',
+        'PROFIT_SUPERVISION_VERSION = "2026-07-24.separated-profit-supervision.v2"',
+        1,
+    )
+    assert legacy_source != SERVICE_CODE
+    legacy_module = ModuleType("local_ai_tools_legacy_v2_artifact_test")
+    exec(compile(legacy_source, "local_ai_tools_api_legacy_v2.py", "exec"), legacy_module.__dict__)
+    legacy_root = tmp_path / "legacy-v2"
+    _persist_test_shadow_artifact(legacy_module, legacy_root)
+
+    current_module = _local_ai_tools_training_module(legacy_root)
+    assert current_module.load_bundle() is None
 
 
 def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(

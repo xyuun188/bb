@@ -56,6 +56,7 @@ REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
 # before persisting a missing fact under burst load.
 ORDERBOOK_ROUTE_TIMEOUT_SECONDS = 5.5
 ORDERBOOK_CACHE_TTL_SECONDS = 10.0
+NATIVE_WEBSOCKET_FACT_MAX_AGE_SECONDS = 10.0
 TICKER_ROUTE_TIMEOUT_SECONDS = 2.5
 # A caller joining an already-running ticker refresh gets a normal bounded
 # wait.  This is deliberately independent from the first caller's short
@@ -213,6 +214,73 @@ def _reference_snapshot_is_complete(result: dict[str, Any]) -> bool:
             source_timestamp_ms=index.get("source_timestamp_ms"),
             received_at=index.get("received_at"),
         )
+    )
+
+
+def _websocket_fact_is_fresh(
+    fact: dict[str, Any],
+    *,
+    max_age_seconds: float = NATIVE_WEBSOCKET_FACT_MAX_AGE_SECONDS,
+) -> bool:
+    source_ms = _positive_timestamp_ms(fact.get("source_timestamp_ms"))
+    received = availability_timestamp(fact.get("received_at"))
+    if source_ms <= 0 or received is None:
+        return False
+    now = datetime.now(UTC)
+    age_seconds = (now - received).total_seconds()
+    return (
+        -1.0 <= age_seconds <= max_age_seconds
+        and source_ms <= int(received.timestamp() * 1000)
+        and abs(int(now.timestamp() * 1000) - source_ms)
+        <= max_age_seconds * 1000
+        and _reference_fact_clock_is_valid(
+            price=fact.get("bid") or fact.get("price"),
+            source_timestamp_ms=source_ms,
+            received_at=received,
+        )
+    )
+
+
+def _websocket_orderbook_matches(
+    result: dict[str, Any],
+    *,
+    expected_inst_id: str,
+) -> bool:
+    fact = result.get("orderbook_fact")
+    return (
+        isinstance(fact, dict)
+        and result.get("orderbook_data_available") is True
+        and str(fact.get("source_endpoint") or "") == "okx_ws_public"
+        and str(fact.get("source_channel") or "") == "books5"
+        and str(fact.get("inst_id") or "").upper() == expected_inst_id
+        and str(fact.get("inst_type") or "").upper() == "SWAP"
+        and _websocket_fact_is_fresh(fact)
+        and _orderbook_snapshot_is_complete(result)
+    )
+
+
+def _websocket_reference_prices_match(
+    result: dict[str, Any],
+    *,
+    expected_inst_id: str,
+    expected_uly: str,
+) -> bool:
+    mark = result.get("mark_price_fact")
+    index = result.get("index_price_fact")
+    return (
+        isinstance(mark, dict)
+        and isinstance(index, dict)
+        and str(mark.get("source_endpoint") or "") == "okx_ws_public"
+        and str(mark.get("source_channel") or "") == "mark-price"
+        and str(mark.get("inst_id") or "").upper() == expected_inst_id
+        and str(mark.get("inst_type") or "").upper() == "SWAP"
+        and str(index.get("source_endpoint") or "") == "okx_ws_public"
+        and str(index.get("source_channel") or "") == "index-tickers"
+        and str(index.get("inst_id") or "").upper() == expected_uly
+        and str(index.get("inst_type") or "").upper() == "INDEX"
+        and _websocket_fact_is_fresh(mark)
+        and _websocket_fact_is_fresh(index, max_age_seconds=65.0)
+        and _reference_snapshot_is_complete(result)
     )
 
 
@@ -1430,6 +1498,7 @@ class OKXRestClient:
         timeout_seconds: float = DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS,
         required_only: bool = False,
         require_funding: bool = False,
+        native_market_facts: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Fetch compact perpetual-swap features used by AI experts.
 
@@ -1443,14 +1512,40 @@ class OKXRestClient:
         required_routes = {"orderbook", "reference_prices"}
         if require_funding:
             required_routes.add("funding")
-        route_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {
-            "orderbook": asyncio.create_task(
+        cached_facts = native_market_facts if isinstance(native_market_facts, dict) else {}
+        normalized_spec = normalize_okx_contract_spec(contract_spec)
+        expected_inst_id = str(normalized_spec.get("inst_id") or "").upper()
+        expected_uly = str(normalized_spec.get("uly") or "").upper()
+        route_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        if (
+            isinstance(cached_facts.get("orderbook"), dict)
+            and _websocket_orderbook_matches(
+                cached_facts["orderbook"],
+                expected_inst_id=expected_inst_id,
+            )
+        ):
+            route_tasks["orderbook"] = asyncio.create_task(
+                asyncio.sleep(0, result=dict(cached_facts["orderbook"]))
+            )
+        else:
+            route_tasks["orderbook"] = asyncio.create_task(
                 self.fetch_order_book_metrics(symbol, contract_spec=contract_spec)
-            ),
-            "reference_prices": asyncio.create_task(
+            )
+        if (
+            isinstance(cached_facts.get("reference_prices"), dict)
+            and _websocket_reference_prices_match(
+                cached_facts["reference_prices"],
+                expected_inst_id=expected_inst_id,
+                expected_uly=expected_uly,
+            )
+        ):
+            route_tasks["reference_prices"] = asyncio.create_task(
+                asyncio.sleep(0, result=dict(cached_facts["reference_prices"]))
+            )
+        else:
+            route_tasks["reference_prices"] = asyncio.create_task(
                 self.fetch_reference_prices(symbol, contract_spec=contract_spec)
-            ),
-        }
+            )
         if not required_only or require_funding:
             route_tasks["funding"] = asyncio.create_task(
                 self._cached_derivatives_route(

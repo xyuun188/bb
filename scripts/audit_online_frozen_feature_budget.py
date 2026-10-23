@@ -91,11 +91,40 @@ def main_summary(rows, checked_at, source):
         if availability_reasons:
             availability_reason_counts.update(availability_reasons)
             if len(availability_invalid_examples) < 12:
+                route_status = features.get("derivatives_route_status")
+                route_status = route_status if isinstance(route_status, dict) else {}
+                fact_sources = {}
+                for key in (
+                    "orderbook_fact",
+                    "mark_price_fact",
+                    "index_price_fact",
+                ):
+                    fact = features.get(key)
+                    fact = fact if isinstance(fact, dict) else {}
+                    fact_sources[key] = {
+                        field: fact.get(field)
+                        for field in (
+                            "source_endpoint",
+                            "source_channel",
+                            "inst_id",
+                            "source_timestamp_ms",
+                            "received_at",
+                        )
+                        if fact.get(field) is not None
+                    }
                 availability_invalid_examples.append(
                     {
                         "id": row.id,
                         "symbol": row.symbol,
                         "reasons": availability_reasons[:12],
+                        "derivatives_route_status": {
+                            key: list(route_status.get(key) or [])[:8]
+                            for key in ("completed", "failed", "timed_out")
+                        },
+                        "derivatives_unavailable_reason": str(
+                            features.get("derivatives_unavailable_reason") or ""
+                        )[:120],
+                        "fact_sources": fact_sources,
                     }
                 )
         else:

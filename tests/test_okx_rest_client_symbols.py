@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -1544,3 +1545,150 @@ async def test_cancel_order_uses_okx_native_cancel_order(monkeypatch) -> None:
             ({"instId": "SPK-USDT-SWAP", "ordId": "spk-order-1"},),
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_derivatives_snapshot_reuses_fresh_native_websocket_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    timestamp = int(time.time() * 1000)
+    received_at = datetime.now(UTC).isoformat()
+    spec = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctVal": "0.01",
+        "ctMult": "1",
+    }
+    native_facts = {
+        "orderbook": {
+            "orderbook_data_available": True,
+            "orderbook_bid_depth": 100.0,
+            "orderbook_ask_depth": 120.0,
+            "orderbook_fact": {
+                "inst_id": "BTC-USDT-SWAP",
+                "inst_type": "SWAP",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "books5",
+                "source_timestamp_ms": timestamp,
+                "received_at": received_at,
+                "bid": 99.9,
+                "ask": 100.1,
+                "bid_depth_usdt": 100.0,
+                "ask_depth_usdt": 120.0,
+            },
+        },
+        "reference_prices": {
+            "reference_prices_data_available": True,
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "mark_price_fact": {
+                "inst_id": "BTC-USDT-SWAP",
+                "inst_type": "SWAP",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "mark-price",
+                "source_timestamp_ms": timestamp,
+                "received_at": received_at,
+                "price": 100.0,
+            },
+            "index_price_fact": {
+                "inst_id": "BTC-USDT",
+                "inst_type": "INDEX",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "index-tickers",
+                "source_timestamp_ms": timestamp,
+                "received_at": received_at,
+                "price": 100.0,
+            },
+        },
+    }
+
+    async def unexpected_orderbook(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("fresh native orderbook should suppress REST")
+
+    async def unexpected_references(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("fresh native references should suppress REST")
+
+    monkeypatch.setattr(client, "fetch_order_book_metrics", unexpected_orderbook)
+    monkeypatch.setattr(client, "fetch_reference_prices", unexpected_references)
+
+    result = await client.fetch_derivatives_snapshot(
+        "BTC/USDT",
+        contract_spec=spec,
+        required_only=True,
+        native_market_facts=native_facts,
+    )
+
+    assert result["derivatives_required_data_available"] is True
+    assert result["derivatives_route_status"] == {
+        "completed": ["orderbook", "reference_prices"],
+        "failed": [],
+        "timed_out": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_derivatives_snapshot_rejects_misbound_websocket_reference_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    timestamp = int(time.time() * 1000)
+    received_at = datetime.now(UTC).isoformat()
+    native_facts = {
+        "reference_prices": {
+            "reference_prices_data_available": True,
+            "mark_price": 100.0,
+            "index_price": 100.0,
+            "mark_price_fact": {
+                "inst_id": "BTC-USDT-SWAP",
+                "inst_type": "SWAP",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "mark-price",
+                "source_timestamp_ms": timestamp,
+                "received_at": received_at,
+                "price": 100.0,
+            },
+            "index_price_fact": {
+                "inst_id": "ETH-USDT",
+                "inst_type": "INDEX",
+                "source_endpoint": "okx_ws_public",
+                "source_channel": "index-tickers",
+                "source_timestamp_ms": timestamp,
+                "received_at": received_at,
+                "price": 100.0,
+            },
+        }
+    }
+    calls: list[str] = []
+
+    async def fallback(_symbol: str, *, contract_spec=None) -> dict[str, Any]:
+        calls.append("reference")
+        return {
+            "reference_prices_data_available": False,
+            "mark_price": 0.0,
+            "index_price": 0.0,
+        }
+
+    async def orderbook(_symbol: str, *, contract_spec=None) -> dict[str, Any]:
+        calls.append("orderbook")
+        return {"orderbook_data_available": False}
+
+    monkeypatch.setattr(client, "fetch_reference_prices", fallback)
+    monkeypatch.setattr(client, "fetch_order_book_metrics", orderbook)
+
+    result = await client.fetch_derivatives_snapshot(
+        "BTC/USDT",
+        contract_spec={
+            "instId": "BTC-USDT-SWAP",
+            "instType": "SWAP",
+            "uly": "BTC-USDT",
+            "ctVal": "0.01",
+            "ctMult": "1",
+        },
+        required_only=True,
+        native_market_facts=native_facts,
+    )
+
+    assert calls == ["orderbook", "reference"]
+    assert result["derivatives_required_data_available"] is False
