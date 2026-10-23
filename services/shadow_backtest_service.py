@@ -21,6 +21,7 @@ from core.market_facts import (
 )
 from core.safe_output import safe_error_text
 from core.training_contracts import (
+    SHADOW_LABEL_HORIZONS_MINUTES,
     SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS,
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
@@ -35,7 +36,7 @@ from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
 logger = structlog.get_logger(__name__)
 
-SHADOW_BACKTEST_HORIZONS_MINUTES = (5, 15, 60, 240)
+SHADOW_BACKTEST_HORIZONS_MINUTES = SHADOW_LABEL_HORIZONS_MINUTES
 SHADOW_LEVERAGE_SCENARIOS = (1, 2, 3, 5, 10)
 SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfactual.v1"
 # Shadow maintenance is deliberately bounded: it must make progress without

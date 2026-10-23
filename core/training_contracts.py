@@ -12,6 +12,7 @@ from typing import Any
 from core.market_facts import _datetime
 
 SHADOW_LABEL_VERSION = "2026-07-27.market-opportunity-multitask.v2"
+SHADOW_LABEL_HORIZONS_MINUTES = (5, 15, 60, 240)
 HISTORICAL_SHADOW_REBUILD_VERSION = "2026-10-22.preserved-ohlcv-close-availability.v2"
 HISTORICAL_SHADOW_SOURCE = "preserved_market_klines_historical_path"
 SHADOW_FEE_AFTER_LABEL_VERSION = "2026-07-22.shadow-fee-after-return.v1"

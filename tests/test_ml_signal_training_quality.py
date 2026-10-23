@@ -12,6 +12,7 @@ import pytest
 from config.settings import settings
 from core.model_artifact_safety import dump_trusted_joblib
 from core.training_contracts import (
+    SHADOW_LABEL_HORIZONS_MINUTES,
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
     compact_shadow_label_contract,
@@ -633,6 +634,7 @@ def _db_shadow_row(
             row_id,
             due_at,
             decision_id=decision_id,
+            horizon_minutes=SHADOW_LABEL_HORIZONS_MINUTES[0],
             long_return_pct=float(long_return_pct or 0.0),
             short_return_pct=float(short_return_pct or 0.0),
             best_action=best_action,
@@ -653,7 +655,7 @@ def _db_shadow_row(
         feature_snapshot=feature_snapshot,
         status=status,
         due_at=due_at,
-        horizon_minutes=30,
+        horizon_minutes=SHADOW_LABEL_HORIZONS_MINUTES[0],
         actual_price=101.0,
         long_return_pct=long_return_pct,
         short_return_pct=short_return_pct,
@@ -3236,6 +3238,65 @@ async def test_load_shadow_training_rows_pulls_deeper_best_trade_pool(
 
 
 @pytest.mark.asyncio
+async def test_load_shadow_training_rows_sql_stratifies_capped_decision_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        ml_training_dataset,
+        "load_training_data_start",
+        lambda: base_time - timedelta(days=1),
+    )
+    monkeypatch.setattr(
+        ml_training_dataset,
+        "LOCAL_ML_TRAINING_MAX_DECISION_GROUPS",
+        3,
+    )
+    rows = [
+        _db_shadow_row(60_000 + index, base_time - timedelta(minutes=index))
+        for index in range(7)
+    ]
+    rows[1].decision_id = rows[0].decision_id
+    rows[1].horizon_minutes = 15
+    rows[1].feature_snapshot["training_label_contract"] = _clean_training_label_contract(
+        rows[1].id,
+        rows[1].due_at,
+        decision_id=int(rows[1].decision_id or 0),
+        horizon_minutes=15,
+        long_return_pct=float(rows[1].long_return_pct or 0.0),
+        short_return_pct=float(rows[1].short_return_pct or 0.0),
+        best_action=str(rows[1].best_action or "hold"),
+    )
+    stale_label = _db_shadow_row(60_007, base_time - timedelta(minutes=7))
+    stale_label.label_version = "stale-shadow-label"
+    unsupported_horizon = _db_shadow_row(60_008, base_time - timedelta(minutes=8))
+    unsupported_horizon.horizon_minutes = 30
+    unsupported_horizon.feature_snapshot["training_label_contract"] = (
+        _clean_training_label_contract(
+            unsupported_horizon.id,
+            unsupported_horizon.due_at,
+            decision_id=int(unsupported_horizon.decision_id or 0),
+            horizon_minutes=30,
+            long_return_pct=float(unsupported_horizon.long_return_pct or 0.0),
+            short_return_pct=float(unsupported_horizon.short_return_pct or 0.0),
+            best_action=str(unsupported_horizon.best_action or "hold"),
+        )
+    )
+    rows.extend((stale_label, unsupported_horizon))
+    async with get_session_ctx() as session:
+        session.add_all(rows)
+
+    try:
+        selected = await load_shadow_training_rows()
+    finally:
+        await close_db()
+
+    assert {row.id for row in selected} == {60_000, 60_001, 60_003, 60_006}
+
+
+@pytest.mark.asyncio
 async def test_load_shadow_training_rows_projects_only_training_and_quality_features(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3261,6 +3322,7 @@ async def test_load_shadow_training_rows_projects_only_training_and_quality_feat
             77,
             row.due_at,
             decision_id=row.decision_id,
+            horizon_minutes=row.horizon_minutes,
             long_return_pct=float(row.long_return_pct or 0.0),
             short_return_pct=float(row.short_return_pct or 0.0),
             best_action=str(row.best_action or "hold"),

@@ -1,6 +1,6 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-23, Asia/Shanghai.
+Updated: 2026-10-24, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
@@ -1682,3 +1682,73 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   no eligible rows/artifact without reusing quarantined pre-contract trade
   features. Keep all model permissions blocked until fresh independent
   profitability evidence passes; keep live trading disabled.
+
+### Bounded Training Query Repair And Online Gate Recheck (2026-10-24 01:41 Asia/Shanghai)
+
+- Recovered the bounded shadow-training input repair in
+  `core/training_contracts.py`, `services/shadow_backtest_service.py`,
+  `services/ml_training_dataset.py`, and
+  `tests/test_ml_signal_training_quality.py`. Candidate identity selection
+  and time-stratified decision-group sampling now happen in SQL rather than
+  streaming all candidate IDs into application memory. The query hard-caps
+  the group budget at 5,000, limits returned IDs to the supported 5/15/60/240
+  minute horizons and current label version, and fails closed if rows exceed
+  the four-horizons-per-group budget. The row and group counters use the same
+  candidate contract.
+- Verification for this change: local focused ML training-quality tests
+  passed `88`; Ruff and `git diff --check` passed. The prior targeted online
+  regression for the selected training files passed `124` tests, and the
+  selected sources were deployed. This is a query/resource and sample-contract
+  fix only; it does not produce valid missing labels, a model artifact, entry
+  permission, or profitability evidence.
+- Current online state was read-only checked at
+  `2026-10-23T17:37Z-17:39Z` (2026-10-24 01:37-01:39 Asia/Shanghai). Paper mode
+  is running and unpaused, heartbeat is current, reconciliation permits entry
+  and training refresh, and there are zero open positions and zero executed
+  entries in the checked recent window. In the preceding 30 minutes, all
+  `13/13` market decisions were HOLD: no authorized, selected, or training
+  prediction horizon exists. Local ML has no paper permission; server-profit
+  and time-series each expose only unavailable 10-minute display results.
+- The current local-ML result still reports `2,040` completed samples but
+  `cost_complete_sample_count=0`; its chronological training partition has
+  zero eligible groups. The artifact is unregistered/unversioned and paper
+  execution is disabled. Existing model-quality blockers include missing
+  profit supervision, stale training-data version, nonpositive fee-after
+  lower bounds/profit factors, and failed walk-forward/regime/symbol stability.
+  Training scheduler heartbeats were fresh, but the latest local-ML attempt
+  skipped for `cost_complete_training_distribution_unavailable`; the
+  specialist training run had also been interrupted. No duplicate training
+  job was started.
+- A bounded authoritative trade sample (`200` paper outcomes) found official
+  OKX fills, fee, slippage and funding facts for all 200, but `0/200` are
+  trainable because every linked original decision feature snapshot lacks
+  `feature_availability_contract`. These historical snapshots remain
+  quarantined; do not reconstruct their decision-time facts or seal them with
+  current data.
+- A bounded new-decision snapshot sample (`14` rows, last 30 minutes) was
+  within the `98,304 B` frozen budget with no seal errors, but only `7/14`
+  passed component availability. Seven failed on missing orderbook and/or
+  mark/index receipts; four also lacked unambiguous account-fee receipt and
+  availability clocks. This is a live feature-producer/data-evidence defect,
+  separate from the model authorization blocker.
+- The shadow worker is alive and making progress, but the last five-minute
+  settlement projection counted `117` quarantined observations and only `3`
+  completed historical OHLCV-only observations. Historical OHLCV labels are
+  not executable cost-complete labels. A protection inventory also reported
+  one orphan `TRX/USDT` short-side order key while no paper position existed;
+  it was not modified. Resolve its authoritative exchange/database status
+  read-only before any future paper execution validation.
+- Gate status remains G1 passed for attribution only (historical fee-after
+  evidence is negative), G2 blocked, G3-G6 pending. Current net-profit
+  acceptance has not passed, and normal paper entry readiness is not
+  established. No strategy or model was authorized and no order/protection
+  mutation was performed.
+- Next exact action: diagnose the seven invalid decision snapshots by comparing
+  their recorded required-route receipts with the native WebSocket/REST
+  producer and cache identity for those exact decisions. Fix only a confirmed
+  producer/merge defect; collect a new bounded post-fix window and require
+  component-valid decision-time contracts before using its matured labels.
+  Separately inspect the training frame's bounded exclusion-reason distribution
+  and reconcile the orphan protection record without mutating it. Keep the
+  model permission gates unchanged until cost-complete development data and
+  fresh independent fee-after acceptance both pass.

@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 
+from core.training_contracts import SHADOW_LABEL_HORIZONS_MINUTES, SHADOW_LABEL_VERSION
 from db.session import get_read_session_ctx
 from models.learning import ShadowBacktest
 from models.trade import OkxPositionHistory
@@ -19,10 +20,14 @@ from services.ml_training_contract import MIN_TRAINING_DECISION_GROUP_COUNT
 from services.training_data_quality import annotate_samples, assess_shadow_sample
 from services.training_epoch import load_training_data_start
 
-LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = max(
-    int(os.environ.get("LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", "5000")),
-    MIN_TRAINING_DECISION_GROUP_COUNT,
-    2,
+LOCAL_ML_TRAINING_HARD_MAX_DECISION_GROUPS = 5_000
+LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = min(
+    max(
+        int(os.environ.get("LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", "5000")),
+        MIN_TRAINING_DECISION_GROUP_COUNT,
+        2,
+    ),
+    LOCAL_ML_TRAINING_HARD_MAX_DECISION_GROUPS,
 )
 LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
 SHADOW_SELECTION_POLICY_VERSION = "2026-10-21.outcome-independent-shadow-selection.v1"
@@ -164,6 +169,8 @@ def shadow_training_candidate_filters(epoch_start: datetime) -> tuple[Any, ...]:
     return (
         ShadowBacktest.status == "completed",
         ShadowBacktest.created_at >= epoch_start,
+        ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
+        ShadowBacktest.horizon_minutes.in_(SHADOW_LABEL_HORIZONS_MINUTES),
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
     )
@@ -176,27 +183,99 @@ async def load_shadow_training_rows() -> list[Any]:
     base_filters = shadow_training_candidate_filters(epoch_start)
     columns = shadow_training_columns()
     async with get_read_session_ctx() as session:
-        identity_result = await session.stream(
-            select(ShadowBacktest.id, ShadowBacktest.decision_id)
-            .where(*base_filters)
-            .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+        group_key = func.coalesce(
+            func.nullif(ShadowBacktest.decision_id, 0),
+            -ShadowBacktest.id,
         )
-        group_ids: dict[int, list[int]] = {}
-        async for mapping in identity_result.mappings():
-            sample_id = int(mapping.get("id") or 0)
-            decision_id = int(mapping.get("decision_id") or 0)
-            if sample_id > 0:
-                group_ids.setdefault(decision_id or -sample_id, []).append(sample_id)
-
-        groups = list(group_ids.values())
-        if len(groups) > LOCAL_ML_TRAINING_MAX_DECISION_GROUPS:
+        ordered_rows = (
+            select(
+                group_key.label("decision_group_key"),
+                ShadowBacktest.created_at.label("created_at"),
+                ShadowBacktest.id.label("sample_id"),
+                func.row_number()
+                .over(
+                    partition_by=group_key,
+                    order_by=(
+                        ShadowBacktest.created_at.desc(),
+                        ShadowBacktest.id.desc(),
+                    ),
+                )
+                .label("group_row_number"),
+            )
+            .where(*base_filters)
+            .subquery()
+        )
+        group_heads = (
+            select(
+                ordered_rows.c.decision_group_key,
+                ordered_rows.c.created_at,
+                ordered_rows.c.sample_id,
+            )
+            .where(ordered_rows.c.group_row_number == 1)
+            .subquery()
+        )
+        group_count_result = await session.execute(
+            select(func.count()).select_from(group_heads)
+        )
+        group_count = int(group_count_result.scalar_one() or 0)
+        if group_count > LOCAL_ML_TRAINING_MAX_DECISION_GROUPS:
             budget = LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
-            selected_group_indexes = {
-                round(index * (len(groups) - 1) / (budget - 1))
+            selected_group_ranks = {
+                round(index * (group_count - 1) / (budget - 1)) + 1
                 for index in range(budget)
             }
-            groups = [groups[index] for index in sorted(selected_group_indexes)]
-        selected_ids = [sample_id for group in groups for sample_id in group]
+            ranked_groups = (
+                select(
+                    group_heads.c.decision_group_key,
+                    func.row_number()
+                    .over(
+                        order_by=(
+                            group_heads.c.created_at.desc(),
+                            group_heads.c.sample_id.desc(),
+                        )
+                    )
+                    .label("group_rank"),
+                )
+                .subquery()
+            )
+            selected_group_result = await session.execute(
+                select(ranked_groups.c.decision_group_key)
+                .where(ranked_groups.c.group_rank.in_(selected_group_ranks))
+                .order_by(ranked_groups.c.group_rank)
+            )
+        else:
+            selected_group_result = await session.execute(
+                select(group_heads.c.decision_group_key).order_by(
+                    group_heads.c.created_at.desc(),
+                    group_heads.c.sample_id.desc(),
+                )
+            )
+        selected_group_keys = [
+            int(row[0]) for row in selected_group_result.all()
+        ]
+        if not selected_group_keys:
+            return []
+
+        identity_result = await session.execute(
+            select(ShadowBacktest.id)
+            .where(
+                *base_filters,
+                group_key.in_(selected_group_keys),
+            )
+            .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
+            .limit(
+                LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
+                * len(SHADOW_LABEL_HORIZONS_MINUTES)
+                + 1
+            )
+        )
+        selected_ids = [int(row[0]) for row in identity_result.all()]
+        sample_row_budget = (
+            LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
+            * len(SHADOW_LABEL_HORIZONS_MINUTES)
+        )
+        if len(selected_ids) > sample_row_budget:
+            raise RuntimeError("local_ml_training_sample_row_budget_exceeded")
 
         rows: list[ShadowTrainingRow] = []
         for offset in range(0, len(selected_ids), LOCAL_ML_TRAINING_READ_PAGE_SIZE):
@@ -215,10 +294,7 @@ async def count_shadow_training_rows() -> int:
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
-                ShadowBacktest.status == "completed",
-                ShadowBacktest.created_at >= epoch_start,
-                ShadowBacktest.long_return_pct.is_not(None),
-                ShadowBacktest.short_return_pct.is_not(None),
+                *shadow_training_candidate_filters(epoch_start)
             )
         )
         return int(result.scalar() or 0)
@@ -230,7 +306,12 @@ async def count_shadow_training_decision_groups() -> int:
         result = await session.execute(
             select(
                 func.count(
-                    func.distinct(func.coalesce(ShadowBacktest.decision_id, ShadowBacktest.id))
+                    func.distinct(
+                        func.coalesce(
+                            func.nullif(ShadowBacktest.decision_id, 0),
+                            -ShadowBacktest.id,
+                        )
+                    )
                 )
             ).where(*shadow_training_candidate_filters(epoch_start))
         )
