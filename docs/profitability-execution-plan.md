@@ -4504,3 +4504,108 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   chronological, purged, cost-aware development family only after clean
   coverage exists. Existing quarantined rows and the negative `n=267`
   evidence remain immutable and cannot be reused as a fresh exam.
+
+### Preregistered New Candidate Family: Fixed Random Forest (2026-10-25 06:45 Asia/Shanghai)
+
+- New development-only identity:
+  `native-fee-after-tree-v1-20261024T224500Z-24h-2500`; cutoff-exclusive UTC
+  `2026-10-24T22:45:00Z`; lookback `24` hours; maximum `2,500` decision
+  groups. This is a new candidate family and is not a rerun or retuning of the
+  inspected Ridge experiment.
+- Inputs are restricted to completed paper rows whose market contract source is
+  `shadow_entry_result_and_okx_native_1m_path` and whose label contract has
+  `fee_after_complete=true`. The model is a fixed random-forest regression
+  over the existing feature keys: `n_estimators=220`, `max_depth=8`,
+  `min_samples_leaf=8`, `random_state=42`, single-threaded research worker.
+  The only searched entry thresholds are `0`, `0.05%`, and `0.1%` net.
+- Selection remains nested and chronological: three purged outer folds,
+  two purged inner folds, primary five-minute horizon, decision-group
+  separation, 240-minute label-end purge, minimum 16 selected rows, positive
+  fee-after mean and lower bound, PF above one, and positive mean in both
+  inner folds. No exam labels, artifact persistence, permission change,
+  database mutation, order, or service restart is allowed.
+- The new source/test/audit code passed the focused seven-test suite, Ruff,
+  compileall, and `git diff --check`. It will be uploaded with
+  `--skip-restart`; the running paper service is not required for this
+  development-only reader.
+
+### Fixed Random-Forest Development Result (2026-10-25 06:53 Asia/Shanghai)
+
+- The preregistered run
+  `native-fee-after-tree-v1-20261024T224500Z-24h-2500` completed at
+  `2026-10-24T22:53:01Z` with the exact fixed cutoff
+  `2026-10-24T22:45:00Z`. It read `3,582` native executable,
+  fee-after-complete rows across `1,885` decision groups; horizon counts were
+  `899/906/909/868` for `5/15/60/240` minutes. The development input
+  fingerprint is
+  `12e4e96594d6ac01d51ea21f3a83c4238e0868b342546bcfac026d35149a94ea`.
+  Report:
+  `data/profitability_remediation/online-nested-development-tree-v4-20261024T224500Z.json`.
+- All three outer folds and all six inner folds were estimable with zero
+  decision-group overlap and chronological label separation. The fixed tree
+  family selected **zero policies in every outer fold** (`0/3`), with
+  `selected_count=0` and no aggregate return metric because no inner policy
+  met the preregistered positive fee-after mean/lower-bound/PF and fold
+  requirements.
+- Representative inner evidence was negative: outer fold 0 threshold `0.0%`
+  had mean `-0.081478%`, lower bound `-0.191482%`, PF `0.4474`; fold 1
+  threshold `0.0%` had mean `-0.121086%`, lower bound `-0.217260%`, PF
+  `0.2707`; fold 2 threshold `0.0%` had mean `-0.428333%`, lower bound
+  `-0.717095%`, PF `0.0540`. Higher thresholds did not satisfy the same
+  gates.
+- Safety evidence is explicit: no exam labels were evaluated, no artifact was
+  persisted, no model permission or runtime policy changed, no database row
+  was mutated, and no order was submitted. This is a completed negative G3
+  experiment, not a candidate and not an independent exam.
+- G3 therefore remains **NOT PASSED**. G4 cannot open an exam, and G5/G6
+  remain pending. The next research action must be a separately preregistered
+  candidate family or a proven data/provenance repair; do not retune this tree
+  result, promote it, or lower any entry/risk/cost gate.
+
+### Current Entry And Readiness Recheck (2026-10-25 07:07 Asia/Shanghai)
+
+- Read-only online entry recovery completed at `2026-10-24T23:02:47Z` for
+  `[2026-10-24T21:32:47Z, 2026-10-24T23:02:47Z)`. There were 198 market
+  decisions; all final actions were `hold`. The latest 120 detailed rows
+  comprised 76 `no_candidate` and 44 `shadow_training`, with 119 sealed
+  feature-availability contracts clean and one missing `index_price` fact.
+  All analyses completed; none had an executed order or granted paper-entry
+  permission. Shadow-training selections are labels only, not paper fills.
+- The direct current veto is unchanged: local-ML paper execution permission is
+  false at 267 authoritative settled samples, with fee-after mean
+  `-0.303832%`, return lower bound `-0.431590%`, and profit factor
+  `0.549713`. The latest model still has `artifact_lifecycle=shadow`,
+  `readiness_state=degraded`, `live_ml_ready=false`, and disabled influence.
+  No model has a positive, sufficiently supported fee-after permission.
+- A separate read-only Phase 3 go/no-go at `2026-10-24T23:03:56Z` returned
+  `no_go`; its one direct blocker was `local_ml_not_live_ready`. The
+  authoritative paper-resume preflight at `2026-10-24T23:06:50Z` was also
+  blocked by four unavailable quant child-endpoint contracts and by the paper
+  service already being active. The service was not restarted. Exchange sync
+  was clean in that preflight: zero recent positions, orders, fills, or
+  reconciliation issues; live routing remained disabled.
+- Recent shadow labels continue to queue/complete, but this has not yielded a
+  registered deployable artifact or authoritative executed return
+  distribution. The latest local-ML scheduler check was `not_due`; all
+  specialist training jobs last reported
+  `authoritative_execution_cost_distribution_unavailable`. The separate
+  online nested tree study still selected zero of three outer-fold policies.
+- Exact user-facing answer: entries are currently withheld because the
+  observed fee-after evidence is negative and quality/quant evidence is
+  missing, not because OKX rejected an order. Profit is not verified because
+  there have been no new governed paper fills and no validated candidate.
+  Shadow-only `paper_training_entry` rows are not trades.
+- Acceptance count is unchanged: G0 passed; G1 passed as attribution only
+  (negative economics); G2 blocked by point-in-time native/executable-cost
+  provenance; G3 not passed (zero qualified policies in the preregistered
+  Ridge and fixed-tree studies); G4 has no frozen candidate or untouched exam;
+  G5 has no governed, settled profitable paper round trip; G6 is pending.
+  Thus five of the six profitability gates are still incomplete or failed.
+- Do not restart the active paper service while the read-only resume preflight
+  is blocked; do not register a model from the shadow rows or enable routing.
+  Next: diagnose why the cost-aware child endpoint contracts and authoritative
+  cost training input are unavailable, then verify the uploaded native refresh
+  repair only after a governed paper-service reload path is safe. Separately
+  preregister a new development family only on clean eligible labels. No code
+  restart, account mutation, order, or protection change occurred in this
+  recheck.

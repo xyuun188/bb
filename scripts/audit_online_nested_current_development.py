@@ -22,6 +22,7 @@ from core.safe_output import safe_print  # noqa: E402
 
 DEPENDENCIES = (
     "services/ml_nested_development.py",
+    "services/ml_nested_development_tree.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -44,6 +45,9 @@ from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
 from services.ml_development_baselines import _development_input_sha256
 from services.ml_nested_development import build_nested_development_report
+from services.ml_nested_development_tree import (
+    build_nested_tree_development_report,
+)
 from services.ml_signal_service import (
     MIN_TRAINING_SAMPLE_COUNT,
     PRIMARY_PREDICTION_HORIZON_MINUTES,
@@ -57,9 +61,11 @@ GROUP_LIMIT = __GROUP_LIMIT__
 HOURS = __HOURS__
 CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
 REVISION = __REVISION__
+FAMILY = __FAMILY__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = (
     "services/ml_nested_development.py",
+    "services/ml_nested_development_tree.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -243,7 +249,11 @@ async def main():
             ]
 
         frame = build_training_frame(rows)
-        nested = build_nested_development_report(frame)
+        nested = (
+            build_nested_development_report(frame)
+            if FAMILY == "ridge"
+            else build_nested_tree_development_report(frame)
+        )
         primary = frame[
             frame["horizon_minutes"] == PRIMARY_PREDICTION_HORIZON_MINUTES
         ].copy()
@@ -311,8 +321,12 @@ async def main():
             )
         )
         report = {
-            "experiment": "bounded-native-fee-after-nested-development",
+            "experiment": (
+                "bounded-native-fee-after-nested-development-"
+                f"{FAMILY}"
+            ),
             "protocol_revision": REVISION,
+            "family": FAMILY,
             "generated_at": datetime.now(UTC).isoformat(),
             "window": {
                 "since": since.isoformat(),
@@ -387,12 +401,14 @@ def _build_remote_command(
     cutoff: datetime,
     unit: str,
     revision: str = "v1",
+    family: str = "ridge",
 ) -> str:
     rendered = (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
         .replace("__HOURS__", str(hours))
         .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
         .replace("__REVISION__", repr(revision))
+        .replace("__FAMILY__", repr(family))
     )
     payload = base64.b64encode(rendered.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({payload!r}))"
@@ -482,8 +498,14 @@ def main() -> None:
     parser.add_argument("--cutoff", help="Exclusive UTC/offset timestamp.")
     parser.add_argument(
         "--revision",
-        choices=("v1", "v2", "v3"),
+        choices=("v1", "v2", "v3", "v4"),
         default="v1",
+    )
+    parser.add_argument(
+        "--family",
+        choices=("ridge", "tree"),
+        default="ridge",
+        help="Development-only candidate family.",
     )
     parser.add_argument("--expected-input-sha256")
     parser.add_argument("--expected-legacy-sha256")
@@ -491,11 +513,14 @@ def main() -> None:
     limit = max(1, min(int(args.limit), 2500))
     hours = max(1, min(int(args.hours), 168))
     cutoff = _parse_cutoff(args.cutoff) if args.cutoff else datetime.now(UTC)
-    unit = f"bb-nested-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
+    unit = (
+        f"bb-nested-dev-{args.family}-{args.revision}-"
+        f"{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
+    )
     result_dir = ROOT / "data" / "profitability_remediation"
     result_dir.mkdir(parents=True, exist_ok=True)
     result_path = result_dir / (
-        f"online-nested-development-{args.revision}-"
+        f"online-nested-development-{args.family}-{args.revision}-"
         f"{cutoff.strftime('%Y%m%dT%H%M%SZ')}.json"
     )
     if result_path.exists():
@@ -534,7 +559,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-nested-development\n"
-            f"{_build_remote_command(limit, hours, cutoff, unit, args.revision)} "
+            f"{_build_remote_command(limit, hours, cutoff, unit, args.revision, args.family)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(
