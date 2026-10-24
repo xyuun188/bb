@@ -4101,3 +4101,54 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   different model family. A candidate must pass the existing positive mean,
   positive lower-bound, PF-above-one, sample, tail and cost-stress rules before
   any untouched G4 exam or governed paper round trip can begin.
+
+### Current User Status Recheck (2026-10-25 03:25 Asia/Shanghai)
+
+- Fresh bounded online checks covered the six hours ending
+  `2026-10-24T19:25:31Z`. The paper and dashboard systemd units are active;
+  the persisted trading control is `paper`, `paused=false`. No
+  `bb-live-trading.service` unit appeared in the systemd inventory. This
+  confirms analysis is running, but does not authorize live trading.
+- All 811 paper market decisions in that six-hour aggregate were `hold` and
+  `was_executed=false`. In the newest bounded 200-row analysis, the funnel
+  was 127 `no_candidate`, 62 `shadow_training`, and 11
+  `insufficient_evidence`; all 200 final actions were `hold`. No exchange
+  order rejection is present because no order was attempted.
+- The immediate entry cause is eligibility, not a stopped scheduler or
+  exchange failure. The local-ML authoritative permission is false at 267
+  realized samples: mean fee-after return `-0.303832%`, lower confidence
+  bound `-0.431590%`, and profit factor `0.549713`. Each misses its
+  preregistered requirement. The latest 200 rows also contain seven missing
+  index-price facts and six ambiguous/missing index-price receipts/clocks;
+  186 rows pass the feature-availability check and 14 do not. Several
+  directional selections are explicitly `paper_training_entry` with
+  `entry_permission.granted=false`: they are observations, not order
+  intents.
+- Collection has improved but has not qualified the candidate. The local-ML
+  trainer reported 1,075 new samples and `not_due`; six local-AI trainers
+  remain skipped for `authoritative_execution_cost_distribution_unavailable`.
+  A 48-hour group projection now contains 120 decision groups with all four
+  horizons independently qualified on native fee-after facts, versus 119 in
+  the prior checkpoint. The same window includes 4,425 mature groups with all
+  four horizons observed but none qualified at all four horizons in that
+  population; historical-label rebuild dry-run remains 0 eligible of 110,709
+  scanned because the original timing/path lineage is absent or stale.
+- The last adequately covered nested development search still selected zero
+  policies. No frozen candidate or independent exam exists, and no governed
+  paper round trip has passed. Therefore the request is not "one switch away":
+  G2 is blocked, G3 has no qualified candidate, and G4-G6 remain
+  unstarted/pending. A positive profit guarantee is not supported by these
+  results. Current mode is paper, so real-money profit cannot accrue in this
+  state; paper entries are also correctly withheld because no candidate
+  currently meets the existing fee-after and risk contracts.
+- This recheck made no application-code changes, uploads, service restarts,
+  orders, position changes, or risk/quality threshold changes. The
+  analysis-coverage helper failed to decode a remote JSON report, so this
+  checkpoint does not claim a fresh full-window service-continuity or market
+  coverage assessment from that helper.
+- Next action remains G2/G3: repair only reproducible decision-time feature
+  receipt defects; preserve new clean native fee-after observations; then
+  preregister a materially different development candidate family, including
+  fixed cutoff, feature set, cost model, purged folds and compute budget.
+  Do not rerun the already inspected nested Ridge search as though it were
+  new evidence, and do not open G4 until a development candidate first passes.
