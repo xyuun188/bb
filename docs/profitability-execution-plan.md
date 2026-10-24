@@ -4213,3 +4213,28 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   2026-10-22 to 2026-10-23) are historical records and are not the cause of
   the current no-entry interval. Do not conflate those past exchange outcomes
   with today's pre-entry quality veto.
+
+### Fresh Native Quarantine Recheck (2026-10-25 03:51 Asia/Shanghai)
+
+- A bounded 24-hour quarantine projection (`row_limit=4000`) completed at
+  `2026-10-24T19:51:15Z` without database mutation, exam-label inspection or
+  order submission. It covered 1,000 decision groups; `453` groups were
+  mature at all four horizons and `44` were qualified at all four. Per horizon,
+  qualified rows were `391/384/326/165` for 5/15/60/240 minutes; quarantined
+  rows were `584/571/518/284`. This is a rolling sample, not a lifetime
+  census.
+- The dominant remaining G2 defects are still provenance, not model
+  scheduling: historical label availability/basis is unverified and the
+  historical market path is not clean. Among fresh native-invalid rows, the
+  recurring executable-path failures are `recent_one_minute_price_path_missing`,
+  `observed_price_outside_recent_native_path` and
+  `executable_quote_sources_not_reconciled`; several rows also have missing or
+  ambiguous index-price receipts/clocks. A representative recent row had
+  `bar_count=0` and failed one-minute-path verification even though native
+  identity and reference-price checks passed.
+- This explains why collection is progressing but the clean four-horizon
+  development pool remains small. The quarantines are correctly fail-closed;
+  treating them as valid labels would fabricate training evidence and could
+  make the system trade on unverifiable costs/prices. The next repair must
+  target the native one-minute path/quote-reconciliation lineage and original
+  historical availability basis, not relax quarantine rules.
