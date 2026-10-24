@@ -4152,3 +4152,51 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   fixed cutoff, feature set, cost model, purged folds and compute budget.
   Do not rerun the already inspected nested Ridge search as though it were
   new evidence, and do not open G4 until a development candidate first passes.
+
+### Fresh Entry-Blocker Recheck (2026-10-25 03:45 Asia/Shanghai)
+
+- A new bounded read-only market-hold economics projection covered decision
+  IDs `694174-694246`, from `2026-10-24T19:16:03Z` through
+  `2026-10-24T19:45:48Z` (Beijing `2026-10-25 03:16-03:45`). All 73 final
+  actions were `hold`: 46 `no_candidate`, 27 `shadow_training`, and zero
+  execution attempts. All 73 analyses were complete and decision-eligible;
+  all four experts completed on every row. This rules out a stopped analysis
+  loop, incomplete model responses, and exchange order rejection as the
+  immediate cause of zero entries in this sample.
+- The actual veto remains profitability evidence. The authoritative local-ML
+  permission is false at 267 settled samples: fee-after mean `-0.303832%`,
+  lower confidence bound `-0.431590%`, and profit factor `0.549713`. Each
+  misses the fixed positive-mean, positive-lower-bound, PF-above-one contract.
+  Across both sides of all 73 rows, none of the 146 side observations had a
+  positive return lower bound and none was production-eligible. Some
+  individual directions had positive point estimates (23 long-side and 16
+  short-side rows), but their lower bounds remained negative; point estimates
+  are not sufficient evidence to authorize entries.
+- A separate 30-minute service/coverage projection generated at
+  `2026-10-24T19:44:44Z` found paper, dashboard and model-tunnel services
+  active, control mode `paper` and `paused=false`, 72 market analyses, no
+  model failures, and market coverage ready. It found zero directional
+  signals, zero executed entries and no open positions. The two projections
+  use slightly different cutoffs; both independently confirm healthy
+  analysis and no entry/order activity.
+- This fresh check identifies no new scheduler, queue-priority or execution
+  transport defect. The previously repaired native-evidence priority
+  isolation is not the current entry veto. It does not resolve the separate
+  G2 historical timing/path provenance blocker, and the already-inspected
+  nested Ridge candidate family still fails G3. No threshold, risk, leverage,
+  model permission or trading mode was changed; no order, position,
+  protection, restart or application source was modified.
+- Gate count: G0 and the G1 attribution audit are passed (G1's measured
+  economics remain negative); G2 is blocked; G3 has no qualifying policy;
+  G4 has no frozen candidate or untouched exam; G5 has no authorized
+  controlled paper round trip; G6 is pending. Thus five of six gates are
+  not fully complete for the overall profitability objective. This is not a
+  guarantee that an eventual profitable policy exists, and paper mode cannot
+  generate real-money profit.
+- Next action remains G2/G3: preserve fresh, fully sourced native fee-after
+  groups, repair only reproducible point-in-time data defects, and preregister
+  a materially different development family with its fixed features,
+  chronological/purged evaluation, cost model, and compute budget. Keep the
+  existing quality and risk gates fixed. Start G4 only if development
+  evidence first passes; otherwise retain the failed result and continue
+  research without promoting or forcing trades.
