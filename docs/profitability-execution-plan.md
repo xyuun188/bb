@@ -2457,3 +2457,137 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   predefined lower-bound, profit-factor, drawdown, and stress criteria before
   any paper permission. Do not turn the positive 60/240-minute baseline into
   an order rule, and do not use the inspected development window as G4.
+
+### Preregistered Current-Native Nested Development Run (2026-10-24)
+
+- Before execution, freeze a bounded development-only study ending at
+  `2026-10-24T02:27:00Z`, covering the preceding six hours. Query only
+  completed paper shadow rows whose compact market contract identifies the
+  native executable 1m path and whose fee-after label is complete; select at
+  most 1,000 rows in chronological completion order with a 15-second SQL
+  statement timeout.
+- Reuse `services.ml_nested_development` unchanged: primary horizon remains
+  five minutes, the Ridge alpha set remains 1/10/100, and predicted-net entry
+  thresholds remain 0/0.05/0.1 percent. The only permissible fitting and
+  selection are inside existing purged chronological development folds. This
+  sample is development data, not G4, even if a fold result is positive.
+- A new read-only runner records its input/dependency hashes and a compact
+  aggregate report under the ignored
+  `data/profitability_remediation/` directory. It creates no model artifact,
+  does not mutate the database or runtime policy, and submits no orders.
+  Remote budget is 25% CPU, 1 GiB memory, 300 seconds, one DB connection and
+  no overflow. The report is keyed by its exclusive cutoff; an existing
+  report or active same-cutoff unit must be reused/checked, not duplicated.
+- Recovery action: inspect the named transient unit and its saved report
+  before any retry. A timeout or insufficient development fold leaves G3
+  pending; it does not authorize model permission or an independent exam.
+
+### Six-Hour Nested Run Result And Bounded Extension (2026-10-24)
+
+- The fixed six-hour query completed at `2026-10-24T02:46:16Z`: all 413
+  selected native fee-after rows built into the training frame, across 304
+  decision groups (5m 125, 15m 113, 60m 104, 240m 71). Input fingerprint:
+  `4da9ddd4ea0a2f66e7f619ff4e7af3e0dcc2f97b7c5b25fba6eabfdad00f1ee8`.
+- The outer chronological partition was ready and disjoint, with 124 training
+  groups / 143 rows and 152 holdout groups / 226 rows after purging 28
+  candidate training groups. The nested researcher nevertheless returned
+  `insufficient_development_data`, no outer folds and zero selected policies;
+  no exam labels were evaluated. This is a blocked G3 study, not a loss or
+  profitability result. The exact report is ignored locally at
+  `data/profitability_remediation/online-nested-development-20261024T022700Z.json`.
+- The report lacked per-fold coverage detail. The runner now adds an outcome-
+  independent outer/inner primary-horizon coverage summary. A separate,
+  preregistered extension uses a fixed 24-hour development window ending
+  `2026-10-24T02:48:00Z`, still limited to 1,000 native fee-after rows and
+  the same model/search/split requirements. It overlaps the already-inspected
+  six-hour development subset and therefore cannot be treated as G4.
+- Online paper process CPU was observed near one full core during the
+  preflight. The extension uses `Nice=10`, a 25% CPU quota, 1 GiB memory,
+  one DB connection, 15-second SQL timeout and 300-second runtime limit to
+  minimize paper-service contention. It remains read-only and must not change
+  any execution permission or risk rule. Recovery is to inspect the unique
+  cutoff unit/report before retry; if folds remain insufficient, G3 stays
+  pending and more mature native evidence is required.
+
+### Fixed-Horizon Purge Correction Preregistration (2026-10-24)
+
+- The 24-hour v1 report exposed an over-purge in the fixed-five-minute nested
+  researcher: its model and inner selection fit only five-minute labels, but
+  `_folds` used each decision group's maximum label end across 5/15/60/240
+  minutes. This left outer primary-horizon training counts `1/4/16` and inner
+  counts between `1` and `6`; every fold failed the unchanged minimum of 16.
+- The fix is scoped to `ml_nested_development`: derive split availability from
+  the fixed primary-horizon rows for both outer and nested boundaries, while
+  continuing to assign whole decision groups to train/validation.
+  `ml_horizon_development` retains all-horizon purging because it searches
+  across horizons.
+- The v2 retry kept the exact 430-row / 315-group source fingerprint, but
+  still produced zero selected policies. Per-fold audit showed only 58
+  primary-horizon groups overall; inner chronological training chunks had
+  8-16 rows and the first two outer folds lacked two qualified inner folds.
+  The runner was also limiting raw rows, which can truncate some horizons of
+  the most recent decision groups.
+- The next preregistered run changes the dataset selector to rank and cap
+  distinct decision groups, then include every qualifying horizon row for
+  each selected group. It will use a 7-day upper window ending at
+  `2026-10-24T03:30:00Z`, at most 1,000 groups, unchanged native-path and
+  fee-after-complete provenance, same primary 5m model/search and
+  qualification rules, one CPU quota fraction, one DB connection, 1 GiB and
+  300 seconds. The report must compute the legacy all-horizon development
+  fingerprint and match
+  `c3d71adc4178e4ad389cb54fdea5d41b87e7b6f52a3f536a1510dd66dac2f813`;
+  otherwise it aborts rather than claiming a same-window comparison.
+- This extension is still development-only and includes previously inspected
+  labels, so it cannot serve as G4. Insufficient folds or negative evidence
+  keep G3 blocked; no thresholds or entry permissions change.
+
+### Nested Study Regression Fix And Verification (2026-10-24 11:43 Asia/Shanghai)
+
+- Corrected `test_nested_exam_changes_cannot_affect_report`: the mutation
+  previously changed `horizon_minutes`, which is present in `FEATURE_KEYS`
+  but also defines the primary-horizon partition. The regression now mutates
+  model inputs only, leaving that partition key intact.
+- Focused nested, horizon-development, diagnostic and online-runner tests:
+  `25 passed`; sync-tool selected tests: `20 passed`. Ruff, compileall and
+  `git diff --check` passed. This is a test-fixture correction; it does not
+  change the strategy or demonstrate profitability.
+- The existing 24-hour v2 result contains 430 rows / 315 groups, with 132
+  primary-horizon rows. After the fixed-horizon purge correction it forms
+  three disjoint outer folds (16/19/23 primary training rows), but all three
+  inner selections report `insufficient_inner_folds`; no policy was selected.
+- Next exact action: stage only the five already-owned plan/runner/researcher/
+  regression paths, targeted-upload those sources and tests with restart
+  skipped, verify remote hashes and focused tests, then check for the exact
+  v3 unit/report before running the preregistered seven-day development
+  extension ending `2026-10-24T03:30:00Z`. Require the legacy all-horizon
+  development fingerprint
+  `c3d71adc4178e4ad389cb54fdea5d41b87e7b6f52a3f536a1510dd66dac2f813`.
+  Do not interpret this overlapping development window as G4 or change any
+  permission based on its result.
+
+### Seven-Day Nested Development Result (2026-10-24 11:48 Asia/Shanghai)
+
+- Targeted upload completed for the runner, fixed-horizon researcher and two
+  regression modules; remote source verification returned `source-integrity-ok:4`
+  and no service restart was performed. The bounded remote regression returned
+  `11 passed in 47.70s`.
+- The preregistered seven-day run (`bb-nested-dev-v3-20261024T033000Z`) read
+  `430` native fee-after rows across `315` decision groups (`132` primary
+  five-minute rows). Its legacy all-horizon development fingerprint matched
+  `c3d71adc4178e4ad389cb54fdea5d41b87e7b6f52a3f536a1510dd66dac2f813`.
+  The current primary-development fingerprint is
+  `a5f5cb9787c3fbd72edc2081a0c5a24e50721aecb7f550d153630b8df3e7f362`.
+- The fixed-horizon outer partition is chronological and disjoint
+  (`62` training / `66` holdout primary rows after purging `4` groups).
+  Outer fold zero still lacks a qualified pair of inner folds; folds one and
+  two are computable, but all `18` searched alpha/threshold combinations
+  have negative fee-after mean and/or profit factor below one. Therefore
+  `selected_policy_fold_count=0`, `selected_count=0`, and no policy can be
+  frozen or promoted.
+- This is a complete negative/insufficient G3 development result, not G4:
+  no exam labels were evaluated, no artifact was persisted, no database or
+  runtime policy changed, and no orders were submitted. G2 remains blocked,
+  G3 remains pending, G4-G6 remain pending, and local-ML paper permission
+  stays false. Continue accumulating fresh native fee-after groups and
+  preregister the next development batch; do not convert this result or the
+  positive historical baselines into an entry rule.

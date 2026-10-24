@@ -27,9 +27,20 @@ NET_THRESHOLDS_PCT = (0.0, 0.05, 0.1)
 
 
 def _folds(
-    frame: pd.DataFrame, count: int,
+    frame: pd.DataFrame,
+    count: int,
+    *,
+    purge_horizon_minutes: int | None = None,
 ) -> list[tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]]:
-    groups, bounds = _decision_group_availability(frame)
+    # Fixed-horizon research must purge on the labels it actually fits. A
+    # long-horizon row in the same decision group is irrelevant to a primary
+    # five-minute target and would otherwise erase usable early training data.
+    boundary_frame = frame
+    if purge_horizon_minutes is not None:
+        boundary_frame = frame[
+            frame["horizon_minutes"] == int(purge_horizon_minutes)
+        ].copy()
+    groups, bounds = _decision_group_availability(boundary_frame)
     initial = max(int(np.ceil(len(groups) * 0.5)), 1)
     result = []
     for chunk in np.array_split(np.asarray(groups[initial:]), count):
@@ -105,7 +116,11 @@ def _sides(predictions: dict[str, np.ndarray], threshold: float) -> np.ndarray:
 
 
 def _select_policy(train: pd.DataFrame) -> dict[str, Any]:
-    folds = _folds(train, 2)
+    folds = _folds(
+        train,
+        2,
+        purge_horizon_minutes=PRIMARY_PREDICTION_HORIZON_MINUTES,
+    )
     if len(folds) != 2:
         return {
             "policy": None, "reason": "insufficient_inner_folds",
@@ -168,7 +183,10 @@ def _select_policy(train: pd.DataFrame) -> dict[str, Any]:
 
 
 def build_nested_development_report(frame: pd.DataFrame) -> dict[str, Any]:
-    partition = decision_group_partition(frame)
+    primary_frame = frame[
+        frame["horizon_minutes"] == PRIMARY_PREDICTION_HORIZON_MINUTES
+    ].copy()
+    partition = decision_group_partition(primary_frame)
     report: dict[str, Any] = {
         "version": NESTED_POLICY_VERSION,
         "status": "insufficient_development_data",
@@ -198,7 +216,11 @@ def build_nested_development_report(frame: pd.DataFrame) -> dict[str, Any]:
         return report
     development = partition.train
     report["development_input_sha256"] = _development_input_sha256(development)
-    outer_folds = _folds(development, 3)
+    outer_folds = _folds(
+        development,
+        3,
+        purge_horizon_minutes=PRIMARY_PREDICTION_HORIZON_MINUTES,
+    )
     if len(outer_folds) != 3:
         return report
     evaluated_frames, evaluated_sides = [], []

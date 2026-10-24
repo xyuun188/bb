@@ -41,8 +41,15 @@ def test_nested_exam_changes_cannot_affect_report(monkeypatch):
     monkeypatch.setattr(nested, "_predict", _predictions)
     frame = _frame()
     report = nested.build_nested_development_report(frame)
-    exam = decision_group_partition(frame).holdout
-    frame.loc[frame["id"].isin(exam["id"]), FEATURE_KEYS] = 1e9
+    exam = decision_group_partition(
+        frame[frame["horizon_minutes"] == nested.PRIMARY_PREDICTION_HORIZON_MINUTES]
+    ).holdout
+    # The horizon is a partition key, not a model feature.  Mutating it would
+    # change the research input instead of testing exam-label isolation.
+    model_feature_keys = [
+        key for key in FEATURE_KEYS if key != "horizon_minutes"
+    ]
+    frame.loc[frame["id"].isin(exam["id"]), model_feature_keys] = 1e9
     frame.loc[
         frame["id"].isin(exam["id"]), ["long_return_pct", "short_return_pct"]
     ] = -1e9
@@ -58,7 +65,10 @@ def test_outer_labels_cannot_choose_their_own_policy(monkeypatch):
     monkeypatch.setattr(nested, "_predict", _predictions)
     frame = _frame()
     report = nested.build_nested_development_report(frame)
-    development = decision_group_partition(frame).train
+    primary = frame[
+        frame["horizon_minutes"] == nested.PRIMARY_PREDICTION_HORIZON_MINUTES
+    ]
+    development = decision_group_partition(primary).train
     _, validation, _ = nested._folds(development, 3)[0]
     frame.loc[frame["id"].isin(validation["id"]), "long_return_pct"] = -100.0
     changed = nested.build_nested_development_report(frame)
@@ -89,3 +99,39 @@ def test_no_qualified_inner_candidate_selects_no_trade(monkeypatch):
         fold["selection"]["reason"] == "no_inner_policy_qualified"
         for fold in report["folds"]
     )
+
+
+def test_fixed_horizon_folds_do_not_purge_on_unfitted_long_horizon_labels() -> None:
+    frame = _frame()
+    groups, _ = nested._decision_group_availability(frame)
+    all_horizon = nested._folds(frame, 3)
+    primary = frame[
+        frame["horizon_minutes"] == nested.PRIMARY_PREDICTION_HORIZON_MINUTES
+    ].copy()
+    fixed_horizon = nested._folds(primary, 3)
+
+    assert len(groups) == 480
+    assert len(all_horizon) == len(fixed_horizon) == 3
+    assert sum(
+        fold[0]["horizon_minutes"].eq(5).sum() for fold in all_horizon
+    ) < sum(
+        fold[0]["horizon_minutes"].eq(5).sum() for fold in fixed_horizon
+    )
+    for train, validation, boundary in fixed_horizon:
+        assert train["horizon_minutes"].eq(5).sum() >= nested.MIN_TRAINING_SAMPLE_COUNT
+        assert validation["horizon_minutes"].eq(5).sum() > 0
+        assert boundary["chronological_label_disjoint"] is True
+
+
+def test_nested_partition_uses_primary_horizon_for_outer_purge() -> None:
+    frame = _frame()
+    generic = decision_group_partition(frame)
+    primary_frame = frame[
+        frame["horizon_minutes"] == nested.PRIMARY_PREDICTION_HORIZON_MINUTES
+    ]
+    primary = decision_group_partition(primary_frame)
+
+    assert primary.report["sample_count"] == 480
+    assert primary.report["train_sample_count"] < generic.report["train_sample_count"]
+    assert primary.report["holdout_decision_group_count"] > 0
+    assert primary.report["chronological_label_disjoint"] is True
