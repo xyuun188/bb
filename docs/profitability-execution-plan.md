@@ -2625,3 +2625,97 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   Dashboard, tunnels, positions or protections), verify service health and
   paper mode, and collect fresh native path/fee-after evidence. Do not
   authorize entries from these pipeline fixes.
+
+### Post-Deployment Native Settlement Recheck (2026-10-24 13:18 Asia/Shanghai)
+
+- Targeted upload of the two service files and one regression module completed
+  with `source-integrity-ok:3`; the bounded remote regression ran as
+  `bb-shadow-path-regression-20261024t1308.service` under 25% CPU/1 GiB and
+  passed `143` tests in `56.92s`.
+- Only `bb-paper-trading.service` was restarted at approximately
+  `2026-10-24 13:08` Asia/Shanghai. It remained `active/running` with
+  `NRestarts=0`; `bb-dashboard.service` and `bb-model-tunnels.service` stayed
+  active. The runtime shadow audit reports `mode=paper`, `running=true`,
+  `paused=false`, no market/position/round error, and no live entry.
+- The 120-minute recovery audit after restart recorded `252/252` market
+  decisions as `HOLD`/`no_candidate`; every sampled entry permission remained
+  false. The authoritative local-ML evidence is unchanged and negative:
+  `n=267`, mean fee-after return `-0.303832%`, lower bound `-0.431590%`,
+  profit factor `0.549713`. Other model families still have no qualified
+  fee-after evidence. This is the current reason for zero orders, not an
+  exchange rejection.
+- The settlement audit at `2026-10-24T05:17:27Z` found successful maintenance
+  (`success_count=8`, `failure_count=0`), `130` newly completed and `48`
+  quarantined rows in the observed throughput interval, `295` native
+  fee-after rows across `217` decision groups, and native lineage verification
+  `200/200`. Historical-path rows (`120` rows / `112` groups) remain
+  non-executable and excluded. No OKX position-history entries or executed
+  paper entries were present.
+- This materially confirms the path/settlement repair is functioning, but it
+  does not create a profitable candidate or satisfy G4. G1 remains negative
+  attribution-only; G2 remains **BLOCKED**; G3 remains pending; G4-G6 remain
+  pending. The new development window must be analyzed without changing
+  entry permissions or reusing it as an exam.
+- Commit `7b618b9` contains the scoped repair and plan evidence. Push to
+  GitHub was attempted but failed with a transient `curl 28` connection
+  timeout; local `main` is one commit ahead of `origin/main`. Retry push
+  before final handoff. No unrelated work was changed.
+
+### Fresh Native Nested Development Result (2026-10-24 13:22 Asia/Shanghai)
+
+- Preregistered read-only development run:
+  `audit_online_nested_current_development.py --limit 1000 --hours 24
+  --cutoff 2026-10-24T05:20:00Z --revision v3`. The immutable interval was
+  `[2026-10-23T05:20:00Z, 2026-10-24T05:20:00Z)`, selecting at most 1,000
+  distinct decision groups and only completed paper labels with native
+  executable path provenance and `fee_after_complete=true`.
+- Exact data read: `465` rows / `341` decision groups; 5-minute primary
+  horizon `137` rows. Development input fingerprint
+  `e65564fc2b8abc37d8388d1bd29b7323cb06651bac78e6694b866c78503c364a`;
+  source-frame fingerprint
+  `ae9f4599e931fef8dae4a3da88943f10a96f362e79b24483d63fb7d7a4091e36`.
+  Nested model/search/split dependencies matched local and online.
+- The chronological outer partition was disjoint (zero group overlap) and
+  label-time purged; it had 62 training and 69 holdout primary rows after
+  purging six groups. Fold 0 lacked adequate inner primary-horizon coverage.
+  Folds 1-2 evaluated all nine fixed Ridge/threshold combinations; zero of
+  nine qualified. Their inner fee-after means ranged from `-0.3720%` to
+  `-0.0504%` in fold 1 and `-0.2124%` to `-0.0731%` in fold 2; all profit
+  factors were below 1 (`0.074`-`0.624`). Across outer folds, zero policies
+  were selected from 31 diagnostic opportunities.
+- Safety report: exam labels not evaluated; no artifact, DB mutation,
+  promotion, orders or runtime-policy change. This fresh G3 result rejects
+  the current frozen search family; it is not G4 and provides no basis to
+  enable an entry. Do not retune on this inspected interval. G1 remains
+  negative attribution-only, G2 blocked, G3 pending candidate redesign,
+  G4-G6 pending.
+- Result artifact is ignored local development evidence:
+  `data/profitability_remediation/online-nested-development-v3-20261024T052000Z.json`.
+  Next: inspect the development-only feature/label diagnosis and cost
+  decomposition without opening an exam, define a materially distinct
+  candidate family on a future development window, and preregister it before
+  execution. If no valid candidate emerges, keep paper entry permission false.
+
+### Current-Native Transparent Baseline Diagnostic (2026-10-24 13:23 Asia/Shanghai)
+
+- A separate read-only 24-hour ledger used `477` native fee-after rows /
+  `352` decision groups and no independent exam. All recorded live decision
+  actions were `hold` (`0` long / `0` short) because the entry gate is
+  evidence-blocked.
+- Transparent baselines are regime-dependent and do not authorize a policy:
+  5-minute always-long was `-0.0116%` development / `-0.1614%` validation;
+  15-minute always-long was `-0.0849%` / `-0.2225%`; both sides were
+  negative at 15 minutes. The 60-minute always-long baseline was positive
+  (`+0.1883%` / `+0.9059%`, PF `1.402` / `6.578`) on only `85`/`37` rows,
+  while 240-minute always-short was positive (`+2.2392%` /
+  `+0.0850%`, PF `63.057` / `1.134`) on only `58`/`25` rows.
+- These positive baselines are not promotable: they are single-side,
+  horizon-specific, low-sample, regime-sensitive, and were inspected during
+  development. They are not a frozen candidate, not a fresh exam, and not
+  proof that current signals can predict those directions. No thresholds,
+  horizon, sizing or quality gate was changed.
+- The consistent result across the nested study and transparent baselines is
+  that the current five-minute Ridge family cannot cover trading costs; the
+  immediate research blocker is candidate/feature/horizon quality, not order
+  placement. G3 remains pending and must continue with a preregistered,
+  materially distinct development experiment; G4-G6 remain pending.
