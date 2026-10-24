@@ -1946,6 +1946,14 @@ async def test_shadow_backtest_maintenance_runs_in_background_for_market_round()
     assert status["failure_count"] == 0
 
 
+def test_shadow_market_maintenance_batch_matches_bounded_recovery_size() -> None:
+    assert (
+        trading_service.SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT
+        == trading_service.SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT
+        == 4
+    )
+
+
 @pytest.mark.asyncio
 async def test_shadow_backtest_maintenance_reuses_running_background_task() -> None:
     service = TradingService.__new__(TradingService)

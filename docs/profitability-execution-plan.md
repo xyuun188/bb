@@ -2764,3 +2764,246 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   from this audit. Continue the same frozen data contract until enough
   matured, all-native groups exist for a preregistered horizon study; G2/G3
   remain blocked/pending and no entries are authorized.
+
+### Live Decision And Training Preflight Recheck (2026-10-24 13:55 Asia/Shanghai)
+
+- Read-only online settlement audit at `2026-10-24T05:39:51Z` found `362`
+  native fee-after rows / `259` decision groups across the latest six hours;
+  native lineage passed `200/200`; settlement success/failure counters were
+  `51/0`. The latest three-hour recovery projection had four horizon rows for
+  each of `379` decisions, but this does not imply every horizon is a clean,
+  completed native fee-after training label. No paper entry or OKX position
+  history appeared in the bounded six-hour query.
+- The bounded three-hour market-decision audit at `05:40:05Z` found `378/378`
+  actions were `hold`, with no executed decision. The authorized model horizon
+  was 5 minutes, but every selected cohort was missing. The aggregate blocker
+  was `paper_prediction_horizon_unavailable`; all 756 local-ML side contracts
+  reported `current_prediction_contract_incomplete`, while server-profit and
+  time-series families had no available artifacts. Exact recent decision
+  projections showed `distribution_members_missing`, null fee-after objective,
+  and no eligible quant evidence. This is an evidence/model-contract hold,
+  not an exchange rejection.
+- A fresh transparent baseline ledger at `05:43:08Z` read `527` native
+  fee-after rows / `383` groups (horizons: `154` x 5m, `139` x 15m, `135` x
+  60m, `99` x 240m). It selected no candidate. The 60m always-long diagnostic
+  was positive on only `94` development / `41` validation rows
+  (`+0.2141%` / `+0.5796%`; PF `1.492` / `3.266`); it remains inspected,
+  single-side development evidence, not a policy or exam. The 240m always-short
+  result reversed from `+2.0743%`, PF `65.953` on 69 development rows to
+  `-0.3877%`, PF `0.382` on 30 validation rows, showing material regime
+  instability.
+- Normal gated local-ML training preflight completed at `05:54:50Z` after its
+  earlier attempt correctly declined to overlap an active training lease.
+  It loaded 2,612 rows and built 527 eligible rows / 383 groups. Purged
+  chronological training used 160 rows / 135 groups; holdout used 295 rows /
+  192 groups; 72 training rows / 56 groups were purged, with zero group
+  overlap. The resulting 5m regressor was in the low-sample Ridge path, which
+  emits no empirical model members and therefore cannot create an eligible
+  standardized prediction distribution. More importantly, its ranking
+  evidence was adverse: the highest-scored long bucket averaged `-0.1785%`
+  (LCB `-0.2845%`, PF `0.082`), and the highest-scored short bucket averaged
+  `-1.4022%` (LCB `-3.5052%`, PF `0.027`); the lower-scored long bucket
+  averaged `+1.2916%`. Authoritative executed-trade samples were zero. Repeated
+  logistic convergence warnings were also emitted. The run was diagnostic
+  only: no artifact persisted, no promotion, no policy change and no orders.
+  Training data fingerprint: `1988bfe7c732f2f65fe6fb76defe9a54d094d0068db6a6861281a6fe2eaa98e1`.
+- These findings reject the current 5m fitted candidate; they do not justify
+  score reversal, changing the estimator threshold on this inspected sample,
+  or opening entries. G2 remains **BLOCKED** and G3 remains pending; G4-G6
+  remain pending.
+
+### Horizon-Aware Current Development Preregistration (2026-10-24 13:57 Asia/Shanghai)
+
+- Before the next read-only run, freeze the experiment as
+  `horizon-current-v1-20261024T055700Z`: cutoff-exclusive
+  `2026-10-24T05:57:00Z`, prior 24 hours, at most 1,000 decision groups,
+  completed paper labels with native executable one-minute path and
+  `fee_after_complete=true` only. This is development data; it is not an
+  independent exam and cannot pass G4.
+- Use the existing `ml_horizon_development` search unchanged:
+  horizons 5/15/60/240 minutes, existing-vs-market-only feature sets, Ridge
+  alpha 1/10/100, thresholds 0/0.05/0.1%, two purged inner folds and three
+  chronological outer folds. Common four-horizon groups only; compare all
+  opportunities and one-position non-overlapping outcomes. Keep the
+  existing minimum 16 selected rows, positive fee-after mean/LCB, PF > 1 and
+  positive means in both inner folds. No candidate-set or gate edits.
+- One read-only DB connection, 15-second statement timeout, 25% CPU, 1 GiB
+  RAM, 300-second runtime; output only aggregate counts, exact source/frame
+  fingerprints and compact fold metrics under ignored
+  `data/profitability_remediation/`. No DB writes, artifact writes,
+  promotions, runtime-policy changes, orders, or service restarts.
+- If there is insufficient complete-group coverage, keep G3 pending and
+  continue collecting native maturity. If a candidate is selected, it remains
+  development-only; preregister a new untouched future interval before G4.
+
+### Online Maturity And Settlement Throughput Recheck (2026-10-24 14:35 Asia/Shanghai)
+
+- The completed preregistered horizon report
+  `online-horizon-development-v1-20261024T055700Z.json` is a
+  development-only negative/insufficient result: `527` native fee-after rows,
+  `383` decision groups, only `4` groups with all four horizons, no folds,
+  no selected policy, no artifact, and no orders. It cannot pass G4.
+- A bounded online coverage comparison at `2026-10-24T06:15:29Z` falsified the
+  first suspected cause that the four-horizon shortage was only an
+  `updated_at` window truncation. The decision-created 24-hour window and the
+  legacy updated-time 24-hour window both produced `383` eligible groups with
+  the same coverage distribution: `275` groups with one horizon, `76` with
+  two, `28` with three, and `4` complete groups. Partial/historical/quarantined
+  rows remain excluded by contract.
+- The bounded post-restart settlement projection at `2026-10-24T06:27:54Z`
+  found overdue paper rows still pending: `82` at 5m, `87` at 15m, `79` at
+  60m and `90` at 240m; the oldest were roughly `55-57` minutes overdue.
+  Runtime maintenance was healthy but its last completion count was zero.
+  This is a data-pipeline throughput defect, not exchange rejection or a reason
+  to lower entry gates.
+- Likely root cause identified in the local code, pending online throughput
+  confirmation: the market-only background worker
+  selected up to `25` due rows while `ShadowBacktestService.update_due`
+  has a `20s` total collection budget and only `2` native path requests in
+  flight. The batch can cancel unfinished path work before any durable
+  completion, leaving due rows pending and starving mature four-horizon groups.
+- Repair made in owned paths: set
+  `SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 4`, matching the existing
+  bounded recovery batch; keep foreground update and all quality, cost,
+  prediction, risk, leverage and live-mode gates unchanged. Added a regression
+  asserting the bounded batch size. Local targeted suite: `38 passed`;
+  Ruff, compileall and `git diff --check` passed.
+- This repair is not a profitability result and has not yet been deployed or
+  rechecked online. Next exact action: upload only
+  `services/trading_service.py` and `tests/test_trading_service_boundaries.py`
+  plus the existing development-audit paths with restart skipped; run the
+  bounded remote tests, then restart only `bb-paper-trading.service` and
+  measure fresh overdue counts, completion throughput, native fee-after groups,
+  and entry decisions. Keep paper mode and entry permission unchanged.
+
+### Bounded Settlement Batch Deployment Recheck (2026-10-24 14:54 Asia/Shanghai)
+
+- Targeted sync for the four owned source/test paths returned
+  `source-integrity-ok:4` and `Uploaded 0 changed files`: the online checkout
+  already matched the intended local bytes. No unrelated file was uploaded.
+- Read-only pre-restart checks at `2026-10-24T06:46:xxZ` confirmed
+  `bb-paper-trading.service` active/running, `NRestarts=0`, persisted and
+  runtime mode `paper`, `paused=false`, `running=true`. The bounded settlement
+  audit showed no executed entries or OKX position-history rows. Only
+  `bb-paper-trading.service` was restarted; it returned active/running with
+  `NRestarts=0` and `ExecMainStartTimestamp=2026-10-24 06:47:58 UTC`.
+- Three remote service-boundary regressions passed individually:
+  background maintenance scheduling, batch/recovery limit equality (`4`),
+  and reuse of an existing background task. The new horizon-audit command
+  regression also passed (`1 passed`). A broader remote run of the full
+  boundary file was not clean: one existing boundary failed and pytest later
+  reported temporary-directory cleanup errors; this is not counted as a
+  passing suite. The local focused suite remains `38 passed` with Ruff,
+  compileall and diff checks passing.
+- At `2026-10-24T06:46:55Z`, before restart, the pending-due counts were
+  `124/128/117/139` for 5/15/60/240m (`508` total). At
+  `2026-10-24T06:54:17Z`, the bounded queue projection showed `88/95/90/110`
+  pending (`383` total), alongside `81` completed and `109` quarantined rows
+  updated in the last five minutes. The latest native fee-after set increased
+  from `248` to `274` decision groups; 200/200 sampled native lineage checks
+  passed. Maintenance was active in paper mode with no surfaced round error,
+  last completed count `21`, cumulative success/failure counters `11/1`.
+- This is evidence that the deployed batch is making progress, but not proof
+  that the queue backlog is resolved: pending work remains, a maintenance
+  failure was counted, and many late/invalid rows are quarantined. Inspect the
+  failure/quarantine reasons and monitor one additional bounded interval
+  before calling the throughput repair stable.
+- No paper entries or OKX position-history rows appeared after restart.
+  Decision permissions, prediction requirements, risk limits, leverage and
+  live mode were unchanged. The zero-entry blocker remains model evidence:
+  the recent decisions stay `HOLD`; this pipeline repair does not create a
+  profitable signal. G1 remains negative attribution-only, G2 **BLOCKED**,
+  G3 pending, and G4-G6 pending.
+- Next: extract only bounded maintenance/quarantine reason aggregates and a
+  fresh all-native horizon-coverage projection; do not read new exam labels or
+  retune the already rejected five-minute family. Continue with G2/G3 only if
+  the current-contract data supports it.
+
+### Horizon-Current Development Six-Hour Preregistration (2026-10-24 14:57 Asia/Shanghai)
+
+- Development-only experiment identity:
+  `horizon-current-v1-6h-20261024T065600Z`. The audit CLI's protocol choice
+  remains `v1`; no unsupported protocol revision is being introduced.
+  Cutoff-exclusive UTC timestamp: `2026-10-24T06:56:00Z`; lookback: six
+  hours; group cap: 1,000.
+- Input contract is unchanged: paper rows with `status=completed`,
+  native executable one-minute path source
+  `shadow_entry_result_and_okx_native_1m_path`, and
+  `fee_after_complete=true`. This is a new development interval after the
+  throughput repair, not an independent exam and cannot pass G4.
+- Search and acceptance rules remain unchanged from v1: common
+  5/15/60/240-minute groups only; existing-vs-market-only features; Ridge
+  alpha `1/10/100`; net thresholds `0/0.05/0.1%`; purged chronological inner
+  and outer folds; minimum selected rows `16`; positive fee-after mean/lower
+  bound; PF above one; positive means in both inner folds. No candidate,
+  threshold, sizing, risk or entry-gate edits are allowed.
+- Resource budget: one read-only connection, 15-second SQL statement timeout,
+  25% CPU, 1 GiB RAM, 300-second runtime; aggregate metrics and fingerprints
+  only under ignored `data/profitability_remediation/`. No artifact, database
+  mutation, promotion, policy change, order, or service restart.
+
+### Horizon-Current Development Six-Hour Result (2026-10-24 15:02 Asia/Shanghai)
+
+- The preregistered read-only run completed at
+  `2026-10-24T07:01:36.789194Z` with exact cutoff
+  `2026-10-24T06:56:00Z`. It read `389` native fee-after rows across `286`
+  decision groups: `118` x 5m, `109` x 15m, `104` x 60m and `58` x 240m.
+  Only `4` groups had all four horizons, so no nested folds were estimable and
+  no policy was selected (`insufficient_development_data`).
+- Development input SHA256:
+  `9dbee51f4c8da9e523f3ca3d3b98c20b079fee5e463d206a5ce9e132c9b50777`;
+  snapshot SHA256:
+  `1bcd0c0f1424c20837cb0621f6d7bdb4af2a4a9b93698f977faf61380be87ac9`.
+  Full aggregate report:
+  `data/profitability_remediation/online-horizon-development-v1-20261024T065600Z.json`.
+  The report confirms `exam_labels_evaluated=false`, no artifact, no database
+  mutation, no promotion, no orders and no policy change.
+- This confirms that reducing the settlement batch now drains stale pending
+  work but has not yet yielded enough complete four-horizon groups for the
+  preregistered horizon search. It is not a candidate rejection or an exam
+  result. G2 remains **BLOCKED** and G3 remains pending; G4-G6 remain pending.
+- Next exact action: use one bounded read-only grouped projection over the
+  same recent decision cohort to separate still-immature 240m labels from
+  quarantine, provenance and missing-row causes. Preserve the current search
+  family and entry permissions; do not create or inspect an exam.
+
+### Post-Repair Current-Stream And Entry Blocker Recheck (2026-10-24 15:14 Asia/Shanghai)
+
+- A fresh bounded projection at approximately `2026-10-24T07:14Z` found
+  `404` current native fee-after rows across `330` decision groups in the
+  latest six hours. In the last 15 minutes, `36/36` paper decisions were
+  `HOLD` and not executed. The paper service remains active/running in paper
+  mode, `NRestarts=0`, with `ExecMainStartTimestamp=2026-10-24 06:47:58 UTC`.
+- There were zero new native quarantines for missing shadow path labels in
+  that 15-minute window. This is consistent with the intended timely-path
+  retry guard operating on the post-restart stream, but is not sufficient
+  time to claim G2 complete.
+- A bounded read-only exact-source recheck of four previously quarantined
+  native rows found their stored result clocks were within 1 minute of the
+  scheduled label time (10-26 seconds); each original stored path had
+  `bar_count=0` and no MFE/MAE path labels. Fetching the same exact native
+  source interval now returned eight 1m bars and re-verified six expected bars
+  per row as `clean`, with both entry and result prices reachable. No database
+  row was changed or requalified. This shows those older missing-path labels
+  are now reconstructible, but why their original updates bypassed the current
+  timely-path pending guard remains unresolved; do not use them as acceptance
+  evidence until a governed repair/replay contract is reviewed.
+- The separate three-hour entry-horizon audit completed at
+  `2026-10-24T07:08:32Z` read 300 decisions, all `HOLD`. All 300 local-ML
+  primary-horizon contracts were `current_prediction_contract_incomplete`,
+  with no selected or training horizon; the aggregate blocker was
+  `paper_prediction_horizon_unavailable`. Server-profit and time-series
+  sources were `signal_unavailable`. No exchange entry was attempted. This is
+  the direct current explanation for zero positions: eligible prediction
+  evidence is absent, not an exchange order rejection.
+- No profitability candidate has passed. G1 remains negative
+  attribution-only; G2 **BLOCKED**; G3 pending due to only four all-native
+  four-horizon groups in the preregistered six-hour window; G4-G6 pending.
+  Keep paper-only mode and every quality, cost, prediction and risk gate
+  unchanged.
+- Next: continue observing the current post-restart stream until clean,
+  matured four-horizon coverage supports nested development; separately
+  reconcile why the four older timely-clock rows were completed with empty
+  native paths. Any requalification requires an explicit reproducible,
+  auditable repair and cannot turn the already inspected interval into an
+  independent exam.

@@ -475,10 +475,13 @@ OKX_BALANCE_SNAPSHOT_STALE_SECONDS = 120.0
 OKX_BALANCE_SNAPSHOT_CONTENTION_WAIT_SECONDS = 12.0
 MARKET_OPEN_POSITIONS_CONTEXT_TTL_SECONDS = 30.0
 NEW_PAIR_PAUSE_CONTEXT_TTL_SECONDS = 5.0
-# Shadow maintenance is low priority; keep the foreground batch within the
-# same bounded latency envelope as market-only background refreshes.
+# Shadow maintenance is low priority; keep each market-only batch within the
+# shadow collector's 20-second total budget. Native path collection is bounded
+# to two concurrent requests and can spend up to one provider timeout per wave,
+# so a 25-row batch can cancel unfinished paths before settlement. The recovery
+# worker already uses four decisions per bounded pass; use the same size here.
 SHADOW_BACKTEST_FOREGROUND_UPDATE_LIMIT = 25
-SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 25
+SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT = 4
 SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS = 300.0
 SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES = 240
 # Each recovery item opens a bounded transaction and creates four horizons.
