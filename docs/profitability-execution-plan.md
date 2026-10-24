@@ -4609,3 +4609,37 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   preregister a new development family only on clean eligible labels. No code
   restart, account mutation, order, or protection change occurred in this
   recheck.
+
+### Authoritative Trade Training Eligibility Recheck (2026-10-25 07:14 Asia/Shanghai)
+
+- The bounded read-only audit
+  `audit_online_trade_training_eligibility.py --limit 500 --mode paper`
+  completed at `2026-10-24T23:13:50Z`. It inspected 500 paper authoritative
+  outcomes and found `trainable_count=0`, `included_count=0`,
+  `excluded_count=500`. Every row was excluded for
+  `feature_availability_contract_missing`.
+- These 500 rows do contain authoritative OKX fill/fee/funding source lineage
+  and non-null fee, slippage and funding values; however, the feature
+  availability contract is missing, so the cost supervision is not eligible
+  and those outcomes cannot safely train/promote a model. The sampled source
+  supervision version is
+  `2026-10-22.separated-profit-component-availability.v4`.
+- Code-path inspection verified that authoritative outcome reconstruction
+  projects the original `AIDecision.feature_snapshot` for linked order
+  `decision_id`s; training quality then rejects a missing availability seal.
+  This does not yet establish whether the absent contracts are unrecoverable
+  legacy decisions or a link/projection defect for any newer decisions.
+  Never fabricate or backfill the seal using settlement-time or current facts.
+- This is a second, independent explanation for the absence of a qualified
+  cost-aware artifact: prior executed outcomes are not trainable under the
+  current point-in-time feature contract, while current shadow observations
+  are not trades and have not produced a profitable selected policy.
+- Next exact action: perform a small bounded cross-check of recent
+  `decision_id`s from the already audited eligible-trade projections against
+  their original decision snapshots and linked order facts, using only the
+  availability-contract presence/version and source timing fields. If these
+  are legacy rows, preserve their exclusion and validate the capture-to-order
+  path only on future governed paper fills after preflight is clear. If recent
+  rows have a seal in `AIDecision` but lose it during projection, fix that
+  deterministic transport defect with focused tests. Do not create orders or
+  start/restart the active service to obtain test data.
