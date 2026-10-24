@@ -3035,3 +3035,105 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   previous push attempt failed on transient GitHub HTTPS connectivity.
   Retry the push of this documentation-only checkpoint before starting any
   new experiment. Do not rerun the completed six-hour study unchanged.
+
+### Horizon-Current Development Recheck Preregistration (2026-10-24 16:06 Asia/Shanghai)
+
+- Development-only identity: `horizon-current-v1-20261024T080400Z`.
+  Cutoff-exclusive UTC timestamp: `2026-10-24T08:04:00Z`; six-hour lookback;
+  at most 1,000 decision groups. Freeze the source to completed paper labels
+  with native executable one-minute paths and `fee_after_complete=true`.
+- Keep the existing v1 search unchanged: common 5/15/60/240-minute groups,
+  existing-vs-market-only features, Ridge alpha 1/10/100, thresholds
+  0/0.05/0.1%, chronological purged inner/outer folds, minimum 16 selected
+  rows, positive fee-after mean and lower bound, PF above one, and positive
+  means in both inner folds. This overlapping window is development evidence,
+  not a fresh exam.
+- Budget: one read-only database connection, 15-second statement timeout,
+  25% CPU, 1 GiB memory, 300-second runtime; aggregate metrics and exact
+  fingerprints only under ignored `data/profitability_remediation/`. The
+  runner must confirm dependency hashes and reject an already active
+  identical unit. No database mutation, artifact, promotion, policy change,
+  order or service restart.
+
+### Latest Online Entry And Settlement Recheck (2026-10-24 16:49 Asia/Shanghai)
+
+- A bounded read-only recovery audit covered the latest three hours
+  (`2026-10-24T05:49:31Z` through `2026-10-24T08:49:31Z`). It found `391`
+  paper market decisions, all `hold` and none executed. This is an evidence
+  and model-permission hold, not an OKX order rejection.
+- The recent funnel classified `292` decisions as `no_candidate` and `8` as
+  `insufficient_evidence`. Recent examples consistently report missing
+  positive expected net return, missing objective net, missing quant evidence
+  and missing prediction horizon. Feature availability was clean for
+  `298/300` sampled rows; the two invalid rows remain disclosed and were not
+  used to authorize entries.
+- Local-ML paper permission remains explicitly disabled by authoritative
+  executed-trade evidence: sample count `267`, fee-after mean
+  `-0.303832%`, lower confidence bound `-0.431590%`, and profit factor
+  `0.549713`. Server-profit, time-series and sentiment sources still have no
+  qualifying fee-after evidence. The current artifact remains `learning_only`
+  / degraded, with live and paper model influence disabled. No artifact,
+  threshold, leverage, risk gate or entry permission was changed.
+- Settlement is still a separate pipeline blocker. The same bounded audit
+  observed overdue pending rows of `81` (5m), `76` (15m), `81` (60m) and
+  `77` (240m), plus new pending rows that are not yet mature. Quarantine
+  reasons were dominated by historical-path availability/provenance
+  violations (`88` sampled reasons), with additional native market-fact and
+  source-consistency failures. The latest native executable set had `298`
+  completed rows across `274` decision groups; this is not yet enough
+  complete, independent four-horizon development coverage.
+- The OKX public latency diagnostic now covers the native consistency route in
+  addition to quote routes. Focused local verification passed (`45` tests,
+  Ruff, compileall and diff check). This instrumentation is diagnostic only;
+  it does not change trading behavior or authorize entries.
+- Acceptance state remains unchanged: G1 passed as negative attribution-only,
+  G2 **BLOCKED**, G3 pending, and G4-G6 pending. The next action is to keep
+  the paper service fail-closed while improving native settlement coverage
+  and collecting enough clean, mature fee-after rows for a preregistered
+  development search. A positive independent candidate is still required
+  before any controlled paper execution can be authorized.
+
+### Fresh Online Entry And Backlog Audit (2026-10-24 17:42 Asia/Shanghai)
+
+- The bounded shadow/settlement audit completed at
+  `2026-10-24T09:34:26Z`. Paper runtime was active, unpaused and reporting no
+  round or market error. The bounded evidence contained no executed-entry rows,
+  no OKX position-history rows, and no current open positions.
+- The same projection found `593` due `pending` shadow rows:
+  `150` at 5m, `148` at 15m, `154` at 60m and `141` at 240m. The oldest due
+  timestamps were between `2026-10-24T07:52Z` and `08:02Z`, about 92-102
+  minutes overdue at audit time. It also found `298` native executable
+  fee-after rows across `274` groups; the latest accepted native update was
+  `2026-10-24T08:40:29Z`. Later completed rows included `45` entries sourced
+  from `preserved_market_klines_historical_path`, which are historical-only
+  and cannot qualify as native executable training evidence. The bounded
+  fingerprint check verified `200/200` sampled native rows.
+- A selected fresh market decision (`692862`, SUSHI/USDT), audited at
+  `2026-10-24T09:42:34Z`, was `hold`, `was_executed=false`, with no order or
+  position. Its entry permission was denied as `no_direction`; blockers were
+  non-positive/missing expected net return, missing objective net, excessive
+  loss probability for quality-observation entry, missing quantitative
+  evidence, and missing prediction horizon. The profit model returned
+  `trained_profit_model_unavailable`; both long and short after-cost return
+  distributions were absent. The most recent 30-decision summary likewise
+  contained only `hold` decisions. This is an evidence/model-permission hold,
+  not a current exchange order rejection. The reconciliation snapshot still
+  reported `can_open_new_entries=true`, which means the account-wide switch is
+  not the immediate blocker; no direction-qualified candidate exists.
+- A separate high-granularity entry-recovery audit lost its SSH channel and
+  produced no evidence; it was not retried. The successful bounded audits above
+  were read-only and did not inspect exam labels, alter policy, or place orders.
+- The latest exact entry reason explains why there is no new paper trade, but
+  does not establish profitability. G1 remains passed only as negative
+  attribution; G2 remains **BLOCKED**; G3-G6 remain not passed. Five of the six
+  profitability gates therefore remain incomplete: one blocked data/label
+  gate and four downstream research, independent-evaluation, paper-execution
+  and final-acceptance gates. The prior local-ML executed-trade evidence
+  (`n=267`, fee-after mean `-0.303832%`, LCB `-0.431590%`, PF `0.549713`)
+  remains adverse and was not refreshed by this entry audit.
+- Next exact action: add a bounded due-age projection by horizon and inspect
+  aggregate native-route wait/provider latency to determine why mature native
+  rows stopped updating after `08:40Z`. Confirm the queue-selection/freshness
+  interaction before changing scheduling or concurrency. Keep all entry and
+  risk permissions unchanged; no profitability claim or independent exam is
+  available yet.
