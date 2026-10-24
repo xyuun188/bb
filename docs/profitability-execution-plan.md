@@ -4454,3 +4454,53 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   a new decision boundary for native-path capture success and fee-after
   eligibility. Existing quarantined rows remain immutable and are not
   retroactively promoted.
+
+### Current Status And Phase 3 Artifact Recheck (2026-10-25 06:28 Asia/Shanghai)
+
+- A fresh bounded online entry-recovery projection completed at
+  `2026-10-24T22:21:21Z` (Beijing `2026-10-25 06:21:21`). It covered
+  134 paper market decisions in the preceding hour; every final action was
+  `hold`, with 69 `no_candidate` and 31 `shadow_training` in the latest
+  100-row detail (`694509-694608`). Analysis completed for all sampled rows,
+  and no order attempt or exchange rejection occurred.
+- The direct authorization veto is unchanged and independently visible in the
+  same report: local-ML paper permission is `false` at `n=267`, fee-after
+  mean `-0.303832%`, return lower bound `-0.431590%`, and profit factor
+  `0.549713`. The blockers are
+  `average_fee_after_return_not_positive`,
+  `fee_after_return_lcb_not_positive`, and
+  `fee_after_profit_factor_not_above_break_even`. Selected shadow-training
+  rows therefore remain non-executing observations, not missed orders.
+- Read-only paper-resume preflight at `2026-10-24T22:21:22Z` confirms exchange
+  truth, account equity, target single-model runtime, Dashboard and tunnel
+  services are healthy. It remains blocked by the four Phase 3 child endpoint
+  contracts being unavailable and by `bb-paper-trading.service` already being
+  active, so it must not be used to restart the process.
+- A direct read-only Phase 3 API check explains the child-endpoint blocker:
+  `bb-phase3-quant-api.service` is active, but reports
+  `artifact_unavailable`, `model_bundle_available=false`,
+  `candidate_artifact_not_registered`, and current/challenger/rollback pointers
+  rejected for an incompatible historical `profit_supervision_version`.
+  Downloaded specialist model files (`10` downloaded, `9` validated) do not
+  constitute a registered cost-aware bundle; all four child routes correctly
+  remain unavailable.
+- A no-persist online local-AI training preflight completed at
+  `2026-10-24T22:27:06Z`: `432` shadow samples were readable but the
+  authoritative execution-cost sample count was `0`; the trainer returned
+  `authoritative_execution_cost_distribution_unavailable` and persisted no
+  artifact. This is consistent with the quarantined pre-contract rows and
+  must not be “fixed” by promoting the incompatible bundle or by treating
+  shadow/price-only labels as fee-after fills.
+- Current acceptance remains: G0 passed; G1 passed only as a negative loss
+  attribution audit; G2 blocked by decision-time native provenance and
+  executable-cost lineage; G3 has no qualifying cost-aware policy; G4 has no
+  frozen candidate or untouched exam; G5 has no governed paper round trip;
+  G6 is pending. Five profitability gates remain incomplete or failed.
+- Next exact action: keep live routing disabled and do not restart the active
+  paper process while the Phase 3 artifact/preflight contract is blocked.
+  Continue collecting only newly captured, native, fee-after-complete groups;
+  inspect the current cost-contract registration path for a reproducible
+  defect without writing an unqualified artifact; then preregister a new
+  chronological, purged, cost-aware development family only after clean
+  coverage exists. Existing quarantined rows and the negative `n=267`
+  evidence remain immutable and cannot be reused as a fresh exam.
