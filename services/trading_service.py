@@ -6057,6 +6057,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 and getattr(candidate, "funding_rate_observed_at", None)
             )
 
+        def native_path_refresh_required(issue: Any) -> bool:
+            """Do not let a cache-only snapshot become a training-time clock."""
+
+            if issue is None or str(getattr(issue, "code", "")) != "native_market_fact_invalid":
+                return False
+            details = getattr(issue, "details", None)
+            details = details if isinstance(details, dict) else {}
+            reason_codes = str(details.get("market_fact_reason_codes") or "")
+            return any(
+                token in reason_codes
+                for token in (
+                    "recent_one_minute_price_path_missing",
+                    "recent_one_minute_price_path_incomplete",
+                    "observed_price_outside_recent_native_path",
+                    "executable_quote_sources_not_reconciled",
+                )
+            )
+
         def validated(candidate: Any, *, source: str) -> tuple[Any | None, Any | None]:
             if not self._is_valid_feature_vector(candidate):
                 return None, None
@@ -6121,6 +6139,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         fallback_usable = bool(
             fallback_candidate is not None and funding_ready(fallback_candidate)
         )
+        fallback_requires_native_path = native_path_refresh_required(
+            fallback_quality_issue
+        )
 
         # A priced fallback with an execution-only quality issue is already a
         # valid observation snapshot. Do not spend the entire market-round
@@ -6128,7 +6149,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # boundary will perform again. This is the key separation between
         # observation throughput and executable-entry validation.
         quality_policy = getattr(self, "entry_market_data_quality", None)
-        if fallback_usable and fallback_quality_issue is not None and quality_policy is not None:
+        if (
+            fallback_usable
+            and fallback_quality_issue is not None
+            and not fallback_requires_native_path
+            and quality_policy is not None
+        ):
             if quality_policy.observation_blocker(
                 fallback_candidate,
                 stage_label="AI observation",
@@ -6188,11 +6214,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 local_candidate,
                 source="fresh_local_market_cache",
             )
-            if cached is not None and funding_ready(cached):
+            local_requires_native_path = native_path_refresh_required(local_quality_issue)
+            if (
+                cached is not None
+                and funding_ready(cached)
+                and not local_requires_native_path
+            ):
                 return cached
             if cached is not None:
                 logger.info(
-                    "fresh local feature cache lacks complete funding evidence; trying remote refresh",
+                    "fresh local feature cache lacks capture-time native path; trying remote refresh",
                     symbol=symbol,
                 )
         except TimeoutError:

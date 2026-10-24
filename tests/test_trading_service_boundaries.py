@@ -1418,6 +1418,72 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
 
 
 @pytest.mark.asyncio
+async def test_market_candidate_refreshes_capture_time_native_path_before_observation() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    stale = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=True,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+    )
+    fresh = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=True,
+        funding_data_available=True,
+        funding_rate=0.0001,
+        funding_interval_minutes=480.0,
+        next_funding_time="2026-08-23T08:00:00+00:00",
+        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+    )
+    path_issue = SimpleNamespace(
+        code="native_market_fact_invalid",
+        details={
+            "market_fact_reason_codes": (
+                "source_consistency:recent_one_minute_price_path_missing"
+            )
+        },
+    )
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return stale if len(calls) < 2 else fresh
+
+    class QualityPolicy:
+        @staticmethod
+        def observation_issue(candidate: Any, *, stage_label: str) -> Any | None:
+            assert stage_label == "AI observation"
+            return path_issue if candidate is stale else None
+
+        @staticmethod
+        def observation_blocker(_candidate: Any, *, stage_label: str) -> None:
+            assert stage_label == "AI observation"
+            return None
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+    service.entry_market_data_quality = QualityPolicy()
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT", stale)
+
+    assert result is fresh
+    assert len(calls) == 2
+    assert calls[0]["block_on_remote_ticker"] is False
+    assert calls[1]["block_on_remote_ticker"] is True
+    assert calls[1]["block_on_remote_indicators"] is False
+    assert calls[1]["block_on_remote_derivatives"] is True
+    assert calls[1]["require_authoritative_snapshot"] is True
+
+
+@pytest.mark.asyncio
 async def test_market_candidate_prewarm_uses_bounded_priority_api() -> None:
     service = TradingService.__new__(TradingService)
     received: dict[str, Any] = {}

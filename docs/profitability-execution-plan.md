@@ -4411,3 +4411,46 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   fee-after groups and preregister a materially different candidate family
   only after enough clean chronological labels exist. G4 remains closed until
   G3 passes.
+
+### Capture-Time Native Refresh Repair (2026-10-25 06:14 Asia/Shanghai)
+
+- The capture-time path was reproducible in the market-analysis flow:
+  `_market_feature_fetch_options()` intentionally uses cache-only ticker and
+  derivative reads for the broad discovery pool. `_fresh_feature_vector_for_analysis()`
+  then accepted a complete priced fallback with a `native_market_fact_invalid`
+  observation issue, even when its reason codes were
+  `recent_one_minute_price_path_missing`,
+  `recent_one_minute_price_path_incomplete`,
+  `observed_price_outside_recent_native_path`, or
+  `executable_quote_sources_not_reconciled`. The resulting AI/shadow row could
+  therefore be persisted without decision-time native-path evidence. A later
+  REST probe cannot retroactively establish that the original snapshot was
+  executable.
+- Repair in `services/trading_service.py`: these four capture-time reason
+  families now suppress the observation-only fallback and force one bounded
+  authoritative native refresh before AI analysis. The refresh also requests
+  the derivative facts needed to rebuild the full native consistency contract.
+  Other observation-only quality issues retain the prior bounded fallback
+  behavior. Refresh timeout/error still leaves the row isolated; no quality,
+  return, risk, leverage, or execution threshold changed.
+- Regression coverage added in
+  `tests/test_trading_service_boundaries.py` for a missing native path at the
+  fallback boundary. Verification: the full boundary module passed
+  `365 passed`; the focused refresh subset passed `7 passed`; the focused
+  market-data quality module passed `18 passed`; the native ticker/data-service
+  subset passed `18 passed`; Ruff, compileall and `git diff --check` passed.
+- Targeted source/test upload completed with
+  `source-integrity-ok:2` and no service restart. The read-only online
+  paper-resume preflight at `2026-10-24T22:13:39Z` still reports
+  `bb-paper-trading.service` already active and all four Phase 3 quant child
+  endpoints unavailable, so the uploaded process has not loaded this patch;
+  restarting is intentionally deferred until the existing preflight contract
+  is clear. Paper mode remains active, live routing remains disabled, and
+  there are no positions or orders needing repair.
+- G2 remains BLOCKED pending fresh post-load capture-time evidence. G1 is
+  passed only as a negative attribution audit; G3 has no qualifying candidate;
+  G4, G5 and G6 remain pending. The next exact action is to clear/verify the
+  existing paper restart preflight, load this patch in paper only, then audit
+  a new decision boundary for native-path capture success and fee-after
+  eligibility. Existing quarantined rows remain immutable and are not
+  retroactively promoted.
