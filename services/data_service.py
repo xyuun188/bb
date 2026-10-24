@@ -228,6 +228,10 @@ TICKER_CACHE_MAX_AGE_SECONDS = max(
 # validator still rejects missing or stale paths.
 NATIVE_CONSISTENCY_BARS_CACHE_TTL_SECONDS = 30.0
 NATIVE_CONSISTENCY_BARS_CACHE_MAX_KEYS = 256
+# Cache-only market scans may start an evidence refresh without waiting for it.
+# Keep that best-effort lane bounded so rotating the 240-symbol universe cannot
+# build an unbounded queue in the isolated native REST gate.
+NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT = 4
 LATEST_MARKET_FACT_CACHE_TTL_SECONDS = 15.0
 AVAILABLE_SYMBOLS_CACHE_TTL_SECONDS = 600.0
 CANDIDATE_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
@@ -1211,17 +1215,29 @@ class DataService:
                 )
 
         results = await asyncio.gather(*(prewarm(symbol) for symbol in normalized_symbols))
-        unavailable = [
-            symbol
-            for symbol, snapshot in results
-            if not bool(snapshot.get("indicator_snapshot_available"))
-        ]
+        unavailable: list[str] = []
+        unavailable_reasons: dict[str, str] = {}
+        for symbol, snapshot in results:
+            if not bool(snapshot.get("indicator_snapshot_available")):
+                reason = str(
+                    snapshot.get("indicator_snapshot_reason")
+                    or "indicator_snapshot_unavailable"
+                )
+            elif not self._has_observed_technical_inputs(snapshot):
+                # An available-looking snapshot without observed source
+                # delivery is not safe to hydrate into an entry candidate.
+                reason = "indicator_source_delivery_unobserved"
+            else:
+                continue
+            unavailable.append(symbol)
+            unavailable_reasons[symbol] = reason
         return {
             "status": "ok" if not unavailable else "partial",
             "requested_count": len(normalized_symbols),
             "available_count": len(normalized_symbols) - len(unavailable),
             "unavailable_count": len(unavailable),
             "unavailable_symbols": unavailable,
+            "unavailable_reasons": unavailable_reasons,
             "timeout_seconds": round(per_symbol_timeout, 3),
             "priority_queue_enabled": True,
         }
@@ -1419,6 +1435,7 @@ class DataService:
                     normalized,
                     source_snapshots,
                     wait_for_completion=block_on_remote,
+                    priority=block_on_remote,
                 )
             )
             if selected.get("source") == "rest":
@@ -1472,6 +1489,7 @@ class DataService:
         *,
         wait_for_completion: bool = True,
         include_result_candle: bool = False,
+        priority: bool = False,
     ) -> list[Any]:
         normalized = self._normalize_symbols([symbol])[0]
         now = asyncio.get_running_loop().time()
@@ -1566,7 +1584,20 @@ class DataService:
                 return rows if covers_required_window(rows) else []
             except TimeoutError:
                 return []
-
+        if not wait_for_completion:
+            pending_count = sum(
+                1
+                for task in tasks.values()
+                if isinstance(task, asyncio.Task) and not task.done()
+            )
+            if pending_count >= NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT:
+                logger.debug(
+                    "native consistency background refresh saturated",
+                    symbol=normalized,
+                    pending_count=pending_count,
+                    limit=NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT,
+                )
+                return []
         async def fetch() -> list[Any]:
             try:
                 if use_native_fetcher:
@@ -1574,11 +1605,21 @@ class DataService:
                     # returns only the latest candles. Anchor it to the latest
                     # fact minute so delayed REST/WS observations are covered.
                     try:
-                        request = fetcher(
-                            normalized,
-                            limit=limit,
-                            end_timestamp_ms=required_last_open,
-                        )
+                        try:
+                            request = fetcher(
+                                normalized,
+                                limit=limit,
+                                end_timestamp_ms=required_last_open,
+                                priority=priority,
+                            )
+                        except TypeError as exc:
+                            if "priority" not in safe_error_text(exc):
+                                raise
+                            request = fetcher(
+                                normalized,
+                                limit=limit,
+                                end_timestamp_ms=required_last_open,
+                            )
                     except TypeError as exc:
                         # Small test doubles and older adapters may not expose
                         # the optional anchor yet; keep them source-compatible.
@@ -1587,19 +1628,34 @@ class DataService:
                         request = fetcher(normalized, limit=limit)
                 else:
                     try:
-                        request = fetcher(
-                            normalized,
-                            timeframe="1m",
-                            limit=limit,
-                            # The general OHLCV adapter uses OKX's exclusive
-                            # `after` cursor directly. Include the last candle
-                            # by anchoring one minute beyond its open time.
-                            end_timestamp_ms=(
-                                required_last_open + minute_ms
-                                if include_result_candle
-                                else required_last_open
-                            ),
-                        )
+                        try:
+                            request = fetcher(
+                                normalized,
+                                timeframe="1m",
+                                limit=limit,
+                                # The general OHLCV adapter uses OKX's exclusive
+                                # `after` cursor directly. Include the last candle
+                                # by anchoring one minute beyond its open time.
+                                end_timestamp_ms=(
+                                    required_last_open + minute_ms
+                                    if include_result_candle
+                                    else required_last_open
+                                ),
+                                priority=priority,
+                            )
+                        except TypeError as exc:
+                            if "priority" not in safe_error_text(exc):
+                                raise
+                            request = fetcher(
+                                normalized,
+                                timeframe="1m",
+                                limit=limit,
+                                end_timestamp_ms=(
+                                    required_last_open + minute_ms
+                                    if include_result_candle
+                                    else required_last_open
+                                ),
+                            )
                     except TypeError as exc:
                         if "end_timestamp_ms" not in safe_error_text(exc):
                             raise
@@ -1904,6 +1960,7 @@ class DataService:
                 normalized,
                 [enriched],
                 wait_for_completion=False,
+                priority=False,
             )
         return enriched
 
@@ -2620,6 +2677,7 @@ class DataService:
             [entry_fact, result_fact],
             wait_for_completion=True,
             include_result_candle=True,
+            priority=False,
         )
         return verify_native_market_fact_path(entry_fact, result_fact, rows)
 

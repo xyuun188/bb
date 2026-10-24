@@ -98,6 +98,7 @@ PUBLIC_MARKET_DIAGNOSTIC_METHODS = frozenset(
     {
         "fetch_order_book",
         "fetch_ticker",
+        "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
         "publicGetMarketTicker",
         "publicGetPublicMarkPrice",
@@ -487,6 +488,7 @@ class OKXRestClient:
             gate_acquired_at: float | None = None
             acquired = False
             request_error: Exception | None = None
+            request_cancelled = False
             try:
                 if gate is not None:
                     await gate.acquire(priority=is_priority)
@@ -512,6 +514,13 @@ class OKXRestClient:
                     )
                     await self.reinitialize()
                     continue
+                raise
+            except asyncio.CancelledError as exc:
+                # A queued low-priority native refresh can be cancelled by its
+                # bounded caller before it reaches the provider. Keep that
+                # diagnostic distinct from a successful zero-duration request.
+                request_error = exc
+                request_cancelled = True
                 raise
             finally:
                 completed_at = time.monotonic()
@@ -541,7 +550,11 @@ class OKXRestClient:
                         provider_duration_ms=round(provider_duration_ms, 1),
                         priority=is_priority,
                         outcome=(
-                            "error" if request_error is not None else "ok"
+                            "cancelled"
+                            if request_cancelled
+                            else "error"
+                            if request_error is not None
+                            else "ok"
                         ),
                         error_type=(
                             type(request_error).__name__
@@ -912,12 +925,13 @@ class OKXRestClient:
         limit: int = 5,
         *,
         end_timestamp_ms: int | None = None,
+        priority: bool = False,
     ) -> list[list[float]]:
         """Fetch the short 1m path on its own bounded request lane."""
         kwargs: dict[str, Any] = {
             "limit": limit,
             "_request_gate": self._native_consistency_gate(),
-            "_request_priority": False,
+            "_request_priority": bool(priority),
         }
         if int(end_timestamp_ms or 0) > 0:
             kwargs["end_timestamp_ms"] = int(end_timestamp_ms)

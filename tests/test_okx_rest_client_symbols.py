@@ -55,10 +55,11 @@ def test_native_consistency_route_uses_a_separate_gate() -> None:
     assert client._native_consistency_gate() is not client._public_market_optional_gate()
 
 
-def test_latency_diagnostics_only_cover_executable_quote_routes() -> None:
+def test_latency_diagnostics_cover_quote_and_native_path_routes() -> None:
     assert PUBLIC_MARKET_DIAGNOSTIC_METHODS == {
         "fetch_order_book",
         "fetch_ticker",
+        "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
         "publicGetMarketTicker",
         "publicGetPublicMarkPrice",
@@ -104,6 +105,101 @@ async def test_public_market_latency_logs_bounded_queue_diagnostic(
     assert events[0]["queue_wait_ms"] >= 250.0
     assert events[0]["provider_duration_ms"] >= 0.0
     assert events[0]["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_native_consistency_latency_logs_queue_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    events: list[dict[str, Any]] = []
+
+    class SlowGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+            await asyncio.sleep(0.26)
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is False
+
+    class Exchange:
+        async def fetch_native_consistency_ohlcv(self, _symbol: str, **_kwargs) -> list:
+            return []
+
+    gate = SlowGate()
+    monkeypatch.setattr(client, "_native_consistency_gate", lambda: gate)
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    monkeypatch.setattr(
+        okx_rest_client_module.logger,
+        "info",
+        lambda _event, **kwargs: events.append(kwargs),
+    )
+
+    result = await client._ccxt_call(
+        "fetch_native_consistency_ohlcv",
+        "BTC/USDT:USDT",
+        _request_gate=gate,
+        _request_priority=False,
+    )
+
+    assert result == []
+    assert len(events) == 1
+    assert events[0]["method"] == "fetch_native_consistency_ohlcv"
+    assert events[0]["queue_wait_ms"] >= 250.0
+    assert events[0]["provider_duration_ms"] >= 0.0
+    assert events[0]["priority"] is False
+    assert events[0]["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_native_consistency_wait_is_not_logged_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    events: list[dict[str, Any]] = []
+    waiting = asyncio.Event()
+
+    class SlowGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+            waiting.set()
+            await asyncio.Event().wait()
+
+        def release(self, *, priority: bool) -> None:
+            raise AssertionError("a cancelled waiter never acquired the gate")
+
+    class Exchange:
+        async def fetch_native_consistency_ohlcv(self, _symbol: str, **_kwargs) -> list:
+            return []
+
+    gate = SlowGate()
+    monkeypatch.setattr(client, "_native_consistency_gate", lambda: gate)
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    monkeypatch.setattr(
+        okx_rest_client_module.logger,
+        "info",
+        lambda _event, **kwargs: events.append(kwargs),
+    )
+
+    task = asyncio.create_task(
+        client._ccxt_call(
+            "fetch_native_consistency_ohlcv",
+            "BTC/USDT:USDT",
+            _request_gate=gate,
+            _request_priority=False,
+        )
+    )
+    await asyncio.wait_for(waiting.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(events) == 1
+    assert events[0]["method"] == "fetch_native_consistency_ohlcv"
+    assert events[0]["outcome"] == "cancelled"
+    assert events[0]["error_type"] == "CancelledError"
 
 
 @pytest.mark.asyncio

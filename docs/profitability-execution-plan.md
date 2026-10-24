@@ -3137,3 +3137,135 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   interaction before changing scheduling or concurrency. Keep all entry and
   risk permissions unchanged; no profitability claim or independent exam is
   available yet.
+
+### Native Evidence Queue Repair (2026-10-24 18:20 Asia/Shanghai)
+
+- The bounded remote journal aggregation covered the prior 30 minutes and
+  found `1,175` `fetch_native_consistency_ohlcv` latency events. Queue wait was
+  `20,557.2 ms` at the median, `25,791.1 ms` at P95 and `26,412.6 ms` at the
+  maximum; provider duration was `0.0 ms` at the median, P95 and maximum.
+  There were `51` shadow price-path batch timeouts. This pattern identifies
+  request-gate starvation/cancellation before the provider, not an OKX
+  rejection or a slow candle response.
+- The code path confirmed the cause: cache-only feature scans started a
+  non-blocking native request for each rotating symbol, while
+  `DataService._fetch_native_consistency_bars` had no total background-task
+  bound. Those tasks accumulated behind the isolated two-request native lane.
+  Foreground path verification also used the same low-priority lane, so valid
+  settlement work could wait behind diagnostic refreshes.
+- Repair implemented in owned paths: cache-only native refreshes now stop
+  creating work after four pending background tasks; foreground/native path
+  verification is submitted as a priority request; compatibility fallbacks
+  preserve older test adapters; cancellation diagnostics are recorded as
+  `outcome=cancelled` instead of `outcome=ok`. No entry threshold, cost rule,
+  risk limit, leverage or live-mode setting changed.
+- Local verification passed: `155` focused data-service/REST tests and `435`
+  related feature/SDK/trading-boundary tests; Ruff, compileall and whitespace
+  checks passed. The source was staged to the online checkout with
+  `source-integrity-ok:4` and no service restart. The repair is therefore not
+  yet active in the long-running paper process.
+- Before rollout, the paper unit must be read-only checked for mode `paper`,
+  `paused=false`, zero positions and no active orders. Restart only
+  `bb-paper-trading.service`; then measure native queue wait, completed native
+  rows, due counts and HOLD reasons over one bounded interval. Do not promote
+  any model or requalify historical rows based on this throughput repair.
+
+### Priority Isolation Follow-Up (2026-10-24 18:34 Asia/Shanghai)
+
+- The first post-deployment interval verified native data progress (fee-after
+  rows increased from `298` to `309`, decision groups from `274` to `285`, and
+  the latest native update advanced to `2026-10-24T10:29:47Z`). Maintenance
+  completed `25` rows, with no surfaced runtime error; `200/200` sampled native
+  fingerprints remained valid. However, the pending queue continued growing,
+  so the throughput fix is not yet accepted.
+- Post-deployment journal evidence still showed a native request queue-wait
+  median of `20,027.6 ms` / P95 `25,993.6 ms` over 197 requests, with 8 shadow
+  path-batch timeout events. Code review found the first rollout had also
+  placed delayed shadow path verification into the priority lane. That would
+  let maintenance compete with current market facts, contrary to the required
+  execution ordering.
+- Follow-up correction keeps real-time current-fact requests priority-enabled
+  but restores delayed shadow path verification to normal/low priority. Added
+  a regression asserting this separation. Four focused regressions passed
+  locally; the changed bytes still require targeted online upload, remote
+  regression, paper-only restart and another bounded latency/throughput check.
+- The four-task background cap and priority separation are transport/data
+  availability fixes only. They do not supply missing prediction distributions
+  or positive after-cost expected return; the model remains unauthorized and
+  entry/HOLD conclusions must be refreshed after rollout.
+
+### Priority-Isolated Rollout Recheck (2026-10-24 18:52 Asia/Shanghai)
+
+- After the second paper-only restart at `2026-10-24T10:46:48Z`, the bounded
+  window through `2026-10-24T10:49Z` completed `96` rows and quarantined `24`
+  rows with no maintenance failure. Pending due rows fell from `804` in the
+  prior window to `668` (`139/145/126/128` for 5/15/60/240m); the oldest
+  pending rows were around `09:11-09:14Z`, so backlog remains material but is
+  moving in the correct direction.
+- Native executable fee-after coverage increased from `309` rows / `285`
+  groups to `398` rows / `347` groups. The bounded lineage check remained
+  `200/200` verified. Historical-only completions (`322` rows / `288` groups)
+  remain quarantined from native training and are not counted as profitability
+  evidence.
+- Five-minute journal aggregation found no shadow price-path batch timeout.
+  Native low-priority requests had queue-wait P50/P95/max of
+  `313.9/1,575.7/1,940.4 ms`; current-fact priority requests had
+  `101.6/992.2/992.2 ms`. This is a substantial improvement over the earlier
+  `20-26s` queue starvation pattern and validates the priority separation.
+- The latest market decision (`693009`, PEPE/USDT) was still `hold` with no
+  order/position. Its exact entry blockers remained expected net return not
+  positive, objective net missing, loss probability too high for observation
+  entry, quantitative evidence missing and prediction horizon missing. Both
+  profit and time-series local model contracts reported
+  `trained_*_model_unavailable` with incomplete return distributions. The
+  account-level reconciliation still allowed new entries, so no exchange
+  rejection is involved.
+- This rollout fixes a real evidence-collection bottleneck but does not pass
+  G2 or establish a profitable strategy. G1 remains negative-attribution-only;
+  G2 **BLOCKED**; G3-G6 remain pending. Continue bounded collection until
+  native four-horizon development coverage is sufficient, then run only the
+  preregistered development search. Do not use historical-only rows, inspect
+  an exam, or lower entry/risk gates to force a trade.
+
+### Horizon-Current Development Recheck Preregistration (2026-10-24 18:55 Asia/Shanghai)
+
+- Development-only identity: `horizon-current-v1-20261024T105500Z`.
+  Cutoff-exclusive UTC timestamp: `2026-10-24T10:55:00Z`; six-hour lookback;
+  maximum 1,000 decision groups. The source is limited to completed paper
+  rows with `shadow_entry_result_and_okx_native_1m_path` and
+  `fee_after_complete=true`.
+- Keep the existing v1 family unchanged: common 5/15/60/240-minute groups;
+  existing-vs-market-only feature policies; Ridge alpha `1/10/100`; net
+  thresholds `0/0.05/0.1%`; purged chronological inner and outer folds;
+  minimum selected rows `16`; positive fee-after mean/lower bound; PF above
+  one; and positive means in both inner folds. No candidate-set, threshold,
+  sizing, risk or entry-gate edits.
+- Budget remains one read-only DB connection, 15-second statement timeout,
+  25% CPU, 1 GiB RAM, 300-second runtime; aggregate metrics, source IDs and
+  fingerprints only under ignored `data/profitability_remediation/`. No
+  artifact, database mutation, promotion, policy change, order, service
+  restart or exam-label read.
+
+### Horizon-Current Development Recheck Result (2026-10-24 18:57 Asia/Shanghai)
+
+- The preregistered development-only run completed at
+  `2026-10-24T10:57:16Z` with the exact cutoff
+  `2026-10-24T10:55:00Z`. It read `429` native fee-after rows across `371`
+  decision groups: `96` x 5m, `111` x 15m, `117` x 60m and `105` x 240m.
+- The common four-horizon group count was still `0`; therefore no purged
+  nested folds were estimable, no policy was selected, and no artifact or
+  model permission was produced. The report status is
+  `insufficient_development_data`; `exam_labels_evaluated=false`,
+  `artifact_persisted=false`, `database_mutated=false`,
+  `promotion_authorized=false` and `orders_submitted=false`.
+- Development input SHA256:
+  `840fa19450104ff54beda499dcd610ebd955d6c5a2d00746877c2c56b73c48a3`;
+  snapshot SHA256:
+  `48356ac4c579a3647b9810b52fdeeafd186f44be6eebae2c75e955def80a6578`.
+  Full aggregate report:
+  `data/profitability_remediation/online-horizon-development-v1-20261024T105500Z.json`.
+- This is not a candidate rejection and not an independent exam result; it
+  means the repaired stream still has no complete four-horizon decision
+  groups. G2 remains **BLOCKED** and G3-G6 remain pending. Continue collecting
+  clean native labels and do not enable entries merely because throughput
+  improved.

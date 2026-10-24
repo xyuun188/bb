@@ -1820,6 +1820,55 @@ async def test_native_consistency_bars_are_singleflight_and_short_cached() -> No
 
 
 @pytest.mark.asyncio
+async def test_native_consistency_background_refreshes_are_bounded() -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    minute = timestamp - timestamp % 60_000
+    calls: list[tuple[str, bool]] = []
+    release = asyncio.Event()
+
+    class FakeRestClient:
+        async def fetch_native_consistency_ohlcv(
+            self,
+            symbol: str,
+            *,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+            priority: bool = False,
+        ) -> list[list[float]]:
+            assert limit >= 1
+            calls.append((symbol, priority))
+            await release.wait()
+            return [[float(end_timestamp_ms or minute), 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    for index in range(data_service_module.NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT):
+        await service._fetch_native_consistency_bars(
+            f"ASSET{index}/USDT",
+            [{"timestamp": timestamp}],
+            wait_for_completion=False,
+        )
+
+    await service._fetch_native_consistency_bars(
+        "OVERFLOW/USDT",
+        [{"timestamp": timestamp}],
+        wait_for_completion=False,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
+
+    tasks = list(service._native_consistency_bars_tasks.values())
+    assert len(tasks) == data_service_module.NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT
+    assert len(calls) == data_service_module.NATIVE_CONSISTENCY_BACKGROUND_TASK_LIMIT
+    assert all(priority is False for _symbol, priority in calls)
+
+    release.set()
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+    assert not service._native_consistency_bars_tasks
+
+
+@pytest.mark.asyncio
 async def test_native_consistency_bars_refresh_when_cache_misses_fact_window() -> None:
     service = _service()
     calls = 0
@@ -2000,11 +2049,13 @@ async def test_shadow_market_fact_path_prefers_isolated_native_lane() -> None:
             *,
             limit: int,
             end_timestamp_ms: int | None = None,
+            priority: bool = True,
         ) -> list[list[float]]:
             requested.update(
                 symbol=symbol,
                 limit=limit,
                 end_timestamp_ms=end_timestamp_ms,
+                priority=priority,
             )
             return [
                 [float(open_time), 100.0, 101.0, 99.0, 100.5, 10.0]
@@ -2025,6 +2076,7 @@ async def test_shadow_market_fact_path_prefers_isolated_native_lane() -> None:
         "symbol": "BTC/USDT",
         "limit": ((last_open - first_open) // 60_000) + 3,
         "end_timestamp_ms": last_open,
+        "priority": False,
     }
 
 
@@ -2735,8 +2787,8 @@ async def test_native_consistency_fetch_includes_source_timestamp_book_window() 
     minute = 1_700_000_040_000
     requests = []
 
-    async def fetch(_symbol, *, limit, end_timestamp_ms):
-        requests.append((limit, end_timestamp_ms))
+    async def fetch(_symbol, *, limit, end_timestamp_ms, priority=False):
+        requests.append((limit, end_timestamp_ms, priority))
         return [[stamp, 99, 101, 98, 100, 10] for stamp in (minute - 60_000, minute)]
 
     service.rest_client = SimpleNamespace(fetch_native_consistency_ohlcv=fetch)
@@ -2745,9 +2797,10 @@ async def test_native_consistency_fetch_includes_source_timestamp_book_window() 
             "timestamp": minute + 1_000,
             "orderbook_fact": {"source_timestamp_ms": minute - 1_000},
         }],
+        priority=True,
     )
     assert len(rows) == 2
-    assert requests == [(4, minute)]
+    assert requests == [(4, minute, True)]
 
 
 @pytest.mark.asyncio
@@ -3685,6 +3738,7 @@ async def test_candidate_indicator_prewarm_reports_unavailable_symbols() -> None
         return {
             "indicator_snapshot_available": True,
             "indicator_snapshot_quality": "full",
+            "technical_availability": _observed_technical_contract(),
         }
 
     service._get_indicator_snapshot = indicator_snapshot  # type: ignore[method-assign]
@@ -3698,7 +3752,35 @@ async def test_candidate_indicator_prewarm_reports_unavailable_symbols() -> None
     assert diagnostics["requested_count"] == 2
     assert diagnostics["available_count"] == 1
     assert diagnostics["unavailable_symbols"] == ["ETH/USDT"]
+    assert diagnostics["unavailable_reasons"] == {
+        "ETH/USDT": "no_recent_klines",
+    }
     assert all(kwargs["prioritize_build"] is True for _symbol, kwargs in calls)
+
+
+@pytest.mark.asyncio
+async def test_candidate_indicator_prewarm_rejects_unobserved_source_delivery() -> None:
+    service = _service()
+
+    async def indicator_snapshot(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "indicator_snapshot_available": True,
+            "indicator_snapshot_quality": "full",
+        }
+
+    service._get_indicator_snapshot = indicator_snapshot  # type: ignore[method-assign]
+
+    diagnostics = await service.prewarm_indicator_snapshots(
+        ["BTC/USDT"],
+        timeout_seconds=0.2,
+    )
+
+    assert diagnostics["status"] == "partial"
+    assert diagnostics["available_count"] == 0
+    assert diagnostics["unavailable_symbols"] == ["BTC/USDT"]
+    assert diagnostics["unavailable_reasons"] == {
+        "BTC/USDT": "indicator_source_delivery_unobserved",
+    }
 
 
 @pytest.mark.asyncio
