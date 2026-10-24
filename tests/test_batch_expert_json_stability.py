@@ -764,6 +764,41 @@ async def test_paper_batch_parser_preserves_complete_model_plan(
 
 
 @pytest.mark.asyncio
+async def test_qwen_batch_failure_exposes_bounded_response_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, _messages: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(
+                content='{"a":["l","s"]}',
+                response_metadata={"finish_reason": "length"},
+                usage_metadata={"completion_tokens": 32},
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": LOCAL_QWEN_TEST_BASE,
+            "api_key": "test-key",
+            "model": "qwen3.8-27b",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    with pytest.raises(LLMResponseParseError, match="finish_reason=length"):
+        await agent.decide_batch_experts(
+            FeatureVector(symbol="BTC/USDT"),
+            {"execution_mode": "paper"},
+            ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
+        )
+
+
+@pytest.mark.asyncio
 async def test_batch_expert_missing_after_repair_raises_for_independent_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

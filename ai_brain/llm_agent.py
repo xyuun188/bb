@@ -841,6 +841,19 @@ def _provider_response_contract(response: Any) -> dict[str, Any]:
     }
 
 
+def _response_contract_summary(contract: dict[str, Any]) -> str:
+    """Format bounded provider metadata without persisting response content."""
+
+    return (
+        "finish_reason="
+        f"{str(contract.get('finish_reason') or 'unknown')[:40]}; "
+        f"completion_tokens={contract.get('completion_tokens')!r}; "
+        f"content_chars={int(contract.get('content_chars') or 0)}; "
+        f"reasoning_only={bool(contract.get('reasoning_only'))}; "
+        f"truncated={bool(contract.get('truncated'))}"
+    )
+
+
 def _strip_qwen_thinking(text: str) -> str:
     """Remove Qwen3 thinking blocks before JSON parsing."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE).strip()
@@ -1561,7 +1574,15 @@ class LLMAgent(AbstractAIModel):
                     response = await asyncio.wait_for(request, timeout=remaining)
                 else:
                     response = await request
-            parsed = _extract_json(_message_content_text(response))
+            response_contract = _provider_response_contract(response)
+            response_summary = _response_contract_summary(response_contract)
+            try:
+                parsed = _extract_json(_message_content_text(response))
+            except Exception as exc:
+                raise LLMResponseParseError(
+                    "batch expert response JSON invalid; "
+                    f"{safe_error_text(exc, limit=160)}; {response_summary}"
+                ) from exc
             if target_single_call:
                 vector = _normalize_compact_batch_vector(parsed, expert_names)
                 if vector is not None:
@@ -1578,7 +1599,10 @@ class LLMAgent(AbstractAIModel):
                     experts = top_level
             if not isinstance(experts, dict):
                 kind = "repair" if repair else "batch"
-                raise LLMResponseParseError(f"{kind} experts response missing experts object")
+                suffix = f"; {response_summary}" if target_single_call else ""
+                raise LLMResponseParseError(
+                    f"{kind} experts response missing experts object{suffix}"
+                )
             return experts
 
         if self._llm is None:
@@ -1635,7 +1659,8 @@ class LLMAgent(AbstractAIModel):
             # fail closed and let the deterministic risk gate hold instead.
             if target_single_call:
                 raise LLMResponseParseError(
-                    "Qwen3.8-27B batch response incomplete; production repair call disabled"
+                    "Qwen3.8-27B batch response incomplete; production repair call disabled; "
+                    f"{repair_error or 'provider response metadata unavailable'}"
                 )
             repair_prompt = build_batch_experts_user_prompt(
                 feature_contexts,

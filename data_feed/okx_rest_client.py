@@ -94,6 +94,7 @@ PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 4
 # a dead exchange connection must not occupy a shared request slot for a full
 # minute and starve executable quotes.
 PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
+PUBLIC_MARKET_NATIVE_CONSISTENCY_TIMEOUT_RETRY_DELAY_SECONDS = 0.05
 PUBLIC_MARKET_SLOW_WAIT_LOG_MS = 250.0
 PUBLIC_MARKET_SLOW_PROVIDER_LOG_MS = 750.0
 PUBLIC_MARKET_DIAGNOSTIC_METHODS = frozenset(
@@ -508,6 +509,20 @@ class OKXRestClient:
                 return await call
             except Exception as exc:
                 request_error = exc
+                if (
+                    attempt == 0
+                    and method_name == "fetch_native_consistency_ohlcv"
+                    and request_priority is False
+                    and isinstance(exc, TimeoutError)
+                ):
+                    logger.debug(
+                        "low-priority native consistency request timed out; retrying once",
+                        method=method_name,
+                    )
+                    await asyncio.sleep(
+                        PUBLIC_MARKET_NATIVE_CONSISTENCY_TIMEOUT_RETRY_DELAY_SECONDS
+                    )
+                    continue
                 if attempt == 0 and self._is_broken_rest_url_error(exc):
                     logger.warning(
                         "OKX REST URL state invalid; reinitializing SDK client",

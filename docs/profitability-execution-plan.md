@@ -3848,3 +3848,114 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `github.com:443` failed/reset; do not redeploy for this transport failure.
   Next Git action is to verify `origin/main` and retry the push when network
   access is available.
+
+### Current Entry And Profitability Recheck (2026-10-25 02:00 Asia/Shanghai)
+
+- The local branch and `origin/main` are both at `4fab404`; the worktree is
+  clean. The current goal remains active. This turn made no online mutations,
+  orders, position changes, or service restarts.
+- A bounded read-only online paper audit (`--limit 200 --minutes 180`) covered
+  decision IDs `693797-693996`, from `2026-10-24T16:29:56Z` through
+  `2026-10-24T17:57:03Z`. All 200 final actions were `hold`. Four experts
+  completed on 195 rows; five rows had a shared Qwen batch failure or its
+  circuit-breaker deferral. In this snapshot the expert statuses were one
+  batch failure and four deferred rows. The latest 395-decision projection,
+  generated at `2026-10-24T17:57:17Z`, also showed all actions `hold` and
+  `was_executed=false`; its latest 200 funnel was 114 `no_candidate`, 83
+  `shadow_training`, and 3 `insufficient_evidence`.
+- The dominant execution veto is still return quality, not an exchange/order
+  rejection. Authoritative local-ML evidence is `n=267`, mean fee-after return
+  `-0.303832%`, lower bound `-0.431590%`, and PF `0.549713`; its paper
+  permission is false. Server-profit and time-series families have zero
+  qualifying samples. For both sides, the latest projection records failures
+  of the positive mean, positive lower-bound, and PF-above-one contract.
+  Directional/shadow selections do not override that permission.
+- The development model is still `shadow` / `learning_only`, with influence
+  disabled. Its top-ranked long return is `-0.1274%` with PF `0.2047`; the
+  top-ranked short return is `-0.0594%` with PF `0.2853`. This is additional
+  negative development evidence, not an execution candidate.
+- Data/label collection remains a separate material blocker. In the same
+  bounded recovery report, only 192/200 recent sealed facts were clean and
+  8 were invalid. The historical requalification dry run scanned 110,709
+  rows and found zero eligible rows, primarily because historical label
+  availability and path provenance are missing or stale. Five local-AI
+  profitability trainers were skipped because
+  `authoritative_execution_cost_distribution_unavailable`; local ML had 863
+  new samples but was not yet due to train. These counts do not mean the
+  scheduler is stopped.
+- The nested development run recorded above remains the latest candidate
+  search: all folds were estimable, but zero policies passed the positive
+  fee-after mean/lower-bound/PF criteria. No frozen candidate exists, so G4
+  independent evaluation and G5 governed paper fills have not started.
+- Correction to the earlier Qwen hypothesis: production batch prompting uses
+  the V3 ultra-compact action vector (`{"a":[...]}`), not four full expert
+  JSON objects. The 32-token output cap is therefore not, by itself, proof of
+  truncation. Batch failures are currently surfaced as an incomplete-response
+  reason without persisted `finish_reason`, output-token count, or response
+  length, so the cause is unverified. Do not increase the cap until fresh
+  provider telemetry demonstrates `finish_reason=length` or equivalent.
+- Focused local model/batch contract tests passed: 44. Current gates remain
+  G0 passed, G1 passed only as negative attribution, G2 blocked, G3 not
+  passed, and G4-G6 pending. The next work must prioritize a reproducible
+  native-path/provenance defect and capture safe batch response diagnostics
+  if the Qwen failure recurs; do not promote the negative model, relax quality
+  or risk gates, or treat these already inspected rows as an independent exam.
+
+### Bounded Native-Path And Batch-Diagnostic Repair (2026-10-25 02:18 Asia/Shanghai)
+
+- Reproducible collection evidence showed low-priority
+  `fetch_native_consistency_ohlcv` calls timing out at the provider's bounded
+  eight-second request limit. The isolated native lane already had a separate
+  gate, but `_ccxt_call` returned the first `TimeoutError` without retrying.
+  This left otherwise recoverable native 1-minute paths empty and caused
+  `native_market_fact_invalid` quarantines.
+- Narrow repair: low-priority native consistency requests retry once after
+  50ms; authoritative/high-priority native requests do not retry and keep
+  their fail-closed behavior. No entry threshold, cost, leverage, risk,
+  funding, or model permission changed. The repair is bounded to one extra
+  read-only provider call and remains within the existing maintenance budget.
+- Narrow Qwen observability repair: a target batch parse/incomplete failure now
+  includes only bounded provider metadata (`finish_reason`,
+  `completion_tokens`, `content_chars`, `reasoning_only`, `truncated`) in the
+  error reason. It never records model response content. The 32-token cap was
+  not changed because the V3 action-vector contract has not shown proven
+  length truncation.
+- Local verification: native REST client tests `48` passed; batch/model runtime
+  tests `45` passed; Ruff and `git diff --check` passed. No online upload or
+  restart has occurred yet for this repair. Next action is targeted upload of
+  `data_feed/okx_rest_client.py`, `ai_brain/llm_agent.py`, and their tests,
+  remote compile/focused tests, then a controlled paper-service restart and
+  fresh path/entry observation.
+
+### Controlled Deployment And Fresh Post-Restart Observation (2026-10-25 02:27 Asia/Shanghai)
+
+- The four owned source/test files from the repair batch were verified on the
+  remote application with matching SHA256 hashes. Remote compilation passed
+  and the focused suite passed `84` tests. The upload reported zero changed
+  files because the same bytes were already present remotely; no unrelated
+  source was uploaded.
+- Only `bb-paper-trading.service` was restarted at
+  `2026-10-24T18:24:56Z` UTC. It returned `active/running` with `NRestarts=0`;
+  dashboard was not restarted, the persisted mode remained `paper`, no model
+  was configured as `live`, and no order/position/protection mutation occurred.
+- A bounded post-restart window through `2026-10-24T18:27:10Z` covered four
+  new decisions (`694063-694066`). All four were complete analyses with all
+  four experts returned and all four final actions `hold`; there were no
+  executed entries. The latest row's direct veto was
+  `direction_support_expected_net_not_positive` plus missing quantitative
+  evidence; its long raw return was `+0.011260%`, but uncertainty and tail
+  penalties produced objective return `-1.391434%`, fee-after expected net
+  `-0.114881%`, and loss probability `76.47%`. This is a valid fail-closed
+  outcome, not an exchange rejection or scheduler stop.
+- Since the restart, the bounded service log contained `14` successful native
+  consistency requests and one unrelated high-priority public-index timeout;
+  no new Qwen batch-incomplete event occurred in the sampled interval. The
+  retry/diagnostic repair is therefore deployed and observable, but it has not
+  produced a qualifying profitable candidate.
+- Acceptance status is unchanged: G0 passed; G1 passed for negative
+  attribution only; G2 remains **BLOCKED** by incomplete native provenance and
+  intermittent provider availability; G3 remains not passed because the last
+  nested development search selected zero policies; G4-G6 remain pending.
+  Next action is to continue collecting clean native groups and run a newly
+  preregistered development search only after chronological coverage is
+  sufficient. Do not relax the positive net mean/lower-bound/PF or risk gates.

@@ -158,6 +158,88 @@ async def test_native_consistency_latency_logs_queue_diagnostic(
 
 
 @pytest.mark.asyncio
+async def test_low_priority_native_consistency_timeout_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+
+    class Gate:
+        acquired = 0
+        released = 0
+
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+            self.acquired += 1
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is False
+            self.released += 1
+
+    class Exchange:
+        calls = 0
+
+        async def fetch_native_consistency_ohlcv(self, _symbol: str, **_kwargs) -> list:
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("transient native market timeout")
+            return [[1.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    gate = Gate()
+    exchange = Exchange()
+    monkeypatch.setattr(client, "_native_consistency_gate", lambda: gate)
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=exchange))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+
+    result = await client._ccxt_call(
+        "fetch_native_consistency_ohlcv",
+        "BTC/USDT:USDT",
+        _request_gate=gate,
+        _request_priority=False,
+    )
+
+    assert result == [[1.0, 1.0, 1.1, 0.9, 1.05, 10.0]]
+    assert exchange.calls == 2
+    assert gate.acquired == gate.released == 2
+
+
+@pytest.mark.asyncio
+async def test_priority_native_consistency_timeout_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+
+    class Gate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is True
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is True
+
+    class Exchange:
+        calls = 0
+
+        async def fetch_native_consistency_ohlcv(self, _symbol: str, **_kwargs) -> list:
+            self.calls += 1
+            raise TimeoutError("authoritative path timeout")
+
+    gate = Gate()
+    exchange = Exchange()
+    monkeypatch.setattr(client, "_native_consistency_gate", lambda: gate)
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=exchange))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+
+    with pytest.raises(TimeoutError, match="authoritative path timeout"):
+        await client._ccxt_call(
+            "fetch_native_consistency_ohlcv",
+            "BTC/USDT:USDT",
+            _request_gate=gate,
+            _request_priority=True,
+        )
+
+    assert exchange.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_cancelled_native_consistency_wait_is_not_logged_as_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
