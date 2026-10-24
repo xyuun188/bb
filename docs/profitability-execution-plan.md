@@ -2719,3 +2719,48 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   immediate research blocker is candidate/feature/horizon quality, not order
   placement. G3 remains pending and must continue with a preregistered,
   materially distinct development experiment; G4-G6 remain pending.
+
+### Horizon-Complete Candidate Check (2026-10-24 13:29 Asia/Shanghai)
+
+- A bounded, read-only horizon-aware nested check used the same native
+  fee-after source contract, 24-hour window
+  `[2026-10-23T05:30:00Z, 2026-10-24T05:30:00Z)`, 1,000-group cap, one DB
+  connection, 25% CPU and 1 GiB memory. It read `513` rows but only `4`
+  decision groups contained all four required horizons (`16` rows); `373`
+  groups were incomplete.
+- The existing horizon policy correctly returned
+  `insufficient_development_data` without folds or selection. This is not a
+  model loss result and not permission to drop incomplete horizons: doing so
+  would select on a biased subset. No exam labels, artifact, DB mutation,
+  policy change or order occurred.
+- The remaining G2/G3 blocker is now concrete: native labels are arriving,
+  but complete four-horizon groups are too sparse for an unbiased
+  horizon-aware candidate, while the fixed five-minute candidate family is
+  negative after costs. Continue collecting current-contract groups and
+  repair/measure horizon completeness before any candidate promotion. Keep
+  entry permission false and paper-only mode unchanged.
+
+### Horizon Maturity And Quarantine Breakdown (2026-10-24 13:35 Asia/Shanghai)
+
+- A bounded latest-created projection (2,500 paper rows, 625 decision groups,
+  created between `2026-10-24T00:43:39Z` and `2026-10-24T05:29:38Z`) separated
+  normal maturity from data defects. At the `05:30Z` cutoff, 240-minute rows
+  were still pending for `520` rows, so most groups were not yet expected to
+  be complete. This is a wait-for-maturity condition, not permission to use
+  partial groups.
+- Among matured/all-four groups, only four groups had all four native
+  fee-after rows completed and clean; other groups were split by native
+  quarantine, historical fallback, or missing labels. Dominant quarantine
+  reasons were native market-fact invalidity, missing path labels, and
+  historical-path provenance. Historical rows remain excluded and are never
+  backfilled into executable-cost training.
+- The earlier old-row projection that showed mostly historical rows was
+  affected by its bounded ascending selection; it was not used as acceptance
+  evidence. The latest-created projection confirms current native completion
+  is increasing (`108` 5m, `98` 15m, `61` 60m, `26` 240m completed native
+  fee-after rows in the bounded slice), while 240m maturity is still catching
+  up.
+- No code, permission, threshold, sizing, leverage or runtime policy changed
+  from this audit. Continue the same frozen data contract until enough
+  matured, all-native groups exist for a preregistered horizon study; G2/G3
+  remain blocked/pending and no entries are authorized.
