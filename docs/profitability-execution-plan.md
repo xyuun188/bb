@@ -3959,3 +3959,145 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   Next action is to continue collecting clean native groups and run a newly
   preregistered development search only after chronological coverage is
   sufficient. Do not relax the positive net mean/lower-bound/PF or risk gates.
+
+### Preregistered Current Native Development Run (2026-10-25 02:31 Asia/Shanghai)
+
+- Development-only identity: `horizon-current-v1-20261024T183000Z-24h-2500`.
+  The immutable cutoff-exclusive UTC time is `2026-10-24T18:30:00Z`;
+  lookback is `24` hours and the bounded selected-group limit is `2,500`.
+- Inputs are restricted to completed paper shadow labels from the native
+  executable 1-minute path with `fee_after_complete=true`. The existing
+  candidate family, Ridge alpha grid, net-return thresholds, chronological
+  outer/inner folds, 240-minute purge, minimum training/selection coverage,
+  cost model and positive mean/lower-bound/PF requirements are unchanged.
+- This run is registered only to measure current development coverage and
+  candidate stability. It cannot inspect exam labels, persist a policy
+  artifact, mutate the database, change model influence or permissions, or
+  submit orders. The report must remain development evidence even if a
+  candidate appears positive; a later separately preregistered untouched
+  sample is required for G4.
+
+### Current Online Cause And Exact Fold Coverage (2026-10-25 02:59 Asia/Shanghai)
+
+- A bounded read-only online economics projection covered decision IDs
+  `693919-694118` through `2026-10-24T18:52:24Z` (Beijing
+  `2026-10-25 02:52:24`). All 200 final actions were `hold`; 186 analyses
+  completed with four experts and 14 were `insufficient_evidence`. There was
+  no execution attempt or exchange rejection in this window.
+- The current entry veto is reproducible on decision `694118`:
+  the selected short direction has fee-after expected return `+0.227500%`,
+  but risk-adjusted objective return `-0.615266%` and loss probability
+  `46.37%`. The authoritative local-ML permission remains false at
+  `n=267`, mean `-0.303832%`, lower bound `-0.431590%`, and profit factor
+  `0.549713`; the required positive mean, positive lower bound and PF above
+  one are all unmet. The same projection reports 60 side-level quality
+  blockers and 120 missing-quality-evidence blockers across 30 fresh rows.
+  This is a quality/economics veto, not a scheduler, sizing or OKX order
+  failure.
+- Added `scripts/audit_online_horizon_fold_coverage.py`, a bounded read-only
+  projection that selects only group timing metadata and does not read
+  returns or mutate the database. At the registered cutoff
+  `2026-10-24T18:30:00Z`, it found 2,872 native fee-after rows and 115
+  complete four-horizon groups. Reproducing the production fold rule shows
+  58 groups in the initial half, but the 240-minute purge leaves only 4
+  primary training groups for each outer fold; the fixed minimum is 16.
+  Each fold therefore misses 12 groups and the run correctly returns
+  `insufficient_development_data` before candidate scoring.
+- This confirms the remaining development blocker is effective chronological
+  coverage, not a missing candidate threshold. Do not shorten the purge,
+  lower the 16-group minimum, or reuse this inspected window as an exam.
+  Continue collecting clean native groups across a wider time span, then
+  preregister a new cutoff and rerun development only after all outer folds
+  meet the fixed coverage rule. G2 remains **BLOCKED**, G3 is not passed, and
+  G4-G6 remain pending.
+
+### Preregistered Fixed-Primary Nested Development (2026-10-25 03:12 Asia/Shanghai)
+
+- Development-only identity:
+  `nested-current-v1-20261024T191034Z-24h-2500`; cutoff-exclusive UTC
+  `2026-10-24T19:10:34Z`, 24-hour lookback and at most 2,500 decision groups.
+- Inputs are completed paper shadow labels from the native executable 1-minute
+  path with `fee_after_complete=true`. The existing fixed-primary (5-minute)
+  Ridge search, alpha values `1/10/100`, net thresholds `0/0.05/0.1%`,
+  chronological outer/inner folds, 240-minute primary-label purge, minimum
+  16 selected observations, positive fee-after mean, positive lower bound and
+  PF-above-one requirements are unchanged.
+- This run is diagnostic/development only. It cannot inspect a sealed exam,
+  persist or promote an artifact, mutate the database, change model influence
+  or permissions, or submit an order. A positive development result would
+  require a separately preregistered untouched exam for G4.
+
+### Fixed-Primary Nested Result (2026-10-25 03:14 Asia/Shanghai)
+
+- The preregistered run completed at `2026-10-24T19:13:48Z` with 2,984
+  native fee-after rows, 1,611 decision groups and 745 primary 5-minute
+  groups. All three outer folds and all six inner folds were estimable:
+  outer primary training counts were `180/239/303`, with validation counts
+  `61/61/61`; group overlap was zero and label periods were disjoint.
+- No policy qualified in any outer fold (`selected_policy_fold_count=0`).
+  Fold 0's strongest small slice (alpha `100`, threshold `0.05%`) had
+  selected count `7`, mean `+0.1690%`, PF `3.3914`, but lower bound
+  `-0.1237%` and therefore failed the minimum-16 and positive-LCB rules.
+  Fold 1's best positive slice (alpha `10`, threshold `0.1%`) had count
+  `19`, mean `+0.0806%`, PF `1.6184`, but lower bound `-0.0990%`.
+  Fold 2's best positive slice (alpha `100`, threshold `0.1%`) had count
+  `4`, mean `+0.0769%`, PF `1.4329`, but lower bound `-0.4758%`.
+  These are development diagnostics, not deployable or independent
+  profitability evidence.
+- The aggregate outer evaluation selected zero observations and produced no
+  return estimate. No artifact was persisted, no permission or runtime policy
+  changed, and no order was submitted. This closes the current
+  `insufficient_development_data` explanation for the fixed-primary protocol:
+  with adequate chronological coverage, the candidate family still fails the
+  preregistered fee-after stability gates. G3 remains **NOT PASSED**; G4-G6
+  cannot start.
+
+### Latest Data Quarantine And Entry Funnel (2026-10-25 03:15 Asia/Shanghai)
+
+- A bounded rolling 24-hour coverage projection completed at
+  `2026-10-24T19:07:13Z`. Within the query's 20,000-row cap it found 2,665
+  mature groups with all four horizons observed; 119 groups qualified at all
+  four horizons as completed native-path, fee-after-complete labels. These
+  counts are an audit snapshot, not the full lifetime database.
+- A more detailed 4,000-row quarantine projection covered 1,000 recent
+  decision groups. Of 466 mature groups with all four horizons observed, 58
+  were fully qualified. Dominant reasons included
+  `historical_label_availability_missing`,
+  `historical_label_availability_basis_unverified`,
+  `historical_market_path_not_clean`, and
+  `native_market_fact_invalid`. In the sampled native-invalid rows, recurring
+  reasons were non-reconciled executable quote sources, observed prices
+  outside the captured native path, and missing/incomplete 1-minute paths.
+  Reason counts overlap because one row may carry multiple quarantine codes.
+- The same 4,000-row reason projection was attempted at a 20,000-row limit but
+  its JSON-heavy SQL projection hit the configured 10-second statement
+  timeout. The bounded 4,000-row result is the accepted current sample; do not
+  interpret the timed-out query as a zero count or a complete census.
+- The fresh market-entry projection at `2026-10-24T18:55:49Z` covered the
+  latest 30 decisions (`694096-694125`): all were `hold`, all 30 had four
+  experts complete, and there were zero execution attempts. The funnel was
+  22 `no_candidate` and 8 `shadow_training`. Nine long and five short
+  directions had positive fee-after expected mean, but all 30 sides had
+  nonpositive lower bounds; the fixed authoritative ML permission still fails
+  mean, lower-bound and PF checks. Therefore none was an approved candidate.
+- The previously registered native-path timeout retry is deployed and the
+  low-priority request lane remains bounded. The current quarantine sample
+  does not prove that every path failure is a provider timeout; quote
+  disagreement, price reachability and historical timing failures are
+  separate causes. Do not increase candle windows or retry authoritative
+  requests without fresh evidence that isolates a recoverable timeout.
+- This turn changed only the local read-only audit helper, its contract test
+  and this plan. A staged `--skip-restart` sync matched no files because those
+  operator-only audit paths are outside the application upload allowlist;
+  nothing was uploaded and no service was restarted.
+- Current stage status: G0 passed; G1 passed as negative attribution only;
+  G2 **BLOCKED** by historical timing/provenance and incomplete native
+  executable paths; G3 **NOT PASSED** because the adequately covered
+  fixed-primary nested search selected zero policies; G4, G5 and G6 remain
+  pending. No profitability guarantee or completion claim is supported.
+- Next work: keep the paper path and live-trading shutdown unchanged; collect
+  new native fee-after labels, quarantine only reproducible source defects,
+  and preregister a new development protocol before exploring a materially
+  different model family. A candidate must pass the existing positive mean,
+  positive lower-bound, PF-above-one, sample, tail and cost-stress rules before
+  any untouched G4 exam or governed paper round trip can begin.
