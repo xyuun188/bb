@@ -1870,6 +1870,60 @@ async def test_native_consistency_background_refreshes_are_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_consistency_priority_refresh_bypasses_background_task() -> None:
+    service = _service()
+    timestamp = int(time.time() * 1000)
+    minute = timestamp - timestamp % 60_000
+    low_started = asyncio.Event()
+    release_low = asyncio.Event()
+    calls: list[bool] = []
+
+    class FakeRestClient:
+        async def fetch_native_consistency_ohlcv(
+            self,
+            _symbol: str,
+            *,
+            limit: int,
+            end_timestamp_ms: int | None = None,
+            priority: bool = False,
+        ) -> list[list[float]]:
+            assert limit >= 1
+            calls.append(priority)
+            if not priority:
+                low_started.set()
+                await release_low.wait()
+            return [[float(end_timestamp_ms or minute), 1.0, 1.1, 0.9, 1.05, 10.0]]
+
+    service.rest_client = FakeRestClient()
+    snapshots = [{"timestamp": timestamp}]
+    background = asyncio.create_task(
+        service._fetch_native_consistency_bars(
+            "BTC/USDT",
+            snapshots,
+            wait_for_completion=False,
+            priority=False,
+        )
+    )
+    await background
+    await asyncio.wait_for(low_started.wait(), timeout=1.0)
+
+    authoritative = await asyncio.wait_for(
+        service._fetch_native_consistency_bars(
+            "BTC/USDT",
+            snapshots,
+            wait_for_completion=True,
+            priority=True,
+        ),
+        timeout=1.0,
+    )
+
+    assert int(authoritative[0][0]) == minute
+    assert calls == [False, True]
+    release_low.set()
+    await asyncio.gather(*service._native_consistency_bars_tasks.values())
+
+
+@pytest.mark.asyncio
 async def test_native_consistency_bars_refresh_when_cache_misses_fact_window() -> None:
     service = _service()
     calls = 0
@@ -2204,7 +2258,10 @@ async def test_authoritative_ticker_refresh_never_falls_back_to_websocket_cache(
 
     class FakeRestClient:
         async def fetch_ticker(self, _symbol: str, **kwargs: Any) -> dict[str, Any]:
-            assert kwargs == {"wait_for_completion": True}
+            assert kwargs == {
+                "wait_for_completion": True,
+                "priority": True,
+            }
             return {
                 "ticker_refresh_in_background": True,
                 "ticker_timeout": True,
@@ -2594,7 +2651,7 @@ async def test_final_derivatives_refresh_requires_funding_route() -> None:
     service._get_instrument_spec = (  # type: ignore[method-assign]
         lambda _symbol, **_kwargs: asyncio.sleep(0, result={"instId": "ETH-USDT-SWAP"})
     )
-    calls: list[tuple[bool, bool]] = []
+    calls: list[tuple[bool, bool, bool]] = []
 
     class FakeRestClient:
         async def fetch_derivatives_snapshot(
@@ -2604,8 +2661,9 @@ async def test_final_derivatives_refresh_requires_funding_route() -> None:
             contract_spec: dict,
             required_only: bool = False,
             require_funding: bool = False,
+            priority: bool = False,
         ) -> dict[str, Any]:
-            calls.append((required_only, require_funding))
+            calls.append((required_only, require_funding, priority))
             return {
                 "orderbook_data_available": True,
                 "orderbook_bid_depth": 10.0,
@@ -2629,7 +2687,7 @@ async def test_final_derivatives_refresh_requires_funding_route() -> None:
         require_funding=True,
     )
 
-    assert calls == [(True, True)]
+    assert calls == [(True, True, True)]
     assert result["funding_data_available"] is True
 
 

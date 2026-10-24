@@ -1360,13 +1360,24 @@ class DataService:
                     raw_ticker = await ticker_fetcher(
                         normalized,
                         wait_for_completion=True,
+                        priority=True,
                     )
                 except TypeError as exc:
-                    # Keep source compatibility with small test doubles and
-                    # older integrations that only accept the symbol.
-                    if "wait_for_completion" not in safe_error_text(exc):
-                        raise
-                    raw_ticker = await ticker_fetcher(normalized)
+                    error_text = safe_error_text(exc)
+                    if "priority" not in error_text:
+                        if "wait_for_completion" not in error_text:
+                            raise
+                        raw_ticker = await ticker_fetcher(normalized)
+                    else:
+                        try:
+                            raw_ticker = await ticker_fetcher(
+                                normalized,
+                                wait_for_completion=True,
+                            )
+                        except TypeError as nested_exc:
+                            if "wait_for_completion" not in safe_error_text(nested_exc):
+                                raise
+                            raw_ticker = await ticker_fetcher(normalized)
             else:
                 raw_ticker = await ticker_fetcher(normalized)
             if not isinstance(raw_ticker, dict) or (
@@ -1593,6 +1604,7 @@ class DataService:
             required_first_open,
             required_last_open,
             bool(include_result_candle),
+            bool(priority),
         )
         existing = tasks.get(task_key)
         if existing is not None and not existing.done():
@@ -1897,7 +1909,17 @@ class DataService:
                     block_on_remote=True,
                     force_refresh=require_authoritative_snapshot,
                 )
-                rest_book = await self.rest_client.fetch_order_book_metrics(symbol, contract_spec=spec)
+                fetch_order_book = self.rest_client.fetch_order_book_metrics
+                try:
+                    rest_book = await fetch_order_book(
+                        symbol,
+                        contract_spec=spec,
+                        priority=bool(require_authoritative_snapshot),
+                    )
+                except TypeError as exc:
+                    if "priority" not in safe_error_text(exc):
+                        raise
+                    rest_book = await fetch_order_book(symbol, contract_spec=spec)
                 if rest_book.get("orderbook_data_available"):
                     enriched["orderbook_bid_depth"] = rest_book.get("orderbook_bid_depth", 0)
                     enriched["orderbook_ask_depth"] = rest_book.get("orderbook_ask_depth", 0)
@@ -4552,6 +4574,7 @@ class DataService:
                 "contract_spec": contract_spec,
                 "required_only": required_only,
                 "require_funding": require_funding,
+                "priority": bool(require_funding),
                 "native_market_facts": self._cached_native_derivatives_facts(
                     normalized,
                     contract_spec,
@@ -4569,6 +4592,7 @@ class DataService:
                             for key in (
                                 "native_market_facts",
                                 "require_funding",
+                                "priority",
                                 "required_only",
                             )
                             if key in error_text

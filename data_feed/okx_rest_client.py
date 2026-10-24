@@ -121,11 +121,7 @@ PUBLIC_MARKET_METHODS = frozenset(
 )
 PUBLIC_MARKET_PRIORITY_METHODS = frozenset(
     {
-        "fetch_ticker",
-        "fetch_order_book",
         "publicGetMarketTicker",
-        "publicGetPublicMarkPrice",
-        "publicGetMarketIndexTickers",
     }
 )
 PUBLIC_MARKET_OPTIONAL_METHODS = frozenset(
@@ -366,15 +362,15 @@ class OKXRestClient:
         self._historical_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        self._reference_price_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._reference_route_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
-        self._reference_price_failure_cache: dict[str, float] = {}
-        self._ticker_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._ticker_retry_at: dict[str, float] = {}
+        self._reference_price_tasks: dict[tuple[str, bool], asyncio.Task[dict[str, Any]]] = {}
+        self._reference_route_tasks: dict[tuple[str, str, bool], asyncio.Task[Any]] = {}
+        self._reference_price_failure_cache: dict[tuple[str, bool], float] = {}
+        self._ticker_tasks: dict[tuple[str, bool], asyncio.Task[dict[str, Any]]] = {}
+        self._ticker_retry_at: dict[tuple[str, bool], float] = {}
         self._authoritative_ticker_batch_task: asyncio.Task[dict[str, Any]] | None = None
         self._authoritative_ticker_batch_cache: tuple[float, dict[str, Any]] | None = None
         self._orderbook_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        self._orderbook_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._orderbook_tasks: dict[tuple[str, bool], asyncio.Task[dict[str, Any]]] = {}
         self._derivatives_route_cache: dict[
             tuple[str, str], tuple[float, dict[str, Any]]
         ] = {}
@@ -602,6 +598,7 @@ class OKXRestClient:
         symbol: str,
         *,
         wait_for_completion: bool = False,
+        priority: bool = False,
     ) -> dict:
         """Fetch one ticker through a bounded per-instrument single-flight.
 
@@ -612,40 +609,47 @@ class OKXRestClient:
         inst_id = okx_inst_id_from_symbol(symbol)
         if not inst_id:
             return {}
+        request_priority = bool(priority)
+        task_key = (inst_id, request_priority)
         now = time.monotonic()
-        task = self._ticker_tasks.get(inst_id)
+        task = self._ticker_tasks.get(task_key)
         joining_inflight = task is not None and not task.done()
         if task is None or task.done():
-            retry_at = self._ticker_retry_at.get(inst_id, 0.0)
+            retry_at = self._ticker_retry_at.get(task_key, 0.0)
             if retry_at > now:
                 if wait_for_completion:
                     fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
                     if fallback:
-                        self._ticker_retry_at.pop(inst_id, None)
+                        self._ticker_retry_at.pop(task_key, None)
                         return fallback
                 return {
                     "ticker_refresh_in_background": True,
                     "ticker_retry_after_seconds": round(retry_at - now, 3),
                 }
-            task = asyncio.create_task(self._fetch_ticker_uncached(inst_id))
-            self._ticker_tasks[inst_id] = task
+            task = asyncio.create_task(
+                self._fetch_ticker_uncached(
+                    inst_id,
+                    priority=request_priority,
+                )
+            )
+            self._ticker_tasks[task_key] = task
 
             def _finish(finished: asyncio.Task[dict[str, Any]]) -> None:
-                if self._ticker_tasks.get(inst_id) is finished:
-                    self._ticker_tasks.pop(inst_id, None)
+                if self._ticker_tasks.get(task_key) is finished:
+                    self._ticker_tasks.pop(task_key, None)
                 try:
                     result = finished.result()
                 except BaseException:
-                    self._ticker_retry_at[inst_id] = (
+                    self._ticker_retry_at[task_key] = (
                         time.monotonic() + TICKER_ROUTE_FAILURE_BACKOFF_SECONDS
                     )
                     return
                 if not isinstance(result, dict) or not result:
-                    self._ticker_retry_at[inst_id] = (
+                    self._ticker_retry_at[task_key] = (
                         time.monotonic() + TICKER_ROUTE_FAILURE_BACKOFF_SECONDS
                     )
                 else:
-                    self._ticker_retry_at.pop(inst_id, None)
+                    self._ticker_retry_at.pop(task_key, None)
 
             task.add_done_callback(_finish)
 
@@ -666,14 +670,14 @@ class OKXRestClient:
             if wait_for_completion and not self._ticker_has_executable_quote(result):
                 fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
                 if fallback:
-                    self._ticker_retry_at.pop(inst_id, None)
+                    self._ticker_retry_at.pop(task_key, None)
                     return fallback
             return result
         except TimeoutError:
             if wait_for_completion:
                 fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
                 if fallback:
-                    self._ticker_retry_at.pop(inst_id, None)
+                    self._ticker_retry_at.pop(task_key, None)
                     return fallback
             # Keep the shared request alive. A later analysis round must wait on
             # this task instead of issuing another request against the same SDK.
@@ -690,12 +694,21 @@ class OKXRestClient:
             if wait_for_completion:
                 fallback = await self._fetch_authoritative_ticker_fallback(inst_id)
                 if fallback:
-                    self._ticker_retry_at.pop(inst_id, None)
+                    self._ticker_retry_at.pop(task_key, None)
                     return fallback
             raise
 
-    async def _fetch_ticker_uncached(self, inst_id: str) -> dict[str, Any]:
-        response = await self._ccxt_call("publicGetMarketTicker", {"instId": inst_id})
+    async def _fetch_ticker_uncached(
+        self,
+        inst_id: str,
+        *,
+        priority: bool = False,
+    ) -> dict[str, Any]:
+        response = await self._ccxt_call(
+            "publicGetMarketTicker",
+            {"instId": inst_id},
+            _request_priority=bool(priority),
+        )
         received_at = datetime.now(UTC).isoformat()
         rows = response.get("data", []) if isinstance(response, dict) else []
         if not rows:
@@ -1180,6 +1193,7 @@ class OKXRestClient:
         limit: int = 20,
         *,
         contract_spec: dict[str, Any] | None = None,
+        priority: bool = False,
     ) -> dict[str, Any]:
         """Return top-book metrics without letting a slow route block the round."""
         normalized_spec = normalize_okx_contract_spec(contract_spec)
@@ -1209,6 +1223,7 @@ class OKXRestClient:
                 "fetch_order_book",
                 self._to_swap_symbol(symbol),
                 limit=limit,
+                _request_priority=bool(priority),
             )
             received_at = datetime.now(UTC).isoformat()
             bids = book.get("bids") or []
@@ -1271,14 +1286,15 @@ class OKXRestClient:
                 self._orderbook_cache[inst_id] = (time.monotonic(), payload)
             return payload
 
-        task = self._orderbook_tasks.get(inst_id)
+        task_key = (inst_id, bool(priority))
+        task = self._orderbook_tasks.get(task_key)
         if task is None or task.done():
             task = asyncio.create_task(fetch_and_normalize())
-            self._orderbook_tasks[inst_id] = task
+            self._orderbook_tasks[task_key] = task
 
             def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
-                if self._orderbook_tasks.get(inst_id) is finished:
-                    self._orderbook_tasks.pop(inst_id, None)
+                if self._orderbook_tasks.get(task_key) is finished:
+                    self._orderbook_tasks.pop(task_key, None)
                 _consume_cancelled_task(finished)
 
             task.add_done_callback(cleanup)
@@ -1317,16 +1333,19 @@ class OKXRestClient:
         symbol: str,
         *,
         contract_spec: dict[str, Any] | None = None,
+        priority: bool = False,
     ) -> dict[str, Any]:
         """Return reference prices through a per-instrument single-flight refresh."""
         normalized_spec = normalize_okx_contract_spec(contract_spec)
         inst_id = okx_inst_id_from_symbol(symbol)
+        request_priority = bool(priority)
         cached = self._reference_price_cache.get(inst_id)
         if cached is not None and time.monotonic() - cached[0] <= REFERENCE_PRICES_CACHE_TTL_SECONDS:
             return {**cached[1], "reference_prices_cached": True}
 
         now = time.monotonic()
-        retry_at = self._reference_price_failure_cache.get(inst_id, 0.0)
+        task_key = (inst_id, request_priority)
+        retry_at = self._reference_price_failure_cache.get(task_key, 0.0)
         if retry_at > now:
             return {
                 "reference_prices_data_available": False,
@@ -1334,33 +1353,34 @@ class OKXRestClient:
                 "reference_prices_refresh_in_background": True,
             }
 
-        task = self._reference_price_tasks.get(inst_id)
+        task = self._reference_price_tasks.get(task_key)
         if task is None or task.done():
             task = asyncio.create_task(
                 self._refresh_reference_prices(
                     symbol,
                     contract_spec=normalized_spec,
+                    priority=request_priority,
                 )
             )
-            self._reference_price_tasks[inst_id] = task
 
             def _finish(completed: asyncio.Task[dict[str, Any]]) -> None:
-                if self._reference_price_tasks.get(inst_id) is completed:
-                    self._reference_price_tasks.pop(inst_id, None)
+                if self._reference_price_tasks.get(task_key) is completed:
+                    self._reference_price_tasks.pop(task_key, None)
                 try:
                     result = completed.result()
                 except BaseException:
-                    self._reference_price_failure_cache[inst_id] = (
+                    self._reference_price_failure_cache[task_key] = (
                         time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
                     )
                     return
                 if result.get("reference_prices_data_available") is not True:
-                    self._reference_price_failure_cache[inst_id] = (
+                    self._reference_price_failure_cache[task_key] = (
                         time.monotonic() + REFERENCE_PRICES_RETRY_BACKOFF_SECONDS
                     )
                 else:
-                    self._reference_price_failure_cache.pop(inst_id, None)
+                    self._reference_price_failure_cache.pop(task_key, None)
 
+            self._reference_price_tasks[task_key] = task
             task.add_done_callback(_finish)
         result = await asyncio.shield(task)
         return dict(result)
@@ -1370,6 +1390,7 @@ class OKXRestClient:
         symbol: str,
         *,
         contract_spec: dict[str, Any] | None = None,
+        priority: bool = False,
     ) -> dict[str, Any]:
         normalized_spec = normalize_okx_contract_spec(contract_spec)
         inst_id = okx_inst_id_from_symbol(symbol)
@@ -1381,12 +1402,19 @@ class OKXRestClient:
                 lambda: self._ccxt_call(
                     "publicGetPublicMarkPrice",
                     {"instType": "SWAP", "instId": inst_id},
+                    _request_priority=bool(priority),
                 ),
+                priority=priority,
             ),
             "index": self._reference_route_task(
                 inst_id,
                 "index",
-                lambda: self._ccxt_call("publicGetMarketIndexTickers", {"instId": uly}),
+                lambda: self._ccxt_call(
+                    "publicGetMarketIndexTickers",
+                    {"instId": uly},
+                    _request_priority=bool(priority),
+                ),
+                priority=priority,
             ),
         }
         # Return a bounded snapshot to the current round, while leaving slow
@@ -1499,8 +1527,10 @@ class OKXRestClient:
         inst_id: str,
         route: str,
         fetcher: Any,
+        *,
+        priority: bool = False,
     ) -> asyncio.Task[Any]:
-        key = (str(inst_id).upper(), str(route))
+        key = (str(inst_id).upper(), str(route), bool(priority))
         existing = self._reference_route_tasks.get(key)
         if existing is not None and not existing.done():
             return existing
@@ -1530,6 +1560,7 @@ class OKXRestClient:
         required_only: bool = False,
         require_funding: bool = False,
         native_market_facts: dict[str, dict[str, Any]] | None = None,
+        priority: bool = False,
     ) -> dict[str, Any]:
         """Fetch compact perpetual-swap features used by AI experts.
 
@@ -1545,9 +1576,20 @@ class OKXRestClient:
             required_routes.add("funding")
         cached_facts = native_market_facts if isinstance(native_market_facts, dict) else {}
         normalized_spec = normalize_okx_contract_spec(contract_spec)
+        request_priority = bool(priority)
         expected_inst_id = str(normalized_spec.get("inst_id") or "").upper()
         expected_uly = str(normalized_spec.get("uly") or "").upper()
         route_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+
+        async def fetch_with_priority(fetcher: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            try:
+                result = await fetcher(*args, priority=request_priority, **kwargs)
+            except TypeError as exc:
+                if "priority" not in safe_error_text(exc):
+                    raise
+                result = await fetcher(*args, **kwargs)
+            return result if isinstance(result, dict) else {}
+
         if (
             isinstance(cached_facts.get("orderbook"), dict)
             and _websocket_orderbook_matches(
@@ -1560,7 +1602,11 @@ class OKXRestClient:
             )
         else:
             route_tasks["orderbook"] = asyncio.create_task(
-                self.fetch_order_book_metrics(symbol, contract_spec=contract_spec)
+                fetch_with_priority(
+                    self.fetch_order_book_metrics,
+                    symbol,
+                    contract_spec=contract_spec,
+                )
             )
         if (
             isinstance(cached_facts.get("reference_prices"), dict)
@@ -1575,7 +1621,11 @@ class OKXRestClient:
             )
         else:
             route_tasks["reference_prices"] = asyncio.create_task(
-                self.fetch_reference_prices(symbol, contract_spec=contract_spec)
+                fetch_with_priority(
+                    self.fetch_reference_prices,
+                    symbol,
+                    contract_spec=contract_spec,
+                )
             )
         if not required_only or require_funding:
             route_tasks["funding"] = asyncio.create_task(

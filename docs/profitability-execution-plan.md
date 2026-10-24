@@ -4238,3 +4238,58 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   make the system trade on unverifiable costs/prices. The next repair must
   target the native one-minute path/quote-reconciliation lineage and original
   historical availability basis, not relax quarantine rules.
+
+### Current User Blocker Recheck And Request-Lane Repair (2026-10-25 04:20 Asia/Shanghai)
+
+- A fresh read-only `audit_online_market_hold_economics.py --limit 100
+  --minutes 30` projection covered decision IDs `694259-694327` through
+  `2026-10-24T20:20:21Z` (Beijing `2026-10-25 04:20:21`). All 69 decisions
+  were `hold`; all 69 analyses completed with all four experts. The funnel
+  contained 40 `no_candidate` and 29 `shadow_training`; this sample had no
+  production-eligible entry.
+- Across all 138 side observations, none had a positive return lower bound.
+  The authoritative local-ML permission remains false at 267 settled samples:
+  fee-after mean `-0.303832%`, lower bound `-0.431590%`, and profit factor
+  `0.549713`. All three fixed requirements fail. There are occasional positive
+  fee-after point estimates, but the lower bounds remain negative and the
+  production permission is false; those estimates cannot authorize an order.
+  The latest hold is therefore still a pre-entry quality/economics veto, not a
+  scheduler stop or exchange rejection.
+- The separate G2 blocker is data quality/coverage: the latest bounded
+  quarantine sample remains 1,000 groups with only 44 fully qualified across
+  all four horizons. Recurrent exclusions are missing/unverified historical
+  label availability, missing or incomplete native one-minute paths, and
+  unreconciled executable quote sources. The fixed-primary nested Ridge
+  development run had adequate fold coverage but selected zero policies.
+  Thus better collection does not itself create a profitable candidate.
+- A local QoS repair was completed in the request client: background and
+  final authoritative ticker/orderbook/reference-price refreshes now use
+  separate single-flight keys and explicit queue priority, so a slow
+  background request cannot make the final validation join that lower-priority
+  task. This is a collection-latency improvement only; it does not loosen
+  entry gates or solve negative expectancy. Four touched source/test files
+  pass 162 focused OKX/DataService tests plus 40 market-receipt/feature
+  availability tests; Ruff, compileall and `git diff --check` pass. The first
+  local run exposed six stale expectations/compatibility defects; those were
+  corrected and the final focused reruns passed.
+- The QoS patch is uploaded to `/data/bb/app` without restart. Remote hashes
+  match the four touched source/test files, and the same focused remote suite
+  passed `203` tests. The current paper process was intentionally not
+  restarted: the read-only paper-resume preflight at `2026-10-24T20:32:23Z`
+  reports the paper service already active and four Phase 3 quant child
+  endpoints unavailable, so restarting would violate the preflight contract
+  and would not improve entry eligibility. The preflight also confirms
+  paper mode, live routing disabled, no local/OKX positions or orders needing
+  repair, and no protection mutation. Explicit isolated commit/push and `bb`
+  memory retention remain pending.
+- Gate status is unchanged: G0 passed; G1 attribution audit passed with
+  negative measured economics; G2 **BLOCKED**; G3 **NOT PASSED**; G4, G5 and
+  G6 pending. Five stage gates remain incomplete for the profitability
+  objective. No claim of profitability or positive-profit guarantee is
+  supported.
+- Next actions: perform staged source upload without restart, verify exact
+  remote hashes and the focused remote suite; then decide whether a paper-only
+  restart is justified for collecting subsequent G2 evidence. Separately
+  trace and repair only reproducible native path/quote receipt defects, keep
+  the negative Ridge family rejected, and register a materially new
+  development protocol only after enough clean chronological coverage exists.
