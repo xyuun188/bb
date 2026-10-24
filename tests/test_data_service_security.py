@@ -15,7 +15,7 @@ from core.feature_availability import (
 )
 from data_feed.feature_vector import build_feature_vector
 from services import data_service as data_service_module
-from services.data_service import DataService
+from services.data_service import DataService, _merge_late_native_derivatives_facts
 
 
 def _service() -> DataService:
@@ -63,6 +63,63 @@ def _service() -> DataService:
     service._available_symbols_refresh_task = None
     service._stopping = False
     return service
+
+
+def test_late_native_reference_facts_complete_a_timed_out_snapshot() -> None:
+    partial = {
+        "derivatives_route_status": {
+            "completed": ["orderbook"],
+            "failed": [],
+            "timed_out": ["reference_prices"],
+        },
+        "derivatives_required_routes": ["orderbook", "reference_prices"],
+        "derivatives_snapshot_partial": True,
+        "reference_prices_data_available": False,
+    }
+    native = {
+        "reference_prices": {
+            "mark_price": 101.0,
+            "index_price": 100.5,
+            "mark_price_fact": {"price": 101.0},
+            "index_price_fact": {"price": 100.5},
+            "reference_prices_data_available": True,
+        }
+    }
+
+    result = _merge_late_native_derivatives_facts(
+        partial,
+        native,
+        required_routes={"orderbook", "reference_prices"},
+    )
+
+    assert result["reference_prices_data_available"] is True
+    assert result["derivatives_required_data_available"] is True
+    assert result["derivatives_snapshot_partial"] is False
+    assert result["derivatives_route_status"] == {
+        "completed": ["orderbook", "reference_prices"],
+        "failed": [],
+        "timed_out": [],
+    }
+    assert result["native_derivatives_late_cache_recheck"] == ["reference_prices"]
+
+
+def test_late_native_facts_do_not_promote_incomplete_routes() -> None:
+    partial = {
+        "derivatives_route_status": {
+            "completed": [],
+            "failed": [],
+            "timed_out": ["reference_prices"],
+        },
+        "derivatives_snapshot_partial": True,
+    }
+
+    result = _merge_late_native_derivatives_facts(
+        partial,
+        {"reference_prices": {"index_price_fact": {"price": 100.5}}},
+        required_routes={"orderbook", "reference_prices"},
+    )
+
+    assert result == partial
 
 
 def _observed(rows: list[list[float]]) -> ObservedKlines:

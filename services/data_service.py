@@ -125,6 +125,70 @@ def _cancel_and_consume_task_result(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(_consume_task_result)
 
 
+def _merge_late_native_derivatives_facts(
+    data: dict[str, Any] | None,
+    native_facts: dict[str, dict[str, Any]] | None,
+    *,
+    required_routes: set[str],
+) -> dict[str, Any]:
+    """Merge only complete, identity-bound native facts observed after a wait."""
+
+    result = dict(data or {})
+    native = native_facts if isinstance(native_facts, dict) else {}
+    status = result.get("derivatives_route_status")
+    status = status if isinstance(status, dict) else {}
+    completed = {str(route) for route in (status.get("completed") or [])}
+    failed = {str(route) for route in (status.get("failed") or [])}
+    timed_out = {str(route) for route in (status.get("timed_out") or [])}
+    merged_routes: set[str] = set()
+
+    route_requirements = {
+        "orderbook": ("orderbook_data_available", "orderbook_fact"),
+        "reference_prices": (
+            "reference_prices_data_available",
+            "mark_price_fact",
+            "index_price_fact",
+        ),
+    }
+    for route, required_fields in route_requirements.items():
+        payload = native.get(route)
+        if not isinstance(payload, dict):
+            continue
+        if not all(
+            payload.get(field) is True
+            if field.endswith("_data_available")
+            else isinstance(payload.get(field), dict)
+            for field in required_fields
+        ):
+            continue
+        result.update(payload)
+        merged_routes.add(route)
+        completed.add(route)
+        failed.discard(route)
+        timed_out.discard(route)
+
+    if merged_routes:
+        result["derivatives_route_status"] = {
+            "completed": sorted(completed),
+            "failed": sorted(failed),
+            "timed_out": sorted(timed_out),
+        }
+        result["derivatives_required_routes"] = sorted(required_routes)
+        result["derivatives_required_data_available"] = required_routes.issubset(
+            completed
+        ) and (
+            "funding" not in required_routes
+            or result.get("funding_data_available") is True
+        )
+        result["derivatives_snapshot_partial"] = bool(
+            not result["derivatives_required_data_available"]
+            or failed
+            or timed_out
+        )
+        result["native_derivatives_late_cache_recheck"] = sorted(merged_routes)
+    return result
+
+
 NATIVE_MARKET_REMOTE_CONCURRENCY = max(
     1,
     int(_MARKET_DATA_PARAMS.native_market_remote_concurrency),
@@ -4365,6 +4429,7 @@ class DataService:
         require_funding: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
+        contract_spec: dict[str, Any] | None = None
         tasks = self._derivatives_refresh_task_map()
         failed_cache = getattr(self, "_derivatives_failed_at", None)
         if not isinstance(failed_cache, dict):
@@ -4458,6 +4523,33 @@ class DataService:
             )
             data = {}
             failed_cache[normalized] = datetime.now(UTC)
+
+        required_routes = {"orderbook", "reference_prices"}
+        if require_funding:
+            required_routes.add("funding")
+        route_status = data.get("derivatives_route_status")
+        route_status = route_status if isinstance(route_status, dict) else {}
+        completed_routes = {
+            str(route)
+            for route in (route_status.get("completed") or [])
+        }
+        # A WebSocket fact can arrive while the bounded REST/reference wait is
+        # in flight. Re-read only the identity-bound native cache before
+        # persisting a partial snapshot, so a late real receipt can complete
+        # this decision without inventing or reusing historical prices.
+        if (
+            isinstance(contract_spec, dict)
+            and not required_routes.issubset(completed_routes)
+        ):
+            late_native_facts = self._cached_native_derivatives_facts(
+                normalized,
+                contract_spec,
+            )
+            data = _merge_late_native_derivatives_facts(
+                data,
+                late_native_facts,
+                required_routes=required_routes,
+            )
 
         # Preserve the last known optional enrichments when the critical path
         # deliberately fetched only orderbook/reference facts.  They remain

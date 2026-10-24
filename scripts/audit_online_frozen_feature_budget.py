@@ -68,6 +68,8 @@ def main_summary(rows, checked_at, source):
     availability_reason_counts = Counter()
     availability_valid_count = 0
     availability_invalid_examples = []
+    availability_streak_rows = []
+    availability_streak_broken = False
     key_sizes = {}
     oversized_examples = []
     for row in rows:
@@ -90,6 +92,8 @@ def main_summary(rows, checked_at, source):
         )
         if availability_reasons:
             availability_reason_counts.update(availability_reasons)
+            if not availability_streak_broken:
+                availability_streak_broken = True
             if len(availability_invalid_examples) < 12:
                 route_status = features.get("derivatives_route_status")
                 route_status = route_status if isinstance(route_status, dict) else {}
@@ -129,6 +133,8 @@ def main_summary(rows, checked_at, source):
                 )
         else:
             availability_valid_count += 1
+            if not availability_streak_broken:
+                availability_streak_rows.append(row)
         compaction_error = features.get("training_feature_compaction_error")
         error = compaction_error or seal_error
         errors[str(error or "none")] += 1
@@ -202,6 +208,26 @@ def main_summary(rows, checked_at, source):
             "original_decision_timestamp_count": original_decision_timestamp_count,
             "valid_count": availability_valid_count,
             "invalid_count": len(rows) - availability_valid_count,
+            "newest_valid_streak_count": len(availability_streak_rows),
+            "newest_valid_streak_distinct_symbols": len(
+                {
+                    str(row.symbol or "")
+                    for row in availability_streak_rows
+                    if str(row.symbol or "")
+                }
+            ),
+            "newest_valid_streak_started_at": (
+                availability_streak_rows[-1].created_at.isoformat()
+                if availability_streak_rows
+                and availability_streak_rows[-1].created_at
+                else None
+            ),
+            "newest_valid_streak_latest_at": (
+                availability_streak_rows[0].created_at.isoformat()
+                if availability_streak_rows
+                and availability_streak_rows[0].created_at
+                else None
+            ),
             "reason_counts": dict(availability_reason_counts.most_common(20)),
             "invalid_examples": availability_invalid_examples,
         },

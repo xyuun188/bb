@@ -2395,3 +2395,65 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   stream produce a full independent window, then re-run the frozen-feature,
   entry-gate and native-label audits before any candidate research or
   permission change.
+
+### Late Native Cache Recheck And Development Baseline (2026-10-24 09:40 Asia/Shanghai)
+
+- Repaired the derivatives refresh join: after the bounded REST/reference
+  wait returns, the service now performs one read-only identity/freshness
+  check of the native WebSocket cache before persisting a partial snapshot.
+  Only complete order-book/reference payloads with real source clocks and
+  receipts can complete the route; incomplete or stale facts remain blocked.
+  The helper also clears the partial flag when all required routes are
+  complete. Local focused verification passed `174` related tests before the
+  repair and `22` direct late-cache/derivatives regressions after it; Ruff,
+  compileall and diff checks passed. The online selected regression passed
+  `108` tests, source integrity passed for the three runtime/test files, and
+  paper/Dashboard were restarted at `2026-10-24 09:09:01` Asia/Shanghai with
+  `NRestarts=0`. Live trading and protections were untouched.
+- The first complete post-restart component window covered `44` decision
+  snapshots across `27` symbols and `64` training snapshots. All were
+  availability-valid, sealed, and within the `98,304 B` frozen budget
+  (`maximum=96,990 B`); no route, receipt, source-clock, seal, or compaction
+  errors remained in that boundary. A later 30-minute mixed boundary retained
+  a `51`-row valid streak but included older/pre-restart rows with missing
+  index or account-fee receipts; those rows remain quarantined and are not
+  counted as acceptance evidence.
+- Fresh shadow settlement now contains `245` completed native rows across
+  `204` decision groups in the last six hours, all with
+  `fee_after_complete=true`; the bounded lineage verifier passed `200/200`
+  checked rows with zero fingerprint failures. The current queue is
+  completing post-restart 5/15/60/240-minute rows without a current
+  maintenance error. This establishes usable native labels for development,
+  not profitability.
+- A preregistered read-only cost-aware baseline ledger ran on `259` native
+  fee-after rows / `214` decision groups from the six-hour development
+  window. The candidate set was limited to no-trade, always-long,
+  always-short, and a hindsight best-action upper bound for diagnostics;
+  no independent exam was opened and no candidate was promoted. The live
+  decision action was `hold` for all `259` rows. Development/validation
+  results are regime-sensitive: 15-minute always-short was positive in the
+  development fold (`+0.0511%`, PF `1.283`) but negative in validation
+  (`-0.4128%`, PF `0.112`); 60-minute always-short was positive in both
+  folds (`+0.1410%` / `+0.1085%`) but only `67` rows; the 240-minute result
+  was positive but only `59` rows and is not an independent acceptance
+  sample. Always-long was negative in development at 5/15/60/240 minutes.
+  These baselines are rejected for promotion because they are too small,
+  horizon/regime dependent, and have no fresh independent exam or risk-bound
+  evidence.
+- The entry audit after the repair still found `64/64` HOLD decisions with
+  `insufficient_evidence`, no model version, and no authorized prediction
+  horizon. Local-ML paper permission remains false because authoritative
+  fee-after evidence is negative (`n=267`, mean `-0.303832%`, LCB
+  `-0.431590%`, PF `0.549713`). This is the direct reason there is still no
+  paper entry; it is not an exchange order-placement failure.
+- G2's post-restart component-validity subgate is now evidenced, but the
+  overall gate remains **BLOCKED** until current-contract cost/horizon
+  supervision is sufficient for a nested candidate study and the historical
+  pre-contract outcomes remain excluded. G1 remains passed only as negative
+  attribution; G3-G6 remain pending. No profitability acceptance exists.
+- Exact next action: keep collecting native fee-after groups under the same
+  frozen development ledger, add a cost-aware feature candidate only inside
+  chronological development folds, and require a new untouched exam with
+  predefined lower-bound, profit-factor, drawdown, and stress criteria before
+  any paper permission. Do not turn the positive 60/240-minute baseline into
+  an order rule, and do not use the inspected development window as G4.
