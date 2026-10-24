@@ -3007,3 +3007,16 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   native paths. Any requalification requires an explicit reproducible,
   auditable repair and cannot turn the already inspected interval into an
   independent exam.
+
+### Checkpoint Commit And Source Integrity (2026-10-24 15:18 Asia/Shanghai)
+
+- Owned changes are committed and pushed as `7701151`
+  (`Bound paper shadow maintenance and record profitability evidence`).
+  The commit contains only the bounded background batch, its regression and
+  the bounded development audit/test plus this execution-plan evidence.
+- A post-push staged source check returned `source-integrity-ok:4` with zero
+  changed files uploaded and no service restart. The remote paper process
+  therefore continues running the already verified bytes.
+- Local verification after the checkpoint: `401 passed` across the shadow,
+  trading-boundary and horizon-audit tests; Ruff, compileall and diff checks
+  passed. This verifies software behavior, not profitability.
