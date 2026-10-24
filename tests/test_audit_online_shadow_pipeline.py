@@ -1,9 +1,30 @@
 from __future__ import annotations
 
 from scripts.audit_online_shadow_pipeline import (
+    REMOTE_SCRIPT,
     _fingerprint,
     verify_shadow_evidence_fingerprint,
 )
+
+
+def test_native_route_probe_is_bounded_read_only_and_compiles() -> None:
+    remote_script = (
+        REMOTE_SCRIPT.replace("__PROBE_HISTORY__", "False")
+        .replace("__PROBE_NATIVE__", "True")
+        .replace("__SETTLEMENT__", "False")
+    )
+
+    compile(remote_script, "<audit-online-shadow-pipeline>", "exec")
+    assert "LIMIT 8" in remote_script
+    assert "MAX(id), 0) - 4000" in remote_script
+    assert "timeout=12" in remote_script
+    assert '"empty_response"' in remote_script
+    assert '"window_coverage_miss"' in remote_script
+    assert "due_timestamp_ms" in remote_script
+    assert "stored_result_fact" in remote_script
+    assert "stored_reason_codes" in remote_script
+    assert "training_feature_snapshot" in remote_script
+    assert '"orders_submitted": False' in remote_script
 
 
 def _native_contract() -> tuple[dict, dict]:

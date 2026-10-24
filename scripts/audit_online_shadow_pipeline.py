@@ -356,6 +356,169 @@ async def main():
                     "contract_data_fingerprint": contract.get("data_fingerprint"),
                 })
     report["native_fingerprint_check"] = native_fingerprint
+    if __PROBE_NATIVE__:
+        probe_inputs = await read("native_route_probe_inputs", """
+            SELECT id, symbol, horizon_minutes,
+                   CASE
+                       WHEN feature_snapshot->'market_fact_contract'->'entry_fact'
+                           ->>'source_timestamp_ms' ~ '^[0-9]+$'
+                       THEN (feature_snapshot->'market_fact_contract'->'entry_fact'
+                           ->>'source_timestamp_ms')::BIGINT
+                       WHEN feature_snapshot->'market_fact'->>'source_timestamp_ms'
+                           ~ '^[0-9]+$'
+                       THEN (feature_snapshot->'market_fact'
+                           ->>'source_timestamp_ms')::BIGINT
+                       ELSE NULL
+                   END AS entry_timestamp_ms,
+                   CASE
+                       WHEN feature_snapshot->'market_fact_contract'->'result_fact'
+                           ->>'source_timestamp_ms' ~ '^[0-9]+$'
+                       THEN (feature_snapshot->'market_fact_contract'->'result_fact'
+                           ->>'source_timestamp_ms')::BIGINT
+                       ELSE NULL
+                   END AS result_timestamp_ms,
+                   (extract(epoch from due_at) * 1000)::BIGINT AS due_timestamp_ms,
+                   training_feature_snapshot->'training_market_fact_contract'->>'status'
+                       AS stored_contract_status,
+                   training_feature_snapshot->'training_market_fact_contract'
+                       ->>'violation_reason_codes' AS stored_reason_codes,
+                   training_feature_snapshot->'training_market_fact_contract'
+                       ->>'fallback_reason' AS stored_fallback_reason,
+                   training_feature_snapshot->'training_market_fact_contract'
+                       ->>'path_status' AS stored_path_status,
+                   training_feature_snapshot->'training_market_fact_contract'
+                       ->>'path_fingerprint' AS stored_path_fingerprint
+            FROM shadow_backtests
+            WHERE execution_mode='paper'
+              AND status='quarantined'
+              AND note ILIKE '%native_market_fact_invalid%'
+              AND id > (
+                  SELECT COALESCE(MAX(id), 0) - 4000
+                  FROM shadow_backtests
+              )
+            ORDER BY id DESC
+            LIMIT 8
+        """)
+        from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
+
+        exchange = OkxPerpetualSdkExchange("paper")
+        probes = []
+        try:
+            for item in probe_inputs:
+                entry_ms = int(item.get("entry_timestamp_ms") or 0)
+                result_ms = int(item.get("result_timestamp_ms") or 0)
+                due_ms = int(item.get("due_timestamp_ms") or 0)
+                end_ms = result_ms if result_ms > 0 else due_ms
+                if entry_ms <= 0 or end_ms <= 0 or end_ms < entry_ms:
+                    probes.append({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "status": "missing_or_invalid_path_timestamps",
+                        "has_entry_timestamp": entry_ms > 0,
+                        "has_result_timestamp": result_ms > 0,
+                        "has_due_timestamp": due_ms > 0,
+                    })
+                    continue
+                start_open_ms = (entry_ms // 60_000) * 60_000
+                end_open_ms = (end_ms // 60_000) * 60_000
+                expected_opens = set(
+                    range(start_open_ms, end_open_ms + 60_000, 60_000)
+                )
+                if len(expected_opens) > 300:
+                    probes.append({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "horizon_minutes": item.get("horizon_minutes"),
+                        "status": "window_exceeds_probe_limit",
+                        "expected_bar_count": len(expected_opens),
+                        "path_end_source": (
+                            "stored_result_fact" if result_ms > 0 else "due_at_fallback"
+                        ),
+                    })
+                    continue
+                started = monotonic()
+                try:
+                    rows = await asyncio.wait_for(
+                        exchange.fetch_native_consistency_ohlcv(
+                            str(item.get("symbol") or ""),
+                            limit=min(max(len(expected_opens) + 2, 5), 300),
+                            end_timestamp_ms=end_open_ms,
+                        ),
+                        timeout=12,
+                    )
+                    opens = []
+                    for row in rows:
+                        if isinstance(row, (list, tuple)) and row:
+                            try:
+                                opens.append(int(float(row[0])))
+                            except (TypeError, ValueError):
+                                continue
+                    covered_count = len(expected_opens.intersection(opens))
+                    status = (
+                        "empty_response"
+                        if not rows
+                        else "complete_window"
+                        if covered_count == len(expected_opens)
+                        else "window_coverage_miss"
+                    )
+                    probes.append({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "horizon_minutes": item.get("horizon_minutes"),
+                        "start_open_ms": start_open_ms,
+                        "end_open_ms": end_open_ms,
+                        "path_end_source": (
+                            "stored_result_fact" if result_ms > 0 else "due_at_fallback"
+                        ),
+                        "stored_contract_status": item.get("stored_contract_status"),
+                        "stored_reason_codes": item.get("stored_reason_codes"),
+                        "stored_fallback_reason": item.get("stored_fallback_reason"),
+                        "stored_path_status": item.get("stored_path_status"),
+                        "has_stored_path_fingerprint": bool(
+                            item.get("stored_path_fingerprint")
+                        ),
+                        "status": status,
+                        "row_count": len(rows),
+                        "covered_expected_bar_count": covered_count,
+                        "expected_bar_count": len(expected_opens),
+                        "missing_expected_bar_count": len(expected_opens.difference(opens)),
+                        "elapsed_seconds": round(monotonic() - started, 3),
+                    })
+                except asyncio.TimeoutError:
+                    probes.append({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "horizon_minutes": item.get("horizon_minutes"),
+                        "start_open_ms": start_open_ms,
+                        "end_open_ms": end_open_ms,
+                        "path_end_source": (
+                            "stored_result_fact" if result_ms > 0 else "due_at_fallback"
+                        ),
+                        "status": "request_timeout",
+                        "elapsed_seconds": round(monotonic() - started, 3),
+                    })
+                except Exception as exc:
+                    probes.append({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "horizon_minutes": item.get("horizon_minutes"),
+                        "start_open_ms": start_open_ms,
+                        "end_open_ms": end_open_ms,
+                        "path_end_source": (
+                            "stored_result_fact" if result_ms > 0 else "due_at_fallback"
+                        ),
+                        "status": "request_error",
+                        "error_type": type(exc).__name__,
+                        "elapsed_seconds": round(monotonic() - started, 3),
+                    })
+        finally:
+            await exchange.close()
+        report["native_route_probe"] = {
+            "read_only": True,
+            "database_mutated": False,
+            "orders_submitted": False,
+            "probes": probes,
+        }
     await read("executed_entry_evidence", """
         SELECT id, symbol, created_at,
                raw_llm_response->'normal_paper_trade'->>'expected_net_return_pct'
@@ -479,23 +642,55 @@ asyncio.run(main())
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe-history", action="store_true")
+    parser.add_argument("--probe-native", action="store_true")
     parser.add_argument("--settlement", action="store_true")
     parser.add_argument("--compact", action="store_true")
     args = parser.parse_args()
     transport.REMOTE_SCRIPT = REMOTE_SCRIPT.replace(
         "__PROBE_HISTORY__", repr(bool(args.probe_history)),
-    ).replace("__SETTLEMENT__", repr(bool(args.settlement)))
+    ).replace("__PROBE_NATIVE__", repr(bool(args.probe_native))).replace(
+        "__SETTLEMENT__", repr(bool(args.settlement))
+    )
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
         report = transport._read_remote_report(ssh, 25, 45)
     finally:
         ssh.close()
     if args.compact:
-        report = {
-            key: value for key, value in report.items()
-            if key not in {"indexes", "table_sizes", "selected_windows", "fills_and_exits"}
-            and not key.startswith("window_")
+        keep = {
+            "checked_at",
+            "database_activity",
+            "queue",
+            "settlement_throughput",
+            "native_fee_after_groups",
+            "entry_exit_counts",
+            "recovery_coverage",
+            "native_fingerprint_check",
+            "native_route_probe_inputs",
+            "native_route_probe",
+            "executed_entry_evidence",
+            "runtime",
         }
+        runtime = report.get("runtime")
+        compact_runtime = {
+            key: runtime.get(key)
+            for key in (
+                "mode",
+                "running",
+                "paused",
+                "heartbeat_at",
+                "last_round_error",
+                "market_last_error",
+                "position_last_error",
+                "market_current_stage",
+                "market_round_active",
+                "last_market_round_started_at",
+                "last_market_round_finished_at",
+            )
+        } if isinstance(runtime, dict) else runtime
+        report = {key: value for key, value in report.items() if key in keep}
+        if compact_runtime is not None:
+            report["runtime"] = compact_runtime
     safe_print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
 
 

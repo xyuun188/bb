@@ -1,6 +1,6 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-24, Asia/Shanghai.
+Updated: 2026-10-25, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
@@ -4297,3 +4297,117 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   defects, keep the negative Ridge family rejected, and register a materially
   new development protocol only after enough clean chronological coverage
   exists.
+
+### Current User Root-Cause Recheck (2026-10-25 04:53 Asia/Shanghai)
+
+- Fresh bounded read-only market audit completed at `2026-10-24T20:52:29Z`
+  (Beijing `2026-10-25 04:52:29`) over 100 decisions (`694306-694405`).
+  All 100 analyses completed with all four experts, all final actions were
+  `hold`, and there were zero order attempts. The funnel was 58
+  `no_candidate` and 42 `shadow_training`; no exchange rejection explains the
+  no-entry interval.
+- Each of the 100 long-side and 100 short-side return lower bounds was
+  non-positive: the best observed long lower bound was `-0.525998%` and the
+  best short lower bound was `-0.170804%`. Positive point estimates existed
+  for 21 long and 31 short observations, but none had a positive lower bound.
+  The governing local-ML permission remains false at 267 authoritative
+  settled samples: fee-after mean `-0.303832%`, lower bound `-0.431590%`,
+  profit factor `0.549713`. Therefore entry is withheld by the profitability
+  contract, not a stopped scheduler, missing expert response, or exchange
+  rejection.
+- Bounded shadow-pipeline audit at `2026-10-24T20:52:46Z` confirmed the paper
+  runtime was running, unpaused, and heartbeating at `20:52:41Z`; the last
+  six-hour decision projection had no non-hold actions. Shadow settlement was
+  active: 47 rows completed and 23 quarantined in the latest five minutes.
+  The rolling six-hour aggregate held 752 native fee-after decision groups
+  across four horizons. These are training/label observations, not executed
+  trades or proof of profitability.
+- The latest bounded 24-hour quarantine sample (`row_limit=4000`) covered
+  1,000 groups: 445 were mature at all four horizons and 24 qualified at all
+  four. Per-horizon native-market invalid reasons included missing one-minute
+  paths (203/200/186/99), incomplete paths (68/68/63/41), and unreconciled
+  executable quotes (210/207/190/102) for 5/15/60/240 minutes. Historical
+  rebuilt rows separately remain quarantined for missing/unverified
+  availability basis; they must not be promoted into executable training
+  evidence. These samples are bounded projections, not lifetime censuses.
+- Read-only paper-resume preflight at `2026-10-24T20:49:17Z` reported the paper
+  service already active and four Phase 3 quant child endpoints unavailable.
+  The model server and quant API parent were reachable, but those child
+  contracts had no ready registered artifact. Live routing remained disabled,
+  and the authoritative account sync showed no open positions or orders to
+  repair. This preflight is a release/restart gate, not the direct veto in the
+  100-decision entry sample; do not restart the running paper service or
+  reinterpret parent liveness as child-model readiness.
+- Remaining acceptance state: G0 passed; G1 passed only as a negative loss
+  attribution audit; G2 remains blocked; G3 remains not passed because the
+  adequately covered fixed-primary nested Ridge search selected zero
+  policies; G4 has no frozen candidate or untouched exam; G5 has no governed
+  profitable paper round trip; G6 is pending. Thus five of the six
+  profitability gates G1-G6 remain incomplete or failed. Real-money profit
+  cannot accrue while execution mode is paper, and no result supports a
+  guarantee of future profit.
+- Next exact action: instrument and directly probe the bounded native 1-minute
+  endpoint on the online runtime, distinguishing timeout/error, empty response,
+  cursor/window coverage miss, and cache-only decision timing without storing
+  raw quotes. Only after a reproducible subcause is isolated, repair it and
+  collect a fresh boundary. Then preregister a materially different
+  cost-aware development family on eligible native labels. Keep all entry,
+  quality, cost, leverage, and risk gates unchanged; do not open G4 until a
+  candidate passes G3. No application source, deployment, service restart,
+  order, position, protection, or account mutation occurred in this recheck.
+
+### Native Route Probe And Current Entry Recheck (2026-10-25 05:22 Asia/Shanghai)
+
+- The read-only probe was completed after bounding the sample lookup to the
+  latest 4,000 IDs and bounding each OKX native 1-minute request to 12
+  seconds. Local focused tests for the probe contract passed `4`; Ruff and
+  compileall passed. The probe never writes the database, submits orders, or
+  changes positions/protection.
+- Eight newest quarantined native rows were checked against the complete
+  entry-to-result window, using the stored result timestamp when available.
+  All eight returned `complete_window`; observed coverage was 7/7, 7/7, 7/7,
+  9/9, 8/8, 8/8, 16/16 and 7/7 bars, with no request timeout or empty
+  response. Therefore the current public OKX 1-minute route is reachable for
+  these windows. This does not promote the rows: their decision-time
+  contracts remain immutable evidence.
+- The stored entry-time quarantine reasons are reproducible and distinct from
+  the later probe result. Representative reasons were
+  `executable_quote_sources_not_reconciled`,
+  `recent_one_minute_price_path_missing` or
+  `recent_one_minute_price_path_incomplete`, and
+  `observed_price_outside_recent_native_path`. A later successful REST fetch
+  cannot prove that the original decision-time quotes/path were available or
+  executable. The remaining G2 blocker is therefore capture-time provenance
+  and source reconciliation, not a blanket current REST outage.
+- A fresh bounded market-hold economics audit covered decision IDs
+  `694368-694467` through `2026-10-24T21:18:11Z`. All 100 analyses completed
+  and all 100 final actions were `hold`; the funnel was 55 `no_candidate` and
+  45 `shadow_training`, with zero order attempts. Across both sides, all 200
+  observations were not production eligible. Twenty-five long and 36 short
+  sides had positive point estimates, but every such side had a non-positive
+  lower bound; the latest lower-bound maxima remained negative
+  (long `-0.666982%`, short `-0.170804%`). Quality blockers remained
+  `average_fee_after_return_not_positive`,
+  `fee_after_return_lcb_not_positive`,
+  `fee_after_profit_factor_not_above_break_even`, and missing fee-after
+  quality evidence. The direct no-entry cause is still the fixed
+  profitability permission, not scheduler inactivity or exchange rejection.
+- Runtime remained paper-only, running and unpaused, with no executed entries.
+  Shadow settlement continued to produce completed and quarantined rows. The
+  compact audit output was reduced to bounded runtime/economics/probe fields
+  so future checks do not dump raw market diagnostics.
+- Acceptance is unchanged: G0 passed; G1 is passed only as negative loss
+  attribution; G2 is blocked by decision-time provenance/reconciliation;
+  G3 has no qualifying policy; G4 has no frozen candidate or untouched exam;
+  G5 has no authorized governed paper round trip; G6 is pending. Five
+  profitability gates remain incomplete or failed. No code change has altered
+  entry thresholds, model permission, risk, leverage, execution mode, or
+  exchange behavior.
+- Next exact action: trace the capture-time source-consistency path from the
+  market-analysis feature snapshot into the shadow row, and add a focused
+  regression only if the missing-path/quote-reconciliation defect is
+  reproducible in code. Preserve all quarantined rows and do not requalify
+  them from the later probe. In parallel, keep collecting fresh native
+  fee-after groups and preregister a materially different candidate family
+  only after enough clean chronological labels exist. G4 remains closed until
+  G3 passes.
