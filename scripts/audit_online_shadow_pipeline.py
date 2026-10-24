@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,6 +16,78 @@ if str(ROOT) not in sys.path:
 from core.remote_ssh import connect_remote_ssh  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from scripts import audit_online_market_hold_economics as transport  # noqa: E402
+
+
+def _fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def verify_shadow_evidence_fingerprint(
+    contract: dict[str, Any] | None,
+    full_market_contract: dict[str, Any] | None,
+    historical_evidence: Any = None,
+) -> tuple[bool, str]:
+    """Verify the lineage appropriate to a native or historical shadow row."""
+
+    compact = contract if isinstance(contract, dict) else {}
+    full = full_market_contract if isinstance(full_market_contract, dict) else {}
+    source = str(compact.get("source") or "").strip()
+    native = source == "shadow_entry_result_and_okx_native_1m_path" or (
+        compact.get("executable_market_fact_verified") is True
+        and compact.get("entry_fact_id")
+        and compact.get("result_fact_id")
+        and compact.get("path_fingerprint")
+    )
+    if native:
+        entry = full.get("entry_fact")
+        entry = entry if isinstance(entry, dict) else {}
+        result = full.get("result_fact")
+        result = result if isinstance(result, dict) else {}
+        path = full.get("price_path")
+        path = path if isinstance(path, dict) else {}
+        entry_fact_id = str(compact.get("entry_fact_id") or entry.get("fact_id") or "").strip()
+        result_fact_id = str(compact.get("result_fact_id") or result.get("fact_id") or "").strip()
+        path_fingerprint = str(
+            compact.get("path_fingerprint") or path.get("path_fingerprint") or ""
+        ).strip()
+        if not entry_fact_id or not result_fact_id or not path_fingerprint:
+            return False, "native_lineage_field_missing"
+        if full and (
+            entry_fact_id != str(entry.get("fact_id") or "").strip()
+            or result_fact_id != str(result.get("fact_id") or "").strip()
+            or path_fingerprint != str(path.get("path_fingerprint") or "").strip()
+        ):
+            return False, "native_lineage_mismatch"
+        expected = _fingerprint(
+            {
+                "entry_fact_id": entry_fact_id,
+                "result_fact_id": result_fact_id,
+                "path_fingerprint": path_fingerprint,
+            }
+        )
+        if str(compact.get("data_fingerprint") or "").strip() != expected:
+            return False, "native_data_fingerprint_mismatch"
+        return True, "native_lineage_verified"
+
+    expected = str(compact.get("data_fingerprint") or "").strip()
+    if not isinstance(historical_evidence, dict) or not expected:
+        return False, "historical_evidence_missing"
+    verified = _fingerprint(historical_evidence) == expected
+    return (
+        verified,
+        "historical_evidence_verified"
+        if verified
+        else "historical_data_fingerprint_mismatch",
+    )
+
 
 REMOTE_SCRIPT = r'''
 import asyncio
@@ -77,6 +151,26 @@ async def main():
               AND status<>'pending'
         GROUP BY status
     """)
+    await read("native_fee_after_groups", """
+        SELECT
+            training_feature_snapshot->'training_market_fact_contract'->>'source'
+                AS market_source,
+            training_feature_snapshot->'training_label_contract'->>'fee_after_complete'
+                AS fee_after_complete,
+            count(*) AS rows,
+            count(DISTINCT decision_id) AS decision_groups,
+            count(DISTINCT horizon_minutes) AS horizons,
+            min(updated_at) AS first_update,
+            max(updated_at) AS last_update
+        FROM shadow_backtests
+        WHERE execution_mode='paper'
+          AND status='completed'
+          AND updated_at>=now()-interval '6 hours'
+        GROUP BY
+            training_feature_snapshot->'training_market_fact_contract'->>'source',
+            training_feature_snapshot->'training_label_contract'->>'fee_after_complete'
+        ORDER BY rows DESC
+    """)
     await read("entry_exit_counts", """
         SELECT action, was_executed, count(*) AS count,
                min(created_at) AS first_decision, max(created_at) AS last_decision
@@ -104,6 +198,7 @@ async def main():
     evidence_rows = await read("recent_historical_evidence", """
         SELECT id, symbol, horizon_minutes, status, updated_at,
                training_feature_snapshot->'training_market_fact_contract' AS contract,
+               feature_snapshot->'market_fact_contract' AS full_market_contract,
                feature_snapshot->'market_fact_contract'->'price_path'
                    ->'ohlcv_evidence' AS evidence,
                json_array_length(
@@ -117,13 +212,150 @@ async def main():
     """)
     for row in evidence_rows:
         evidence = row.pop("evidence", None)
-        row["evidence_fingerprint_verified"] = bool(
-            evidence and hashlib.sha256(json.dumps(
-                evidence, ensure_ascii=True, separators=(",", ":"), default=str,
-            ).encode("utf-8")).hexdigest() == (row.get("contract") or {}).get(
-                "data_fingerprint"
-            )
+        full_market_contract = row.pop("full_market_contract", None)
+        contract = row.get("contract") or {}
+        source = str(contract.get("source") or "").strip()
+        native = source == "shadow_entry_result_and_okx_native_1m_path" or (
+            contract.get("executable_market_fact_verified") is True
+            and contract.get("entry_fact_id")
+            and contract.get("result_fact_id")
+            and contract.get("path_fingerprint")
         )
+        if native:
+            entry = (
+                full_market_contract.get("entry_fact")
+                if isinstance(full_market_contract, dict)
+                else {}
+            )
+            result = (
+                full_market_contract.get("result_fact")
+                if isinstance(full_market_contract, dict)
+                else {}
+            )
+            path = (
+                full_market_contract.get("price_path")
+                if isinstance(full_market_contract, dict)
+                else {}
+            )
+            entry_fact_id = str(
+                contract.get("entry_fact_id")
+                or (entry or {}).get("fact_id")
+                or ""
+            ).strip()
+            result_fact_id = str(
+                contract.get("result_fact_id")
+                or (result or {}).get("fact_id")
+                or ""
+            ).strip()
+            path_fingerprint = str(
+                contract.get("path_fingerprint")
+                or (path or {}).get("path_fingerprint")
+                or ""
+            ).strip()
+            expected = hashlib.sha256(json.dumps(
+                {
+                    "entry_fact_id": entry_fact_id,
+                    "result_fact_id": result_fact_id,
+                    "path_fingerprint": path_fingerprint,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")).hexdigest()
+            row["evidence_fingerprint_verified"] = bool(
+                entry_fact_id
+                and result_fact_id
+                and path_fingerprint
+                and contract.get("data_fingerprint") == expected
+                and (
+                    not isinstance(full_market_contract, dict)
+                    or (
+                        entry_fact_id == str((entry or {}).get("fact_id") or "").strip()
+                        and result_fact_id == str((result or {}).get("fact_id") or "").strip()
+                        and path_fingerprint == str((path or {}).get("path_fingerprint") or "").strip()
+                    )
+                )
+            )
+            row["evidence_fingerprint_kind"] = "native_lineage"
+        else:
+            row["evidence_fingerprint_verified"] = bool(
+                evidence and hashlib.sha256(json.dumps(
+                    evidence, ensure_ascii=True, separators=(",", ":"), default=str,
+                ).encode("utf-8")).hexdigest() == contract.get("data_fingerprint")
+            )
+            row["evidence_fingerprint_kind"] = "historical_ohlcv"
+    native_rows = await read("native_fingerprint_rows", """
+        SELECT id, symbol, decision_id, horizon_minutes, updated_at,
+               training_feature_snapshot->'training_market_fact_contract' AS contract,
+               feature_snapshot->'market_fact_contract' AS full_market_contract
+        FROM shadow_backtests
+        WHERE execution_mode='paper'
+          AND status='completed'
+          AND updated_at>=now()-interval '6 hours'
+          AND training_feature_snapshot->'training_market_fact_contract'->>'source'
+              = 'shadow_entry_result_and_okx_native_1m_path'
+        ORDER BY updated_at DESC
+        LIMIT 200
+    """)
+    report.pop("native_fingerprint_rows", None)
+    native_fingerprint = {
+        "checked_rows": len(native_rows),
+        "verified_rows": 0,
+        "failed_rows": 0,
+        "distinct_decision_groups": len({
+            int(row.get("decision_id") or 0)
+            for row in native_rows
+            if int(row.get("decision_id") or 0) > 0
+        }),
+        "failure_samples": [],
+    }
+    for row in native_rows:
+        contract = row.get("contract") or {}
+        full = row.get("full_market_contract")
+        entry = full.get("entry_fact") if isinstance(full, dict) else {}
+        result = full.get("result_fact") if isinstance(full, dict) else {}
+        path = full.get("price_path") if isinstance(full, dict) else {}
+        entry_id = str(contract.get("entry_fact_id") or (entry or {}).get("fact_id") or "").strip()
+        result_id = str(contract.get("result_fact_id") or (result or {}).get("fact_id") or "").strip()
+        path_id = str(contract.get("path_fingerprint") or (path or {}).get("path_fingerprint") or "").strip()
+        expected = hashlib.sha256(json.dumps(
+            {
+                "entry_fact_id": entry_id,
+                "result_fact_id": result_id,
+                "path_fingerprint": path_id,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest()
+        verified = bool(
+            entry_id
+            and result_id
+            and path_id
+            and contract.get("data_fingerprint") == expected
+            and entry_id == str((entry or {}).get("fact_id") or "").strip()
+            and result_id == str((result or {}).get("fact_id") or "").strip()
+            and path_id == str((path or {}).get("path_fingerprint") or "").strip()
+        )
+        if verified:
+            native_fingerprint["verified_rows"] += 1
+        else:
+            native_fingerprint["failed_rows"] += 1
+            if len(native_fingerprint["failure_samples"]) < 6:
+                native_fingerprint["failure_samples"].append({
+                    "id": row.get("id"),
+                    "symbol": row.get("symbol"),
+                    "decision_id": row.get("decision_id"),
+                    "horizon_minutes": row.get("horizon_minutes"),
+                    "updated_at": row.get("updated_at"),
+                    "has_entry_fact": bool(entry_id),
+                    "has_result_fact": bool(result_id),
+                    "has_path_fingerprint": bool(path_id),
+                    "contract_data_fingerprint": contract.get("data_fingerprint"),
+                })
+    report["native_fingerprint_check"] = native_fingerprint
     await read("executed_entry_evidence", """
         SELECT id, symbol, created_at,
                raw_llm_response->'normal_paper_trade'->>'expected_net_return_pct'

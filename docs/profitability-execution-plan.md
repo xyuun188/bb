@@ -2321,3 +2321,45 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   recovers, keep G2 blocked until independent native fee-after samples meet
   the preregistered evidence gate; if it does not, trace the remaining REST
   fallback or instrument-contract path without weakening the gate.
+
+### Native Shadow Lineage Audit Repair And Fresh Evidence (2026-10-24 08:10 Asia/Shanghai)
+
+- The online shadow audit had a verifier defect: it always hashed the
+  historical `price_path.ohlcv_evidence` object. Native executable-market
+  contracts do not contain that object; their authoritative lineage is
+  `entry_fact_id + result_fact_id + path_fingerprint`, with `data_fingerprint`
+  equal to the canonical hash of those three values. The old verifier
+  therefore falsely marked native rows as fingerprint failures.
+- Repaired `scripts/audit_online_shadow_pipeline.py` to keep historical OHLCV
+  verification and native lineage verification separate. Added bounded native
+  fee-after group counts and a 200-row lineage check. Local focused regression
+  passed `3`; Ruff, compileall and diff checks passed. Only the audit script
+  was targeted-uploaded with source integrity verified; no service restart or
+  runtime mutation occurred.
+- Read-only online audit at `2026-10-24T00:08:11Z` UTC found, within the last
+  six hours, `176` completed native rows with `fee_after_complete=true`,
+  spanning `149` distinct decision groups and all four horizons. Native
+  lineage verification passed `176/176`; no fingerprint failure remains in
+  the checked set. Historical OHLCV rows are separate (`51` rows / `39`
+  decision groups) and are not executable-cost supervision.
+- The same window still has no executed paper entry. Entry recovery reports
+  `176` market decisions, all `HOLD`/`insufficient_evidence`; local ML paper
+  permission remains false because authoritative fee-after economics are
+  negative (`n=267`, mean `-0.303832%`, LCB `-0.431590%`, PF `0.549713`), and
+  the other model families have no qualified evidence.
+- Fresh frozen-feature checks show the transport repair is improving
+  availability but not yet a clean acceptance window: latest 30-minute
+  decision snapshots are `61/64` component-valid and training snapshots
+  `64/64` valid; the latest 10-minute `16/16` decision and training snapshots
+  are valid. All are below the `98,304 B` budget with zero seal errors. The
+  remaining older invalid decision rows contain missing index facts or a stale
+  technical availability contract and remain quarantined.
+- G1 remains passed only as negative-economics attribution; G2 remains
+  **BLOCKED**; G3-G6 remain pending. The native sample volume now supports
+  bounded cost-aware research preparation, but profitability has not been
+  demonstrated and no model/entry permission may be granted.
+- Exact next action: collect a fresh preregistered clean decision/training
+  window after the repaired stream, keep quarantined rows out of research,
+  then run the frozen cost-aware development ledger on native fee-after
+  groups only. Do not mix the historical rows, tune on the inspected window,
+  or manufacture orders.
