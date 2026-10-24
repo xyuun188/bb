@@ -2975,9 +2975,9 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `HOLD` and not executed. The paper service remains active/running in paper
   mode, `NRestarts=0`, with `ExecMainStartTimestamp=2026-10-24 06:47:58 UTC`.
 - There were zero new native quarantines for missing shadow path labels in
-  that 15-minute window. This is consistent with the intended timely-path
-  retry guard operating on the post-restart stream, but is not sufficient
-  time to claim G2 complete.
+  that 15-minute window. This is only an observation about the post-restart
+  stream; no new retry guard was deployed or inferred from it, and the
+  window is not sufficient to claim G2 complete.
 - A bounded read-only exact-source recheck of four previously quarantined
   native rows found their stored result clocks were within 1 minute of the
   scheduled label time (10-26 seconds); each original stored path had
@@ -3020,3 +3020,18 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - Local verification after the checkpoint: `401 passed` across the shadow,
   trading-boundary and horizon-audit tests; Ruff, compileall and diff checks
   passed. This verifies software behavior, not profitability.
+
+### Latest Bounded Native Projection (2026-10-24 15:51 Asia/Shanghai)
+
+- The latest six-hour bounded projection at `2026-10-24T07:51:58Z` found
+  native fee-after rows by horizon of `107` (5m), `101` (15m), `90` (60m)
+  and `64` (240m). No decision group had all four horizons; `236` groups had
+  one horizon and `63` had two. Recent decisions remained `64 HOLD` with no
+  executed entries, and the paper service remained healthy.
+- This is a maturity/coverage observation only. It does not establish a
+  profitable candidate, a valid current prediction contract, or an
+  independent exam. G2 remains **BLOCKED** and G3-G6 remain pending.
+- The local branch is one commit ahead of `origin/main` at `d2de71a`; the
+  previous push attempt failed on transient GitHub HTTPS connectivity.
+  Retry the push of this documentation-only checkpoint before starting any
+  new experiment. Do not rerun the completed six-hour study unchanged.
