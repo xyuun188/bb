@@ -30,6 +30,7 @@ from core.feature_availability import (
 from core.market_facts import (
     build_market_fact,
     build_market_source_consistency,
+    market_source_consistency_reasons,
     normalize_okx_contract_spec,
 )
 from core.market_facts import (
@@ -106,6 +107,10 @@ TICKER_PERSIST_CONCURRENCY = max(
     min(4, max(int(settings.database_pool_size or 1) // 8, 1)),
 )
 DERIVATIVES_STALE_MAX_AGE_SECONDS = _MARKET_DATA_PARAMS.derivatives_stale_max_age_seconds
+# Only compare executable quote sources captured within the same short
+# observation window. A stale websocket ticker must not invalidate a fresh
+# authoritative REST snapshot.
+MARKET_SOURCE_MAX_SKEW_MS = 2_000
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -1419,9 +1424,28 @@ class DataService:
                     require_authoritative_snapshot=require_authoritative_snapshot,
                 )
                 # A blocking refresh has an authoritative REST snapshot. Keep
-                # the fresh WebSocket observation only as a comparison source;
-                # it must never overwrite the REST fact after the refresh.
-                source_snapshots.append(websocket_snapshot)
+                # the websocket observation only when it belongs to the same
+                # short capture window; an older comparison source would
+                # otherwise quarantine the fresh REST fact.
+                rest_timestamp = self._ticker_timestamp_from_raw(rest_snapshot)
+                websocket_timestamp = self._ticker_timestamp_from_raw(
+                    websocket_snapshot
+                )
+                if (
+                    rest_timestamp > 0
+                    and websocket_timestamp > 0
+                    and abs(rest_timestamp - websocket_timestamp)
+                    <= MARKET_SOURCE_MAX_SKEW_MS
+                ):
+                    source_snapshots.append(websocket_snapshot)
+                else:
+                    logger.info(
+                        "skipping stale websocket comparison source",
+                        symbol=normalized,
+                        rest_timestamp_ms=rest_timestamp,
+                        websocket_timestamp_ms=websocket_timestamp,
+                        max_skew_ms=MARKET_SOURCE_MAX_SKEW_MS,
+                    )
 
             selected = dict(selected)
             selected["market_source_snapshots"] = [
@@ -2528,23 +2552,36 @@ class DataService:
         # Shadow settlement is read-only maintenance. When the WebSocket has a
         # fresh ticker plus executable book/mark facts, build from that native
         # cache first instead of opening a second REST fan-out for the same
-        # symbol. A clean result is returned immediately; incomplete cache data
-        # falls through to the authoritative REST refresh below.
+        # symbol. A cache-only snapshot may short-circuit only when its native
+        # 1m path and source-consistency contract are already present and clean;
+        # otherwise an unverified websocket snapshot would be persisted as a
+        # settlement fact before executable evidence is available.
         cached_ticker = await self._get_ticker_snapshot(
             symbol,
             block_on_remote=False,
         )
         if cached_ticker:
-            cached_fact = build_market_fact(
+            cached_enriched = self._attach_market_source_consistency(
                 symbol,
                 cached_ticker,
-                contract_spec=cached_ticker.get("contract_spec"),
-                received_at=cached_ticker.get("received_at"),
+                {},
+            )
+            cached_fact = build_market_fact(
+                symbol,
+                cached_enriched,
+                contract_spec=cached_enriched.get("contract_spec"),
+                received_at=cached_enriched.get("received_at"),
                 require_observed_receipt=True,
             )
-            if isinstance(cached_fact.get("quality"), dict) and cached_fact["quality"].get(
-                "status"
-            ) == "clean":
+            cached_consistency = cached_enriched.get("market_source_consistency")
+            cached_path = cached_ticker.get("native_consistency_bars_1m")
+            if (
+                isinstance(cached_path, list)
+                and bool(cached_path)
+                and not market_source_consistency_reasons(cached_consistency)
+                and isinstance(cached_fact.get("quality"), dict)
+                and cached_fact["quality"].get("status") == "clean"
+            ):
                 return cached_fact
 
         ticker_result, derivatives_result = await asyncio.gather(

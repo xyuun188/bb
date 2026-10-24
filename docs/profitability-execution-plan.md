@@ -3562,3 +3562,289 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   estimable; G4-G6 remain pending. The next development run must use a new
   cutoff after enough clean common groups accumulate (at least the fixed-fold
   minimum), not a replay of this same cutoff.
+
+### Fresh Common-Group Coverage Recheck And Development Registration (2026-10-24 23:29 Asia/Shanghai)
+
+- A new bounded read-only coverage query completed at
+  `2026-10-24T15:24:46Z` using the 12-hour window. It found 33 mature
+  decision groups with all four horizons (`5/15/60/240`) completed from the
+  native executable path with `fee_after_complete=true`; 463 other mature
+  groups had at least one horizon quarantined or otherwise ineligible. The
+  33-group count is above the fixed 16-observation primary training minimum,
+  so a new development run is now estimable. This is a data-coverage result,
+  not a profitability result.
+- The same query showed marginal native rows of `457/479/485/387` for
+  `5/15/60/240` minutes and 565 market decisions in the latest four-hour
+  entry window. Marginal counts are not common groups and do not authorize
+  entries.
+- Preregistered next development identity:
+  `horizon-current-v1-20261024T152900Z`; cutoff-exclusive UTC
+  `2026-10-24T15:29:00Z`; 12-hour lookback; maximum 1,000 decision groups.
+  Inputs are restricted to completed paper rows from the native executable
+  1-minute path with `fee_after_complete=true`. The candidate family,
+  purged chronological folds, minimum selected rows `16`, positive
+  fee-after mean and lower bound, PF above one, and positive means in both
+  inner folds remain unchanged. This run is development-only: no exam labels,
+  artifact persistence, model permission, database mutation, order, or
+  service restart.
+- Entry recovery at `2026-10-24T15:25:20Z` still showed `565/565` market
+  decisions as HOLD and no executed entries. In the latest 80 decisions,
+  38 were `no_candidate`, 38 were `shadow_training`, and 4 were
+  `insufficient_evidence`; all entry permissions remained false. The direct
+  blockers were non-positive expected net after costs, missing quantitative
+  evidence, and excessive observation-loss probability. Local ML
+  authoritative evidence remains `n=267`, mean fee-after return
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`, so its execution
+  permission remains false.
+
+### Horizon Development Result At Fresh Cutoff (2026-10-24 23:33 Asia/Shanghai)
+
+- The preregistered run `horizon-current-v1-20261024T152900Z` completed at
+  `2026-10-24T15:32:41Z` with the exact cutoff
+  `2026-10-24T15:29:00Z`. It read 1,746 native fee-after rows across the
+  1,000 most recent decision groups, but only 25 groups contained all four
+  horizons. The fixed three outer folds require at least 31 groups because
+  the first half of groups must provide the 16-row primary training minimum;
+  therefore the runner correctly returned `insufficient_development_data`
+  before scoring any candidate.
+- No policy, artifact, model permission, database mutation or order was
+  produced. This is insufficient coverage, not a candidate rejection and not
+  an independent exam result. G2 remains **BLOCKED** and G3-G6 remain
+  pending.
+- The 12-hour cutoff is still too short for the fixed fold protocol despite
+  the 33-group created-time coverage snapshot. Development eligibility is
+  bounded by `updated_at`, while the coverage diagnostic is grouped by
+  `created_at`; older completed rows therefore fall outside the development
+  window. The next run must use a newly preregistered longer development
+  window, not reuse this cutoff or lower the fold minimum.
+
+### Longer Development Window Registration (2026-10-24 23:35 Asia/Shanghai)
+
+- New development-only identity:
+  `horizon-current-v1-20261024T153500Z-24h`; cutoff-exclusive UTC
+  `2026-10-24T15:35:00Z`; lookback `24` hours; maximum `1,000` decision
+  groups. The source filter, model family, alpha/threshold grid, purged
+  chronological folds, minimum `16` selected observations and all
+  fee-after acceptance criteria are unchanged. The longer window is
+  preregistered solely to obtain enough current `updated_at` coverage for the
+  fixed protocol; it is not an exam and cannot authorize trading.
+
+### Updated-Time Coverage Diagnosis And Bounded Re-registration (2026-10-24 23:45 Asia/Shanghai)
+
+- A separate read-only `updated_at` projection completed at
+  `2026-10-24T15:44:53Z`. Across the full 24-hour scope it found 54 mature
+  groups with all four native fee-after-complete horizons. This confirms the
+  data stream contains enough common groups for the fixed folds.
+- The 24-hour run with `decision_group_limit=1,000` still saw only 4 common
+  groups because its selected-group query orders `max(updated_at)` ascending
+  before applying the limit. The oldest eligible groups, including stale
+  quarantined/rebuilt activity, consume the bound and exclude newer complete
+  groups. This is a bounded research-input selection defect, not a reason to
+  lower entry gates or accept quarantined labels.
+- New preregistered identity:
+  `horizon-current-v1-20261024T154700Z-24h-2500`; cutoff-exclusive UTC
+  `2026-10-24T15:47:00Z`; 24-hour lookback; maximum `2,500` decision groups.
+  Candidate family, fold rules, costs, and acceptance criteria remain
+  unchanged. The run is development-only and cannot persist an artifact,
+  authorize model influence, mutate the database, or submit orders.
+
+### Horizon Development Result With Expanded Group Bound (2026-10-24 23:49 Asia/Shanghai)
+
+- The run `horizon-current-v1-20261024T154700Z-24h-2500` completed at
+  `2026-10-24T15:48:58Z`. It read 2,392 native fee-after rows across 1,377
+  decision groups, with 56 common four-horizon groups. The result remained
+  `insufficient_development_data` before candidate scoring.
+- A bounded fold-coverage projection on the exact frozen frame explains why:
+  the first outer validation boundary starts at `2026-10-24T11:08:48Z`, but
+  the 240-minute purge leaves only 4 primary training groups before that
+  boundary. All three outer folds therefore fail the fixed minimum of 16
+  primary training observations. The 56 groups are concentrated in roughly
+  `2026-10-24T01:18:22Z` through `2026-10-24T11:46:22Z`; group count alone
+  does not replace chronological separation.
+- No candidate was scored, no return metric was produced, and no policy,
+  artifact, permission, database row or order was changed. This is
+  insufficient chronological coverage, not a profitability pass or a
+  candidate rejection. G2 remains **BLOCKED**; G3-G6 remain pending.
+- The next exact action is to continue collecting newly created native
+  fee-after-complete groups across a longer time span until the fixed
+  240-minute purged folds have at least 16 primary training groups. Do not
+  shorten the purge, reuse this window as an exam, or lower the entry gates.
+
+### New Development Registration After Current Coverage (2026-10-25 00:50 Asia/Shanghai)
+
+- A fresh bounded entry/coverage check at `2026-10-24T16:46:35Z` still showed
+  `398/398` paper market decisions as `hold`, with `17` shadow-training
+  selections and `13` no-candidate decisions in the latest 30. No entry
+  permission was granted. The direct blockers remain non-positive expected net
+  return, missing quantitative evidence, and excessive observation-loss
+  probability; the authoritative local-ML evidence remains `n=267`,
+  mean fee-after return `-0.303832%`, lower bound `-0.431590%`, and PF
+  `0.549713`.
+- The same coverage window contains `85` mature four-horizon groups with
+  native executable 1-minute paths and `fee_after_complete=true`. This is
+  sufficient to attempt a development-only nested run, but it is not an
+  independent exam and cannot authorize execution.
+- Preregistered development identity:
+  `horizon-current-v1-20261024T165000Z-24h-2500`; cutoff-exclusive UTC
+  `2026-10-24T16:50:00Z`; 24-hour lookback; maximum `2,500` decision groups.
+  Inputs are restricted to completed paper rows from the native executable
+  1-minute path with `fee_after_complete=true`. The candidate family, Ridge
+  alpha grid, net thresholds, purged chronological folds, minimum selected
+  rows, fee-after cost model, and positive mean/lower-bound/PF requirements
+  remain unchanged. No exam labels, artifact persistence, permission change,
+  database mutation, order, or service restart is allowed.
+
+### Development Result And Cache-Path Repair (2026-10-25 01:08 Asia/Shanghai)
+
+- The registered development run completed at
+  `2026-10-24T16:53:34Z` with `2,585` native fee-after rows across `1,438`
+  decision groups and `88` common four-horizon groups. It returned
+  `insufficient_development_data` before candidate scoring: the fixed
+  chronological/purged folds still cannot supply the required primary
+  training coverage after the 240-minute label boundary. No candidate,
+  artifact, permission, database mutation, exam evaluation, or order was
+  produced. Report:
+  `data/profitability_remediation/online-horizon-development-v1-20261024T165000Z.json`.
+- The online source hash before deployment differed from the workspace only
+  by the uncommitted cache-path guard. The 2-second stale-WebSocket comparison
+  fix was already online; it was not the missing deployment. The new guard
+  was verified locally with `111` focused tests, Ruff, and compileall, uploaded
+  alone, remotely compiled and tested (`110` existing remote tests passed), then
+  `bb-paper-trading.service` was restarted once. Remote service state after
+  restart was `active/running`, `NRestarts=0`, paper mode unchanged.
+- A post-restart read-only window through `2026-10-24T17:08:33Z` observed
+  `18` market decisions, all `hold`: `8` shadow-training, `8` no-candidate,
+  and `2` insufficient-evidence. The model/economics permission remained
+  false with authoritative local-ML `n=267`, mean fee-after return
+  `-0.303832%`, lower bound `-0.431590%`, and PF `0.549713`. This verifies
+  the service is running and the guard is active; it does not establish
+  profitability.
+- The cache repair is a data-integrity correction, not a strategy relaxation:
+  cache-only shadow settlement now requires a non-empty native 1-minute path,
+  a current clean source-consistency contract, and a clean market fact before
+  short-circuiting the authoritative refresh. Fresh one-hour quarantine
+  samples still include missing/incomplete native paths, so G2 remains
+  **BLOCKED**. G1 remains passed only as negative attribution; G3 remains
+  blocked by chronological coverage, and G4-G6 remain pending.
+- Exact remaining work: continue collecting clean native groups across a
+  wider time span, fix only reproducible path-collection defects, then run a
+  new development search. Only a candidate with positive fee-after mean,
+  lower bound, PF and fold stability can proceed to a frozen independent exam
+  and governed paper fills. Do not lower gates or count shadow selections as
+  trades.
+
+### Post-Deployment Path Observation (2026-10-25 01:17 Asia/Shanghai)
+
+- The first bounded one-hour post-deployment quarantine projection completed
+  at `2026-10-24T17:17:29Z`. It observed `27` qualified 5-minute rows and
+  `26` qualified 15-minute rows, while newer 60/240-minute rows were still
+  pending. Remaining native invalidity was still present: 5-minute rows had
+  `15` `recent_one_minute_price_path_missing`/quote-reconciliation groups
+  and `15` incomplete-path groups; 15-minute rows had the same `15/15`
+  pattern. This confirms the cache guard is active but does not yet repair
+  the underlying provider/path availability problem.
+- No historical quarantined row was requalified. G2 therefore remains
+  **BLOCKED**, and the negative fee-after model evidence continues to block
+  entries independently of data collection. The next repair must instrument
+  the native fetch outcome (empty response, timeout, cursor-window miss, or
+  path continuity gap) on newly created decision IDs before changing any
+  collection behavior.
+
+### Fresh Online Status Recheck (2026-10-25 01:30 Asia/Shanghai)
+
+- A new bounded market-hold economics projection covered 500 paper market
+  decisions from `2026-10-24T13:42:44Z` through `2026-10-24T17:27:27Z`.
+  All 500 final actions were `hold`; there were no executed entries or open
+  positions. Of these, 460 analyses completed with four experts and 40 were
+  `insufficient_evidence` because the shared Qwen3.8-27B batch circuit breaker
+  deferred the expert call after a prior incomplete response.
+- The completed rows are not blocked by a scheduler or exchange rejection.
+  They are rejected by the economics/quality contract: the local-ML quality
+  permission was false for all 500 projections because authoritative
+  fee-after evidence remains `n=267`, mean `-0.303832%`, lower bound
+  `-0.431590%`, and profit factor `0.549713`. The required break-even
+  contract is positive mean, positive lower bound, and PF above one. Server
+  profit and time-series sources remain unavailable, so they cannot provide an
+  independent qualifying family.
+- A direct compact projection of decision `693914` shows the exact current
+  veto: long expected net `-0.1011786%` and short expected net
+  `-0.1585154%`, with no quantitative evidence family accepted; entry
+  permission is `false` with `no_direction`. This is the concrete reason the
+  latest online scan did not open a position.
+- Native data collection has improved but is not yet a clean research feed.
+  The six-hour quarantine projection found 65 mature groups with all four
+  native fee-after horizons qualified, while many other rows remain
+  quarantined for historical-only availability, quote-source
+  non-reconciliation, missing/incomplete one-minute paths, or observed prices
+  outside the captured path. The 24-hour coverage projection found 107 fully
+  qualified four-horizon groups; this is development evidence only and does
+  not authorize trading.
+- Current gates remain G0 passed, G1 passed only as negative attribution, G2
+  **BLOCKED**, and G3-G6 pending. The remaining work is therefore two
+  separate tracks: (1) obtain a stable positive fee-after candidate through
+  preregistered nested development on newly qualified native groups, and
+  (2) independently close the remaining provenance/quarantine and expert
+  batch reliability defects. No quality gate, risk limit, leverage, or live
+  trading setting was relaxed.
+- Next exact action: finish one bounded current-window development diagnostic,
+  then preregister any subsequent run's immutable cutoff and inputs before
+  execution. In parallel, trace the expert batch circuit-breaker timeout on
+  fresh decision IDs; do not count deferred expert rows as trades or use them
+  to justify an entry.
+
+### Nested Development Result At Fresh Cutoff (2026-10-25 01:32 Asia/Shanghai)
+
+- A bounded 24-hour native development diagnostic completed at
+  `2026-10-24T17:31:22Z` with cutoff-exclusive
+  `2026-10-24T17:28:57.682776Z`, 2,702 fee-after-complete rows across 1,484
+  decision groups, input SHA256
+  `5678f8528412eb87e39c0768ffedb130cd4ca5d226669a72bdd6d4758d22dd93`,
+  and source-frame SHA256
+  `1e7079769615d7de9ed5506ac17b63f85b34adee0c65ba68795bd8412a2eb4e5`.
+  Report: `data/profitability_remediation/online-nested-development-v1-20261024T172857Z.json`.
+  Its cutoff was generated at execution rather than recorded as a distinct
+  preregistration entry; keep this run development/diagnostic only and do not
+  treat it as G3 acceptance evidence. All three chronological outer folds and
+  their inner folds were estimable with zero group overlap and purged label
+  boundaries.
+- No policy qualified in any fold. The aggregate opportunity count was 164,
+  but selected count was zero because every candidate failed the inner
+  positive fee-after mean/lower-bound/PF requirements. Representative inner
+  results remained negative (for example fold 0 mean `-0.1070%`, PF
+  `0.3629`; fold 1 best mean `0.0618%` still had lower bound `-0.1192%`;
+  fold 2 best mean `0.1740%` still had lower bound `-0.1880%`). No artifact,
+  promotion, permission change, database mutation or order was produced.
+- This is a completed negative development diagnostic, not an
+  insufficient-data result and not an independent exam. G3 therefore remains
+  not passed; G4-G6 cannot start until a new preregistered candidate passes
+  development and the remaining G2 provenance requirements are satisfied.
+  Any future run must preregister a new cutoff and may not tune on this result.
+
+### Live Service And Collection Reliability Recheck (2026-10-25 01:44 Asia/Shanghai)
+
+- A fresh 30-minute online projection through `2026-10-24T17:41:20Z`
+  still showed only `hold` market decisions and zero executed entries/open
+  positions. `bb-paper-trading.service` is `active/running` with
+  `NRestarts=0`; dashboard is also active with zero restarts. This rules out a
+  stopped service as the current entry cause.
+- The latest retained-log tail spans `2026-10-24T12:00:34Z` through
+  `2026-10-24T17:44:40Z`. It contains 48 explicit native-path
+  `TimeoutError` events, 14 shadow path-batch timeout events and 47 Qwen
+  batch-circuit-breaker warnings. A newer clean tail from
+  `2026-10-24T17:34:36Z` through `17:41:54Z` contains 79 successful native
+  one-minute requests, no native errors, zero queue wait, provider-duration
+  p95 `3.91s` and maximum `4.94s`. This shows the capacity repair is working
+  in the latest minutes but has not erased intermittent failures across the
+  retained window; deferred expert rows remain fail-closed and are not counted
+  as trades.
+- No code or runtime policy was changed by this recheck. The remaining
+  blockers are still the negative fee-after economics, incomplete provenance
+  on part of the native label stream, and intermittent model/path reliability;
+  none justifies lowering the entry or risk contracts.
+- The validated `services/data_service.py` hash matches the remote application
+  exactly: `918613a008a88ffbb146853dc4ae3a0a470a3c9a6c3d956dad0b401f0cb169a6`.
+  The owned source, regression tests and this checkpoint are committed locally.
+  Two `git push origin main` attempts failed because the connection to
+  `github.com:443` failed/reset; do not redeploy for this transport failure.
+  Next Git action is to verify `origin/main` and retry the push when network
+  access is available.

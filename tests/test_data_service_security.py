@@ -13,6 +13,7 @@ from core.feature_availability import (
     COMPONENT_AVAILABILITY_VERSION,
     ObservedKlines,
 )
+from core.market_facts import MARKET_SOURCE_CONSISTENCY_VERSION
 from data_feed.feature_vector import build_feature_vector
 from services import data_service as data_service_module
 from services.data_service import DataService, _merge_late_native_derivatives_facts
@@ -2269,6 +2270,49 @@ async def test_blocking_ticker_refresh_keeps_rest_as_primary_over_fresh_ws_cache
     ]
 
 
+@pytest.mark.asyncio
+async def test_blocking_ticker_refresh_excludes_stale_ws_comparison_source() -> None:
+    service = _service()
+    rest_timestamp_ms = int(time.time() * 1000)
+
+    class FakeWsClient:
+        latest_tickers = {
+            "PROS/USDT": {
+                "symbol": "PROS/USDT",
+                "last_price": 0.3902,
+                "bid": 0.3901,
+                "ask": 0.3903,
+                "high_24h": 0.4000,
+                "low_24h": 0.3800,
+                "timestamp": rest_timestamp_ms - 5_000,
+                "source": "websocket",
+            }
+        }
+
+    class FakeRestClient:
+        async def fetch_ticker(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "last": 0.5666,
+                "bid": 0.5665,
+                "ask": 0.5667,
+                "high": 0.5700,
+                "low": 0.5500,
+                "baseVolume": 1234,
+                "timestamp": rest_timestamp_ms,
+                "info": {"instId": "PROS-USDT-SWAP"},
+            }
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+
+    snapshot = await service._get_ticker_snapshot("PROS/USDT")
+
+    assert snapshot["source"] == "rest"
+    assert [item["source"] for item in snapshot["market_source_snapshots"]] == [
+        "rest",
+    ]
+
+
 def test_last_trade_outside_current_book_is_not_cache_corruption() -> None:
     service = _service()
 
@@ -3786,6 +3830,7 @@ async def test_candidate_indicator_prewarm_rejects_unobserved_source_delivery() 
 @pytest.mark.asyncio
 async def test_latest_market_fact_keeps_valid_ticker_facts_when_derivatives_are_empty() -> None:
     service = _service()
+    derivatives_calls = 0
     timestamp = 1_783_990_800_000
     spec = {
         "instId": "BTC-USDT-SWAP",
@@ -3852,6 +3897,8 @@ async def test_latest_market_fact_keeps_valid_ticker_facts_when_derivatives_are_
         return dict(ticker)
 
     async def derivatives_snapshot(_symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal derivatives_calls
+        derivatives_calls += 1
         return {
             "orderbook_bid_depth": 0.0,
             "orderbook_ask_depth": 0.0,
@@ -3874,6 +3921,79 @@ async def test_latest_market_fact_keeps_valid_ticker_facts_when_derivatives_are_
     assert fact["prices"]["index"] == pytest.approx(100.0)
     assert fact["stale"] is False
     assert fact["quality"]["status"] == "clean"
+    assert derivatives_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_latest_market_fact_refreshes_clean_cache_without_native_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    ticker_calls: list[bool] = []
+    derivatives_calls = 0
+
+    async def ticker_snapshot(
+        _symbol: str,
+        *,
+        block_on_remote: bool,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        ticker_calls.append(block_on_remote)
+        return {
+            "source": "rest" if block_on_remote else "websocket",
+            "native_consistency_bars_1m": (
+                [[1_800_000_000_000, 99.0, 101.0, 98.0, 100.0, 10.0]]
+                if block_on_remote
+                else []
+            ),
+        }
+
+    async def derivatives_snapshot(
+        _symbol: str,
+        *,
+        block_on_remote: bool,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal derivatives_calls
+        assert block_on_remote is True
+        derivatives_calls += 1
+        return {}
+
+    clean_consistency = {
+        "version": MARKET_SOURCE_CONSISTENCY_VERSION,
+        "status": "clean",
+        "reasons": [],
+        "assertions": {
+            "native_identity_verified": True,
+            "executable_quotes_verified": True,
+            "tick_alignment_verified": True,
+            "reference_prices_verified": True,
+            "market_continuity_verified": True,
+        },
+    }
+    service._get_ticker_snapshot = ticker_snapshot  # type: ignore[method-assign]
+    service._get_derivatives_snapshot = derivatives_snapshot  # type: ignore[method-assign]
+    service._attach_market_source_consistency = (  # type: ignore[method-assign]
+        lambda _symbol, ticker, _derivatives: {
+            **ticker,
+            "market_source_consistency": clean_consistency,
+        }
+    )
+    monkeypatch.setattr(
+        data_service_module,
+        "build_market_fact",
+        lambda symbol, snapshot, **_kwargs: {
+            "symbol": symbol,
+            "source": snapshot["source"],
+            "quality": {"status": "clean", "reasons": []},
+        },
+    )
+
+    fact = await service.get_latest_market_fact("BTC/USDT")
+
+    assert ticker_calls == [False, True]
+    assert derivatives_calls == 1
+    assert fact["source"] == "rest"
 
 
 @pytest.mark.asyncio
