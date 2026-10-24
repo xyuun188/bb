@@ -4280,16 +4280,20 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   endpoints unavailable, so restarting would violate the preflight contract
   and would not improve entry eligibility. The preflight also confirms
   paper mode, live routing disabled, no local/OKX positions or orders needing
-  repair, and no protection mutation. Explicit isolated commit/push and `bb`
-  memory retention remain pending.
+  repair, and no protection mutation. Commit `89ed1b3` was pushed to
+  `origin/main`; a concise project-memory retention was accepted by the `bb`
+  Hindsight bank. The service process has not loaded the uploaded code because
+  it has not been restarted.
 - Gate status is unchanged: G0 passed; G1 attribution audit passed with
   negative measured economics; G2 **BLOCKED**; G3 **NOT PASSED**; G4, G5 and
   G6 pending. Five stage gates remain incomplete for the profitability
   objective. No claim of profitability or positive-profit guarantee is
   supported.
-- Next actions: perform staged source upload without restart, verify exact
-  remote hashes and the focused remote suite; then decide whether a paper-only
-  restart is justified for collecting subsequent G2 evidence. Separately
-  trace and repair only reproducible native path/quote receipt defects, keep
-  the negative Ridge family rejected, and register a materially new
-  development protocol only after enough clean chronological coverage exists.
+- Next actions: keep the existing paper service and live shutdown state
+  unchanged while the four Phase 3 quant child endpoints are unavailable. Once
+  the preflight blockers clear, verify paper-only runtime state and then
+  consider a paper-only restart to load the verified request-lane patch.
+  Separately trace and repair only reproducible native path/quote receipt
+  defects, keep the negative Ridge family rejected, and register a materially
+  new development protocol only after enough clean chronological coverage
+  exists.
