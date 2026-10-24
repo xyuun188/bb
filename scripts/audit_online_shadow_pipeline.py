@@ -463,6 +463,10 @@ async def main():
         key: status.get(key) for key in (
             "mode", "running", "paused", "heartbeat_at", "last_round_error",
             "market_last_error", "position_last_error",
+            "market_current_stage", "market_round_active",
+            "last_market_round_started_at", "last_market_round_finished_at",
+            "market_stage_durations", "last_market_candidate_funnel",
+            "last_market_round_summary", "ws_stats", "data_service_runtime",
             "last_position_price_refresh_diagnostics", "shadow_backtest_maintenance",
         )
     }

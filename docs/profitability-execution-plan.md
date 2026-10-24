@@ -2363,3 +2363,35 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   then run the frozen cost-aware development ledger on native fee-after
   groups only. Do not mix the historical rows, tune on the inspected window,
   or manufacture orders.
+
+### Post-Repair Route Diagnostic (2026-10-24 08:18 Asia/Shanghai)
+
+- The bounded runtime projection now includes the persisted WebSocket and
+  native-cache diagnostics. At `2026-10-24T00:17:50Z` UTC the connection was
+  healthy with no reconnects, `1,131,819` messages received, `1,992/1,992`
+  subscription acknowledgements, and `498/498` message-seen coverage for each
+  of `books5`, `mark-price`, `index-tickers`, and `tickers`.
+- The previously failing PEPE route is currently healthy: the native cache
+  diagnostic shows executable book, mark and index facts from
+  `okx_ws_public`, with the index fact on `PEPE-USDT` about 14 seconds old.
+  The latest market round had `11/11` valid feature snapshots and no market
+  feature failures. The historical invalid PEPE rows in the 30-minute frozen
+  sample are therefore retained as old quarantined observations, not evidence
+  that the current stream repair failed.
+- The current market funnel remains intentionally conservative: four ranked
+  candidates were evaluated, but `rank_tradable_candidates=0` because the
+  existing notional, ADX, volatility and 24-hour change quality contracts
+  rejected them. This is an evidence/risk result, not an exchange execution
+  failure; no threshold, leverage, sizing, model permission or risk veto was
+  changed.
+- Shadow maintenance is currently succeeding (`last_error=null`, latest
+  successful pass recorded) although its cumulative failure counter still
+  includes earlier timeout/quarantine attempts. No current service error,
+  dropped sample, order or protection mutation was observed.
+- G2 remains **BLOCKED** until a new, mature, preregistered clean window
+  excludes the old missing-index snapshots. G3-G6 remain pending; the native
+  fee-after sample is evidence for research preparation only and has not
+  demonstrated positive net returns. Exact next action: let the repaired
+  stream produce a full independent window, then re-run the frozen-feature,
+  entry-gate and native-label audits before any candidate research or
+  permission change.
