@@ -4200,3 +4200,16 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   existing quality and risk gates fixed. Start G4 only if development
   evidence first passes; otherwise retain the failed result and continue
   research without promoting or forcing trades.
+
+### Entry Contract Confirmation (2026-10-25 03:49 Asia/Shanghai)
+
+- A second bounded read-only entry-contract report through
+  `2026-10-24T19:49:29Z` confirmed `can_open_new_entries=true`,
+  `paper_entry_requires_historical_fee_after_quality_permission=true`,
+  zero contract violations and zero executed entries in the latest
+  30-minute window. The paper position list is empty.
+- The latest decisions (`694226-694255`) remain `hold`; no order was created
+  in that window. Older rejected order rows (decision IDs around `688243-688666`,
+  2026-10-22 to 2026-10-23) are historical records and are not the cause of
+  the current no-entry interval. Do not conflate those past exchange outcomes
+  with today's pre-entry quality veto.
