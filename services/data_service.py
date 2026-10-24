@@ -376,7 +376,7 @@ class DataService:
         self._ticker_persist_dropped_count = 0
         self._native_consistency_bars_cache: dict[str, tuple[float, list[Any]]] = {}
         self._native_consistency_bars_tasks: dict[
-            tuple[str, int, int], asyncio.Task[list[Any]]
+            tuple[str, int, int, bool], asyncio.Task[list[Any]]
         ] = {}
         self._native_derivatives_cache_diagnostics: deque[dict[str, Any]] = deque(
             maxlen=64
@@ -1471,6 +1471,7 @@ class DataService:
         source_snapshots: list[dict[str, Any]],
         *,
         wait_for_completion: bool = True,
+        include_result_candle: bool = False,
     ) -> list[Any]:
         normalized = self._normalize_symbols([symbol])[0]
         now = asyncio.get_running_loop().time()
@@ -1545,7 +1546,12 @@ class DataService:
         if not callable(fetcher):
             return []
 
-        task_key = (normalized, required_first_open, required_last_open)
+        task_key = (
+            normalized,
+            required_first_open,
+            required_last_open,
+            bool(include_result_candle),
+        )
         existing = tasks.get(task_key)
         if existing is not None and not existing.done():
             if not wait_for_completion:
@@ -1585,7 +1591,14 @@ class DataService:
                             normalized,
                             timeframe="1m",
                             limit=limit,
-                            end_timestamp_ms=required_last_open,
+                            # The general OHLCV adapter uses OKX's exclusive
+                            # `after` cursor directly. Include the last candle
+                            # by anchoring one minute beyond its open time.
+                            end_timestamp_ms=(
+                                required_last_open + minute_ms
+                                if include_result_candle
+                                else required_last_open
+                            ),
                         )
                     except TypeError as exc:
                         if "end_timestamp_ms" not in safe_error_text(exc):
@@ -2601,51 +2614,13 @@ class DataService:
         entry_fact: dict[str, Any],
         result_fact: dict[str, Any],
     ) -> dict[str, Any]:
-        entry_ms = int(entry_fact.get("source_timestamp_ms") or 0)
-        result_ms = int(result_fact.get("source_timestamp_ms") or 0)
-        minute_ms = 60_000
-        entry_open_ms = entry_ms - entry_ms % minute_ms if entry_ms > 0 else 0
-        result_open_ms = result_ms - result_ms % minute_ms if result_ms > 0 else 0
-        elapsed_minutes = (
-            max((result_open_ms - entry_open_ms) // minute_ms, 0) + 1
-            if entry_ms > 0 and result_ms >= entry_ms
-            else 1
+        symbol = str(entry_fact.get("symbol") or "")
+        rows = await self._fetch_native_consistency_bars(
+            symbol,
+            [entry_fact, result_fact],
+            wait_for_completion=True,
+            include_result_candle=True,
         )
-        # OKX's public candle API caps a single response; this is an exchange boundary,
-        # while the requested window is derived from the actual fact timestamps.
-        limit = min(elapsed_minutes + 2, 300)
-        result_open_ms = result_ms - result_ms % 60_000 if result_ms > 0 else 0
-        try:
-            symbol = str(entry_fact.get("symbol") or "")
-            isolated_fetcher = getattr(
-                self.rest_client,
-                "fetch_native_consistency_ohlcv",
-                None,
-            )
-            if callable(isolated_fetcher):
-                rows = await isolated_fetcher(
-                    symbol,
-                    limit=limit,
-                    end_timestamp_ms=result_open_ms if result_open_ms > 0 else None,
-                )
-            else:
-                rows = await self.rest_client.fetch_ohlcv(
-                    symbol,
-                    timeframe="1m",
-                    limit=limit,
-                    # OKX after cursor is exclusive of the supplied minute. Move
-                    # one minute forward so the result candle is included.
-                    end_timestamp_ms=(result_open_ms + 60_000)
-                    if result_open_ms > 0
-                    else None,
-                )
-        except Exception as exc:
-            logger.warning(
-                "OKX native 1m path unavailable for shadow outcome",
-                symbol=entry_fact.get("symbol"),
-                error=safe_error_text(exc),
-            )
-            rows = []
         return verify_native_market_fact_path(entry_fact, result_fact, rows)
 
     async def get_historical_shadow_market_path(

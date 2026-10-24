@@ -1300,6 +1300,27 @@ class ShadowBacktestService:
                     price_path = path_cache.get(cache_key) or verify_market_fact_path(
                         entry_fact, result_fact, []
                     )
+                    label_timing = shadow_label_timing(
+                        {"result_fact": result_fact}, getattr(row, "due_at", None)
+                    )
+                    path_reasons = set(price_path.get("reasons") or [])
+                    if (
+                        not label_timing["reasons"]
+                        and self.price_path_provider is not None
+                        and path_reasons.intersection(
+                            {
+                                "one_minute_price_path_incomplete",
+                                "one_minute_price_path_missing",
+                            }
+                        )
+                    ):
+                        logger.info(
+                            "shadow native price path incomplete; keeping sample pending",
+                            symbol=_symbol,
+                            shadow_backtest_id=row_id,
+                            bar_count=price_path.get("bar_count"),
+                        )
+                        continue
                     market_contract = build_shadow_market_fact_contract(
                         entry_fact,
                         result_fact,

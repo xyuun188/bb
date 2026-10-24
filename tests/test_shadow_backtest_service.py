@@ -708,8 +708,13 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
             horizon_minutes=10,
             status="pending",
             note="",
-            feature_snapshot={},
-            due_at=datetime.now(UTC) - timedelta(seconds=1),
+            feature_snapshot={
+                "market_fact": _market_fact(
+                    "BTC/USDT", 100.0, _ENTRY_TIMESTAMP_MS,
+                ),
+            },
+            due_at=datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
+            - timedelta(seconds=1),
         )
     ]
 
@@ -729,12 +734,29 @@ async def test_shadow_backtest_price_collection_does_not_hold_database_session(
         assert TrackingSessionCtx.active == 0
         return 101.0
 
+    async def latest_fact(symbol: str) -> dict[str, Any]:
+        assert TrackingSessionCtx.active == 0
+        return _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS)
+
+    async def price_path(
+        entry: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert TrackingSessionCtx.active == 0
+        bars = [
+            [stamp, 100.0, 102.0, 99.0, 101.0, 1.0]
+            for stamp in range(_ENTRY_TIMESTAMP_MS, _RESULT_TIMESTAMP_MS + 1, 60_000)
+        ]
+        return verify_market_fact_path(entry, result, bars)
+
     service = ShadowBacktestService(
         latest_price_provider=latest,
         symbol_normalizer=lambda symbol: str(symbol or "").upper(),
         float_parser=_float,
         session_factory=TrackingSessionCtx,
         repository_factory=lambda _session: repo,
+        latest_market_fact_provider=latest_fact,
+        price_path_provider=price_path,
     )
 
     assert await service.update_due() == 1
@@ -1246,7 +1268,7 @@ async def test_unavailable_historical_rows_yield_queue_capacity_until_cooldown_e
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_path_timeout_falls_back_to_endpoint_prices(
+async def test_shadow_backtest_path_timeout_keeps_row_pending_for_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _FakeRepo()
@@ -1278,11 +1300,68 @@ async def test_shadow_backtest_path_timeout_falls_back_to_endpoint_prices(
     )
     service.price_path_provider = slow_path
 
+    assert await service.update_due() == 0
+    assert row.status == "pending"
+    assert repo.completed == []
+
+    result_fact = _market_fact(row.symbol, 101.0, _RESULT_TIMESTAMP_MS)
+    first_open = _ENTRY_TIMESTAMP_MS - _ENTRY_TIMESTAMP_MS % 60_000
+    last_open = _RESULT_TIMESTAMP_MS - _RESULT_TIMESTAMP_MS % 60_000
+
+    async def recovered_path(
+        entry: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        bars = [
+            [stamp, 100.0, 102.0, 99.0, 101.0, 1.0]
+            for stamp in range(first_open, last_open + 60_000, 60_000)
+        ]
+        return verify_market_fact_path(entry, result, bars)
+
+    async def recovered_fact(_symbol: str) -> dict[str, Any]:
+        return result_fact
+
+    service.latest_market_fact_provider = recovered_fact
+    service.price_path_provider = recovered_path
+
     assert await service.update_due() == 1
     assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
     assert row.feature_snapshot["market_fact_contract"]["assertions"][
         "same_contract_price_path_verified"
-    ] is False
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_late_shadow_label_does_not_stay_pending_for_missing_path() -> None:
+    repo = _FakeRepo()
+    result_at = datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
+    row = SimpleNamespace(
+        id=97,
+        decision_id=997,
+        model_name="ensemble_trader",
+        symbol="ETH/USDT",
+        decision_action="long",
+        entry_price=100.0,
+        horizon_minutes=10,
+        status="pending",
+        note="",
+        due_at=result_at - timedelta(seconds=61),
+        feature_snapshot={},
+    )
+    repo.due_rows = [row]
+    service = _service(repo, latest_price=101.0)
+
+    async def missing_path(
+        entry: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return verify_market_fact_path(entry, result, [])
+
+    service.price_path_provider = missing_path
+
+    assert await service.update_due() == 1
+    assert row.status == "quarantined"
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
 
 
 @pytest.mark.asyncio
@@ -1448,10 +1527,10 @@ async def test_shadow_collection_stages_share_deadline_and_preserve_completed_wo
     service.price_path_provider = path
     started = asyncio.get_running_loop().time()
 
-    assert await asyncio.wait_for(service.update_due(), timeout=0.6) == 2
+    assert await asyncio.wait_for(service.update_due(), timeout=0.6) == 1
     assert asyncio.get_running_loop().time() - started < 0.6
     await asyncio.wait_for(path_cancelled.wait(), timeout=1.0)
-    assert len(repo.completed) == 2
+    assert len(repo.completed) == 1
     assert repo.due_rows[0].feature_snapshot["market_fact_contract"]["assertions"][
         "same_contract_price_path_verified"
     ] is True

@@ -2591,3 +2591,37 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   stays false. Continue accumulating fresh native fee-after groups and
   preregister the next development batch; do not convert this result or the
   positive historical baselines into an entry rule.
+
+### Native Path Retry Timing Guard (2026-10-24 13:08 Asia/Shanghai)
+
+- Recovery confirmed the active goal remains `ACTIVE`; branch `main` was at
+  `f6a047e` / `origin/main`, with only
+  `services/data_service.py`, `services/shadow_backtest_service.py`, and
+  `tests/test_shadow_backtest_service.py` dirty before this batch.
+- Root cause in the in-progress shadow retry change: an incomplete native
+  1m path was kept pending before checking whether its result fact was already
+  outside the one-minute label-source tolerance. A stale label could
+  therefore retry indefinitely instead of reaching the existing quarantine
+  flow.
+- Repair: only a timing-valid native label may remain pending for an
+  incomplete/missing 1m path. Late labels continue through the existing
+  completion/quarantine path and are not promoted into training. The native
+  path fetch now reuses the bounded per-symbol cache/single-flight helper and
+  explicitly anchors the result candle for adapters whose `after` cursor is
+  exclusive.
+- Added a regression for late labels with a missing path and corrected the
+  existing session-boundary fixture to use consistent fixed source clocks.
+  Focused local suite `tests/test_shadow_backtest_service.py` plus
+  `tests/test_data_service_security.py`: `143 passed`. Changed-file Ruff,
+  compileall and `git diff --check` passed.
+- This is a settlement/data-pipeline repair only. It does not create
+  executable signals, permit entries, or show profitability. G1 remains
+  attribution-only with negative economics; G2 remains **BLOCKED**; G3-G6
+  remain pending; live trading remains inactive.
+- Online state has not yet been changed or rechecked in this batch. Next:
+  targeted upload only of the two services and shadow regression test with
+  restart skipped; verify remote source hashes and run the same bounded
+  regression remotely. Only then restart `bb-paper-trading.service` (not
+  Dashboard, tunnels, positions or protections), verify service health and
+  paper mode, and collect fresh native path/fee-after evidence. Do not
+  authorize entries from these pipeline fixes.
