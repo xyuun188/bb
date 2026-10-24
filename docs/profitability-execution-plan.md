@@ -3269,3 +3269,296 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   groups. G2 remains **BLOCKED** and G3-G6 remain pending. Continue collecting
   clean native labels and do not enable entries merely because throughput
   improved.
+
+### Fresh Online Entry And Queue Audit (2026-10-24 19:35 Asia/Shanghai)
+
+- Two bounded read-only online audits completed at approximately
+  `2026-10-24T11:35Z`. The paper runtime was active and unpaused, with no
+  runtime, market or position-loop error. In the preceding three hours,
+  `394/394` market decisions were `hold` and none was executed; the bounded
+  OKX position-history query found no entry lifecycle in the preceding six
+  hours. This is not evidence of an exchange order rejection.
+- The last 60 decisions were all classified `no_candidate`. A representative
+  complete analysis was held because direction support lacked positive
+  fee-after expected return, objective net, quantitative evidence and a
+  prediction horizon; quality-observation loss probability was also too high.
+  Account-level entry availability was not reported as the blocker in this
+  audit. Feature availability was sealed and clean for `59/60`; one row had a
+  missing/stale technical availability contract.
+- Model authorization remains intentionally fail-closed. Local ML's
+  authoritative executed-trade evidence is `n=267`, mean fee-after return
+  `-0.303832%`, lower bound `-0.431590%`, and PF `0.549713`; execution
+  permission is false. Server-profit, time-series and sentiment sources each
+  have zero qualifying fee-after samples. The latest artifact is still
+  `learning_only` / degraded with influence disabled. Recent model training
+  uses shadow data (`trade=0` in its sample cursor), so it has not replaced
+  the negative authoritative execution evidence.
+- The repaired settlement stream is progressing: the preceding six-hour
+  bounded projection contained `528` native executable, fee-after-complete
+  rows across `388` decision groups and all four horizons; the newest native
+  update was `2026-10-24T11:34:25Z`. In the preceding five minutes,
+  `28` rows completed and `10` were quarantined. The 200-row lineage sample
+  remained `200/200` valid. At audit time, `10` pending rows were due across
+  horizons, most just reaching their scheduled time; the much larger pending
+  totals include labels not yet mature and must not be described as overdue.
+- Data-quality quarantine remains material: recent causes include invalid
+  native market facts, missing/unverified historical label availability,
+  absent shadow-label contracts, and source-consistency/path disagreements.
+  No quarantined or historical-only rows were counted as native training
+  evidence or modified by these audits.
+- Acceptance remains G1 passed as negative attribution only, G2 **BLOCKED**,
+  and G3-G6 not passed. Five gates remain incomplete: G2, G3, G4, G5 and G6.
+  The immediate entry blocker is missing/insufficient predictive evidence and
+  failed historical fee-after quality, not an account-wide open switch or
+  exchange rejection. This explains no new positions; it does not establish
+  why any future strategy would profit.
+- Next development-only run preregistration: identity
+  `horizon-current-v1-20261024T113500Z`, cutoff-exclusive
+  `2026-10-24T11:35:00Z`, six-hour window, maximum 1,000 decision groups.
+  Freeze source to completed paper rows with native executable 1m paths and
+  `fee_after_complete=true`. Keep the previously preregistered v1 research
+  family unchanged: common 5/15/60/240-minute groups; existing-vs-market-only
+  feature policies; Ridge alpha `1/10/100`; net thresholds `0/0.05/0.1%`;
+  purged chronological inner/outer folds; minimum 16 selected rows; positive
+  fee-after mean and lower bound, PF above one, and positive means in both
+  inner folds. This is development, not an exam or promotion. Retain the
+  existing resource budget (one read-only DB connection, 15-second statement
+  timeout, 25% CPU, 1 GiB memory, 300-second runtime); no artifact, database
+  mutation, model permission, policy change, order or service restart.
+
+### Horizon-Current Development Recheck Result (2026-10-24 19:40 Asia/Shanghai)
+
+- The preregistered development-only run completed at
+  `2026-10-24T11:39:58Z` with the exact cutoff
+  `2026-10-24T11:35:00Z`. It read `528` native fee-after rows across
+  `388` decision groups: `127` x 5m, `133` x 15m, `134` x 60m and `134`
+  x 240m.
+- The common four-horizon group count was still `0`, so no purged nested
+  folds were estimable, no candidate was selected, and no artifact or model
+  permission was produced. The report status is
+  `insufficient_development_data`; `exam_labels_evaluated=false`,
+  `artifact_persisted=false`, `database_mutated=false`,
+  `promotion_authorized=false` and `orders_submitted=false`.
+- Development input SHA256:
+  `1433768634865c21066f3ecb2a2078132dda17e3e3e8fcb8e0f8f3c5042f7dc5`;
+  snapshot SHA256:
+  `8ce94558f09436da446538c786648b0b052d2dec59d6cb98021bbdbbb63325c8`.
+  Full aggregate report:
+  `data/profitability_remediation/online-horizon-development-v1-20261024T113500Z.json`.
+- This is insufficient data, not a candidate rejection and not an
+  independent exam result. G2 remains **BLOCKED** and G3-G6 remain pending.
+  The next investigation must explain the missing same-decision four-horizon
+  closure (including group identity, scheduling and quarantine causes) before
+  another identical development run is started.
+
+### Mature Horizon-Group Coverage Root Cause (2026-10-24 20:04 Asia/Shanghai)
+
+- Added the read-only bounded diagnostic
+  `scripts/audit_online_horizon_group_coverage.py` and regression
+  `tests/test_audit_online_horizon_group_coverage.py`. It uses one
+  repeatable-read/read-only DB transaction, a 10-second SQL timeout, a
+  12-hour lookback, current label version, four explicit horizons and at most
+  eight compact group examples. It does not fetch full feature snapshots or
+  mutate rows.
+- The online snapshot at `2026-10-24T12:03:57Z` found `1,051` market
+  decision groups older than 242 minutes in the 12-hour window. Each had all
+  four horizon rows present, so incomplete row creation is not the dominant
+  cause of zero nested-development coverage. However only `4/1,051` groups
+  had all four rows completed from the native executable 1m path with
+  `fee_after_complete=true`; at least one horizon failed that eligibility
+  contract for the other groups. The four fully eligible groups were created
+  around `2026-10-24T01:18Z-01:23Z` and their labels matured outside the
+  development run's six-hour `updated_at` window. Therefore the six-hour
+  run's `0` common groups is consistent with current source and cutoff rules,
+  not evidence that the research runner dropped complete rows.
+- A separate bounded sample of the latest 100 quarantine notes in the prior
+  three hours was dominated by native market-fact invalidity (`40`) and
+  historical-path provenance/label-availability failures (`48` across two
+  reason combinations). Other observed causes were source-consistency/path
+  disagreements (`5`), missing shadow-label contract (`3`), stale technical
+  availability (`1`), price-vs-indicator divergence (`1`), and missing or
+  ambiguous index-price availability (`2`). Historical-path rows are not
+  eligible substitutes for decision-time native executable evidence.
+- Local verification for the new diagnostic: compileall and Ruff passed;
+  focused related coverage tests passed. The audit was read-only and created
+  no online data changes. No trading rule, model artifact, threshold, entry
+  permission, order or service was changed.
+- This sharpens, but does not resolve, the original blocker: G1 remains
+  negative attribution only; G2 is **BLOCKED** by insufficient clean native
+  fee-after label quality; G3 has no estimable four-horizon nested candidate;
+  G4 has no frozen independent exam; G5 has no accepted candidate to take
+  through governed paper fills; G6 cannot pass. Five gates remain incomplete.
+- Next exact action: trace the top live quarantine reason
+  `native_market_fact_invalid` to its validation fields and the point-in-time
+  capture path, then separately inspect the five source-consistency/path
+  disagreements. Repair only a reproducible present-time defect; never
+  requalify already quarantined historical rows or loosen provenance and
+  fee-after gates. After a focused fix, verify on newly created samples, then
+  start a newly cutoff-bound development run only after its complete-group
+  coverage is sufficient.
+
+### Fresh Root-Cause And Coverage Recheck (2026-10-24 21:11 Asia/Shanghai)
+
+- Online service state was checked at `2026-10-24T13:09:40Z`: paper trading
+  and dashboard units were active, with zero service restarts; runtime mode
+  was `paper`, unpaused, with fresh heartbeat and no round/market/position
+  error. This verifies a running decision loop, not trading eligibility or
+  profitability.
+- The bounded 30-minute funnel at `2026-10-24T12:54:38Z` contained `79/79`
+  market decisions as `hold`; the latest 30 detailed decisions were `30/30`
+  `no_candidate`. All 30 had sealed, clean feature availability and required
+  derivatives routes completed. The representative blockers were missing
+  positive fee-after expected return, objective-net evidence, quantitative
+  evidence and forecast horizon, plus excessive observation loss probability.
+  This points to missing qualified signal/economics, not a stopped loop or
+  observed exchange order rejection.
+- The strategy/model permission evidence remains adverse: local ML has `267`
+  authoritative executed samples with mean fee-after return `-0.303832%`,
+  lower bound `-0.431590%`, and profit factor `0.549713`. Its execution
+  permission remains false. Other specialist models have zero qualifying
+  authoritative samples; current training attempts for their fee-after
+  objectives report `authoritative_execution_cost_distribution_unavailable`.
+  The recent local-model training cursor still uses shadow samples and zero
+  new trade samples; it does not supersede the negative executed evidence.
+- A new 12-hour, read-only coverage query at `2026-10-24T13:08:43Z` found
+  `1,036/1,036` mature groups had all four horizon rows present, but only
+  `4/1,036` had every 5/15/60/240-minute row completed from the native
+  executable path with fee-after costs complete. Per-horizon eligible rows
+  were 389 (5m), 385 (15m), 328 (60m), and 290 (240m); marginal row totals
+  are not common complete groups. Thus the stream is producing data, but
+  cross-horizon eligibility remains far too sparse for the preregistered
+  nested search. This confirms G3 was not merely waiting for missing row
+  creation.
+- A separate 30-minute reason-code projection at `2026-10-24T13:07:39Z`
+  found three decision groups / five rows with no 1m path and unreconciled
+  executable quote sources (quote spans observed at 2.7-50.7 seconds), and
+  one decision group / two rows with an incomplete path. The sampled
+  incomplete path had 300 bars and one missing minute; the missing minute
+  was the latest minute in the captured window. These are evidence-collection
+  defects or unavailable source windows to investigate, not grounds to
+  accept the quarantined labels. Historical OHLCV-only rows continue to lack
+  verified decision-time label availability and are not eligible substitutes.
+- Acceptance remains G1 passed only as negative attribution, G2 **BLOCKED**,
+  and G3-G6 not passed. Five evidence gates remain incomplete. The direct
+  reason for no new entries is that current decisions do not have an eligible
+  positive after-cost candidate; clearing the data-collection issues alone
+  will not make a candidate profitable.
+- Next exact action: instrument and trace native 1m fetch outcomes for newly
+  created decision IDs, distinguishing provider empty/timeout, background
+  queue saturation, cursor-window coverage and the expected open-minute gap.
+  Make a narrowly scoped collection repair only if it is reproducible, then
+  verify on fresh rows and recompute common four-horizon coverage. Keep model
+  influence, entry permissions, execution thresholds and risk limits
+  unchanged. Start the frozen development search only when sufficient common
+  eligible groups exist; do not claim a profit result or reuse inspected
+  observations as an independent exam.
+
+### Fresh Entry And Quarantine Recheck (2026-10-24 22:40 Asia/Shanghai)
+
+- The read-only entry recovery audit completed at
+  `2026-10-24T14:40:29Z`. The three-hour window contained `430/430` market
+  decisions as HOLD, with no executed decision. In the latest 80 decisions,
+  `42` were `no_candidate` and `38` were shadow-training selections; neither
+  category had entry permission granted. Feature availability was sealed on
+  `80/80` and clean on `79/80`; the one invalid row had a missing/stale
+  technical availability contract. Required derivatives routes completed on
+  the representative rows except isolated funding timeouts, not a broad
+  market-feed outage.
+- The immediate entry blocker is unchanged and directly observed:
+  representative shadow candidates lacked positive expected net after costs
+  and quantitative evidence, while the local ML execution gate remained
+  false. Its authoritative executed-trade evidence was `n=267`, mean
+  fee-after return `-0.303832%`, lower bound `-0.431590%`, and PF `0.549713`.
+  Server-profit, time-series and sentiment sources still had zero qualifying
+  authoritative fee-after samples. The latest artifact remained
+  `shadow` / `learning_only`, influence disabled, with training cursor
+  `trade=0`; the latest local training check reported `new_sample_count=215`
+  but `not_due`. Those shadow rows do not replace executed-trade evidence.
+  This is a fail-closed strategy/economics decision, not an observed exchange
+  rejection or globally disabled paper entry switch.
+- The bounded 12-hour per-horizon audit completed at
+  `2026-10-24T14:37:51Z`: among `1,602` decision groups, `1,024` were mature
+  across all four horizons, but only `4` had all four horizons natively
+  executable and fee-after complete. Marginal eligible rows were `414/429/430/360`
+  for 5/15/60/240 minutes, respectively; those marginal counts are not
+  common groups. Most other mature groups include historical-only labels
+  whose point-in-time availability cannot be verified. Recent native
+  quarantines also include unreconciled ticker/orderbook quotes, missing or
+  incomplete 1-minute paths, and observed prices outside the captured path.
+  A sampled quote-source span reached `33.5s` while the validator requires
+  source reconciliation within `2s`; the requirement was not relaxed.
+- This separates two blockers that must not be conflated: insufficient
+  after-cost predictive evidence blocks entries, while incomplete provenance
+  and sparse common native labels block research and fresh validation. Fixing
+  label collection alone will not authorize a trade or prove profit.
+- Stage status is still G0 passed, G1 passed only as negative attribution,
+  G2 **BLOCKED**, and G3-G6 not passed: five gates remain incomplete. No
+  position, order, model permission, threshold, policy, or risk setting was
+  changed by these audits.
+- Immediate next action: use a bounded time/symbol-scoped journal projection
+  for the newly observed native 1-minute fetches to distinguish empty provider
+  responses, timeouts, cursor-window misses, and in-flight background fetches.
+  Then repair only a reproducible collection defect and verify on newly
+  created labels. Do not rerun broad status audits unchanged, count
+  shadow-training selections as trades, lower entry gates, or use inspected
+  outcomes as the independent exam.
+
+### Native Path Capacity Repair And Development Preregistration (2026-10-24 23:07 Asia/Shanghai)
+
+- Reproducible defect: the native executable 1-minute route had only two
+  isolated request slots while shadow maintenance could queue a four-horizon
+  path batch. In the preceding three-hour journal window this produced native
+  path `TimeoutError` events and repeated `shadow result price path batch
+  timed out` events. This was a bounded collection bottleneck, not a reason to
+  weaken the market-fact or entry-quality contract.
+- Repair: `PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY` was changed from `2`
+  to `4` in `data_feed/okx_rest_client.py`. The native route remains on its
+  own gate, separate from ticker/orderbook capacity; no quote-reconciliation
+  tolerance, fee model, prediction threshold, risk limit, leverage or trading
+  mode changed. Local focused tests passed (`155`), Ruff and compileall passed.
+  The changed source was uploaded alone, remote `py_compile` passed, remote
+  REST-client tests passed (`46`), and only `bb-paper-trading.service` was
+  restarted at `2026-10-24T15:04:03Z`; mode remained `paper`.
+- Fresh post-restart observation through `2026-10-24T15:07:08Z` showed no new
+  native path timeout or shadow path batch timeout in the last two minutes,
+  with `21` successful native consistency requests. The bounded 12-hour
+  coverage snapshot at `2026-10-24T15:07:07Z` showed `24` mature groups with
+  all four horizons qualified, up from `4` before the repair. This validates
+  collection progress only; it is not a profitability result.
+- Development-only run preregistration: identity
+  `horizon-current-v1-20261024T150800Z`; cutoff-exclusive UTC
+  `2026-10-24T15:08:00Z`; 12-hour lookback; maximum 1,000 decision groups.
+  Source is restricted to completed paper rows with native executable 1m path
+  and `fee_after_complete=true`. Candidate family remains unchanged:
+  common 5/15/60/240-minute groups; existing-vs-market-only feature policies;
+  Ridge alpha `1/10/100`; net thresholds `0/0.05/0.1%`; purged chronological
+  inner/outer folds; minimum selected rows `16`; positive fee-after mean and
+  lower bound, PF above one, and positive means in both inner folds. This is
+  development evidence only: no exam labels, artifact persistence, model
+  permission, database mutation, order or service restart.
+
+### Horizon Development Result After Capacity Repair (2026-10-24 23:10 Asia/Shanghai)
+
+- The preregistered development run completed at
+  `2026-10-24T15:10:46Z` using the exact cutoff
+  `2026-10-24T15:08:00Z`. It read `1,726` native fee-after rows across the
+  first `1,000` decision groups; per-horizon rows were `419/443/453/411`
+  for 5/15/60/240 minutes and `20` groups had all four horizons.
+- The run returned `insufficient_development_data` before candidate scoring:
+  the fixed three outer folds cannot meet the minimum primary training
+  coverage with only 20 common groups. No policy was selected and no
+  profitability metrics were produced. This is a sample-size result, not a
+  candidate rejection or an independent exam.
+- Input SHA256:
+  `9b3da3dfe2f958807fdee2d003d8ab2c1ed92684e4b5a7bb21470b5a31d25bfb`;
+  snapshot SHA256:
+  `41b80e89883e93398d75a591266e3a7f328f56119a9750a38a98d5830084e204`.
+  Report:
+  `data/profitability_remediation/online-horizon-development-v1-20261024T150800Z.json`.
+  Safety fields remained false for exam evaluation, artifact persistence,
+  database mutation, promotion and orders.
+- G2 remains **BLOCKED** because native and historical provenance defects still
+  exist; G3 remains pending because the preregistered folds are not yet
+  estimable; G4-G6 remain pending. The next development run must use a new
+  cutoff after enough clean common groups accumulate (at least the fixed-fold
+  minimum), not a replay of this same cutoff.

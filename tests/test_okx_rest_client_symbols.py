@@ -53,6 +53,11 @@ def test_native_consistency_route_uses_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._native_consistency_gate() is not client._public_market_gate()
     assert client._native_consistency_gate() is not client._public_market_optional_gate()
+    assert (
+        client._native_consistency_gate()._limit
+        == okx_rest_client_module.PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY
+        == 4
+    )
 
 
 def test_latency_diagnostics_cover_quote_and_native_path_routes() -> None:

@@ -84,9 +84,11 @@ PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
 )
 PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 1
 # Native one-minute candles are part of the executable-market-fact proof. They
-# must not queue behind the larger indicator K-line fan-out, while still being
-# bounded so a provider outage cannot consume all public-request capacity.
-PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 2
+# must not queue behind the larger indicator K-line fan-out. Four bounded slots
+# let a four-horizon shadow-maintenance batch drain without turning a provider
+# outage into an unbounded request fan-out; the separate gate still prevents
+# these reads from consuming ticker/orderbook capacity.
+PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 4
 # Bound the underlying SDK call as well as each caller's route wait.  A route
 # can still finish in the background after a 2-3 second caller deadline, but
 # a dead exchange connection must not occupy a shared request slot for a full
