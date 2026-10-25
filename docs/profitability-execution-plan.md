@@ -6167,3 +6167,17 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   authoritative evidence, with live and paper-entry permission still
   fail-closed. No placeholder, order, leverage, risk, or permission change is
   allowed.
+
+### Reference Route Post-Upload Probe (2026-10-25 19:57 Asia/Shanghai)
+
+- A read-only probe executed inside `/data/bb/app` using the uploaded source
+  queried the five symbols that failed the fresh boundary: GMT, RESOLV, UNI,
+  ATOM, and MAGIC. All five returned `reference_prices_data_available=true`,
+  positive mark/index prices, positive OKX source timestamps, and valid receipt
+  ordering. The project SDK also returned the expected batch `ts` fields.
+- This separates the old-process observation from the current source: the
+  running paper PID has not loaded the batched reference-market implementation,
+  while the same implementation is healthy in the remote runtime environment.
+  No clock, freshness, or feature-quality rule was weakened. The next reload
+  must be the existing governed stop/preflight/start sequence after a real
+  compatible quant artifact is present.
