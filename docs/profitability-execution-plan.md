@@ -6557,3 +6557,14 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   positive fee-after evidence. Leave this endpoint/model gate closed until
   valid mature inputs and an accepted candidate exist. This is a local
   producer-contract trace, not a new online status probe.
+
+### Maturity Boundary Clock Correction (2026-10-26 00:05 Asia/Shanghai)
+
+- Exact local clock recheck: `2026-10-26T00:05:18+08:00`. The sealed cohort's
+  240-minute maturity point is still in the future at
+  `2026-10-26T01:06:52+08:00` (`2026-10-25T17:06:52Z`). An earlier progress
+  message incorrectly inferred maturity from the calendar date alone.
+- No cohort-label query was launched at 00:05. Keep the audit pending until
+  the full timestamp has passed; then run it once with the registered
+  decision and maturity cutoffs. This correction supersedes any wording that
+  implies the cohort is already mature.
