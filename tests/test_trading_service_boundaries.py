@@ -1681,15 +1681,13 @@ async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -
         }
     )
 
-    assert hydrated == {"BTC/USDT": full}
-    assert diagnostics["status"] == "partial"
-    assert diagnostics["hydrated_count"] == 1
-    assert diagnostics["unavailable_symbols"] == [
-        {
-            "symbol": "ETH/USDT",
-            "reason": "candidate_indicator_prewarm_timeout",
-        }
-    ]
+    assert hydrated == {"BTC/USDT": full, "ETH/USDT": unavailable}
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["hydrated_count"] == 2
+    assert diagnostics["observation_only_symbols"] == ["ETH/USDT"]
+    assert diagnostics["unavailable_symbols"] == []
+    assert unavailable.market_data_observation_only is True
+    assert unavailable.indicator_hydration_pending is True
     assert all(kwargs["block_on_remote_indicators"] is False for _symbol, kwargs in calls)
     assert all(kwargs["prioritize_indicator_build"] is True for _symbol, kwargs in calls)
 
@@ -1720,13 +1718,10 @@ async def test_pending_indicator_snapshot_is_not_rebuilt_in_same_round() -> None
         }
     )
 
-    assert hydrated == {}
-    assert diagnostics["unavailable_symbols"] == [
-        {
-            "symbol": "BTC/USDT",
-            "reason": "indicator_snapshot_build_in_progress",
-        }
-    ]
+    assert list(hydrated) == ["BTC/USDT"]
+    assert hydrated["BTC/USDT"].market_data_observation_only is True
+    assert diagnostics["observation_only_symbols"] == ["BTC/USDT"]
+    assert diagnostics["unavailable_symbols"] == []
     assert calls == []
 
 
@@ -4884,11 +4879,11 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
         "paper",
     )
 
-    assert list(selected) == ["BTC/USDT"]
+    assert list(selected) == ["BTC/USDT", "ETH/USDT"]
     diagnostics = service._last_auto_feature_rank_diagnostics
-    assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 1
+    assert diagnostics["execution_availability"]["analysis_only_selected_count"] == 2
     assert diagnostics["execution_availability"]["execution_verified_selected_count"] == 0
-    assert diagnostics["execution_availability"]["analysis_only_fallback_truncated_count"] == 1
+    assert diagnostics["execution_availability"]["analysis_only_fallback_truncated_count"] == 0
     ranked = {item["symbol"]: item for item in diagnostics["ranked_symbol_sample"]}
     assert ranked["BTC/USDT"]["analysis_only"] is True
     assert ranked["BTC/USDT"]["execution_candidate_state"] == (
@@ -4904,7 +4899,7 @@ async def test_market_shortlist_keeps_temporary_private_outage_for_analysis_only
 
 
 @pytest.mark.asyncio
-async def test_market_shortlist_limits_unverified_tail_when_verified_candidates_exist() -> None:
+async def test_market_shortlist_keeps_bounded_unverified_tail_when_verified_candidates_exist() -> None:
     service = TradingService.__new__(TradingService)
     service._last_auto_feature_rank_diagnostics = {
         "selected": 5,
@@ -4938,12 +4933,18 @@ async def test_market_shortlist_limits_unverified_tail_when_verified_candidates_
     finally:
         monkeypatch.undo()
 
-    assert list(selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    assert list(selected) == [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "XRP/USDT",
+        "ADA/USDT",
+    ]
     diagnostics = service._last_auto_feature_rank_diagnostics["execution_availability"]
     assert diagnostics["execution_verified_selected_count"] == 2
-    assert diagnostics["analysis_only_selected_count"] == 1
-    assert diagnostics["analysis_only_fallback_limit"] == 1
-    assert diagnostics["analysis_only_fallback_truncated_count"] == 2
+    assert diagnostics["analysis_only_selected_count"] == 3
+    assert diagnostics["analysis_only_fallback_limit"] == 8
+    assert diagnostics["analysis_only_fallback_truncated_count"] == 0
 
 
 def test_hydration_rerank_does_not_restore_unverified_analysis_tail() -> None:
@@ -4977,11 +4978,11 @@ def test_hydration_rerank_does_not_restore_unverified_analysis_tail() -> None:
 
     selected = service._rank_auto_feature_vectors(features, limit=4)
 
-    assert list(selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    assert list(selected) == ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
     diagnostics = service._last_auto_feature_rank_diagnostics
     assert diagnostics["execution_verified_selected_count"] == 2
-    assert diagnostics["analysis_only_selected_symbols"] == ["SOL/USDT"]
-    assert diagnostics["analysis_only_fallback_truncated_count"] == 1
+    assert diagnostics["analysis_only_selected_symbols"] == ["SOL/USDT", "XRP/USDT"]
+    assert diagnostics["analysis_only_fallback_truncated_count"] == 0
 
 
 @pytest.mark.asyncio

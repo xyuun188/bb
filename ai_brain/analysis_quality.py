@@ -40,6 +40,8 @@ def analysis_quality_stage_status(quality: dict[str, Any]) -> str:
 
     if quality.get("analysis_complete") is True:
         return "completed"
+    if quality.get("observation_complete") is True:
+        return "completed"
     if analysis_quality_reason_code(quality) in {
         ReasonCode.MODEL_TIMEOUT,
         ReasonCode.MODEL_INVALID_OUTPUT,

@@ -59,10 +59,13 @@ def _apply_market_funding_quality_contract(
     quality_contract: dict[str, Any],
     context: dict[str, Any],
 ) -> None:
-    """Require a complete direction-aware funding projection for market analysis."""
+    """Require funding for entry while preserving paper observation completeness."""
 
     if context.get("review_positions"):
         return
+    paper_observation = (
+        str(context.get("execution_mode") or "").lower() == "paper"
+    )
     direction_competition = context.get("direction_competition")
     funding_projection = (
         direction_competition.get("funding_projection")
@@ -77,6 +80,7 @@ def _apply_market_funding_quality_contract(
                 "funding_evidence_status": "funding_evidence_unavailable",
                 "analysis_complete": False,
                 "decision_eligible": False,
+                "observation_complete": paper_observation,
                 "result": "unclear",
                 "reason_code": "funding_evidence_unavailable",
                 "reason": "资金费率、下一结算时间或数据时效证据不完整。",
@@ -84,6 +88,7 @@ def _apply_market_funding_quality_contract(
         )
         return
     quality_contract["funding_evidence_status"] = "complete"
+    quality_contract["observation_complete"] = True
 
 
 def _analysis_budget_snapshot(context: dict[str, Any]) -> dict[str, Any] | None:

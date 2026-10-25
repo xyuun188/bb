@@ -281,6 +281,14 @@ def main() -> None:
     parser.add_argument("--since", required=True)
     parser.add_argument("--cutoff", required=True)
     parser.add_argument("--limit", type=int, default=1200)
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Optional evidence path. Relative paths are rooted at the project "
+            "and must stay under data/profitability_remediation."
+        ),
+    )
     args = parser.parse_args()
 
     decision_since = _parse_cutoff(args.since)
@@ -291,12 +299,19 @@ def main() -> None:
     if not 1 <= row_limit <= 2500:
         parser.error("--limit must be between 1 and 2500")
     decision_stamp = decision_cutoff.strftime("%Y%m%dT%H%M%SZ")
-    result_path = (
-        ROOT
-        / "data"
-        / "profitability_remediation"
-        / f"online-decision-cohort-d{decision_stamp}.json"
-    )
+    evidence_root = (ROOT / "data" / "profitability_remediation").resolve()
+    if args.output:
+        result_path = Path(args.output)
+        if not result_path.is_absolute():
+            result_path = ROOT / result_path
+        result_path = result_path.resolve()
+        try:
+            result_path.relative_to(evidence_root)
+        except ValueError as exc:
+            parser.error("--output must stay under data/profitability_remediation")
+            raise AssertionError("unreachable") from exc
+    else:
+        result_path = evidence_root / f"online-decision-cohort-d{decision_stamp}.json"
     if result_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report: {result_path}")
 

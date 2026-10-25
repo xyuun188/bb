@@ -233,6 +233,28 @@ async def test_log_decision_marks_incomplete_analysis_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_log_decision_marks_paper_observation_complete_when_entry_evidence_is_missing() -> None:
+    repo = FakeDecisionRepo()
+    service = _service(FakeSession(), repo)
+    decision = _decision(Action.HOLD)
+    decision.raw_response["analysis_quality_contract"] = {
+        "analysis_complete": False,
+        "observation_complete": True,
+        "decision_eligible": False,
+        "reason_code": "funding_evidence_unavailable",
+        "reason": "Funding evidence is unavailable for this observation.",
+        "status_counts": {"completed": 4},
+    }
+
+    await service.log_decision(decision, is_paper=True)
+
+    machine = repo.logged[0]["raw_llm_response"]["decision_state_machine"]
+    assert machine["current_status"] == DecisionStageStatus.COMPLETED
+    assert machine["stages"][-1]["data"]["analysis_complete"] is False
+    assert machine["stages"][-1]["data"]["decision_eligible"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reason_code", "counts", "expected_status", "expected_reason_code"),
     [

@@ -37,6 +37,22 @@ def test_missing_market_funding_projection_blocks_analysis_quality() -> None:
     assert quality["funding_evidence_status"] == "funding_evidence_unavailable"
     assert quality["analysis_complete"] is False
     assert quality["decision_eligible"] is False
+    assert quality["observation_complete"] is False
+    assert quality["reason_code"] == "funding_evidence_unavailable"
+
+
+def test_missing_market_funding_projection_keeps_paper_observation_complete() -> None:
+    quality = _complete_quality_contract()
+
+    _apply_market_funding_quality_contract(
+        quality,
+        {"direction_competition": {}, "execution_mode": "paper"},
+    )
+
+    assert quality["funding_evidence_status"] == "funding_evidence_unavailable"
+    assert quality["analysis_complete"] is False
+    assert quality["observation_complete"] is True
+    assert quality["decision_eligible"] is False
     assert quality["reason_code"] == "funding_evidence_unavailable"
 
 

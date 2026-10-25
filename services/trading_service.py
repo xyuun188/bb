@@ -350,9 +350,13 @@ MARKET_ROUND_FINALIZATION_RESERVE_SECONDS = 15.0
 # and remain eligible through the defer tracker.
 MARKET_ROUND_SCHEDULER_MAX_SECONDS = 120.0
 MARKET_SYMBOL_TIMEOUT_RETRY_COOLDOWN_SECONDS = 90.0
-# Keep one unverified paper observation for learning without allowing a large
-# analysis-only tail to monopolize the single-worker model's request budget.
-MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT = 1
+# Keep a bounded observation-only tail while private capability probes warm.
+# This is a scheduling limit only: unverified candidates can be analyzed for
+# market coverage, but the final entry contract still requires fresh,
+# execution-verified instrument facts.  Eight observations fit the existing
+# per-round model budget without letting a cold capability cache starve the
+# rotating market universe.
+MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT = 8
 # Keep the single-flight queue above the 75-second entry handoff deadline.
 # The final execution boundary refreshes market/account facts before submit.
 # Entry risk preparation and exchange submission are independent per-symbol
@@ -6623,24 +6627,56 @@ class TradingService(ModelTrainingCoordinatorMixin):
         async def hydrate(symbol: str) -> tuple[str, Any | None, str, str]:
             existing = feature_vectors.get(symbol)
 
+            def observation_snapshot(candidate: Any, reason: str) -> Any | None:
+                """Keep a priced snapshot visible without making it executable."""
+
+                if not self._is_valid_feature_vector(candidate):
+                    return None
+                try:
+                    reasons = [
+                        str(item).strip()
+                        for item in (
+                            getattr(candidate, "market_data_observation_reasons", None) or []
+                        )
+                        if str(item).strip()
+                    ]
+                    normalized_reason = str(
+                        reason or "indicator_snapshot_unavailable"
+                    ).strip()
+                    if normalized_reason and normalized_reason not in reasons:
+                        reasons.append(normalized_reason)
+                    candidate.market_data_observation_only = True
+                    candidate.market_data_observation_reasons = reasons
+                    candidate.training_quality_reason = ";".join(
+                        f"market_data_quality:{item}" for item in reasons
+                    )
+                    candidate.indicator_hydration_pending = True
+                except (AttributeError, TypeError):
+                    return None
+                return candidate
+
             # The observation pool may contain vectors whose indicators are
             # still being built by the background prewarm worker.  Re-running
             # the full feature pipeline here for every such candidate just
-            # recreates the same 3-second timeout storm.  Leave those symbols
-            # explicitly pending so the worker can populate the cache and a
-            # later rotation can retry them; executable entry quality remains
-            # enforced by the final per-symbol refresh.
+            # recreates the same 3-second timeout storm. Keep a usable price
+            # snapshot as an explicit observation-only row while the worker
+            # populates the cache; executable entry quality remains enforced
+            # by the final per-symbol refresh and strict prefilter.
             if (
                 existing is not None
                 and getattr(existing, "indicator_snapshot_available", None) is False
             ):
+                reason = str(
+                    getattr(existing, "indicator_snapshot_reason", "")
+                    or "background_indicator_prewarm_pending"
+                )
+                observation = observation_snapshot(existing, reason)
+                if observation is not None:
+                    return symbol, observation, reason, "observation_only_snapshot"
                 return (
                     symbol,
                     None,
-                    str(
-                        getattr(existing, "indicator_snapshot_reason", "")
-                        or "background_indicator_prewarm_pending"
-                    ),
+                    reason,
                     "background_prewarm_pending",
                 )
 
@@ -6650,6 +6686,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 ):
                     return existing
                 return None
+
+            def existing_observation_snapshot(reason: str) -> Any | None:
+                return observation_snapshot(existing, reason)
 
             async with semaphore:
                 try:
@@ -6669,11 +6708,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     )
                 except TimeoutError:
                     fallback = existing_full_snapshot()
+                    if fallback is None:
+                        fallback = existing_observation_snapshot(
+                            "prewarmed_feature_refresh_timeout"
+                        )
                     return (
                         symbol,
                         fallback,
-                        "" if fallback is not None else "prewarmed_feature_refresh_timeout",
-                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                        ""
+                        if fallback is not None
+                        else "prewarmed_feature_refresh_timeout",
+                        (
+                            "existing_full_snapshot"
+                            if fallback is not None
+                            and bool(getattr(fallback, "indicator_snapshot_available", False))
+                            else "observation_only_snapshot"
+                            if fallback is not None
+                            else "unavailable"
+                        ),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -6682,24 +6734,56 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         error=safe_error_text(exc),
                     )
                     fallback = existing_full_snapshot()
+                    if fallback is None:
+                        fallback = existing_observation_snapshot(
+                            "prewarmed_feature_refresh_failed"
+                        )
                     return (
                         symbol,
                         fallback,
-                        "" if fallback is not None else "prewarmed_feature_refresh_failed",
-                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                        ""
+                        if fallback is not None
+                        else "prewarmed_feature_refresh_failed",
+                        (
+                            "existing_full_snapshot"
+                            if fallback is not None
+                            and bool(getattr(fallback, "indicator_snapshot_available", False))
+                            else "observation_only_snapshot"
+                            if fallback is not None
+                            else "unavailable"
+                        ),
                     )
                 if not self._is_valid_feature_vector(refreshed):
                     fallback = existing_full_snapshot()
+                    if fallback is None:
+                        fallback = existing_observation_snapshot("prewarmed_feature_invalid")
                     return (
                         symbol,
                         fallback,
                         "" if fallback is not None else "prewarmed_feature_invalid",
-                        "existing_full_snapshot" if fallback is not None else "unavailable",
+                        (
+                            "existing_full_snapshot"
+                            if fallback is not None
+                            and bool(getattr(fallback, "indicator_snapshot_available", False))
+                            else "observation_only_snapshot"
+                            if fallback is not None
+                            else "unavailable"
+                        ),
                     )
                 if not bool(getattr(refreshed, "indicator_snapshot_available", False)):
+                    reason = str(
+                        getattr(refreshed, "indicator_snapshot_reason", "")
+                        or "indicator_snapshot_unavailable"
+                    )
+                    # A complete prewarmed snapshot is higher quality than a
+                    # newly returned observation-only fallback. Keep it when
+                    # the refresh cannot provide indicators.
                     fallback = existing_full_snapshot()
                     if fallback is not None:
                         return symbol, fallback, "", "existing_full_snapshot"
+                    observation = observation_snapshot(refreshed, reason)
+                    if observation is not None:
+                        return symbol, observation, reason, "observation_only_snapshot"
                     return (
                         symbol,
                         None,
@@ -6724,13 +6808,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol, refreshed, reason, source in rows
             if refreshed is None and source == "background_prewarm_pending"
         ]
+        observation_only = [
+            symbol
+            for symbol, refreshed, _reason, source in rows
+            if refreshed is not None and source == "observation_only_snapshot"
+        ]
         unavailable = [
             {"symbol": symbol, "reason": reason}
             for symbol, refreshed, reason, source in rows
             if refreshed is None
         ]
         analysis_unavailable_count = sum(
-            source != "background_prewarm_pending"
+            source not in {"background_prewarm_pending", "observation_only_snapshot"}
             for _symbol, refreshed, _reason, source in rows
             if refreshed is None
         )
@@ -6752,6 +6841,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "unavailable_symbols": unavailable,
             "pending_count": len(pending),
             "pending_symbols": pending,
+            "observation_only_count": len(observation_only),
+            "observation_only_symbols": observation_only,
             "reused_existing_full_snapshot_count": sum(
                 source == "existing_full_snapshot" for _symbol, _refreshed, _reason, source in rows
             ),
@@ -8949,11 +9040,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if str(symbol) not in selected_order
             and candidate_state(str(symbol)) == "analysis_only_execution_unverified"
         ]
-        # Preserve one read-only exploration sample while prioritizing every
-        # currently executable symbol.  An unverified candidate cannot submit
-        # an order, so expanding this fallback to the whole shortlist only
-        # queues useless model calls behind the single-worker carrier and
-        # turns a capability probe delay into batch timeouts.
+        # Preserve a bounded read-only exploration tail while prioritizing
+        # every currently executable symbol.  An unverified candidate cannot
+        # submit an order; the cap only protects the single-worker carrier
+        # while avoiding a cold capability cache starving market coverage.
         unverified_limit = MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT
         selected_order.extend(unverified_order[:unverified_limit])
         selected_order = selected_order[:target]
@@ -10828,6 +10918,77 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     s: fv for s, fv in feature_vectors.items() if self._is_valid_feature_vector(fv)
                 }
 
+            recovery_sem = asyncio.Semaphore(2)
+
+            async def recover_feature_vector(sym: str) -> tuple[str, Any | None]:
+                async with recovery_sem:
+                    try:
+                        recovered = await asyncio.wait_for(
+                            self._get_feature_vector_snapshot(
+                                sym,
+                                wait_for_sentiment=False,
+                                block_on_remote_ticker=True,
+                                block_on_remote_indicators=False,
+                                block_on_remote_derivatives=False,
+                                allow_cached_indicator_build=True,
+                                allow_indicator_background_refresh=True,
+                                allow_derivatives_background_refresh=True,
+                                prioritize_native_market_data=True,
+                            ),
+                            timeout=max(
+                                1.0,
+                                float(AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS),
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "market feature recovery failed",
+                            symbol=sym,
+                            error=safe_error_text(exc),
+                        )
+                        return sym, None
+                    return (
+                        sym,
+                        recovered
+                        if self._is_valid_feature_vector(recovered)
+                        else None,
+                    )
+
+            async def recover_feature_rows(symbols: list[str]) -> dict[str, Any]:
+                if not symbols:
+                    return {}
+                recovered_rows = await asyncio.gather(
+                    *(recover_feature_vector(sym) for sym in symbols)
+                )
+                return {
+                    sym: fv
+                    for sym, fv in recovered_rows
+                    if fv is not None
+                }
+
+            if run_market_analysis and unavailable_market_features:
+                # A partial cache hit must not strand every cache miss until
+                # the next scheduler round. Recover a small rotating slice
+                # through the bounded native route while retaining the larger
+                # discovery pool for later rounds.
+                recovery_limit = min(
+                    len(unavailable_market_features),
+                    max(4, min(8, int(settings.auto_scan_symbol_limit or 8))),
+                )
+                recovery_symbols = unavailable_market_features[:recovery_limit]
+                recovered_features = await recover_feature_rows(recovery_symbols)
+                feature_vectors.update(recovered_features)
+                for recovered_symbol in recovered_features:
+                    self._market_defer_tracker().complete(recovered_symbol)
+                results["market_feature_recovery"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "attempted_count": len(recovery_symbols),
+                    "recovered_count": len(recovered_features),
+                    "symbols": recovery_symbols,
+                    "source": "bounded_native_market_rest_partial",
+                }
+
             if not feature_vectors:
                 # The websocket ticker stream is an optimization, not the
                 # market-analysis authority.  When it is disconnected or its
@@ -10843,50 +11004,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         max(4, min(8, int(settings.auto_scan_symbol_limit or 8))),
                     )
                     recovery_symbols = list(market_scan_symbols[:recovery_limit])
-                    recovery_sem = asyncio.Semaphore(2)
-
-                    async def recover_feature_vector(sym: str) -> tuple[str, Any | None]:
-                        async with recovery_sem:
-                            try:
-                                recovered = await asyncio.wait_for(
-                                    self._get_feature_vector_snapshot(
-                                        sym,
-                                        wait_for_sentiment=False,
-                                        block_on_remote_ticker=True,
-                                        block_on_remote_indicators=False,
-                                        block_on_remote_derivatives=False,
-                                        allow_cached_indicator_build=True,
-                                        allow_indicator_background_refresh=True,
-                                        allow_derivatives_background_refresh=True,
-                                        prioritize_native_market_data=True,
-                                    ),
-                                    timeout=max(
-                                        1.0,
-                                        float(AUTO_SCAN_FEATURE_FETCH_TIMEOUT_SECONDS),
-                                    ),
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "market feature recovery failed",
-                                    symbol=sym,
-                                    error=safe_error_text(exc),
-                                )
-                                return sym, None
-                            return (
-                                sym,
-                                recovered
-                                if self._is_valid_feature_vector(recovered)
-                                else None,
-                            )
-
-                    recovered_rows = await asyncio.gather(
-                        *(recover_feature_vector(sym) for sym in recovery_symbols)
-                    )
-                    feature_vectors = {
-                        sym: fv
-                        for sym, fv in recovered_rows
-                        if fv is not None
-                    }
+                    feature_vectors = await recover_feature_rows(recovery_symbols)
+                    for recovered_symbol in feature_vectors:
+                        self._market_defer_tracker().complete(recovered_symbol)
                     results["market_feature_recovery"] = {
                         "read_only": True,
                         "is_entry_gate": False,

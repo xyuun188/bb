@@ -6880,3 +6880,48 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - G2 therefore remains **IN PROGRESS / not promotable**; G3-G6 remain
   unpassed. The authoritative fee-after result is unchanged
   (`n=267`, mean `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`).
+
+### Market Analysis Throughput Repair Loaded And Verified (2026-10-26 03:56 Asia/Shanghai)
+
+- The previously prepared throughput patch was targeted-synced to
+  `/data/bb/app` with source-integrity verification for the six owned
+  source/test files. Local focused regression passed `403` tests; Ruff,
+  compileall and `git diff --check` passed. Remote focused regression passed
+  `36` persistence/quality/defer tests and `18` market-boundary tests.
+  A full remote boundary-file run was not counted as a pass because an
+  unrelated test attempted to clean a root-owned `/tmp/pytest-of-root` tree;
+  the affected market-boundary subset itself passed.
+- Only `bb-paper-trading.service` was restarted at
+  `2026-10-25T19:51:58Z`; it is active/running with `NRestarts=0`. Paper
+  control remains `mode=paper`, `paused=false`; live routing, permissions,
+  leverage, protections and orders were untouched.
+- The bounded pre-reload 15-minute coverage window
+  `[2026-10-25T19:36:26Z,2026-10-25T19:51:26Z)` recorded `30` completed
+  market decisions across `27` symbols, maximum inter-decision gap
+  `80.793s`, top-symbol count `2`, and zero completed/retry decisions inside
+  the fixed `600s` symbol cooldown. This is evidence that the throughput and
+  duplicate-analysis defect is materially improved; a fresh post-reload
+  window is still required before closing the runtime repair.
+- The repair remains observation-only for incomplete market facts. Final
+  funding, native execution, model, cost and risk gates remain fail-closed;
+  no profitability or entry authorization is implied by higher analysis
+  coverage.
+
+### Prospective Decision Cohort Final Seal (2026-10-26 03:56 Asia/Shanghai)
+
+- After the exclusive cutoff
+  `2026-10-25T19:06:53Z`, the decision-only seal was rerun once without
+  reading `ShadowBacktest` labels. The final immutable window contains
+  `398` decision snapshots (not the prematurely sealed `356`), with
+  `754` bounded candidates, no candidate-limit saturation, and ID fingerprint
+  `958170cc42dfa8cf0db69856db6809007c719ce141c4c3ba06d7646ba0d2c283`.
+- Evidence is saved at
+  `data/profitability_remediation/online-decision-cohort-d20261025T190653Z-final.json`.
+  The prior `...190653Z.json` (356 rows) and the mismatch report remain
+  preserved as invalid/technical history and must not be reused.
+- The final cohort's fixed maturity boundary remains
+  `2026-10-25T23:07:53Z` (`2026-10-26 07:07:53 Asia/Shanghai`). Only after
+  that exact time may the one bounded four-horizon G2 native
+  label/source/cost audit run with `--expected-decision-count 398`; until
+  then, no labels from this cohort may be read. G2 remains pending and
+  G3-G6 remain unpassed.
