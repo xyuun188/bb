@@ -5515,3 +5515,39 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   stopped-before-start preflight. Gate state remains G0 passed, G1 negative
   attribution only, G2 blocked, G3 without a qualifying candidate, G4/G5 not
   started, and G6 blocked.
+
+### Fresh v4 Boundary And Eligibility Recheck (2026-10-25 13:22 Asia/Shanghai)
+
+- A bounded entry recovery through `2026-10-25T05:14:36Z` found
+  `208/208` market decisions as `hold`, with zero order attempts, positions or
+  fills. There were `31` completed 60-minute shadow settlements, but recent
+  selected directions still had permission denied for non-positive expected
+  net return, excessive loss probability or missing quantitative evidence.
+  Local-ML authority remains false at `n=267`, mean `-0.303832%`, lower bound
+  `-0.431590%`, PF `0.549713`.
+- The fresh 90-minute feature-budget audit at
+  `2026-10-25T05:18:04Z` found decision snapshots `63/64` valid and training
+  snapshots `64/64` valid. Both sources had the v4-era availability contract,
+  frozen timestamps, original decision timestamps and zero payload
+  over-budget rows. The decision source had one isolated ZRO row with missing
+  or ambiguous index-price receipt/clock; the newest valid decision streak was
+  `25` rows across `25` symbols. Training snapshots had a `64`-row clean
+  streak across `16` symbols. This is progress toward G2, not yet the
+  predefined clean boundary or loaded-source verification.
+- A fresh authoritative trade-training eligibility audit at
+  `2026-10-25T05:21:33Z` again inspected `200` paper outcomes and found
+  `trainable_count=0`; all were excluded for
+  `feature_availability:feature_availability_contract_missing`. Their OKX
+  fee, slippage and funding facts remain present, but these historical
+  outcome snapshots predate the point-in-time contract. No backfill,
+  relabeling, order or permission change was made.
+- The quant API process is still the pre-existing PID from
+  `2026-10-23 12:36:25 CST`; the fail-closed liveness source is staged on the
+  model host but not loaded. The current process therefore still exposes the
+  old liveness response, while `/models/status` correctly rejects the
+  incompatible artifact. Do not treat the old response as readiness.
+- Gate state remains G0 passed; G1 negative attribution only; G2 blocked
+  pending a loaded-source clean boundary; G3 has no qualifying candidate;
+  G4/G5 are not started; G6 is blocked. The next measurable checkpoint is a
+  longer clean prospective v4 streak and a governed quant-service reload;
+  profitability still has no honest calendar completion date.
