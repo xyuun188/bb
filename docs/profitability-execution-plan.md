@@ -5340,6 +5340,33 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   interrupt the active service. These operational blockers prevent verifying
   the uploaded market-data code in the running process, but do not explain the
   negative economic permission that currently vetoes entries.
+- A direct read-only runtime status check during this continuation identified
+  why the child contracts are unavailable.
+  The quant API process is healthy and its downloaded/validated model inventory
+  is complete (`10` downloaded, `9` validated, validation/import/CUDA checks
+  all OK), but the current, challenger and rollback artifact pointers are
+  rejected because their embedded `profit_supervision_version` is incompatible
+  with the required v4 contract. The candidate pointer is not registered, so
+  the API correctly reports `model_bundle_available=false`,
+  `artifact_lifecycle=unregistered`, and no child endpoint as available.
+  This is a real artifact/data-contract gap; changing the pointer or relabeling
+  an old bundle would violate the supervision contract and was not done.
+- A bounded authoritative-trade eligibility audit at
+  `2026-10-25T04:31:01Z` inspected `200` paper outcomes. All `200` were
+  excluded and `trainable_count=0` for the same concrete reason:
+  `feature_availability:feature_availability_contract_missing`. The rows do
+  contain OKX fee, funding and slippage fields and already carry the required
+  v4 supervision version, but their original decision snapshots predate the
+  point-in-time availability contract. Consequently the v4 artifact cannot be
+  honestly retrained from those historical outcomes. This closes the loop
+  between the missing quant bundle and the G2 provenance blocker; it is not a
+  missing model-server process.
+- The safe next data action is therefore prospective capture under the current
+  availability contract, followed by a genuinely new governed paper/training
+  sample only after the relevant gates permit it. No historical backfill,
+  synthetic cost label, old-artifact relabel, order, service restart, or
+  permission change is authorized. G2 remains blocked, G3 remains not passed,
+  and G4-G6 remain unstarted/blocked.
 - Gate decision: G0 passed; G1 passed as negative authoritative attribution;
   G2 blocked pending loaded-source verification; G3 not passed (all completed
   preregistered candidate families so far rejected, including fixed 60-minute
@@ -5348,10 +5375,14 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   measurable next operational checkpoint, but G3 depends on finding a
   genuinely positive fee-after candidate, which cannot be guaranteed by
   waiting or by relaxing gates.
-- Next: resolve the paper-only reload readiness without interrupting the
-  active service or fabricating endpoint eligibility; once a governed reload
-  is available, collect the required fresh 30-decision/20-symbol zero
-  missing-book/mark/index boundary and verify the loaded source hash. In
-  parallel, do not resume model-family sweeps on inspected windows; register
-  only a materially new development question. Keep live disabled and all
-  profitability, quality and risk gates unchanged.
+- Next: do not relabel old pointers or repeat training while the authoritative
+  cost training set is empty. Keep the active paper service and live-disabled
+  state unchanged; do not restart through a blocked resume preflight. Continue
+  only with (a) prospective v4 availability capture and (b) a materially new,
+  preregistered G3 question on a new chronological development window, with
+  native fee-after labels and overlap-aware evaluation. Do not reopen the
+  rejected fixed-short hypothesis or sweep more model families on inspected
+  windows. If no candidate passes G3, do not open G4 or generate paper trades
+  to create training labels. After a legitimate G3/G4 pass, revisit governed
+  paper execution and the v4 bundle dependency with the now-current evidence.
+  Keep every profitability, quality and risk gate unchanged.
