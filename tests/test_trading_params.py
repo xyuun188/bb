@@ -27,7 +27,7 @@ def test_training_data_quality_uses_the_current_snapshot() -> None:
     assert training_data_quality._QUALITY_PARAMS == DEFAULT_TRADING_PARAMS.training_data_quality
     assert (
         training_data_quality.DATA_QUALITY_VERSION
-        == "2026-10-22.component-feature-availability.v8"
+        == "2026-10-24.component-feature-availability.v9"
     )
 
 

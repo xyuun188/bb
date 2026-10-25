@@ -307,7 +307,7 @@ def test_decision_completion_metadata_added_after_freeze_does_not_change_input_f
 
 
 def test_component_availability_contract_retires_earlier_training_versions() -> None:
-    assert DATA_QUALITY_VERSION == "2026-10-22.component-feature-availability.v8"
+    assert DATA_QUALITY_VERSION == "2026-10-24.component-feature-availability.v9"
     assert PROFIT_SUPERVISION_VERSION == (
         "2026-10-22.separated-profit-component-availability.v4"
     )
