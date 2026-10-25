@@ -5112,3 +5112,50 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   a materially new, cost-aware chronological development question is
   preregistered; and (4) preserve the negative profitability permission and
   live-disabled state.
+
+### Account-Fee Timeout Repair (2026-10-25 11:31 Asia/Shanghai)
+
+- A new bounded audit at `2026-10-25T03:17:56Z` inspected 64 market
+  decisions and 64 paper shadow-training snapshots. Decision availability was
+  `57/64` valid and training availability was `60/64` valid; all rows had the
+  v1 seal and stayed below the `98,304 B` frozen-input budget. The seven
+  invalid decisions included five account-fee receipt gaps, one timed-out
+  UNI reference-price fact, and one stale TRX technical contract. The newest
+  valid decision streak was only 13 rows, so the post-load G2 boundary is not
+  yet accepted.
+- The five account-fee gaps have a reproducible local cause. Journald records
+  `fetch market execution cost facts failed` with `TimeoutError` at
+  `2026-10-25T03:09:00.236254Z`, during a round whose public market request
+  queue was congested. The shared OKX connection was busy with public routes;
+  the 5-second private fee read timed out and the batch continued with empty
+  cost facts. This is an availability defect, not evidence that fee economics
+  were positive.
+- Repair in `services/trading_service.py` adds one bounded, isolated,
+  read-only `OKXExecutor` fallback after the shared fee read fails or returns
+  without an account-fee receipt. The fallback is closed in `finally`, never
+  submits orders, and still returns `{}` when it cannot obtain a receipt. It
+  does not widen the 65-second market freshness contract or alter any
+  profitability/risk gate.
+- Local verification passed the two new timeout/fail-closed regressions,
+  execution-cost tests (`10`), OKX receipt-clock tests (`12`), Ruff,
+  compileall and `git diff --check`. Targeted online sync uploaded only
+  `services/trading_service.py` and
+  `tests/test_trading_service_boundaries.py`; remote integrity was
+  `source-integrity-ok:2`, and the two focused remote tests passed
+  (`2` and `1` tests).
+- The long-running paper process has not loaded the repair. The read-only
+  paper-resume preflight at `2026-10-25T03:23:10Z` remains blocked because
+  `bb-paper-trading.service` is already active and the four Phase 3 quant
+  child endpoint contracts are unavailable. No restart was performed.
+- Entry and profitability remain unchanged: the fresh entry recovery through
+  `2026-10-25T03:17:58Z` found `427/427` market decisions as `hold`, with no
+  order attempts, positions or fills. The authoritative local-ML permission
+  is still false at `n=267` with fee-after mean `-0.303832%`, lower bound
+  `-0.431590%`, and PF `0.549713`; the shadow artifact remains
+  `shadow`/`degraded` with influence disabled. This repair reduces one
+  secondary data-quality failure but does not create a profitable candidate or
+  authorize entries.
+- Next action: obtain a clear paper-only reload path, load the repair, and
+  measure a fresh post-load availability boundary. Keep G3 model-family
+  sweeps stopped; G4-G6 remain unstarted until a genuinely positive,
+  cost-aware candidate exists.

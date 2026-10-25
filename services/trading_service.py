@@ -307,6 +307,7 @@ AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
 MARKET_SYMBOL_DISCOVERY_TIMEOUT_SECONDS = 8.0
 OPEN_POSITIONS_CONTEXT_TIMEOUT_SECONDS = 9.0
 MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS = 5.0
+MARKET_EXECUTION_COST_FACTS_FALLBACK_TIMEOUT_SECONDS = 12.0
 MARKET_SHADOW_SAMPLE_WRITE_TIMEOUT_SECONDS = 2.0
 MARKET_ANALYSIS_SELECTION_HISTORY_FEATURE_KEYS = (
     "current_price",
@@ -14676,18 +14677,75 @@ class TradingService(ModelTrainingCoordinatorMixin):
             timeout=MARKET_EXECUTION_COST_FACTS_TIMEOUT_SECONDS,
         )
 
+    async def _fresh_execution_cost_facts(self, mode: str) -> dict[str, Any]:
+        """Read account fee facts on an isolated connection after contention.
+
+        Public market fan-out can keep the long-lived executor busy long enough
+        to make a private fee request miss the round deadline.  A short-lived
+        read-only executor gives the fee snapshot an independent connection;
+        it never submits orders and is always closed before returning.
+        """
+
+        selected_mode = "live" if mode == "live" else "paper"
+        fallback = OKXExecutor(
+            mode=selected_mode,
+            load_markets_on_initialize=False,
+        )
+        try:
+            await fallback.initialize()
+            return await fallback.fetch_account_fee_snapshot()
+        finally:
+            try:
+                await fallback.shutdown()
+            except Exception as exc:
+                logger.debug(
+                    "isolated OKX fee executor shutdown failed",
+                    mode=selected_mode,
+                    error=safe_error_text(exc),
+                )
+
     async def _market_execution_cost_facts(self, mode: str) -> dict[str, Any]:
         """Read the same authoritative fee facts used by shadow evaluation."""
 
         try:
-            return await self._shadow_execution_cost_facts(mode)
+            facts = await self._shadow_execution_cost_facts(mode)
+            if isinstance(facts, dict) and facts.get("account_fee_received_at"):
+                return facts
+            raise RuntimeError("account_fee_receipt_missing")
         except Exception as exc:
             logger.warning(
                 "fetch market execution cost facts failed",
                 mode=mode,
                 error=safe_error_text(exc),
             )
-            return {}
+            try:
+                fallback = await asyncio.wait_for(
+                    self._fresh_execution_cost_facts(mode),
+                    timeout=MARKET_EXECUTION_COST_FACTS_FALLBACK_TIMEOUT_SECONDS,
+                )
+            except Exception as fallback_exc:
+                logger.warning(
+                    "isolated market execution cost facts fallback failed",
+                    mode=mode,
+                    original_error=safe_error_text(exc),
+                    error=safe_error_text(fallback_exc),
+                )
+                return {}
+            if not isinstance(fallback, dict) or not fallback.get(
+                "account_fee_received_at"
+            ):
+                logger.warning(
+                    "isolated market execution cost facts fallback incomplete",
+                    mode=mode,
+                    original_error=safe_error_text(exc),
+                )
+                return {}
+            logger.info(
+                "isolated market execution cost facts fallback succeeded",
+                mode=mode,
+                original_error=safe_error_text(exc),
+            )
+            return fallback
 
     async def _get_okx_available_balance_for_mode(self, mode: str) -> float | None:
         """Return the actual OKX free USDT balance used to cap new entries."""

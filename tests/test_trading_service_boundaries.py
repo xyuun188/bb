@@ -2159,6 +2159,76 @@ async def test_okx_executor_initialization_cancellation_does_not_publish_partial
 
 
 @pytest.mark.asyncio
+async def test_market_execution_cost_facts_use_isolated_read_only_fallback_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    primary_calls: list[str] = []
+
+    async def primary(_mode: str) -> dict[str, Any]:
+        primary_calls.append("primary")
+        raise TimeoutError("busy shared executor")
+
+    service._shadow_execution_cost_facts = primary  # type: ignore[method-assign]
+    lifecycle: list[str] = []
+
+    class IsolatedExecutor:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs == {"mode": "paper", "load_markets_on_initialize": False}
+            lifecycle.append("constructed")
+
+        async def initialize(self) -> None:
+            lifecycle.append("initialized")
+
+        async def fetch_account_fee_snapshot(self) -> dict[str, Any]:
+            lifecycle.append("fetched")
+            return {
+                "taker_fee_rate": 0.0004,
+                "account_fee_received_at": "2026-10-25T03:09:01+00:00",
+            }
+
+        async def shutdown(self) -> None:
+            lifecycle.append("shutdown")
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", IsolatedExecutor)
+
+    facts = await service._market_execution_cost_facts("paper")
+
+    assert facts["taker_fee_rate"] == pytest.approx(0.0004)
+    assert primary_calls == ["primary"]
+    assert lifecycle == ["constructed", "initialized", "fetched", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_market_execution_cost_facts_keep_fail_closed_when_fallback_has_no_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+
+    async def primary(_mode: str) -> dict[str, Any]:
+        raise TimeoutError("busy shared executor")
+
+    service._shadow_execution_cost_facts = primary  # type: ignore[method-assign]
+
+    class IncompleteExecutor:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def initialize(self) -> None:
+            return None
+
+        async def fetch_account_fee_snapshot(self) -> dict[str, Any]:
+            return {"taker_fee_rate": 0.0004}
+
+        async def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(trading_service, "OKXExecutor", IncompleteExecutor)
+
+    assert await service._market_execution_cost_facts("paper") == {}
+
+
+@pytest.mark.asyncio
 async def test_stale_entry_maintenance_runs_in_background_for_market_round() -> None:
     service = TradingService.__new__(TradingService)
     started = asyncio.Event()
