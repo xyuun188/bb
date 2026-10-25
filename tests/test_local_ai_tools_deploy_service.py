@@ -757,18 +757,11 @@ async def test_local_ai_tools_liveness_does_not_read_artifact_metadata(monkeypat
     assert liveness["ok"] is True
     assert liveness["service"] == "phase3_quant_api"
     assert liveness["port"] == 8101
-    assert liveness["model_bundle_available"] is True
-    assert liveness["status"] == "ready"
+    assert liveness["bundle_files_present"] is True
+    assert "model_bundle_available" not in liveness
+    assert liveness["status"] == "live"
     assert liveness["status_endpoint_uses_metadata_only"] is True
-    assert {
-        name: row["available"]
-        for name, row in liveness["child_endpoints"].items()
-    } == {
-        "profit_prediction": True,
-        "time_series_prediction": True,
-        "sentiment_analysis": True,
-        "exit_advice": True,
-    }
+    assert "child_endpoints" not in liveness
 
     payload = module.with_model_metadata(
         "profit_prediction",

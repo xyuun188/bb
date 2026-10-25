@@ -2982,7 +2982,10 @@ async def test_collect_platform_runtime_status_falls_back_to_liveness_when_statu
     }
     assert tools["available"] is True
     assert tools["service_available"] is True
-    assert tools["model_bundle_available"] is True
+    assert tools["model_bundle_available"] is False
+    assert tools["artifact_status"] == "unavailable"
+    assert tools["child_metadata_ready_count"] == 0
+    assert tools["child_endpoints"]["profit_prediction"]["available"] is False
     assert tools["health"]["probe_mode"] == "liveness"
     assert tools["status"]["probe_mode"] == "metadata_status"
 

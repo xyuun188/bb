@@ -721,8 +721,7 @@ class LocalAIToolsClient:
         """Return one stable status contract for fresh, cached, and early-error paths."""
 
         status = dict(payload) if isinstance(payload, Mapping) else {}
-        health = status.get("health") if isinstance(status.get("health"), Mapping) else {}
-        child_endpoints = self._metadata_child_endpoints(status, health)
+        child_endpoints = self._metadata_child_endpoints(status)
         child_metadata_ready_count = sum(
             bool(item.get("metadata_ready"))
             for item in child_endpoints.values()
@@ -870,7 +869,7 @@ class LocalAIToolsClient:
             health_ok = False
             health_error = safe_error_text(exc, limit=180)
 
-        child_endpoints = self._metadata_child_endpoints(status, health)
+        child_endpoints = self._metadata_child_endpoints(status)
         child_available = any(
             bool(item.get("metadata_ready"))
             for item in child_endpoints.values()
@@ -909,12 +908,9 @@ class LocalAIToolsClient:
             else:
                 model_bundle_available = bool(status.get("available"))
         else:
-            model_bundle_available = bool(
-                health.get("model_bundle_available")
-                or health.get("trained_models_available")
-            )
-        # `/health/live` is a transport/liveness contract.  A slow metadata
-        # endpoint must not turn a reachable model service into "unavailable".
+            model_bundle_available = False
+        # `/health/live` is a transport/liveness contract. It cannot authorize
+        # an artifact or route when metadata validation failed.
         service_available = bool(health_ok or status_ok or child_available)
 
         status["model_bundle_available"] = model_bundle_available
@@ -1061,62 +1057,56 @@ class LocalAIToolsClient:
     @staticmethod
     def _metadata_child_endpoints(
         status: Mapping[str, Any],
-        health: Mapping[str, Any],
     ) -> dict[str, dict[str, Any]]:
         """Normalize metadata readiness separately from real inference probes."""
 
-        for source in (status, health):
-            raw = source.get("child_endpoints")
-            if not isinstance(raw, dict):
+        raw = status.get("child_endpoints")
+        if not isinstance(raw, dict):
+            return {}
+        rows: dict[str, dict[str, Any]] = {}
+        for name, item in raw.items():
+            if not str(name).strip() or not isinstance(item, dict):
                 continue
-            rows: dict[str, dict[str, Any]] = {}
-            for name, item in raw.items():
-                if not str(name).strip() or not isinstance(item, dict):
-                    continue
-                metadata_ready = bool(
-                    item.get("metadata_ready")
-                    or item.get("available")
-                    or item.get("status") == "metadata_ready"
-                    or item.get("status_category") == "metadata_contract"
-                )
-                live_probe_ok = bool(
-                    item.get("live_probe_ok")
-                    or (item.get("actual_inference_probe") is True and item.get("ok") is True)
-                    or item.get("status") == "live_probe_ok"
-                )
-                if live_probe_ok:
-                    state = "live_probe_ok"
-                elif metadata_ready:
-                    state = "metadata_ready"
-                elif item:
-                    state = "unavailable"
-                else:
-                    state = "contract_missing"
-                normalized = dict(item)
-                normalized.update(
-                    {
-                        "metadata_ready": metadata_ready,
-                        "live_probe_ok": live_probe_ok,
-                        "status": state,
-                        "status_category": state,
-                        # Keep legacy consumers truthful: available means the route
-                        # contract is registered, not that a heavy inference probe ran.
-                        "available": metadata_ready,
-                        "ok": live_probe_ok or metadata_ready,
-                        "actual_inference_probe": live_probe_ok,
-                        "error": (
-                            ""
-                            if live_probe_ok
-                            else "inference_probe_not_run"
-                            if metadata_ready
-                            else "child_endpoint_contract_missing"
-                        ),
-                    }
-                )
-                rows[str(name)] = normalized
-            if rows:
-                return rows
-        return {}
+            metadata_ready = bool(
+                item.get("metadata_ready")
+                or item.get("available")
+                or item.get("status") == "metadata_ready"
+                or item.get("status_category") == "metadata_contract"
+            )
+            live_probe_ok = bool(
+                item.get("live_probe_ok")
+                or (item.get("actual_inference_probe") is True and item.get("ok") is True)
+                or item.get("status") == "live_probe_ok"
+            )
+            if live_probe_ok:
+                state = "live_probe_ok"
+            elif metadata_ready:
+                state = "metadata_ready"
+            elif item:
+                state = "unavailable"
+            else:
+                state = "contract_missing"
+            normalized = dict(item)
+            normalized.update(
+                {
+                    "metadata_ready": metadata_ready,
+                    "live_probe_ok": live_probe_ok,
+                    "status": state,
+                    "status_category": state,
+                    "available": metadata_ready,
+                    "ok": live_probe_ok or metadata_ready,
+                    "actual_inference_probe": live_probe_ok,
+                    "error": (
+                        ""
+                        if live_probe_ok
+                        else "inference_probe_not_run"
+                        if metadata_ready
+                        else "child_endpoint_contract_missing"
+                    ),
+                }
+            )
+            rows[str(name)] = normalized
+        return rows
 
     async def train(
         self,

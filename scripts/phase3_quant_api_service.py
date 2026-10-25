@@ -4848,22 +4848,15 @@ def _run_finbert_shadow(features: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/health/live")
 async def liveness() -> dict[str, Any]:
-    """Return a cheap liveness plus child-contract snapshot.
+    """Return process liveness without claiming that an artifact is verified."""
 
-    The platform uses this endpoint when the full metadata endpoint is busy.
-    Keeping the route contracts here prevents a transient metadata timeout from
-    being misreported as four missing quant endpoints.
-    """
-
-    model_bundle_available = _lightweight_model_bundle_available()
     return {
         "ok": True,
         "service": "phase3_quant_api",
         "port": PHASE3_API_PORT,
-        "model_bundle_available": model_bundle_available,
-        "status": "ready" if model_bundle_available else "artifact_unavailable",
+        "bundle_files_present": _lightweight_model_bundle_available(),
+        "status": "live",
         "status_endpoint_uses_metadata_only": True,
-        "child_endpoints": _status_child_endpoint_contracts(model_bundle_available),
     }
 
 

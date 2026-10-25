@@ -1588,7 +1588,7 @@ async def test_local_ai_tools_status_preserves_health_supervision_and_route_cont
 
 
 @pytest.mark.asyncio
-async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fails(
+async def test_local_ai_tools_status_keeps_readiness_unavailable_when_status_fails(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1600,15 +1600,7 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
             return {
                 "ok": True,
                 "service": "phase3_quant_api",
-                "model_bundle_available": True,
-                "child_endpoints": {
-                    "profit_prediction": {
-                        "available": True,
-                        "path": "/profit/predict",
-                        "probe_mode": "metadata_contract",
-                        "actual_inference_probe": False,
-                    }
-                },
+                "bundle_files_present": True,
             }
         raise RuntimeError("models status endpoint unavailable")
 
@@ -1628,11 +1620,13 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_status_fail
 
     assert result["available"] is True
     assert result["service_available"] is True
-    assert result["model_bundle_available"] is True
-    assert result["status"] == "ready"
+    assert result["model_bundle_available"] is False
+    assert result["artifact_status"] == "unavailable"
+    assert result["status"] == "artifact_unavailable"
     assert result["status_error"] == "models status endpoint unavailable"
     assert result["health_available"] is True
-    assert result["child_endpoints"]["profit_prediction"]["available"] is True
+    assert result["child_endpoints"] == {}
+    assert result["child_contract_status"] == "unavailable"
     assert result["failure_count"] == 0
 
 

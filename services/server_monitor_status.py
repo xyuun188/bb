@@ -1225,7 +1225,6 @@ def _local_ai_tools_api_key_for_platform_probe() -> str:
 
 
 def _local_ai_tools_child_endpoint_contracts(
-    health_metadata: dict[str, Any],
     status_metadata: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     """Read lightweight route contracts without running expensive inference probes."""
@@ -1237,8 +1236,6 @@ def _local_ai_tools_child_endpoint_contracts(
         "exit_advice": "/exit/advise",
     }
     raw_contracts = status_metadata.get("child_endpoints")
-    if not isinstance(raw_contracts, dict) or not raw_contracts:
-        raw_contracts = health_metadata.get("child_endpoints")
     raw_contracts = raw_contracts if isinstance(raw_contracts, dict) else {}
     rows: dict[str, dict[str, Any]] = {}
     for name, path in specs.items():
@@ -1420,11 +1417,8 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     or status_probe.get("ok")
                 )
             )
-            # The metadata endpoint is authoritative when it answered
-            # successfully: liveness only proves that bundle files exist and
-            # must not resurrect a bundle rejected by pointer/hash/supervision
-            # validation.  Fall back to liveness only when metadata itself
-            # failed.
+            # Only a successful metadata response can establish artifact or
+            # route readiness. Liveness remains a transport signal.
             if status_probe.get("ok"):
                 if "model_bundle_available" in status_metadata:
                     model_bundle_available = bool(
@@ -1437,12 +1431,8 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 else:
                     model_bundle_available = bool(status_metadata.get("available"))
             else:
-                model_bundle_available = bool(
-                    metadata.get("model_bundle_available")
-                    or metadata.get("trained_models_available")
-                )
+                model_bundle_available = False
             child_endpoints = _local_ai_tools_child_endpoint_contracts(
-                metadata,
                 status_metadata,
             )
             child_available = any(

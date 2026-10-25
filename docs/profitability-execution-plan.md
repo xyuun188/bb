@@ -5462,3 +5462,56 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   blocked. Next work is prospective contract-valid shadow evidence and a new
   preregistered, cost-aware G3 question. Keep all trading and risk gates
   unchanged.
+
+### Direct Quant API Contract Evidence (2026-10-25 12:57 Asia/Shanghai)
+
+- A read-only probe through the production tunnel `127.0.0.1:18001` separated
+  the cheap liveness contract from the full artifact contract:
+  `/health/live` reports bundle files present and four route shapes, while
+  `/models/status` and `/health` report `status=artifact_unavailable`,
+  `artifact_lifecycle=unregistered`, `model_bundle_available=false`, and
+  `live_ml_ready=false`.
+- The full endpoint reports `candidate_artifact_not_registered`; current,
+  challenger and rollback pointers are all rejected because the embedded
+  `profit_supervision_version` belongs to an incompatible contract. No
+  pointer is eligible for v4, so the four child endpoints correctly remain
+  unavailable after the readiness-precedence repair.
+- This is an artifact/data-contract dependency, not an HTTP, GPU, OKX or
+  exchange rejection. The only valid repair is to produce and register a
+  genuinely v4-compatible artifact from contract-valid data. Relabeling an old
+  artifact, fabricating availability fields or bypassing the supervision gate
+  is prohibited.
+- Gate state is unchanged: G0 passed; G1 is negative attribution only; G2
+  blocked; G3 has no qualifying candidate; G4/G5 not started; G6 blocked.
+  Keep paper/live order controls and all risk/economic gates unchanged while
+  collecting prospective v4 evidence.
+
+### Fail-Closed Quant Liveness Contract (2026-10-25 13:08 Asia/Shanghai)
+
+- The previous precedence repair still allowed `/health/live` to advertise
+  `model_bundle_available=true` and four child route contracts when the full
+  metadata endpoint was unavailable. That made a transport fallback look like
+  model readiness. The quant API liveness response now reports only
+  `ok=true`, `status=live`, and a non-authoritative
+  `bundle_files_present` diagnostic; it no longer returns model readiness or
+  child endpoint availability.
+- The application client and dashboard runtime aggregator now accept child
+  endpoint contracts only from a successful `/models/status` response. If that
+  metadata request fails, the service may be reachable but artifact and route
+  readiness remain unavailable. This is fail-closed status semantics, not a
+  trading or model-permission change.
+- Focused local tests passed `33`; Ruff and diff checks passed. The six
+  changed runtime/test files were uploaded to the application server with
+  source integrity `6`. The quant API source and unit were installed on the
+  model host with `--install-only`; source hash
+  `ee1be6ef00660f39733fa586bfef413060d4a8729898da9b0df926aabfeb1259`
+  matched the local generated service source, and remote AST compilation
+  passed. The running `bb-phase3-quant-api.service` was not restarted; its
+  active PID/start time remains the pre-existing process from
+  `2026-10-23 12:36:25 CST`.
+- Because the governed paper resume path is still blocked, the new liveness
+  behavior is staged but not loaded by the running quant API. Do not infer
+  readiness from the old process, and do not restart it outside the approved
+  stopped-before-start preflight. Gate state remains G0 passed, G1 negative
+  attribution only, G2 blocked, G3 without a qualifying candidate, G4/G5 not
+  started, and G6 blocked.
