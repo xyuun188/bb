@@ -6452,9 +6452,13 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   required-contract-compaction, and new nested-status-precedence tests passed
   `3 passed`; the new test used an isolated `/tmp/bb-path-status-20261025-2225`
   pytest base directory. No database or account state was accessed.
-- Next: commit/push the bounded code, test, and this checkpoint, then sync
-  this durable result to `bb`. Do not retry database activation or ad hoc
-  parity against the runtime database.
+- Commit `163589b` (`Preserve explicit compacted market path status`) is pushed
+  to `origin/main`; the change is isolated to the core projector, its test,
+  and this execution checkpoint. Local `39 passed, 1 skipped`, static checks,
+  remote source hashes, and the three remote focused tests are the evidence
+  for this code correction, not profitability acceptance.
+- Do not retry database activation or ad hoc parity against the runtime
+  database.
 - No new labels were audited: the last sealed decisions were at
   `2026-10-25T13:06:52Z`; at this checkpoint only about 78 minutes have
   elapsed, below the 240-minute maximum horizon. Revisit the maturity audit
