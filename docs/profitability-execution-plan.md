@@ -6359,9 +6359,11 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `git diff --check` passed. Targeted online sync uploaded only the service
   module and its test, verified as `source-integrity-ok:2`, and skipped every
   service restart. The running quant API has not loaded this new contract yet.
-- Commit `75ca5c9` contains this code and evidence. Two pushes to
-  `origin/main` failed due GitHub connection reset/unreachable; local `main`
-  is one commit ahead and clean. Retry the push before further deployment work.
+- Commit `75ca5c9` contains this code and evidence. Push attempts to
+  `origin/main` failed because GitHub was unreachable/resetting connections;
+  the code and checkpoint commits remain local and the worktree is clean.
+  Retry the push after network connectivity returns, before further deployment
+  work.
 - Next action: wait for the 42 prospective decisions to mature, then run one
   bounded native-label/provenance audit. In parallel, keep G3 blocked until a
   newly registered development window has enough clean, mature, cost-aware
