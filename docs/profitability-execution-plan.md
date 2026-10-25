@@ -7009,3 +7009,31 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   action is to register a materially new prospective development window and
   a preregistered candidate family/cost model before reading its outcomes;
   the rejected cohort must not be reused.
+
+### New Prospective Development Window Registered (2026-10-26 07:38 Asia/Shanghai)
+
+- A materially new, untouched development window is preregistered before any
+  labels from it are read:
+  `prospective-g3-horizon-ridge-v2-d20261026T000000Z`,
+  decision interval `[2026-10-26T00:00:00Z, 2026-10-26T06:00:00Z)`.
+  Its fixed maturity boundary is `2026-10-26T10:01:00Z`
+  (`2026-10-26 18:01:00 Asia/Shanghai`), which is six hours plus the
+  maximum 240-minute horizon and the 60-second source-lag buffer.
+- The candidate family is frozen as the existing cost-aware
+  `standardized_ridge_net` horizon study: horizons `5/15/60/240` minutes;
+  feature policies `existing` and `market_only`; Ridge alphas
+  `1/10/100`; net-return thresholds `0/0.05/0.1%`; two purged inner folds
+  for selection and three chronological outer folds. No feature, horizon,
+  side, threshold, or exit change may be introduced after labels are seen.
+- The cost contract is fixed to native
+  `shadow_entry_result_and_okx_native_1m_path` rows with
+  `fee_after_complete=true`, including recorded entry/exit fees, slippage and
+  funding; historical-only or incomplete-cost rows are quarantined. Research
+  is reported in both all-opportunity and one-position non-overlapping views.
+  Each outer fold and aggregate must have at least `16` selected rows,
+  positive fee-after mean, positive lower bound and PF above `1`; otherwise
+  the candidate is rejected with no artifact or permission change.
+- The collection/audit budget is fixed at at most `1,200` decision groups and
+  `4,800` label rows in one read-only bounded run. Until the maturity boundary,
+  do not query labels or tune on this window. Paper/live entry remains
+  observation-only, and G4-G6 remain blocked.
