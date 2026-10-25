@@ -26,6 +26,7 @@ from core.market_facts import (
     market_fact_reasons,
 )
 from core.training_contracts import (
+    HISTORICAL_SHADOW_SOURCE,
     SHADOW_LABEL_VERSION,
     build_shadow_label_contract,
     compact_shadow_label_contract,
@@ -368,6 +369,11 @@ def _large_native_market_fact_contract() -> dict:
             "strategy_version": MARKET_FACT_CONTRACT_VERSION,
             "fallback_reason": "",
             "data_fingerprint": "b" * 64,
+            "scheduled_label_at": "2026-10-22T01:29:25+00:00",
+            "result_source_available_at": "2026-10-22T01:30:00+00:00",
+            "label_maturity_lag_seconds": 35.0,
+            "availability_basis": "one_minute_candle_close_lower_bound",
+            "delivery_latency_observed": False,
         },
     }
 
@@ -883,7 +889,13 @@ def test_optional_diagnostics_are_dropped_when_they_exceed_snapshot_budget() -> 
 
 
 def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None:
-    compact_sql = postgres_training_feature_snapshot_functions()[-1]
+    functions = postgres_training_feature_snapshot_functions()
+    compact_sql = functions[-1]
+    market_contract_sql = next(
+        sql
+        for sql in functions
+        if "CREATE OR REPLACE FUNCTION bb_compact_training_market_fact_contract" in sql
+    )
 
     assert "optional_item RECORD" in compact_sql
     assert "FOR optional_item IN" in compact_sql
@@ -891,6 +903,10 @@ def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None
     assert "bb_compact_training_market_fact_contract(" in compact_sql
     assert "'training_market_fact_contract', required_contract" in compact_sql
     assert "FOR item IN" not in compact_sql
+    assert "'scheduled_label_at'," in market_contract_sql
+    assert "'result_source_available_at'," in market_contract_sql
+    assert "'availability_basis'," in market_contract_sql
+    assert "'path_status', COALESCE(source->'path_status', path->'status')" in market_contract_sql
 
 
 @pytest.mark.parametrize("mutation", ["sequence", "nested_receipt"])
@@ -1042,10 +1058,49 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                 for index in range(80)
             }
         )
+        with_historical_contract = deepcopy(original)
+        with_historical_contract["training_market_fact_contract"] = {
+            "version": MARKET_FACT_CONTRACT_VERSION,
+            "status": "historical_ohlcv_only",
+            "violation_count": 0,
+            "violation_reason_codes": "",
+            "native_instrument_identity_verified": True,
+            "same_contract_price_path_verified": True,
+            "executable_market_fact_verified": False,
+            "source": HISTORICAL_SHADOW_SOURCE,
+            "observation_window": json.dumps(
+                {
+                    "start": "2026-09-01T00:00:00+00:00",
+                    "end": "2026-09-01T00:06:00+00:00",
+                }
+            ),
+            "sample_count": 6,
+            "effective_sample_size": 1.0,
+            "generated_at": "2026-09-01T00:06:01+00:00",
+            "strategy_version": "historical-test-v1",
+            "fallback_reason": "historical_ohlcv_has_no_historical_orderbook",
+            "data_fingerprint": "a" * 64,
+            "entry_fact_id": None,
+            "result_fact_id": None,
+            "result_source_timestamp_ms": None,
+            "result_received_at": None,
+            "scheduled_label_at": "2026-09-01T00:05:25+00:00",
+            "result_source_available_at": "2026-09-01T00:06:00+00:00",
+            "label_maturity_lag_seconds": 35.0,
+            "availability_basis": "one_minute_candle_close_lower_bound",
+            "delivery_latency_observed": False,
+            "entry_inst_id": None,
+            "result_inst_id": None,
+            "entry_contract_spec_version": None,
+            "result_contract_spec_version": None,
+            "path_status": "clean",
+            "path_fingerprint": "b" * 64,
+        }
         for features in (
             original,
             oversized,
             with_contract,
+            with_historical_contract,
             {"empty": {}, "array": [], "text": "x" * 513},
         ):
             encoded = json.dumps(features, ensure_ascii=False)

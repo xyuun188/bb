@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.training_contracts import SHADOW_LABEL_VERSION, shadow_label_contract_reasons
+from core.training_feature_snapshot import compact_training_feature_snapshot
 from services.historical_shadow_rebuild import (
     HISTORICAL_SHADOW_REBUILD_VERSION,
     HISTORICAL_SHADOW_SOURCE,
@@ -128,6 +129,44 @@ def test_historical_shadow_sample_is_market_only_and_has_real_identity() -> None
     tasks = annotated["profit_supervision"]["tasks"]
     assert tasks["market_opportunity_distribution"]["eligible"] is True
     assert tasks["execution_cost_and_slippage_distribution"]["eligible"] is False
+
+
+def test_historical_label_provenance_survives_training_snapshot_compaction() -> None:
+    sample = build_historical_shadow_sample(
+        _decision(),
+        horizon_minutes=5,
+        bars=_bars(6),
+        shadow_backtest_id=96,
+    )
+    assert sample is not None
+
+    features = compact_training_feature_snapshot(sample["feature_snapshot"])
+    market = features["training_market_fact_contract"]
+    assert market["path_status"] == "clean"
+    assert market["scheduled_label_at"] == "2026-09-01T00:05:25+00:00"
+    assert market["result_source_available_at"] == "2026-09-01T00:06:00+00:00"
+    assert market["availability_basis"] == "one_minute_candle_close_lower_bound"
+    assert market["delivery_latency_observed"] is False
+
+    assessment = annotate_sample(
+        {
+            "id": 96,
+            "decision_id": sample["decision_id"],
+            "label_version": sample["label_version"],
+            "symbol": sample["symbol"],
+            "decision_action": sample["decision_action"],
+            "decision_confidence": sample["decision_confidence"],
+            "horizon_minutes": sample["horizon_minutes"],
+            "features": features,
+            "long_return_pct": sample["long_return_pct"],
+            "short_return_pct": sample["short_return_pct"],
+            "best_action": sample["best_action"],
+            "label_timestamp": sample["due_at"].isoformat(),
+        },
+        "shadow",
+    )
+    assert assessment["exclude_from_training"] is False
+    assert assessment["quality_reasons"] == ["historical_market_path_only"]
 
 
 def test_historical_shadow_sample_does_not_invent_missing_feature_contract() -> None:

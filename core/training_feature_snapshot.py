@@ -70,6 +70,11 @@ _TRAINING_MARKET_FACT_CONTRACT_KEYS = (
     "result_fact_id",
     "result_source_timestamp_ms",
     "result_received_at",
+    "scheduled_label_at",
+    "result_source_available_at",
+    "label_maturity_lag_seconds",
+    "availability_basis",
+    "delivery_latency_observed",
     "entry_inst_id",
     "result_inst_id",
     "entry_contract_spec_version",
@@ -693,6 +698,26 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     COALESCE(result->'source_timestamp_ms', source->'result_source_timestamp_ms'),
                 'result_received_at',
                     COALESCE(result->'received_at', source->'result_received_at'),
+                'scheduled_label_at',
+                    COALESCE(provenance->'scheduled_label_at', source->'scheduled_label_at'),
+                'result_source_available_at',
+                    COALESCE(
+                        provenance->'result_source_available_at',
+                        result->'source_available_at',
+                        source->'result_source_available_at'
+                    ),
+                'label_maturity_lag_seconds',
+                    COALESCE(
+                        provenance->'label_maturity_lag_seconds',
+                        source->'label_maturity_lag_seconds'
+                    ),
+                'availability_basis',
+                    COALESCE(provenance->'availability_basis', source->'availability_basis'),
+                'delivery_latency_observed',
+                    COALESCE(
+                        provenance->'delivery_latency_observed',
+                        source->'delivery_latency_observed'
+                    ),
                 'entry_inst_id',
                     COALESCE(entry_identity->'inst_id', source->'entry_inst_id'),
                 'result_inst_id',
@@ -701,7 +726,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     COALESCE(entry_identity->'contract_spec_version', source->'entry_contract_spec_version'),
                 'result_contract_spec_version',
                     COALESCE(result_identity->'contract_spec_version', source->'result_contract_spec_version'),
-                'path_status', COALESCE(path->'status', source->'path_status'),
+                'path_status', COALESCE(source->'path_status', path->'status'),
                 'path_fingerprint',
                     COALESCE(path->'path_fingerprint', source->'path_fingerprint')
             );

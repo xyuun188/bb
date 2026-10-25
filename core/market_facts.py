@@ -1142,6 +1142,14 @@ def compact_market_fact_contract(contract: Mapping[str, Any] | None) -> dict[str
         "result_fact_id": result.get("fact_id"),
         "result_source_timestamp_ms": result.get("source_timestamp_ms"),
         "result_received_at": result.get("received_at"),
+        "scheduled_label_at": provenance.get("scheduled_label_at"),
+        "result_source_available_at": (
+            provenance.get("result_source_available_at")
+            or result.get("source_available_at")
+        ),
+        "label_maturity_lag_seconds": provenance.get("label_maturity_lag_seconds"),
+        "availability_basis": provenance.get("availability_basis"),
+        "delivery_latency_observed": provenance.get("delivery_latency_observed"),
         "entry_inst_id": entry_identity.get("inst_id"),
         "result_inst_id": result_identity.get("inst_id"),
         "entry_contract_spec_version": entry_identity.get("contract_spec_version"),

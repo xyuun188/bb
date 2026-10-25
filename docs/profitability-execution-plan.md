@@ -6368,3 +6368,65 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   bounded native-label/provenance audit. In parallel, keep G3 blocked until a
   newly registered development window has enough clean, mature, cost-aware
   labels; do not backfill old rows or manufacture paper fills.
+
+### Historical Label Provenance Compaction Repair (2026-10-25 21:57 Asia/Shanghai)
+
+- Root cause confirmed in the compact training-market-fact projection:
+  scheduled label time, source-availability time, maturity lag, availability
+  basis, and delivery-latency evidence were omitted. The PostgreSQL projector
+  also preferred nested path status over an explicit `path_status`, allowing a
+  historical contract's `status=historical_ohlcv_only` to overwrite its
+  independently verified `path_status=clean`. This makes valid historical
+  timing/path evidence appear missing or invalid at training-quality checks.
+- Local patch is limited to `core/market_facts.py`,
+  `core/training_feature_snapshot.py`, and focused regressions in
+  `tests/test_feature_availability_compaction.py` and
+  `tests/test_historical_shadow_rebuild.py`. It preserves existing source
+  evidence only; it does not infer missing timestamps, convert historical
+  OHLCV into executable quotes, or weaken quality rules.
+- Verification: the focused suites pass `38 passed, 1 skipped`; Ruff,
+  compileall, and `git diff --check` pass. The one skipped check compares the
+  live PostgreSQL projector with Python and requires a dedicated
+  `BB_TEST_POSTGRES_URL`, which is not configured in this workspace.
+- Deployment status: source is uploaded and hash-verified, but the updated
+  function is not loaded into the online PostgreSQL trigger. The two runtime
+  modules and two regression files were uploaded
+  with `--only`, `--include-tests`, and `--skip-restart`; source integrity
+  passed for all four files. The later nested-provenance fixture update was
+  uploaded separately, also with restart disabled, and its remote source hash
+  passed.
+- Remote focused verification: three isolated affected tests passed remotely.
+  The full two-file focused group reached 18 passing tests but pytest cleanup
+  then failed because the remote root-run environment could not traverse its
+  pytest temporary directory; the retry with an explicit temporary directory
+  had the same permissions failure. These are environment/test-runner errors,
+  not reported assertion failures. The full remote result is therefore
+  INCOMPLETE, not passed.
+- PostgreSQL activation remains NOT DONE. The ordinary PostgreSQL parity test
+  is skipped unless `BB_TEST_POSTGRES_URL` names a dedicated test database.
+  Several ad hoc isolated parity/activation attempts against the configured
+  runtime connection did not establish the standard parity criterion; each
+  transaction rolled back before completion. No business rows were updated,
+  no service was restarted, and the database function is not claimed active.
+  Stop ad hoc retries. Resume only with a dedicated test-database connection
+  supplied through the approved password-manager secure channel, then run the
+  repository's standard PostgreSQL test. Any production-function activation
+  must be a separately reviewed, short transaction using a stable direct
+  connection and exact parity evidence; do not inspect environment secrets,
+  recycle application pooled sessions, repurpose a worker, or bypass service
+  preflight.
+- Acceptance remains unchanged: G2 numeric feature coverage passed, but fresh
+  label maturity/provenance is still pending; G3 has no qualified candidate,
+  G4-G5 are not started, and G6 is blocked. The last verified online cohort
+  had 42 decision groups with four shadow horizons each, but zero groups with
+  all four native fee-complete horizons. Existing fee-after evidence remains
+  negative (`n=267`, mean `-0.303832%`, lower bound `-0.431590%`,
+  PF `0.549713`). No entry, order, risk, permission, or live-routing setting
+  was changed.
+- Next action: do not repeat the online test without resolving its temporary
+  directory ownership. Obtain the dedicated test-database connection through
+  the approved secure channel, run the standard Python/PostgreSQL parity test,
+  and preserve the failed/incomplete state if that prerequisite is unavailable.
+  Then use the guarded function activation workflow and audit only newly
+  mature, provenance-complete labels. Keep G2-G6 unpassed where evidence is
+  incomplete.
