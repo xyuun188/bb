@@ -6906,6 +6906,15 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   funding, native execution, model, cost and risk gates remain fail-closed;
   no profitability or entry authorization is implied by higher analysis
   coverage.
+- A clean post-reload 15-minute window
+  `[2026-10-25T19:59:07Z,2026-10-25T20:14:07Z)` recorded `40` completed
+  market decisions across `39` symbols, maximum inter-decision gap
+  `65.190s`, top-symbol count `2`, minimum repeated-symbol gap `740.828s`,
+  and zero completed/retry decisions inside the fixed `600s` cooldown.
+  There were no model failures and no incomplete analysis rows. The coverage
+  assessor still reports unresolved candidate due symbols because its
+  `1800s` universe-coverage target is a separate longer-horizon metric; that
+  is not a duplicate-analysis failure.
 
 ### Prospective Decision Cohort Final Seal (2026-10-26 03:56 Asia/Shanghai)
 
