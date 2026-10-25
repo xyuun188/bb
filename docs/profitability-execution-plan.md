@@ -5695,3 +5695,62 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   the active paper process can be handled by the existing control path; no
   restart, order, protection, model relabel, leverage or gate relaxation is
   authorized while the v4 artifact contract is unavailable.
+
+### Preregistered Fixed Rules-Canary Development (2026-10-25 14:28 Asia/Shanghai)
+
+- To make one materially new G3 decision without another estimator sweep, the
+  next development question is fixed before reading its result:
+  does the existing `live_rules_canary_signal.v1` technical-consensus policy
+  produce positive fee-after returns on the primary five-minute native path?
+- The policy is immutable: use
+  `returns_1`, `returns_5`, `returns_20`, `macd_diff`,
+  `price_vs_sma20` and `price_vs_sma50`; ignore zero/missing values; require
+  at least four valid votes, at least four votes for the dominant side, and a
+  dominant ratio of at least `0.75`. Emit that side, otherwise hold. There is
+  no feature fitting, side/horizon selection, threshold search, sizing,
+  leverage or exit tuning. The evaluation horizon is fixed at five minutes
+  because it is the registered primary label horizon.
+- Evaluation will read only completed paper shadow rows whose native
+  executable one-minute path and `fee_after_complete=true` contracts are
+  present. Three chronological decision-group folds are purged by label end.
+  Each fold and the aggregate must pass both all-opportunity and one-global-
+  position non-overlap views: at least 16 selected rows, positive fee-after
+  mean, positive research lower bound and PF above one. This is development
+  evidence only; it cannot open G4 or authorize entries.
+- Safety/resource boundary: one read-only connection, 15-second statement
+  timeout, 25% CPU, 1 GiB memory, 300-second deadline; no database mutation,
+  artifact persistence, permission change, service restart or order. A
+  rejection closes this policy and no additional rules/model sweep will be
+  started on the same window. A qualifying result would require a separately
+  frozen policy and untouched G4 exam.
+
+### Fixed Rules-Canary Result And Time Boundary (2026-10-25 14:41 Asia/Shanghai)
+
+- The preregistered policy was uploaded with `--skip-restart` and verified by
+  remote source integrity (`source-integrity-ok:4`). The bounded read-only
+  audit used cutoff `2026-10-25T06:41:04Z`, a six-hour window, one read-only
+  session, and `275` completed paper shadow rows with the native executable
+  one-minute path and `fee_after_complete=true`. No database mutation, model
+  artifact, permission change, service restart or order occurred.
+- The policy is **rejected** and closed. It selected `93/275` rows. Across
+  three chronological label-purged folds, the all-opportunity view had
+  `52` selected rows, fee-after mean `-0.087678%`, research lower bound
+  `-0.151640%`, and PF `0.409238`. The one-global-position
+  non-overlapping view had `23` selected rows, mean `-0.105225%`, lower bound
+  `-0.204326%`, and PF `0.332381`. Fold-level stability also failed; no fold
+  met the required positive mean, positive lower bound, PF above one, and
+  minimum-count contract. The immutable development input is
+  `c2d3b55c6d1ed5389ee6695936eae061b1031488956b5835383d07bce59e37a7`.
+- The result confirms the current no-entry behavior is an economic safety
+  decision, not an exchange order rejection: the fixed rules candidate loses
+  after native costs and is not eligible for G4 or runtime promotion. The
+  authoritative local-ML candidate remains negative and the v4 quant artifact
+  remains unavailable, so no profitable candidate currently exists.
+- Current gates remain G0 passed; G1 passed only as negative attribution; G2
+  numerically improving but still blocked pending a sustained clean
+  availability boundary and governed loaded-source verification; G3 has no
+  qualifying candidate after closing this rules policy; G4 and G5 have not
+  started; G6 is blocked. There is no honest fixed calendar date for
+  profitability. The next work is limited to completing the G2 loaded-source
+  boundary and obtaining a genuinely positive, cost-aware candidate on fresh
+  data; if that never passes, the correct result is to keep trading disabled.
