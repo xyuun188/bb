@@ -6493,6 +6493,11 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - The code repair is remotely verified but does not make the trading process
   load this reader; restart/deployment activation is intentionally not part
   of this data-only training change.
-- Next action: commit/push only this plan, reader, and focused tests; retain
-  the verified repair in the `bb` project memory. Revisit the sealed-label
-  maturity audit only at/after its fixed 240-minute boundary.
+- Commit `5bd248e` (`Recover linked training label provenance`) contains only
+  this checkpoint, reader, and focused tests. The push to `origin/main` failed
+  with a GitHub connection reset at 2026-10-25 23:01 Asia/Shanghai; the commit
+  is local only. Durable repair evidence was retained in the `bb` project
+  memory.
+- Next action: retry the push once network connectivity is restored, then
+  revisit the sealed-label maturity audit only at/after its fixed 240-minute
+  boundary. Do not repeat already completed local/remote code tests.
