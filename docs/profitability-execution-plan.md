@@ -6767,3 +6767,8 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   point-in-time, fee-after eligible count is insufficient, close this cohort
   as G2 insufficient and register a later window; do not run G3 or tune on
   its labels.
+- The evidence note is committed locally as `99af7cc`. A push attempt at this
+  checkpoint failed because `github.com:443` was unreachable; `origin/main`
+  remains `d70f8a4`. The local worktree is clean and the push must be retried
+  when connectivity returns, without rebuilding or rerunning this sealed
+  cohort.
